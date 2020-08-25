@@ -1041,12 +1041,13 @@ int _main(int argc, char* argv[], char** envp) {
         }
 
         if (!hasMongoRC && isatty(fileno(stdin))) {
-            std::cout
-                << "Welcome to the Percona Server for MongoDB shell.\n"
-                   "For interactive help, type \"help\".\n"
-                   "For more comprehensive documentation, see\n\thttps://www.percona.com/doc/percona-server-for-mongodb\n"
-                   "Questions? Try the support group\n\thttps://www.percona.com/forums/questions-discussions/percona-server-for-mongodb"
-                << std::endl;
+            std::cout << "Welcome to the Percona Server for MongoDB shell.\n"
+                         "For interactive help, type \"help\".\n"
+                         "For more comprehensive documentation, see\n"
+                         "\thttps://www.percona.com/doc/percona-server-for-mongodb\n"
+                         "Questions? Try the support group\n"
+                         "\thttps://www.percona.com/forums/questions-discussions/percona-server-for-mongodb"
+                      << std::endl;
             File f;
             f.open(rcLocation.c_str(), false);  // Create empty .mongorc.js file
         }

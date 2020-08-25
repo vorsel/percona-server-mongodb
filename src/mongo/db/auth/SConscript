@@ -15,7 +15,7 @@ env.SConscript(
 
 generateActionTypes = env.Command(
     target=[
-        'action_type.h', 'action_type.cpp'
+        'action_type_gen.h', 'action_type_gen.cpp'
     ],
     source=[
         'generate_action_types.py',
@@ -205,7 +205,7 @@ env.Library(
     target='authprivilege',
     source=[
         'action_set.cpp',
-        'action_type.cpp',
+        'action_type_gen.cpp',
         'impersonation_session.cpp',
         'privilege.cpp',
         'privilege_parser.cpp',

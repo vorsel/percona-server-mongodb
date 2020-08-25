@@ -60,6 +60,7 @@
 #include "mongo/db/mongod_options_storage_gen.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/prepare_conflict_tracker.h"
+#include "mongo/db/repl/always_allow_non_local_writes.h"
 #include "mongo/db/repl/check_quorum_for_config_change.h"
 #include "mongo/db/repl/data_replicator_external_state_initial_sync.h"
 #include "mongo/db/repl/is_master_response.h"
@@ -133,34 +134,6 @@ using NextAction = Fetcher::NextAction;
 namespace {
 
 const char kLocalDB[] = "local";
-// Overrides _canAcceptLocalWrites for the decorated OperationContext.
-const OperationContext::Decoration<bool> alwaysAllowNonLocalWrites =
-    OperationContext::declareDecoration<bool>();
-
-/**
- * Allows non-local writes despite _canAcceptNonLocalWrites being false on a single OperationContext
- * while in scope.
- *
- * Resets to original value when leaving scope so it is safe to nest.
- */
-class AllowNonLocalWritesBlock {
-    AllowNonLocalWritesBlock(const AllowNonLocalWritesBlock&) = delete;
-    AllowNonLocalWritesBlock& operator=(const AllowNonLocalWritesBlock&) = delete;
-
-public:
-    AllowNonLocalWritesBlock(OperationContext* opCtx)
-        : _opCtx(opCtx), _initialState(alwaysAllowNonLocalWrites(_opCtx)) {
-        alwaysAllowNonLocalWrites(_opCtx) = true;
-    }
-
-    ~AllowNonLocalWritesBlock() {
-        alwaysAllowNonLocalWrites(_opCtx) = _initialState;
-    }
-
-private:
-    OperationContext* const _opCtx;
-    const bool _initialState;
-};
 
 void lockAndCall(stdx::unique_lock<Latch>* lk, const stdx::function<void()>& fn) {
     if (!lk->owns_lock()) {
@@ -1250,14 +1223,17 @@ void ReplicationCoordinatorImpl::_setMyLastAppliedOpTimeAndWallTime(
         _updateLastCommittedOpTimeAndWallTime(lk);
     }
 
+    // Update the storage engine's lastApplied snapshot before updating the stable timestamp on the
+    // storage engine. New transactions reading from the lastApplied snapshot should start before
+    // the oldest timestamp is advanced to avoid races. Additionally, update this snapshot before
+    // signaling optime waiters. This avoids a race that would allow optime waiters to open
+    // transactions on stale lastApplied values because they do not hold or reacquire the
+    // replication coordinator mutex when signaled.
+    _externalState->updateLastAppliedSnapshot(opTime);
+
     // Signal anyone waiting on optime changes.
     _opTimeWaiterList.signalIf_inlock(
         [opTime](Waiter* waiter) { return waiter->opTime <= opTime; });
-
-    // Update the local snapshot before updating the stable timestamp on the storage engine. New
-    // transactions reading from the local snapshot should start before the oldest timestamp is
-    // advanced to avoid races.
-    _externalState->updateLocalSnapshot(opTime);
 
     // Notify the oplog waiters after updating the local snapshot.
     signalOplogWaiters();
@@ -2278,7 +2254,7 @@ bool ReplicationCoordinatorImpl::canAcceptWritesForDatabase_UNSAFE(OperationCont
     //
     // Stand-alone nodes and drained replica set primaries can always accept writes.  Writes are
     // always permitted to the "local" database.
-    if (_readWriteAbility->canAcceptNonLocalWrites_UNSAFE() || alwaysAllowNonLocalWrites(*opCtx)) {
+    if (_readWriteAbility->canAcceptNonLocalWrites_UNSAFE() || alwaysAllowNonLocalWrites(opCtx)) {
         return true;
     }
     if (dbName == kLocalDB) {
@@ -2312,7 +2288,7 @@ bool ReplicationCoordinatorImpl::canAcceptWritesFor_UNSAFE(OperationContext* opC
     // If we can accept non local writes (ie we're PRIMARY) then we must not be in ROLLBACK.
     // This check is redundant of the check of _memberState below, but since this can be checked
     // without locking, we do it as an optimization.
-    if (_readWriteAbility->canAcceptNonLocalWrites_UNSAFE() || alwaysAllowNonLocalWrites(*opCtx)) {
+    if (_readWriteAbility->canAcceptNonLocalWrites_UNSAFE() || alwaysAllowNonLocalWrites(opCtx)) {
         return true;
     }
 
@@ -2388,6 +2364,9 @@ bool ReplicationCoordinatorImpl::isInPrimaryOrSecondaryState_UNSAFE() const {
 
 bool ReplicationCoordinatorImpl::shouldRelaxIndexConstraints(OperationContext* opCtx,
                                                              const NamespaceString& ns) {
+    if (ReplSettings::shouldRecoverFromOplogAsStandalone()) {
+        return true;
+    }
     return !canAcceptWritesFor(opCtx, ns);
 }
 

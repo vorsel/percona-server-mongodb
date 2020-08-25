@@ -94,10 +94,9 @@ void IndexBuildInterceptor::deleteTemporaryTables(OperationContext* opCtx) {
     }
 }
 
-Status IndexBuildInterceptor::recordDuplicateKeys(OperationContext* opCtx,
-                                                  const std::vector<BSONObj>& keys) {
+Status IndexBuildInterceptor::recordDuplicateKey(OperationContext* opCtx, const BSONObj& key) {
     invariant(_indexCatalogEntry->descriptor()->unique());
-    return _duplicateKeyTracker->recordKeys(opCtx, keys);
+    return _duplicateKeyTracker->recordKey(opCtx, key);
 }
 
 Status IndexBuildInterceptor::checkDuplicateKeyConstraints(OperationContext* opCtx) const {
@@ -276,27 +275,24 @@ Status IndexBuildInterceptor::_applyWrite(OperationContext* opCtx,
 
     auto accessMethod = _indexCatalogEntry->accessMethod();
     if (opType == Op::kInsert) {
-        InsertResult result;
-        auto status = accessMethod->insertKeys(opCtx,
-                                               {keySet.begin(), keySet.end()},
-                                               {},
-                                               MultikeyPaths{},
-                                               opRecordId,
-                                               options,
-                                               &result);
+        int64_t numInserted;
+        auto status = accessMethod->insertKeys(
+            opCtx,
+            {keySet.begin(), keySet.end()},
+            {},
+            MultikeyPaths{},
+            opRecordId,
+            options,
+            [=](const BSONObj& duplicateKey) {
+                return options.getKeysMode == IndexAccessMethod::GetKeysMode::kEnforceConstraints
+                    ? recordDuplicateKey(opCtx, duplicateKey)
+                    : Status::OK();
+            },
+            &numInserted);
         if (!status.isOK()) {
             return status;
         }
 
-        if (result.dupsInserted.size() &&
-            options.getKeysMode == IndexAccessMethod::GetKeysMode::kEnforceConstraints) {
-            status = recordDuplicateKeys(opCtx, result.dupsInserted);
-            if (!status.isOK()) {
-                return status;
-            }
-        }
-
-        int64_t numInserted = result.numInserted;
         *keysInserted += numInserted;
         opCtx->recoveryUnit()->onRollback(
             [keysInserted, numInserted] { *keysInserted -= numInserted; });
@@ -366,7 +362,16 @@ bool IndexBuildInterceptor::areAllWritesApplied(OperationContext* opCtx) const {
                    "applied, despite the table appearing empty. Writes recorded: "
                 << writesRecorded << ", applied: " << _numApplied;
             log() << message;
-            return false;
+
+            // If _numApplied is less than writesRecorded, this suggests that there are keys not
+            // visible in our snapshot, so we return false. If _numApplied is greater than
+            // writesRecorded, this suggests that we either double-counted or double-applied a key.
+            // Double counting would suggest a bug in the code that tracks inserts, but these
+            // counters are only used for progress reporting and invariants. Double-inserting could
+            // be concerning, but indexes allow key overwrites, so we would never introduce an
+            // inconsistency in this case; we would just overwrite a previous key. Thus, we return
+            // true.
+            return writesRecorded < _numApplied;
         }
         return true;
     }

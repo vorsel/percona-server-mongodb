@@ -33,6 +33,12 @@ replica_sets_jscore_multiversion_passthrough:
   test_file: jstests/core/profile_find.js
 - ticket: SERVER-47773
   test_file: jstests/core/geo_near_tailable.js
+- ticket: SERVER-48614
+  test_file: jstests/core/wildcard_index_partial_index.js
+- ticket: SERVER-48993
+  test_file: jstests/core/explode_for_sort_collation.js
+- ticket: SERVER-48525
+  test_file: jstests/core/txns/no_writes_to_config_transactions_with_prepared_transaction.js
 
 replica_sets_multiversion:
 - ticket: SERVER-42825
@@ -59,17 +65,29 @@ replica_sets_multiversion:
   test_file: jstests/replsets/reconfig_uses_default_protocolVersion.js
 - ticket: SERVER-47190
   test_file: jstests/replsets/force_shutdown_primary.js
+- ticket: SERVER-49471
+  test_file: jstests/replsets/apply_prepare_txn_write_conflict_robustness.js
 
 sharding_multiversion:
 - ticket: SERVER-38691
   test_file: jstests/sharding/explain_cmd.js
 - ticket: SERVER-43889
   test_file: jstests/sharding/retryable_writes.js
+- ticket: SERVER-48993
+  test_file: jstests/core/explode_for_sort_collation.js
 
 sharding_jscore_multiversion_passthrough:
 - ticket: SERVER-47773
   test_file: jstests/core/geo_near_tailable.js
+- ticket: SERVER-48614
+  test_file: jstests/core/wildcard_index_partial_index.js
+- ticket: SERVER-48993
+  test_file: jstests/core/explode_for_sort_collation.js
 
 sharded_collections_jscore_multiversion_passthrough:
 - ticket: SERVER-47773
   test_file: jstests/core/geo_near_tailable.js
+- ticket: SERVER-48614
+  test_file: jstests/core/wildcard_index_partial_index.js
+- ticket: SERVER-48993
+  test_file: jstests/core/explode_for_sort_collation.js

@@ -77,9 +77,11 @@ functions:
         dsi: ${dsi_rev}
         enterprise: ${enterprise_rev}
         linkbench: ${linkbench_rev}
+        linkbench2: ${linkbench2_rev}
         genny: ${genny_rev}
         workloads: ${workloads_rev}
         wtdevelop: ${wtdevelop_rev}
+        signal-processing: ${signal-processing_rev}
 
   "compile mongodb":
     # We create a virtual environment with the Python dependencies for compiling the server
@@ -288,6 +290,8 @@ functions:
           aws_secret_key: "${terraform_secret}"
           perf_jira_user: "${perf_jira_user}"
           perf_jira_pw: "${perf_jira_pw}"
+          cedar_api_user: ${cedar_api_user}
+          cedar_api_key: ${cedar_api_key}
           dsi_analysis_atlas_user: "${dsi_analysis_atlas_user}"
           dsi_analysis_atlas_pw: "${dsi_analysis_atlas_pw}"
           EOF
@@ -882,10 +886,21 @@ modules:
   prefix: linkbench
   branch: master
 
+- name: linkbench2
+  repo: git@github.com:mdcallag/linkbench.git
+  prefix: linkbench2
+  branch: master
+  ref: 63207190657737b32eb0e81c5b81ad1b8bad0e5a
+
 - name: enterprise
   repo: git@github.com:10gen/mongo-enterprise-modules.git
   prefix: src/mongo/db/modules
   branch: v4.2
+
+- name: signal-processing
+  repo: git@github.com:10gen/signal-processing.git
+  prefix: signal_processing
+  branch: master
 
 #######################################
 #         Buildvariants               #
@@ -972,6 +987,8 @@ buildvariants:
     - genny
     - workloads
     - linkbench
+    - linkbench2
+    - signal-processing
   expansions:
     setup: single-replica
     cluster: single
