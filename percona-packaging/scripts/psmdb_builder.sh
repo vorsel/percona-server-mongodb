@@ -892,7 +892,7 @@ build_tarball(){
     if [ ! -d lib/private ]; then
         mkdir -p lib/private
     fi
-    LIBLIST="libcrypto.so libssl.so libpcap.so libsasl2.so libcurl.so libldap liblber libssh libbrotlidec.so libbrotlicommon.so libgssapi_krb5.so libkrb5.so libkrb5support.so libk5crypto.so librtmp.so libgssapi.so libfreebl3.so libssl3.so libsmime3.so libnss3.so libnssutil3.so libplds4.so libplc4.so libnspr4.so libssl3.so libplds4.so liblzma.so"
+    LIBLIST="libcrypto.so libssl.so libpcap.so libsasl2.so libcurl.so libldap liblber libssh libbrotlidec.so libbrotlicommon.so libgssapi_krb5.so libkrb5.so libkrb5support.so libk5crypto.so librtmp.so libgssapi.so libfreebl3.so libssl3.so libsmime3.so libnss3.so libnssutil3.so libplds4.so libplc4.so libnspr4.so libssl3.so libplds4.so liblzma.so libidn.so"
     DIRLIST="bin lib/private"
 
     LIBPATH=""
@@ -950,6 +950,26 @@ build_tarball(){
         done
     }
 
+    function create_sparse {
+        local elf_path=$1
+        for elf in $(find $elf_path -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
+            if [[ ! -f "$elf.sparse" ]]; then
+                echo "Creating sparse file of $(basename $elf)"
+                cp --sparse=always $elf $elf.sparse
+            fi
+        done
+    }
+
+    function replace_binaries {
+        local elf_path=$1
+        for elf in $(find $elf_path -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
+            if [[ -f "$elf.sparse" ]]; then
+                echo "Replacing binary with sparse file"
+                mv $elf.sparse $elf
+            fi
+        done
+    }
+
     function check_libs {
         local elf_path=$1
         for elf in $(find $elf_path -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
@@ -972,6 +992,10 @@ build_tarball(){
     for DIR in $DIRLIST; do
         replace_libs $DIR
     done
+
+    # Create and replace by sparse file to reduce size
+    create_sparse bin
+    replace_binaries bin
 
     # Make final check in order to determine any error after linkage
     for DIR in $DIRLIST; do
