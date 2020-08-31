@@ -194,18 +194,15 @@ get_sources(){
 
 get_system(){
     if [ -f /etc/redhat-release ]; then
-        GLIBC_VER_TMP="$(rpm glibc -qa --qf %{VERSION})"
         RHEL=$(rpm --eval %rhel)
         ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
         OS_NAME="el$RHEL"
         OS="rpm"
     else
-        GLIBC_VER_TMP="$(dpkg-query -W -f='${Version}' libc6 | awk -F'-' '{print $1}')"
         ARCH=$(uname -m)
         OS_NAME="$(lsb_release -sc)"
         OS="deb"
     fi
-    export GLIBC_VER=".glibc${GLIBC_VER_TMP}"
     return
 }
 
@@ -320,10 +317,7 @@ install_deps() {
       add_percona_yum_repo
       wget http://jenkins.percona.com/yum-repo/percona-dev.repo
       mv -f percona-dev.repo /etc/yum.repos.d/
-      yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm
-      percona-release enable tools testing
       yum clean all
-      yum install -y patchelf
       rm -fr /usr/local/gcc-5.4.0
       RHEL=$(rpm --eval %rhel)
       if [ x"$RHEL" = x6 ]; then
@@ -369,6 +363,8 @@ install_deps() {
       install_golang
       install_gcc_54_centos
     else
+      apt-get update
+      apt-get -y install lsb-release
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
       if [ x"${DEBIAN}" = xjessie ]; then
@@ -380,10 +376,7 @@ EOL
         rm -f /etc/apt/sources.list.d/stretch.list
         apt-get -y update
       fi
-      wget https://repo.percona.com/apt/percona-release_latest.$(lsb_release -sc)_all.deb && dpkg -i percona-release_latest.$(lsb_release -sc)_all.deb
-      percona-release enable tools testing
-      apt-get -y update
-      INSTALL_LIST="valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl patchelf"
+      INSTALL_LIST="valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl"
       if [ x"${DEBIAN}" = xfocal ]; then
           INSTALL_LIST="${INSTALL_LIST} python2 python2-dev "
       else
@@ -727,9 +720,13 @@ build_tarball(){
     if [ ${DEBUG} = 1 ]; then
     TARBALL_SUFFIX=".dbg"
     fi
+    if [ -f /etc/debian_version ]; then
+    export OS_RELEASE="$(lsb_release -sc)"
+    fi
     #
     if [ -f /etc/redhat-release ]; then
     #export OS_RELEASE="centos$(lsb_release -sr | awk -F'.' '{print $1}')"
+    export OS_RELEASE="centos$(rpm --eval %rhel)"
     RHEL=$(rpm --eval %rhel)
     fi
     #
@@ -847,108 +844,16 @@ build_tarball(){
     sed -i "s:TARBALL=0:TARBALL=1:" ${PSMDIR_ABS}/percona-packaging/conf/percona-server-mongodb-enable-auth.sh
     cp ${PSMDIR_ABS}/percona-packaging/conf/percona-server-mongodb-enable-auth.sh ${PSMDIR_ABS}/${PSMDIR}/bin
 
-    # Patch needed libraries
-    cd "${PSMDIR_ABS}/${PSMDIR}"
-    if [ ! -d lib/private ]; then
-        mkdir -p lib/private
-    fi
-    LIBLIST="libcrypto.so libssl.so libpcap.so libsasl2.so libcurl.so libldap liblber libgssapi_krb5.so libkrb5.so libkrb5support.so libk5crypto.so libgssapi.so libfreebl3.so libssl3.so libsmime3.so libnss3.so libnssutil3.so libplds4.so libplc4.so libnspr4.so libssl3.so libplds4.so"
-    DIRLIST="bin lib/private"
-
-    LIBPATH=""
-
-    function gather_libs {
-        local elf_path=$1
-        for lib in $LIBLIST; do
-            for elf in $(find $elf_path -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
-                IFS=$'\n'
-                for libfromelf in $(ldd $elf | grep $lib | awk '{print $3}'); do
-                    if [ ! -f lib/private/$(basename $(readlink -f $libfromelf)) ] && [ ! -L lib/$(basename $(readlink -f $libfromelf)) ]; then
-                        echo "Copying lib $(basename $(readlink -f $libfromelf))"
-                        cp $(readlink -f $libfromelf) lib/private
-
-                        echo "Symlinking lib $(basename $(readlink -f $libfromelf))"
-                        cd lib
-                        ln -s private/$(basename $(readlink -f $libfromelf)) $(basename $(readlink -f $libfromelf))
-                        cd -
-
-                        LIBPATH+=" $(echo $libfromelf | grep -v $(pwd))"
-                    fi
-                done
-                unset IFS
-            done
-        done
-    }
-
-    function set_runpath {
-        # Set proper runpath for bins but check before doing anything
-        local elf_path=$1
-        local r_path=$2
-        for elf in $(find $elf_path -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
-            echo "Checking LD_RUNPATH for $elf"
-            if [ -z $(patchelf --print-rpath $elf) ]; then
-                echo "Changing RUNPATH for $elf"
-                patchelf --set-rpath $r_path $elf
-            fi
-        done
-    }
-
-    function replace_libs {
-        local elf_path=$1
-        for libpath_sorted in $LIBPATH; do
-            for elf in $(find $elf_path -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
-                LDD=$(ldd $elf | grep $libpath_sorted|head -n1|awk '{print $1}')
-                if [[ ! -z $LDD  ]]; then
-                    echo "Replacing lib $(basename $(readlink -f $libpath_sorted)) for $elf"
-                    patchelf --replace-needed $LDD $(basename $(readlink -f $libpath_sorted)) $elf
-                fi
-                # Add if present in LDD to NEEDED
-                if [[ ! -z $LDD ]] && [[ -z "$(readelf -d $elf | grep $(basename $libpath_sorted | awk -F'.' '{print $1}'))" ]]; then
-                    patchelf --add-needed $(basename $(readlink -f $libpath_sorted)) $elf
-                fi
-            done
-        done
-    }
-
-    function check_libs {
-        local elf_path=$1
-        for elf in $(find $elf_path -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
-            if ! ldd $elf; then
-                exit 1
-            fi
-        done
-    }
-
-    # Gather libs
-    for DIR in $DIRLIST; do
-        gather_libs $DIR
-    done
-
-    # Set proper runpath
-    set_runpath bin '$ORIGIN/../lib/private/'
-    set_runpath lib/private '$ORIGIN/'
-
-    # Replace libs
-    for DIR in $DIRLIST; do
-        replace_libs $DIR
-    done
-
-    # Make final check in order to determine any error after linkage
-    for DIR in $DIRLIST; do
-        check_libs $DIR
-    done
-
     cd ${PSMDIR_ABS}
-    mv ${PSMDIR} ${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}
-    tar --owner=0 --group=0 -czf ${WORKDIR}/${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}.tar.gz ${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}
+    tar --owner=0 --group=0 -czf ${WORKDIR}/${PSMDIR}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${PSMDIR}
     DIRNAME="tarball"
     if [ "${DEBUG}" = 1 ]; then
     DIRNAME="debug"
     fi
     mkdir -p ${WORKDIR}/${DIRNAME}
     mkdir -p ${CURDIR}/${DIRNAME}
-    cp ${WORKDIR}/${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}.tar.gz ${WORKDIR}/${DIRNAME}
-    cp ${WORKDIR}/${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}.tar.gz ${CURDIR}/${DIRNAME}
+    cp ${WORKDIR}/${PSMDIR}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${WORKDIR}/${DIRNAME}
+    cp ${WORKDIR}/${PSMDIR}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${CURDIR}/${DIRNAME}
 }
 
 #main
