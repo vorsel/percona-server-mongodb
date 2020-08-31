@@ -160,8 +160,8 @@ mkdir -p build_tools/src/github.com/mongodb/mongo-tools
 mkdir -p $RPM_BUILD_DIR/%{src_dir}/bin
 cp -r $(ls | grep -v build_tools) build_tools/src/github.com/mongodb/mongo-tools/
 pushd build_tools/src/github.com/mongodb/mongo-tools
-sed -i 's|VersionStr="$(git describe)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
-sed -i 's|Gitspec="$(git rev-parse HEAD)"|Gitspec="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
+sed -i 's|VersionStr="$(go run release/release.go get-version)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
+sed -i 's|GitCommit="$(git rev-parse HEAD)"|GitCommit="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
 sed -i 's|go build|go build -a -x|' build.sh
 sed -i 's|exit $ec||' build.sh
 . ./set_tools_revision.sh
