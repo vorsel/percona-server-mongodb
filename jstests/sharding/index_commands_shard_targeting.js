@@ -106,8 +106,15 @@ function assertCommandBlocksIfCriticalSectionInProgress(
     joinMoveChunk();
 }
 
+// Disable checking for index consistency to ensure that the config server doesn't trigger a
+// StaleShardVersion exception on shards and cause them to refresh their sharding metadata.
+const nodeOptions = {
+    setParameter: {enableShardedIndexConsistencyCheck: false}
+};
+
 const numShards = 4;
-const st = new ShardingTest({shards: numShards});
+const st = new ShardingTest({shards: numShards, other: {configOptions: nodeOptions}});
+
 const allShards = [];
 for (let i = 0; i < numShards; i++) {
     allShards.push(st["shard" + i]);

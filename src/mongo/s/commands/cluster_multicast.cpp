@@ -33,7 +33,6 @@
 
 #include "mongo/base/init.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/executor/async_multicaster.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -41,6 +40,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/commands/cluster_multicast_gen.h"
 #include "mongo/s/grid.h"
+#include "mongo/util/duration.h"
 
 namespace mongo {
 namespace {
@@ -135,8 +135,9 @@ public:
 
                     if (CommandHelpers::appendCommandStatusNoThrow(subbob, response.status)) {
                         subbob.append("data", response.data);
-                        if (response.elapsedMillis) {
-                            subbob.append("elapsedMillis", response.elapsedMillis->count());
+                        if (response.elapsed) {
+                            subbob.append("elapsedMillis",
+                                          durationCount<Milliseconds>(*response.elapsed));
                         }
                     }
                 }

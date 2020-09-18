@@ -63,6 +63,8 @@
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
@@ -107,6 +109,25 @@ Status validateDBNameForWindows(StringData dbname) {
 PseudoRandom uniqueCollectionNamespacePseudoRandom(Date_t::now().asInt64());
 
 Mutex uniqueCollectionNamespaceMutex = MONGO_MAKE_LATCH("DatabaseUniqueCollectionNamespaceMutex");
+
+void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const& nss) {
+    Lock::DBLock dblock(opCtx, nss.db(), MODE_IS);
+    auto dss = DatabaseShardingState::get(opCtx, nss.db().toString());
+    if (!dss) {
+        return;
+    }
+
+    auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
+    auto mpsm = dss->getMovePrimarySourceManager(dssLock);
+
+    if (mpsm) {
+        LOGV2(4909100, "assertMovePrimaryInProgress", "movePrimaryNss"_attr = nss.toString());
+
+        uasserted(ErrorCodes::MovePrimaryInProgress,
+                  "movePrimary is in progress for namespace " + nss.toString());
+    }
+}
+
 }  // namespace
 
 Status DatabaseImpl::validateDBName(StringData dbname) {
@@ -559,6 +580,7 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
                           << toNss);
         }
     }
+    assertMovePrimaryInProgress(opCtx, fromNss);
 
     LOGV2(20319,
           "renameCollection: renaming collection {collToRename_uuid} from {fromNss} to {toNss}",
@@ -639,6 +661,7 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
                               << " FCV 4.2 Limit: " << NamespaceString::MaxNSCollectionLenFCV42,
                 nss.size() <= NamespaceString::MaxNSCollectionLenFCV42);
     }
+    assertMovePrimaryInProgress(opCtx, nss);
 }
 
 Status DatabaseImpl::createView(OperationContext* opCtx,
@@ -652,6 +675,7 @@ Status DatabaseImpl::createView(OperationContext* opCtx,
 
     NamespaceString viewOnNss(viewName.db(), options.viewOn);
     _checkCanCreateCollection(opCtx, viewName, options);
+
     audit::logCreateCollection(&cc(), viewName.toString());
 
     if (viewName.isOplog())
@@ -718,6 +742,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     }
 
     _checkCanCreateCollection(opCtx, nss, optionsWithUUID);
+    assertMovePrimaryInProgress(opCtx, nss);
     audit::logCreateCollection(&cc(), nss.ns());
 
     LOGV2(20320,

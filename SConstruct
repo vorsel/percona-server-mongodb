@@ -117,6 +117,13 @@ add_option('prefix',
     help='installation prefix (conficts with DESTDIR, PREFIX, and --install-mode=hygienic)',
 )
 
+add_option('build-tools',
+    choices=['stable', 'next'],
+    default='stable',
+    type='choice',
+    help='Enable experimental build tools',
+)
+
 add_option('legacy-tarball',
     choices=['true', 'false'],
     default='false',
@@ -1130,6 +1137,13 @@ if get_option('install-mode') != 'hygienic':
     envDict["INTEGRATION_TEST_ALIAS"] = "integration_tests"
     envDict["LIBFUZZER_TEST_ALIAS"] = "libfuzzer_tests"
     envDict["BENCHMARK_ALIAS"] = "benchmarks"
+
+# By default, we will get the normal SCons tool search. But if the
+# user has opted into the next gen tools, add our experimental tool
+# directory into the default toolpath, ahead of whatever is already in
+# there so it overrides it.
+if get_option('build-tools') == 'next' or get_option('ninja') == 'next':
+    SCons.Tool.DefaultToolpath.insert(0, os.path.abspath('site_scons/site_tools/next'))
 
 env = Environment(variables=env_vars, **envDict)
 
@@ -2955,7 +2969,15 @@ def doConfigure(myenv):
         # generator to return at command line expansion time so that
         # we can change the signature if the file contents change.
         if blackfiles:
-            blacklist_options=["-fsanitize-blacklist=%s" % blackfile for blackfile in blackfiles]
+            # Unconditionally using the full path can affect SCons cached builds, so we only do
+            # this in cases where we know it's going to matter.
+            blackfile_paths = [
+                blackfile.get_abspath() if ('ICECC' in env and env['ICECC']) else blackfile.path
+                for blackfile in blackfiles
+            ]
+            # Make these files available to remote icecream builds if requested
+            blacklist_options=[f"-fsanitize-blacklist={file_path}" for file_path in blackfile_paths]
+            env.AppendUnique(ICECC_CREATE_ENV_ADDFILES=blackfile_paths)
             def SanitizerBlacklistGenerator(source, target, env, for_signature):
                 if for_signature:
                     return [f.get_csig() for f in blackfiles]
@@ -3857,9 +3879,10 @@ def doConfigure(myenv):
 env = doConfigure( env )
 env["NINJA_SYNTAX"] = "#site_scons/third_party/ninja_syntax.py"
 
+
 # Now that we are done with configure checks, enable ccache and
-# icecream, if available. Per the rules declared in the icecream tool,
-# load the ccache tool first.
+# icecream if requested. If *both* icecream and ccache are requested,
+# ccache must be loaded first.
 env.Tool('ccache')
 
 if env.ToolchainIs("clang"):
@@ -3867,7 +3890,11 @@ if env.ToolchainIs("clang"):
 elif env.ToolchainIs("gcc"):
     env["ICECC_COMPILER_TYPE"] = "gcc"
 
-env.Tool('icecream')
+if get_option('build-tools') == 'next' or get_option('ninja') == 'next':
+    env['ICECREAM_TARGET_DIR'] = '$BUILD_ROOT/scons/icecream'
+    env.Tool('icecream', verbose=env.Verbose())
+else:
+    env.Tool('icecream')
 
 # Defaults for SCons provided flags. SetOption only sets the option to our value
 # if the user did not provide it. So for any flag here if it's explicitly passed
@@ -3921,11 +3948,17 @@ if get_option('ninja') != 'disabled':
         if env['ICECREAM_VERSION'] < parse_version("1.2"):
             env.FatalError("Use of ccache is mandatory with --ninja and icecream older than 1.2. You are running {}.".format(env['ICECREAM_VERSION']))
 
-    if get_option('ninja') == 'stable':
-        ninja_builder = Tool("ninja")
+    ninja_builder = Tool("ninja")
+    if get_option('build-tools') == 'next' or get_option('ninja') == 'next':
+        env["NINJA_BUILDDIR"] = env.Dir("$BUILD_DIR/ninja")
         ninja_builder.generate(env)
+
+        ninjaConf = Configure(env, help=False, custom_tests = {
+            'CheckNinjaCompdbExpand': env.CheckNinjaCompdbExpand,
+        })
+        env['NINJA_COMPDB_EXPAND'] = ninjaConf.CheckNinjaCompdbExpand()
+        ninjaConf.Finish()
     else:
-        ninja_builder = Tool("ninja_next")
         ninja_builder.generate(env)
 
     # idlc.py has the ability to print it's implicit dependencies
@@ -3970,7 +4003,7 @@ if get_option('ninja') != 'disabled':
 
     def ninja_test_list_builder(env, node):
         test_files = [test_file.path for test_file in env["MONGO_TEST_REGISTRY"][node.path]]
-        files = "\\n".join(test_files)
+        files = ' '.join(test_files)
         return {
             "outputs": [node.get_path()],
             "rule": "TEST_LIST",
@@ -3980,13 +4013,15 @@ if get_option('ninja') != 'disabled':
             }
         }
 
+    if env["PLATFORM"] == "win32":
+        cmd = 'cmd.exe /c del "$out" && for %a in ($files) do (echo %a >> "$out")'
+    else:
+        cmd = 'rm -f "$out"; for i in $files; do echo "$$i" >> "$out"; done;'
+
     env.NinjaRule(
         rule="TEST_LIST",
         description="Compiling test list: $out",
-        command="{prefix}echo {flags} '$files' > '$out'".format(
-            prefix="cmd.exe /c " if env["PLATFORM"] == "win32" else "",
-            flags="-n" if env["PLATFORM"] != "win32" else "",
-        ),
+        command=cmd,
     )
     env.NinjaRegisterFunctionHandler("test_list_builder_action", ninja_test_list_builder)
 

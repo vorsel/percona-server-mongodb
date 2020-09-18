@@ -804,8 +804,11 @@ void StorageEngineImpl::setStableTimestamp(Timestamp stableTimestamp, bool force
 }
 
 void StorageEngineImpl::setInitialDataTimestamp(Timestamp initialDataTimestamp) {
-    _initialDataTimestamp = initialDataTimestamp;
     _engine->setInitialDataTimestamp(initialDataTimestamp);
+}
+
+Timestamp StorageEngineImpl::getInitialDataTimestamp() {
+    return _engine->getInitialDataTimestamp();
 }
 
 void StorageEngineImpl::setOldestTimestampFromStable() {
@@ -816,6 +819,10 @@ void StorageEngineImpl::setOldestTimestamp(Timestamp newOldestTimestamp) {
     const bool force = true;
     _engine->setOldestTimestamp(newOldestTimestamp, force);
 }
+
+Timestamp StorageEngineImpl::getOldestTimestamp() const {
+    return _engine->getOldestTimestamp();
+};
 
 void StorageEngineImpl::setOldestActiveTransactionTimestampCallback(
     StorageEngine::OldestActiveTransactionTimestampCallback callback) {

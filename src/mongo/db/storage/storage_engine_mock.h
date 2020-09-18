@@ -137,8 +137,14 @@ public:
     }
     void setStableTimestamp(Timestamp stableTimestamp, bool force = false) final {}
     void setInitialDataTimestamp(Timestamp timestamp) final {}
+    Timestamp getInitialDataTimestamp() {
+        return Timestamp();
+    }
     void setOldestTimestampFromStable() final {}
     void setOldestTimestamp(Timestamp timestamp) final {}
+    Timestamp getOldestTimestamp() const final {
+        return {};
+    };
     void setOldestActiveTransactionTimestampCallback(
         OldestActiveTransactionTimestampCallback callback) final {}
     bool isCacheUnderPressure(OperationContext* opCtx) const final {

@@ -60,13 +60,20 @@ var ChunkHelper = (function() {
         return runCommandWithRetries(db, cmd, res => res.code === ErrorCodes.LockBusy);
     }
 
-    function moveChunk(db, collName, bounds, toShard, waitForDelete) {
+    function moveChunk(db, collName, bounds, toShard, waitForDelete, secondaryThrottle) {
         var cmd = {
             moveChunk: db[collName].getFullName(),
             bounds: bounds,
             to: toShard,
             _waitForDelete: waitForDelete
         };
+
+        // Using _secondaryThrottle adds coverage for additional waits for write concern on the
+        // recipient during cloning.
+        if (secondaryThrottle) {
+            cmd._secondaryThrottle = true;
+            cmd.writeConcern = {w: "majority"};  // _secondaryThrottle requires a write concern.
+        }
 
         const runningWithStepdowns =
             TestData.runningWithConfigStepdowns || TestData.runningWithShardStepdowns;
@@ -76,6 +83,7 @@ var ChunkHelper = (function() {
             cmd,
             res => (res.code === ErrorCodes.ConflictingOperationInProgress ||
                     res.code === ErrorCodes.ChunkRangeCleanupPending ||
+                    res.code === ErrorCodes.LockTimeout ||
                     // The chunk migration has surely been aborted if the startCommit of the
                     // procedure was interrupted by a stepdown.
                     (runningWithStepdowns && res.code === ErrorCodes.CommandFailed &&

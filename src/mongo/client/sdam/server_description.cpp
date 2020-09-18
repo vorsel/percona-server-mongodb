@@ -98,6 +98,11 @@ ServerDescription::ServerDescription(ClockSource* clockSource,
     }
 }
 
+ServerDescription::ServerDescription(const ServerDescriptionPtr& source, ServerType serverType)
+    : ServerDescription(*source) {
+    _type = serverType;
+}
+
 void ServerDescription::storeHostListIfPresent(const std::string key,
                                                const BSONObj response,
                                                std::set<HostAndPort>& destination) {
@@ -171,8 +176,10 @@ void ServerDescription::calculateRtt(const boost::optional<IsMasterRTT> currentR
         _rtt = currentRtt;
     } else {
         // new_rtt = alpha * x + (1 - alpha) * old_rtt
-        _rtt = IsMasterRTT(static_cast<IsMasterRTT::rep>(kRttAlpha * currentRtt.get().count() +
-                                                         (1 - kRttAlpha) * lastRtt.get().count()));
+        auto currentMicros = durationCount<Microseconds>(*currentRtt);
+        auto lastMicros = durationCount<Microseconds>(*lastRtt);
+        _rtt = Microseconds(static_cast<Microseconds::rep>(kRttAlpha * currentMicros +
+                                                           (1 - kRttAlpha) * lastMicros));
     }
 }
 

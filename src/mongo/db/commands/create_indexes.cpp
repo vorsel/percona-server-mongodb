@@ -57,6 +57,7 @@
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_metadata.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/server_options.h"
@@ -375,10 +376,32 @@ bool indexesAlreadyExist(OperationContext* opCtx,
 /**
  * Checks database sharding state. Throws exception on error.
  */
-void checkDatabaseShardingState(OperationContext* opCtx, StringData dbName) {
-    auto dss = DatabaseShardingState::get(opCtx, dbName);
+void checkDatabaseShardingState(OperationContext* opCtx, const NamespaceString& ns) {
+    auto dss = DatabaseShardingState::get(opCtx, ns.db());
     auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
     dss->checkDbVersion(opCtx, dssLock);
+
+    Lock::CollectionLock collLock(opCtx, ns, MODE_IS);
+    try {
+        const auto collDesc = CollectionShardingState::get(opCtx, ns)->getCollectionDescription();
+        if (!collDesc.isSharded()) {
+            auto mpsm = dss->getMovePrimarySourceManager(dssLock);
+
+            if (mpsm) {
+                LOGV2(
+                    4909200, "assertMovePrimaryInProgress", "movePrimaryNss"_attr = ns.toString());
+
+                uasserted(ErrorCodes::MovePrimaryInProgress,
+                          "movePrimary is in progress for namespace " + ns.toString());
+            }
+        }
+    } catch (const DBException& ex) {
+        if (ex.toStatus() != ErrorCodes::MovePrimaryInProgress) {
+            LOGV2(4909201, "Error when getting colleciton description", "what"_attr = ex.what());
+            return;
+        }
+        throw;
+    }
 }
 
 /**
@@ -519,7 +542,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
     OptionalCollectionUUID collectionUUID;
     {
         Lock::DBLock dbLock(opCtx, ns.db(), MODE_IX);
-        checkDatabaseShardingState(opCtx, ns.db());
+        checkDatabaseShardingState(opCtx, ns);
         if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
             uasserted(ErrorCodes::NotMaster,
                       str::stream() << "Not primary while creating indexes in " << ns.ns());
@@ -591,6 +614,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
           "firstIndex"_attr = specs[0][IndexDescriptor::kIndexNameFieldName]);
     hangCreateIndexesBeforeStartingIndexBuild.pauseWhileSet(opCtx);
 
+    bool shouldContinueInBackground = false;
     try {
         auto buildIndexFuture = uassertStatusOK(indexBuildsCoord->startIndexBuild(
             opCtx, dbname, *collectionUUID, specs, buildUUID, protocol, indexBuildOptions));
@@ -617,9 +641,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
                 // background and will complete when this node receives a commitIndexBuild oplog
                 // entry from the new primary.
                 if (ErrorCodes::InterruptedDueToReplStateChange == interruptionEx.code()) {
-                    LOGV2(20442,
-                          "Index build: ignoring interrupt and continuing in background",
-                          "buildUUID"_attr = buildUUID);
+                    shouldContinueInBackground = true;
                     throw;
                 }
             }
@@ -655,9 +677,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             // background and will complete when this node receives a commitIndexBuild oplog
             // entry from the new primary.
             if (IndexBuildProtocol::kTwoPhase == protocol) {
-                LOGV2(20445,
-                      "Index build: ignoring interrupt and continuing in background",
-                      "buildUUID"_attr = buildUUID);
+                shouldContinueInBackground = true;
                 throw;
             }
 
@@ -686,8 +706,15 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
             return true;
         }
 
+        if (shouldContinueInBackground) {
+            LOGV2(4760400,
+                  "Index build: ignoring interrupt and continuing in background",
+                  "buildUUID"_attr = buildUUID);
+        } else {
+            LOGV2(20449, "Index build: failed", "buildUUID"_attr = buildUUID, "error"_attr = ex);
+        }
+
         // All other errors should be forwarded to the caller with index build information included.
-        LOGV2(20449, "Index build: failed", "buildUUID"_attr = buildUUID, "error"_attr = ex);
         ex.addContext(str::stream() << "Index build failed: " << buildUUID << ": Collection " << ns
                                     << " ( " << *collectionUUID << " )");
 

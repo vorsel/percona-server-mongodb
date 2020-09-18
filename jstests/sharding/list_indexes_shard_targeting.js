@@ -13,10 +13,20 @@ load("jstests/libs/fail_point_util.js");
 // This test makes shards have inconsistent indexes.
 TestData.skipCheckingIndexesConsistentAcrossCluster = true;
 
+// Disable checking for index consistency to ensure that the config server doesn't trigger a
+// StaleShardVersion exception on shards and cause them to refresh their sharding metadata.
+const configOpts = {
+    setParameter: {enableShardedIndexConsistencyCheck: false}
+};
+
 const st = new ShardingTest({
     shards: 3,
-    other: {mongosOptions: {setParameter: {enableFinerGrainedCatalogCacheRefresh: true}}}
+    other: {
+        mongosOptions: {setParameter: {enableFinerGrainedCatalogCacheRefresh: true}},
+        configOptions: configOpts
+    }
 });
+
 const dbName = "test";
 const collName = "user";
 const ns = dbName + "." + collName;

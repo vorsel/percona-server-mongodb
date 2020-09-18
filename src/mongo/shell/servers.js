@@ -1116,6 +1116,13 @@ function appendSetParameterArgs(argArray) {
         if (jsTest.options().enableTestCommands) {
             argArray.push(...['--setParameter', "enableTestCommands=1"]);
         }
+
+        if (!programMajorMinorVersion || programMajorMinorVersion >= 404) {
+            if (jsTest.options().testingDiagnosticsEnabled) {
+                argArray.push(...['--setParameter', "testingDiagnosticsEnabled=1"]);
+            }
+        }
+
         if (jsTest.options().authMechanism && jsTest.options().authMechanism != "SCRAM-SHA-1") {
             if (!argArrayContainsSetParameterValue('authenticationMechanisms=')) {
                 argArray.push(...['--setParameter',

@@ -69,6 +69,8 @@ ThreadPool::Options makeDefaultThreadPoolOptions() {
     // Ensure all threads have a client
     options.onCreateThread = [](const std::string& threadName) {
         Client::initThread(threadName.c_str());
+        stdx::lock_guard<Client> lk(cc());
+        cc().setSystemOperationKillable(lk);
     };
     return options;
 }
@@ -303,7 +305,17 @@ void ChunkSplitter::_runAutosplit(std::shared_ptr<ChunkSplitStateDriver> chunkSp
                 "Could not split chunk. Collection is no longer sharded",
                 cm);
 
+        // Best effort checks that the chunk we're splitting hasn't changed bounds or moved shards
+        // since the auto split task was scheduled. Best effort because the chunk metadata may
+        // change after this point.
         const auto chunk = cm->findIntersectingChunkWithSimpleCollation(min);
+        uassert(4860100,
+                "Chunk to be auto split has different boundaries than when the split was initiated",
+                chunk.getRange() == ChunkRange(min, max));
+        uassert(4860101,
+                "Chunk to be auto split isn't owned by this shard",
+                ShardingState::get(opCtx.get())->shardId() == chunk.getShardId());
+
         const auto& shardKeyPattern = cm->getShardKeyPattern();
 
         const auto balancerConfig = Grid::get(opCtx.get())->getBalancerConfiguration();
@@ -384,7 +396,7 @@ void ChunkSplitter::_runAutosplit(std::shared_ptr<ChunkSplitStateDriver> chunkSp
                                                    nss,
                                                    shardKeyPattern,
                                                    cm->getVersion(),
-                                                   ChunkRange(min, max),
+                                                   chunk.getRange(),
                                                    splitPoints));
         chunkSplitStateDriver->commitSplit();
 

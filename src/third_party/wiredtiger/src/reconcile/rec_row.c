@@ -590,6 +590,17 @@ __rec_row_leaf_insert(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_INSERT *ins)
             continue;
         }
 
+        /*
+         * If we've selected an update, it should be flagged as being destined for the data store.
+         *
+         * If not, it's either because we're not doing a history store reconciliation or because the
+         * update is globally visible (in which case, subsequent updates become irrelevant for
+         * reconciliation).
+         */
+        WT_ASSERT(session,
+          F_ISSET(upd, WT_UPDATE_DS) || !F_ISSET(r, WT_REC_HS) ||
+            __wt_txn_tw_start_visible_all(session, &upd_select.tw));
+
         WT_TIME_WINDOW_COPY(&tw, &upd_select.tw);
 
         switch (upd->type) {
@@ -709,7 +720,7 @@ __wt_rec_row_leaf(
     WT_UPDATE *upd;
     WT_UPDATE_SELECT upd_select;
     uint64_t slvg_skip;
-    uint32_t i;
+    uint32_t i, session_flags;
     bool dictionary, key_onpage_ovfl, ovfl_key;
     void *copy;
 
@@ -839,6 +850,18 @@ __wt_rec_row_leaf(
                     r->ovfl_items = true;
             }
         } else {
+            /*
+             * If we've selected an update, it should be flagged as being destined for the data
+             * store.
+             *
+             * If not, it's either because we're not doing a history store reconciliation or because
+             * the update is globally visible (in which case, subsequent updates become irrelevant
+             * for reconciliation).
+             */
+            WT_ASSERT(session,
+              F_ISSET(upd, WT_UPDATE_DS) || !F_ISSET(r, WT_REC_HS) ||
+                __wt_txn_tw_start_visible_all(session, &upd_select.tw));
+
             /* The first time we find an overflow record, discard the underlying blocks. */
             if (F_ISSET(vpack, WT_CELL_UNPACK_OVERFLOW) && vpack->raw != WT_CELL_VALUE_OVFL_RM)
                 WT_ERR(__wt_ovfl_remove(session, page, vpack));
@@ -887,9 +910,19 @@ __wt_rec_row_leaf(
                 if (tw.durable_stop_ts == WT_TS_NONE && F_ISSET(S2C(session), WT_CONN_HS_OPEN) &&
                   !WT_IS_HS(btree)) {
                     WT_ERR(__wt_row_leaf_key(session, page, rip, tmpkey, true));
-                    /* Start from WT_TS_NONE to delete all the history store content of the key. */
-                    WT_ERR(__wt_hs_delete_key_from_ts(session, btree->id, tmpkey, WT_TS_NONE));
-                    WT_STAT_CONN_INCR(session, cache_hs_key_truncate_onpage_removal);
+                    /*
+                     * Start from WT_TS_NONE to delete all the history store content of the key.
+                     *
+                     * Some code paths, such as schema removal, involve deleting keys in metadata
+                     * and assert that they shouldn't open new dhandles. In those cases we won't
+                     * ever need to blow away history store content, so we can skip this.
+                     */
+                    if (!F_ISSET(session, WT_SESSION_NO_DATA_HANDLES)) {
+                        WT_ERR(__wt_hs_cursor_open(session, &session_flags));
+                        WT_ERR(__wt_hs_delete_key_from_ts(session, btree->id, tmpkey, WT_TS_NONE));
+                        WT_ERR(__wt_hs_cursor_close(session, session_flags));
+                        WT_STAT_CONN_INCR(session, cache_hs_key_truncate_onpage_removal);
+                    }
                 }
 
                 /*

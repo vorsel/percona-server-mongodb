@@ -366,6 +366,8 @@ error_codes:
 
     - {code: 313,name: ResumableRangeDeleterDisabled}
 
+    - {code: 319,name: MovePrimaryInProgress}
+
     # Error codes 4000-8999 are reserved.
 
     # Non-sequential error codes for compatibility only)

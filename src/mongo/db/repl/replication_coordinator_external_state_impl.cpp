@@ -60,6 +60,7 @@
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/op_observer.h"
+#include "mongo/db/repl/always_allow_non_local_writes.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/isself.h"
@@ -436,8 +437,9 @@ Status ReplicationCoordinatorExternalStateImpl::initializeReplSetStorage(Operati
                            "initiate oplog entry",
                            NamespaceString::kRsOplogNamespace.toString(),
                            [this, &opCtx, &config] {
+                               // Permit writing to the oplog before we step up to primary.
+                               AllowNonLocalWritesBlock allowNonLocalWrites(opCtx);
                                Lock::GlobalWrite globalWrite(opCtx);
-
                                WriteUnitOfWork wuow(opCtx);
                                Helpers::putSingleton(opCtx, configCollectionName, config);
                                const auto msgObj = BSON("msg" << kInitiatingSetMsg);
@@ -654,12 +656,14 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
     invariant(!opCtx->shouldParticipateInFlowControl());
 
     try {
+        // If we are casting a vote in a new election immediately after stepping down, we
+        // don't want to have this process interrupted due to us stepping down, since we
+        // want to be able to cast our vote for a new primary right away. Both the write's lock
+        // acquisition and the "waitUntilDurable" lock acquisition must be uninterruptible.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
         Status status =
             writeConflictRetry(opCtx, "save replica set lastVote", lastVoteCollectionName, [&] {
-                // If we are casting a vote in a new election immediately after stepping down, we
-                // don't want to have this process interrupted due to us stepping down, since we
-                // want to be able to cast our vote for a new primary right away.
-                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
                 AutoGetCollection coll(opCtx, NamespaceString(lastVoteCollectionName), MODE_IX);
                 WriteUnitOfWork wunit(opCtx);
 

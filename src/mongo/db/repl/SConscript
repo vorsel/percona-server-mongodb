@@ -136,7 +136,6 @@ env.Library(
     LIBDEPS_PRIVATE=[
         'repl_server_parameters',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
-        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
     ],
 )
 
@@ -737,6 +736,7 @@ env.Library(
 env.Library(
     target='repl_coordinator_interface',
     source=[
+        'always_allow_non_local_writes.cpp',
         'repl_client_info.cpp',
         'replication_coordinator.cpp',
         'replication_coordinator_noop.cpp',
@@ -1185,7 +1185,6 @@ env.Library(
     LIBDEPS_PRIVATE=[
         'local_oplog_info',
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
-        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         'repl_server_parameters',
     ],

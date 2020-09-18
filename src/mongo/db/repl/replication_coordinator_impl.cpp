@@ -53,7 +53,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/curop_failpoint_helpers.h"
@@ -67,6 +66,7 @@
 #include "mongo/db/mongod_options_storage_gen.h"
 #include "mongo/db/operation_context_noop.h"
 #include "mongo/db/prepare_conflict_tracker.h"
+#include "mongo/db/repl/always_allow_non_local_writes.h"
 #include "mongo/db/repl/check_quorum_for_config_change.h"
 #include "mongo/db/repl/data_replicator_external_state_initial_sync.h"
 #include "mongo/db/repl/is_master_response.h"
@@ -90,6 +90,7 @@
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
@@ -104,6 +105,7 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/stacktrace.h"
+#include "mongo/util/testing_proctor.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
@@ -158,34 +160,6 @@ using NextAction = Fetcher::NextAction;
 namespace {
 
 const char kLocalDB[] = "local";
-// Overrides _canAcceptLocalWrites for the decorated OperationContext.
-const OperationContext::Decoration<bool> alwaysAllowNonLocalWrites =
-    OperationContext::declareDecoration<bool>();
-
-/**
- * Allows non-local writes despite _canAcceptNonLocalWrites being false on a single OperationContext
- * while in scope.
- *
- * Resets to original value when leaving scope so it is safe to nest.
- */
-class AllowNonLocalWritesBlock {
-    AllowNonLocalWritesBlock(const AllowNonLocalWritesBlock&) = delete;
-    AllowNonLocalWritesBlock& operator=(const AllowNonLocalWritesBlock&) = delete;
-
-public:
-    AllowNonLocalWritesBlock(OperationContext* opCtx)
-        : _opCtx(opCtx), _initialState(alwaysAllowNonLocalWrites(_opCtx)) {
-        alwaysAllowNonLocalWrites(_opCtx) = true;
-    }
-
-    ~AllowNonLocalWritesBlock() {
-        alwaysAllowNonLocalWrites(_opCtx) = _initialState;
-    }
-
-private:
-    OperationContext* const _opCtx;
-    const bool _initialState;
-};
 
 void lockAndCall(stdx::unique_lock<Latch>* lk, const std::function<void()>& fn) {
     if (!lk->owns_lock()) {
@@ -432,7 +406,8 @@ void ReplicationCoordinatorImpl::appendConnectionStats(executor::ConnectionPoolS
     _replExecutor->appendConnectionStats(stats);
 }
 
-bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) {
+bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
+    OperationContext* opCtx, LastStorageEngineShutdownState lastStorageEngineShutdownState) {
     // Create necessary replication collections to guarantee that if a checkpoint sees data after
     // initial sync has completed, it also sees these collections.
     fassert(50708, _replicationProcess->getConsistencyMarkers()->createInternalCollections(opCtx));
@@ -474,6 +449,9 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) 
                                 "Error loading local Rollback ID document at startup",
                                 "error"_attr = status);
         }
+    } else if (lastStorageEngineShutdownState == LastStorageEngineShutdownState::kUnclean) {
+        LOGV2(501401, "Incrementing the rollback ID after unclean shutdown");
+        fassert(501402, _replicationProcess->incrementRollbackID(opCtx));
     }
 
     StatusWith<BSONObj> cfg = _externalState->loadLocalConfigDocument(opCtx);
@@ -833,7 +811,8 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
     }
 }
 
-void ReplicationCoordinatorImpl::startup(OperationContext* opCtx) {
+void ReplicationCoordinatorImpl::startup(
+    OperationContext* opCtx, LastStorageEngineShutdownState lastStorageEngineShutdownState) {
     if (!isReplEnabled()) {
         if (ReplSettings::shouldRecoverFromOplogAsStandalone()) {
             uassert(ErrorCodes::InvalidOptions,
@@ -892,7 +871,7 @@ void ReplicationCoordinatorImpl::startup(OperationContext* opCtx) {
 
     _replExecutor->startup();
 
-    bool doneLoadingConfig = _startLoadLocalConfig(opCtx);
+    bool doneLoadingConfig = _startLoadLocalConfig(opCtx, lastStorageEngineShutdownState);
     if (doneLoadingConfig) {
         // If we're not done loading the config, then the config state will be set by
         // _finishLoadLocalConfig.
@@ -1900,6 +1879,10 @@ bool ReplicationCoordinatorImpl::_doneWaitingForReplication_inlock(
 
 ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorImpl::awaitReplication(
     OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern) {
+    // It is illegal to wait for replication with a session checked out because it can lead to
+    // deadlocks.
+    invariant(OperationContextSession::get(opCtx) == nullptr);
+
     Timer timer;
     WriteConcernOptions fixedWriteConcern = populateUnsetWriteConcernOptionsSyncMode(writeConcern);
 
@@ -1940,7 +1923,7 @@ ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorImpl::awaitRepli
         status = Status{ErrorCodes::WriteConcernFailed, "waiting for replication timed out"};
     }
 
-    if (getTestCommandsEnabled() && !status.isOK()) {
+    if (TestingProctor::instance().isEnabled() && !status.isOK()) {
         stdx::lock_guard lock(_mutex);
         LOGV2(21339,
               "Replication failed for write concern: {writeConcern}, waiting for optime: {opTime}, "
@@ -2649,6 +2632,7 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     lk.unlock();
 
     yieldLocksForPreparedTransactions(opCtx);
+    invalidateSessionsForStepdown(opCtx);
 
     lk.lock();
 
@@ -2754,7 +2738,7 @@ bool ReplicationCoordinatorImpl::canAcceptWritesForDatabase_UNSAFE(OperationCont
     //
     // Stand-alone nodes and drained replica set primaries can always accept writes.  Writes are
     // always permitted to the "local" database.
-    if (_readWriteAbility->canAcceptNonLocalWrites_UNSAFE() || alwaysAllowNonLocalWrites(*opCtx)) {
+    if (_readWriteAbility->canAcceptNonLocalWrites_UNSAFE() || alwaysAllowNonLocalWrites(opCtx)) {
         return true;
     }
     if (dbName == kLocalDB) {
@@ -2799,7 +2783,7 @@ bool ReplicationCoordinatorImpl::canAcceptWritesFor_UNSAFE(OperationContext* opC
     // If we can accept non local writes (ie we're PRIMARY) then we must not be in ROLLBACK.
     // This check is redundant of the check of _memberState below, but since this can be checked
     // without locking, we do it as an optimization.
-    if (_readWriteAbility->canAcceptNonLocalWrites_UNSAFE() || alwaysAllowNonLocalWrites(*opCtx)) {
+    if (_readWriteAbility->canAcceptNonLocalWrites_UNSAFE() || alwaysAllowNonLocalWrites(opCtx)) {
         return true;
     }
 
@@ -2883,6 +2867,9 @@ bool ReplicationCoordinatorImpl::isInPrimaryOrSecondaryState_UNSAFE() const {
 
 bool ReplicationCoordinatorImpl::shouldRelaxIndexConstraints(OperationContext* opCtx,
                                                              const NamespaceString& ns) {
+    if (ReplSettings::shouldRecoverFromOplogAsStandalone()) {
+        return true;
+    }
     return !canAcceptWritesFor(opCtx, ns);
 }
 
@@ -3429,6 +3416,7 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
             lk.unlock();
 
             yieldLocksForPreparedTransactions(opCtx);
+            invalidateSessionsForStepdown(opCtx);
 
             lk.lock();
 
@@ -4781,6 +4769,22 @@ void ReplicationCoordinatorImpl::finishRecoveryIfEligible(OperationContext* opCt
                     " is less than the 'minValid' optime",
                     "minValid"_attr = minValid,
                     "lastApplied"_attr = lastApplied);
+        return;
+    }
+
+    // Rolling back with eMRC false, we set initialDataTimestamp to max(local oplog top, source's
+    // oplog top), then rollback via refetch. Data is inconsistent until lastApplied >=
+    // initialDataTimestamp.
+    auto initialTs = opCtx->getServiceContext()->getStorageEngine()->getInitialDataTimestamp();
+    if (lastApplied.getTimestamp() < initialTs) {
+        invariant(!serverGlobalParams.enableMajorityReadConcern);
+        LOGV2_DEBUG(4851800,
+                    2,
+                    "We cannot transition to SECONDARY state because our 'lastApplied' optime is "
+                    "less than the initial data timestamp and enableMajorityReadConcern = false",
+                    "minValid"_attr = minValid,
+                    "lastApplied"_attr = lastApplied,
+                    "initialDataTimestamp"_attr = initialTs);
         return;
     }
 

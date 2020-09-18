@@ -110,6 +110,7 @@
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/testing_proctor.h"
 #include "mongo/util/time_support.h"
 
 #if !defined(__has_feature)
@@ -1142,7 +1143,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         }
     }
 
-    if (_ephemeral && !getTestCommandsEnabled()) {
+    if (_ephemeral && !TestingProctor::instance().isEnabled()) {
         // We do not maintain any snapshot history for the ephemeral storage engine in production
         // because replication and sharded transactions do not currently run on the inMemory engine.
         // It is live in testing, however.
@@ -2781,7 +2782,7 @@ Timestamp WiredTigerKVEngine::_calculateHistoryLagFromStableTimestamp(Timestamp 
     // The oldest_timestamp should lag behind the stable_timestamp by
     // 'targetSnapshotHistoryWindowInSeconds' seconds.
 
-    if (_ephemeral && !getTestCommandsEnabled()) {
+    if (_ephemeral && !TestingProctor::instance().isEnabled()) {
         // No history should be maintained for the inMemory engine because it is not used yet.
         invariant(snapshotWindowParams.targetSnapshotHistoryWindowInSeconds.load() == 0);
     }
@@ -2813,6 +2814,10 @@ void WiredTigerKVEngine::setInitialDataTimestamp(Timestamp initialDataTimestamp)
                 "Setting initial data timestamp. Value: {initialDataTimestamp}",
                 "initialDataTimestamp"_attr = initialDataTimestamp);
     _initialDataTimestamp.store(initialDataTimestamp.asULL());
+}
+
+Timestamp WiredTigerKVEngine::getInitialDataTimestamp() {
+    return Timestamp(_initialDataTimestamp.load());
 }
 
 bool WiredTigerKVEngine::supportsRecoverToStableTimestamp() const {
@@ -3122,10 +3127,6 @@ Timestamp WiredTigerKVEngine::getOldestTimestamp() const {
 
 Timestamp WiredTigerKVEngine::getCheckpointTimestamp() const {
     return Timestamp(_getCheckpointTimestamp());
-}
-
-Timestamp WiredTigerKVEngine::getInitialDataTimestamp() const {
-    return Timestamp(_initialDataTimestamp.load());
 }
 
 std::uint64_t WiredTigerKVEngine::_getCheckpointTimestamp() const {

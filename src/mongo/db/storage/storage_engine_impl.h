@@ -132,9 +132,13 @@ public:
 
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
+    virtual Timestamp getInitialDataTimestamp() override;
+
     virtual void setOldestTimestampFromStable() override;
 
     virtual void setOldestTimestamp(Timestamp newOldestTimestamp) override;
+
+    virtual Timestamp getOldestTimestamp() const override;
 
     virtual void setOldestActiveTransactionTimestampCallback(
         StorageEngine::OldestActiveTransactionTimestampCallback) override;
@@ -419,7 +423,6 @@ private:
     const bool _supportsDocLocking;
     const bool _supportsDBLocking;
     const bool _supportsCappedCollections;
-    Timestamp _initialDataTimestamp = Timestamp::kAllowUnstableCheckpointsSentinel;
 
     std::unique_ptr<RecordStore> _catalogRecordStore;
     std::unique_ptr<DurableCatalogImpl> _catalog;

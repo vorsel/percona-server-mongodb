@@ -43,7 +43,6 @@
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/global_settings.h"
@@ -69,6 +68,7 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
+#include "mongo/util/testing_proctor.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
@@ -457,13 +457,15 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesByScanning(OperationCon
         int64_t newCurrentBytes = _currentBytes.addAndFetch(record->data.size());
         if (newCurrentBytes >= _minBytesPerStone) {
             BSONObj obj = record->data.toBson();
-            Date_t wallTime = obj["wall"].Date();
+            auto wallTime = obj.hasField("wall") ? obj["wall"].Date() : obj["ts"].timestampTime();
 
-            LOGV2_DEBUG(
-                22385, 1, "Marking oplog entry as a potential future oplog truncation point.");
-            OplogStones::Stone stone(
+            LOGV2_DEBUG(22385,
+                        1,
+                        "Marking oplog entry as a potential future oplog truncation point",
+                        "wall"_attr = wallTime);
+
+            _stones.emplace_back(
                 _currentRecords.swap(0), _currentBytes.swap(0), record->id, wallTime);
-            _stones.push_back(stone);
         }
 
         numRecords++;
@@ -554,8 +556,8 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationCon
         }
 
         BSONObj obj = record->data.toBson();
-        Date_t wall = obj["wall"].Date();
-        oplogEstimates.push_back(RecordIdAndWall{record->id, wall});
+        oplogEstimates.emplace_back(
+            record->id, obj.hasField("wall") ? obj["wall"].Date() : obj["ts"].timestampTime());
 
         const auto now = Date_t::now();
         if (samplingLogIntervalSeconds > 0 &&
@@ -577,17 +579,17 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationCon
         // Use every (kRandomSamplesPerStone)th sample, starting with the
         // (kRandomSamplesPerStone - 1)th, as the last record for each stone.
         // If parsing "wall" fails, we crash to allow user to fix their oplog.
-        int sampleIndex = kRandomSamplesPerStone * i - 1;
-        RecordIdAndWall rIdAndWall = oplogEstimates[sampleIndex];
+        const auto& [id, wallTime] = oplogEstimates[kRandomSamplesPerStone * i - 1];
+
         LOGV2_DEBUG(22394,
                     1,
                     "Marking oplog entry as a potential future oplog truncation point. wall: "
                     "{wall}, ts: {ts}",
-                    "wall"_attr = rIdAndWall.wall,
-                    "ts"_attr = rIdAndWall.id);
-        OplogStones::Stone stone(
-            estRecordsPerStone, estBytesPerStone, rIdAndWall.id, rIdAndWall.wall);
-        _stones.push_back(stone);
+                    "Marking oplog entry as a potential future oplog truncation point",
+                    "wall"_attr = wallTime,
+                    "ts"_attr = id);
+
+        _stones.emplace_back(estRecordsPerStone, estBytesPerStone, id, wallTime);
     }
 
     // Account for the partially filled chunk.
@@ -2155,8 +2157,8 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
               "next"_attr = id,
               "last"_attr = _lastReturnedId);
 
-        // Crash when test commands are enabled.
-        invariant(!getTestCommandsEnabled());
+        // Crash when testing diagnostics are enabled.
+        invariant(!TestingProctor::instance().isEnabled());
 
         // Force a retry of the operation from our last known position by acting as-if
         // we received a WT_ROLLBACK error.
