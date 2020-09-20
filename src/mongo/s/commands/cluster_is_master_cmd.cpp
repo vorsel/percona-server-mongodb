@@ -37,6 +37,7 @@
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/repl/speculative_auth.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
@@ -44,7 +45,6 @@
 #include "mongo/rpc/topology_version_gen.h"
 #include "mongo/s/mongos_topology_coordinator.h"
 #include "mongo/transport/message_compressor_manager.h"
-#include "mongo/util/map_util.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/version.h"
 
@@ -123,7 +123,7 @@ public:
         auto topologyVersionElement = cmdObj["topologyVersion"];
         auto maxAwaitTimeMSField = cmdObj["maxAwaitTimeMS"];
         boost::optional<TopologyVersion> clientTopologyVersion;
-        boost::optional<long long> maxAwaitTimeMS;
+        boost::optional<Date_t> deadline;
         if (topologyVersionElement && maxAwaitTimeMSField) {
             clientTopologyVersion = TopologyVersion::parse(IDLParserErrorContext("TopologyVersion"),
                                                            topologyVersionElement.Obj());
@@ -131,14 +131,13 @@ public:
                     "topologyVersion must have a non-negative counter",
                     clientTopologyVersion->getCounter() >= 0);
 
-            long long parsedMaxAwaitTimeMS;
-            uassertStatusOK(
-                bsonExtractIntegerField(cmdObj, "maxAwaitTimeMS", &parsedMaxAwaitTimeMS));
+            long long maxAwaitTimeMS;
+            uassertStatusOK(bsonExtractIntegerField(cmdObj, "maxAwaitTimeMS", &maxAwaitTimeMS));
 
-            uassert(
-                51759, "maxAwaitTimeMS must be a non-negative integer", parsedMaxAwaitTimeMS >= 0);
+            uassert(51759, "maxAwaitTimeMS must be a non-negative integer", maxAwaitTimeMS >= 0);
 
-            maxAwaitTimeMS = parsedMaxAwaitTimeMS;
+            deadline = opCtx->getServiceContext()->getPreciseClockSource()->now() +
+                Milliseconds(maxAwaitTimeMS);
 
             LOGV2_DEBUG(23871, 3, "Using maxAwaitTimeMS for awaitable isMaster protocol.");
         } else {
@@ -153,7 +152,7 @@ public:
         const auto* mongosTopCoord = MongosTopologyCoordinator::get(opCtx);
 
         auto mongosIsMasterResponse =
-            mongosTopCoord->awaitIsMasterResponse(opCtx, clientTopologyVersion, maxAwaitTimeMS);
+            mongosTopCoord->awaitIsMasterResponse(opCtx, clientTopologyVersion, deadline);
 
         mongosIsMasterResponse->appendToBuilder(&result);
         // The isMaster response always includes a topologyVersion.
@@ -171,11 +170,12 @@ public:
         result.append("maxWireVersion", WireSpec::instance().incomingExternalClient.maxWireVersion);
         result.append("minWireVersion", WireSpec::instance().incomingExternalClient.minWireVersion);
 
-        const auto parameter = mapFindWithDefault(ServerParameterSet::getGlobal()->getMap(),
-                                                  "automationServiceDescriptor",
-                                                  static_cast<ServerParameter*>(nullptr));
-        if (parameter)
-            parameter->append(opCtx, result, "automationServiceDescriptor");
+        {
+            const auto& serverParams = ServerParameterSet::getGlobal()->getMap();
+            auto iter = serverParams.find("automationServiceDescriptor");
+            if (iter != serverParams.end() && iter->second)
+                iter->second->append(opCtx, result, "automationServiceDescriptor");
+        }
 
         MessageCompressorManager::forSession(opCtx->getClient()->session())
             .serverNegotiate(cmdObj, &result);
@@ -214,6 +214,8 @@ public:
                 replyBuilder->setNextInvocation(nextInvocationBuilder.obj());
             }
         }
+
+        handleIsMasterSpeculativeAuth(opCtx, cmdObj, &result);
 
         return true;
     }

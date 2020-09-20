@@ -128,7 +128,7 @@ const std::shared_ptr<TopologyDescription> TopologyManager::getTopologyDescripti
     return _topologyDescription;
 }
 
-void TopologyManager::onServerRTTUpdated(ServerAddress hostAndPort, IsMasterRTT rtt) {
+void TopologyManager::onServerRTTUpdated(HostAndPort hostAndPort, IsMasterRTT rtt) {
     {
         stdx::lock_guard<mongo::Mutex> lock(_mutex);
 
@@ -156,7 +156,7 @@ void TopologyManager::_publishTopologyDescriptionChanged(
     const TopologyDescriptionPtr& oldTopologyDescription,
     const TopologyDescriptionPtr& newTopologyDescription) const {
     if (_topologyEventsPublisher)
-        _topologyEventsPublisher->onTopologyDescriptionChangedEvent(
-            newTopologyDescription->getId(), oldTopologyDescription, newTopologyDescription);
+        _topologyEventsPublisher->onTopologyDescriptionChangedEvent(oldTopologyDescription,
+                                                                    newTopologyDescription);
 }
 };  // namespace mongo::sdam

@@ -77,35 +77,6 @@ public:
     using OldestActiveTransactionTimestampCallback =
         std::function<OldestActiveTransactionTimestampResult(Timestamp stableTimestamp)>;
 
-    struct BackupOptions {
-        bool disableIncrementalBackup = false;
-        bool incrementalBackup = false;
-        int blockSizeMB = 16;
-        boost::optional<std::string> thisBackupName;
-        boost::optional<std::string> srcBackupName;
-    };
-
-    struct BackupBlock {
-        std::uint64_t offset = 0;
-        std::uint64_t length = 0;
-    };
-
-    /**
-     * Contains the size of the file to be backed up. This allows the backup application to safely
-     * truncate the file for incremental backups. Files that have had changes since the last
-     * incremental backup will have their changed file blocks listed.
-     */
-    struct BackupFile {
-        BackupFile() = delete;
-        explicit BackupFile(std::uint64_t fileSize) : fileSize(fileSize){};
-
-        std::uint64_t fileSize;
-        std::vector<BackupBlock> blocksToCopy;
-    };
-
-    // Map of filenames to backup file information.
-    using BackupInformation = stdx::unordered_map<std::string, BackupFile>;
-
     /**
      * The interface for creating new instances of storage engines.
      *
@@ -186,36 +157,6 @@ public:
         virtual bool supportsReadOnly() const {
             return false;
         }
-    };
-
-    /**
-     * RAII-style class required for checkpoint activity. Instances should be obtained via
-     * getCheckpointLock() calls.
-     *
-     * Operations taking a checkpoint should create a CheckpointLock first. Also used when opening
-     * several checkpoint cursors to guarantee that all cursors are against the same checkpoint.
-     *
-     * This interface is placed in the StorageEngine in order to be accessible externally and
-     * internally to the storage layer. Each storage engine chooses how to implement it.
-     */
-    class CheckpointLock {
-        CheckpointLock(const CheckpointLock&) = delete;
-        CheckpointLock& operator=(const CheckpointLock&) = delete;
-
-        // We should never call the move constructor of the base class. We should not create base
-        // CheckpointLock instances, so any CheckpointLock type will actually be an instance of a
-        // derived class. At that point, moving the CheckpointLock type would call this constructor
-        // and skip the derived class' move constructor, likely leading to subtle bugs.
-        //
-        // Always using CheckpointLock pointer types will obviate needing a move constructor in
-        // either base or derived classes.
-        CheckpointLock(CheckpointLock&&) = delete;
-
-    public:
-        virtual ~CheckpointLock() = default;
-
-    protected:
-        CheckpointLock() = default;
     };
 
     /**
@@ -344,21 +285,67 @@ public:
     virtual Status disableIncrementalBackup(OperationContext* opCtx) = 0;
 
     /**
-     * When performing an incremental backup, we first need a basis for future incremental backups.
-     * The basis will be a full backup called 'thisBackupName'. For future incremental backups, the
-     * storage engine will take a backup called 'thisBackupName' which will contain the changes made
-     * to data files since the backup named 'srcBackupName'.
+     * Represents the options that the storage engine can use during full and incremental backups.
      *
-     * The storage engine must use an upper bound limit of 'blockSizeMB' when returning changed
-     * file blocks.
+     * When performing a full backup where incrementalBackup=false, the values of 'blockSizeMB',
+     * 'thisBackupName', and 'srcBackupName' should not be modified.
      *
-     * The first full backup meant for incremental and future incremental backups must pass
-     * 'incrementalBackup' as true.
-     * 'thisBackupName' must exist only if 'incrementalBackup' is true.
-     * 'srcBackupName' must not exist when 'incrementalBackup' is false but may or may not exist
-     * when 'incrementalBackup' is true.
+     * When performing an incremental backup where incrementalBackup=true, we first need a basis for
+     * future incremental backups. This first basis (named 'thisBackupName'), which is a full
+     * backup, must pass incrementalBackup=true and should not set 'srcBackupName'. An incremental
+     * backup will include changed blocks since 'srcBackupName' was taken. This backup (also named
+     * 'thisBackupName') will then become the basis for future incremental backups.
+     *
+     * Note that 'thisBackupName' must exist if and only if incrementalBackup=true while
+     * 'srcBackupName' must not exist if incrementalBackup=false but may or may not exist if
+     * incrementalBackup=true.
      */
-    virtual StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+    struct BackupOptions {
+        bool disableIncrementalBackup = false;
+        bool incrementalBackup = false;
+        int blockSizeMB = 16;
+        boost::optional<std::string> thisBackupName;
+        boost::optional<std::string> srcBackupName;
+    };
+
+    /**
+     * Represents the file blocks returned by the storage engine during both full and incremental
+     * backups. In the case of a full backup, each block is an entire file with offset=0 and
+     * length=fileSize. In the case of the first basis for future incremental backups, each block is
+     * an entire file with offset=0 and length=0. In the case of a subsequent incremental backup,
+     * each block reflects changes made to data files since the basis (named 'thisBackupName') and
+     * each block has a maximum size of 'blockSizeMB'.
+     *
+     * If a file is unchanged in a subsequent incremental backup, a single block is returned with
+     * offset=0 and length=0. This allows consumers of the backup API to safely truncate files that
+     * are not returned by the backup cursor.
+     */
+    struct BackupBlock {
+        std::string filename;
+        std::uint64_t offset = 0;
+        std::uint64_t length = 0;
+        std::uint64_t fileSize = 0;
+    };
+
+    /**
+     * Abstract class required for streaming both full and incremental backups. The function
+     * getNextBatch() returns a vector containing 'batchSize' or less BackupBlocks. The
+     * StreamingCursor has been exhausted if getNextBatch() returns an empty vector.
+     */
+    class StreamingCursor {
+    public:
+        StreamingCursor() = delete;
+        explicit StreamingCursor(BackupOptions options) : options(options){};
+
+        virtual ~StreamingCursor() = default;
+
+        virtual StatusWith<std::vector<BackupBlock>> getNextBatch(const std::size_t batchSize) = 0;
+
+    protected:
+        BackupOptions options;
+    };
+
+    virtual StatusWith<std::unique_ptr<StreamingCursor>> beginNonBlockingBackup(
         OperationContext* opCtx, const BackupOptions& options) = 0;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) = 0;
@@ -456,11 +443,6 @@ public:
     virtual void clearDropPendingState() = 0;
 
     /**
-     * Returns true if the storage engine supports two phase index builds.
-     */
-    virtual bool supportsTwoPhaseIndexBuild() const = 0;
-
-    /**
      * Recovers the storage engine state to the last stable timestamp. "Stable" in this case
      * refers to a timestamp that is guaranteed to never be rolled back. The stable timestamp
      * used should be one provided by StorageEngine::setStableTimestamp().
@@ -515,7 +497,7 @@ public:
      * must maintain snapshot history through.
      *
      * oldest_timestamp will be set to stable_timestamp adjusted by
-     * 'targetSnapshotHistoryWindowInSeconds' to create a window of available snapshots on the
+     * 'minSnapshotHistoryWindowInSeconds' to create a window of available snapshots on the
      * storage engine from oldest to stable. Furthermore, oldest_timestamp will never be set ahead
      * of the oplog read timestamp, ensuring the oplog reader's 'read_timestamp' can always be
      * serviced.
@@ -631,20 +613,6 @@ public:
     virtual const KVEngine* getEngine() const = 0;
     virtual DurableCatalog* getCatalog() = 0;
     virtual const DurableCatalog* getCatalog() const = 0;
-
-    /**
-     * Returns a CheckpointLock RAII instance that holds the checkpoint resource mutex.
-     *
-     * All operations taking a checkpoint should use this CheckpointLock. Also applicable for
-     * opening several checkpoint cursors to ensure the same checkpoint is targeted.
-     */
-    virtual std::unique_ptr<CheckpointLock> getCheckpointLock(OperationContext* opCtx) = 0;
-
-    virtual void addIndividuallyCheckpointedIndexToList(const std::string& ident) = 0;
-
-    virtual void clearIndividuallyCheckpointedIndexesList() = 0;
-
-    virtual bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const = 0;
 };
 
 }  // namespace mongo

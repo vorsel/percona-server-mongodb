@@ -108,9 +108,10 @@ const auto kAllowImplicitCollectionCreation = "allowImplicitCollectionCreation"_
  * Constructs a requests vector targeting each of the specified shard ids. Each request contains the
  * same cmdObj combined with the default sharding parameters.
  */
-std::vector<AsyncRequestsSender::Request> buildUnversionedRequestsForShards(
+std::vector<AsyncRequestsSender::Request> buildUnshardedRequestsForAllShards(
     OperationContext* opCtx, std::vector<ShardId> shardIds, const BSONObj& cmdObj) {
     auto cmdToSend = cmdObj;
+    appendShardVersion(cmdToSend, ChunkVersion::UNSHARDED());
 
     std::vector<AsyncRequestsSender::Request> requests;
     for (auto&& shardId : shardIds)
@@ -123,7 +124,7 @@ std::vector<AsyncRequestsSender::Request> buildUnversionedRequestsForAllShards(
     OperationContext* opCtx, const BSONObj& cmdObj) {
     std::vector<ShardId> shardIds;
     Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload(&shardIds);
-    return buildUnversionedRequestsForShards(opCtx, std::move(shardIds), cmdObj);
+    return buildUnshardedRequestsForAllShards(opCtx, std::move(shardIds), cmdObj);
 }
 
 std::vector<AsyncRequestsSender::Response> gatherResponsesImpl(
@@ -266,6 +267,7 @@ BSONObj applyReadWriteConcern(OperationContext* opCtx,
     BSONObjBuilder output;
     bool seenReadConcern = false;
     bool seenWriteConcern = false;
+    const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     for (const auto& elem : cmdObj) {
         const auto name = elem.fieldNameStringData();
         if (appendRC && name == repl::ReadConcernArgs::kReadConcernFieldName) {
@@ -275,13 +277,18 @@ BSONObj applyReadWriteConcern(OperationContext* opCtx,
             seenWriteConcern = true;
         }
         if (!output.hasField(name)) {
-            output.append(elem);
+            // If mongos selected atClusterTime, forward it to the shard.
+            if (name == repl::ReadConcernArgs::kReadConcernFieldName &&
+                readConcernArgs.wasAtClusterTimeSelected()) {
+                output.appendElements(readConcernArgs.toBSON());
+            } else {
+                output.append(elem);
+            }
         }
     }
 
     // Finally, add the new read/write concern.
     if (appendRC && !seenReadConcern) {
-        const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
         output.appendElements(readConcernArgs.toBSON());
     }
     if (appendWC && !seenWriteConcern) {
@@ -348,7 +355,7 @@ std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShard
             ? appendShardVersion(cmdToSend, ChunkVersion::UNSHARDED())
             : cmdToSend;
 
-        return buildUnversionedRequestsForShards(
+        return buildUnshardedRequestsForAllShards(
             opCtx,
             {primaryShardId},
             appendDbVersionIfPresent(cmdObjWithShardVersion, routingInfo.db()));
@@ -451,7 +458,7 @@ AsyncRequestsSender::Response executeCommandAgainstDatabasePrimary(
                         dbName,
                         readPref,
                         retryPolicy,
-                        buildUnversionedRequestsForShards(
+                        buildUnshardedRequestsForAllShards(
                             opCtx, {dbInfo.primaryId()}, appendDbVersionIfPresent(cmdObj, dbInfo)));
     return std::move(responses.front());
 }
@@ -719,6 +726,12 @@ StatusWith<CachedCollectionRoutingInfo> getCollectionRoutingInfoForTxnCmd(
     OperationContext* opCtx, const NamespaceString& nss) {
     auto catalogCache = Grid::get(opCtx)->catalogCache();
     invariant(catalogCache);
+
+    auto argsAtClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+    if (argsAtClusterTime) {
+        return catalogCache->getCollectionRoutingInfoAt(
+            opCtx, nss, argsAtClusterTime->asTimestamp());
+    }
 
     // Return the latest routing table if not running in a transaction with snapshot level read
     // concern.

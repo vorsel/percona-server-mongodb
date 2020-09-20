@@ -1,5 +1,5 @@
 test_kind: fsm_workload_test
-use_in_multiversion: concurrency_sharded_replication_multiversion
+# use_in_multiversion: concurrency_sharded_replication_multiversion
 
 selector:
   roots:
@@ -91,9 +91,6 @@ selector:
   # stagedebug can only be run against a standalone mongod
   - jstests/concurrency/fsm_workloads/yield_and_hashed.js
   - jstests/concurrency/fsm_workloads/yield_and_sorted.js
-
-  # TODO Unblacklist (SERVER-35538).
-  - jstests/concurrency/fsm_workloads/database_versioning.js
 
   # TODO Unblacklist (SERVER-38852).
   - jstests/concurrency/fsm_workloads/agg_out_interrupt_cleanup.js

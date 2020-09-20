@@ -117,7 +117,10 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
 
         for i in range(self.num_nodes):
             steady_state_constraint_param = "oplogApplicationEnforcesSteadyStateConstraints"
-            if steady_state_constraint_param not in self.nodes[i].mongod_options["set_parameters"]:
+            # TODO (SERVER-47813): Set steady state constraint parameters on last-stable nodes.
+            if (steady_state_constraint_param not in self.nodes[i].mongod_options["set_parameters"]
+                    and self.mixed_bin_versions is not None
+                    and self.mixed_bin_versions[i] == "new"):
                 self.nodes[i].mongod_options["set_parameters"][steady_state_constraint_param] = True
             if self.linear_chain and i > 0:
                 self.nodes[i].mongod_options["set_parameters"][
@@ -191,12 +194,10 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             replset_settings = self.replset_config_options["settings"]
             repl_config["settings"] = replset_settings
 
-        # If not all nodes are electable and no election timeout was specified, then we increase
-        # the election timeout to 24 hours to prevent spurious elections.
-        if not self.all_nodes_electable:
-            repl_config.setdefault("settings", {})
-            if "electionTimeoutMillis" not in repl_config["settings"]:
-                repl_config["settings"]["electionTimeoutMillis"] = 24 * 60 * 60 * 1000
+        # Increase the election timeout to 24 hours to prevent spurious elections.
+        repl_config.setdefault("settings", {})
+        if "electionTimeoutMillis" not in repl_config["settings"]:
+            repl_config["settings"]["electionTimeoutMillis"] = 24 * 60 * 60 * 1000
 
         # Start up a single node replica set then reconfigure to the correct size (if the config
         # contains more than 1 node), so the primary is elected more quickly.

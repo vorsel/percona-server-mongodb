@@ -152,14 +152,6 @@ public:
                                 const CollectionType& coll,
                                 bool expectUpsert = true);
 
-    /**
-     * Expects a setShardVersion command to be executed on the specified shard.
-     */
-    void expectSetShardVersion(const HostAndPort& expectedHost,
-                               const ShardType& expectedShard,
-                               const NamespaceString& expectedNs,
-                               const ChunkVersion& expectedChunkVersion);
-
     void shutdownExecutor();
 
     void setRemote(const HostAndPort& remote);
@@ -170,6 +162,17 @@ public:
     void checkReadConcern(const BSONObj& cmdObj,
                           const Timestamp& expectedTS,
                           long long expectedTerm) const;
+
+    /**
+     * Mocks an error cursor response from a remote with the given 'status'.
+     */
+    BSONObj createErrorCursorResponse(Status status) {
+        invariant(!status.isOK());
+        BSONObjBuilder result;
+        status.serializeErrorToBSON(&result);
+        result.appendBool("ok", false);
+        return result.obj();
+    }
 
 private:
     ServiceContext::UniqueClient _client;

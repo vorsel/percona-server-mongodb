@@ -76,7 +76,7 @@
 #include "mongo/db/s/transaction_coordinator_factory.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/db/session_catalog_mongod.h"
-#include "mongo/db/snapshot_window_util.h"
+#include "mongo/db/snapshot_window_options.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/stats/top.h"
@@ -498,20 +498,26 @@ void appendErrorLabelsAndTopologyVersion(OperationContext* opCtx,
         getErrorLabels(opCtx, sessionOptions, commandName, code, wcCode, isInternalClient);
     commandBodyFieldsBob->appendElements(errorLabels);
 
-    auto isNotMasterError = false;
-    if (code) {
-        isNotMasterError = ErrorCodes::isA<ErrorCategory::NotMasterError>(*code);
-    }
+    const auto isNotMasterError = (code && ErrorCodes::isA<ErrorCategory::NotMasterError>(*code)) ||
+        (wcCode && ErrorCodes::isA<ErrorCategory::NotMasterError>(*wcCode));
 
-    if (!isNotMasterError && wcCode) {
-        isNotMasterError = ErrorCodes::isA<ErrorCategory::NotMasterError>(*wcCode);
-    }
+    const auto isShutdownError = (code && ErrorCodes::isA<ErrorCategory::ShutdownError>(*code)) ||
+        (wcCode && ErrorCodes::isA<ErrorCategory::ShutdownError>(*wcCode));
 
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet ||
-        !isNotMasterError) {
+    // NotMaster errors always include a topologyVersion, since we increment topologyVersion on
+    // stepdown. ShutdownErrors only include a topologyVersion if the server is in quiesce mode,
+    // since we only increment the topologyVersion at shutdown and alert waiting isMaster commands
+    // if the server enters quiesce mode.
+    const auto shouldAppendTopologyVersion =
+        (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet &&
+         isNotMasterError) ||
+        (replCoord->inQuiesceMode() && isShutdownError);
+
+    if (!shouldAppendTopologyVersion) {
         return;
     }
+
     const auto topologyVersion = replCoord->getTopologyVersion();
     BSONObjBuilder topologyVersionBuilder(commandBodyFieldsBob->subobjStart("topologyVersion"));
     topologyVersion.serialize(&topologyVersionBuilder);
@@ -615,13 +621,21 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
     if (!opCtx->getClient()->isInDirectClient()) {
         const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
 
+        auto command = invocation->definition();
+        // Record readConcern usages for commands run inside transactions after unstashing the
+        // transaction resources.
+        if (command->shouldAffectReadConcernCounter() && opCtx->inMultiDocumentTransaction()) {
+            ServerReadConcernMetrics::get(opCtx)->recordReadConcern(readConcernArgs,
+                                                                    true /* isTransaction */);
+        }
+
         // For replica sets, we do not receive the readConcernArgs of our parent transaction
         // statements until we unstash the transaction resources. The below check is necessary to
         // ensure commands, including those occurring after the first statement in their respective
         // transactions, are checked for readConcern support. Presently, only `create` and
         // `createIndexes` do not support readConcern inside transactions.
         // TODO(SERVER-46971): Consider how to extend this check to other commands.
-        auto cmdName = invocation->definition()->getName();
+        auto cmdName = command->getName();
         auto readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel());
         if (readConcernArgs.hasLevel() &&
             (cmdName == "create"_sd || cmdName == "createIndexes"_sd)) {
@@ -713,6 +727,15 @@ bool runCommandImpl(OperationContext* opCtx,
     // only performed reads then we will not need to wait at all.
     const bool shouldWaitForWriteConcern =
         invocation->supportsWriteConcern() || command->getLogicalOp() == LogicalOp::opGetMore;
+
+    // Record readConcern usages for commands run outside of transactions, excluding DBDirectClient.
+    // For commands inside a transaction, they inherit the readConcern from the transaction. So we
+    // will record their readConcern usages after we have unstashed the transaction resources.
+    if (!opCtx->getClient()->isInDirectClient() && command->shouldAffectReadConcernCounter() &&
+        !opCtx->inMultiDocumentTransaction()) {
+        ServerReadConcernMetrics::get(opCtx)->recordReadConcern(repl::ReadConcernArgs::get(opCtx),
+                                                                false /* isTransaction */);
+    }
 
     if (shouldWaitForWriteConcern) {
         auto lastOpBeforeRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
@@ -1212,8 +1235,7 @@ void execCommandDatabase(OperationContext* opCtx,
             // snapshot at their specified atClusterTime. Therefore, we'll try to increase the
             // snapshot history window that the storage engine maintains in order to increase
             // the likelihood of successful future PIT atClusterTime requests.
-            SnapshotWindowUtil::incrementSnapshotTooOldErrorCount();
-            SnapshotWindowUtil::increaseTargetSnapshotWindowSize(opCtx);
+            snapshotWindowParams.snapshotTooOldErrorCount.addAndFetch(1);
         } else {
             behaviors.handleException(e, opCtx);
         }
@@ -1436,7 +1458,11 @@ DbResponse receivedQuery(OperationContext* opCtx,
                          const ServiceEntryPointCommon::Hooks& behaviors) {
     invariant(!nss.isCommand());
     globalOpCounters.gotQuery();
-    ServerReadConcernMetrics::get(opCtx)->recordReadConcern(repl::ReadConcernArgs::get(opCtx));
+
+    if (!opCtx->getClient()->isInDirectClient()) {
+        ServerReadConcernMetrics::get(opCtx)->recordReadConcern(repl::ReadConcernArgs::get(opCtx),
+                                                                false /* isTransaction */);
+    }
 
     DbMessage d(m);
     QueryMessage q(d);

@@ -4,10 +4,9 @@
  * initial sync (via heartbeats), it initiates a reconfig to remove the corresponding 'newlyAdded'
  * field.
  *
- * TODO(SERVER-46592): This test is multiversion-incompatible in 4.6.  If we use 'requires_fcv_46'
- *                     as the tag for that, removing 'requires_fcv_44' is sufficient.  Otherwise,
- *                     please set the appropriate tag when removing 'requires_fcv_44'
- * @tags: [requires_fcv_44, requires_fcv_46]
+ * @tags: [
+ *   requires_fcv_46,
+ * ]
  */
 
 (function() {
@@ -101,16 +100,13 @@ checkWriteConcernTimedOut(res);
 rst.nodes[2].disconnect(rst.nodes);
 assert.commandWorked(primaryColl.insert({a: 3}, {writeConcern: {w: "majority"}}));
 
-// TODO(SERVER-47612): Reinstate these elections in a more robust form.
-/**
- * // Only two nodes are needed for an election (0 and 1).
- * assert.commandWorked(rst.nodes[1].adminCommand({replSetStepUp: 1}));
- *
- * // Reset node 0 to be primary.
- * rst.awaitReplication(null, null, [rst.nodes[0], rst.nodes[1]]);
- * assert.commandWorked(rst.nodes[0].adminCommand({replSetStepUp: 1}));
- * assert.eq(rst.getPrimary(), rst.nodes[0]);
- */
+// Only two nodes are needed for an election (0 and 1).
+assert.commandWorked(rst.nodes[1].adminCommand({replSetStepUp: 1}));
+
+// Reset node 0 to be primary.
+rst.awaitReplication(null, null, [rst.nodes[0], rst.nodes[1]]);
+assert.commandWorked(rst.nodes[0].adminCommand({replSetStepUp: 1}));
+assert.eq(rst.getPrimary(), rst.nodes[0]);
 
 // Initial syncing nodes do not acknowledge replication.
 rst.nodes[1].disconnect(rst.nodes);
@@ -156,16 +152,13 @@ rst.nodes[2].disconnect(rst.nodes);
 rst.nodes[3].disconnect(rst.nodes);
 assert.commandWorked(primaryColl.insert({a: 6}, {writeConcern: {w: "majority"}}));
 
-// TODO(SERVER-47612): Reinstate these elections in a more robust form.
-/**
- * // Only two nodes are needed for an election (0 and 1).
- * assert.commandWorked(rst.nodes[1].adminCommand({replSetStepUp: 1}));
- *
- * // Reset node 0 to be primary.
- * rst.awaitReplication(null, null, [rst.nodes[0], rst.nodes[1]]);
- * assert.commandWorked(rst.nodes[0].adminCommand({replSetStepUp: 1}));
- * assert.eq(rst.getPrimary(), rst.nodes[0]);
- */
+// Only two nodes are needed for an election (0 and 1).
+assert.commandWorked(rst.nodes[1].adminCommand({replSetStepUp: 1}));
+
+// Reset node 0 to be primary.
+rst.awaitReplication(null, null, [rst.nodes[0], rst.nodes[1]]);
+assert.commandWorked(rst.nodes[0].adminCommand({replSetStepUp: 1}));
+assert.eq(rst.getPrimary(), rst.nodes[0]);
 
 // 'newlyAdded' nodes cannot be one of the two nodes to satisfy w:majority.
 rst.nodes[3].reconnect(rst.nodes);
@@ -220,16 +213,13 @@ rst.nodes[2].disconnect(rst.nodes);
 // TODO (SERVER-47499): Uncomment this line.
 // assert.commandWorked(primaryColl.insert({a: 8}, {writeConcern: {w: "majority"}}));
 
-// TODO(SERVER-47612): Reinstate these elections in a more robust form.
-/**
- * // Only three nodes are needed for an election (0, 1, and 3).
- * assert.commandWorked(rst.nodes[1].adminCommand({replSetStepUp: 1}));
- *
- * // Reset node 0 to be primary.
- * rst.awaitReplication(null, null, [rst.nodes[0], rst.nodes[1]]);
- * assert.commandWorked(rst.nodes[0].adminCommand({replSetStepUp: 1}));
- * assert.eq(rst.getPrimary(), rst.nodes[0]);
- */
+// Only three nodes are needed for an election (0, 1, and 3).
+assert.commandWorked(rst.nodes[1].adminCommand({replSetStepUp: 1}));
+
+// Reset node 0 to be primary.
+rst.awaitReplication(null, null, [rst.nodes[0], rst.nodes[1]]);
+assert.commandWorked(rst.nodes[0].adminCommand({replSetStepUp: 1}));
+assert.eq(rst.getPrimary(), rst.nodes[0]);
 
 // 3 nodes are needed for a w:majority write.
 rst.nodes[3].disconnect(rst.nodes);

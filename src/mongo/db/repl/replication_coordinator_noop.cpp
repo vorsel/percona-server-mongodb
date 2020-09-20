@@ -41,7 +41,13 @@ void ReplicationCoordinatorNoOp::startup(OperationContext* opCtx) {}
 
 void ReplicationCoordinatorNoOp::enterTerminalShutdown() {}
 
-void ReplicationCoordinatorNoOp::enterQuiesceMode() {}
+bool ReplicationCoordinatorNoOp::enterQuiesceModeIfSecondary() {
+    MONGO_UNREACHABLE;
+}
+
+bool ReplicationCoordinatorNoOp::inQuiesceMode() const {
+    MONGO_UNREACHABLE;
+}
 
 void ReplicationCoordinatorNoOp::shutdown(OperationContext* opCtx) {}
 
@@ -499,7 +505,8 @@ ReplicationCoordinatorNoOp::getIsMasterResponseFuture(
     MONGO_UNREACHABLE;
 }
 
-OpTime ReplicationCoordinatorNoOp::getLatestWriteOpTime(OperationContext* opCtx) const {
+StatusWith<OpTime> ReplicationCoordinatorNoOp::getLatestWriteOpTime(OperationContext* opCtx) const
+    noexcept {
     return getMyLastAppliedOpTime();
 }
 

@@ -108,10 +108,10 @@ function pathJoin(...parts) {
 let _hangAnalyzerEnabled = true;
 
 /**
- * Run `./buildscripts/hang_analyzer.py`.
+ * Run `./buildscripts/resmoke.py hang-analyzer`.
  *
  * @param {Number[]} pids
- *     optional pids of processes to pass to hang_analyzer.py.
+ *     optional pids of processes to pass to the hang analyzer.
  *     If not specified will use `TestData.peerPids` (pids of
  *     "fixture" processes started and passed in by resmoke)
  *     plus `MongoRunner.runningChildPids()` which includes all
@@ -148,9 +148,9 @@ function runHangAnalyzer(pids) {
     // Result of runningChildPids may be NumberLong(), so
     // add 0 to convert to Number.
     pids = pids.map(p => p + 0).join(',');
-    print(`Running hang_analyzer.py for pids [${pids}]`);
-    const scriptPath = pathJoin('.', 'buildscripts', 'hang_analyzer.py');
-    return runProgram('python', scriptPath, '-c', '-d', pids);
+    print(`Running hang analyzer for pids [${pids}]`);
+    const scriptPath = pathJoin('.', 'buildscripts', 'resmoke.py');
+    return runProgram('python', scriptPath, 'hang-analyzer', '-c', '-d', pids);
 }
 
 MongoRunner.runHangAnalyzer = runHangAnalyzer;
@@ -676,6 +676,7 @@ MongoRunner.mongodOptions = function(opts = {}) {
     _removeSetParameterIfBeforeVersion(opts, "numInitialSyncAttempts", "3.3.12");
     _removeSetParameterIfBeforeVersion(opts, "numInitialSyncConnectAttempts", "3.3.12");
     _removeSetParameterIfBeforeVersion(opts, "migrationLockAcquisitionMaxWaitMS", "4.1.7");
+    _removeSetParameterIfBeforeVersion(opts, "shutdownTimeoutMillisForSignaledShutdown", "4.5.0");
 
     if (!opts.logFile && opts.useLogFiles) {
         opts.logFile = opts.dbpath + "/mongod.log";
@@ -1166,6 +1167,22 @@ function appendSetParameterArgs(argArray) {
                 (!programVersion || programMajorMinorVersion >= 300)) {
                 if (!argArrayContains("--storageEngine")) {
                     argArray.push(...['--storageEngine', jsTest.options().storageEngine]);
+                }
+            }
+
+            // New mongod-specific option in 4.5.x.
+            if (!programMajorMinorVersion || programMajorMinorVersion >= 450) {
+                // Allow the parameter to be overridden if set explicitly via TestData.
+                const parameters = jsTest.options().setParameters;
+
+                if ((parameters === undefined ||
+                     parameters['coordinateCommitReturnImmediatelyAfterPersistingDecision'] ===
+                         undefined) &&
+                    !argArrayContainsSetParameterValue(
+                        'coordinateCommitReturnImmediatelyAfterPersistingDecision=')) {
+                    argArray.push(
+                        ...['--setParameter',
+                            "coordinateCommitReturnImmediatelyAfterPersistingDecision=false"]);
                 }
             }
 

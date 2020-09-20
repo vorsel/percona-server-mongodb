@@ -196,11 +196,11 @@ __wt_block_checkpoint_start(WT_SESSION_IMPL *session, WT_BLOCK *block)
     case WT_CKPT_INPROGRESS:
     case WT_CKPT_PANIC_ON_FAILURE:
     case WT_CKPT_SALVAGE:
-        __wt_err(session, EINVAL,
+        ret = __wt_panic(session, EINVAL,
           "%s: an unexpected checkpoint start: the checkpoint "
           "has already started or was configured for salvage",
           block->name);
-        ret = __wt_block_panic(session);
+        __wt_block_set_readonly(session);
         break;
     case WT_CKPT_NONE:
         block->ckpt_state = WT_CKPT_INPROGRESS;
@@ -389,11 +389,11 @@ __ckpt_process(WT_SESSION_IMPL *session, WT_BLOCK *block, WT_CKPT *ckptbase)
         break;
     case WT_CKPT_NONE:
     case WT_CKPT_PANIC_ON_FAILURE:
-        __wt_err(session, EINVAL,
+        ret = __wt_panic(session, EINVAL,
           "%s: an unexpected checkpoint attempt: the checkpoint "
           "was never started or has already completed",
           block->name);
-        ret = __wt_block_panic(session);
+        __wt_block_set_readonly(session);
         break;
     case WT_CKPT_SALVAGE:
         /* Salvage doesn't use the standard checkpoint APIs. */
@@ -638,8 +638,8 @@ live_update:
 
 err:
     if (ret != 0 && fatal) {
-        __wt_err(session, ret, "%s: fatal checkpoint failure", block->name);
-        ret = __wt_block_panic(session);
+        ret = __wt_panic(session, ret, "%s: fatal checkpoint failure", block->name);
+        __wt_block_set_readonly(session);
     }
 
     if (locked)
@@ -661,14 +661,20 @@ static int
 __ckpt_add_blkmod_entry(
   WT_SESSION_IMPL *session, WT_BLOCK_MODS *blk_mod, wt_off_t offset, wt_off_t len)
 {
-    uint64_t end, start;
-    uint32_t end_buf_bytes, end_rdup_bytes;
+    uint64_t end_bit, start_bit;
+    uint32_t end_buf_bytes, end_rdup_bits, end_rdup_bytes;
 
     WT_ASSERT(session, blk_mod->granularity != 0);
-    start = (uint64_t)offset / blk_mod->granularity;
-    end = (uint64_t)(offset + len) / blk_mod->granularity;
-    WT_ASSERT(session, end < UINT32_MAX);
-    end_rdup_bytes = WT_MAX(__wt_rduppo2((uint32_t)end, 8), WT_BLOCK_MODS_LIST_MIN);
+    /*
+     * Figure out how the starting and ending bits based on the granularity and our offset and
+     * length.
+     */
+    start_bit = (uint64_t)offset / blk_mod->granularity;
+    end_bit = (uint64_t)(offset + len - 1) / blk_mod->granularity;
+    WT_ASSERT(session, end_bit < UINT32_MAX);
+    /* We want to grow the bitmap by 64 bits, or 8 bytes at a time. */
+    end_rdup_bits = WT_MAX(__wt_rduppo2((uint32_t)end_bit, 64), WT_BLOCK_MODS_LIST_MIN);
+    end_rdup_bytes = end_rdup_bits >> 3;
     end_buf_bytes = (uint32_t)blk_mod->nbits >> 3;
     /*
      * We are doing a lot of shifting. Make sure that the number of bytes we end up with is a
@@ -687,11 +693,10 @@ __ckpt_add_blkmod_entry(
             memset(
               (uint8_t *)blk_mod->bitstring.mem + end_buf_bytes, 0, end_rdup_bytes - end_buf_bytes);
         }
-        blk_mod->nbits = end_rdup_bytes << 3;
+        blk_mod->nbits = end_rdup_bits;
     }
-
     /* Set all the bits needed to record this offset/length pair. */
-    __bit_nset(blk_mod->bitstring.mem, start, end);
+    __bit_nset(blk_mod->bitstring.mem, start_bit, end_bit);
     return (0);
 }
 
@@ -860,26 +865,26 @@ __wt_block_checkpoint_resolve(WT_SESSION_IMPL *session, WT_BLOCK *block, bool fa
         goto done;
     case WT_CKPT_NONE:
     case WT_CKPT_SALVAGE:
-        __wt_err(session, EINVAL,
+        ret = __wt_panic(session, EINVAL,
           "%s: an unexpected checkpoint resolution: the checkpoint "
           "was never started or completed, or configured for salvage",
           block->name);
-        ret = __wt_block_panic(session);
+        __wt_block_set_readonly(session);
         break;
     case WT_CKPT_PANIC_ON_FAILURE:
         if (!failed)
             break;
-        __wt_err(
+        ret = __wt_panic(
           session, EINVAL, "%s: the checkpoint failed, the system must restart", block->name);
-        ret = __wt_block_panic(session);
+        __wt_block_set_readonly(session);
         break;
     }
     WT_ERR(ret);
 
     if ((ret = __wt_block_extlist_merge(session, block, &ci->ckpt_avail, &ci->avail)) != 0) {
-        __wt_err(
+        ret = __wt_panic(
           session, ret, "%s: fatal checkpoint failure during extent list merge", block->name);
-        ret = __wt_block_panic(session);
+        __wt_block_set_readonly(session);
     }
     __wt_spin_unlock(session, &block->live_lock);
 

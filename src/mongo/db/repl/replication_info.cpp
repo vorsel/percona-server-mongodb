@@ -36,11 +36,8 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_connection.h"
-#include "mongo/db/auth/sasl_command_constants.h"
-#include "mongo/db/auth/sasl_commands.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/client.h"
-#include "mongo/db/commands/authentication_commands.h"
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
@@ -55,6 +52,7 @@
 #include "mongo/db/repl/replication_auth.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
+#include "mongo/db/repl/speculative_auth.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/wire_version.h"
@@ -65,7 +63,6 @@
 #include "mongo/transport/ismaster_metrics.h"
 #include "mongo/util/decimal_counter.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/map_util.h"
 
 namespace mongo {
 
@@ -501,11 +498,10 @@ public:
 
         result.append("readOnly", storageGlobalParams.readOnly);
 
-        const auto parameter = mapFindWithDefault(ServerParameterSet::getGlobal()->getMap(),
-                                                  "automationServiceDescriptor",
-                                                  static_cast<ServerParameter*>(nullptr));
-        if (parameter)
-            parameter->append(opCtx, result, "automationServiceDescriptor");
+        const auto& params = ServerParameterSet::getGlobal()->getMap();
+        if (auto iter = params.find("automationServiceDescriptor");
+            iter != params.end() && iter->second)
+            iter->second->append(opCtx, result, "automationServiceDescriptor");
 
         if (opCtx->getClient()->session()) {
             MessageCompressorManager::forSession(opCtx->getClient()->session())
@@ -546,29 +542,7 @@ public:
             }
         }
 
-        if (auto sae = cmdObj[auth::kSpeculativeAuthenticate]; !sae.eoo()) {
-            uassert(ErrorCodes::BadValue,
-                    str::stream() << "isMaster." << auth::kSpeculativeAuthenticate
-                                  << " must be an Object",
-                    sae.type() == Object);
-            auto specAuth = sae.Obj();
-
-            uassert(ErrorCodes::BadValue,
-                    str::stream() << "isMaster." << auth::kSpeculativeAuthenticate
-                                  << " must be a non-empty Object",
-                    !specAuth.isEmpty());
-            auto specCmd = specAuth.firstElementFieldNameStringData();
-
-            if (specCmd == saslStartCommandName) {
-                doSpeculativeSaslStart(opCtx, specAuth, &result);
-            } else if (specCmd == auth::kAuthenticateCommand) {
-                doSpeculativeAuthenticate(opCtx, specAuth, &result);
-            } else {
-                uasserted(51769,
-                          str::stream() << "isMaster." << auth::kSpeculativeAuthenticate
-                                        << " unknown command: " << specCmd);
-            }
-        }
+        handleIsMasterSpeculativeAuth(opCtx, cmdObj, &result);
 
         return true;
     }

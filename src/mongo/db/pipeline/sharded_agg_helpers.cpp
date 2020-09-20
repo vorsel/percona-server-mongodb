@@ -540,15 +540,20 @@ boost::optional<ShardedExchangePolicy> walkPipelineBackwardsTrackingShardKey(
     // We also compute consumer indices for every chunk. From the example above (3 chunks) we may
     // get the vector [0,1,2]; i.e. the first chunk goes to the consumer 0 and so on. Note that
     // the consumer id may be repeated if the consumer hosts more than 1 chunk.
-    boundaries.emplace_back(translateBoundary((*chunkManager.chunks().begin()).getMin()));
-    for (auto&& chunk : chunkManager.chunks()) {
+    chunkManager.forEachChunk([&](const auto& chunk) {
+        if (boundaries.empty())
+            boundaries.emplace_back(translateBoundary(chunk.getMin()));
+
         boundaries.emplace_back(translateBoundary(chunk.getMax()));
         if (shardToConsumer.find(chunk.getShardId()) == shardToConsumer.end()) {
             shardToConsumer.emplace(chunk.getShardId(), numConsumers++);
             consumerShards.emplace_back(chunk.getShardId());
         }
         consumerIds.emplace_back(shardToConsumer[chunk.getShardId()]);
-    }
+
+        return true;
+    });
+
     exchangeSpec.setPolicy(ExchangePolicyEnum::kKeyRange);
     exchangeSpec.setKey(newShardKey.toBSON());
     exchangeSpec.setBoundaries(std::move(boundaries));
@@ -1144,7 +1149,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> attachCursorToPipeline(Pipeline* owne
                 // If the db is local, this may be a change stream examining the oplog. We know the
                 // oplog (and any other local collections) will not be sharded.
                 return expCtx->mongoProcessInterface->attachCursorSourceToPipelineForLocalRead(
-                    pipeline.release());
+                    pipelineToTarget.release());
             }
             return targetShardsAndAddMergeCursors(expCtx, pipelineToTarget.release());
         });

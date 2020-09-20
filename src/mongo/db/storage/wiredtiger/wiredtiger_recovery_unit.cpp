@@ -433,13 +433,12 @@ Status WiredTigerRecoveryUnit::obtainMajorityCommittedSnapshot() {
 boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp() {
     // After a ReadSource has been set on this RecoveryUnit, callers expect that this method returns
     // the read timestamp that will be used for current or future transactions. Because callers use
-    // this timestamp to inform visiblity of operations, it is therefore necessary to open a
+    // this timestamp to inform visibility of operations, it is therefore necessary to open a
     // transaction to establish a read timestamp, but only for ReadSources that are expected to have
     // read timestamps.
     switch (_timestampReadSource) {
         case ReadSource::kUnset:
         case ReadSource::kNoTimestamp:
-        case ReadSource::kCheckpoint:
             return boost::none;
         case ReadSource::kMajorityCommitted:
             // This ReadSource depends on a previous call to obtainMajorityCommittedSnapshot() and
@@ -480,7 +479,6 @@ boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp()
         case ReadSource::kNoTimestamp:
         case ReadSource::kMajorityCommitted:
         case ReadSource::kProvided:
-        case ReadSource::kCheckpoint:
             MONGO_UNREACHABLE;
     }
     MONGO_UNREACHABLE;
@@ -505,11 +503,6 @@ void WiredTigerRecoveryUnit::_txnOpen() {
             if (_isOplogReader) {
                 _oplogVisibleTs = static_cast<std::int64_t>(_oplogManager->getOplogReadTimestamp());
             }
-            WiredTigerBeginTxnBlock(session, _prepareConflictBehavior, _roundUpPreparedTimestamps)
-                .done();
-            break;
-        }
-        case ReadSource::kCheckpoint: {
             WiredTigerBeginTxnBlock(session, _prepareConflictBehavior, _roundUpPreparedTimestamps)
                 .done();
             break;

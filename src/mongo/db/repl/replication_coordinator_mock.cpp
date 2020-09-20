@@ -81,8 +81,14 @@ void ReplicationCoordinatorMock::enterTerminalShutdown() {
     // TODO
 }
 
-void ReplicationCoordinatorMock::enterQuiesceMode() {
+bool ReplicationCoordinatorMock::enterQuiesceModeIfSecondary() {
     // TODO
+    return true;
+}
+
+bool ReplicationCoordinatorMock::inQuiesceMode() const {
+    // TODO
+    return false;
 }
 
 void ReplicationCoordinatorMock::shutdown(OperationContext*) {
@@ -600,7 +606,8 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorMock::awaitIsMaste
     return response;
 }
 
-OpTime ReplicationCoordinatorMock::getLatestWriteOpTime(OperationContext* opCtx) const {
+StatusWith<OpTime> ReplicationCoordinatorMock::getLatestWriteOpTime(OperationContext* opCtx) const
+    noexcept {
     return getMyLastAppliedOpTime();
 }
 

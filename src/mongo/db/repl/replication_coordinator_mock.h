@@ -70,7 +70,9 @@ public:
 
     virtual void enterTerminalShutdown();
 
-    virtual void enterQuiesceMode();
+    virtual bool enterQuiesceModeIfSecondary();
+
+    virtual bool inQuiesceMode() const;
 
     virtual void shutdown(OperationContext* opCtx);
 
@@ -343,7 +345,8 @@ public:
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion) override;
 
-    virtual OpTime getLatestWriteOpTime(OperationContext* opCtx) const override;
+    virtual StatusWith<OpTime> getLatestWriteOpTime(OperationContext* opCtx) const
+        noexcept override;
 
     virtual HostAndPort getCurrentPrimaryHostAndPort() const override;
 

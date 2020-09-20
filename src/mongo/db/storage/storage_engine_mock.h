@@ -81,7 +81,7 @@ public:
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
     }
-    StatusWith<StorageEngine::BackupInformation> beginNonBlockingBackup(
+    StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> beginNonBlockingBackup(
         OperationContext* opCtx, const StorageEngine::BackupOptions& options) final {
         return Status(ErrorCodes::CommandNotSupported,
                       "The current storage engine doesn't support backup mode");
@@ -123,9 +123,6 @@ public:
         return false;
     }
     void clearDropPendingState() final {}
-    bool supportsTwoPhaseIndexBuild() const final {
-        return false;
-    }
     StatusWith<Timestamp> recoverToStableTimestamp(OperationContext* opCtx) final {
         fassertFailed(40547);
     }
@@ -181,14 +178,6 @@ public:
     }
     const DurableCatalog* getCatalog() const final {
         return nullptr;
-    }
-    std::unique_ptr<CheckpointLock> getCheckpointLock(OperationContext* opCtx) final {
-        return nullptr;
-    }
-    void addIndividuallyCheckpointedIndexToList(const std::string& ident) final {}
-    void clearIndividuallyCheckpointedIndexesList() final {}
-    bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const final {
-        return false;
     }
 };
 

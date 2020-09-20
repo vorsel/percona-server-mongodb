@@ -33,7 +33,6 @@
 
 #include "mongo/client/sdam/sdam_datatypes.h"
 #include "mongo/executor/task_executor.h"
-#include "mongo/util/uuid.h"
 
 namespace mongo::sdam {
 
@@ -48,22 +47,21 @@ public:
      * Called when a TopologyDescriptionChangedEvent is published - The TopologyDescription changed
      * and the new TopologyDescription does not match the old.
      */
-    virtual void onTopologyDescriptionChangedEvent(UUID topologyId,
-                                                   TopologyDescriptionPtr previousDescription,
+    virtual void onTopologyDescriptionChangedEvent(TopologyDescriptionPtr previousDescription,
                                                    TopologyDescriptionPtr newDescription){};
 
     virtual void onServerHeartbeatFailureEvent(Status errorStatus,
-                                               const ServerAddress& hostAndPort,
+                                               const HostAndPort& hostAndPort,
                                                const BSONObj reply){};
     /**
      * Called when a ServerHandshakeCompleteEvent is published - The initial handshake to the server
      * at hostAndPort was successful. durationMS is the measured RTT (Round Trip Time).
      */
     virtual void onServerHandshakeCompleteEvent(IsMasterRTT durationMs,
-                                                const sdam::ServerAddress& address,
+                                                const HostAndPort& address,
                                                 const BSONObj reply = BSONObj()){};
 
-    virtual void onServerHandshakeFailedEvent(const sdam::ServerAddress& address,
+    virtual void onServerHandshakeFailedEvent(const HostAndPort& address,
                                               const Status& status,
                                               const BSONObj reply){};
 
@@ -72,21 +70,21 @@ public:
      * hostAndPort succeeded. durationMS is the execution time of the event, including the time it
      * took to send the message and recieve the reply from the server.
      */
-    virtual void onServerHeartbeatSucceededEvent(const ServerAddress& hostAndPort,
+    virtual void onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort,
                                                  const BSONObj reply){};
 
     /*
      * Called when a ServerPingFailedEvent is published - A monitoring ping to the server at
      * hostAndPort was not successful.
      */
-    virtual void onServerPingFailedEvent(const ServerAddress& hostAndPort, const Status& status){};
+    virtual void onServerPingFailedEvent(const HostAndPort& hostAndPort, const Status& status){};
 
     /**
      * Called when a ServerPingSucceededEvent is published - A monitoring ping to the server at
      * hostAndPort was successful. durationMS is the measured RTT (Round Trip Time).
      */
     virtual void onServerPingSucceededEvent(IsMasterRTT durationMS,
-                                            const ServerAddress& hostAndPort){};
+                                            const HostAndPort& hostAndPort){};
 };
 
 /**
@@ -104,25 +102,24 @@ public:
     void removeListener(TopologyListenerPtr listener);
     void close();
 
-    void onTopologyDescriptionChangedEvent(UUID topologyId,
-                                           TopologyDescriptionPtr previousDescription,
+    void onTopologyDescriptionChangedEvent(TopologyDescriptionPtr previousDescription,
                                            TopologyDescriptionPtr newDescription) override;
     virtual void onServerHandshakeCompleteEvent(IsMasterRTT durationMs,
-                                                const sdam::ServerAddress& address,
+                                                const HostAndPort& address,
                                                 const BSONObj reply = BSONObj()) override;
 
-    void onServerHandshakeFailedEvent(const sdam::ServerAddress& address,
+    void onServerHandshakeFailedEvent(const HostAndPort& address,
                                       const Status& status,
                                       const BSONObj reply);
 
-    void onServerHeartbeatSucceededEvent(const ServerAddress& hostAndPort,
+    void onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort,
                                          const BSONObj reply) override;
     void onServerHeartbeatFailureEvent(Status errorStatus,
-                                       const ServerAddress& hostAndPort,
+                                       const HostAndPort& hostAndPort,
                                        const BSONObj reply) override;
-    void onServerPingFailedEvent(const ServerAddress& hostAndPort, const Status& status) override;
+    void onServerPingFailedEvent(const HostAndPort& hostAndPort, const Status& status) override;
     void onServerPingSucceededEvent(IsMasterRTT durationMS,
-                                    const ServerAddress& hostAndPort) override;
+                                    const HostAndPort& hostAndPort) override;
 
 private:
     enum class EventType {
@@ -137,12 +134,11 @@ private:
 
     struct Event {
         EventType type;
-        ServerAddress hostAndPort;
+        HostAndPort hostAndPort;
         IsMasterRTT duration;
         BSONObj reply;
         TopologyDescriptionPtr previousDescription;
         TopologyDescriptionPtr newDescription;
-        boost::optional<UUID> topologyId;
         Status status = Status::OK();
     };
     using EventPtr = std::unique_ptr<Event>;

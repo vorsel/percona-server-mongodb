@@ -51,7 +51,13 @@ void ReplicationCoordinatorEmbedded::startup(OperationContext* opCtx) {}
 
 void ReplicationCoordinatorEmbedded::enterTerminalShutdown() {}
 
-void ReplicationCoordinatorEmbedded::enterQuiesceMode() {}
+bool ReplicationCoordinatorEmbedded::enterQuiesceModeIfSecondary() {
+    return true;
+}
+
+bool ReplicationCoordinatorEmbedded::inQuiesceMode() const {
+    return false;
+}
 
 void ReplicationCoordinatorEmbedded::shutdown(OperationContext* opCtx) {}
 
@@ -525,7 +531,8 @@ ReplicationCoordinatorEmbedded::getIsMasterResponseFuture(
     UASSERT_NOT_IMPLEMENTED;
 }
 
-OpTime ReplicationCoordinatorEmbedded::getLatestWriteOpTime(OperationContext* opCtx) const {
+StatusWith<OpTime> ReplicationCoordinatorEmbedded::getLatestWriteOpTime(
+    OperationContext* opCtx) const noexcept {
     return getMyLastAppliedOpTime();
 }
 

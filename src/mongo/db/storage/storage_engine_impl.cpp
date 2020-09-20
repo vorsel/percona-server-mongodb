@@ -46,7 +46,6 @@
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/temporary_kv_record_store.h"
 #include "mongo/db/storage/storage_repair_observer.h"
-#include "mongo/db/storage/two_phase_index_build_knobs_gen.h"
 #include "mongo/db/unclean_shutdown.h"
 #include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_map.h"
@@ -712,8 +711,9 @@ Status StorageEngineImpl::disableIncrementalBackup(OperationContext* opCtx) {
     return _engine->disableIncrementalBackup(opCtx);
 }
 
-StatusWith<StorageEngine::BackupInformation> StorageEngineImpl::beginNonBlockingBackup(
-    OperationContext* opCtx, const StorageEngine::BackupOptions& options) {
+StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>>
+StorageEngineImpl::beginNonBlockingBackup(OperationContext* opCtx,
+                                          const StorageEngine::BackupOptions& options) {
     return _engine->beginNonBlockingBackup(opCtx, options);
 }
 
@@ -878,13 +878,6 @@ void StorageEngineImpl::clearDropPendingState() {
     _dropPendingIdentReaper.clearDropPendingState();
 }
 
-bool StorageEngineImpl::supportsTwoPhaseIndexBuild() const {
-    if (!enableTwoPhaseIndexBuild) {
-        return false;
-    }
-    return true;
-}
-
 Timestamp StorageEngineImpl::getAllDurableTimestamp() const {
     return _engine->getAllDurableTimestamp();
 }
@@ -1031,8 +1024,8 @@ void StorageEngineImpl::TimestampMonitor::startup() {
                 // If we're interrupted at shutdown or after PeriodicRunner's client has been
                 // killed, it's fine to give up on future notifications.
                 LOGV2(22263,
-                      "{Timestamp_monitor_is_stopping_due_to_ex_reason}",
-                      "Timestamp monitor is stopping",
+                      "Timestamp monitor is stopping. {reason}",
+                      "Timestamp monitor is stopping"
                       "reason"_attr = ex.reason());
                 return;
             }

@@ -436,6 +436,18 @@ env.Library(
     ]
 )
 
+env.Library(
+    target='sessions_collection_sharded',
+    source=[
+        'sessions_collection_sharded.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/logical_session_id',
+        '$BUILD_DIR/mongo/db/sessions_collection',
+        'sharding_api',
+    ],
+)
+
 env.CppUnitTest(
     target='s_test',
     source=[
@@ -456,12 +468,14 @@ env.CppUnitTest(
         'catalog/type_tags_test.cpp',
         'chunk_manager_index_bounds_test.cpp',
         'chunk_manager_query_test.cpp',
+        'chunk_map_test.cpp',
         'chunk_test.cpp',
         'chunk_version_test.cpp',
         'chunk_writes_tracker_test.cpp',
         'cluster_identity_loader_test.cpp',
         'cluster_last_error_info_test.cpp',
         'hedge_options_util_test.cpp',
+        'mongos_topology_coordinator_test.cpp',
         'request_types/add_shard_request_test.cpp',
         'request_types/add_shard_to_zone_request_test.cpp',
         'request_types/balance_chunk_request_test.cpp',
@@ -474,6 +488,7 @@ env.CppUnitTest(
         'request_types/split_chunk_request_test.cpp',
         'request_types/update_zone_key_range_request_test.cpp',
         'routing_table_history_test.cpp',
+        'sessions_collection_sharded_test.cpp',
         'shard_id_test.cpp',
         'shard_key_pattern_test.cpp',
         'sharding_task_executor_test.cpp',
@@ -501,6 +516,8 @@ env.CppUnitTest(
         'cluster_last_error_info',
         'common_s',
         'coreshard',
+        'mongos_topology_coordinator',
+        'sessions_collection_sharded',
         'shard_server_test_fixture',
         'sharding_router_test_fixture',
         'sharding_task_executor',

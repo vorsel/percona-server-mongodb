@@ -46,7 +46,7 @@ SHARDED_MIXED_VERSION_CONFIGS = ["new-old-old-new"]
 BURN_IN_TASK = "burn_in_tests_multiversion"
 MULTIVERSION_CONFIG_KEY = "use_in_multiversion"
 PASSTHROUGH_TAG = "multiversion_passthrough"
-RANDOM_REPLSETS_TAG = "random_multiversion_replica_sets"
+RANDOM_REPLSETS_TAG = "random_multiversion_ds"
 EXCLUDE_TAGS = f"{REQUIRES_FCV_TAG},multiversion_incompatible"
 
 # The directory in which BACKPORTS_REQUIRED_FILE resides.
@@ -91,8 +91,8 @@ def get_backports_required_last_stable_hash(task_path_suffix: str):
     shell_version = check_output([last_stable_shell_exec, "--version"]).decode('utf-8')
     last_stable_commit_hash = ""
     for line in shell_version.splitlines():
-        if "git version" in line:
-            last_stable_commit_hash = line.split(':')[1].strip()
+        if "gitVersion" in line:
+            last_stable_commit_hash = line.split(':')[1].strip('"')
             break
     if not last_stable_commit_hash:
         raise ValueError("Could not find a valid commit hash from the last-stable mongo binary.")
@@ -415,7 +415,7 @@ def generate_exclude_yaml(suite: str, task_path_suffix: str, is_generated_suite:
 
     if not is_generated_suite:
         # Populate the config values to get the resmoke config directory.
-        buildscripts.resmokelib.parser.set_options()
+        buildscripts.resmokelib.parser.set_run_options()
         suites_dir = os.path.join(_config.CONFIG_DIR, "suites")
 
         # Update the static suite config with the excluded files and write to disk.

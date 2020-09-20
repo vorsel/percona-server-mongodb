@@ -651,12 +651,14 @@ Status ReplicationCoordinatorExternalStateImpl::storeLocalLastVoteDocument(
     invariant(!opCtx->shouldParticipateInFlowControl());
 
     try {
+        // If we are casting a vote in a new election immediately after stepping down, we
+        // don't want to have this process interrupted due to us stepping down, since we
+        // want to be able to cast our vote for a new primary right away. Both the write's lock
+        // acquisition and the "waitUntilDurable" lock acquisition must be uninterruptible.
+        UninterruptibleLockGuard noInterrupt(opCtx->lockState());
+
         Status status =
             writeConflictRetry(opCtx, "save replica set lastVote", lastVoteCollectionName, [&] {
-                // If we are casting a vote in a new election immediately after stepping down, we
-                // don't want to have this process interrupted due to us stepping down, since we
-                // want to be able to cast our vote for a new primary right away.
-                UninterruptibleLockGuard noInterrupt(opCtx->lockState());
                 AutoGetCollection coll(opCtx, NamespaceString(lastVoteCollectionName), MODE_IX);
                 WriteUnitOfWork wunit(opCtx);
 
@@ -804,6 +806,10 @@ void ReplicationCoordinatorExternalStateImpl::_stopAsyncUpdatesOfAndClearOplogTr
     // below. It is possible that the JournalFlusher will not check for the interrupt signaled
     // above, if writing is imminent, so we must make sure that the code completes fully.
     StorageControl::waitForJournalFlush(opCtx);
+
+    // Writes to non-replicated collections do not need concurrency control with the OplogApplier
+    // that never accesses them. Skip taking the PBWM.
+    ShouldNotConflictWithSecondaryBatchApplicationBlock shouldNotConflictBlock(opCtx->lockState());
 
     // We can clear the oplogTruncateAfterPoint because we know there are no user writes during
     // stepdown and therefore presently no oplog holes.
@@ -962,6 +968,7 @@ void ReplicationCoordinatorExternalStateImpl::updateCommittedSnapshot(
     if (manager) {
         manager->setCommittedSnapshot(newCommitPoint.getTimestamp());
     }
+    _service->getOpObserver()->onMajorityCommitPointUpdate(_service, newCommitPoint);
     notifyOplogMetadataWaiters(newCommitPoint);
 }
 

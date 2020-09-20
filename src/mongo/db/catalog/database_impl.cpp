@@ -537,25 +537,6 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
         return Status(ErrorCodes::NamespaceNotFound, "collection not found to rename");
     }
 
-    // Renaming a collection under the same database name is permitted for two-phase index builds.
-    if (!IndexBuildsCoordinator::supportsTwoPhaseIndexBuild()) {
-        invariant(
-            !collToRename->getIndexCatalog()->haveAnyIndexesInProgress(),
-            str::stream() << "cannot perform operation: an index build is currently running for "
-                             "collection "
-                          << fromNss);
-
-        Collection* toColl =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, toNss);
-        if (toColl) {
-            invariant(!toColl->getIndexCatalog()->haveAnyIndexesInProgress(),
-                      str::stream()
-                          << "cannot perform operation: an index build is currently running for "
-                             "collection "
-                          << toNss);
-        }
-    }
-
     LOGV2(20319,
           "renameCollection: renaming collection {collToRename_uuid} from {fromNss} to {toNss}",
           "renameCollection: renaming collection",
@@ -924,8 +905,17 @@ Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
         // validator to apply some additional checks.
         expCtx->isParsingCollectionValidator = true;
 
-        auto statusWithMatcher =
-            MatchExpressionParser::parse(collectionOptions.validator, std::move(expCtx));
+        // If the validation action is "warn" or the level is "moderate", then disallow any
+        // encryption keywords. This is to prevent any plaintext data from showing up in the logs.
+        auto allowedFeatures = MatchExpressionParser::kDefaultSpecialFeatures;
+        if (collectionOptions.validationAction == "warn" ||
+            collectionOptions.validationLevel == "moderate")
+            allowedFeatures &= ~MatchExpressionParser::AllowedFeatures::kEncryptKeywords;
+
+        auto statusWithMatcher = MatchExpressionParser::parse(collectionOptions.validator,
+                                                              std::move(expCtx),
+                                                              ExtensionsCallbackNoop(),
+                                                              allowedFeatures);
 
         // We check the status of the parse to see if there are any banned features, but we don't
         // actually need the result for now.

@@ -130,9 +130,15 @@ public:
      * We enter quiesce mode during the shutdown process if we are in secondary mode. While in
      * quiesce mode, we allow reads to continue and accept new reads, but we fail isMaster requests
      * with ShutdownInProgress. This function causes us to increment the topologyVersion and start
-     * failing isMaster requests with ShutdownInProgress.
+     * failing isMaster requests with ShutdownInProgress. Returns true if the server entered quiesce
+     * mode.
      */
-    virtual void enterQuiesceMode() = 0;
+    virtual bool enterQuiesceModeIfSecondary() = 0;
+
+    /**
+     * Returns whether the server is in quiesce mode.
+     */
+    virtual bool inQuiesceMode() const = 0;
 
     /**
      * Does whatever cleanup is required to stop replication, including instructing the other
@@ -1001,14 +1007,14 @@ public:
     /**
      * Returns the OpTime that consists of the timestamp of the latest oplog entry and the current
      * term.
-     * This function throws if:
+     * This function returns a non-ok status if:
      * 1. It is called on secondaries.
      * 2. OperationContext times out or is interrupted.
      * 3. Oplog collection does not exist.
      * 4. Oplog collection is empty.
      * 5. Getting latest oplog timestamp is not supported by the storage engine.
      */
-    virtual OpTime getLatestWriteOpTime(OperationContext* opCtx) const = 0;
+    virtual StatusWith<OpTime> getLatestWriteOpTime(OperationContext* opCtx) const noexcept = 0;
 
     /**
      * Returns the HostAndPort of the current primary, or an empty HostAndPort if there is no

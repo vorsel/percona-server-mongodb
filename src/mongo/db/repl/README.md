@@ -283,9 +283,6 @@ It includes:
 4. The replica set ID.
 5. Whether the upstream node is primary.
 
-If the metadata has a different config version than the downstream node's config version, then the
-metadata is ignored until a reconfig command is received that synchronizes the config versions.
-
 The node sets its term to the upstream node's term, and if it's a primary (which can only happen on
 heartbeats), it steps down.
 
@@ -1464,9 +1461,7 @@ following:
 
 As seen here, there can be operations on collections that have since been dropped or indexes could
 conflict with the data being added. As a result, many errors that occur here are ignored and assumed
-to resolve themselves, such as `DuplicateKey` errors (like in the example above). If known
-problematic operations such as `renameCollection` are received, where we cannot assume a drop will
-come and fix them, we abort and retry initial sync.
+to resolve themselves, such as `DuplicateKey` errors (like in the example above).
 
 ## Finishing initial sync
 

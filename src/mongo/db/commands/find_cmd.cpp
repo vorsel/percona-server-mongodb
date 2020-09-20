@@ -114,6 +114,7 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
                                           nullptr,  // mongoProcessInterface
                                           StringMap<ExpressionContext::ResolvedNamespace>{},
                                           boost::none,                             // uuid
+                                          boost::none,                             // let
                                           CurOp::get(opCtx)->dbProfileLevel() > 0  // mayDbProfile
         );
     expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
@@ -167,6 +168,10 @@ public:
      */
     bool shouldAffectCommandCounter() const override {
         return false;
+    }
+
+    bool shouldAffectReadConcernCounter() const override {
+        return true;
     }
 
     class Invocation final : public CommandInvocation {
@@ -301,8 +306,6 @@ public:
             CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
             // Although it is a command, a find command gets counted as a query.
             globalOpCounters.gotQuery();
-            ServerReadConcernMetrics::get(opCtx)->recordReadConcern(
-                repl::ReadConcernArgs::get(opCtx));
 
             // Parse the command BSON to a QueryRequest. Pass in the parsedNss in case _request.body
             // does not have a UUID.
@@ -499,6 +502,7 @@ public:
             // Stream query results, adding them to a BSONArray as we go.
             CursorResponseBuilder::Options options;
             options.isInitialResponse = true;
+            options.atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
             CursorResponseBuilder firstBatch(result, options);
             Document doc;
             PlanExecutor::ExecState state = PlanExecutor::ADVANCED;

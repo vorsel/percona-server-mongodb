@@ -24,10 +24,8 @@ replSet.startSet();
 replSet.initiate();
 
 const primary = replSet.getPrimary();
-if (!(IndexBuildTest.supportsTwoPhaseIndexBuild(primary) &&
-      IndexBuildTest.indexBuildCommitQuorumEnabled(primary))) {
-    jsTestLog(
-        'Skipping test because two phase index build and index build commit quorum are not supported.');
+if (!IndexBuildTest.indexBuildCommitQuorumEnabled(primary)) {
+    jsTestLog('Skipping test because index build commit quorum is not supported.');
     replSet.stopSet();
     return;
 }
@@ -61,7 +59,7 @@ assert.eq("votingMembers", res.commitQuorum);
 res = assert.commandWorked(testDB[collName].createIndexes([{j: 1}], {}, 1));
 assert.eq(1, res.commitQuorum);
 
-replSet.waitForAllIndexBuildsToFinish(testDB.getName(), collName);
+replSet.awaitReplication();
 
 let awaitShell;
 try {

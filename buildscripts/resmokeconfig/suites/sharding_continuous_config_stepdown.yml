@@ -35,7 +35,7 @@ selector:
   - jstests/sharding/disable_autosplit.js
   - jstests/sharding/drop_sharded_db.js
   - jstests/sharding/findandmodify1.js
-  - jstests/sharding/findandmodify2.js
+  - jstests/sharding/findandmodify_autosplit.js
   - jstests/sharding/query/geo_near_sharded.js
   - jstests/sharding/hash_basic.js
   - jstests/sharding/hash_shard1.js
@@ -195,7 +195,7 @@ selector:
   # Moves a chunk before continuing a transaction, which can lead to snapshot errors if the
   # CSRS failovers are sufficiently slow.
   - jstests/sharding/transactions_reject_writes_for_moved_chunks.js
-  - jstests/sharding/transactions_target_at_point_in_time.js
+  - jstests/sharding/snapshot_reads_target_at_point_in_time.js
   # Tests that rely on shards becoming aware of collection drops regardless of config stepdowns.
   # (SERVER-34760)
   - jstests/sharding/merge_requires_unique_index.js

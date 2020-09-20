@@ -162,6 +162,15 @@ void applyCursorReadConcern(OperationContext* opCtx, repl::ReadConcernArgs rcArg
         }
     }
 
+    if (replicationMode == repl::ReplicationCoordinator::modeReplSet &&
+        rcArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern &&
+        !opCtx->inMultiDocumentTransaction()) {
+        auto atClusterTime = rcArgs.getArgsAtClusterTime();
+        invariant(atClusterTime && *atClusterTime != LogicalTime::kUninitialized);
+        opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
+                                                      atClusterTime->asTimestamp());
+    }
+
     // For cursor commands that take locks internally, the read concern on the
     // OperationContext may affect the timestamp read source selected by the storage engine.
     // We place the cursor read concern onto the OperationContext so the lock acquisition
@@ -568,8 +577,9 @@ public:
                 });
 
             CursorId respondWithId = 0;
-
-            CursorResponseBuilder nextBatch(reply, CursorResponseBuilder::Options());
+            CursorResponseBuilder::Options options;
+            options.atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+            CursorResponseBuilder nextBatch(reply, options);
             BSONObj obj;
             PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
             std::uint64_t numResults = 0;

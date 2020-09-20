@@ -391,7 +391,7 @@ public:
          */
         kNoTimestamp,
         /**
-         * Read from the majority all-commmitted timestamp.
+         * Read from the majority all-committed timestamp.
          */
         kMajorityCommitted,
         /**
@@ -411,11 +411,7 @@ public:
         /**
          * Read from the timestamp provided to setTimestampReadSource.
          */
-        kProvided,
-        /**
-         * Read from the latest checkpoint.
-         */
-        kCheckpoint
+        kProvided
     };
 
     /**

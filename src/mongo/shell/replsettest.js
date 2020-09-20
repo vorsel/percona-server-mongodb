@@ -682,9 +682,10 @@ var ReplSetTest = function(opts) {
      * if it throws.
      */
     this.awaitSecondaryNodesForRollbackTest = function(
-        timeout, slaves, connToCheckForUnrecoverableRollback) {
+        timeout, slaves, connToCheckForUnrecoverableRollback, retryIntervalMS) {
+        retryIntervalMS = retryIntervalMS || 200;
         try {
-            this.awaitSecondaryNodes(timeout, slaves);
+            this.awaitSecondaryNodes(timeout, slaves, retryIntervalMS);
         } catch (originalEx) {
             // There is a special case where we expect the (rare) possibility of unrecoverable
             // rollbacks with EMRC:false in rollback suites with unclean shutdowns.
@@ -1022,7 +1023,12 @@ var ReplSetTest = function(opts) {
         return this.start(nextId, config);
     };
 
+    /**
+     * Calls stop() on the node identifed by nodeId and removes it from the list of nodes managed by
+     * ReplSetTest.
+     */
     this.remove = function(nodeId) {
+        this.stop(nodeId);
         nodeId = this.getNodeId(nodeId);
         this.nodes.splice(nodeId, 1);
         this.ports.splice(nodeId, 1);
@@ -1679,12 +1685,13 @@ var ReplSetTest = function(opts) {
     // Wait until the optime of the specified type reaches the primary's last applied optime. Blocks
     // on all secondary nodes or just 'slaves', if specified. The timeout will reset if any of the
     // secondaries makes progress.
-    this.awaitReplication = function(timeout, secondaryOpTimeType, slaves) {
+    this.awaitReplication = function(timeout, secondaryOpTimeType, slaves, retryIntervalMS) {
         if (slaves !== undefined && slaves !== self._slaves) {
             print("ReplSetTest awaitReplication: going to check only " + slaves.map(s => s.host));
         }
 
         timeout = timeout || self.kDefaultTimeoutMS;
+        retryIntervalMS = retryIntervalMS || 200;
 
         secondaryOpTimeType = secondaryOpTimeType || ReplSetTest.OpTimeType.LAST_APPLIED;
 
@@ -1878,17 +1885,8 @@ var ReplSetTest = function(opts) {
 
                     return false;
                 }
-            }, "awaiting replication", timeout);
+            }, "awaitReplication timed out", timeout, retryIntervalMS);
         }
-    };
-
-    // TODO: SERVER-38961 Remove when simultaneous index builds complete.
-    this.waitForAllIndexBuildsToFinish = function(dbName, collName) {
-        // Run a no-op command and wait for it to be applied on secondaries. Due to the asynchronous
-        // completion nature of indexes on secondaries, we can guarantee an index build is complete
-        // on all secondaries once all secondaries have applied this collMod command.
-        assert.commandWorked(this.getPrimary().getDB(dbName).runCommand({collMod: collName}));
-        this.awaitReplication();
     };
 
     this.getHashesUsingSessions = function(sessions, dbName, {
@@ -2070,39 +2068,6 @@ var ReplSetTest = function(opts) {
         // Call getPrimary to populate rst with information about the nodes.
         var primary = this.getPrimary();
         assert(primary, 'calling getPrimary() failed');
-
-        // Since we cannot determine if there is a background index in progress (SERVER-26624), we
-        // use the "collMod" command to wait for any index builds that may be in progress on the
-        // primary or on one of the secondaries to complete.
-        for (let dbName of primary.getDBNames()) {
-            if (dbName === "local") {
-                continue;
-            }
-
-            let dbHandle = primary.getDB(dbName);
-            dbHandle.getCollectionInfos({$or: [{type: "collection"}, {type: {$exists: false}}]})
-                .forEach(function(collInfo) {
-                    // Skip system collections. We handle here rather than in the getCollectionInfos
-                    // filter to take advantage of the fact that a simple 'collection' filter will
-                    // skip view evaluation, and therefore won't fail on an invalid view.
-                    if (!collInfo.name.startsWith('system.')) {
-                        // We intentionally await replication without doing any I/O to avoid any
-                        // overhead. We call awaitReplication() later on to ensure the collMod
-                        // is replicated to all nodes.
-                        try {
-                            assert.commandWorked(dbHandle.runCommand(
-                                {collMod: collInfo.name, writeConcern: {w: 1}}));
-                        } catch (e) {
-                            // Ignore NamespaceNotFound errors because a background thread could
-                            // have dropped the collection after getCollectionInfos but before
-                            // running collMod.
-                            if (e.code != ErrorCodes.NamespaceNotFound) {
-                                throw e;
-                            }
-                        }
-                    }
-                });
-        }
 
         // Prevent an election, which could start, then hang due to the fsyncLock.
         jsTestLog(`Freezing nodes: [${slaves.map((n) => n.host)}]`);
@@ -2798,6 +2763,11 @@ var ReplSetTest = function(opts) {
         options.setParameter.numInitialSyncConnectAttempts =
             options.setParameter.numInitialSyncConnectAttempts || 60;
 
+        // The default time for stepdown and quiesce mode in response to SIGTERM is 15 seconds.
+        // Reduce this to 100ms for faster shutdown.
+        options.setParameter.shutdownTimeoutMillisForSignaledShutdown =
+            options.setParameter.shutdownTimeoutMillisForSignaledShutdown || 100;
+
         if (tojson(options) != tojson({}))
             printjson(options);
 
@@ -2955,6 +2925,7 @@ var ReplSetTest = function(opts) {
         n = this.getNodeId(n);
 
         var conn = _useBridge ? _unbridgedNodes[n] : this.nodes[n];
+
         print('ReplSetTest stop *** Shutting down mongod in port ' + conn.port +
               ', wait for process termination: ' + waitPid + ' ***');
         var ret = MongoRunner.stopMongod(conn, signal, opts, waitPid);
@@ -3039,7 +3010,9 @@ var ReplSetTest = function(opts) {
         }
 
         // Make shutdown faster in tests, especially when election handoff has no viable candidate.
-        // Ignore errors from setParameter, perhaps it's a pre-4.1.10 mongod.
+        // Ignore errors from setParameter, since this parameter does not exist before 4.1.10 or
+        // after 4.4.
+        // TODO(SERVER-47797): Remove reference to waitForStepDownOnNonCommandShutdown.
         if (_callIsMaster()) {
             asCluster(this._liveNodes, () => {
                 for (let node of this._liveNodes) {
@@ -3052,8 +3025,6 @@ var ReplSetTest = function(opts) {
                             waitForStepDownOnNonCommandShutdown: false,
                         }));
                     } catch (e) {
-                        print("Error in setParameter for waitForStepDownOnNonCommandShutdown:");
-                        print(e);
                     }
                 }
             });

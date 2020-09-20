@@ -105,7 +105,7 @@ public:
 
     virtual Status disableIncrementalBackup(OperationContext* opCtx) override;
 
-    virtual StatusWith<BackupInformation> beginNonBlockingBackup(
+    virtual StatusWith<std::unique_ptr<StreamingCursor>> beginNonBlockingBackup(
         OperationContext* opCtx, const BackupOptions& options) override;
 
     virtual void endNonBlockingBackup(OperationContext* opCtx) override;
@@ -168,8 +168,6 @@ public:
     bool supportsPendingDrops() const final;
 
     void clearDropPendingState() final;
-
-    bool supportsTwoPhaseIndexBuild() const final;
 
     SnapshotManager* getSnapshotManager() const final;
 
@@ -334,22 +332,6 @@ public:
 
     const DurableCatalog* getCatalog() const override {
         return _catalog.get();
-    }
-
-    std::unique_ptr<CheckpointLock> getCheckpointLock(OperationContext* opCtx) override {
-        return _engine->getCheckpointLock(opCtx);
-    }
-
-    void addIndividuallyCheckpointedIndexToList(const std::string& ident) override {
-        return _engine->addIndividuallyCheckpointedIndexToList(ident);
-    }
-
-    void clearIndividuallyCheckpointedIndexesList() override {
-        return _engine->clearIndividuallyCheckpointedIndexesList();
-    }
-
-    bool isInIndividuallyCheckpointedIndexesList(const std::string& ident) const override {
-        return _engine->isInIndividuallyCheckpointedIndexesList(ident);
     }
 
     StatusWith<ReconcileResult> reconcileCatalogAndIdents(OperationContext* opCtx) override;

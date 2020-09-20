@@ -47,14 +47,11 @@ void TopologyEventsPublisher::close() {
 }
 
 void TopologyEventsPublisher::onTopologyDescriptionChangedEvent(
-    UUID topologyId,
-    TopologyDescriptionPtr previousDescription,
-    TopologyDescriptionPtr newDescription) {
+    TopologyDescriptionPtr previousDescription, TopologyDescriptionPtr newDescription) {
     {
         stdx::lock_guard lock(_eventQueueMutex);
         EventPtr event = std::make_unique<Event>();
         event->type = EventType::TOPOLOGY_DESCRIPTION_CHANGED;
-        event->topologyId = std::move(topologyId);
         event->previousDescription = previousDescription;
         event->newDescription = newDescription;
         _eventQueue.push_back(std::move(event));
@@ -63,7 +60,7 @@ void TopologyEventsPublisher::onTopologyDescriptionChangedEvent(
 }
 
 void TopologyEventsPublisher::onServerHandshakeCompleteEvent(IsMasterRTT durationMs,
-                                                             const sdam::ServerAddress& address,
+                                                             const HostAndPort& address,
                                                              const BSONObj reply) {
     {
         stdx::lock_guard<Mutex> lock(_eventQueueMutex);
@@ -77,7 +74,7 @@ void TopologyEventsPublisher::onServerHandshakeCompleteEvent(IsMasterRTT duratio
     _scheduleNextDelivery();
 }
 
-void TopologyEventsPublisher::onServerHandshakeFailedEvent(const sdam::ServerAddress& address,
+void TopologyEventsPublisher::onServerHandshakeFailedEvent(const HostAndPort& address,
                                                            const Status& status,
                                                            const BSONObj reply) {
     {
@@ -92,7 +89,7 @@ void TopologyEventsPublisher::onServerHandshakeFailedEvent(const sdam::ServerAdd
     _scheduleNextDelivery();
 }
 
-void TopologyEventsPublisher::onServerHeartbeatSucceededEvent(const ServerAddress& hostAndPort,
+void TopologyEventsPublisher::onServerHeartbeatSucceededEvent(const HostAndPort& hostAndPort,
                                                               const BSONObj reply) {
     {
         stdx::lock_guard lock(_eventQueueMutex);
@@ -106,7 +103,7 @@ void TopologyEventsPublisher::onServerHeartbeatSucceededEvent(const ServerAddres
 }
 
 void TopologyEventsPublisher::onServerHeartbeatFailureEvent(Status errorStatus,
-                                                            const ServerAddress& hostAndPort,
+                                                            const HostAndPort& hostAndPort,
                                                             const BSONObj reply) {
     {
         stdx::lock_guard lock(_eventQueueMutex);
@@ -126,7 +123,7 @@ void TopologyEventsPublisher::_scheduleNextDelivery() {
         [self = shared_from_this()](const Status& status) { self->_nextDelivery(); });
 }
 
-void TopologyEventsPublisher::onServerPingFailedEvent(const ServerAddress& hostAndPort,
+void TopologyEventsPublisher::onServerPingFailedEvent(const HostAndPort& hostAndPort,
                                                       const Status& status) {
     {
         stdx::lock_guard lock(_eventQueueMutex);
@@ -140,7 +137,7 @@ void TopologyEventsPublisher::onServerPingFailedEvent(const ServerAddress& hostA
 }
 
 void TopologyEventsPublisher::onServerPingSucceededEvent(IsMasterRTT durationMS,
-                                                         const ServerAddress& hostAndPort) {
+                                                         const HostAndPort& hostAndPort) {
     {
         stdx::lock_guard lock(_eventQueueMutex);
         EventPtr event = std::make_unique<Event>();
@@ -191,9 +188,8 @@ void TopologyEventsPublisher::_sendEvent(TopologyListenerPtr listener, const Eve
             listener->onServerHeartbeatFailureEvent(event.status, event.hostAndPort, event.reply);
             break;
         case EventType::TOPOLOGY_DESCRIPTION_CHANGED:
-            // TODO SERVER-46497: fix uuid or just remove
-            listener->onTopologyDescriptionChangedEvent(
-                UUID::gen(), event.previousDescription, event.newDescription);
+            listener->onTopologyDescriptionChangedEvent(event.previousDescription,
+                                                        event.newDescription);
             break;
         case EventType::HANDSHAKE_COMPLETE:
             listener->onServerHandshakeCompleteEvent(
