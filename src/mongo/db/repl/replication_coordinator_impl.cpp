@@ -84,7 +84,6 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/rslog.h"
 #include "mongo/db/repl/storage_interface.h"
-#include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/vote_requester.h"
@@ -3338,6 +3337,14 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     }
     auto topCoordTerm = _topCoord->getTerm();
 
+    if (!force) {
+        // For safety of reconfig, since we must commit a config in our own term before executing a
+        // reconfig, so we should never have a config in an older term. If the current config was
+        // installed via a force reconfig, we aren't concerned about this safety guarantee.
+        invariant(_rsConfig.getConfigTerm() == OpTime::kUninitializedTerm ||
+                  _rsConfig.getConfigTerm() == topCoordTerm);
+    }
+
     auto configWriteConcern = _getConfigReplicationWriteConcern();
     // Construct a fake OpTime that can be accepted but isn't used.
     OpTime fakeOpTime(Timestamp(1, 1), topCoordTerm);
@@ -3966,12 +3973,6 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
     const MemberState newState = _topCoord->getMemberState();
 
     if (newState == _memberState) {
-        if (_topCoord->getRole() == TopologyCoordinator::Role::kCandidate) {
-            invariant(_rsConfig.getNumMembers() == 1 && _selfIndex == 0 &&
-                      _rsConfig.getMemberAt(0).isElectable());
-            // Start election in protocol version 1
-            return kActionStartSingleNodeElection;
-        }
         return kActionNone;
     }
 
@@ -4021,13 +4022,10 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
         _readWriteAbility->setCanServeNonLocalReads_UNSAFE(1U);
     }
 
-    if (newState.secondary() && _topCoord->getRole() == TopologyCoordinator::Role::kCandidate) {
-        // When transitioning to SECONDARY, the only way for _topCoord to report the candidate
-        // role is if the configuration represents a single-node replica set.  In that case, the
-        // overriding requirement is to elect this singleton node primary.
-        invariant(_rsConfig.getNumMembers() == 1 && _selfIndex == 0 &&
-                  _rsConfig.getMemberAt(0).isElectable());
-        // Start election in protocol version 1
+    if (newState.secondary() && result != kActionSteppedDown &&
+        _topCoord->isElectableNodeInSingleNodeReplicaSet()) {
+        // When transitioning from other follower states to SECONDARY, run for election on a
+        // single-node replica set.
         result = kActionStartSingleNodeElection;
     }
 
@@ -4103,9 +4101,7 @@ void ReplicationCoordinatorImpl::_performPostMemberStateUpdateAction(
             _externalState->onStepDownHook();
             break;
         case kActionStartSingleNodeElection:
-            // In protocol version 1, single node replset will run an election instead of
-            // kActionWinElection as in protocol version 0.
-            _startElectSelfV1(StartElectionReasonEnum::kElectionTimeout);
+            _startElectSelfIfEligibleV1(StartElectionReasonEnum::kElectionTimeout);
             break;
         default:
             LOGV2_FATAL(26010,
@@ -4459,7 +4455,13 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
     _cancelPriorityTakeover_inlock();
     _cancelAndRescheduleElectionTimeout_inlock();
 
-    const PostMemberStateUpdateAction action = _updateMemberStateFromTopologyCoordinator(lk);
+    PostMemberStateUpdateAction action = _updateMemberStateFromTopologyCoordinator(lk);
+    if (_topCoord->isElectableNodeInSingleNodeReplicaSet()) {
+        // If the new config describes an electable one-node replica set, we need to start an
+        // election.
+        action = PostMemberStateUpdateAction::kActionStartSingleNodeElection;
+    }
+
     if (_selfIndex >= 0) {
         // Don't send heartbeats if we're not in the config, if we get re-added one of the
         // nodes in the set will contact us.
@@ -4603,16 +4605,12 @@ bool ReplicationCoordinatorImpl::isReplEnabled() const {
     return getReplicationMode() != modeNone;
 }
 
-HostAndPort ReplicationCoordinatorImpl::chooseNewSyncSource(const OpTime& lastOpTimeFetched) {
-    stdx::lock_guard<Latch> lk(_mutex);
-
-    HostAndPort oldSyncSource = _topCoord->getSyncSourceAddress();
+const ReadPreference ReplicationCoordinatorImpl::_getSyncSourceReadPreference(WithLock) {
     // Always allow chaining while in catchup and drain mode.
     auto memberState = _getMemberState_inlock();
-    auto chainingPreference = memberState.primary()
-        ? TopologyCoordinator::ChainingPreference::kAllowChaining
-        : TopologyCoordinator::ChainingPreference::kUseConfiguration;
     ReadPreference readPreference = ReadPreference::Nearest;
+
+    bool parsedSyncSourceFromInitialSync = false;
     // Handle special case of initial sync source read preference.
     // This sync source will be cleared when we go to secondary mode, because we will perform
     // a postMemberState action of kOnFollowerModeStateChange which calls chooseNewSyncSource().
@@ -4622,11 +4620,10 @@ HostAndPort ReplicationCoordinatorImpl::chooseNewSyncSource(const OpTime& lastOp
                 readPreference =
                     ReadPreference_parse(IDLParserErrorContext("initialSyncSourceReadPreference"),
                                          initialSyncSourceReadPreference);
+                parsedSyncSourceFromInitialSync = true;
             } catch (const DBException& e) {
                 fassertFailedWithStatus(3873100, e.toStatus());
             }
-            // If read preference is explictly set, it takes precedence over chaining: false.
-            chainingPreference = TopologyCoordinator::ChainingPreference::kAllowChaining;
         } else if (_rsConfig.getMemberAt(_selfIndex).getNumVotes() > 0) {
             // Voting nodes prefer to sync from the primary.  A voting node that is initial syncing
             // may have acknowledged writes which are part of the set's write majority; if it then
@@ -4637,8 +4634,24 @@ HostAndPort ReplicationCoordinatorImpl::chooseNewSyncSource(const OpTime& lastOp
             readPreference = ReadPreference::PrimaryPreferred;
         }
     }
-    HostAndPort newSyncSource = _topCoord->chooseNewSyncSource(
-        _replExecutor->now(), lastOpTimeFetched, chainingPreference, readPreference);
+    if (!parsedSyncSourceFromInitialSync && !memberState.primary() &&
+        !_rsConfig.isChainingAllowed()) {
+        // If we are not the primary and chaining is disabled in the config, we should only be
+        // syncing from the primary.
+        readPreference = ReadPreference::PrimaryOnly;
+    }
+    return readPreference;
+}
+
+HostAndPort ReplicationCoordinatorImpl::chooseNewSyncSource(const OpTime& lastOpTimeFetched) {
+    stdx::lock_guard<Latch> lk(_mutex);
+
+    HostAndPort oldSyncSource = _topCoord->getSyncSourceAddress();
+
+    const auto readPreference = _getSyncSourceReadPreference(lk);
+
+    HostAndPort newSyncSource =
+        _topCoord->chooseNewSyncSource(_replExecutor->now(), lastOpTimeFetched, readPreference);
     auto primary = _topCoord->getCurrentPrimaryMember();
     // If read preference is SecondaryOnly, we should never choose the primary.
     invariant(readPreference != ReadPreference::SecondaryOnly || !primary ||
@@ -4703,8 +4716,15 @@ bool ReplicationCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& curre
                                                         const rpc::OplogQueryMetadata& oqMetadata,
                                                         const OpTime& lastOpTimeFetched) {
     stdx::lock_guard<Latch> lock(_mutex);
-    return _topCoord->shouldChangeSyncSource(
-        currentSource, replMetadata, oqMetadata, lastOpTimeFetched, _replExecutor->now());
+    const auto now = _replExecutor->now();
+    if (_topCoord->shouldChangeSyncSource(
+            currentSource, replMetadata, oqMetadata, lastOpTimeFetched, now)) {
+        return true;
+    }
+
+    const auto readPreference = _getSyncSourceReadPreference(lock);
+    return _topCoord->shouldChangeSyncSourceDueToPingTime(
+        currentSource, _getMemberState_inlock(), lastOpTimeFetched, now, readPreference);
 }
 
 void ReplicationCoordinatorImpl::_updateLastCommittedOpTimeAndWallTime(WithLock lk) {
@@ -5145,18 +5165,27 @@ Status ReplicationCoordinatorImpl::processHeartbeatV1(const ReplSetHeartbeatArgs
         }
     } else if (result.isOK() &&
                response->getConfigVersionAndTerm() < args.getConfigVersionAndTerm()) {
+        logv2::DynamicAttributes attr;
+        attr.add("configTerm", args.getConfigTerm());
+        attr.add("configVersion", args.getConfigVersion());
+        attr.add("senderHost", senderHost);
+
+        // If we are currently in drain mode, we won't allow installing newer configs, so we don't
+        // schedule a heartbeat to fetch one. We do allow force reconfigs to proceed even if we are
+        // in drain mode.
+        if (_memberState.primary() && !_readWriteAbility->canAcceptNonLocalWrites(lk) &&
+            args.getConfigTerm() != OpTime::kUninitializedTerm) {
+            LOGV2(4794901,
+                  "Not scheduling a heartbeat to fetch a newer config since we are in PRIMARY "
+                  "state but cannot accept writes yet.",
+                  attr);
+        }
         // Schedule a heartbeat to the sender to fetch the new config.
         // Only send this if the sender's config is newer.
         // We cannot cancel the enqueued heartbeat, but either this one or the enqueued heartbeat
         // will trigger reconfig, which cancels and reschedules all heartbeats.
-        if (args.hasSender()) {
-            LOGV2(21401,
-                  "Scheduling heartbeat to fetch a newer config with term {configTerm} and "
-                  "version {configVersion} from member: {senderHost}",
-                  "Scheduling heartbeat to fetch a newer config",
-                  "configTerm"_attr = args.getConfigTerm(),
-                  "configVersion"_attr = args.getConfigVersion(),
-                  "senderHost"_attr = senderHost);
+        else if (args.hasSender()) {
+            LOGV2(21401, "Scheduling heartbeat to fetch a newer config", attr);
             int senderIndex = _rsConfig.findMemberIndexByHostAndPort(senderHost);
             _scheduleHeartbeatToTarget_inlock(senderHost, senderIndex, now);
         }

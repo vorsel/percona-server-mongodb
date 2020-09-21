@@ -143,11 +143,12 @@ void ReplicationCoordinatorImpl::_scheduleHeartbeatToTarget_inlock(const HostAnd
 }
 
 void ReplicationCoordinatorImpl::handleHeartbeatResponse_forTest(BSONObj response,
-                                                                 int targetIndex) {
+                                                                 int targetIndex,
+                                                                 Milliseconds ping) {
     CallbackHandle handle;
     RemoteCommandRequest request;
     request.target = _rsConfig.getMemberAt(targetIndex).getHostAndPort();
-    executor::TaskExecutor::ResponseStatus status(response, Milliseconds(100));
+    executor::TaskExecutor::ResponseStatus status(response, ping);
     executor::TaskExecutor::RemoteCommandCallbackArgs cbData(
         _replExecutor.get(), handle, request, status);
 
@@ -355,7 +356,7 @@ stdx::unique_lock<Latch> ReplicationCoordinatorImpl::_handleHeartbeatResponseAct
             break;
         case HeartbeatResponseAction::Reconfig:
             invariant(responseStatus.isOK());
-            _scheduleHeartbeatReconfig_inlock(responseStatus.getValue().getConfig());
+            _scheduleHeartbeatReconfig(lock, responseStatus.getValue().getConfig());
             break;
         case HeartbeatResponseAction::StepDownSelf:
             invariant(action.getPrimaryConfigIndex() == _selfIndex);
@@ -529,7 +530,8 @@ bool ReplicationCoordinatorImpl::_shouldStepDownOnReconfig(WithLock,
         !(myIndex.isOK() && newConfig.getMemberAt(myIndex.getValue()).isElectable());
 }
 
-void ReplicationCoordinatorImpl::_scheduleHeartbeatReconfig_inlock(const ReplSetConfig& newConfig) {
+void ReplicationCoordinatorImpl::_scheduleHeartbeatReconfig(WithLock lk,
+                                                            const ReplSetConfig& newConfig) {
     if (_inShutdown) {
         return;
     }
@@ -564,6 +566,17 @@ void ReplicationCoordinatorImpl::_scheduleHeartbeatReconfig_inlock(const ReplSet
                         "{_rsConfigState}; aborting.",
                         "Aborting reconfiguration request",
                         "_rsConfigState"_attr = int(_rsConfigState));
+    }
+
+    // Allow force reconfigs to proceed even if we are not a writable primary yet.
+    if (_memberState.primary() && !_readWriteAbility->canAcceptNonLocalWrites(lk) &&
+        newConfig.getConfigTerm() != OpTime::kUninitializedTerm) {
+        LOGV2_FOR_HEARTBEATS(
+            4794900,
+            1,
+            "Not scheduling a heartbeat reconfig since we are in PRIMARY state but "
+            "cannot accept writes yet.");
+        return;
     }
     _setConfigState_inlock(kConfigHBReconfiguring);
     invariant(!_rsConfig.isInitialized() ||
@@ -1064,7 +1077,9 @@ void ReplicationCoordinatorImpl::_startElectSelfIfEligibleV1(WithLock,
                                                              StartElectionReasonEnum reason) {
     // If it is not a single node replica set, no need to start an election after stepdown timeout.
     if (reason == StartElectionReasonEnum::kSingleNodePromptElection &&
-        _rsConfig.getNumMembers() != 1) {
+        !_topCoord->isElectableNodeInSingleNodeReplicaSet()) {
+        LOGV2_FOR_ELECTION(
+            4764800, 0, "Not starting an election, since we are not an electable single node");
         return;
     }
 

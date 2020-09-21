@@ -2,6 +2,7 @@
  * Test that the index commands send and check shard versions, and only target the shards
  * that have chunks for the collection. Also test that the commands fail if they are run
  * when the critical section is in progress, and block until the critical section is over.
+ * @tags: [need_fixing_for_46]
  */
 (function() {
 "use strict";
@@ -10,6 +11,7 @@ load('jstests/libs/chunk_manipulation_util.js');
 load("jstests/libs/fail_point_util.js");
 load("jstests/sharding/libs/sharded_index_util.js");
 load("jstests/sharding/libs/shard_versioning_util.js");
+load("jstests/libs/parallelTester.js");  // For Thread.
 
 // Test deliberately inserts orphans outside of migration.
 TestData.skipCheckOrphans = true;

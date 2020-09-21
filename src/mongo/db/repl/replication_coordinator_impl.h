@@ -444,7 +444,9 @@ public:
     void cleanupStableOpTimeCandidates_forTest(std::set<OpTimeAndWallTime>* candidates,
                                                OpTimeAndWallTime stableOpTime);
     std::set<OpTimeAndWallTime> getStableOpTimeCandidates_forTest();
-    void handleHeartbeatResponse_forTest(BSONObj response, int targetIndex);
+    void handleHeartbeatResponse_forTest(BSONObj response,
+                                         int targetIndex,
+                                         Milliseconds ping = Milliseconds(100));
 
     /**
      * Non-blocking version of updateTerm.
@@ -456,13 +458,13 @@ public:
         long long term, TopologyCoordinator::UpdateTermResult* updateResult);
 
     /**
-     * If called after _startElectSelfV1(), blocks until all asynchronous
+     * If called after _startElectSelfV1_inlock(), blocks until all asynchronous
      * activities associated with election complete.
      */
     void waitForElectionFinish_forTest();
 
     /**
-     * If called after _startElectSelfV1(), blocks until all asynchronous
+     * If called after _startElectSelfV1_inlock(), blocks until all asynchronous
      * activities associated with election dry run complete, including writing
      * last vote and scheduling the real election.
      */
@@ -1075,7 +1077,7 @@ private:
      * For proper concurrency, start methods must be called while holding _mutex.
      *
      * For V1 (raft) style elections the election path is:
-     *      _startElectSelfV1() or _startElectSelfV1_inlock()
+     *      _startElectSelfIfEligibleV1()
      *      _processDryRunResult() (may skip)
      *      _startRealElection_inlock()
      *      _writeLastVoteForMyElection()
@@ -1083,7 +1085,6 @@ private:
      *      _onVoteRequestComplete()
      */
     void _startElectSelfV1_inlock(StartElectionReasonEnum reason);
-    void _startElectSelfV1(StartElectionReasonEnum reason);
 
     /**
      * Callback called when the dryRun VoteRequester has completed; checks the results and
@@ -1161,7 +1162,7 @@ private:
     /**
      * Schedules a replica set config change.
      */
-    void _scheduleHeartbeatReconfig_inlock(const ReplSetConfig& newConfig);
+    void _scheduleHeartbeatReconfig(WithLock lk, const ReplSetConfig& newConfig);
 
     /**
      * Method to write a configuration transmitted via heartbeat message to stable storage.
@@ -1448,6 +1449,11 @@ private:
     void _reconfigToRemoveNewlyAddedField(const executor::TaskExecutor::CallbackArgs& cbData,
                                           MemberId memberId,
                                           ConfigVersionAndTerm versionAndTerm);
+
+    /*
+     * Calculates and returns the read preference for the node.
+     */
+    const ReadPreference _getSyncSourceReadPreference(WithLock);
 
     //
     // All member variables are labeled with one of the following codes indicating the
