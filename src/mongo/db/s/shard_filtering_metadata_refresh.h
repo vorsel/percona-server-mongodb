@@ -35,34 +35,7 @@
 
 namespace mongo {
 
-class CatalogCache;
-class CatalogCacheLoader;
-class ServiceContext;
 class OperationContext;
-
-/**
- * Returns True when a separate CatalogCache must be used for filtering
- */
-bool hasAdditionalCatalogCacheForFiltering();
-
-/**
- * CatalogCacheForFiltering is only used on a shard for obtaining the orphan filtering metadata
- */
-void setCatalogCacheForFiltering(ServiceContext* serviceContext,
-                                 std::unique_ptr<CatalogCache> catalogCache);
-
-
-/**
- * CatalogCacheLoaderForFiltering is only used on a shard for obtaining the orphan filtering
- * metadata
- */
-void setCatalogCacheLoaderForFiltering(ServiceContext* serviceContext,
-                                       std::unique_ptr<CatalogCacheLoader> loader);
-
-// For routing use `CatalogCacheLoader::get()`
-CatalogCacheLoader& getCatalogCacheLoaderForFiltering(ServiceContext* serviceContext);
-CatalogCacheLoader& getCatalogCacheLoaderForFiltering(OperationContext* opCtx);
-
 
 /**
  * Must be invoked whenever code, which is executing on a shard encounters a StaleConfig exception
@@ -83,8 +56,7 @@ CatalogCacheLoader& getCatalogCacheLoaderForFiltering(OperationContext* opCtx);
  */
 Status onShardVersionMismatchNoExcept(OperationContext* opCtx,
                                       const NamespaceString& nss,
-                                      ChunkVersion shardVersionReceived,
-                                      bool forceRefreshFromThisThread = false) noexcept;
+                                      ChunkVersion shardVersionReceived) noexcept;
 
 /**
  * Unconditionally causes the shard's filtering metadata to be refreshed from the config server and
@@ -110,5 +82,25 @@ Status onDbVersionMismatchNoExcept(
     const boost::optional<DatabaseVersion>& serverDbVersion) noexcept;
 
 void forceDatabaseRefresh(OperationContext* opCtx, const StringData dbName);
+
+/**
+ * RAII-style class that enters the migration critical section and refresh the filtering
+ * metadata for the specified collection. The critical section is released when this object
+ * goes out of scope.
+ */
+class ScopedShardVersionCriticalSection {
+    ScopedShardVersionCriticalSection(const ScopedShardVersionCriticalSection&) = delete;
+    ScopedShardVersionCriticalSection& operator=(const ScopedShardVersionCriticalSection&) = delete;
+
+public:
+    ScopedShardVersionCriticalSection(OperationContext* opCtx, NamespaceString nss);
+    ~ScopedShardVersionCriticalSection();
+
+    void enterCommitPhase();
+
+private:
+    OperationContext* const _opCtx;
+    const NamespaceString _nss;
+};
 
 }  // namespace mongo

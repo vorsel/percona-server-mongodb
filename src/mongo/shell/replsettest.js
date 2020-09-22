@@ -138,16 +138,21 @@ var ReplSetTest = function(opts) {
         self._slaves = [];
 
         var twoPrimaries = false;
+        let isMaster = false;
+        // Ensure that only one node is in primary state.
         self.nodes.forEach(function(node) {
             try {
                 node.setSlaveOk();
                 var n = node.getDB('admin').runCommand({ismaster: 1});
                 self._liveNodes.push(node);
-                if (n.ismaster == true) {
+                // We verify that the node has a valid config by checking if n.me exists. Then, we
+                // check to see if the node is in primary state.
+                if (n.me && n.me == n.primary) {
                     if (self._master) {
                         twoPrimaries = true;
                     } else {
                         self._master = node;
+                        isMaster = n.ismaster;
                     }
                 } else {
                     self._slaves.push(node);
@@ -157,11 +162,11 @@ var ReplSetTest = function(opts) {
                 self._slaves.push(node);
             }
         });
-        if (twoPrimaries) {
+        if (twoPrimaries || !self._master || !isMaster) {
             return false;
         }
 
-        return self._master || false;
+        return self._master;
     }
 
     /**
@@ -884,6 +889,44 @@ var ReplSetTest = function(opts) {
         assert(highPriorityNodes.includes(primary),
                "Primary switched away from highest priority node.  Found primary: " +
                    tojson(primary) + ", but expected one of: " + tojson(highPriorityNodes));
+    };
+
+    /**
+     * Blocks until all nodes agree on who the primary is.
+     * Unlike awaitNodesAgreeOnPrimary, this does not require that all nodes are authenticated.
+     */
+    this.awaitNodesAgreeOnPrimaryNoAuth = function(timeout, nodes) {
+        timeout = timeout || self.kDefaultTimeoutMS;
+        nodes = nodes || self.nodes;
+
+        print("AwaitNodesAgreeOnPrimaryNoAuth: Waiting for nodes to agree on any primary.");
+
+        assert.soonNoExcept(function() {
+            var primary;
+
+            for (var i = 0; i < nodes.length; i++) {
+                var isMaster = assert.commandWorked(nodes[i].adminCommand({isMaster: 1}));
+                var nodesPrimary = isMaster.primary;
+                // Node doesn't see a primary.
+                if (!nodesPrimary) {
+                    print("AwaitNodesAgreeOnPrimaryNoAuth: Retrying because " + nodes[i].name +
+                          " does not see a primary.");
+                    return false;
+                }
+
+                if (!primary) {
+                    // If we haven't seen a primary yet, set it to this.
+                    primary = nodesPrimary;
+                } else if (primary !== nodesPrimary) {
+                    print("AwaitNodesAgreeOnPrimaryNoAuth: Retrying because " + nodes[i].name +
+                          " thinks the primary is " + nodesPrimary + " instead of " + primary);
+                    return false;
+                }
+            }
+
+            print("AwaitNodesAgreeOnPrimaryNoAuth: Nodes agreed on primary " + primary);
+            return true;
+        }, "Awaiting nodes to agree on primary", timeout);
     };
 
     /**

@@ -31,6 +31,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/s/mongos_main.h"
+
 #include <boost/optional.hpp>
 #include <memory>
 
@@ -85,6 +87,7 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
 #include "mongo/s/mongos_options.h"
+#include "mongo/s/mongos_server_parameters_gen.h"
 #include "mongo/s/mongos_topology_coordinator.h"
 #include "mongo/s/query/cluster_cursor_cleanup_job.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
@@ -136,6 +139,8 @@ using logv2::LogComponent;
 MONGO_FAIL_POINT_DEFINE(failReplicaSetChangeConfigServerUpdateHook);
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(pauseWhileKillingOperationsAtShutdown);
 
 #if defined(_WIN32)
 const ntservice::NtServiceDefaultStrings defaultServiceStrings = {
@@ -254,7 +259,8 @@ void implicitlyAbortAllTransactions(OperationContext* opCtx) {
  * NOTE: This function may be called at any time after registerShutdownTask is called below. It must
  * not depend on the prior execution of mongo initializers or the existence of threads.
  */
-void cleanupTask(ServiceContext* serviceContext) {
+void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
+    const auto serviceContext = getGlobalServiceContext();
     {
         // This client initiation pattern is only to be used here, with plans to eliminate this
         // pattern down the line.
@@ -269,11 +275,20 @@ void cleanupTask(ServiceContext* serviceContext) {
             opCtx = uniqueTxn.get();
         }
 
+        Milliseconds quiesceTime;
+        if (shutdownArgs.quiesceTime) {
+            quiesceTime = *shutdownArgs.quiesceTime;
+        } else {
+            // IDL gaurantees that quiesceTime is populated.
+            invariant(!shutdownArgs.isUserInitiated);
+            quiesceTime = Milliseconds(mongosShutdownTimeoutMillisForSignaledShutdown.load());
+        }
+
         // Enter quiesce mode so that existing and new short operations are allowed to finish.
         // At this point, we will start responding to any isMaster request with ShutdownInProgress
         // so that clients can re-route their operations.
         if (auto mongosTopCoord = MongosTopologyCoordinator::get(opCtx)) {
-            mongosTopCoord->enterQuiesceModeAndWait(opCtx);
+            mongosTopCoord->enterQuiesceModeAndWait(opCtx, quiesceTime);
         }
 
         // Shutdown the TransportLayer so that new connections aren't accepted
@@ -304,6 +319,11 @@ void cleanupTask(ServiceContext* serviceContext) {
 
         if (serviceContext) {
             serviceContext->setKillAllOperations();
+
+            if (MONGO_unlikely(pauseWhileKillingOperationsAtShutdown.shouldFail())) {
+                LOGV2(4701800, "pauseWhileKillingOperationsAtShutdown failpoint enabled");
+                sleepsecs(1);
+            }
         }
 
         // Perform all shutdown operations after setKillAllOperations is called in order to ensure
@@ -865,7 +885,6 @@ ExitCode main(ServiceContext* serviceContext) {
     return runMongosServer(serviceContext);
 }
 
-namespace {
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 (InitializerContext* context) {
     forkServerOrDie();
@@ -895,7 +914,7 @@ MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManage
 
 }  // namespace
 
-ExitCode mongoSMain(int argc, char* argv[], char** envp) {
+ExitCode mongos_main(int argc, char* argv[], char** envp) {
     setMongos();
 
     if (argc < 1)
@@ -928,9 +947,9 @@ ExitCode mongoSMain(int argc, char* argv[], char** envp) {
         return EXIT_ABRUPT;
     }
 
-    const auto service = getGlobalServiceContext();
+    registerShutdownTask(cleanupTask);
 
-    registerShutdownTask([service]() { cleanupTask(service); });
+    const auto service = getGlobalServiceContext();
 
     ErrorExtraInfo::invariantHaveAllParsers();
 
@@ -967,21 +986,4 @@ ExitCode mongoSMain(int argc, char* argv[], char** envp) {
     }
 }
 
-}  // namespace
 }  // namespace mongo
-
-#if defined(_WIN32)
-// In Windows, wmain() is an alternate entry point for main(), and receives the same parameters
-// as main() but encoded in Windows Unicode (UTF-16); "wide" 16-bit wchar_t characters.  The
-// WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
-// and makes them available through the argv() and envp() members.  This enables mongoSMain()
-// to process UTF-8 encoded arguments and environment variables without regard to platform.
-int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
-    mongo::WindowsCommandLine wcl(argc, argvW, envpW);
-    mongo::exitCleanly(mongo::mongoSMain(argc, wcl.argv(), wcl.envp()));
-}
-#else
-int main(int argc, char* argv[], char** envp) {
-    mongo::exitCleanly(mongo::mongoSMain(argc, argv, envp));
-}
-#endif

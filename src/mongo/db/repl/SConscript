@@ -47,7 +47,6 @@ env.Library(
         'repl_settings',
         'timestamp_block',
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/background',
         '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
         '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/catalog/index_build_oplog_entry',
@@ -97,7 +96,6 @@ env.Library(
         'oplog_interface_remote',
         'repl_coordinator_interface',
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/background',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/dbhelpers',
@@ -153,12 +151,6 @@ env.Library(
         '$BUILD_DIR/mongo/idl/server_parameter',
     ],
 )
-
-env.Library('rslog',
-            'rslog.cpp',
-            LIBDEPS=[
-                '$BUILD_DIR/mongo/base',
-            ])
 
 env.Library(
     target='abstract_async_component',
@@ -403,7 +395,6 @@ env.Library(
         'replication_process',
         'roll_back_local_operations',
         'rollback_impl',
-        'rslog',
         '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
         '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
@@ -667,7 +658,6 @@ env.Library('topology_coordinator',
                 'member_data',
                 'replica_set_messages',
                 'repl_settings',
-                'rslog',
                 'repl_coordinator_interface',
             ],
             LIBDEPS_PRIVATE=[
@@ -710,7 +700,6 @@ env.Library(
         'replica_set_messages',
         'replication_process',
         'reporter',
-        'rslog',
         'scatter_gather',
         'topology_coordinator',
     ],

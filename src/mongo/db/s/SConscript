@@ -67,7 +67,6 @@ env.Library(
         'range_deletion_util.cpp',
         'read_only_catalog_cache_loader.cpp',
         'scoped_operation_completion_sharding_actions.cpp',
-        'scoped_shard_version_critical_section.cpp',
         'session_catalog_migration_destination.cpp',
         'session_catalog_migration_source.cpp',
         'shard_filtering_metadata_refresh.cpp',
@@ -255,7 +254,9 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
+        '$BUILD_DIR/mongo/db/snapshot_window_options',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser',
     ],
 )
 

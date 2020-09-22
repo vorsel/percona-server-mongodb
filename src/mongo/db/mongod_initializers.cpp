@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,31 +27,5 @@
  *    it in the license file.
  */
 
-#pragma once
-
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/s/collection_sharding_runtime.h"
-
-namespace mongo {
-
-/**
- * RAII-style class that enters the migration critical section and refresh the filtering
- * metadata for the specified collection. The critical section is released when this object
- * goes out of scope.
- */
-class ScopedShardVersionCriticalSection {
-    ScopedShardVersionCriticalSection(const ScopedShardVersionCriticalSection&) = delete;
-    ScopedShardVersionCriticalSection& operator=(const ScopedShardVersionCriticalSection&) = delete;
-
-public:
-    ScopedShardVersionCriticalSection(OperationContext* opCtx, NamespaceString nss);
-    ~ScopedShardVersionCriticalSection();
-
-    void enterCommitPhase();
-
-private:
-    const NamespaceString _nss;
-    OperationContext* _opCtx;
-};
-
-}  // namespace mongo
+// This file intentionally blank. mongod_initializers.cpp exists only to provide
+// a compilable source file for systems which cannot produce a library with no sources.

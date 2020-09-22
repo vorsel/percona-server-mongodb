@@ -631,17 +631,21 @@ __txn_append_hs_record(WT_SESSION_IMPL *session, WT_CURSOR *hs_cursor, WT_ITEM *
 
     WT_ERR(hs_cursor->get_key(hs_cursor, &hs_btree_id, hs_key, &hs_start_ts, &hs_counter));
 
-    /* Stop before crossing over to the next btree */
-    if (hs_btree_id != S2BT(session)->id)
+    /* Not found if we cross the tree boundary. */
+    if (hs_btree_id != S2BT(session)->id) {
+        ret = WT_NOTFOUND;
         goto done;
+    }
 
     /*
      * Keys are sorted in an order, skip the ones before the desired key, and bail out if we have
      * crossed over the desired key and not found the record we are looking for.
      */
     WT_ERR(__wt_compare(session, NULL, hs_key, key, &cmp));
-    if (cmp != 0)
+    if (cmp != 0) {
+        ret = WT_NOTFOUND;
         goto done;
+    }
 
     /*
      * As part of the history store search, we never get an exact match based on our search criteria
@@ -666,9 +670,9 @@ __txn_append_hs_record(WT_SESSION_IMPL *session, WT_CURSOR *hs_cursor, WT_ITEM *
         goto done;
 
     WT_ERR(__wt_upd_alloc(session, hs_value, WT_UPDATE_STANDARD, &upd, &size));
-    upd->txnid = hs_cbt->upd_value->txnid;
-    upd->durable_ts = durable_ts;
-    upd->start_ts = hs_start_ts;
+    upd->txnid = hs_cbt->upd_value->tw.start_txn;
+    upd->durable_ts = hs_cbt->upd_value->tw.durable_start_ts;
+    upd->start_ts = hs_cbt->upd_value->tw.start_ts;
     *fix_updp = upd;
 
     /*
@@ -683,10 +687,9 @@ __txn_append_hs_record(WT_SESSION_IMPL *session, WT_CURSOR *hs_cursor, WT_ITEM *
     /* If the history store record has a valid stop time point, append it. */
     if (hs_stop_durable_ts != WT_TS_MAX) {
         WT_ERR(__wt_upd_alloc(session, NULL, WT_UPDATE_TOMBSTONE, &tombstone, &size));
-        tombstone->durable_ts = hs_stop_durable_ts;
-        /* FIXME: get the correct stop ts and txnid from the cell. */
-        tombstone->start_ts = hs_stop_durable_ts;
-        tombstone->txnid = WT_TXN_NONE;
+        tombstone->durable_ts = hs_cbt->upd_value->tw.durable_stop_ts;
+        tombstone->start_ts = hs_cbt->upd_value->tw.stop_ts;
+        tombstone->txnid = hs_cbt->upd_value->tw.stop_txn;
         tombstone->next = upd;
         total_size += size;
     } else
@@ -886,14 +889,15 @@ __txn_resolve_prepared_op(WT_SESSION_IMPL *session, WT_TXN_OP *op, bool commit, 
      * Aborted updates can exist in the update chain of our transaction. Generally this will occur
      * due to a reserved update. As such we should skip over these updates.
      */
-    for (; upd->txnid == WT_TXN_ABORTED; upd = upd->next)
+    for (; upd != NULL && upd->txnid == WT_TXN_ABORTED; upd = upd->next)
         ;
 
     /*
      * The head of the update chain is not a prepared update, which means all the prepared updates
-     * of the key are resolved.
+     * of the key are resolved. The head of the update chain can also be null in the scenario that
+     * we rolled back all associated updates in the previous iteration of this function.
      */
-    if (upd->prepare_state != WT_PREPARE_INPROGRESS)
+    if (upd == NULL || upd->prepare_state != WT_PREPARE_INPROGRESS)
         return (0);
 
     /*
@@ -916,16 +920,21 @@ __txn_resolve_prepared_op(WT_SESSION_IMPL *session, WT_TXN_OP *op, bool commit, 
 
         /*
          * Scan the history store for the given btree and key with maximum start timestamp to let
-         * the search point to the last version of the key.
+         * the search point to the last version of the key. We must ignore tombstone in the history
+         * store while retrieving the update from the history store to replace the update in the
+         * data store.
          */
+        F_SET(hs_cursor, WT_CURSTD_IGNORE_TOMBSTONE);
         WT_ERR_NOTFOUND_OK(
           __wt_hs_cursor_position(session, hs_cursor, hs_btree_id, &op->u.op_row.key, WT_TS_MAX),
           true);
 
         if (ret == 0)
-            WT_ERR(__txn_append_hs_record(session, hs_cursor, &op->u.op_row.key, cbt->ref->page,
-              upd, commit, &fix_upd, &upd_appended));
-        else if (ret == WT_NOTFOUND && !commit) {
+            /* Not found if we cross the tree or key boundary. */
+            WT_ERR_NOTFOUND_OK(__txn_append_hs_record(session, hs_cursor, &op->u.op_row.key,
+                                 cbt->ref->page, upd, commit, &fix_upd, &upd_appended),
+              true);
+        if (ret == WT_NOTFOUND && !commit) {
             /*
              * Allocate a tombstone so that when we reconcile the update chain we don't copy the
              * prepared cell, which is now associated with a rolled back prepare, and instead write
@@ -999,8 +1008,10 @@ __txn_resolve_prepared_op(WT_SESSION_IMPL *session, WT_TXN_OP *op, bool commit, 
         WT_ERR(__txn_fixup_prepared_update(session, hs_cursor, fix_upd, commit));
 
 err:
-    if (hs_cursor != NULL)
+    if (hs_cursor != NULL) {
+        F_CLR(hs_cursor, WT_CURSTD_IGNORE_TOMBSTONE);
         ret = __wt_hs_cursor_close(session, session_flags, is_owner);
+    }
     if (!upd_appended)
         __wt_free(session, fix_upd);
     return (ret);
@@ -1493,11 +1504,9 @@ __wt_txn_prepare(WT_SESSION_IMPL *session, const char *cfg[])
          * Logged table updates should never be prepared. As these updates are immediately durable,
          * it is not possible to roll them back if the prepared transaction is rolled back.
          */
-        if (!F_ISSET(op->btree, WT_BTREE_NO_LOGGING) &&
-          (FLD_ISSET(S2C(session)->log_flags, WT_CONN_LOG_ENABLED) ||
-            F_ISSET(S2C(session), WT_CONN_IN_MEMORY)))
+        if (FLD_ISSET(S2C(session)->log_flags, WT_CONN_LOG_ENABLED) &&
+          !F_ISSET(op->btree, WT_BTREE_NO_LOGGING))
             WT_RET_MSG(session, EINVAL, "transaction prepare is not supported with logged tables");
-
         switch (op->type) {
         case WT_TXN_OP_NONE:
             break;

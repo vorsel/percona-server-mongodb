@@ -287,8 +287,8 @@ void fillOutPlannerParams(OperationContext* opCtx,
 
     // If the caller wants a shard filter, make sure we're actually sharded.
     if (plannerParams->options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
-        auto collDesc =
-            CollectionShardingState::get(opCtx, canonicalQuery->nss())->getCollectionDescription();
+        auto collDesc = CollectionShardingState::get(opCtx, canonicalQuery->nss())
+                            ->getCollectionDescription(opCtx);
         if (collDesc.isSharded()) {
             plannerParams->shardKey = collDesc.getKeyPattern();
         } else {
@@ -915,7 +915,7 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
     // the collection prior to calling this method. Explain, however, will never do
     // collection or database creation.
     if (!collection && request->isUpsert()) {
-        invariant(request->isExplain());
+        invariant(request->explain());
     }
 
     // If the parsed update does not have a user-specified collation, set it from the collection
@@ -1001,9 +1001,6 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
 
     // This is the regular path for when we have a CanonicalQuery.
     unique_ptr<CanonicalQuery> cq(parsedUpdate->releaseParsedQuery());
-
-    // Transfer the explain verbosity level into the expression context.
-    cq->getExpCtx()->explain = verbosity;
 
     std::unique_ptr<projection_ast::Projection> projection;
     if (!request->getProj().isEmpty()) {

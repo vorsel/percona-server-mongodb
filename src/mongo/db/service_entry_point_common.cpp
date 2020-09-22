@@ -390,7 +390,7 @@ LogicalTime getClientOperationTime(OperationContext* opCtx) {
     }
 
     return LogicalTime(
-        repl::ReplClientInfo::forClient(opCtx->getClient()).getMaxKnownOpTime().getTimestamp());
+        repl::ReplClientInfo::forClient(opCtx->getClient()).getMaxKnownOperationTime());
 }
 
 /**
@@ -514,7 +514,7 @@ void appendErrorLabelsAndTopologyVersion(OperationContext* opCtx,
     const auto shouldAppendTopologyVersion =
         (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet &&
          isNotMasterError) ||
-        (replCoord->inQuiesceMode() && isShutdownError);
+        (isShutdownError && replCoord->inQuiesceMode());
 
     if (!shouldAppendTopologyVersion) {
         return;

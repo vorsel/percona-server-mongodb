@@ -50,7 +50,7 @@ extern AtomicWord<int> migrationLockAcquisitionMaxWaitMS;
 class CollectionShardingRuntime final : public CollectionShardingState,
                                         public Decorable<CollectionShardingRuntime> {
 public:
-    CollectionShardingRuntime(ServiceContext* sc,
+    CollectionShardingRuntime(ServiceContext* service,
                               NamespaceString nss,
                               std::shared_ptr<executor::TaskExecutor> rangeDeleterExecutor);
 
@@ -87,7 +87,7 @@ public:
     ScopedCollectionFilter getOwnershipFilter(OperationContext* opCtx,
                                               OrphanCleanupPolicy orphanCleanupPolicy) override;
 
-    ScopedCollectionDescription getCollectionDescription() override;
+    ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx) override;
     ScopedCollectionDescription getCollectionDescription_DEPRECATED() override;
 
     void checkShardVersionOrThrow(OperationContext* opCtx) override;
@@ -167,8 +167,8 @@ public:
      *
      * In these methods, the CSRLock ensures concurrent access to the critical section.
      */
-    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx);
-    void enterCriticalSectionCommitPhase(OperationContext* opCtx);
+    void enterCriticalSectionCatchUpPhase(OperationContext* opCtx, const CSRLock&);
+    void enterCriticalSectionCommitPhase(OperationContext* opCtx, const CSRLock&);
 
     /**
      * Method to control the collection's critical secion. Method listed below must be called with
@@ -221,6 +221,9 @@ private:
     std::shared_ptr<ScopedCollectionDescription::Impl> _getMetadataWithVersionCheckAt(
         OperationContext* opCtx, const boost::optional<mongo::LogicalTime>& atClusterTime);
 
+    // The service context under which this instance runs
+    ServiceContext* const _serviceContext;
+
     // Namespace this state belongs to.
     const NamespaceString _nss;
 
@@ -236,15 +239,12 @@ private:
     // Must hold CSRLock while accessing.
     ShardingMigrationCriticalSection _critSec;
 
+    // Protects state around the metadata manager below
     mutable Mutex _metadataManagerLock =
         MONGO_MAKE_LATCH("CollectionShardingRuntime::_metadataManagerLock");
 
     // Tracks whether the filtering metadata is unknown, unsharded, or sharded
-    enum class MetadataType {
-        kUnknown,
-        kUnsharded,
-        kSharded
-    } _metadataType{MetadataType::kUnknown};
+    enum class MetadataType { kUnknown, kUnsharded, kSharded } _metadataType;
 
     // If the collection is sharded, contains all the metadata associated with this collection.
     //
@@ -254,9 +254,6 @@ private:
 
     // Used for testing to check the number of times a new MetadataManager has been installed.
     std::uint64_t _numMetadataManagerChanges{0};
-
-    // Used to get the shardId if no metadata is known when calling getCollectionDescription
-    ServiceContext* _serviceContext;
 };
 
 /**
@@ -267,7 +264,7 @@ class CollectionCriticalSection {
     CollectionCriticalSection& operator=(const CollectionCriticalSection&) = delete;
 
 public:
-    CollectionCriticalSection(OperationContext* opCtx, NamespaceString ns);
+    CollectionCriticalSection(OperationContext* opCtx, NamespaceString nss);
     ~CollectionCriticalSection();
 
     /**
@@ -276,9 +273,9 @@ public:
     void enterCommitPhase();
 
 private:
-    NamespaceString _nss;
+    OperationContext* const _opCtx;
 
-    OperationContext* _opCtx;
+    NamespaceString _nss;
 };
 
 }  // namespace mongo

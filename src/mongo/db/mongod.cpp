@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,20 +27,26 @@
  *    it in the license file.
  */
 
-#pragma once
+#include "mongo/platform/basic.h"
 
-#include <string>
+#include "mongo/db/mongod_main.h"
+#include "mongo/util/quick_exit.h"
+#include "mongo/util/text.h"
 
-namespace mongo {
-
-namespace logger {
-class Tee;
-}  // namespace logger
-
-namespace repl {
-
-// ramlog used for replSet actions
-extern logger::Tee* rsLog;
-
-}  // namespace repl
-}  // namespace mongo
+#if defined(_WIN32)
+// In Windows, wmain() is an alternate entry point for main(), and receives the same parameters
+// as main() but encoded in Windows Unicode (UTF-16); "wide" 16-bit wchar_t characters.  The
+// WindowsCommandLine object converts these wide character strings to a UTF-8 coded equivalent
+// and makes them available through the argv() and envp() members.  This enables mongoDbMain()
+// to process UTF-8 encoded arguments and environment variables without regard to platform.
+int wmain(int argc, wchar_t* argvW[], wchar_t* envpW[]) {
+    mongo::WindowsCommandLine wcl(argc, argvW, envpW);
+    int exitCode = mongo::mongod_main(argc, wcl.argv(), wcl.envp());
+    mongo::quickExit(exitCode);
+}
+#else
+int main(int argc, char* argv[], char** envp) {
+    int exitCode = mongo::mongod_main(argc, argv, envp);
+    mongo::quickExit(exitCode);
+}
+#endif

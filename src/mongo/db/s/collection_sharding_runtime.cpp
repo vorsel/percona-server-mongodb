@@ -89,17 +89,15 @@ boost::optional<ChunkVersion> getOperationReceivedVersion(OperationContext* opCt
 }  // namespace
 
 CollectionShardingRuntime::CollectionShardingRuntime(
-    ServiceContext* sc,
+    ServiceContext* service,
     NamespaceString nss,
     std::shared_ptr<executor::TaskExecutor> rangeDeleterExecutor)
-    : _nss(std::move(nss)),
-      _rangeDeleterExecutor(rangeDeleterExecutor),
-      _stateChangeMutex(nss.toString()),
-      _serviceContext(sc) {
-    if (isNamespaceAlwaysUnsharded(_nss)) {
-        _metadataType = MetadataType::kUnsharded;
-    }
-}
+    : _serviceContext(service),
+      _nss(std::move(nss)),
+      _rangeDeleterExecutor(std::move(rangeDeleterExecutor)),
+      _stateChangeMutex(_nss.toString()),
+      _metadataType(isNamespaceAlwaysUnsharded(_nss) ? MetadataType::kUnsharded
+                                                     : MetadataType::kUnknown) {}
 
 CollectionShardingRuntime* CollectionShardingRuntime::get(OperationContext* opCtx,
                                                           const NamespaceString& nss) {
@@ -123,10 +121,14 @@ ScopedCollectionFilter CollectionShardingRuntime::getOwnershipFilter(
                                           repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime());
 }
 
-ScopedCollectionDescription CollectionShardingRuntime::getCollectionDescription() {
+ScopedCollectionDescription CollectionShardingRuntime::getCollectionDescription(
+    OperationContext* opCtx) {
+    auto& oss = OperationShardingState::get(opCtx);
     // If the server has been started with --shardsvr, but hasn't been added to a cluster we should
-    // consider all collections as unsharded.
-    if (!ShardingState::get(_serviceContext)->enabled()) {
+    // consider all collections as unsharded. Also, return unsharded if no shard version or db
+    // version is present on the context.
+    if (!ShardingState::get(_serviceContext)->enabled() ||
+        (!oss.hasShardVersion() && !oss.hasDbVersion())) {
         return {kUnshardedCollection};
     }
 
@@ -164,15 +166,13 @@ void CollectionShardingRuntime::checkShardVersionOrThrow(OperationContext* opCtx
     (void)_getMetadataWithVersionCheckAt(opCtx, boost::none);
 }
 
-void CollectionShardingRuntime::enterCriticalSectionCatchUpPhase(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
-    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, this);
+void CollectionShardingRuntime::enterCriticalSectionCatchUpPhase(OperationContext* opCtx,
+                                                                 const CSRLock&) {
     _critSec.enterCriticalSectionCatchUpPhase();
 }
 
-void CollectionShardingRuntime::enterCriticalSectionCommitPhase(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_X));
-    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, this);
+void CollectionShardingRuntime::enterCriticalSectionCommitPhase(OperationContext* opCtx,
+                                                                const CSRLock&) {
     _critSec.enterCriticalSectionCommitPhase();
 }
 
@@ -417,8 +417,8 @@ size_t CollectionShardingRuntime::numberOfRangesScheduledForDeletion() const {
     return 0;
 }
 
-CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx, NamespaceString ns)
-    : _nss(std::move(ns)), _opCtx(opCtx) {
+CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx, NamespaceString nss)
+    : _opCtx(opCtx), _nss(std::move(nss)) {
     AutoGetCollection autoColl(_opCtx,
                                _nss,
                                MODE_X,
@@ -426,7 +426,8 @@ CollectionCriticalSection::CollectionCriticalSection(OperationContext* opCtx, Na
                                opCtx->getServiceContext()->getPreciseClockSource()->now() +
                                    Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
     auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
-    csr->enterCriticalSectionCatchUpPhase(_opCtx);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr);
+    csr->enterCriticalSectionCatchUpPhase(_opCtx, csrLock);
 }
 
 CollectionCriticalSection::~CollectionCriticalSection() {
@@ -444,7 +445,8 @@ void CollectionCriticalSection::enterCommitPhase() {
                                _opCtx->getServiceContext()->getPreciseClockSource()->now() +
                                    Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
     auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
-    csr->enterCriticalSectionCommitPhase(_opCtx);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
+    csr->enterCriticalSectionCommitPhase(_opCtx, csrLock);
 }
 
 }  // namespace mongo

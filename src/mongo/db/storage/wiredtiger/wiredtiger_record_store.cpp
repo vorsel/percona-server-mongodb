@@ -678,8 +678,16 @@ public:
         WT_SESSION* session = WiredTigerRecoveryUnit::get(_opCtx)->getSession()->getSession();
 
         if (!_cursor) {
-            invariantWTOK(session->open_cursor(
+            auto status = wtRCToStatus(session->open_cursor(
                 session, _rs->_uri.c_str(), nullptr, _config.c_str(), &_cursor));
+            if (status == ErrorCodes::ObjectIsBusy) {
+                // This can happen if you try to open a cursor on the oplog table and a verify is
+                // currently running on it.
+                uasserted(
+                    4820000,
+                    "Failed to open a cursor on a collection because it was locked by WiredTiger.");
+            }
+            invariantStatusOK(status);
             invariant(_cursor);
         }
         return true;
@@ -1532,7 +1540,9 @@ StatusWith<Timestamp> WiredTigerRecordStore::getLatestOplogTimestamp(
 
     WiredTigerSessionCache* cache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();
     auto sessRaii = cache->getSession();
-    WT_CURSOR* cursor = sessRaii->getCachedCursor(_uri, _tableId, nullptr);
+    WT_CURSOR* cursor = writeConflictRetry(opCtx, "getLatestOplogTimestamp", "local.oplog.rs", [&] {
+        return sessRaii->getCachedCursor(_uri, _tableId, nullptr);
+    });
     ON_BLOCK_EXIT([&] { sessRaii->releaseCursor(_tableId, cursor); });
     int ret = cursor->prev(cursor);
     if (ret == WT_NOTFOUND) {
@@ -1554,7 +1564,10 @@ StatusWith<Timestamp> WiredTigerRecordStore::getEarliestOplogTimestamp(Operation
     if (_cappedFirstRecord == RecordId()) {
         WiredTigerSessionCache* cache = WiredTigerRecoveryUnit::get(opCtx)->getSessionCache();
         auto sessRaii = cache->getSession();
-        WT_CURSOR* cursor = sessRaii->getCachedCursor(_uri, _tableId, nullptr);
+        WT_CURSOR* cursor =
+            writeConflictRetry(opCtx, "getEarliestOplogTimestamp", "local.oplog.rs", [&] {
+                return sessRaii->getCachedCursor(_uri, _tableId, nullptr);
+            });
         ON_BLOCK_EXIT([&] { sessRaii->releaseCursor(_tableId, cursor); });
         auto ret = cursor->next(cursor);
         if (ret == WT_NOTFOUND) {

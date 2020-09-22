@@ -77,6 +77,7 @@
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/commands/cluster_explain.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/mongos_topology_coordinator.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/query/cluster_find.h"
 #include "mongo/s/session_catalog_router.h"
@@ -270,24 +271,6 @@ void execCommandClient(OperationContext* opCtx,
             auto body = result->getBodyBuilder();
             CommandHelpers::appendCommandStatusNoThrow(body, e.toStatus());
             return;
-        }
-
-        auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-        if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern &&
-            !TransactionRouter::get(opCtx) && !readConcernArgs.getArgsAtClusterTime()) {
-            // Select the latest known clusterTime as the atClusterTime for snapshot reads outside
-            // of transactions.
-            auto atClusterTime = [&] {
-                auto latestKnownClusterTime = LogicalClock::get(opCtx)->getClusterTime();
-                // If the user passed afterClusterTime, the chosen time must be greater than or
-                // equal to it.
-                auto afterClusterTime = readConcernArgs.getArgsAfterClusterTime();
-                if (afterClusterTime && *afterClusterTime > latestKnownClusterTime) {
-                    return afterClusterTime->asTimestamp();
-                }
-                return latestKnownClusterTime.asTimestamp();
-            }();
-            readConcernArgs.setArgsAtClusterTimeForSnapshot(atClusterTime);
         }
 
         // attach tracking
@@ -676,6 +659,24 @@ void runCommand(OperationContext* opCtx,
                           "unexpected change of namespace when retrying");
             }
 
+            // On each try, select the latest known clusterTime as the atClusterTime for snapshot
+            // reads outside of transactions.
+            if (readConcernArgs.getLevel() == repl::ReadConcernLevel::kSnapshotReadConcern &&
+                !TransactionRouter::get(opCtx) &&
+                (!readConcernArgs.getArgsAtClusterTime() ||
+                 readConcernArgs.wasAtClusterTimeSelected())) {
+                auto atClusterTime = [&] {
+                    auto latestKnownClusterTime = LogicalClock::get(opCtx)->getClusterTime();
+                    // Choose a time after the user-supplied afterClusterTime.
+                    auto afterClusterTime = readConcernArgs.getArgsAfterClusterTime();
+                    if (afterClusterTime && *afterClusterTime > latestKnownClusterTime) {
+                        return afterClusterTime->asTimestamp();
+                    }
+                    return latestKnownClusterTime.asTimestamp();
+                }();
+                readConcernArgs.setArgsAtClusterTimeForSnapshot(atClusterTime);
+            }
+
             replyBuilder->reset();
             try {
                 execCommandClient(opCtx, invocation.get(), request, replyBuilder);
@@ -863,6 +864,11 @@ void runCommand(OperationContext* opCtx,
 
                     abortGuard.dismiss();
                     continue;
+                } else if (!ReadConcernArgs::get(opCtx).wasAtClusterTimeSelected()) {
+                    // Non-transaction snapshot read. The client sent readConcern: {level:
+                    // "snapshot", atClusterTime: T}, where T is older than
+                    // minSnapshotHistoryWindowInSeconds, retrying won't succeed.
+                    throw;
                 }
 
                 if (canRetry) {
@@ -888,6 +894,26 @@ void runCommand(OperationContext* opCtx,
             opCtx, osi, command->getName(), e.code(), boost::none, true /* isInternalClient */);
         errorBuilder->appendElements(errorLabels);
         throw;
+    }
+}
+
+/**
+ * Attaches the topology version to the response.
+ */
+void attachTopologyVersionDuringShutdown(OperationContext* opCtx,
+                                         const DBException& ex,
+                                         BSONObjBuilder* errorBuilder) {
+    // Only attach the topology version if the mongos is in quiesce mode. If the mongos is in
+    // quiesce mode, this shutdown error is due to mongos rather than a shard.
+    auto code = ex.code();
+    if (code && ErrorCodes::isA<ErrorCategory::ShutdownError>(code)) {
+        if (auto mongosTopCoord = MongosTopologyCoordinator::get(opCtx);
+            mongosTopCoord && mongosTopCoord->inQuiesceMode()) {
+            // Append the topology version to the response.
+            const auto topologyVersion = mongosTopCoord->getTopologyVersion();
+            BSONObjBuilder topologyVersionBuilder(errorBuilder->subobjStart("topologyVersion"));
+            topologyVersion.serialize(&topologyVersionBuilder);
+        }
     }
 }
 
@@ -1078,10 +1104,13 @@ DbResponse Strategy::clientCommand(OperationContext* opCtx, const Message& m) {
         if (propagateException) {
             throw;
         }
+
         reply->reset();
         auto bob = reply->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(bob, ex.toStatus());
         appendRequiredFieldsToResponse(opCtx, &bob);
+
+        attachTopologyVersionDuringShutdown(opCtx, ex, &errorBuilder);
         bob.appendElements(errorBuilder.obj());
     }
 

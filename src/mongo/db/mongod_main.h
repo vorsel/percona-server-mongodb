@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,18 +27,8 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/repl/rslog.h"
-
-#include "mongo/logger/tee.h"
-#include "mongo/util/ramlog.h"
-
 namespace mongo {
-namespace repl {
 
-static RamLog* _rsLog = RamLog::get("rs");
-logger::Tee* rsLog = _rsLog;
+int mongod_main(int argc, char* argv[], char** envp);
 
-}  // namespace repl
 }  // namespace mongo

@@ -272,14 +272,14 @@ public:
                                 Date_t now) const;
 
     /**
-     * Returns true if we find an eligible sync source that is considered to be within the same data
-     * center as us and our current sync source is not in the same data center as us.
+     * Returns true if we find an eligible sync source that is significantly closer than our current
+     * sync source.
      */
     bool shouldChangeSyncSourceDueToPingTime(const HostAndPort& currentSource,
                                              const MemberState& memberState,
                                              const OpTime& lastOpTimeFetched,
                                              Date_t now,
-                                             const ReadPreference readPreference) const;
+                                             const ReadPreference readPreference);
 
     /**
      * Sets the reported mode of this node to one of RS_SECONDARY, RS_STARTUP2, RS_ROLLBACK or

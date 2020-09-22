@@ -45,7 +45,6 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
 #include "mongo/db/auth/user_name.h"
-#include "mongo/db/background.h"
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/create_collection.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -458,7 +457,8 @@ public:
         AutoGetCollectionForReadCommand ctx(opCtx, nss);
         Collection* collection = ctx.getCollection();
 
-        const auto collDesc = CollectionShardingState::get(opCtx, nss)->getCollectionDescription();
+        const auto collDesc =
+            CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx);
 
         if (collDesc.isSharded()) {
             const ShardKeyPattern shardKeyPattern(collDesc.getKeyPattern());
