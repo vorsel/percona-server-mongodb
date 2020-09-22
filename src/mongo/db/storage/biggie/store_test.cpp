@@ -1054,6 +1054,12 @@ TEST_F(RadixStoreTest, EraseKeyThatOverlapsAnotherKeyTest) {
     ASSERT_EQ(iter->first, otherKey);
 }
 
+TEST_F(RadixStoreTest, EraseInternalNodeShouldFail) {
+    thisStore.insert({"aaaa", "a"});
+    thisStore.insert({"aaab", "b"});
+    ASSERT_FALSE(thisStore.erase("aaa"));
+}
+
 TEST_F(RadixStoreTest, CopyTest) {
     value_type value1 = std::make_pair("foo", "1");
     value_type value2 = std::make_pair("bar", "2");
@@ -1588,6 +1594,22 @@ TEST_F(RadixStoreTest, MergeOnlyDataDifferenceInBranch) {
 
     expected.insert({"a", "a"});
     expected.insert({"aa", "b"});
+    ASSERT_TRUE(thisStore == expected);
+}
+
+TEST_F(RadixStoreTest, MergeSharedSubKey) {
+    otherStore = baseStore;
+
+    otherStore.insert({"aaa", "a"});
+    otherStore.insert({"aaab", "b"});
+
+    thisStore = baseStore;
+    thisStore.insert({"aaaa", "a"});
+    thisStore.merge3(baseStore, otherStore);
+
+    expected.insert({"aaa", "a"});
+    expected.insert({"aaaa", "a"});
+    expected.insert({"aaab", "b"});
     ASSERT_TRUE(thisStore == expected);
 }
 

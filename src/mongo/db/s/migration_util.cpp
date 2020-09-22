@@ -49,9 +49,11 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/active_migrations_registry.h"
+#include "mongo/db/s/collection_metadata.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/migration_coordinator.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
+#include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_statistics.h"
 #include "mongo/db/s/wait_for_majority_service.h"
 #include "mongo/db/write_concern.h"
@@ -219,6 +221,44 @@ BSONObj makeMigrationStatusDocument(const NamespaceString& nss,
     return builder.obj();
 }
 
+ChunkRange extendOrTruncateBoundsForMetadata(const CollectionMetadata& metadata,
+                                             const ChunkRange& range) {
+    auto metadataShardKeyPattern = KeyPattern(metadata.getKeyPattern());
+
+    // If the input range is shorter than the range in the ChunkManager inside
+    // 'metadata', we must extend its bounds to get a correct comparison. If the input
+    // range is longer than the range in the ChunkManager, we likewise must shorten it.
+    // We make sure to match what's in the ChunkManager instead of the other way around,
+    // since the ChunkManager only stores ranges and compares overlaps using a string version of the
+    // key, rather than a BSONObj. This logic is necessary because the _metadata list can
+    // contain ChunkManagers with different shard keys if the shard key has been refined.
+    //
+    // Note that it's safe to use BSONObj::nFields() (which returns the number of top level
+    // fields in the BSONObj) to compare the two, since shard key refine operations can only add
+    // top-level fields.
+    //
+    // Using extractFieldsUndotted to shorten the input range is correct because the ChunkRange and
+    // the shard key pattern will both already store nested shard key fields as top-level dotted
+    // fields, and extractFieldsUndotted uses the top-level fields verbatim rather than treating
+    // dots as accessors for subfields.
+    auto metadataShardKeyPatternBson = metadataShardKeyPattern.toBSON();
+    auto numFieldsInMetadataShardKey = metadataShardKeyPatternBson.nFields();
+    auto numFieldsInInputRangeShardKey = range.getMin().nFields();
+    if (numFieldsInInputRangeShardKey < numFieldsInMetadataShardKey) {
+        auto extendedRangeMin = metadataShardKeyPattern.extendRangeBound(
+            range.getMin(), false /* makeUpperInclusive */);
+        auto extendedRangeMax = metadataShardKeyPattern.extendRangeBound(
+            range.getMax(), false /* makeUpperInclusive */);
+        return ChunkRange(extendedRangeMin, extendedRangeMax);
+    } else if (numFieldsInInputRangeShardKey > numFieldsInMetadataShardKey) {
+        auto shortenedRangeMin = range.getMin().extractFieldsUndotted(metadataShardKeyPatternBson);
+        auto shortenedRangeMax = range.getMax().extractFieldsUndotted(metadataShardKeyPatternBson);
+        return ChunkRange(shortenedRangeMin, shortenedRangeMax);
+    } else {
+        return range;
+    }
+}
+
 Query overlappingRangeQuery(const ChunkRange& range, const UUID& uuid) {
     return QUERY(RangeDeletionTask::kCollectionUuidFieldName
                  << uuid << RangeDeletionTask::kRangeFieldName + "." + ChunkRange::kMinKey << LT
@@ -254,6 +294,13 @@ ExecutorFuture<void> submitRangeDeletionTask(OperationContext* opCtx,
             }
             auto uniqueOpCtx = tc->makeOperationContext();
             auto opCtx = uniqueOpCtx.get();
+
+            uassert(
+                ErrorCodes::ResumableRangeDeleterDisabled,
+                str::stream()
+                    << "Not submitting range deletion task " << redact(deletionTask.toBSON())
+                    << " because the disableResumableRangeDeleter server parameter is set to true",
+                !disableResumableRangeDeleter.load());
 
             // Make sure the collection metadata is up-to-date.
             {
@@ -897,7 +944,11 @@ void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx) {
                         return true;
                     }
 
-                    if (refreshedMetadata->keyBelongsToMe(doc.getRange().getMin())) {
+                    // Note this should only extend the range boundaries (if there has been a shard
+                    // key refine since the migration began) and never truncate them.
+                    auto chunkRangeToCompareToMetadata =
+                        extendOrTruncateBoundsForMetadata(*refreshedMetadata, doc.getRange());
+                    if (refreshedMetadata->keyBelongsToMe(chunkRangeToCompareToMetadata.getMin())) {
                         coordinator.setMigrationDecision(MigrationCoordinator::Decision::kAborted);
                     } else {
                         coordinator.setMigrationDecision(

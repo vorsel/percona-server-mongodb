@@ -38,8 +38,8 @@ extern bool __wt_rwlock_islocked(WT_SESSION_IMPL *session, WT_RWLOCK *l)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern char *__wt_time_aggregate_to_string(WT_TIME_AGGREGATE *ta, char *ta_string)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
-extern char *__wt_time_pair_to_string(wt_timestamp_t timestamp, uint64_t txn_id, char *tp_string)
-  WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
+extern char *__wt_time_point_to_string(wt_timestamp_t ts, wt_timestamp_t durable_ts,
+  uint64_t txn_id, char *tp_string) WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern char *__wt_time_window_to_string(WT_TIME_WINDOW *tw, char *tw_string)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern char *__wt_timestamp_to_string(wt_timestamp_t ts, char *ts_string)
@@ -938,14 +938,14 @@ extern int __wt_logop_row_truncate_unpack(WT_SESSION_IMPL *session, const uint8_
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_logop_txn_timestamp_pack(WT_SESSION_IMPL *session, WT_ITEM *logrec,
   uint64_t time_sec, uint64_t time_nsec, uint64_t commit_ts, uint64_t durable_ts,
-  uint64_t first_commit_ts, uint64_t prepare_ts, uint64_t read_ts, uint64_t pinned_read_ts)
+  uint64_t first_commit_ts, uint64_t prepare_ts, uint64_t read_ts)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_logop_txn_timestamp_print(WT_SESSION_IMPL *session, const uint8_t **pp,
   const uint8_t *end, WT_TXN_PRINTLOG_ARGS *args) WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_logop_txn_timestamp_unpack(WT_SESSION_IMPL *session, const uint8_t **pp,
   const uint8_t *end, uint64_t *time_secp, uint64_t *time_nsecp, uint64_t *commit_tsp,
-  uint64_t *durable_tsp, uint64_t *first_commit_tsp, uint64_t *prepare_tsp, uint64_t *read_tsp,
-  uint64_t *pinned_read_tsp) WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
+  uint64_t *durable_tsp, uint64_t *first_commit_tsp, uint64_t *prepare_tsp, uint64_t *read_tsp)
+  WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_logrec_alloc(WT_SESSION_IMPL *session, size_t size, WT_ITEM **logrecp)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_logrec_read(WT_SESSION_IMPL *session, const uint8_t **pp, const uint8_t *end,
@@ -1041,6 +1041,8 @@ extern int __wt_meta_ckptlist_set(WT_SESSION_IMPL *session, const char *fname, W
   WT_LSN *ckptlsn) WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_meta_ckptlist_to_meta(WT_SESSION_IMPL *session, WT_CKPT *ckptbase, WT_ITEM *buf)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
+extern int __wt_meta_get_oldest_ckpt_timestamp(WT_SESSION_IMPL *session, const char *fname,
+  wt_timestamp_t *oldest_ckpt_ts) WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_meta_sysinfo_set(WT_SESSION_IMPL *session)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_meta_track_checkpoint(WT_SESSION_IMPL *session)
@@ -1423,6 +1425,10 @@ extern int __wt_thread_group_destroy(WT_SESSION_IMPL *session, WT_THREAD_GROUP *
 extern int __wt_thread_group_resize(WT_SESSION_IMPL *session, WT_THREAD_GROUP *group,
   uint32_t new_min, uint32_t new_max, uint32_t flags)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
+extern int __wt_time_aggregate_validate(WT_SESSION_IMPL *session, WT_TIME_AGGREGATE *ta,
+  WT_TIME_AGGREGATE *parent, bool silent) WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
+extern int __wt_time_value_validate(WT_SESSION_IMPL *session, WT_TIME_WINDOW *tw,
+  WT_TIME_AGGREGATE *parent, bool silent) WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_timing_stress_config(WT_SESSION_IMPL *session, const char *cfg[])
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_tree_walk(WT_SESSION_IMPL *session, WT_REF **refp, uint32_t flags)
@@ -1833,14 +1839,6 @@ static inline bool __wt_session_can_wait(WT_SESSION_IMPL *session)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 static inline bool __wt_split_descent_race(WT_SESSION_IMPL *session, WT_REF *ref,
   WT_PAGE_INDEX *saved_pindex) WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
-static inline bool __wt_time_aggregate_is_empty(WT_TIME_AGGREGATE *ta)
-  WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
-static inline bool __wt_time_window_has_stop(WT_TIME_WINDOW *tw)
-  WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
-static inline bool __wt_time_window_is_empty(WT_TIME_WINDOW *tw)
-  WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
-static inline bool __wt_time_windows_equal(WT_TIME_WINDOW *tw1, WT_TIME_WINDOW *tw2)
-  WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 static inline bool __wt_txn_tw_start_visible(WT_SESSION_IMPL *session, WT_TIME_WINDOW *tw)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 static inline bool __wt_txn_tw_start_visible_all(WT_SESSION_IMPL *session, WT_TIME_WINDOW *tw)
@@ -2194,18 +2192,8 @@ static inline void __wt_spin_lock(WT_SESSION_IMPL *session, WT_SPINLOCK *t);
 static inline void __wt_spin_lock_track(WT_SESSION_IMPL *session, WT_SPINLOCK *t);
 static inline void __wt_spin_unlock(WT_SESSION_IMPL *session, WT_SPINLOCK *t);
 static inline void __wt_struct_size_adjust(WT_SESSION_IMPL *session, size_t *sizep);
-static inline void __wt_time_aggregate_copy(WT_TIME_AGGREGATE *dest, WT_TIME_AGGREGATE *source);
-static inline void __wt_time_aggregate_init(WT_TIME_AGGREGATE *ta);
-static inline void __wt_time_aggregate_init_max(WT_TIME_AGGREGATE *ta);
-static inline void __wt_time_aggregate_merge(WT_TIME_AGGREGATE *dest, WT_TIME_AGGREGATE *source);
-static inline void __wt_time_aggregate_update(WT_TIME_AGGREGATE *ta, WT_TIME_WINDOW *tw);
 static inline void __wt_time_window_clear_obsolete(
   WT_SESSION_IMPL *session, WT_TIME_WINDOW *tw, uint64_t oldest_id, wt_timestamp_t oldest_ts);
-static inline void __wt_time_window_copy(WT_TIME_WINDOW *dest, WT_TIME_WINDOW *source);
-static inline void __wt_time_window_init(WT_TIME_WINDOW *tw);
-static inline void __wt_time_window_init_max(WT_TIME_WINDOW *tw);
-static inline void __wt_time_window_set_start(WT_TIME_WINDOW *tw, WT_UPDATE *upd);
-static inline void __wt_time_window_set_stop(WT_TIME_WINDOW *tw, WT_UPDATE *upd);
 static inline void __wt_timing_stress(WT_SESSION_IMPL *session, u_int flag);
 static inline void __wt_tree_modify_set(WT_SESSION_IMPL *session);
 static inline void __wt_txn_cursor_op(WT_SESSION_IMPL *session);

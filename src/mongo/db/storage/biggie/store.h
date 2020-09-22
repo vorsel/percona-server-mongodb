@@ -581,6 +581,11 @@ public:
         Node* deleted = context.back().first;
         context.pop_back();
 
+        // If the to-be deleted node is an internal node without data it is hidden from the user and
+        // should not be deleted
+        if (!deleted->_data)
+            return false;
+
         if (!deleted->isLeaf()) {
             // The to-be deleted node is an internal node, and therefore updating its data to be
             // boost::none will "delete" it.
@@ -931,7 +936,9 @@ private:
             }
             depth++;
 
-            if (depth == key.size()) {
+            // Return node if entire trieKey matches.
+            if (depth == key.size() &&
+                (key.size() - initialDepthOffset) == _root->_trieKey.size()) {
                 return _root.get();
             }
         }

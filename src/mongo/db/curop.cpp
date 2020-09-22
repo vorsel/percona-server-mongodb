@@ -413,12 +413,10 @@ void CurOp::ensureStarted() {
     }
 }
 
-void CurOp::enter_inlock(const char* ns, boost::optional<int> dbProfileLevel) {
+void CurOp::enter_inlock(const char* ns, int dbProfileLevel) {
     ensureStarted();
     _ns = ns;
-    if (dbProfileLevel) {
-        raiseDbProfileLevel(*dbProfileLevel);
-    }
+    raiseDbProfileLevel(dbProfileLevel);
 }
 
 void CurOp::raiseDbProfileLevel(int dbProfileLevel) {
@@ -481,7 +479,7 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
                         "Failed to gather storage statistics for {opId} due to {reason}",
                         "Failed to gather storage statistics for slow operation",
                         "opId"_attr = opCtx->getOpID(),
-                        "reason"_attr = "lock acquire timeout"_sd);
+                        "error"_attr = "lock acquire timeout"_sd);
                 }
             } catch (const ExceptionForCat<ErrorCategory::Interruption>& ex) {
                 LOGV2_WARNING_OPTIONS(
@@ -490,7 +488,7 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
                     "Failed to gather storage statistics for {opId} due to {reason}",
                     "Failed to gather storage statistics for slow operation",
                     "opId"_attr = opCtx->getOpID(),
-                    "reason"_attr = redact(ex));
+                    "error"_attr = redact(ex));
             }
         }
 

@@ -623,7 +623,7 @@ __checkpoint_prepare(WT_SESSION_IMPL *session, bool *trackingp, const char *cfg[
     } else {
         if (!F_ISSET(conn, WT_CONN_RECOVERING))
             txn_global->meta_ckpt_timestamp = WT_TS_NONE;
-        txn->read_timestamp = txn_shared->pinned_read_timestamp = WT_TS_NONE;
+        txn_shared->read_timestamp = WT_TS_NONE;
     }
 
     __wt_writeunlock(session, &txn_global->rwlock);
@@ -1523,7 +1523,7 @@ __wt_checkpoint_tree_reconcile_update(WT_SESSION_IMPL *session, WT_TIME_AGGREGAT
     WT_CKPT_FOREACH (ckptbase, ckpt)
         if (F_ISSET(ckpt, WT_CKPT_ADD)) {
             ckpt->write_gen = btree->write_gen;
-            __wt_time_aggregate_copy(&ckpt->ta, ta);
+            WT_TIME_AGGREGATE_COPY(&ckpt->ta, ta);
         }
 }
 
@@ -1550,7 +1550,7 @@ __checkpoint_tree(WT_SESSION_IMPL *session, bool is_checkpoint, const char *cfg[
     conn = S2C(session);
     dhandle = session->dhandle;
     fake_ckpt = resolve_bm = false;
-    __wt_time_aggregate_init(&ta);
+    WT_TIME_AGGREGATE_INIT(&ta);
 
     /*
      * Set the checkpoint LSN to the maximum LSN so that if logging is disabled, recovery will never

@@ -2355,28 +2355,6 @@ void ReplicationCoordinatorImpl::cancelCbkHandle(CallbackHandle activeHandle) {
     _replExecutor->cancel(activeHandle);
 }
 
-BSONObj ReplicationCoordinatorImpl::_runCmdOnSelfOnAlternativeClient(OperationContext* opCtx,
-                                                                     const std::string& dbName,
-                                                                     const BSONObj& cmdObj) {
-
-    auto client = opCtx->getServiceContext()->makeClient("DBDirectClientCmd");
-    // We want the command's opCtx that gets executed via DBDirectClient to be interruptible
-    // so that we don't block state transitions. Callers of this function might run opCtx
-    // in an uninterruptible mode. To be on safer side, run the command in AlternativeClientRegion,
-    // to make sure that the command's opCtx is interruptible.
-    AlternativeClientRegion acr(client);
-    auto uniqueNewOpCtx = cc().makeOperationContext();
-    {
-        stdx::lock_guard<Client> lk(cc());
-        cc().setSystemOperationKillable(lk);
-    }
-
-    DBDirectClient dbClient(uniqueNewOpCtx.get());
-    const auto commandResponse = dbClient.runCommand(OpMsgRequest::fromDBAndBody(dbName, cmdObj));
-
-    return commandResponse->getCommandReply();
-}
-
 BSONObj ReplicationCoordinatorImpl::runCmdOnPrimaryAndAwaitResponse(
     OperationContext* opCtx,
     const std::string& dbName,
@@ -2386,27 +2364,14 @@ BSONObj ReplicationCoordinatorImpl::runCmdOnPrimaryAndAwaitResponse(
     // About to make network and DBDirectClient (recursive) calls, so we should not hold any locks.
     invariant(!opCtx->lockState()->isLocked());
 
-    const auto myHostAndPort = getMyHostAndPort();
     const auto primaryHostAndPort = getCurrentPrimaryHostAndPort();
-
-    if (myHostAndPort.empty()) {
-        // Possibly because either rsconfig is uninitialized or the node got removed from config.
-        uassertStatusOK(Status{ErrorCodes::NodeNotFound, "Address unknown."});
-    }
-
     if (primaryHostAndPort.empty()) {
         uassertStatusOK(Status{ErrorCodes::NoConfigMaster, "Primary is unknown/down."});
     }
 
-    auto iAmPrimary = (myHostAndPort == primaryHostAndPort) ? true : false;
-
-    if (iAmPrimary) {
-        // Run command using DBDirectClient to avoid tcp connection.
-        return _runCmdOnSelfOnAlternativeClient(opCtx, dbName, cmdObj);
-    }
-
-    // Node is not primary, so we will run the remote command via AsyncDBClient. To use
-    // AsyncDBClient, we will be using repl task executor.
+    // Run the command via AsyncDBClient which performs a network call. This is also the desired
+    // behaviour when running this command locally as to avoid using the DBDirectClient which would
+    // provide additional management when trying to cancel the request with differing clients.
     executor::RemoteCommandRequest request(primaryHostAndPort, dbName, cmdObj, nullptr);
     executor::RemoteCommandResponse cbkResponse(
         Status{ErrorCodes::InternalError, "Uninitialized value"});
@@ -3258,62 +3223,62 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
             auto newMutableConfig = newConfig.getMutable();
             newMutableConfig.setConfigVersion(version);
             newConfig = ReplSetConfig(std::move(newMutableConfig));
-        } else {
-            // Only append 'newlyAdded' to nodes during safe reconfig.
-            if (enableAutomaticReconfig) {
-                boost::optional<MutableReplSetConfig> newMutableConfig;
+        }
 
-                // Set the 'newlyAdded' field to true for all new voting nodes.
-                for (int i = 0; i < newConfig.getNumMembers(); i++) {
-                    const auto newMem = newConfig.getMemberAt(i);
+        if (enableAutomaticReconfig) {
+            boost::optional<MutableReplSetConfig> newMutableConfig;
 
-                    // In a safe reconfig, the 'newlyAdded' flag should never already be set for
-                    // this member. If it is set, throw an error.
-                    if (newMem.isNewlyAdded()) {
-                        str::stream errmsg;
-                        errmsg << "Cannot provide " << MemberConfig::kNewlyAddedFieldName
-                               << " field to member config during safe reconfig.";
-                        LOGV2_ERROR(
-                            4634900,
-                            "Initializing 'newlyAdded' field to member has failed with bad status.",
-                            "errmsg"_attr = std::string(errmsg));
-                        return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
-                    }
+            // Set the 'newlyAdded' field to true for all new voting nodes.
+            for (int i = 0; i < newConfig.getNumMembers(); i++) {
+                const auto newMem = newConfig.getMemberAt(i);
 
-                    // We should never set the 'newlyAdded' field for arbiters.
-                    if (newMem.isArbiter()) {
-                        continue;
-                    }
-                    const auto newMemId = newMem.getId();
-                    const auto oldMem = oldConfig.findMemberByID(newMemId.getData());
-
-                    const bool isNewVotingMember = (oldMem == nullptr && newMem.isVoter());
-                    const bool isCurrentlyNewlyAdded =
-                        (oldMem != nullptr && oldMem->isNewlyAdded());
-
-                    // Append the 'newlyAdded' field if the node:
-                    // 1) Is a new, voting node
-                    // 2) Already has a 'newlyAdded' field in the old config
-                    if (isNewVotingMember || isCurrentlyNewlyAdded) {
-                        if (!newMutableConfig) {
-                            newMutableConfig = newConfig.getMutable();
-                        }
-                        newMutableConfig->addNewlyAddedFieldForMember(newMemId);
-                    }
+                // In a reconfig, the 'newlyAdded' flag should never already be set for
+                // this member. If it is set, throw an error.
+                if (newMem.isNewlyAdded()) {
+                    str::stream errmsg;
+                    errmsg << "Cannot provide " << MemberConfig::kNewlyAddedFieldName
+                           << " field to member config during reconfig.";
+                    LOGV2_ERROR(
+                        4634900,
+                        "Initializing 'newlyAdded' field to member has failed with bad status.",
+                        "errmsg"_attr = std::string(errmsg));
+                    return Status(ErrorCodes::InvalidReplicaSetConfig, errmsg);
                 }
 
-                if (newMutableConfig) {
-                    newConfig = ReplSetConfig(*std::move(newMutableConfig));
-                    LOGV2(4634400,
-                          "Appended the 'newlyAdded' field to a node in the new config. Nodes with "
-                          "the 'newlyAdded' field will be considered to have 'votes:0'. Upon "
-                          "transition to SECONDARY, this field will be automatically removed.",
-                          "newConfigObj"_attr = newConfig.toBSON(),
-                          "userProvidedConfig"_attr = args.newConfigObj,
-                          "oldConfig"_attr = oldConfig.toBSON());
+                // We should never set the 'newlyAdded' field for arbiters, or during force
+                // reconfigs.
+                if (newMem.isArbiter() || args.force) {
+                    continue;
+                }
+                const auto newMemId = newMem.getId();
+                const auto oldMem = oldConfig.findMemberByID(newMemId.getData());
+
+                const bool isNewVotingMember = (oldMem == nullptr && newMem.isVoter());
+                const bool isCurrentlyNewlyAdded = (oldMem != nullptr && oldMem->isNewlyAdded());
+
+                // Append the 'newlyAdded' field if the node:
+                // 1) Is a new, voting node
+                // 2) Already has a 'newlyAdded' field in the old config
+                if (isNewVotingMember || isCurrentlyNewlyAdded) {
+                    if (!newMutableConfig) {
+                        newMutableConfig = newConfig.getMutable();
+                    }
+                    newMutableConfig->addNewlyAddedFieldForMember(newMemId);
                 }
             }
+
+            if (newMutableConfig) {
+                newConfig = ReplSetConfig(*std::move(newMutableConfig));
+                LOGV2(4634400,
+                      "Appended the 'newlyAdded' field to a node in the new config. Nodes with "
+                      "the 'newlyAdded' field will be considered to have 'votes:0'. Upon "
+                      "transition to SECONDARY, this field will be automatically removed.",
+                      "newConfigObj"_attr = newConfig.toBSON(),
+                      "userProvidedConfig"_attr = args.newConfigObj,
+                      "oldConfig"_attr = oldConfig.toBSON());
+            }
         }
+
         return newConfig;
     };
 
@@ -5238,6 +5203,25 @@ Status ReplicationCoordinatorImpl::processHeartbeatV1(const ReplSetHeartbeatArgs
             LOGV2(21401, "Scheduling heartbeat to fetch a newer config", attr);
             int senderIndex = _rsConfig.findMemberIndexByHostAndPort(senderHost);
             _scheduleHeartbeatToTarget_inlock(senderHost, senderIndex, now);
+        }
+    } else if (result.isOK() && args.getPrimaryId() >= 0 &&
+               (!response->hasPrimaryId() || response->getPrimaryId() != args.getPrimaryId())) {
+        // If the sender thinks the primary is different from what we think and if the sender itself
+        // is the primary, then we want to update our view of primary by immediately sending out a
+        // new round of heartbeats, whose responses should inform us of the new primary. We only do
+        // this if the term of the heartbeat is greater than or equal to our own, to prevent
+        // updating our view to a stale primary.
+        if (args.hasSender() && args.getSenderId() == args.getPrimaryId() &&
+            args.getTerm() >= _topCoord->getTerm()) {
+            std::string myPrimaryId =
+                (response->hasPrimaryId() ? (str::stream() << response->getPrimaryId())
+                                          : std::string("none"));
+            LOGV2(2903000,
+                  "Restarting heartbeats after learning of a new primary",
+                  "myPrimaryId"_attr = myPrimaryId,
+                  "senderAndPrimaryId"_attr = args.getPrimaryId(),
+                  "senderTerm"_attr = args.getTerm());
+            _restartHeartbeats_inlock();
         }
     }
     return result;
