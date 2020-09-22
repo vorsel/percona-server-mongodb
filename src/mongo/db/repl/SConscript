@@ -25,6 +25,7 @@ env.Library(
         'repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/logical_clock',
         '$BUILD_DIR/mongo/db/logical_time',
+        '$BUILD_DIR/mongo/db/vector_clock_mutable',
         '$BUILD_DIR/mongo/db/storage/flow_control',
     ],
 )
@@ -670,6 +671,7 @@ env.Library('topology_coordinator',
                 'repl_coordinator_interface',
             ],
             LIBDEPS_PRIVATE=[
+                'repl_server_parameters',
                 '$BUILD_DIR/mongo/db/catalog/commit_quorum_options',
                 '$BUILD_DIR/mongo/idl/server_parameter',
                 'repl_server_parameters',

@@ -5,7 +5,7 @@
 "use strict";
 
 const standalone = MongoRunner.runMongod();
-assert.neq(null, conn, "mongod was unable to start up");
+assert.neq(null, standalone, "mongod was unable to start up");
 
 const dbName = "test";
 const db = standalone.getDB(dbName);

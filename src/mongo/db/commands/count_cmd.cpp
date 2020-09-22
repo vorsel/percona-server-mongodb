@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
@@ -91,7 +89,10 @@ public:
 
     ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
                                                  repl::ReadConcernLevel level) const override {
-        return ReadConcernSupportResult::allSupportedAndDefaultPermitted();
+        static const Status kSnapshotNotSupported{ErrorCodes::InvalidOptions,
+                                                  "read concern snapshot not supported"};
+        return {{level == repl::ReadConcernLevel::kSnapshotReadConcern, kSnapshotNotSupported},
+                Status::OK()};
     }
 
     bool shouldAffectReadConcernCounter() const override {

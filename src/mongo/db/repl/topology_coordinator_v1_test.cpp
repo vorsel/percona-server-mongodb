@@ -201,8 +201,7 @@ protected:
     // Update config and set selfIndex
     // If "now" is passed in, set _now to now+1
     void updateConfig(BSONObj cfg, int selfIndex, Date_t now = Date_t::fromMillisSinceEpoch(-1)) {
-        ReplSetConfig config;
-        ASSERT_OK(config.initialize(addProtocolVersion(cfg)));
+        auto config = ReplSetConfig::parse(addProtocolVersion(cfg));
         ASSERT_OK(config.validate());
 
         _selfIndex = selfIndex;
@@ -636,12 +635,22 @@ TEST_F(TopoCoordTest, ChooseOnlyVotersAsSyncSourceWhenNodeIsAVoter) {
     heartbeatFromMember(h3, "rs0", MemberState::RS_SECONDARY, ot1, hbRTT300);
 
     // Should choose h3 as it is a voter
-    auto newSource = getTopoCoord().chooseNewSyncSource(now()++, OpTime(), ReadPreference::Nearest);
+    auto first = now()++;
+    auto newSource = getTopoCoord().chooseNewSyncSource(first, OpTime(), ReadPreference::Nearest);
     ASSERT_EQUALS(h3, newSource);
 
+    // Since a new sync source was chosen, recentSyncSourceChanges should be updated
+    auto recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+    ASSERT(std::queue<Date_t>({first}) == recentSyncSourceChanges->getChanges_forTest());
+
     // Can't choose h2 as it is not a voter
-    newSource = getTopoCoord().chooseNewSyncSource(now()++, ot10, ReadPreference::Nearest);
+    auto second = now()++;
+    newSource = getTopoCoord().chooseNewSyncSource(second, ot10, ReadPreference::Nearest);
     ASSERT_EQUALS(HostAndPort(), newSource);
+
+    // Since no new sync source was chosen, recentSyncSourceChanges shouldn't be updated.
+    recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+    ASSERT(std::queue<Date_t>({first}) == recentSyncSourceChanges->getChanges_forTest());
 
     // Should choose h3 as it is a voter, and ahead
     heartbeatFromMember(h3, "rs0", MemberState::RS_SECONDARY, ot5, hbRTT300);
@@ -893,6 +902,10 @@ TEST_F(TopoCoordTest, ChooseOnlyPrimaryAsSyncSourceWhenReadPreferenceIsPrimaryOn
         getTopoCoord().chooseNewSyncSource(now()++, OpTime(), ReadPreference::PrimaryOnly));
     ASSERT(getTopoCoord().getSyncSourceAddress().empty());
 
+    // Since no new sync source was chosen, recentSyncSourceChanges shouldn't be updated.
+    auto recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+    ASSERT(recentSyncSourceChanges->getChanges_forTest().empty());
+
     // Add primary
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
     heartbeatFromMember(HostAndPort("h3"),
@@ -909,6 +922,10 @@ TEST_F(TopoCoordTest, ChooseOnlyPrimaryAsSyncSourceWhenReadPreferenceIsPrimaryOn
                       now()++, OpTime(Timestamp(10, 0), 0), ReadPreference::PrimaryOnly));
     ASSERT_EQUALS(HostAndPort(), getTopoCoord().getSyncSourceAddress());
 
+    // Since no new sync source was chosen, recentSyncSourceChanges shouldn't be updated.
+    recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+    ASSERT(recentSyncSourceChanges->getChanges_forTest().empty());
+
     // Update the primary's position.
     heartbeatFromMember(HostAndPort("h3"),
                         "rs0",
@@ -918,10 +935,15 @@ TEST_F(TopoCoordTest, ChooseOnlyPrimaryAsSyncSourceWhenReadPreferenceIsPrimaryOn
 
     // h3 is primary and should be chosen as the sync source, despite being further away than h2
     // and the primary (h3) being at our most recently applied optime.
+    auto changeTime = now()++;
     ASSERT_EQUALS(HostAndPort("h3"),
                   getTopoCoord().chooseNewSyncSource(
-                      now()++, OpTime(Timestamp(10, 0), 0), ReadPreference::PrimaryOnly));
+                      changeTime, OpTime(Timestamp(10, 0), 0), ReadPreference::PrimaryOnly));
     ASSERT_EQUALS(HostAndPort("h3"), getTopoCoord().getSyncSourceAddress());
+
+    // Since a new sync source was chosen, recentSyncSourceChanges should be updated.
+    recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+    ASSERT(std::queue<Date_t>({changeTime}) == recentSyncSourceChanges->getChanges_forTest());
 
     // Become primary: should not choose self as sync source.
     heartbeatFromMember(HostAndPort("h3"),
@@ -1058,10 +1080,16 @@ TEST_F(TopoCoordTest, PreferPrimaryAsSyncSourceWhenReadPreferenceIsPrimaryPrefer
                         Milliseconds(300));
 
     // No primary situation: should choose h2.
+    auto first = now()++;
     ASSERT_EQUALS(
         HostAndPort("h2"),
-        getTopoCoord().chooseNewSyncSource(now()++, OpTime(), ReadPreference::PrimaryPreferred));
+        getTopoCoord().chooseNewSyncSource(first, OpTime(), ReadPreference::PrimaryPreferred));
     ASSERT_EQUALS(HostAndPort("h2"), getTopoCoord().getSyncSourceAddress());
+
+    // Make sure that recentSyncSourceChanges is updated even though the primary is not chosen as
+    // the next sync source.
+    auto recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+    ASSERT(std::queue<Date_t>({first}) == recentSyncSourceChanges->getChanges_forTest());
 
     // Add primary
     ASSERT_EQUALS(-1, getCurrentPrimaryIndex());
@@ -1074,10 +1102,16 @@ TEST_F(TopoCoordTest, PreferPrimaryAsSyncSourceWhenReadPreferenceIsPrimaryPrefer
 
     // h3 is primary, but its last applied isn't as up-to-date as ours, so it cannot be chosen
     // as the sync source.
+    auto second = now()++;
     ASSERT_EQUALS(HostAndPort("h2"),
                   getTopoCoord().chooseNewSyncSource(
-                      now()++, OpTime(Timestamp(10, 0), 0), ReadPreference::PrimaryPreferred));
+                      second, OpTime(Timestamp(10, 0), 0), ReadPreference::PrimaryPreferred));
     ASSERT_EQUALS(HostAndPort("h2"), getTopoCoord().getSyncSourceAddress());
+
+    // Make sure that recentSyncSourceChanges is updated even though the primary is not chosen as
+    // the next sync source.
+    recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+    ASSERT(std::queue<Date_t>({first, second}) == recentSyncSourceChanges->getChanges_forTest());
 
     // Update the primary's position.
     heartbeatFromMember(HostAndPort("h3"),
@@ -1088,10 +1122,17 @@ TEST_F(TopoCoordTest, PreferPrimaryAsSyncSourceWhenReadPreferenceIsPrimaryPrefer
 
     // h3 is primary and should be chosen as the sync source, despite being further away than h2
     // and the primary (h3) being at our most recently applied optime.
+    auto third = now()++;
     ASSERT_EQUALS(HostAndPort("h3"),
                   getTopoCoord().chooseNewSyncSource(
-                      now()++, OpTime(Timestamp(10, 0), 0), ReadPreference::PrimaryPreferred));
+                      third, OpTime(Timestamp(10, 0), 0), ReadPreference::PrimaryPreferred));
     ASSERT_EQUALS(HostAndPort("h3"), getTopoCoord().getSyncSourceAddress());
+
+    // Make sure that recentSyncSourceChanges is updated when the primary is chosen as the next
+    // sync source.
+    recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+    ASSERT(std::queue<Date_t>({first, second, third}) ==
+           recentSyncSourceChanges->getChanges_forTest());
 
     // Sanity check: the same test as above should return the secondary "h2" if primary is not
     // preferred.
@@ -2119,6 +2160,128 @@ TEST_F(TopoCoordTest, PrepareStepDownAttemptFailsIfNotLeader) {
     ASSERT_EQUALS(expectedStatus, getTopoCoord().prepareForStepDownAttempt().getStatus());
 }
 
+/**
+ * Checks that the queue contains the expected entries in the correct order.
+ */
+void assertTimesEqual(const std::initializer_list<Date_t>& expectedTimes,
+                      std::queue<Date_t> actualQueue) {
+    std::queue<Date_t> expectedQueue(expectedTimes);
+    ASSERT(expectedQueue == actualQueue);
+}
+
+TEST_F(TopoCoordTest, RecordSyncSourceChangeMaintainsSizeWhenAtCapacity) {
+    auto recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+
+    auto first = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(first);
+
+    auto second = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(second);
+
+    auto third = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(third);
+
+    auto fourth = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(fourth);
+
+    assertTimesEqual({second, third, fourth}, recentSyncSourceChanges->getChanges_forTest());
+}
+
+TEST_F(TopoCoordTest, ChangedTooOftenRecentlyReturnsTrue) {
+    auto recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+
+    auto first = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(first);
+
+    auto second = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(second);
+
+    auto third = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(third);
+
+    assertTimesEqual({first, second, third}, recentSyncSourceChanges->getChanges_forTest());
+    ASSERT(recentSyncSourceChanges->changedTooOftenRecently(Date_t::now()));
+}
+
+TEST_F(TopoCoordTest, ChangedTooOftenRecentlyReturnsFalse) {
+    auto recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+
+    // Make this two hours before now.
+    auto first = Date_t::now() - Hours(2);
+    recentSyncSourceChanges->addNewEntry(first);
+
+    auto second = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(second);
+
+    auto third = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(third);
+
+    assertTimesEqual({first, second, third}, recentSyncSourceChanges->getChanges_forTest());
+    ASSERT_FALSE(recentSyncSourceChanges->changedTooOftenRecently(Date_t::now()));
+}
+
+TEST_F(TopoCoordTest, AddNewEntryReducesSizeIfMaxNumSyncSourceChangesPerHourChanged) {
+    // Make sure to restore the default value at the end of this test.
+    ON_BLOCK_EXIT([]() { maxNumSyncSourceChangesPerHour.store(3); });
+
+    auto recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+
+    auto first = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(first);
+
+    auto second = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(second);
+
+    auto third = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(third);
+
+    maxNumSyncSourceChangesPerHour.store(2);
+
+    auto fourth = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(fourth);
+
+    assertTimesEqual({third, fourth}, recentSyncSourceChanges->getChanges_forTest());
+    ASSERT(recentSyncSourceChanges->changedTooOftenRecently(Date_t::now()));
+}
+
+TEST_F(TopoCoordTest, ChangedTooOftenRecentlyReducesSizeIfMaxNumSyncSourceChangesPerHourChanged) {
+    // Make sure to restore the default value at the end of this test.
+    ON_BLOCK_EXIT([]() { maxNumSyncSourceChangesPerHour.store(3); });
+
+    auto recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+
+    auto first = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(first);
+
+    auto second = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(second);
+
+    auto third = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(third);
+
+    maxNumSyncSourceChangesPerHour.store(1);
+
+    ASSERT(recentSyncSourceChanges->changedTooOftenRecently(Date_t::now()));
+
+    assertTimesEqual({third}, recentSyncSourceChanges->getChanges_forTest());
+}
+
+TEST_F(TopoCoordTest, ChangedTooOftenRecentlyReturnsFalseWhenEmpty) {
+    auto recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+    assertTimesEqual({}, recentSyncSourceChanges->getChanges_forTest());
+    ASSERT_FALSE(recentSyncSourceChanges->changedTooOftenRecently(Date_t::now()));
+}
+
+TEST_F(TopoCoordTest, ChangedTooOftenRecentlyReturnsFalseWhenNotFilled) {
+    auto recentSyncSourceChanges = getTopoCoord().getRecentSyncSourceChanges_forTest();
+
+    auto first = Date_t::now();
+    recentSyncSourceChanges->addNewEntry(first);
+
+    assertTimesEqual({first}, recentSyncSourceChanges->getChanges_forTest());
+    ASSERT_FALSE(recentSyncSourceChanges->changedTooOftenRecently(Date_t::now()));
+}
+
 class PrepareHeartbeatResponseV1Test : public TopoCoordTest {
 public:
     virtual void setUp() {
@@ -2537,13 +2700,12 @@ TEST_F(TopoCoordTest,
        DoNotBecomeCandidateWhenReconfigToBeElectableInSingleNodeSetIfInMaintenanceMode) {
     ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
-    ReplSetConfig cfg;
-    ASSERT_OK(cfg.initialize(BSON("_id"
-                                  << "rs0"
-                                  << "version" << 1 << "protocolVersion" << 1 << "members"
-                                  << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                           << "hself"
-                                                           << "priority" << 0)))));
+    auto cfg = ReplSetConfig::parse(BSON("_id"
+                                         << "rs0"
+                                         << "version" << 1 << "protocolVersion" << 1 << "members"
+                                         << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                  << "hself"
+                                                                  << "priority" << 0))));
     getTopoCoord().updateConfig(cfg, 0, now()++);
     ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
 
@@ -2567,14 +2729,12 @@ TEST_F(TopoCoordTest,
 TEST_F(TopoCoordTest, NodeDoesNotBecomeCandidateWhenBecomingSecondaryInSingleNodeSetIfUnelectable) {
     ASSERT_TRUE(TopologyCoordinator::Role::kFollower == getTopoCoord().getRole());
     ASSERT_EQUALS(MemberState::RS_STARTUP, getTopoCoord().getMemberState().s);
-    ReplSetConfig cfg;
-    cfg.initialize(BSON("_id"
-                        << "rs0"
-                        << "version" << 1 << "members"
-                        << BSON_ARRAY(BSON("_id" << 1 << "host"
-                                                 << "hself"
-                                                 << "priority" << 0))))
-        .transitional_ignore();
+    auto cfg = ReplSetConfig::parse(BSON("_id"
+                                         << "rs0"
+                                         << "version" << 1 << "members"
+                                         << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                  << "hself"
+                                                                  << "priority" << 0))));
 
     getTopoCoord().updateConfig(cfg, 0, now()++);
     ASSERT_EQUALS(MemberState::RS_STARTUP2, getTopoCoord().getMemberState().s);
@@ -4151,6 +4311,57 @@ TEST_F(ReevalSyncSourceTest, NoChangeWhenCandidatePingTimeIsMissing) {
                                                                     ReadPreference::Nearest));
 }
 
+TEST_F(ReevalSyncSourceTest, NoChangeWhenNodeConfiguredWithSlaveDelay) {
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version" << 5 << "term" << 1 << "members"
+                      << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                               << "host1:27017"
+                                               << "slaveDelay" << 1 << "priority" << 0)
+                                    << BSON("_id" << 1 << "host"
+                                                  << "host2:27017")
+                                    << BSON("_id" << 2 << "host"
+                                                  << "host3:27017"))
+                      << "protocolVersion" << 1),
+                 0);
+
+    // Set up so that without slaveDelay, the node otherwise would have changed sync sources.
+    getTopoCoord().setPing_forTest(HostAndPort("host2"), pingTimeAboveThreshold);
+    getTopoCoord().setPing_forTest(HostAndPort("host3"), pingTimeBelowThreshold);
+
+    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSourceDueToPingTime(HostAndPort("host2"),
+                                                                    MemberState::RS_SECONDARY,
+                                                                    lastOpTimeFetched,
+                                                                    now(),
+                                                                    ReadPreference::Nearest));
+}
+
+TEST_F(ReevalSyncSourceTest, NoChangeWhenNodeNotFoundInConfig) {
+    updateConfig(BSON("_id"
+                      << "rs0"
+                      << "version" << 5 << "term" << 1 << "members"
+                      << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                               << "host1:27017"
+                                               << "slaveDelay" << 1 << "priority" << 0)
+                                    << BSON("_id" << 1 << "host"
+                                                  << "host2:27017")
+                                    << BSON("_id" << 2 << "host"
+                                                  << "host3:27017"))
+                      << "protocolVersion" << 1),
+                 -1);
+
+    // Set up so that without slaveDelay and not being in the config, the node otherwise would have
+    // changed sync sources.
+    getTopoCoord().setPing_forTest(HostAndPort("host2"), pingTimeAboveThreshold);
+    getTopoCoord().setPing_forTest(HostAndPort("host3"), pingTimeBelowThreshold);
+
+    ASSERT_FALSE(getTopoCoord().shouldChangeSyncSourceDueToPingTime(HostAndPort("host2"),
+                                                                    MemberState::RS_SECONDARY,
+                                                                    lastOpTimeFetched,
+                                                                    now(),
+                                                                    ReadPreference::Nearest));
+}
+
 class HeartbeatResponseReconfigTestV1 : public TopoCoordTest {
 public:
     virtual void setUp() {
@@ -4177,10 +4388,9 @@ public:
 };
 
 TEST_F(HeartbeatResponseReconfigTestV1, NodeAcceptsConfigIfVersionInHeartbeatResponseIsNewer) {
-    ReplSetConfig config;
     long long version = initConfigVersion + 1;
     long long term = initConfigTerm;
-    config.initialize(makeRSConfigWithVersionAndTerm(version, term)).transitional_ignore();
+    auto config = ReplSetConfig::parse(makeRSConfigWithVersionAndTerm(version, term));
 
     ReplSetHeartbeatResponse hb;
     hb.initialize(BSON("ok" << 1 << "v" << 1 << "state" << MemberState::RS_SECONDARY), 1)
@@ -4197,11 +4407,50 @@ TEST_F(HeartbeatResponseReconfigTestV1, NodeAcceptsConfigIfVersionInHeartbeatRes
     ASSERT_EQ(action.getAction(), HeartbeatResponseAction::Reconfig);
 }
 
+TEST_F(HeartbeatResponseReconfigTestV1, PrimaryAcceptsConfigAfterUpdatingHeartbeatData) {
+    // Become primary but don't completeTransitionToPrimary.
+    Timestamp electionTimestamp(2, 0);
+    getTopoCoord().changeMemberState_forTest(MemberState::RS_PRIMARY, electionTimestamp);
+    getTopoCoord().setCurrentPrimary_forTest(getSelfIndex(), electionTimestamp);
+    OpTime dummyOpTime(electionTimestamp, getTopoCoord().getTerm());
+    setMyOpTime(dummyOpTime);
+
+    long long version = initConfigVersion + 1;
+    long long term = initConfigTerm;
+    auto config = ReplSetConfig::parse(makeRSConfigWithVersionAndTerm(version, term));
+
+    auto remote = HostAndPort("host2");
+    auto remoteId = getCurrentConfig().findMemberByHostAndPort(remote)->getId();
+    auto oldOpTime = getTopoCoord().latestKnownOpTimeSinceHeartbeatRestartPerMember().at(remoteId);
+    ASSERT_FALSE(oldOpTime);
+
+    // Construct a higher OpTime.
+    OpTime newOpTime{{20, 1}, term};
+    ReplSetHeartbeatResponse hb;
+    hb.initialize(BSON("ok" << 1 << "v" << 1 << "state" << MemberState::RS_SECONDARY), 1).ignore();
+    hb.setConfig(config);
+    hb.setConfigVersion(version);
+    hb.setConfigTerm(term);
+    hb.setAppliedOpTimeAndWallTime({newOpTime, now()});
+    StatusWith<ReplSetHeartbeatResponse> hbResponse(hb);
+
+    getTopoCoord().prepareHeartbeatRequestV1(now(), "rs0", remote);
+    now() += Milliseconds(1);
+    auto action =
+        getTopoCoord().processHeartbeatResponse(now(), Milliseconds(1), remote, hbResponse);
+    ASSERT_EQ(action.getAction(), HeartbeatResponseAction::Reconfig);
+
+    // Check that heartbeat response updated the heartbeat data even on reconfig.
+    auto actualOpTime =
+        getTopoCoord().latestKnownOpTimeSinceHeartbeatRestartPerMember().at(remoteId);
+    ASSERT(actualOpTime);
+    ASSERT_EQUALS(*actualOpTime, newOpTime);
+}
+
 TEST_F(HeartbeatResponseReconfigTestV1, NodeAcceptsConfigIfTermInHeartbeatResponseIsNewer) {
-    ReplSetConfig config;
     long long version = initConfigVersion;
     long long term = initConfigTerm + 1;
-    config.initialize(makeRSConfigWithVersionAndTerm(version, term)).transitional_ignore();
+    auto config = ReplSetConfig::parse(makeRSConfigWithVersionAndTerm(version, term));
 
     ReplSetHeartbeatResponse hb;
     hb.initialize(BSON("ok" << 1 << "v" << 1 << "state" << MemberState::RS_SECONDARY), 1)
@@ -4220,10 +4469,9 @@ TEST_F(HeartbeatResponseReconfigTestV1, NodeAcceptsConfigIfTermInHeartbeatRespon
 
 TEST_F(HeartbeatResponseReconfigTestV1,
        NodeAcceptsConfigIfVersionInHeartbeatResponseIfNewerAndTermUninitialized) {
-    ReplSetConfig config;
     long long version = initConfigVersion + 1;
     long long term = OpTime::kUninitializedTerm;
-    config.initialize(makeRSConfigWithVersionAndTerm(version, term)).transitional_ignore();
+    auto config = ReplSetConfig::parse(makeRSConfigWithVersionAndTerm(version, term));
 
     ReplSetHeartbeatResponse hb;
     hb.initialize(BSON("ok" << 1 << "v" << 1 << "state" << MemberState::RS_SECONDARY), 1)
@@ -4242,10 +4490,9 @@ TEST_F(HeartbeatResponseReconfigTestV1,
 
 TEST_F(HeartbeatResponseReconfigTestV1, NodeRejectsConfigInHeartbeatResponseIfVersionIsOlder) {
     // Older config version, same term.
-    ReplSetConfig config;
     long long version = (initConfigVersion - 1);
     long long term = initConfigTerm;
-    config.initialize(makeRSConfigWithVersionAndTerm(version, term)).transitional_ignore();
+    auto config = ReplSetConfig::parse(makeRSConfigWithVersionAndTerm(version, term));
 
     ReplSetHeartbeatResponse hb;
     hb.initialize(BSON("ok" << 1 << "v" << 1 << "state" << MemberState::RS_SECONDARY), 1)
@@ -4264,10 +4511,9 @@ TEST_F(HeartbeatResponseReconfigTestV1, NodeRejectsConfigInHeartbeatResponseIfVe
 }
 
 TEST_F(HeartbeatResponseReconfigTestV1, NodeRejectsConfigInHeartbeatResponseIfConfigIsTheSame) {
-    ReplSetConfig config;
     long long version = initConfigVersion;
     long long term = initConfigTerm;
-    config.initialize(makeRSConfigWithVersionAndTerm(version, term)).transitional_ignore();
+    auto config = ReplSetConfig::parse(makeRSConfigWithVersionAndTerm(version, term));
 
     ReplSetHeartbeatResponse hb;
     hb.initialize(BSON("ok" << 1 << "v" << 1 << "state" << MemberState::RS_SECONDARY), 0)
@@ -4287,10 +4533,9 @@ TEST_F(HeartbeatResponseReconfigTestV1, NodeRejectsConfigInHeartbeatResponseIfCo
 
 TEST_F(HeartbeatResponseReconfigTestV1, NodeRejectsConfigInHeartbeatResponseIfTermIsOlder) {
     // Older config term, same version
-    ReplSetConfig config;
     long long version = initConfigVersion;
     long long term = initConfigTerm - 1;
-    config.initialize(makeRSConfigWithVersionAndTerm(version, term)).transitional_ignore();
+    auto config = ReplSetConfig::parse(makeRSConfigWithVersionAndTerm(version, term));
 
     ReplSetHeartbeatResponse hb;
     hb.initialize(BSON("ok" << 1 << "v" << 1 << "state" << MemberState::RS_SECONDARY), 0)
@@ -4311,10 +4556,9 @@ TEST_F(HeartbeatResponseReconfigTestV1, NodeRejectsConfigInHeartbeatResponseIfTe
 TEST_F(HeartbeatResponseReconfigTestV1,
        NodeRejectsConfigInHeartbeatResponseIfNewerVersionButOlderTerm) {
     // Newer version but older term.
-    ReplSetConfig config;
     long long version = (initConfigVersion + 1);
     long long term = (initConfigTerm - 1);
-    config.initialize(makeRSConfigWithVersionAndTerm(version, term)).transitional_ignore();
+    auto config = ReplSetConfig::parse(makeRSConfigWithVersionAndTerm(version, term));
 
     ReplSetHeartbeatResponse hb;
     hb.initialize(BSON("ok" << 1 << "v" << 1 << "state" << MemberState::RS_SECONDARY), 0)
@@ -5840,8 +6084,7 @@ TEST_F(TopoCoordTest, ArbitersNotIncludedInW2WriteInPSSAAReplSet) {
 }
 
 TEST_F(TopoCoordTest, CheckIfCommitQuorumCanBeSatisfied) {
-    ReplSetConfig configA;
-    ASSERT_OK(configA.initialize(BSON(
+    auto configA = ReplSetConfig::parse(BSON(
         "_id"
         << "rs0"
         << "version" << 1 << "protocolVersion" << 1 << "members"
@@ -5886,7 +6129,7 @@ TEST_F(TopoCoordTest, CheckIfCommitQuorumCanBeSatisfied) {
         << "settings"
         << BSON("getLastErrorModes" << BSON(
                     "valid" << BSON("dc" << 2 << "rack" << 3) << "invalidNotEnoughValues"
-                            << BSON("dc" << 3) << "invalidNotEnoughNodes" << BSON("rack" << 6))))));
+                            << BSON("dc" << 3) << "invalidNotEnoughNodes" << BSON("rack" << 6)))));
     getTopoCoord().updateConfig(configA, -1, Date_t());
 
     CommitQuorumOptions validNumberCQ;
@@ -6930,20 +7173,17 @@ TEST_F(HeartbeatResponseHighVerbosityTestV1, UpdateHeartbeatDataSameConfig) {
 
     // construct a copy of the original config for log message checking later
     // see HeartbeatResponseTest for the origin of the original config
-    ReplSetConfig originalConfig;
-    originalConfig
-        .initialize(BSON("_id"
-                         << "rs0"
-                         << "version" << 5 << "members"
-                         << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                  << "host1:27017")
-                                       << BSON("_id" << 1 << "host"
-                                                     << "host2:27017")
-                                       << BSON("_id" << 2 << "host"
-                                                     << "host3:27017"))
-                         << "protocolVersion" << 1 << "settings"
-                         << BSON("heartbeatTimeoutSecs" << 5)))
-        .transitional_ignore();
+    auto originalConfig = ReplSetConfig::parse(BSON("_id"
+                                                    << "rs0"
+                                                    << "version" << 5 << "members"
+                                                    << BSON_ARRAY(BSON("_id" << 0 << "host"
+                                                                             << "host1:27017")
+                                                                  << BSON("_id" << 1 << "host"
+                                                                                << "host2:27017")
+                                                                  << BSON("_id" << 2 << "host"
+                                                                                << "host3:27017"))
+                                                    << "protocolVersion" << 1 << "settings"
+                                                    << BSON("heartbeatTimeoutSecs" << 5)));
 
     ReplSetHeartbeatResponse sameConfigResponse;
     sameConfigResponse.setSetName("rs0");

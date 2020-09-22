@@ -31,6 +31,7 @@
 
 #include <functional>
 #include <iosfwd>
+#include <queue>
 #include <string>
 
 #include "mongo/client/read_preference.h"
@@ -75,6 +76,37 @@ class TopologyCoordinator {
     TopologyCoordinator& operator=(const TopologyCoordinator&) = delete;
 
 public:
+    /**
+     * RecentSyncSourceChanges stores the times that recent sync source changes happened. It will
+     * maintain a max size of maxSyncSourceChangesPerHour. If any additional entries are added,
+     * older entries will be removed. It is used to restrict the number of sync source changes that
+     * happen per hour when the node already has a valid sync source.
+     */
+    class RecentSyncSourceChanges {
+    public:
+        /**
+         * Checks if all the entries occurred within the last hour or not. It will remove additional
+         * entries if it sees that there are more than maxSyncSourceChangesPerHour entries. If there
+         * are fewer than maxSyncSourceChangesPerHour entries, it returns false.
+         */
+        bool changedTooOftenRecently(Date_t now);
+
+        /**
+         * Adds a new entry. It will remove additional entries if it sees that there are more than
+         * maxSyncSourceChangesPerHour entries. This should only be called if the sync source was
+         * changed to another node, not if the sync source was cleared.
+         */
+        void addNewEntry(Date_t now);
+
+        /**
+         * Return the underlying queue. Used for testing purposes only.
+         */
+        std::queue<Date_t> getChanges_forTest();
+
+    private:
+        std::queue<Date_t> _recentChanges;
+    };
+
     /**
      * Type that denotes the role of a node in the replication protocol.
      *
@@ -784,6 +816,13 @@ public:
                                    const Timestamp& electionTime = Timestamp(0, 0));
 
     /**
+     * Get a raw pointer to the list of recent sync source changes. It is the caller's
+     * responsibility to not use this pointer beyond the lifetime of the object. Used for testing
+     * only.
+     */
+    RecentSyncSourceChanges* getRecentSyncSourceChanges_forTest();
+
+    /**
      * Change config (version, term) of each member in the initial test config so that
      * it will be majority replicated without having to mock heartbeats.
      */
@@ -936,13 +975,14 @@ private:
     MemberData* _findMemberDataByMemberId(const int memberId);
 
     /**
-     * Performs updating "_currentPrimaryIndex" for processHeartbeatResponse(), and determines if an
-     * election or stepdown should commence.
+     * Performs updating "_currentPrimaryIndex" for processHeartbeatResponse().
      */
-    HeartbeatResponseAction _updatePrimaryFromHBDataV1(int updatedConfigIndex,
-                                                       const MemberState& originalState,
-                                                       Date_t now);
+    void _updatePrimaryFromHBDataV1(Date_t now);
 
+    /**
+     * Determine if the node should run PriorityTakeover or CatchupTakeover.
+     */
+    HeartbeatResponseAction _shouldTakeOverPrimary(int updatedConfigIndex);
     /**
      * Updates _memberData based on the newConfig, ensuring that every member in the newConfig
      * has an entry in _memberData.  If any nodes in the newConfig are also present in
@@ -1076,6 +1116,8 @@ private:
 
     // Whether or not the storage engine supports read committed.
     ReadCommittedSupport _storageEngineSupportsReadCommitted{ReadCommittedSupport::kUnknown};
+
+    RecentSyncSourceChanges _recentSyncSourceChanges;
 };
 
 /**

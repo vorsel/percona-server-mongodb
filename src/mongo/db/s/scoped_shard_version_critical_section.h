@@ -29,36 +29,29 @@
 
 #pragma once
 
-#include "mongo/idl/mutable_observer_registry.h"
-#include "mongo/platform/atomic_proxy.h"
-#include "mongo/platform/atomic_word.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 
 namespace mongo {
 
 /**
- * These are parameters that affect how much snapshot history the storage engine will keep to
- * support snapshot reads. This is referred to as the snapshot window. The window is between the
- * stable timestamp and the oldest timestamp.
+ * RAII-style class that enters the migration critical section and refresh the filtering
+ * metadata for the specified collection. The critical section is released when this object
+ * goes out of scope.
  */
-struct SnapshotWindowParams {
+class ScopedShardVersionCriticalSection {
+    ScopedShardVersionCriticalSection(const ScopedShardVersionCriticalSection&) = delete;
+    ScopedShardVersionCriticalSection& operator=(const ScopedShardVersionCriticalSection&) = delete;
 
-    // minSnapshotHistoryWindowInSeconds (startup & runtime server parameter, range 0+).
-    //
-    // Dictates the lag in seconds oldest_timestamp should be set behind stable_timestamp.
-    //
-    // Note that the window size can become greater than this if an ongoing operation is holding an
-    // older snapshot open.
-    AtomicWord<int> minSnapshotHistoryWindowInSeconds{5};
+public:
+    ScopedShardVersionCriticalSection(OperationContext* opCtx, NamespaceString nss);
+    ~ScopedShardVersionCriticalSection();
 
-    // cachePressureThreshold (startup & runtime server parameter, range [0, 100]).
-    //
-    // Compares against a storage engine cache pressure indicator that ranges from 0 to 100.
-    // Currently, the only indicator is the WT lookaside score.
-    AtomicWord<int> cachePressureThreshold{95};
+    void enterCommitPhase();
 
-    AtomicWord<std::int64_t> snapshotTooOldErrorCount{0};
+private:
+    const NamespaceString _nss;
+    OperationContext* _opCtx;
 };
-
-extern SnapshotWindowParams snapshotWindowParams;
 
 }  // namespace mongo

@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,12 +27,40 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
+#pragma once
 
-#include "mongo/db/snapshot_window_options.h"
+#include "mongo/db/vector_clock.h"
 
 namespace mongo {
 
-SnapshotWindowParams snapshotWindowParams;
+/**
+ * A vector clock service that additionally permits being advanced authoritatively ("ticking").
+ *
+ * Only linked in contexts where ticking is allowed, ie. mongod, embedded, mongod-based unittests.
+ */
+class VectorClockMutable : public VectorClock {
+public:
+    // Decorate ServiceContext with VectorClockMutable*, that will resolve to the mutable vector
+    // clock implementation.
+    static VectorClockMutable* get(ServiceContext* service);
+    static VectorClockMutable* get(OperationContext* ctx);
+
+    static void registerVectorClockOnServiceContext(ServiceContext* service,
+                                                    VectorClockMutable* vectorClockMutable);
+
+    // Ticking
+    virtual LogicalTime tick(Component component, uint64_t nTicks) = 0;
+    virtual void tickTo(Component component, LogicalTime newTime) = 0;
+
+protected:
+    static bool _lessThanOrEqualToMaxPossibleTime(LogicalTime time, uint64_t nTicks);
+
+    VectorClockMutable();
+    virtual ~VectorClockMutable();
+
+    // Internal Ticking API
+    LogicalTime _advanceComponentTimeByTicks(Component component, uint64_t nTicks);
+    void _advanceComponentTimeTo(Component component, LogicalTime&& newTime);
+};
 
 }  // namespace mongo

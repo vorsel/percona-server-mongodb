@@ -76,14 +76,12 @@ bool TopologyManager::onServerDescription(const IsMasterOutcome& isMasterOutcome
 
     boost::optional<IsMasterRTT> lastRTT;
     boost::optional<TopologyVersion> lastTopologyVersion;
-    boost::optional<int> lastPoolResetCounter;
 
     const auto& lastServerDescription =
         _topologyDescription->findServerByAddress(isMasterOutcome.getServer());
     if (lastServerDescription) {
         lastRTT = (*lastServerDescription)->getRtt();
         lastTopologyVersion = (*lastServerDescription)->getTopologyVersion();
-        lastPoolResetCounter = (*lastServerDescription)->getPoolResetCounter();
     }
 
     boost::optional<TopologyVersion> newTopologyVersion = isMasterOutcome.getTopologyVersion();
@@ -92,19 +90,15 @@ bool TopologyManager::onServerDescription(const IsMasterOutcome& isMasterOutcome
             23930,
             "Ignoring this isMaster response because our topologyVersion: {lastTopologyVersion} is "
             "fresher than the provided topologyVersion: {newTopologyVersion}",
+            "Ignoring this isMaster response because our last topologyVersion is fresher than the "
+            "new topologyVersion provided",
             "lastTopologyVersion"_attr = lastTopologyVersion->toBSON(),
             "newTopologyVersion"_attr = newTopologyVersion->toBSON());
         return false;
     }
 
-    boost::optional<int> poolResetCounter = lastPoolResetCounter;
-    if (!isMasterOutcome.isSuccess() && lastPoolResetCounter) {
-        // Bump the poolResetCounter on error if we have one established already.
-        poolResetCounter = ++lastPoolResetCounter.get();
-    }
-
     auto newServerDescription = std::make_shared<ServerDescription>(
-        _clockSource, isMasterOutcome, lastRTT, newTopologyVersion, poolResetCounter);
+        _clockSource, isMasterOutcome, lastRTT, newTopologyVersion);
 
     auto oldTopologyDescription = _topologyDescription;
     _topologyDescription = std::make_shared<TopologyDescription>(*oldTopologyDescription);
@@ -148,7 +142,8 @@ void TopologyManager::onServerRTTUpdated(HostAndPort hostAndPort, IsMasterRTT rt
     // otherwise, the server was removed from the topology. Nothing to do.
     LOGV2(4333201,
           "Not updating RTT. Server {server} does not exist in {replicaSet}",
-          "host"_attr = hostAndPort,
+          "Not updating RTT. The server does not exist in the replica set",
+          "server"_attr = hostAndPort,
           "replicaSet"_attr = getTopologyDescription()->getSetName());
 }
 

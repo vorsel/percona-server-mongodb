@@ -3318,6 +3318,52 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceMode) {
     getIsMasterThread.join();
 }
 
+TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceModeAfterWaitingTimesOut) {
+    init();
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 1 << "members"
+                            << BSON_ARRAY(BSON("host"
+                                               << "node1:12345"
+                                               << "_id" << 0))),
+                       HostAndPort("node1", 12345));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+
+    auto opCtx = makeOperationContext();
+    auto currentTopologyVersion = getTopoCoord().getTopologyVersion();
+
+    auto maxAwaitTime = Milliseconds(5000);
+    auto deadline = getNet()->now() + maxAwaitTime;
+
+    stdx::thread getIsMasterThread([&] {
+        ASSERT_THROWS_CODE(getReplCoord()->awaitIsMasterResponse(
+                               opCtx.get(), {}, currentTopologyVersion, deadline),
+                           AssertionException,
+                           ErrorCodes::ShutdownInProgress);
+    });
+
+    auto failPoint = globalFailPointRegistry().find("hangAfterWaitingForTopologyChangeTimesOut");
+    auto timesEnteredFailPoint = failPoint->setMode(FailPoint::alwaysOn);
+    ON_BLOCK_EXIT([&] { failPoint->setMode(FailPoint::off, 0); });
+
+    getNet()->enterNetwork();
+    getNet()->advanceTime(deadline);
+    ASSERT_EQUALS(deadline, getNet()->now());
+    getNet()->exitNetwork();
+
+    // Ensure that waiting for a topology change timed out before entering quiesce mode.
+    failPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    ASSERT(getReplCoord()->enterQuiesceModeIfSecondary());
+    failPoint->setMode(FailPoint::off, 0);
+
+    // Advance the clock so that pauseWhileSet() will wake up.
+    getNet()->enterNetwork();
+    getNet()->advanceTime(getNet()->now() + Milliseconds(100));
+    getNet()->exitNetwork();
+
+    getIsMasterThread.join();
+}
+
 TEST_F(ReplCoordTest, IsMasterReturnsErrorInQuiesceMode) {
     init();
     assertStartSuccess(BSON("_id"
@@ -3999,14 +4045,14 @@ TEST_F(ReplCoordTest, IsMasterOnRemovedNode) {
 
     // Receive a config that excludes node1 and with node2 having a configured horizon.
     ReplSetHeartbeatResponse hbResp;
-    ReplSetConfig removedFromConfig;
-    ASSERT_OK(removedFromConfig.initialize(
-        BSON("_id"
-             << "mySet"
-             << "protocolVersion" << 1 << "version" << 2 << "members"
-             << BSON_ARRAY(BSON("host" << nodeTwoHostName << "_id" << 2 << "horizons"
-                                       << BSON("horizon1"
-                                               << "testhorizon.com:100"))))));
+    auto removedFromConfig =
+        ReplSetConfig::parse(BSON("_id"
+                                  << "mySet"
+                                  << "protocolVersion" << 1 << "version" << 2 << "members"
+                                  << BSON_ARRAY(BSON("host" << nodeTwoHostName << "_id" << 2
+                                                            << "horizons"
+                                                            << BSON("horizon1"
+                                                                    << "testhorizon.com:100")))));
     hbResp.setConfig(removedFromConfig);
     hbResp.setConfigVersion(2);
     hbResp.setSetName("mySet");
@@ -4165,14 +4211,14 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
 
     // Receive a config that excludes node1 and with node2 having a configured horizon.
     ReplSetHeartbeatResponse hbResp;
-    ReplSetConfig removedFromConfig;
-    ASSERT_OK(removedFromConfig.initialize(
-        BSON("_id"
-             << "mySet"
-             << "protocolVersion" << 1 << "version" << 2 << "members"
-             << BSON_ARRAY(BSON("host" << nodeTwoHostName << "_id" << 2 << "horizons"
-                                       << BSON("horizon1"
-                                               << "testhorizon.com:100"))))));
+    auto removedFromConfig =
+        ReplSetConfig::parse(BSON("_id"
+                                  << "mySet"
+                                  << "protocolVersion" << 1 << "version" << 2 << "members"
+                                  << BSON_ARRAY(BSON("host" << nodeTwoHostName << "_id" << 2
+                                                            << "horizons"
+                                                            << BSON("horizon1"
+                                                                    << "testhorizon.com:100")))));
     hbResp.setConfig(removedFromConfig);
     hbResp.setConfigVersion(2);
     hbResp.setSetName("mySet");
@@ -6618,15 +6664,12 @@ TEST_F(ReplCoordTest,
 
     // Respond to node1's heartbeat command with a config that excludes node1.
     ReplSetHeartbeatResponse hbResp;
-    ReplSetConfig config;
-    config
-        .initialize(BSON("_id"
-                         << "mySet"
-                         << "protocolVersion" << 1 << "version" << 3 << "members"
-                         << BSON_ARRAY(BSON("host"
-                                            << "node2:12345"
-                                            << "_id" << 1))))
-        .transitional_ignore();
+    auto config = ReplSetConfig::parse(BSON("_id"
+                                            << "mySet"
+                                            << "protocolVersion" << 1 << "version" << 3 << "members"
+                                            << BSON_ARRAY(BSON("host"
+                                                               << "node2:12345"
+                                                               << "_id" << 1))));
     hbResp.setConfig(config);
     hbResp.setConfigVersion(3);
     hbResp.setSetName("mySet");

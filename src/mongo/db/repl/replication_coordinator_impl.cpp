@@ -55,6 +55,7 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -119,12 +120,16 @@ MONGO_FAIL_POINT_DEFINE(forceSyncSourceRetryWaitForInitialSync);
 MONGO_FAIL_POINT_DEFINE(waitForIsMasterResponse);
 // Will cause an isMaster request to hang as it starts waiting.
 MONGO_FAIL_POINT_DEFINE(hangWhileWaitingForIsMasterResponse);
+// Will cause an isMaster request to hang after it times out waiting for a topology change.
+MONGO_FAIL_POINT_DEFINE(hangAfterWaitingForTopologyChangeTimesOut);
 MONGO_FAIL_POINT_DEFINE(skipDurableTimestampUpdates);
 // Skip sending heartbeats to pre-check that a quorum is available before a reconfig.
 MONGO_FAIL_POINT_DEFINE(omitConfigQuorumCheck);
 // Will cause signal drain complete to hang after reconfig
 MONGO_FAIL_POINT_DEFINE(hangAfterReconfigOnDrainComplete);
 MONGO_FAIL_POINT_DEFINE(doNotRemoveNewlyAddedOnHeartbeats);
+// Will hang right after setting the currentOp info associated with an automatic reconfig.
+MONGO_FAIL_POINT_DEFINE(hangDuringAutomaticReconfig);
 
 // Number of times we tried to go live as a secondary.
 Counter64 attemptsToBecomeSecondary;
@@ -212,6 +217,9 @@ StatusOrStatusWith<T> futureGetNoThrowWithDeadline(OperationContext* opCtx,
         return e.toStatus();
     }
 }
+
+const Status kQuiesceModeShutdownStatus =
+    Status(ErrorCodes::ShutdownInProgress, "The server is in quiesce mode and will shut down");
 
 }  // namespace
 
@@ -492,8 +500,10 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(OperationContext* opCtx) 
         return true;
     }
     ReplSetConfig localConfig;
-    status = localConfig.initialize(cfg.getValue());
-    if (!status.isOK()) {
+    try {
+        localConfig = ReplSetConfig::parse(cfg.getValue());
+    } catch (const DBException& e) {
+        auto status = e.toStatus();
         if (status.code() == ErrorCodes::RepairedReplicaSetNode) {
             LOGV2_FATAL_NOTRACE(
                 50923,
@@ -1178,9 +1188,9 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
                     return {ErrorCodes::ConfigurationInProgress,
                             "reconfig on step up was preempted by another reconfig"};
                 }
-                auto config = oldConfig;
+                auto config = oldConfig.getMutable();
                 config.setConfigTerm(primaryTerm);
-                return config;
+                return ReplSetConfig(std::move(config));
             };
             LOGV2(4508103, "Increment the config term via reconfig");
             auto reconfigStatus = doReplSetReconfig(opCtx, getNewConfig, true /* force */);
@@ -1382,17 +1392,20 @@ void ReplicationCoordinatorImpl::_setMyLastAppliedOpTimeAndWallTime(
     // No need to wake up replication waiters because there should not be any replication waiters
     // waiting on our own lastApplied.
 
+    // Update the storage engine's lastApplied snapshot before updating the stable timestamp on the
+    // storage engine. New transactions reading from the lastApplied snapshot should start before
+    // the oldest timestamp is advanced to avoid races. Additionally, update this snapshot before
+    // signaling optime waiters. This avoids a race that would allow optime waiters to open
+    // transactions on stale lastApplied values because they do not hold or reacquire the
+    // replication coordinator mutex when signaled.
+    _externalState->updateLastAppliedSnapshot(opTime);
+
     // Signal anyone waiting on optime changes.
     _opTimeWaiterList.setValueIf_inlock(
         [opTime](const OpTime& waitOpTime, const SharedWaiterHandle& waiter) {
             return waitOpTime <= opTime;
         },
         opTime);
-
-    // Update the local snapshot before updating the stable timestamp on the storage engine. New
-    // transactions reading from the local snapshot should start before the oldest timestamp is
-    // advanced to avoid races.
-    _externalState->updateLocalSnapshot(opTime);
 
     // Notify the oplog waiters after updating the local snapshot.
     signalOplogWaiters();
@@ -2129,6 +2142,9 @@ void ReplicationCoordinatorImpl::updateAndLogStateTransitionMetrics(
 
 std::shared_ptr<IsMasterResponse> ReplicationCoordinatorImpl::_makeIsMasterResponse(
     boost::optional<StringData> horizonString, WithLock lock, const bool hasValidConfig) const {
+    uassert(
+        kQuiesceModeShutdownStatus.code(), kQuiesceModeShutdownStatus.reason(), !_inQuiesceMode);
+
     if (!hasValidConfig) {
         auto response = std::make_shared<IsMasterResponse>();
         response->setTopologyVersion(_topCoord->getTopologyVersion());
@@ -2170,9 +2186,8 @@ ReplicationCoordinatorImpl::_getIsMasterResponseFuture(
     boost::optional<StringData> horizonString,
     boost::optional<TopologyVersion> clientTopologyVersion) {
 
-    uassert(ErrorCodes::ShutdownInProgress,
-            "The server is in quiesce mode and will shut down",
-            !_inQuiesceMode);
+    uassert(
+        kQuiesceModeShutdownStatus.code(), kQuiesceModeShutdownStatus.reason(), !_inQuiesceMode);
 
     const bool hasValidConfig = horizonString != boost::none;
 
@@ -2286,6 +2301,11 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMaste
     auto statusWithIsMaster =
         futureGetNoThrowWithDeadline(opCtx, future, deadline.get(), opCtx->getTimeoutError());
     auto status = statusWithIsMaster.getStatus();
+
+    if (MONGO_unlikely(hangAfterWaitingForTopologyChangeTimesOut.shouldFail())) {
+        LOGV2(4783200, "Hanging due to hangAfterWaitingForTopologyChangeTimesOut failpoint");
+        hangAfterWaitingForTopologyChangeTimesOut.pauseWhileSet(opCtx);
+    }
 
     if (status == ErrorCodes::ExceededTimeLimit) {
         // Return an IsMasterResponse with the current topology version on timeout when waiting for
@@ -3206,10 +3226,10 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
 
         // When initializing a new config through the replSetReconfig command, ignore the term
         // field passed in through its args. Instead, use this node's term.
-        const Status status =
-            newConfig.initialize(args.newConfigObj, term, oldConfig.getReplicaSetId());
-
-        if (!status.isOK()) {
+        try {
+            newConfig = ReplSetConfig::parse(args.newConfigObj, term, oldConfig.getReplicaSetId());
+        } catch (const DBException& e) {
+            auto status = e.toStatus();
             LOGV2_ERROR(21418,
                         "replSetReconfig got {error} while parsing {newConfig}",
                         "replSetReconfig error parsing new config",
@@ -3235,11 +3255,13 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
             // Increase the config version for force reconfig.
             auto version = std::max(oldConfig.getConfigVersion(), newConfig.getConfigVersion());
             version += 10'000 + SecureRandom().nextInt32(100'000);
-            newConfig.setConfigVersion(version);
+            auto newMutableConfig = newConfig.getMutable();
+            newMutableConfig.setConfigVersion(version);
+            newConfig = ReplSetConfig(std::move(newMutableConfig));
         } else {
             // Only append 'newlyAdded' to nodes during safe reconfig.
             if (enableAutomaticReconfig) {
-                bool addedNewlyAddedField = false;
+                boost::optional<MutableReplSetConfig> newMutableConfig;
 
                 // Set the 'newlyAdded' field to true for all new voting nodes.
                 for (int i = 0; i < newConfig.getNumMembers(); i++) {
@@ -3273,12 +3295,15 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
                     // 1) Is a new, voting node
                     // 2) Already has a 'newlyAdded' field in the old config
                     if (isNewVotingMember || isCurrentlyNewlyAdded) {
-                        newConfig.addNewlyAddedFieldForMember(newMemId);
-                        addedNewlyAddedField = true;
+                        if (!newMutableConfig) {
+                            newMutableConfig = newConfig.getMutable();
+                        }
+                        newMutableConfig->addNewlyAddedFieldForMember(newMemId);
                     }
                 }
 
-                if (addedNewlyAddedField) {
+                if (newMutableConfig) {
+                    newConfig = ReplSetConfig(*std::move(newMutableConfig));
                     LOGV2(4634400,
                           "Appended the 'newlyAdded' field to a node in the new config. Nodes with "
                           "the 'newlyAdded' field will be considered to have 'votes:0'. Upon "
@@ -3560,7 +3585,7 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
         newConfig.getWriteConcernMajorityShouldJournal();
     // If the new config has the same content but different version and term, like on stepup, we
     // don't need to drop snapshots either, since the quorum condition is still the same.
-    auto newConfigCopy = newConfig;
+    auto newConfigCopy = newConfig.getMutable();
     newConfigCopy.setConfigTerm(oldConfig.getConfigTerm());
     newConfigCopy.setConfigVersion(oldConfig.getConfigVersion());
     auto contentChanged =
@@ -3680,7 +3705,7 @@ void ReplicationCoordinatorImpl::_reconfigToRemoveNewlyAddedField(
                               << ", heartbeat data config version: " << versionAndTerm.toString());
         }
 
-        auto newConfig = oldConfig;
+        auto newConfig = oldConfig.getMutable();
         newConfig.setConfigVersion(newConfig.getConfigVersion() + 1);
 
         const auto hasNewlyAddedField =
@@ -3690,10 +3715,34 @@ void ReplicationCoordinatorImpl::_reconfigToRemoveNewlyAddedField(
         }
 
         newConfig.removeNewlyAddedFieldForMember(memberId);
-        return newConfig;
+        return ReplSetConfig(std::move(newConfig));
     };
 
     auto opCtx = cc().makeOperationContext();
+
+    // Set info for currentOp to display if called while this is still running.
+    {
+        stdx::unique_lock<Client> lk(*opCtx->getClient());
+        auto curOp = CurOp::get(opCtx.get());
+        curOp->setLogicalOp_inlock(LogicalOp::opCommand);
+        BSONObjBuilder bob;
+        bob.append("replSetReconfig", "automatic");
+        bob.append("memberId", memberId.getData());
+        bob.append("configVersionAndTerm", versionAndTerm.toString());
+        bob.append("info",
+                   "An automatic reconfig. Used to remove a 'newlyAdded' config field for a "
+                   "replica set member.");
+        curOp->setOpDescription_inlock(bob.obj());
+        curOp->setNS_inlock("local.system.replset");
+        curOp->ensureStarted();
+    }
+
+    if (MONGO_unlikely(hangDuringAutomaticReconfig.shouldFail())) {
+        LOGV2(4635700,
+              "Failpoint 'hangDuringAutomaticReconfig' enabled. Blocking until it is disabled.");
+        hangDuringAutomaticReconfig.pauseWhileSet();
+    }
+
     auto status = doReplSetReconfig(opCtx.get(), getNewConfig, false /* force */);
 
     if (!status.isOK()) {
@@ -3748,8 +3797,10 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
     lk.unlock();
 
     ReplSetConfig newConfig;
-    Status status = newConfig.initializeForInitiate(configObj, OID::gen());
-    if (!status.isOK()) {
+    try {
+        newConfig = ReplSetConfig::parseForInitiate(configObj, OID::gen());
+    } catch (const DBException& e) {
+        Status status = e.toStatus();
         LOGV2_ERROR(21423,
                     "replSet initiate got {error} while parsing {config}",
                     "replSetInitiate error while parsing config",
@@ -3788,7 +3839,7 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
 
     // In pv1, the TopologyCoordinator has not set the term yet. It will be set to kInitialTerm if
     // the initiate succeeds so we pass that here.
-    status = checkQuorumForInitiate(
+    auto status = checkQuorumForInitiate(
         _replExecutor.get(), newConfig, myIndex.getValue(), OpTime::kInitialTerm);
 
     if (!status.isOK()) {
@@ -3909,8 +3960,7 @@ void ReplicationCoordinatorImpl::_fulfillTopologyChangePromise(WithLock lock) {
          iter != _horizonToTopologyChangePromiseMap.end();
          iter++) {
         if (_inQuiesceMode) {
-            iter->second->setError({ErrorCodes::ShutdownInProgress,
-                                    "The server is in quiesce mode and will shut down"});
+            iter->second->setError(kQuiesceModeShutdownStatus);
         } else {
             StringData horizonString = iter->first;
             auto response = _makeIsMasterResponse(horizonString, lock, hasValidConfig);

@@ -51,6 +51,8 @@ namespace mongo {
 using RoundUpPreparedTimestamps = WiredTigerBeginTxnBlock::RoundUpPreparedTimestamps;
 using RoundUpReadTimestamp = WiredTigerBeginTxnBlock::RoundUpReadTimestamp;
 
+extern AtomicWord<std::int64_t> snapshotTooOldErrorCount;
+
 class BSONObjBuilder;
 
 class WiredTigerOperationStats final : public StorageStats {
@@ -116,6 +118,10 @@ public:
     boost::optional<Timestamp> getPointInTimeReadTimestamp() override;
 
     Status setTimestamp(Timestamp timestamp) override;
+
+    bool isTimestamped() const override {
+        return _isTimestamped;
+    }
 
     void setCommitTimestamp(Timestamp timestamp) override;
 

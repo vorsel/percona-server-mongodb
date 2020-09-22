@@ -14,7 +14,7 @@
 load("jstests/libs/global_snapshot_reads_util.js");
 load("jstests/sharding/libs/sharded_transactions_helpers.js");
 
-const configOptions = {
+const nodeOptions = {
     // Set a large snapshot window of 10 minutes for the test.
     setParameter: {minSnapshotHistoryWindowInSeconds: 600}
 };
@@ -37,7 +37,7 @@ let shardingScenarios = {
                 mongos: 1,
                 config: 1,
                 shards: {rs0: {nodes: 2}},
-                other: {configOptions: configOptions}
+                other: {configOptions: nodeOptions, rsOptions: nodeOptions}
             });
             setUpAllScenarios(st);
             return st;
@@ -54,7 +54,7 @@ let shardingScenarios = {
                 },
                 mongos: 1,
                 config: 1,
-                other: {configOptions: configOptions}
+                other: {configOptions: nodeOptions, rsOptions: nodeOptions}
             });
             setUpAllScenarios(st);
             const mongos = st.s0;
@@ -92,7 +92,7 @@ let shardingScenarios = {
                 },
                 mongos: 1,
                 config: 1,
-                other: {configOptions: configOptions}
+                other: {configOptions: nodeOptions, rsOptions: nodeOptions}
             });
             setUpAllScenarios(st);
             const mongos = st.s0;
@@ -120,6 +120,12 @@ for (let [scenarioName, scenario] of Object.entries(shardingScenarios)) {
     scenario.compatibleCollections.forEach(function(collName) {
         jsTestLog(`Run scenario ${scenarioName} with collection ${collName}`);
         let st = scenario.setUp();
+        let primaryAdmin = st.rs0.getPrimary().getDB("admin");
+        assert.eq(assert
+                      .commandWorked(primaryAdmin.runCommand(
+                          {getParameter: 1, minSnapshotHistoryWindowInSeconds: 1}))
+                      .minSnapshotHistoryWindowInSeconds,
+                  600);
 
         function awaitCommittedFn() {
             for (let i = 0; st['rs' + i] !== undefined; i++) {
@@ -130,13 +136,20 @@ for (let [scenarioName, scenario] of Object.entries(shardingScenarios)) {
         // Pass the same DB handle as "primaryDB" and "secondaryDB" params; the test functions will
         // send readPreference to mongos to target primary/secondary shard servers.
         let db = st.s.getDB(dbName);
-        snapshotReadsTest({
-            testScenarioName: scenarioName,
-            primaryDB: db,
-            secondaryDB: db,
-            collName: collName,
-            awaitCommittedFn: awaitCommittedFn
-        });
+        let snapshotReadsTest = new SnapshotReadsTest(
+            {primaryDB: db, secondaryDB: db, awaitCommittedFn: awaitCommittedFn});
+
+        snapshotReadsTest.cursorTest({testScenarioName: scenarioName, collName: collName});
+
+        if (collName === shardedCollName) {
+            // "distinct" prohibited on sharded collections.
+            assert.commandFailedWithCode(
+                db.runCommand({distinct: collName, key: "_id", readConcern: {level: "snapshot"}}),
+                ErrorCodes.InvalidOptions);
+        } else {
+            snapshotReadsTest.distinctTest({testScenarioName: scenarioName, collName: collName});
+        }
+
         st.stop();
     });
 }

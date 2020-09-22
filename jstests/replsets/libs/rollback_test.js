@@ -170,9 +170,13 @@ function RollbackTest(name = "RollbackTest", replSet) {
         // any other. If we do not do this, then due to initial sync timing and sync source
         // selection all nodes may not be guaranteed to have overlapping oplogs.
         const dbName = "EnsureAnyNodeCanSyncFromAnyOther";
+        // To prevent losing this document due to unclean shutdowns, we need to
+        // ensure the insert was replicated and written to the on-disk journal of all 3
+        // nodes, with the exception of ephemeral and in-memory storage engines where
+        // journaling isn't supported.
         assert.commandWorked(curPrimary.getDB(dbName).ensureSyncSource.insert(
             {thisDocument: 'is inserted to ensure any node can sync from any other'},
-            {writeConcern: {w: 3}}));
+            {writeConcern: {w: 3, j: config.writeConcernMajorityJournalDefault}}));
     }
 
     /**
@@ -435,10 +439,14 @@ function RollbackTest(name = "RollbackTest", replSet) {
 
         transitionIfAllowed(State.kSyncSourceOpsBeforeRollback);
 
-        // Insert one document to ensure rollback will not be skipped.
+        // Insert one document to ensure rollback will not be skipped. This needs to be journaled to
+        // ensure that this document is not lost due to unclean shutdowns. Ephemeral and in-memory
+        // storage engines are an exception because journaling isn't supported.
+        let writeConcern = TestData.rollbackShutdowns ? {w: 1, j: true} : {w: 1};
         let dbName = "EnsureThereIsAtLeastOneOperationToRollback";
         assert.commandWorked(curPrimary.getDB(dbName).ensureRollback.insert(
-            {thisDocument: 'is inserted to ensure rollback is not skipped'}));
+            {thisDocument: 'is inserted to ensure rollback is not skipped'},
+            {writeConcern: writeConcern}));
 
         log(`Isolating the primary ${curPrimary.host} so it will step down`);
         // We should have already disconnected the primary from the secondary during the first stage
@@ -597,8 +605,19 @@ function RollbackTest(name = "RollbackTest", replSet) {
             // because we have configured the replica set with high electionTimeoutMillis.
             assert.eq(newPrimary, curPrimary, "Did not elect the same node as primary");
 
-            // Unfreeze the current secondary so that it can step up again.
-            assert.commandWorked(curSecondary.adminCommand({replSetFreeze: 0}));
+            // Unfreeze the current secondary so that it can step up again. Retry on network errors
+            // in case the current secondary is in ROLLBACK state.
+            assert.soon(() => {
+                try {
+                    assert.commandWorked(curSecondary.adminCommand({replSetFreeze: 0}));
+                    return true;
+                } catch (e) {
+                    if (isNetworkError(e)) {
+                        return false;
+                    }
+                    throw e;
+                }
+            }, `Failed to unfreeze current secondary ${curSecondary.host}`);
         }
 
         curSecondary = rst.getSecondary();

@@ -18,17 +18,24 @@ const options = {
 const replSet = new ReplSetTest({nodes: 3, nodeOptions: options});
 replSet.startSet();
 replSet.initiateWithHighElectionTimeout();
+let primaryAdmin = replSet.getPrimary().getDB("admin");
+assert.eq(assert
+              .commandWorked(
+                  primaryAdmin.runCommand({getParameter: 1, minSnapshotHistoryWindowInSeconds: 1}))
+              .minSnapshotHistoryWindowInSeconds,
+          600);
 const primaryDB = replSet.getPrimary().getDB('test');
 const secondaryDB = replSet.getSecondary().getDB('test');
-snapshotReadsTest({
-    testScenarioName: jsTestName(),
+const snapshotReadsTest = new SnapshotReadsTest({
     primaryDB: primaryDB,
     secondaryDB: secondaryDB,
-    collName: "test",
     awaitCommittedFn: () => {
         replSet.awaitLastOpCommitted();
     }
 });
+
+snapshotReadsTest.cursorTest({testScenarioName: jsTestName(), collName: "test"});
+snapshotReadsTest.distinctTest({testScenarioName: jsTestName(), collName: "test"});
 
 // Ensure "atClusterTime" is omitted from a regular (non-snapshot) read.
 primaryDB["collection"].insertOne({});
