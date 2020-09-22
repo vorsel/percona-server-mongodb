@@ -45,9 +45,7 @@ check_copy(void)
     path = dmalloc(len);
     testutil_check(__wt_snprintf(path, len, "%s/BACKUP", g.home));
 
-    wts_open(path, false, &conn, true);
-
-    testutil_checkfmt(conn->open_session(conn, NULL, NULL, &session), "%s", path);
+    wts_open(path, &conn, &session, true);
 
     /*
      * Verify can return EBUSY if the handle isn't available. Don't yield and retry, in the case of
@@ -56,7 +54,7 @@ check_copy(void)
     ret = session->verify(session, g.uri, NULL);
     testutil_assertfmt(ret == 0 || ret == EBUSY, "WT_SESSION.verify: %s: %s", path, g.uri);
 
-    testutil_checkfmt(conn->close(conn, NULL), "%s", path);
+    wts_close(&conn, &session);
 
     free(path);
 }
@@ -401,15 +399,16 @@ backup(void *arg)
         if (g.c_backup_incr_flag == INCREMENTAL_BLOCK) {
             /*
              * If we're doing a full backup as the start of the incremental backup, only send in an
-             * identifier for this one.
+             * identifier for this one. Also set the block granularity.
              */
             if (incr_full) {
                 active_files_free(&active[0]);
                 active_files_free(&active[1]);
                 active_now = &active[g.backup_id % 2];
                 active_prev = NULL;
-                testutil_check(__wt_snprintf(
-                  cfg, sizeof(cfg), "incremental=(enabled,this_id=ID%" PRIu64 ")", g.backup_id++));
+                testutil_check(__wt_snprintf(cfg, sizeof(cfg),
+                  "incremental=(enabled,granularity=%" PRIu32 "K,this_id=ID%" PRIu64 ")",
+                  g.c_backup_incr_granularity, g.backup_id++));
                 full = true;
                 incr_full = false;
             } else {

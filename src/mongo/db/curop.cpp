@@ -441,7 +441,7 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
 
     const auto executionTimeMillis = _debug.executionTimeMicros / 1000;
 
-    if (_debug.isReplOplogFetching) {
+    if (_debug.isReplOplogGetMore) {
         oplogGetMoreStats.recordMillis(executionTimeMillis);
     }
 
@@ -993,7 +993,7 @@ void OpDebug::report(OperationContext* opCtx,
         if (!errInfo.reason().empty()) {
             pAttrs->add("errMsg", redact(errInfo.reason()));
         }
-        pAttrs->add("errName", errInfo.code());
+        pAttrs->addDeepCopy("errName", errInfo.codeString());
         pAttrs->add("errCode", static_cast<int>(errInfo.code()));
     }
 

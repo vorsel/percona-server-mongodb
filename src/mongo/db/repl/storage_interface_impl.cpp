@@ -94,9 +94,6 @@ using UniqueLock = stdx::unique_lock<Latch>;
 
 const auto kIdIndexName = "_id_"_sd;
 
-LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
-    return nss.isSystemDotViews() ? MODE_X : mode;
-}
 }  // namespace
 
 StorageInterfaceImpl::StorageInterfaceImpl()
@@ -116,7 +113,7 @@ StatusWith<int> StorageInterfaceImpl::getRollbackID(OperationContext* opCtx) {
         auto rbid = RollbackID::parse(IDLParserErrorContext("RollbackID"), rbidDoc.getValue());
         invariant(rbid.get_id() == kRollbackIdDocumentId);
         return rbid.getRollbackId();
-    } catch (...) {
+    } catch (const DBException&) {
         return exceptionToStatus();
     }
 
@@ -593,7 +590,7 @@ Status StorageInterfaceImpl::setIndexIsMultikey(OperationContext* opCtx,
                           str::stream() << "Could not find index " << indexName << " in "
                                         << nss.ns() << " to set to multikey.");
         }
-        collection->getIndexCatalog()->setMultikeyPaths(opCtx, idx, paths);
+        collection->getIndexCatalog()->setMultikeyPaths(opCtx, collection, idx, paths);
         wunit.commit();
         return Status::OK();
     });
@@ -721,24 +718,24 @@ StatusWith<std::vector<BSONObj>> _findOrDeleteDocuments(
             }
 
             std::vector<BSONObj> docs;
-            BSONObj out;
-            PlanExecutor::ExecState state = PlanExecutor::ExecState::ADVANCED;
-            while (state == PlanExecutor::ExecState::ADVANCED && docs.size() < limit) {
-                state = planExecutor->getNext(&out, nullptr);
-                if (state == PlanExecutor::ExecState::ADVANCED) {
-                    docs.push_back(out.getOwned());
+
+            try {
+                BSONObj out;
+                PlanExecutor::ExecState state = PlanExecutor::ExecState::ADVANCED;
+                while (state == PlanExecutor::ExecState::ADVANCED && docs.size() < limit) {
+                    state = planExecutor->getNext(&out, nullptr);
+                    if (state == PlanExecutor::ExecState::ADVANCED) {
+                        docs.push_back(out.getOwned());
+                    }
                 }
+            } catch (const WriteConflictException&) {
+                // Re-throw the WCE, since it will get caught be a retry loop at a higher level.
+                throw;
+            } catch (const DBException&) {
+                return exceptionToStatus();
             }
 
-            switch (state) {
-                case PlanExecutor::ADVANCED:
-                case PlanExecutor::IS_EOF:
-                    return Result(docs);
-                case PlanExecutor::FAILURE:
-                    return WorkingSetCommon::getMemberObjectStatus(out);
-                default:
-                    MONGO_UNREACHABLE;
-            }
+            return Result{docs};
         });
 }
 
@@ -906,9 +903,16 @@ Status _updateWithQuery(OperationContext* opCtx,
         }
         auto planExecutor = std::move(planExecutorResult.getValue());
 
-        auto ret = planExecutor->executePlan();
+        try {
+            planExecutor->executePlan();
+        } catch (const WriteConflictException&) {
+            // Re-throw the WCE, since it will get caught and retried at a higher level.
+            throw;
+        } catch (const DBException&) {
+            return exceptionToStatus();
+        }
         wuow.commit();
-        return ret;
+        return Status::OK();
     });
 }
 
@@ -971,7 +975,15 @@ Status StorageInterfaceImpl::upsertById(OperationContext* opCtx,
                                                               idKey.wrap(""),
                                                               parsedUpdate.yieldPolicy());
 
-        return planExecutor->executePlan();
+        try {
+            planExecutor->executePlan();
+        } catch (const WriteConflictException&) {
+            // Re-throw the WCE, since it will get caught and retried at a higher level.
+            throw;
+        } catch (const DBException&) {
+            return exceptionToStatus();
+        }
+        return Status::OK();
     });
 }
 
@@ -1039,7 +1051,15 @@ Status StorageInterfaceImpl::deleteByFilter(OperationContext* opCtx,
         }
         auto planExecutor = std::move(planExecutorResult.getValue());
 
-        return planExecutor->executePlan();
+        try {
+            planExecutor->executePlan();
+        } catch (const WriteConflictException&) {
+            // Re-throw the WCE, since it will get caught and retried at a higher level.
+            throw;
+        } catch (const DBException&) {
+            return exceptionToStatus();
+        }
+        return Status::OK();
     });
 }
 

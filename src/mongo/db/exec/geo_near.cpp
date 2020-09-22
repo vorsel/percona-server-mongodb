@@ -138,8 +138,7 @@ static void extractGeometries(const BSONObj& doc,
     }
 }
 
-static StatusWith<double> computeGeoNearDistance(const GeoNearParams& nearParams,
-                                                 WorkingSetMember* member) {
+static double computeGeoNearDistance(const GeoNearParams& nearParams, WorkingSetMember* member) {
     //
     // Generic GeoNear distance computation
     // Distances are computed by projecting the stored geometry into the query CRS, and
@@ -183,7 +182,7 @@ static StatusWith<double> computeGeoNearDistance(const GeoNearParams& nearParams
 
     if (minDistance < 0) {
         // No distance to report
-        return StatusWith<double>(-1);
+        return -1;
     }
 
     if (nearParams.addDistMeta) {
@@ -201,7 +200,7 @@ static StatusWith<double> computeGeoNearDistance(const GeoNearParams& nearParams
         member->metadata().setGeoNearPoint(minDistanceMetadata);
     }
 
-    return StatusWith<double>(minDistance);
+    return minDistance;
 }
 
 static R2Annulus geoNearDistanceBounds(const GeoNearExpression& query) {
@@ -267,11 +266,16 @@ static R2Annulus twoDDistanceBounds(const GeoNearParams& nearParams,
     return fullBounds;
 }
 
-GeoNear2DStage::DensityEstimator::DensityEstimator(PlanStage::Children* children,
+GeoNear2DStage::DensityEstimator::DensityEstimator(const Collection* collection,
+                                                   PlanStage::Children* children,
                                                    BSONObj infoObj,
                                                    const GeoNearParams* nearParams,
                                                    const R2Annulus& fullBounds)
-    : _children(children), _nearParams(nearParams), _fullBounds(fullBounds), _currentLevel(0) {
+    : _collection(collection),
+      _children(children),
+      _nearParams(nearParams),
+      _fullBounds(fullBounds),
+      _currentLevel(0) {
     // The index status should always be valid.
     auto result = invariantStatusOK(GeoHashConverter::createFromDoc(std::move(infoObj)));
 
@@ -321,7 +325,7 @@ void GeoNear2DStage::DensityEstimator::buildIndexScan(ExpressionContext* expCtx,
     IndexBoundsBuilder::intersectize(oil, &scanParams.bounds.fields[twoDFieldPosition]);
 
     invariant(!_indexScan);
-    _indexScan = new IndexScan(expCtx, scanParams, workingSet, nullptr);
+    _indexScan = new IndexScan(expCtx, _collection, scanParams, workingSet, nullptr);
     _children->emplace_back(_indexScan);
 }
 
@@ -407,7 +411,7 @@ PlanStage::StageState GeoNear2DStage::initialize(OperationContext* opCtx,
                                                  WorkingSetID* out) {
     if (!_densityEstimator) {
         _densityEstimator.reset(new DensityEstimator(
-            &_children, indexDescriptor()->infoObj(), &_nearParams, _fullBounds));
+            collection(), &_children, indexDescriptor()->infoObj(), &_nearParams, _fullBounds));
     }
 
     double estimatedDistance;
@@ -450,8 +454,14 @@ static const string kTwoDIndexNearStage("GEO_NEAR_2D");
 GeoNear2DStage::GeoNear2DStage(const GeoNearParams& nearParams,
                                ExpressionContext* expCtx,
                                WorkingSet* workingSet,
+                               const Collection* collection,
                                const IndexDescriptor* twoDIndex)
-    : NearStage(expCtx, kTwoDIndexNearStage.c_str(), STAGE_GEO_NEAR_2D, workingSet, twoDIndex),
+    : NearStage(expCtx,
+                kTwoDIndexNearStage.c_str(),
+                STAGE_GEO_NEAR_2D,
+                workingSet,
+                collection,
+                twoDIndex),
       _nearParams(nearParams),
       _fullBounds(twoDDistanceBounds(nearParams, twoDIndex)),
       _currBounds(_fullBounds.center(), -1, _fullBounds.getInner()),
@@ -565,13 +575,11 @@ static R2Annulus projectBoundsToTwoDDegrees(R2Annulus sphereBounds) {
                      outerDegrees + maxErrorDegrees);
 }
 
-StatusWith<NearStage::CoveredInterval*>  //
-GeoNear2DStage::nextInterval(OperationContext* opCtx,
-                             WorkingSet* workingSet,
-                             const Collection* collection) {
+std::unique_ptr<NearStage::CoveredInterval> GeoNear2DStage::nextInterval(
+    OperationContext* opCtx, WorkingSet* workingSet, const Collection* collection) {
     // The search is finished if we searched at least once and all the way to the edge
     if (_currBounds.getInner() >= 0 && _currBounds.getOuter() == _fullBounds.getOuter()) {
-        return StatusWith<CoveredInterval*>(nullptr);
+        return nullptr;
     }
 
     //
@@ -696,7 +704,8 @@ GeoNear2DStage::nextInterval(OperationContext* opCtx,
     invariantStatusOK(GeoHashConverter::createFromDoc(indexDescriptor()->infoObj()));
 
     // 2D indexes support covered search over additional fields they contain
-    auto scan = std::make_unique<IndexScan>(expCtx(), scanParams, workingSet, _nearParams.filter);
+    auto scan = std::make_unique<IndexScan>(
+        expCtx(), collection, scanParams, workingSet, _nearParams.filter);
 
     MatchExpression* docMatcher = nullptr;
 
@@ -710,11 +719,11 @@ GeoNear2DStage::nextInterval(OperationContext* opCtx,
     _children.emplace_back(std::make_unique<FetchStageWithMatch>(
         expCtx(), workingSet, std::move(scan), docMatcher, collection));
 
-    return StatusWith<CoveredInterval*>(new CoveredInterval(
-        _children.back().get(), nextBounds.getInner(), nextBounds.getOuter(), isLastInterval));
+    return std::make_unique<CoveredInterval>(
+        _children.back().get(), nextBounds.getInner(), nextBounds.getOuter(), isLastInterval);
 }
 
-StatusWith<double> GeoNear2DStage::computeDistance(WorkingSetMember* member) {
+double GeoNear2DStage::computeDistance(WorkingSetMember* member) {
     return computeGeoNearDistance(_nearParams, member);
 }
 
@@ -744,8 +753,14 @@ static const string kS2IndexNearStage("GEO_NEAR_2DSPHERE");
 GeoNear2DSphereStage::GeoNear2DSphereStage(const GeoNearParams& nearParams,
                                            ExpressionContext* expCtx,
                                            WorkingSet* workingSet,
+                                           const Collection* collection,
                                            const IndexDescriptor* s2Index)
-    : NearStage(expCtx, kS2IndexNearStage.c_str(), STAGE_GEO_NEAR_2DSPHERE, workingSet, s2Index),
+    : NearStage(expCtx,
+                kS2IndexNearStage.c_str(),
+                STAGE_GEO_NEAR_2DSPHERE,
+                workingSet,
+                collection,
+                s2Index),
       _nearParams(nearParams),
       _fullBounds(geoNearDistanceBounds(*nearParams.nearQuery)),
       _currBounds(_fullBounds.center(), -1, _fullBounds.getInner()),
@@ -761,8 +776,6 @@ GeoNear2DSphereStage::GeoNear2DSphereStage(const GeoNearParams& nearParams,
     const CollatorInterface* collator = nullptr;
     ExpressionParams::initialize2dsphereParams(s2Index->infoObj(), collator, &_indexParams);
 }
-
-GeoNear2DSphereStage::~GeoNear2DSphereStage() {}
 
 namespace {
 
@@ -805,11 +818,13 @@ S2Region* buildS2Region(const R2Annulus& sphereBounds) {
 }
 }  // namespace
 
-GeoNear2DSphereStage::DensityEstimator::DensityEstimator(PlanStage::Children* children,
+GeoNear2DSphereStage::DensityEstimator::DensityEstimator(const Collection* collection,
+                                                         PlanStage::Children* children,
                                                          const GeoNearParams* nearParams,
                                                          const S2IndexingParams& indexParams,
                                                          const R2Annulus& fullBounds)
-    : _children(children),
+    : _collection(collection),
+      _children(children),
       _nearParams(nearParams),
       _indexParams(indexParams),
       _fullBounds(fullBounds),
@@ -847,7 +862,7 @@ void GeoNear2DSphereStage::DensityEstimator::buildIndexScan(ExpressionContext* e
 
     // Index scan
     invariant(!_indexScan);
-    _indexScan = new IndexScan(expCtx, scanParams, workingSet, nullptr);
+    _indexScan = new IndexScan(expCtx, _collection, scanParams, workingSet, nullptr);
     _children->emplace_back(_indexScan);
 }
 
@@ -933,8 +948,8 @@ PlanStage::StageState GeoNear2DSphereStage::initialize(OperationContext* opCtx,
                                                        WorkingSet* workingSet,
                                                        WorkingSetID* out) {
     if (!_densityEstimator) {
-        _densityEstimator.reset(
-            new DensityEstimator(&_children, &_nearParams, _indexParams, _fullBounds));
+        _densityEstimator.reset(new DensityEstimator(
+            collection(), &_children, &_nearParams, _indexParams, _fullBounds));
     }
 
     double estimatedDistance;
@@ -959,13 +974,11 @@ PlanStage::StageState GeoNear2DSphereStage::initialize(OperationContext* opCtx,
     return state;
 }
 
-StatusWith<NearStage::CoveredInterval*>  //
-GeoNear2DSphereStage::nextInterval(OperationContext* opCtx,
-                                   WorkingSet* workingSet,
-                                   const Collection* collection) {
+std::unique_ptr<NearStage::CoveredInterval> GeoNear2DSphereStage::nextInterval(
+    OperationContext* opCtx, WorkingSet* workingSet, const Collection* collection) {
     // The search is finished if we searched at least once and all the way to the edge
     if (_currBounds.getInner() >= 0 && _currBounds.getOuter() == _fullBounds.getOuter()) {
-        return StatusWith<CoveredInterval*>(nullptr);
+        return nullptr;
     }
 
     //
@@ -1027,17 +1040,17 @@ GeoNear2DSphereStage::nextInterval(OperationContext* opCtx,
     OrderedIntervalList* coveredIntervals = &scanParams.bounds.fields[s2FieldPosition];
     ExpressionMapping::S2CellIdsToIntervalsWithParents(cover, _indexParams, coveredIntervals);
 
-    auto scan = std::make_unique<IndexScan>(expCtx(), scanParams, workingSet, nullptr);
+    auto scan = std::make_unique<IndexScan>(expCtx(), collection, scanParams, workingSet, nullptr);
 
     // FetchStage owns index scan
     _children.emplace_back(std::make_unique<FetchStage>(
         expCtx(), workingSet, std::move(scan), _nearParams.filter, collection));
 
-    return StatusWith<CoveredInterval*>(new CoveredInterval(
-        _children.back().get(), nextBounds.getInner(), nextBounds.getOuter(), isLastInterval));
+    return std::make_unique<CoveredInterval>(
+        _children.back().get(), nextBounds.getInner(), nextBounds.getOuter(), isLastInterval);
 }
 
-StatusWith<double> GeoNear2DSphereStage::computeDistance(WorkingSetMember* member) {
+double GeoNear2DSphereStage::computeDistance(WorkingSetMember* member) {
     return computeGeoNearDistance(_nearParams, member);
 }
 

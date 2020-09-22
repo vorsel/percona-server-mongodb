@@ -135,7 +135,7 @@ add_option('lint-scope',
 
 add_option('install-mode',
     choices=['legacy', 'hygienic'],
-    default='legacy',
+    default='hygienic',
     help='select type of installation',
     nargs=1,
     type='choice',
@@ -2239,7 +2239,7 @@ def doConfigure(myenv):
         }
         """ % compiler_minimum_string)
     elif myenv.ToolchainIs('clang'):
-        compiler_minimum_string = "clang 7.0 (or Apple XCode 10.0)"
+        compiler_minimum_string = "clang 7.0 (or Apple XCode 10.2)"
         compiler_test_body = textwrap.dedent(
         """
         #if !defined(__clang__)
@@ -3924,40 +3924,6 @@ if get_option('ninja') != 'disabled':
     if get_option('ninja') == 'stable':
         ninja_builder = Tool("ninja")
         ninja_builder.generate(env)
-
-        # Explicitly add all generated sources to the DAG so NinjaBuilder can
-        # generate rules for them. SCons if the files don't exist will not wire up
-        # the dependencies in the DAG because it cannot scan them. The Ninja builder
-        # does not care about the actual edge here as all generated sources will be
-        # pushed to the "bottom" of it's DAG via the order_only dependency on
-        # _generated_sources (an internal phony target)
-        if get_option('install-mode') == 'hygienic':
-            env.Alias("install-common-base", env.Alias("generated-sources"))
-        else:
-            env.Alias("all", env.Alias("generated-sources"))
-            env.Alias("core", env.Alias("generated-sources"))
-
-        if env.get("NINJA_SUFFIX") and env["NINJA_SUFFIX"][0] != ".":
-            env["NINJA_SUFFIX"] = "." + env["NINJA_SUFFIX"]
-
-        if get_option("install-mode") == "hygienic":
-            ninja_build = env.Ninja(
-                target="${NINJA_PREFIX}.ninja$NINJA_SUFFIX",
-                source=[
-                    env.Alias("install-all-meta"),
-                    env.Alias("test-execution-aliases"),
-                ],
-            )
-        else:
-            ninja_build = env.Ninja(
-                target="${NINJA_PREFIX}.ninja$NINJA_SUFFIX",
-                source=[
-                    env.Alias("all"),
-                    env.Alias("test-execution-aliases"),
-                ],
-            )
-
-        env.Alias("generate-ninja", ninja_build)
     else:
         ninja_builder = Tool("ninja_next")
         ninja_builder.generate(env)

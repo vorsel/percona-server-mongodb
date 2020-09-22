@@ -86,7 +86,6 @@ public:
      */
     struct IndexBuildOptions {
         boost::optional<CommitQuorumOptions> commitQuorum;
-        bool replSetAndNotPrimaryAtStart = false;
         ApplicationMode applicationMode = ApplicationMode::kNormal;
     };
 
@@ -232,6 +231,17 @@ public:
                                   const std::string& reason);
 
     /**
+     * Signals all of the index builds to abort and then waits until the index builds are no longer
+     * running. The provided 'reason' will be used in the error message that the index builders
+     * return to their callers.
+     *
+     * Does not require holding locks.
+     *
+     * Does not stop new index builds from starting. Caller must make that guarantee.
+     */
+    void abortAllIndexBuildsForInitialSync(OperationContext* opCtx, const std::string& reason);
+
+    /**
      * Aborts an index build by index build UUID. Returns when the index build thread exits.
      *
      * Returns true if the index build was aborted or the index build is already in the process of
@@ -365,18 +375,15 @@ public:
     //
 
     /**
-     * Creates indexes in collection.
+     * Creates index in collection.
      * Assumes callers has necessary locks.
-     * For two phase index builds, writes both startIndexBuild and commitIndexBuild oplog entries
-     * on success. No two phase index build oplog entries, including abortIndexBuild, will be
-     * written on failure.
      * Throws exception on error.
      */
-    void createIndexes(OperationContext* opCtx,
-                       UUID collectionUUID,
-                       const std::vector<BSONObj>& specs,
-                       IndexBuildsManager::IndexConstraints indexConstraints,
-                       bool fromMigrate);
+    void createIndex(OperationContext* opCtx,
+                     UUID collectionUUID,
+                     const BSONObj& spec,
+                     IndexBuildsManager::IndexConstraints indexConstraints,
+                     bool fromMigrate);
 
     /**
      * Creates indexes on an empty collection.
@@ -445,6 +452,8 @@ public:
         OperationContext* opCtx,
         std::shared_ptr<ReplIndexBuildState> replState,
         IndexBuildAction signal) = 0;
+
+    bool supportsResumableIndexBuilds() const;
 
 private:
     /**
@@ -628,7 +637,7 @@ protected:
     /**
      * Signals the primary to commit the index build by sending "voteCommitIndexBuild" command
      * request to it with write concern 'majority', then waits for that command's response. And,
-     * command gets retried on error. This function gets called after the second draining phase of
+     * command gets retried on error. This function gets called after the first draining phase of
      * index build.
      */
     virtual void _signalPrimaryForCommitReadiness(

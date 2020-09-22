@@ -5,8 +5,8 @@
 load("jstests/libs/analyze_plan.js");     // For assertExplainCount.
 load("jstests/libs/fixture_helpers.js");  // For isMongos and isSharded.
 
-const collName = "jstests_explain_count";
-const t = db[collName];
+var collName = "jstests_explain_count";
+var t = db[collName];
 t.drop();
 
 /**
@@ -61,12 +61,12 @@ function checkIndexedCountWithPred(db, explain, keyName, bounds) {
 
 // Collection does not exist.
 assert.eq(0, t.count());
-let explain =
+var explain =
     assert.commandWorked(db.runCommand({explain: {count: collName}, verbosity: "executionStats"}));
 assertExplainCount({explainResults: explain, expectedCount: 0});
 
 // Collection does not exist with skip, limit, and/or query.
-let result = assert.commandWorked(db.runCommand({count: collName, skip: 3}));
+var result = assert.commandWorked(db.runCommand({count: collName, skip: 3}));
 assert.eq(0, result.n);
 explain = assert.commandWorked(
     db.runCommand({explain: {count: collName, skip: 3}, verbosity: "executionStats"}));

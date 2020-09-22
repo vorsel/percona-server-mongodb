@@ -2248,6 +2248,12 @@ TEST(ValueIntegral, CorrectlyIdentifiesInvalid64BitIntegralValues) {
     ASSERT_FALSE(Value(kDoubleMinAsDecimal).integral64Bit());
 }
 
+TEST(ValueOutput, StreamOutputForIllegalDateProducesErrorToken) {
+    auto sout = std::ostringstream{};
+    sout << mongo::Value{Date_t::min()};
+    ASSERT_EQ("illegal date", sout.str());
+}
+
 }  // namespace Value
 
 class All : public OldStyleSuiteSpecification {
@@ -2357,11 +2363,5 @@ public:
 };
 
 OldStyleSuiteInitializer<All> myall;
-
-TEST(ValueOutput, StreamOutputForIllegalDateProducesErrorToken) {
-    auto sout = std::ostringstream{};
-    sout << mongo::Value{Date_t::min()};
-    ASSERT_EQ("illegal date", sout.str());
-}
 
 }  // namespace DocumentTests

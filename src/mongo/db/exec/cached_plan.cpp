@@ -43,7 +43,6 @@
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/plan_cache.h"
-#include "mongo/db/query/plan_ranker.h"
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
@@ -102,7 +101,28 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
         }
 
         WorkingSetID id = WorkingSet::INVALID_ID;
-        PlanStage::StageState state = child()->work(&id);
+        PlanStage::StageState state;
+        try {
+            state = child()->work(&id);
+        } catch (const ExceptionFor<ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed>& ex) {
+            // The plan failed by hitting the limit we impose on memory consumption. It's possible
+            // that a different plan is less resource-intensive, so we fall back to replanning the
+            // whole query. We neither evict the existing cache entry nor cache the result of
+            // replanning.
+            LOGV2_DEBUG(20579,
+                        1,
+                        "Execution of cached plan failed, falling back to replan. query: "
+                        "{query} planSummary: {planSummary} status: {status}",
+                        "Execution of cached plan failed, failling back to replan",
+                        "query"_attr = redact(_canonicalQuery->toStringShort()),
+                        "planSummary"_attr = Explain::getPlanSummary(child().get()),
+                        "status"_attr = redact(ex.toStatus()));
+
+            const bool shouldCache = false;
+            return replan(yieldPolicy,
+                          shouldCache,
+                          str::stream() << "cached plan returned: " << ex.toStatus());
+        }
 
         if (PlanStage::ADVANCED == state) {
             // Save result for later.
@@ -112,15 +132,11 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
             _results.push(id);
 
             if (_results.size() >= numResults) {
-                // Once a plan returns enough results, stop working. Update cache with stats
-                // from this run and return.
-                updatePlanCache();
+                // Once a plan returns enough results, stop working. There is no need to replan.
                 return Status::OK();
             }
         } else if (PlanStage::IS_EOF == state) {
-            // Cached plan hit EOF quickly enough. No need to replan. Update cache with stats
-            // from this run and return.
-            updatePlanCache();
+            // Cached plan hit EOF quickly enough. No need to replan.
             return Status::OK();
         } else if (PlanStage::NEED_YIELD == state) {
             invariant(id == WorkingSet::INVALID_ID);
@@ -136,26 +152,6 @@ Status CachedPlanStage::pickBestPlan(PlanYieldPolicy* yieldPolicy) {
             if (!yieldStatus.isOK()) {
                 return yieldStatus;
             }
-        } else if (PlanStage::FAILURE == state) {
-            // On failure, fall back to replanning the whole query. We neither evict the
-            // existing cache entry nor cache the result of replanning.
-            BSONObj statusObj = WorkingSetCommon::getStatusMemberDocument(*_ws, id)->toBson();
-
-            LOGV2_DEBUG(20579,
-                        1,
-                        "Execution of cached plan failed, falling back to replan. query: "
-                        "{canonicalQuery_Short} planSummary: {Explain_getPlanSummary_child_get} "
-                        "status: {statusObj}",
-                        "canonicalQuery_Short"_attr = redact(_canonicalQuery->toStringShort()),
-                        "Explain_getPlanSummary_child_get"_attr =
-                            Explain::getPlanSummary(child().get()),
-                        "statusObj"_attr = redact(statusObj));
-
-            const bool shouldCache = false;
-            return replan(yieldPolicy,
-                          shouldCache,
-                          str::stream() << "cached plan returned: "
-                                        << WorkingSetCommon::toStatusString(statusObj));
         } else {
             invariant(PlanStage::NEED_TIME == state);
         }
@@ -313,28 +309,6 @@ std::unique_ptr<PlanStageStats> CachedPlanStage::getStats() {
 
 const SpecificStats* CachedPlanStage::getSpecificStats() const {
     return &_specificStats;
-}
-
-void CachedPlanStage::updatePlanCache() {
-    const double score = PlanRanker::scoreTree(getStats()->children[0].get());
-
-    PlanCache* cache = CollectionQueryInfo::get(collection()).getPlanCache();
-    Status fbs = cache->feedback(*_canonicalQuery, score);
-    if (!fbs.isOK()) {
-        LOGV2_DEBUG(
-            20583,
-            5,
-            "{canonicalQuery_ns}: Failed to update cache with feedback: {fbs} - (query: "
-            "{canonicalQuery_getQueryObj}; sort: {canonicalQuery_getQueryRequest_getSort}; "
-            "projection: {canonicalQuery_getQueryRequest_getProj}) is no longer in plan cache.",
-            "canonicalQuery_ns"_attr = _canonicalQuery->ns(),
-            "fbs"_attr = redact(fbs),
-            "canonicalQuery_getQueryObj"_attr = redact(_canonicalQuery->getQueryObj()),
-            "canonicalQuery_getQueryRequest_getSort"_attr =
-                _canonicalQuery->getQueryRequest().getSort(),
-            "canonicalQuery_getQueryRequest_getProj"_attr =
-                _canonicalQuery->getQueryRequest().getProj());
-    }
 }
 
 }  // namespace mongo

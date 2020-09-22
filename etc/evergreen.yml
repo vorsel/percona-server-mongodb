@@ -1463,7 +1463,6 @@ functions:
         set +o errexit
         PATH="$path_value"                                \
             AWS_PROFILE=${aws_profile_remote}             \
-            RSK_is_asan_build=${is_asan_build|""}         \
             ${gcov_environment}                           \
             ${lang_environment}                           \
             ${san_options}                                \
@@ -1656,6 +1655,7 @@ functions:
       params:
         target: generate_tasks_config.tgz
         source_dir: src/generated_resmoke_config
+        optional: true
         include:
           - "*"
 
@@ -1989,6 +1989,8 @@ functions:
           branch=$(git symbolic-ref --short HEAD)
           commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
           echo "Git branch: $branch, commit: $commit"
+
+          sudo apt-get install leiningen
           lein install
     - command: shell.exec
       params:
@@ -2110,14 +2112,6 @@ functions:
           ${activate_virtualenv}
           $python buildscripts/evergreen_gen_multiversion_tests.py run --expansion-file expansions.yml
 
-    - command: shell.exec
-      params:
-        working_dir: src
-        script: |
-          set -o errexit
-          set -o verbose
-
-          ${activate_virtualenv}
           $python buildscripts/evergreen_gen_multiversion_tests.py generate-exclude-files --suite=${task_name} --task-path-suffix=${task_path_suffix} --is-generated-suite=true
 
     - command: archive.targz_pack
@@ -2137,9 +2131,13 @@ functions:
         permissions: public-read
         content_type: ${content_type|application/gzip}
         display_name: Generated Task Config - Execution ${execution}
+        optional: true
 
     - command: generate.tasks
       params:
+        # Optional b/c reruns of this task will produce no JSON files to avoid
+        # generate.tasks failing
+        optional: true
         files:
           - src/generated_resmoke_config/*.json
 
@@ -3448,6 +3446,11 @@ functions:
 
         set -eou pipefail
 
+        # Only run on unit test tasks so we don't target mongod binaries from cores.
+        if [ "${task_name}" != "unittests" ] && [ "${task_name}" != "dbtest" ]; then
+            exit 0
+        fi
+
         mkdir unittest_binaries || true
         # Find all core files
         core_files=$(/usr/bin/find -H . \( -name "dump_*.core" -o -name "*.mdmp" \) 2> /dev/null)
@@ -3466,7 +3469,7 @@ functions:
             binary_file=$(echo $core_file | sed "s/.*\///;s/dump_//;s/\..*\.core//;s/\..*\.mdmp//")
             # Locate the binary file. Since the base file name might be truncated, the find
             # may return more than 1 file.
-            binary_file_locations=$(/usr/bin/find -H . -name "$binary_file*${exe}" 2> /dev/null)
+            binary_file_locations=$(/usr/bin/find -H . -executable -name "$binary_file*${exe}" 2> /dev/null)
           fi
           if [ -z "$binary_file_locations" ]; then
             echo "Cannot locate the unittest binary file ($binary_file) that generated the core file $core_file"
@@ -3567,7 +3570,7 @@ functions:
 
         hang_analyzer_option="-o file -o stdout -p ${hang_analyzer_processes|dbtest,java,mongo,mongod,mongos,python,_test}"
 
-        if [ ${is_asan_build|false} = false ]; then
+        if [ ${hang_analyzer_dump_core|true} = true ]; then
           hang_analyzer_option="-c $hang_analyzer_option"
         fi
 
@@ -4661,6 +4664,19 @@ tasks:
       jepsen_storage_engine: --storage-engine wiredTiger
       jepsen_test_name: read-concern-majority
 
+# Smoke test to ensure the Server still works with Jepsen
+- <<: *run_jepsen_template
+  name: jepsen-smoke
+  commands:
+    - func: "do setup"
+    - func: "do jepsen setup"
+    - func: "run jepsen test"
+      vars:
+        <<: *jepsen_config_vars
+        jepsen_storage_engine: --storage-engine wiredTiger
+        jepsen_test_name: read-concern-majority
+        jepsen_time_limit: --time-limit 120
+
 - <<: *run_jepsen_template
   name: jepsen_read-concern-majority_w1
   tags: ["jepsen"]
@@ -4851,7 +4867,7 @@ tasks:
 ## rollback multiversion fuzzer ##
 - <<: *jstestfuzz_template
   name: rollback_multiversion_fuzzer_gen
-# tags: ["multiversion_fuzzer"]
+  tags: ["multiversion_fuzzer"]
   commands:
   - func: "generate fuzzer tasks"
     vars:
@@ -7260,6 +7276,28 @@ tasks:
       resmoke_args: --storageEngine=wiredTiger
       fallback_num_sub_suites: 15
 
+- name: causally_consistent_read_concern_snapshot_passthrough_gen
+  tags: ["causally_consistent", "read_write_concern"]
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      depends_on: jsCore
+      resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 15
+
+- name: sharded_causally_consistent_read_concern_snapshot_passthrough_gen
+  tags: ["causally_consistent", "read_write_concern"]
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      depends_on: jsCore
+      resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 15
+
 - name: sharded_causally_consistent_jscore_passthrough_gen
   tags: ["causally_consistent"]
   depends_on:
@@ -7869,7 +7907,6 @@ tasks:
   stepback: false
   # Same dependencies as "push" below
   depends_on:
-  - name: compile
   - name: package
   - name: jsCore
   - name: dbtest
@@ -10296,6 +10333,103 @@ buildvariants:
   - name: server_discovery_and_monitoring_json_test_TG
   - name: server_selection_json_test_TG
 
+- name: enterprise-rhel-62-64-bit-dynamic
+  display_name: "~ Shared Library Enterprise RHEL 6.2"
+  batchtime: 60 # 1 hour
+  modules:
+  - enterprise
+  run_on:
+  - rhel62-small
+  expansions:
+    additional_package_targets: archive-mongocryptd archive-mongocryptd-debug archive-mh archive-mh-debug
+    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --link-model=dynamic
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
+    packager_script: packager_enterprise.py
+    packager_arch: x86_64
+    packager_distro: rhel62
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    jstestfuzz_num_generated_files: 40
+    jstestfuzz_concurrent_num_files: 10
+    target_resmoke_time: 10
+    max_sub_suites: 100
+    large_distro_name: rhel62-large
+    scons_cache_mode: all
+    num_scons_link_jobs_available: 0.99
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - rhel62-large
+  - name: .aggfuzzer
+  - name: .aggregation
+  - name: audit
+  - name: .auth
+  - name: .causally_consistent !.sharding
+  - name: .change_streams
+  - name: .misc_js
+  - name: .concurrency !.large !.ubsan !.no_txns !.debug_only
+  - name: .concurrency .large !.ubsan !.no_txns !.debug_only
+    distros:
+    - rhel62-large
+  - name: disk_wiredtiger
+  - name: .encrypt
+  - name: idl_tests
+  - name: initial_sync_fuzzer_gen
+  - name: .integration
+    distros:
+    - rhel62-large
+  - name: .jscore .common
+  - name: jsCore_minimum_batch_size
+  - name: jsCore_op_query
+  - name: jsCore_txns_large_txns_format
+  - name: jsonSchema
+  - name: .jstestfuzz !.flow_control  # Flow control jstestfuzz take longer.
+  - name: libunwind_tests
+  - name: multiversion_sanity_check_gen
+  - name: mqlrun
+  - name: .multi_shard
+  - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
+  - name: multiversion_gen
+  - name: .query_fuzzer
+  - name: .random_multiversion_ds
+  - name: .read_write_concern .large
+    distros:
+    - rhel62-large
+  - name: .read_write_concern !.large
+  - name: .replica_sets !.encrypt !.auth
+    distros:
+    - rhel62-large
+  - name: replica_sets_reconfig_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_reconfig_jscore_stepdown_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_reconfig_kill_primary_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: retryable_writes_jscore_passthrough_gen
+  - name: retryable_writes_jscore_stepdown_passthrough
+    distros:
+    - rhel62-large
+  - name: .read_only
+  - name: .rollbackfuzzer
+  - name: sasl
+  - name: search
+  - name: search_auth
+  - name: search_ssl
+  - name: session_jscore_passthrough
+  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
+  - name: .sharding .txns
+  - name: .sharding .common
+  - name: snmp
+  - name: .stitch
+  - name: .updatefuzzer
+  - name: secondary_reads_passthrough_gen
+  - name: server_discovery_and_monitoring_json_test_TG
+  - name: server_selection_json_test_TG
+
 - name: enterprise-rhel-62-64-bit-large-txns-format
   display_name: "Enterprise RHEL 6.2 (large transactions format)"
   modules:
@@ -10427,7 +10561,7 @@ buildvariants:
   - name: audit
   - name: .auth !.multiversion
   - name: buildscripts_test
-  - name: .causally_consistent !.txns
+  - name: .causally_consistent !.txns !.read_write_concern
   - name: causally_consistent_jscore_txns_passthrough
   - name: .change_streams
   - name: .misc_js !.non_read_maj
@@ -10476,6 +10610,31 @@ buildvariants:
   - name: snmp
   - name: .updatefuzzer
 
+- name: enterprise-rhel-62-64-bit-resumable-index-builds
+  display_name: "Enterprise RHEL 6.2 (resumable index builds)"
+  modules:
+  - enterprise
+  run_on:
+  - rhel62-small
+  expansions: &enterprise-rhel-62-64-bit-resumable-index-builds-expansions
+    test_flags: >-
+      --mongodSetParameters="{enableResumableIndexBuilds: true}"
+    compile_flags: >-
+      -j$(grep -c ^processor /proc/cpuinfo)
+      --ssl
+      --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+      MONGO_DISTMOD=rhel62
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    large_distro_name: rhel62-large
+  tasks:
+  - name: compile_TG
+    distros:
+    - rhel62-large
+  - name: noPassthrough_gen
+  - name: noPassthroughWithMongod_gen
 
 # This build variant is used to run multiversion tests as part of burn_in_tags as these tests are
 # currently only run on our daily builders.
@@ -10566,9 +10725,10 @@ buildvariants:
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
   - name: multi_shard_multi_stmt_txn_kill_primary_jscore_passthrough_gen
   - name: multiversion_gen
-  - name: .read_write_concern !.aggregation
+  - name: .read_write_concern !.large !.aggregation
+  - name: .read_write_concern .large !.aggregation
     distros:
-      - rhel62-large
+    - rhel62-large
   - name: .replica_sets !.encrypt !.auth
     distros:
     - rhel62-large
@@ -12137,7 +12297,13 @@ buildvariants:
   expansions:
     # Transactions are not explicitly supported on the ephemeralForTest storage engine.
     # Speculative majority reads are currently only allowed for change streams, which are only supported on WiredTiger.
-    test_flags: --storageEngine=ephemeralForTest --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_wiredtiger,uses_transactions,requires_document_locking,uses_speculative_majority,requires_snapshot_read,requires_majority_read_concern,uses_change_streams,requires_sharding
+    # We also relax oplog constraints so that applying oplog entries after a rollbackViaRefetch works correctly.
+    # TODO (SERVER-47022): Re-enable oplog constraint enforcement once we set the application mode
+    # correctly after rollbackViaRefetch.
+    test_flags: >-
+      --storageEngine=ephemeralForTest
+      --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_wiredtiger,uses_transactions,requires_document_locking,uses_speculative_majority,requires_snapshot_read,requires_majority_read_concern,uses_change_streams,requires_sharding
+      --mongodSetParameters="{oplogApplicationEnforcesSteadyStateConstraints: false}"
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     multiversion_platform: rhel62
     multiversion_edition: targeted
@@ -12268,7 +12434,7 @@ buildvariants:
     multiversion_platform: ubuntu1804
     multiversion_edition: enterprise
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under ASAN build.
-    is_asan_build: true
+    hang_analyzer_dump_core: false
     scons_cache_scope: shared
     test_flags: --excludeWithAnyTags=requires_fast_memory
   tasks:
@@ -12335,7 +12501,7 @@ buildvariants:
     multiversion_platform: ubuntu1804
     multiversion_edition: enterprise
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under ASAN build.
-    is_asan_build: true
+    hang_analyzer_dump_core: false
     scons_cache_scope: shared
     test_flags: --excludeWithAnyTags=requires_fast_memory
   tasks:
@@ -12425,15 +12591,18 @@ buildvariants:
     san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
-    is_asan_build: true
+    hang_analyzer_dump_core: false
     scons_cache_scope: shared
     max_sub_suites: 100
   tasks:
   - name: compile_all_run_unittests_TG
-  - name: server_discovery_and_monitoring_json_test_TG
-  - name: server_selection_json_test_TG
   - name: jsCore
   - name: jsCore_txns
+  # Note: {A,UB}SAN has a runtime component that is not fed into Jepsen.
+  # We don't actually run jepsen with {A,UB}SAN.  This task is on this BV because
+  # Jepsen uses Java and Leiningen which is available on this distro
+  # and requires a static build, so this is the only suitable build variant for it.
+  - name: jepsen-smoke
 
 - name: ubuntu1804-debug-aubsan-lite_fuzzer
   display_name: "{A,UB}SAN Enterprise Ubuntu 18.04 FUZZER"
@@ -12450,7 +12619,7 @@ buildvariants:
     san_options: UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
     compile_flags: LINKFLAGS=-nostdlib++ LIBS=stdc++ --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address,fuzzer --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
-    is_asan_build: true
+    hang_analyzer_dump_core: false
     scons_cache_scope: shared
   display_tasks:
   - *libfuzzertests
@@ -12536,6 +12705,8 @@ buildvariants:
   expansions:
     scons_cache_scope: shared
     compile_flags: MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    multiversion_platform: ubuntu1604
+    multiversion_edition: enterprise
     test_flags: >-
       --mongosSetParameters="{replicaSetMonitorProtocol: scanning}"
       --mongodSetParameters="{replicaSetMonitorProtocol: scanning}"
@@ -12565,6 +12736,8 @@ buildvariants:
   expansions:
     scons_cache_scope: shared
     compile_flags: MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    multiversion_platform: ubuntu1604
+    multiversion_edition: enterprise
     test_flags: >-
       --mongosSetParameters="{replicaSetMonitorProtocol: sdam}"
       --mongodSetParameters="{replicaSetMonitorProtocol: sdam}"
@@ -12594,6 +12767,8 @@ buildvariants:
   expansions:
     scons_cache_scope: shared
     compile_flags: MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    multiversion_platform: ubuntu1604
+    multiversion_edition: enterprise
     test_flags: |- # Set the taskExecutorPoolSize for all tests
         --mongosSetParameters="taskExecutorPoolSize: 4"
   tasks:

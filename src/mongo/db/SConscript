@@ -137,6 +137,7 @@ env.Library(
         'generic_cursor',
     ],
     LIBDEPS_PRIVATE=[
+        'auth/auth',
         'prepare_conflict_tracker',
     ],
 )
@@ -440,7 +441,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/util/caching',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
-        'logical_clock',
+        'vector_clock',
     ],
 )
 
@@ -595,6 +596,7 @@ env.Library(
         '$BUILD_DIR/mongo/rpc/rpc',
         '$BUILD_DIR/mongo/rpc/command_status',
         'audit',
+        'auth/auth',
         'command_generic_argument',
         'commands/server_status_core',
         'commands/test_commands_enabled',
@@ -1055,7 +1057,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/catalog/collection',
         'rw_concern_d',
-        'logical_clock',
+        'vector_clock',
     ],
     LIBDEPS_PRIVATE=[
         'index_builds_coordinator_interface',
@@ -1112,6 +1114,7 @@ env.Library(
         'exec/index_scan.cpp',
         'exec/limit.cpp',
         'exec/merge_sort.cpp',
+        'exec/mock_stage.cpp',
         'exec/multi_iterator.cpp',
         'exec/multi_plan.cpp',
         'exec/near.cpp',
@@ -1257,7 +1260,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/crypto/sha1_block',
         'keys_collection_document',
-        'logical_clock',
+        'vector_clock',
     ],
 )
 
@@ -1543,9 +1546,9 @@ env.Library(
         'keys_collection_client_direct.cpp',
     ],
     LIBDEPS=[
-        'logical_clock',
         'keys_collection_document',
         'logical_time',
+        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client',
         '$BUILD_DIR/mongo/s/client/rs_local_client',
         '$BUILD_DIR/mongo/s/client/shard_interface',
     ],
@@ -1557,7 +1560,6 @@ env.Library(
         'keys_collection_client_sharded.cpp',
     ],
     LIBDEPS=[
-        'logical_clock',
         'keys_collection_document',
         'logical_time',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client',
@@ -1565,45 +1567,31 @@ env.Library(
 )
 
 env.Library(
-    target='keys_collection_manager',
+    target='vector_clock',
     source=[
-        env.Idlc('keys_collection_manager.idl')[0],
-        'keys_collection_manager.cpp',
-        'keys_collection_cache.cpp',
         'key_generator.cpp',
-    ],
-    LIBDEPS=[
-        'logical_clock',
-        'keys_collection_document',
-        'logical_time',
-        'keys_collection_client_sharded',
-        'repl/repl_coordinator_interface',
-        '$BUILD_DIR/mongo/transport/transport_layer_common',
-    ],
-)
-
-env.Library(
-    target='logical_clock',
-    source=[
+        'keys_collection_cache.cpp',
+        'keys_collection_manager.cpp',
         'logical_clock.cpp',
+        'logical_time_validator.cpp',
+        'vector_clock.cpp',
+        env.Idlc('keys_collection_manager.idl')[0],
         env.Idlc('logical_clock.idl')[0],
     ],
     LIBDEPS=[
+        'auth/authprivilege',
         'global_settings',
+        'keys_collection_client_sharded',
+        'keys_collection_document',
         'logical_time',
+        'repl/repl_coordinator_interface',
         'service_context',
-        'vector_clock_mutable',
+        'signed_logical_time',
+        'time_proof_service',
+        '$BUILD_DIR/mongo/transport/transport_layer_common',
     ],
-)
-
-env.Library(
-    target='vector_clock',
-    source=[
-        'vector_clock.cpp',
-    ],
-    LIBDEPS=[
-        'logical_time',
-        'service_context',
+    LIBDEPS_PRIVATE=[
+        'server_options_core',
     ],
 )
 
@@ -1618,7 +1606,7 @@ env.Library(
 )
 
 env.Library(
-    target='vector_clock_d',
+    target='vector_clock_mongod',
     source=[
         'vector_clock_mongod.cpp',
     ],
@@ -1642,28 +1630,13 @@ env.Library(
 )
 
 env.Library(
-    target='logical_time_validator',
-    source=[
-        'logical_time_validator.cpp',
-    ],
-    LIBDEPS=[
-        'keys_collection_manager',
-        'service_context',
-        'signed_logical_time',
-        'time_proof_service',
-        '$BUILD_DIR/mongo/db/auth/auth',
-        '$BUILD_DIR/mongo/db/auth/authprivilege',
-    ],
-)
-
-env.Library(
     target= 'logical_time_metadata_hook',
     source= [
         'logical_time_metadata_hook.cpp',
     ],
     LIBDEPS= [
-        'logical_time_validator',
-        'signed_logical_time',
+        'logical_time',
+        'vector_clock',
         '$BUILD_DIR/mongo/rpc/metadata',
     ],
 )
@@ -1685,8 +1658,8 @@ env.Library(
         'logical_clock_test_fixture.cpp',
     ],
     LIBDEPS= [
-        'logical_clock',
         'signed_logical_time',
+        'vector_clock',
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/s/sharding_mongod_test_fixture',
         '$BUILD_DIR/mongo/util/clock_source_mock'
@@ -1945,9 +1918,8 @@ envWithAsio.CppUnitTest(
         'dbmessage',
         'index_build_entry_helpers',
         'index_builds_coordinator_mongod',
+        'keys_collection_client_direct',
         'keys_collection_document',
-        'keys_collection_manager',
-        'logical_clock',
         'logical_clock_test_fixture',
         'logical_session_cache',
         'logical_session_cache_impl',
@@ -1985,6 +1957,7 @@ envWithAsio.CppUnitTest(
         'time_proof_service',
         'transaction',
         'update_index_data',
+        'vector_clock',
         'write_concern_options',
         'write_ops',
     ],
@@ -2005,8 +1978,7 @@ envWithAsio.CppUnitTest(
         '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
         '$BUILD_DIR/mongo/s/config_server_test_fixture',
         'auth/authmocks',
-        'keys_collection_manager',
-        'logical_time_validator',
+        'vector_clock',
     ],
 )
 

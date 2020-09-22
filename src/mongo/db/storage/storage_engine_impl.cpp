@@ -46,6 +46,7 @@
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/temporary_kv_record_store.h"
 #include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/db/storage/two_phase_index_build_knobs_gen.h"
 #include "mongo/db/unclean_shutdown.h"
 #include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_map.h"
@@ -82,10 +83,10 @@ void StorageEngineImpl::keydbDropDatabase(const std::string& db) {
     _engine->keydbDropDatabase(db);
 }
 
-StorageEngineImpl::StorageEngineImpl(KVEngine* engine, StorageEngineOptions options)
-    : _engine(engine),
+StorageEngineImpl::StorageEngineImpl(std::unique_ptr<KVEngine> engine, StorageEngineOptions options)
+    : _engine(std::move(engine)),
       _options(std::move(options)),
-      _dropPendingIdentReaper(engine),
+      _dropPendingIdentReaper(_engine.get()),
       _minOfCheckpointAndOldestTimestampListener(
           TimestampMonitor::TimestampType::kMinOfCheckpointAndOldest,
           [this](Timestamp timestamp) { _onMinOfCheckpointAndOldestTimestampChanged(timestamp); }),
@@ -94,7 +95,7 @@ StorageEngineImpl::StorageEngineImpl(KVEngine* engine, StorageEngineOptions opti
       _supportsCappedCollections(_engine->supportsCappedCollections()) {
     uassert(28601,
             "Storage engine does not support --directoryperdb",
-            !(options.directoryPerDB && !engine->supportsDirectoryPerDB()));
+            !(options.directoryPerDB && !_engine->supportsDirectoryPerDB()));
 
     OperationContextNoop opCtx(_engine->newRecoveryUnit());
     loadCatalog(&opCtx);
@@ -531,7 +532,8 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
             // will return the index to be rebuilt.
             if (indexMetaData.isBackgroundSecondaryBuild && (!foundIdent || !indexMetaData.ready)) {
                 LOGV2(22255,
-                      "Expected background index build did not complete, rebuilding",
+                      "Expected background index build did not complete, rebuilding in foreground "
+                      "- see SERVER-43097",
                       "namespace"_attr = coll,
                       "index"_attr = indexName);
                 ret.indexesToRebuild.push_back({entry.catalogId, coll, indexName});
@@ -875,6 +877,14 @@ bool StorageEngineImpl::supportsReadConcernMajority() const {
 
 bool StorageEngineImpl::supportsOplogStones() const {
     return _engine->supportsOplogStones();
+}
+
+bool StorageEngineImpl::supportsResumableIndexBuilds() const {
+    return enableResumableIndexBuilds && supportsReadConcernMajority() && !isEphemeral() &&
+        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.getVersion() ==
+        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46 &&
+        !repl::ReplSettings::shouldRecoverFromOplogAsStandalone();
 }
 
 bool StorageEngineImpl::supportsPendingDrops() const {

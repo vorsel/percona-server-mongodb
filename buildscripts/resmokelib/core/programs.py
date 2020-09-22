@@ -10,6 +10,7 @@ import stat
 import sys
 
 from buildscripts.resmokelib.multiversionconstants import LAST_STABLE_MONGOD_BINARY
+from buildscripts.resmokelib.multiversionconstants import LAST_STABLE_MONGOS_BINARY
 from . import jasper_process
 from . import process
 from .. import config
@@ -107,6 +108,13 @@ def get_default_log_component_verbosity_for_mongod(executable):
     return default_mongod_log_component_verbosity()
 
 
+def _add_testing_set_parameters(suite_set_parameters):
+    # Certain behaviors should only be enabled for resmoke usage. These are traditionally new
+    # commands, insecure access, and increased diagnostics.
+    suite_set_parameters.setdefault("testingDiagnosticsEnabled", True)
+    suite_set_parameters.setdefault("enableTestCommands", True)
+
+
 def mongod_program(  # pylint: disable=too-many-branches,too-many-statements
         logger, executable=None, process_kwargs=None, **kwargs):
     """Return a Process instance that starts mongod arguments constructed from 'kwargs'."""
@@ -196,6 +204,12 @@ def mongod_program(  # pylint: disable=too-many-branches,too-many-statements
             "mode": "alwaysOn", "data": {"numTickets": config.FLOW_CONTROL_TICKETS}
         }
 
+    # TODO(SERVER-48645): Only keep the else block once v4.4 is not longer the last stable version
+    if executable == LAST_STABLE_MONGOD_BINARY:
+        suite_set_parameters.setdefault("enableTestCommands", True)
+    else:
+        _add_testing_set_parameters(suite_set_parameters)
+
     _apply_set_parameters(args, suite_set_parameters)
 
     shortcut_opts = {
@@ -272,6 +286,12 @@ def mongos_program(logger, executable=None, process_kwargs=None, **kwargs):
     # Set default log verbosity levels if none were specified.
     if "logComponentVerbosity" not in suite_set_parameters:
         suite_set_parameters["logComponentVerbosity"] = default_mongos_log_component_verbosity()
+
+    # TODO(SERVER-48645): Only keep the else block once v4.4 is not longer the last stable version
+    if executable == LAST_STABLE_MONGOS_BINARY:
+        suite_set_parameters.setdefault("enableTestCommands", True)
+    else:
+        _add_testing_set_parameters(suite_set_parameters)
 
     _apply_set_parameters(args, suite_set_parameters)
 
@@ -365,7 +385,7 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
     test_data["setParameters"] = mongod_set_parameters
     test_data["setParametersMongos"] = mongos_set_parameters
 
-    test_data["isAsanBuild"] = config.IS_ASAN_BUILD
+    test_data["undoRecorderPath"] = config.UNDO_RECORDER_PATH
 
     # There's a periodic background thread that checks for and aborts expired transactions.
     # "transactionLifetimeLimitSeconds" specifies for how long a transaction can run before expiring

@@ -114,15 +114,6 @@ Status IndexBuildsManager::setUpIndexBuild(OperationContext* opCtx,
         return ex.toStatus();
     }
 
-    LOGV2(
-        20346,
-        "Index build initialized: {buildUUID}: {nss} ({collection_uuid} ): indexes: {indexes_size}",
-        "Index build initialized",
-        "indexBuildUUID"_attr = buildUUID,
-        "namespace"_attr = nss,
-        "collectionUuid"_attr = collection->uuid(),
-        "numIndexes"_attr = indexes.size());
-
     return Status::OK();
 }
 
@@ -182,7 +173,7 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
                     }
                     LOGV2_WARNING(20348,
                                   "Invalid BSON detected at {id}: {validStatus}. Deleting.",
-                                  "Invalid BSON detected; deleting.",
+                                  "Invalid BSON detected; deleting",
                                   "id"_attr = id,
                                   "error"_attr = redact(validStatus));
                     rs->deleteRecord(opCtx, id);
@@ -294,22 +285,36 @@ bool IndexBuildsManager::abortIndexBuild(OperationContext* opCtx,
     return true;
 }
 
-bool IndexBuildsManager::abortIndexBuildWithoutCleanup(OperationContext* opCtx,
-                                                       Collection* collection,
-                                                       const UUID& buildUUID,
-                                                       const std::string& reason) {
+bool IndexBuildsManager::abortIndexBuildWithoutCleanupForRollback(OperationContext* opCtx,
+                                                                  Collection* collection,
+                                                                  const UUID& buildUUID,
+                                                                  const std::string& reason) {
     auto builder = _getBuilder(buildUUID);
     if (!builder.isOK()) {
         return false;
     }
 
     LOGV2(20347,
-          "Index build aborted without cleanup: {buildUUID}: {reason}",
-          "Index build aborted without cleanup",
-          "buildUUID"_attr = buildUUID,
+          "Index build aborted without cleanup for rollback: {uuid}: {reason}",
+          "Index build aborted without cleanup for rollback",
+          logAttrs(buildUUID),
           "reason"_attr = reason);
 
-    builder.getValue()->abortWithoutCleanup(opCtx);
+    builder.getValue()->abortWithoutCleanupForRollback(opCtx);
+    return true;
+}
+
+bool IndexBuildsManager::abortIndexBuildWithoutCleanupForShutdown(OperationContext* opCtx,
+                                                                  Collection* collection,
+                                                                  const UUID& buildUUID) {
+    auto builder = _getBuilder(buildUUID);
+    if (!builder.isOK()) {
+        return false;
+    }
+
+    LOGV2(4841500, "Index build aborted without cleanup for shutdown", logAttrs(buildUUID));
+
+    builder.getValue()->abortWithoutCleanupForShutdown(opCtx);
     return true;
 }
 

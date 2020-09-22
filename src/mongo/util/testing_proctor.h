@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -29,21 +29,39 @@
 
 #pragma once
 
-#include <string>
-#include <vector>
-
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/jsobj.h"
+#include <boost/optional.hpp>
 
 namespace mongo {
 
-class Client;
+/**
+ * Provides the apparatus to control the passive testing behavior and diagnostics. Testing
+ * diagnostics can be controlled via the "testingDiagnosticsEnabled" server parameter, or
+ * directly through calling "TestingProctor::instance().setEnabled()".
+ */
+class TestingProctor {
+public:
+    static TestingProctor& instance();
 
-namespace rename_collection {
+    bool isInitialized() const noexcept {
+        return _diagnosticsEnabled.has_value();
+    }
 
-Status checkAuthForRenameCollectionCommand(Client* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj);
+    /**
+     * Throws "ErrorCodes::NotYetInitialized" if called before any invocation of "setEnabled()" to
+     * initialize "_diagnosticsEnabled".
+     */
+    bool isEnabled() const;
 
-}  // namespace rename_collection
+    /**
+     * Enables/disables testing diagnostics. Once invoked for the first time during the lifetime of
+     * a process, its impact (i.e., enabled or disabled diagnostics) cannot be altered. Throws
+     * "ErrorCodes::AlreadyInitialized" if the caller provides a value for "enable" that does not
+     * match what is stored in "_diagnosticsEnabled".
+     */
+    void setEnabled(bool enable);
+
+private:
+    boost::optional<bool> _diagnosticsEnabled;
+};
+
 }  // namespace mongo

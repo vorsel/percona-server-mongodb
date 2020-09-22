@@ -68,10 +68,8 @@ class StorageEngineImpl final : public StorageEngineInterface, public StorageEng
     void keydbDropDatabase(const std::string& db) override;
 
 public:
-    /**
-     * @param engine - ownership passes to me.
-     */
-    StorageEngineImpl(KVEngine* engine, StorageEngineOptions options = StorageEngineOptions());
+    StorageEngineImpl(std::unique_ptr<KVEngine> engine,
+                      StorageEngineOptions options = StorageEngineOptions());
 
     virtual ~StorageEngineImpl();
 
@@ -160,6 +158,8 @@ public:
     bool supportsReadConcernMajority() const final;
 
     bool supportsOplogStones() const final;
+
+    bool supportsResumableIndexBuilds() const final;
 
     bool supportsPendingDrops() const final;
 

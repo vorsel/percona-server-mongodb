@@ -43,7 +43,6 @@
 #include "mongo/base/checked_cast.h"
 #include "mongo/base/static_assert.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/locker.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/global_settings.h"
@@ -69,6 +68,7 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
+#include "mongo/util/testing_proctor.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
@@ -196,6 +196,7 @@ private:
 
 WiredTigerRecordStore::OplogStones::OplogStones(OperationContext* opCtx, WiredTigerRecordStore* rs)
     : _rs(rs) {
+    stdx::lock_guard<Latch> reclaimLk(_oplogReclaimMutex);
     stdx::lock_guard<Latch> lk(_mutex);
 
     invariant(rs->isCapped());
@@ -226,10 +227,8 @@ bool WiredTigerRecordStore::OplogStones::isDead() {
 }
 
 void WiredTigerRecordStore::OplogStones::kill() {
-    {
-        stdx::lock_guard<Latch> lk(_oplogReclaimMutex);
-        _isDead = true;
-    }
+    stdx::lock_guard<Latch> lk(_oplogReclaimMutex);
+    _isDead = true;
     _oplogReclaimCv.notify_one();
 }
 
@@ -306,10 +305,16 @@ void WiredTigerRecordStore::OplogStones::popOldestStone() {
 void WiredTigerRecordStore::OplogStones::createNewStoneIfNeeded(OperationContext* opCtx,
                                                                 RecordId lastRecord,
                                                                 Date_t wallTime) {
+    // Try to lock both mutexes, if we fail to lock a mutex then someone else is either already
+    // creating a new stone or popping the oldest one. In the latter case, we let the next insert
+    // trigger the new stone's creation.
+    stdx::unique_lock<Latch> reclaimLk(_oplogReclaimMutex, stdx::try_to_lock);
+    if (!reclaimLk) {
+        return;
+    }
+
     stdx::unique_lock<Latch> lk(_mutex, stdx::try_to_lock);
     if (!lk) {
-        // Someone else is either already creating a new stone or popping the oldest one. In the
-        // latter case, we let the next insert trigger the new stone's creation.
         return;
     }
 
@@ -597,6 +602,7 @@ void WiredTigerRecordStore::OplogStones::_pokeReclaimThreadIfNeeded() {
 }
 
 void WiredTigerRecordStore::OplogStones::adjust(int64_t maxSize) {
+    stdx::lock_guard<Latch> reclaimLk(_oplogReclaimMutex);
     stdx::lock_guard<Latch> lk(_mutex);
 
     const unsigned int oplogStoneSize =
@@ -1030,6 +1036,9 @@ bool WiredTigerRecordStore::findRecord(OperationContext* opCtx,
 void WiredTigerRecordStore::deleteRecord(OperationContext* opCtx, const RecordId& id) {
     dassert(opCtx->lockState()->isWriteLocked());
     invariant(opCtx->lockState()->inAWriteUnitOfWork() || opCtx->lockState()->isNoop());
+    // SERVER-48453: Initialize the next record id counter before deleting. This ensures we won't
+    // reuse record ids, which can be problematic for the _mdb_catalog.
+    _initNextIdIfNeeded(opCtx);
 
     // Deletes should never occur on a capped collection because truncation uses
     // WT_SESSION::truncate().
@@ -1741,6 +1750,11 @@ void WiredTigerRecordStore::validate(OperationContext* opCtx,
         return;
     }
 
+    if (_isOplog) {
+        results->warnings.push_back("Skipping verification of the WiredTiger table for the oplog.");
+        return;
+    }
+
     int err = WiredTigerUtil::verifyTable(opCtx, _uri, &results->errors);
     if (!err) {
         return;
@@ -2149,8 +2163,8 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
               "next"_attr = id,
               "last"_attr = _lastReturnedId);
 
-        // Crash when test commands are enabled.
-        invariant(!getTestCommandsEnabled());
+        // Crash when testing diagnostics are enabled.
+        invariant(!TestingProctor::instance().isEnabled());
 
         // Force a retry of the operation from our last known position by acting as-if
         // we received a WT_ROLLBACK error.

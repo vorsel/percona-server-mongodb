@@ -62,24 +62,25 @@ const std::string kInMemoryEngineName = "inMemory";
 class InMemoryFactory : public StorageEngine::Factory {
 public:
     virtual ~InMemoryFactory() {}
-    virtual StorageEngine* create(const StorageGlobalParams& params,
-                                  const StorageEngineLockFile*) const {
+    virtual std::unique_ptr<StorageEngine> create(const StorageGlobalParams& params,
+                                                  const StorageEngineLockFile*) const {
         syncInMemoryAndWiredTigerOptions();
 
         size_t cacheMB = WiredTigerUtil::getCacheSizeMB(wiredTigerGlobalOptions.cacheSizeGB);
         const bool durable = false;
         const bool ephemeral = true;
         const bool readOnly = false;
-        WiredTigerKVEngine* kv = new WiredTigerKVEngine(getCanonicalName().toString(),
-                                                        params.dbpath,
-                                                        getGlobalServiceContext()->getFastClockSource(),
-                                                        wiredTigerGlobalOptions.engineConfig,
-                                                        cacheMB,
-                                                        0,
-                                                        durable,
-                                                        ephemeral,
-                                                        params.repair,
-                                                        readOnly);
+        auto kv =
+            std::make_unique<WiredTigerKVEngine>(getCanonicalName().toString(),
+                                                 params.dbpath,
+                                                 getGlobalServiceContext()->getFastClockSource(),
+                                                 wiredTigerGlobalOptions.engineConfig,
+                                                 cacheMB,
+                                                 0,
+                                                 durable,
+                                                 ephemeral,
+                                                 params.repair,
+                                                 readOnly);
         kv->setRecordStoreExtraOptions(wiredTigerGlobalOptions.collectionConfig);
         kv->setSortedDataInterfaceExtraOptions(wiredTigerGlobalOptions.indexConfig);
 
@@ -90,7 +91,7 @@ public:
 
             // Intentionally leaked.
             MONGO_COMPILER_VARIABLE_UNUSED auto leakedSection =
-                new WiredTigerServerStatusSection(kv);
+                new WiredTigerServerStatusSection(kv.get());
 
             // This allows unit tests to run this code without encountering memory leaks
 #if __has_feature(address_sanitizer)
@@ -102,7 +103,7 @@ public:
         options.directoryPerDB = params.directoryperdb;
         options.directoryForIndexes = wiredTigerGlobalOptions.directoryForIndexes;
         options.forRepair = params.repair;
-        return new StorageEngineImpl(kv, options);
+        return std::make_unique<StorageEngineImpl>(std::move(kv), options);
     }
 
     virtual StringData getCanonicalName() const {

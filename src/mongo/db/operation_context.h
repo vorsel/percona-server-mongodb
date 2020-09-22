@@ -267,6 +267,20 @@ public:
         return _writesAreReplicated;
     }
 
+    /**
+     * Returns true if operations' durations should be added to serverStatus latency metrics.
+     */
+    bool shouldIncrementLatencyStats() const {
+        return _shouldIncrementLatencyStats;
+    }
+
+    /**
+     * Sets the shouldIncrementLatencyStats flag.
+     */
+    void setShouldIncrementLatencyStats(bool shouldIncrementLatencyStats) {
+        _shouldIncrementLatencyStats = shouldIncrementLatencyStats;
+    }
+
     void markKillOnClientDisconnect();
 
     /**
@@ -390,6 +404,19 @@ public:
      */
     void setInMultiDocumentTransaction() {
         _inMultiDocumentTransaction = true;
+    }
+
+    /**
+     * Clears metadata associated with a multi-document transaction.
+     */
+    void resetMultiDocumentTransactionState() {
+        invariant(_inMultiDocumentTransaction);
+        invariant(!_writeUnitOfWork);
+        invariant(_ruState == WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+        _inMultiDocumentTransaction = false;
+        _isStartingMultiDocumentTransaction = false;
+        _lsid = boost::none;
+        _txnNumber = boost::none;
     }
 
     /**
@@ -568,6 +595,7 @@ private:
     Timer _elapsedTime;
 
     bool _writesAreReplicated = true;
+    bool _shouldIncrementLatencyStats = true;
     bool _shouldParticipateInFlowControl = true;
     bool _inMultiDocumentTransaction = false;
     bool _isStartingMultiDocumentTransaction = false;

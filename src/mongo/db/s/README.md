@@ -317,6 +317,37 @@ should be automatically split and balanced.
 
 ## Auto-balancing
 
+The balancer is a background process that monitors the chunk distribution in a cluster. It is enabled by default and can be turned off for the entire cluster or per-collection at any time.
+
+The balancer process [runs in a separate thread](https://github.com/mongodb/mongo/blob/b4094a6541bf5745cb225639c2486fcf390c4c38/src/mongo/db/s/balancer/balancer.cpp#L318-L490) on the config server primary. It runs continuously, but in "rounds" with a 10 second delay between each round. During a round, the balancer uses the current chunk distribution and zone information for the cluster to decide if any chunk migrations or chunk splits are necessary.
+
+In order to retrieve the necessary distribution information, the balancer has a reference to the ClusterStatistics which is an interface that [obtains the data distribution and shard utilization statistics for the cluster](https://github.com/mongodb/mongo/blob/d501442a8ed07ba6e05cce3db8b83a5d7f4b7313/src/mongo/db/s/balancer/cluster_statistics_impl.cpp#L101-L166). During each round, the balancer uses the ClusterStatistics to get the current stats in order to [create a DistributionStatus for every collection](https://github.com/mongodb/mongo/blob/d501442a8ed07ba6e05cce3db8b83a5d7f4b7313/src/mongo/db/s/balancer/balancer_chunk_selection_policy_impl.cpp#L63-L116). The DistributionStatus contains information about which chunks are owned by which shards, the zones defined for the collection, and which chunks are a part of which zones. Note that because the DistributionStatus is per collection, this means that the balancer optimizes for an even distribution per collection rather than for the entire cluster.
+
+### What happens during a balancer round
+
+During each round, the balancer uses the DistributionStatus for each collection to [check if any chunk has a range that violates a zone boundary](https://github.com/mongodb/mongo/blob/d501442a8ed07ba6e05cce3db8b83a5d7f4b7313/src/mongo/db/s/balancer/balancer.cpp#L410). Any such chunks will be split into smaller chunks with new min and max values equal to the zone boundaries using the splitChunk command.
+
+After any chunk splits have completed, the balancer then selects one or more chunks to migrate. The balancer again uses the DistributionStatus for each collection in order to select chunks to move. The balancer [prioritizes which chunks to move](https://github.com/mongodb/mongo/blob/d501442a8ed07ba6e05cce3db8b83a5d7f4b7313/src/mongo/db/s/balancer/balancer_policy.cpp#L360-L543) by the following:
+1. If any chunk in this collection is owned by a shard that is draining (being removed), select this chunk first.
+1. If no chunks for this collection belong to a draining shard, check for any chunks that violate zones.
+1. If neither of the above is true, the balancer can select chunks to move in order to obtain the "ideal" number of chunks per shard. This value is calculated by dividing [the total number of chunks associated with some zone] / [the total number of shards associated with this zone]. For chunks that do not belong to any zone, this value is instead calculated by dividing [the total number of chunks that do not belong to any zone] / [the total number of shards]. The balancer will pick a chunk currently owned by the shard that is [most overloaded](https://github.com/mongodb/mongo/blob/d501442a8ed07ba6e05cce3db8b83a5d7f4b7313/src/mongo/db/s/balancer/balancer_policy.cpp#L272-L293) (has the highest number of chunks in the zone).
+
+In each of these cases, the balancer will pick the ["least loaded" shard](https://github.com/mongodb/mongo/blob/d501442a8ed07ba6e05cce3db8b83a5d7f4b7313/src/mongo/db/s/balancer/balancer_policy.cpp#L244-L270) (the shard with the lowest number of chunks in the zone) as the recipient shard for the chunk. If a shard already has more chunks than the "ideal" number, it is draining, or it is already involved in a migration during this balancer round, the balancer will not pick this shard as the recipient. Similarly, the balancer will not select a chunk to move that is currently owned by a shard that is already involved in a migration. This is because a shard cannot be involved in more than one migration at any given time.
+
+If the balancer has selected any chunks to move during a round, it will [schedule a migration for each of them](https://github.com/mongodb/mongo/blob/d501442a8ed07ba6e05cce3db8b83a5d7f4b7313/src/mongo/db/s/balancer/balancer.cpp#L631-L693) using the migration procedure outlined above. A balancer round is finished once all of the scheduled migrations have completed.
+
+## Important caveats
+
+### Jumbo Chunks
+
+By default, a chunk is considered "too large to migrate" if its size exceeds the maximum size specified in the chunk size configuration parameter. If a chunk is this large and the balancer schedules either a migration or splitChunk, the migration or splitChunk will fail and the balancer will set the chunk's "jumbo" flag to true. However, if the balancer configuration setting 'attemptToBalanceJumboChunks' is set to true, the balancer will not fail a migration or splitChunk due to the chunk's size. Regardless of whether 'attemptToBalanceJumboChunks' is true or false, the balancer will not attempt to schedule a migration or splitChunk if the chunk's "jumbo" flag is set to true. Note that because a chunk's "jumbo" flag is not set to true until a migration or splitChunk has failed due to its size, it is possible for a chunk to be larger than the maximum chunk size and not actually be marked "jumbo" internally. The reason that the balancer will not schedule a migration for a chunk marked "jumbo" is to avoid the risk of forever scheduling the same migration or split - if a chunk is marked "jumbo" it means a migration or splitChunk has already failed. The clearJumboFlag command can be run for a chunk in order to clear its "jumbo" flag so that the balancer will schedule this migration in the future.
+
+#### Code references
+* [**Balancer class**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/balancer/balancer.h)
+* [**BalancerPolicy class**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/balancer/balancer_policy.h)
+* [**BalancerChunkSelectionPolicy class**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/balancer/balancer_chunk_selection_policy.h)
+* [**ClusterStatistics class**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/balancer/cluster_statistics.h)
+
 ---
 
 # DDL operations
@@ -422,6 +453,132 @@ mergeChunks, and moveChunk all take the chunk ResourceMutex.
 ---
 
 # The logical clock and causal consistency
+Starting from v3.6 MongoDB provides session based causal consistency. All operations in the causally
+consistent session will be execute in the order that preserves the causality. In particular it
+means that client of the session has guarantees to
+* Read own writes
+* Monotonic reads and writes
+* Writes follow reads
+Causal consistency guarantees described in details in the [**server
+documentation**](https://docs.mongodb.com/v4.0/core/read-isolation-consistency-recency/#causal-consistency).
+Causality is implemented by assigning to all operations in the system a strictly monotonically increasing  scalar number - a cluster time - and making sure that
+the operations are executed in the order of the cluster times. To achieve this in a distributed
+system MongoDB implements gossiping protocol which distributes the cluster time across all the
+nodes: mongod, mongos, drivers and mongo shell clients. Separately from gossiping the cluster time is incremented only on the nodes that can write -
+i.e. primary nodes.
+
+## Cluster time
+ClusterTime refers to the time value of the node's logical clock. Its represented as an unsigned 64
+bit integer representing a combination of unix epoch (high 32 bit) and an integer 32 bit counter (low 32 bit). It's
+incremented only when state changing events occur. As the state is represented by the oplog entries
+the oplog optime is derived from the cluster time.
+
+### Cluster time gossiping
+Every node (mongod, mongos, config servers, clients) keep track on the maximum value of the
+ClusterTime it has seen. Every node adds this value to each message it sends.
+
+### Cluster time ticking
+Every node in the cluster has a LogicalClock that keeps an in-memory version of the node's
+ClusterTime. ClusterTime can be converted to the OpTime, the time stored in MongoDB's replication oplog. OpTime
+can be used to identify entries and corresponding events in the oplog. OpTime is represented by a
+<Time><Increment><ElectionTerm> triplet. Here, the <ElectionTerm> is specific to the MongoDB
+replication protocol. It is local to the replica set and not a global state that should be included in the ClusterTime.
+To associate the ClusterTime with an oplog entry when events occur, [**MongoDB first computes the next ClusterTime
+value on the node, and then uses that value to create an OpTime (with the election term).**](https://github.com/mongodb/mongo/blob/v4.4/src/mongo/db/logical_clock.cpp#L102)
+This OpTime is what gets written to the oplog. This update does not require the OpTime format to change, remaining tied to a physical time. All the
+existing tools that use the oplog, such as backup and recovery, remain forward compatible.
+
+Example of ClusterTime gossiping and incrementing:
+1. Client sends a write command to the primary, the message includes its current value of the ClusterTime: T1.
+1. Primary node receives the message and advances its ClusterTime to T1, if T1 is greater than the primary
+node's current ClusterTime value.
+1. Primary node increments the cluster time to T2 in the process of preparing the OpTime for the write. This is
+the only time a new value of ClusterTime is generated.
+1. Primary node writes to the oplog.
+1. Result is returned to the client, it includes the new ClusterTime T2.
+1. The client advances its ClusterTime to T2.
+
+
+### Cluster time signing
+As shown before, nodes advance their logical clocks to the maximum ClusterTime that they receive in the client
+messages. The next oplog entry will use this value in the timestamp portion of the OpTime. But a malicious client
+could modify their maximum ClusterTime sent in a message.  For example, it could send the <greatest possible
+cluster time - 1> . This value, once written to the oplogs of replica set nodes, will not be incrementable and the
+nodes will be unable to accept any changes (writes against the database). The only way to recover from this situation
+would be to unload the data, clean it, and reload back with the correct OpTime. This malicious attack would take the
+affected shard offline, affecting the availability of the entire system. To mitigate this risk,
+MongoDB added a HMAC- SHA1 signature that is used to verify the value of the ClusterTime on the server. ClusterTime values can be read
+by any node, but only MongoDB processes can sign new values. The signature cannot be generated by clients.
+
+Here is an example of the document that distributes ClusterTime:
+```
+"$clusterTime" : {
+    "clusterTime" :
+        Timestamp(1495470881, 5),
+        "signature" : {
+            "hash" : BinData(0, "7olYjQCLtnfORsI9IAhdsftESR4="),
+            "keyId" : "6422998367101517844"
+        }
+}
+```
+The keyId is used to find the key that generated the hash.  The keys are stored and generated only on MongoDB
+processes. This seals the ClusterTime value, as time can only be incremented on a server that has access to a signing key.
+Every time the mongod or mongos receives a message that includes a
+ClusterTime that is greater than the value of its logical clock, they will validate it by generating the signature using the key
+with the keyId from the message. If the signature does not match, the message will be rejected.
+
+## Key management
+To provide HMAC message verification all nodes inside a security perimeter i.e. mongos and mongod  need to access a secret key to generate and
+verify message signatures. MongoDB maintains keys in a `system.keys` collection in the `admin`
+database. In the sharded cluster this collection is located on the config server, in the Replica Set
+its on the primary node. The key document has the following format:
+```
+{
+    _id: <NumberLong>,
+    purpose: <string>,
+    key: <BinData>,
+    expiresAt: <Timestamp>
+}
+```
+
+The node that has the `system.keys` collection runs a thread that periodically checks if the keys
+need to be updated, by checking its `expiresAt` field. The new keys are generated in advance, so
+there is always one key that is valid for the next 3 months (the default). The signature validation
+requests the key that was used for signing the message by its Id which is also stored in the
+signature. Since the old keys are never deleted from the `system.keys` collection they are always
+available to verify the messages signed in the past.
+As the message verification is on the critical path each node also keeps the in memory cache of the
+valid keys.
+
+## Handling operator errors
+The risk of malicious clients affecting ClusterTime is mitigated by a signature, but it is still possible to advance the
+ClusterTime to the end of time by changing the wall clock value. This may happen as a result of operator error. Once
+the data with the OpTime containing the end of time timestamp is committed to the majority of nodes it cannot be
+changed. To mitigate this, we implemented a limit on the rate of change. The ClusterTime on a node cannot be advanced
+more than the number of seconds defined by the `maxAcceptableLogicalClockDriftSecs` parameter (default value is one year).
+
+## Causal consistency in sessions
+When a write event is sent from a client, that client has no idea what time is associated with the write, because the time
+was assigned after the message was sent. But the node that processes the write does know, as it incremented its
+ClusterTime and applied the write to the oplog. To make the client aware of the write's ClusterTime, it will be included
+in the `operationTime` field of the response. To make sure that the client knows the time of all events, every
+response (including errors) will include the `operationTime` field, representing the Stable Cluster
+Time i.e. the ClusterTime of the latest item added to the oplog at the time the command was executed.
+Now, to make the follow up read causally consistent the client will pass the exact time of the data it needs to read -
+the received `operationTime` - in the `afterClusterTime` field of the request. The data node
+needs to return data with an associated ClusterTime greater than or equal to the requested `afterClusterTime` value.
+
+Below is an example of causally consistent "read own write" for the products collection that is sharded and has chunks on Shards A and B.
+1. The client sends db.products.insert({_id: 10, price: 100}) to a mongos and it gets routed to Shard A.
+1. The primary on Shard A computes the ClusterTime, and ticks as described in the previous sections.
+1. Shard A returns the result with the `operationTime` that was written to the oplog.
+1. The client conditionally updates its local lastOperationTime value with the returned `operationTime` value
+1. The client sends a read db.products.aggregate([{$count: "numProducts"}]) to mongos and it gets routed to all shards where this collection has chunks: i.e. Shard A and Shard B.
+  To be sure that it can "read own write" the client includes the `afterClusterTime` field in the request and passes the `operationTime` value it received from the write.
+1. Shard B checks if the data with the requested OpTime is in its oplog. If not, it performs a noop write, then returns the result to mongos.
+ It includes the `operationTime` that was the top of the oplog at the moment the read was performed.
+1. Shard A checks if the data with the requested OpTime is in its oplog and returns the result to mongos. It includes the `operationTime` that was the top of the oplog at the moment the read was performed.
+1. mongos aggregates the results and returns to the client with the largest `operationTime` it has seen in the responses from shards A and B.
 
 ---
 
@@ -540,10 +697,11 @@ when a session is killed, whereas the number of kills requested is used to make 
 are only killed on the first kill request.
 
 To keep the in-memory transaction state of all sessions in sync with the content of the `config.transactions`
-collection (the collection that stores documents used to support retryable writes and transactions), the
-transaction state and the session catalog on each mongod is [invalidated](https://github.com/mongodb/mongo/blob/56655b06ac46825c5937ccca5947dc84ccbca69c/src/mongo/db/session_catalog_mongod.cpp#L324) whenever the `config.transactions` collection is dropped and whenever there is a rollback. When invalidation occurs, all
-active sessions are killed, and the in-memory transaction state is marked as invalid to force it to be
-[reloaded from storage the next time a session is checked out](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session_catalog_mongod.cpp#L426).
+collection (the collection that stores documents used to support retryable writes and transactions, also
+referred to as the transaction table), the transaction state and the session catalog on each mongod is
+[invalidated](https://github.com/mongodb/mongo/blob/56655b06ac46825c5937ccca5947dc84ccbca69c/src/mongo/db/session_catalog_mongod.cpp#L324) whenever the `config.transactions` collection is dropped and whenever
+there is a rollback. When invalidation occurs, all active sessions are killed, and the in-memory transaction
+state is marked as invalid to force it to be [reloaded from storage the next time a session is checked out](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session_catalog_mongod.cpp#L426).
 
 #### Code references
 * [**SessionCatalog class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session_catalog.h)
@@ -553,10 +711,153 @@ active sessions are killed, and the in-memory transaction state is marked as inv
 
 ## Retryable writes
 
+Retryable writes allow drivers to automatically retry non-idempotent write commands on network errors or failovers.
+They are supported in logical sessions with `retryableWrites` enabled (default), with the caveat that the writes
+are executed with write concern `w` greater than 0 and outside of transactions. [Here](https://github.com/mongodb/specifications/blob/49589d66d49517f10cc8e1e4b0badd61dbb1917e/source/retryable-writes/retryable-writes.rst#supported-write-operations)
+is a complete list of retryable write commands.
+
+When a command is executed as a retryable write, it is sent from the driver with `lsid` and `txnNumber` attached.
+After that, all write operations inside the command are assigned a unique integer statement id `stmtId` by the
+mongos or mongod that executes the command. In other words, each write operation inside a batch write command
+is given its own `stmtId` and is individually retryable. The `lsid`, `txnNumber`, and `stmtId` constitute a
+unique identifier for a retryable write operation.
+
+This unique identifier enables a primary mongod to track and record its progress for a retryable write
+command using the `config.transactions` collection and augmented oplog entries. The oplog entry for a
+retryable write operation is written with a number of additional fields including `lsid`, `txnNumber`,
+`stmtId` and `prevOpTime`, where `prevOpTime` is the opTime of the write that precedes it. This results in
+a chain of write history that can be used to reconstruct the result of writes that have already executed.
+After generating the oplog entry for a retryable write operation, a primary mongod performs an upsert into
+`config.transactions` to write a document containing the `lsid` (`_id`), `txnNumber`, `stmtId` and
+`lastWriteOpTime`, where `lastWriteOpTime` is the opTime of the newly generated oplog entry. The `config.transactions` collection is indexed by `_id` so this document is replaced every time there is a new retryable write command
+(or transaction) on the session.
+
+The opTimes for all committed statements for the latest retryable write command is cached in an [in-memory table](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/transaction_participant.h#L928) that gets [updated](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/transaction_participant.cpp#L2125-L2127) after each
+write oplog entry is generated, and gets cleared every time a new retryable write command starts. Prior to executing
+a retryable write operation, a primary mongod first checks to see if it has the commit opTime for the `stmtId` of
+that write. If it does, the write operation is skipped and a response is constructed immediately based on the oplog
+entry with that opTime. Otherwise, the write operation is performed with the additional bookkeeping as described above.
+This in-memory cache of opTimes for committed statements is invalidated along with the entire in-memory transaction
+state whenever the `config.transactions` is dropped and whenever there is rollback. The invalidated transaction
+state is overwritten by the on-disk transaction history at the next session checkout.
+
+To support retryability of writes across migrations, the session state for the migrated chunk is propagated
+from the donor shard to the recipient shard. After entering the chunk cloning step, the recipient shard
+repeatedly sends [\_getNextSessionMods](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/s/migration_chunk_cloner_source_legacy_commands.cpp#L240-L359) (also referred to as MigrateSession) commands to
+the donor shard until the migration reaches the commit phase to clone any oplog entries that contain session
+information for the migrated chunk. Upon receiving each response, the recipient shard writes the oplog entries
+to disk and [updates](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/transaction_participant.cpp#L2142-L2144) its in-memory transaction state to restore the session state for the chunk.
+
+#### Code references
+* [**TransactionParticipant class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/transaction_participant.h)
+* How a write operation [checks if a statement has been executed](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/ops/write_ops_exec.cpp#L811-L816)
+* How mongos [assigns statement ids to writes in a batch write command](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/s/write_ops/batch_write_op.cpp#L483-L486)
+* How mongod [assigns statement ids to insert operations](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/ops/write_ops_exec.cpp#L573)
+* [Retryable writes specifications](https://github.com/mongodb/specifications/blob/49589d66d49517f10cc8e1e4b0badd61dbb1917e/source/retryable-writes/retryable-writes.rst)
+
 ## The historical routing table
 
 ## Transactions
 
+Cross-shard transactions provide ACID guarantees for multi-statement operations that involve documents on
+multiple shards in a cluster. Similar to [transactions on a single replica set](https://github.com/mongodb/mongo/blob/r4.4.0-rc7/src/mongo/db/repl/README.md#transactions), cross-shard transactions are only supported in logical
+sessions. They have a configurable lifetime limit, and are automatically aborted when they are expired
+or when the session is killed.
+
+To run a cross-shard transaction, a client sends all statements, including the `commitTransaction` and
+`abortTransaction` command, to a single mongos with common `lsid` and `txnNumber` attached. The first
+statement is sent with `startTransaction: true` to indicate the start of a transaction. Once a transaction
+is started, it remains active until it is explicitly committed or aborted by the client, or unilaterally
+aborted by a participant shard, or overwritten by a transaction with a higher `txnNumber`.
+
+When a mongos executes a transaction, it is responsible for keeping track of all participant shards, and
+choosing a coordinator shard and a recovery shard for the transaction. In addition, if the transaction
+uses read concern `"snapshot"`, the mongos is also responsible for choosing a global read timestamp (i.e.
+`atClusterTime`) at the start of the transaction. The mongos will, by design, always choose the first participant
+shard as the coordinator shard, and the first shard that the transaction writes to as the recovery shard.
+Similarly, the global read timestamp will always be the logical clock time on the mongos when it receives
+the first statement for the transaction. If a participant shard cannot provide a snapshot at the chosen
+read timestamp, it will throw a snapshot error, which will trigger a client level retry of the transaction.
+The mongos will only keep this information in memory as it relies on the participant shards to persist their
+respective transaction states in their local `config.transactions` collection.
+
+The execution of a statement inside a cross-shard transaction works very similarly to that of a statement
+outside a transaction. One difference is that mongos attaches the transaction information (e.g. `lsid`,
+`txnNumber` and `coordinator`) in every statement it forwards to targeted shards. Additionally, the first
+statement to a participant shard is sent with `startTransaction: true` and `readConcern`, which contains
+the `atClusterTime` if the transaction uses read concern `"snapshot"`. When a participant shard receives
+a transaction statement with `coordinator: true` for the first time, it will infer that it has been chosen
+as the transaction coordinator and will set up in-memory state immediately to prepare for coordinating
+transaction commit. One other difference is that the response from each participant shard includes an
+additional `readOnly` flag which is set to true if the statement does not do a write on the shard. Mongos
+uses this to determine how a transaction should be committed or aborted, and to choose the recovery shard
+as described above. The id of the recovery shard is included in the `recoveryToken` in the response to
+the client.
+
+### Committing a Transaction
+
+The commit procedure begins when a client sends a `commitTransaction` command to the mongos that the
+transaction runs on. The command is retryable as long as no new transaction has been started on the session
+and the session is still alive. The number of participant shards and the number of write shards determine
+the commit path for the transaction.
+
+* If the number of participant shards is zero, the mongos skips the commit and returns immediately.
+* If the number of participant shards is one, the mongos forwards `commitTransaction` directly to that shard.
+* If the number of pariticipant shards is greater than one:
+   * If the number of write shards is zero, the mongos forwards `commitTransaction` to each shard individually.
+   * Otherwise, the mongos sends `coordinateCommitTransaction` with the participant list to the coordinator shard to
+   initiate two-phase commit.
+
+To recover the commit decision after the original mongos has become unreachable, the client can send `commitTransaction`
+along with the `recoveryToken` to a different mongos. This will not initiate committing the transaction, instead
+the mongos will send `coordinateCommitTransaction` with an empty participant list to the recovery shard to try to
+join the progress of the existing coordinator if any, and to retrieve the commit outcome for the transaction.
+
+#### Two-phase Commit Protocol
+
+The two-phase commit protocol consists of the prepare phase and the commit phase. To support recovery from
+failovers, a coordinator keeps a document inside the `config.transaction_coordinators` collection that contains
+information about the transaction it is trying commit. This document is deleted when the commit procedure finishes.
+
+Below are the steps in the two-phase commit protocol.
+
+* Prepare Phase
+  1. The coordinator writes the participant list to the `config.transaction_coordinators` document for the
+transaction, and waits for it to be majority committed.
+  1. The coordinator sends [`prepareTransaction`](https://github.com/mongodb/mongo/blob/r4.4.0-rc7/src/mongo/db/repl/README.md#lifetime-of-a-prepared-transaction) to the participants, and waits for vote reponses. Each participant
+shard responds with a vote, marks the transaction as prepared, and updates the `config.transactions`
+document for the transaction.
+  1. The coordinator writes the decision to the `config.transaction_coordinators` document and waits for it to
+be majority committed. If the `coordinateCommitTransactionReturnImmediatelyAfterPersistingDecision` server parameter is
+true  (default), the  `coordinateCommitTransaction` command returns immediately after waiting for client's write concern
+(i.e. let the remaining work continue in the background).
+
+* Commit Phase
+  1. If the decision is 'commit', the coordinator sends `commitTransaction` to the participant shards, and waits
+for responses. If the decision is 'abort', it sends `abortTransaction` instead. Each participant shard marks
+the transaction as committed or aborted, and updates the `config.transactions` document.
+  1. The coordinator deletes the coordinator document with write concern `{w: 1}`.
+
+The prepare phase is skipped if the coordinator already has the participant list and the commit decision persisted.
+This can be the case if the coordinator was created as part of step-up recovery.
+
+### Aborting a Transaction
+
+Mongos will implicitly abort a transaction on any error except the view resolution error from a participant shard
+if a two phase commit has not been initiated. To explicitly abort a transaction, a client must send an `abortTransaction`
+command to the mongos that the transaction runs on. The command is also retryable as long as no new transaction has
+been started on the session and the session is still alive. In both cases, the mongos simply sends `abortTransaction`
+to all participant shards.
+
+#### Code references
+* [**TransactioRouter class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/s/transaction_router.h)
+* [**TransactioCoordinatorService class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/s/transaction_coordinator_service.h)
+* [**TransactioCoordinator class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/s/transaction_coordinator.h)
+
 ---
 
-# Sharding component hierarchy
+# Node startup and shutdown
+
+## Sharding component initialization and shutdown
+
+## Quiesce mode on shutdown

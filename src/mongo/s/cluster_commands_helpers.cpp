@@ -41,6 +41,8 @@
 #include "mongo/db/error_labels.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -365,7 +367,14 @@ std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShard
 
     // The collection is sharded. Target all shards that own chunks that match the query.
     std::set<ShardId> shardIds;
-    routingInfo.cm()->getShardIdsForQuery(opCtx, query, collation, &shardIds);
+    std::unique_ptr<CollatorInterface> collator;
+    if (!collation.isEmpty()) {
+        collator = uassertStatusOK(
+            CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation));
+    }
+
+    auto expCtx = make_intrusive<ExpressionContext>(opCtx, std::move(collator), nss);
+    routingInfo.cm()->getShardIdsForQuery(expCtx, query, collation, &shardIds);
 
     for (const ShardId& shardId : shardIds) {
         if (shardsToSkip.find(shardId) == shardsToSkip.end()) {
@@ -686,7 +695,7 @@ void createShardDatabase(OperationContext* opCtx, StringData dbName) {
     uassertStatusOKWithContext(dbStatus, str::stream() << "Database " << dbName << " not found");
 }
 
-std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
+std::set<ShardId> getTargetedShardsForQuery(boost::intrusive_ptr<ExpressionContext> expCtx,
                                             const CachedCollectionRoutingInfo& routingInfo,
                                             const BSONObj& query,
                                             const BSONObj& collation) {
@@ -694,7 +703,7 @@ std::set<ShardId> getTargetedShardsForQuery(OperationContext* opCtx,
         // The collection is sharded. Use the routing table to decide which shards to target
         // based on the query and collation.
         std::set<ShardId> shardIds;
-        routingInfo.cm()->getShardIdsForQuery(opCtx, query, collation, &shardIds);
+        routingInfo.cm()->getShardIdsForQuery(expCtx, query, collation, &shardIds);
         return shardIds;
     }
 

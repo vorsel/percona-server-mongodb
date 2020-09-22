@@ -143,7 +143,7 @@ void DatabaseImpl::init(OperationContext* const opCtx) const {
     if (!status.isOK()) {
         LOGV2_WARNING(20325,
                       "tried to open invalid db: {name}",
-                      "tried to open invalid db",
+                      "Tried to open invalid db",
                       "db"_attr = _name);
         uasserted(10028, status.toString());
     }
@@ -168,7 +168,7 @@ void DatabaseImpl::init(OperationContext* const opCtx) const {
         LOGV2_WARNING_OPTIONS(20326,
                               {logv2::LogTag::kStartupWarnings},
                               "Unable to parse views; remove any invalid views "
-                              "from the collection to restore server functionality.",
+                              "from the collection to restore server functionality",
                               "error"_attr = redact(reloadStatus),
                               "namespace"_attr = _viewsName);
     }
@@ -183,7 +183,7 @@ void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) const {
             Status status = dropCollection(opCtx, collection->ns(), {});
             if (!status.isOK()) {
                 LOGV2_WARNING(20327,
-                              "could not drop temp collection '{collection_ns}': {status}",
+                              "could not drop temp collection '{namespace}': {error}",
                               "could not drop temp collection",
                               "namespace"_attr = collection->ns(),
                               "error"_attr = redact(status));
@@ -192,7 +192,7 @@ void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) const {
         } catch (const WriteConflictException&) {
             LOGV2_WARNING(
                 20328,
-                "could not drop temp collection '{collection_ns}' due to WriteConflictException",
+                "could not drop temp collection '{namespace}' due to WriteConflictException",
                 "could not drop temp collection due to WriteConflictException",
                 "namespace"_attr = collection->ns());
             opCtx->recoveryUnit()->abandonSnapshot();
@@ -274,8 +274,8 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
             LOGV2(20312,
                   "Failed to query filesystem disk stats (code: {ec_value}): {ec_message}",
                   "Failed to query filesystem disk stats",
-                  "errorCode"_attr = ec.value(),
-                  "errorMessage"_attr = ec.message());
+                  "error"_attr = ec.message(),
+                  "errorCode"_attr = ec.value());
         }
     }
 }
@@ -325,7 +325,7 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
                                                 repl::OpTime dropOpTime) const {
     invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
 
-    LOGV2_DEBUG(20313, 1, "dropCollection: {nss}", "nss"_attr = nss);
+    LOGV2_DEBUG(20313, 1, "dropCollection: {namespace}", "dropCollection", "namespace"_attr = nss);
 
     // A valid 'dropOpTime' is not allowed when writes are replicated.
     if (!dropOpTime.isNull() && opCtx->writesAreReplicated()) {
@@ -379,7 +379,8 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
 
         auto commitTimestamp = opCtx->recoveryUnit()->getCommitTimestamp();
         LOGV2(20314,
-              "dropCollection: {nss} ({uuid}) - storage engine will take ownership of drop-pending "
+              "dropCollection: {namespace} ({uuid}) - storage engine will take ownership of "
+              "drop-pending "
               "collection with optime {dropOpTime} and commit timestamp {commitTimestamp}",
               "dropCollection: storage engine will take ownership of drop-pending "
               "collection",
@@ -426,7 +427,8 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
     auto dpns = nss.makeDropPendingNamespace(dropOpTime);
     const bool stayTemp = true;
     LOGV2(20315,
-          "dropCollection: {nss} ({uuid}) - renaming to drop-pending collection: {dpns} with drop "
+          "dropCollection: {namespace} ({uuid}) - renaming to drop-pending collection: "
+          "{dropPendingName} with drop "
           "optime {dropOpTime}",
           "dropCollection: renaming to drop-pending collection",
           "namespace"_attr = nss,
@@ -449,12 +451,14 @@ void DatabaseImpl::_dropCollectionIndexes(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           Collection* collection) const {
     invariant(_name == nss.db());
-    LOGV2_DEBUG(20316, 1, "dropCollection: {nss} - dropAllIndexes start", "nss"_attr = nss);
+    LOGV2_DEBUG(
+        20316, 1, "dropCollection: {namespace} - dropAllIndexes start", "namespace"_attr = nss);
     collection->getIndexCatalog()->dropAllIndexes(opCtx, true);
 
     invariant(DurableCatalog::get(opCtx)->getTotalIndexCount(opCtx, collection->getCatalogId()) ==
               0);
-    LOGV2_DEBUG(20317, 1, "dropCollection: {nss} - dropAllIndexes done", "nss"_attr = nss);
+    LOGV2_DEBUG(
+        20317, 1, "dropCollection: {namespace} - dropAllIndexes done", "namespace"_attr = nss);
 }
 
 Status DatabaseImpl::_finishDropCollection(OperationContext* opCtx,
@@ -462,7 +466,7 @@ Status DatabaseImpl::_finishDropCollection(OperationContext* opCtx,
                                            Collection* collection) const {
     UUID uuid = collection->uuid();
     LOGV2(20318,
-          "Finishing collection drop for {nss} ({uuid}).",
+          "Finishing collection drop for {namespace} ({uuid}).",
           "Finishing collection drop",
           "namespace"_attr = nss,
           "uuid"_attr = uuid);
@@ -503,7 +507,7 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
 
     LOGV2(20319,
           "renameCollection: renaming collection {collToRename_uuid} from {fromNss} to {toNss}",
-          "renameCollection: renaming collection",
+          "renameCollection",
           "uuid"_attr = collToRename->uuid(),
           "fromName"_attr = fromNss,
           "toName"_attr = toNss);
@@ -548,28 +552,11 @@ void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
         throw WriteConflictException();
     }
 
-
-    uassert(17320,
-            str::stream() << "cannot do createCollection on namespace with a $ in it: " << nss,
-            nss.ns().find('$') == std::string::npos);
-    uassert(14037,
-            "can't create user databases on a --configsvr instance",
-            serverGlobalParams.clusterRole != ClusterRole::ConfigServer || nss.isOnInternalDb());
-
-    uassert(17316,
-            str::stream() << "cannot create a collection with an empty name on db: " << nss.db(),
-            !nss.coll().empty());
-
     uassert(28838, "cannot create a non-capped oplog collection", options.capped || !nss.isOplog());
     uassert(ErrorCodes::DatabaseDropPending,
             str::stream() << "Cannot create collection " << nss
                           << " - database is in the process of being dropped.",
             !_dropPending.load());
-
-    uassert(17381,
-            str::stream() << "Fully qualified namespace is too long. Namespace: " << nss.ns()
-                          << " Max: " << NamespaceString::MaxNsCollectionLen,
-            !nss.isNormalCollection() || nss.size() <= NamespaceString::MaxNsCollectionLen);
 }
 
 Status DatabaseImpl::createView(OperationContext* opCtx,
@@ -652,13 +639,13 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     audit::logCreateCollection(&cc(), nss.ns());
 
     LOGV2(20320,
-          "createCollection: {nss} with {generatedUUID_generated_provided} UUID: "
+          "createCollection: {namespace} with {generatedUUID_generated_provided} UUID: "
           "{optionsWithUUID_uuid_get} and options: {options}",
           "createCollection",
           "namespace"_attr = nss,
           "uuidDisposition"_attr = (generatedUUID ? "generated" : "provided"),
           "uuid"_attr = optionsWithUUID.uuid.get(),
-          "options"_attr = options.toBSON());
+          "options"_attr = options);
 
     // Create Collection object
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
@@ -784,7 +771,7 @@ void DatabaseImpl::checkForIdIndexesAndDropPendingCollections(OperationContext* 
         if (nss.isDropPendingNamespace()) {
             auto dropOpTime = fassert(40459, nss.getDropPendingNamespaceOpTime());
             LOGV2(20321,
-                  "Found drop-pending namespace {nss} with drop optime {dropOpTime}",
+                  "Found drop-pending namespace {namespace} with drop optime {dropOpTime}",
                   "Found drop-pending namespace",
                   "namespace"_attr = nss,
                   "dropOpTime"_attr = dropOpTime);
@@ -802,15 +789,13 @@ void DatabaseImpl::checkForIdIndexesAndDropPendingCollections(OperationContext* 
         if (coll->getIndexCatalog()->findIdIndex(opCtx))
             continue;
 
-        LOGV2_OPTIONS(20322,
-                      {logv2::LogTag::kStartupWarnings},
-                      "WARNING: a collection lacks a unique index on _id. This index is "
-                      "needed for replication to function properly",
-                      "namespace"_attr = nss);
-        LOGV2_OPTIONS(20323,
-                      {logv2::LogTag::kStartupWarnings},
-                      "To fix this, you need to create a unique index on _id. See "
-                      "http://dochub.mongodb.org/core/build-replica-set-indexes");
+        LOGV2_OPTIONS(
+            20322,
+            {logv2::LogTag::kStartupWarnings},
+            "Collection lacks a unique index on _id. This index is "
+            "needed for replication to function properly. To fix this, you need to create a unique "
+            "index on _id. See http://dochub.mongodb.org/core/build-replica-set-indexes",
+            "namespace"_attr = nss);
     }
 }
 
@@ -821,8 +806,8 @@ Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
                                   const BSONObj& idIndex) const {
     LOGV2_DEBUG(20324,
                 1,
-                "create collection {nss} {collectionOptions}",
-                "nss"_attr = nss,
+                "create collection {namespace} {collectionOptions}",
+                "namespace"_attr = nss,
                 "collectionOptions"_attr = collectionOptions.toBSON());
     if (!NamespaceString::validCollectionComponent(nss.ns()))
         return Status(ErrorCodes::InvalidNamespace, str::stream() << "invalid ns: " << nss);

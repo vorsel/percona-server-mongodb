@@ -114,7 +114,10 @@ Status checkFailCollectionInsertsFailPoint(const NamespaceString& ns, const BSON
             const std::string msg = str::stream()
                 << "Failpoint (failCollectionInserts) has been enabled (" << data
                 << "), so rejecting insert (first doc): " << firstDoc;
-            LOGV2(20287, "{msg}", "msg"_attr = msg);
+            LOGV2(20287,
+                  "Failpoint (failCollectionInserts) has been enabled, so rejecting insert",
+                  "data"_attr = data,
+                  "document"_attr = firstDoc);
             s = {ErrorCodes::FailPointEnabled, msg};
         },
         [&](const BSONObj& data) {
@@ -242,7 +245,8 @@ CollectionImpl::CollectionImpl(OperationContext* opCtx,
                                RecordId catalogId,
                                UUID uuid,
                                std::unique_ptr<RecordStore> recordStore)
-    : _ns(nss),
+    : _sharedDecorations(std::make_shared<SharedCollectionDecorations>()),
+      _ns(nss),
       _catalogId(catalogId),
       _uuid(uuid),
       _recordStore(std::move(recordStore)),
@@ -250,7 +254,7 @@ CollectionImpl::CollectionImpl(OperationContext* opCtx,
                       _ns.db() != "local"),
       _indexCatalog(std::make_unique<IndexCatalogImpl>(this)),
       _cappedNotifier(_recordStore && _recordStore->isCapped()
-                          ? std::make_unique<CappedInsertNotifier>()
+                          ? std::make_shared<CappedInsertNotifier>()
                           : nullptr) {
     if (isCapped())
         _recordStore->setCappedCallback(this);
@@ -274,6 +278,10 @@ std::unique_ptr<Collection> CollectionImpl::FactoryImpl::make(
     CollectionUUID uuid,
     std::unique_ptr<RecordStore> rs) const {
     return std::make_unique<CollectionImpl>(opCtx, nss, catalogId, uuid, std::move(rs));
+}
+
+SharedCollectionDecorations* CollectionImpl::getSharedDecorations() const {
+    return _sharedDecorations.get();
 }
 
 void CollectionImpl::init(OperationContext* opCtx) {
@@ -517,7 +525,7 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
             LOGV2(20289,
                   "hangAfterCollectionInserts fail point enabled. Blocking "
                   "until fail point is disabled.",
-                  "ns"_attr = _ns,
+                  "namespace"_attr = _ns,
                   "whenFirst"_attr = whenFirst);
             hangAfterCollectionInserts.pauseWhileSet(opCtx);
         },
@@ -572,8 +580,8 @@ Status CollectionImpl::insertDocumentForBulkLoader(OperationContext* opCtx,
     if (MONGO_unlikely(failAfterBulkLoadDocInsert.shouldFail())) {
         LOGV2(20290,
               "Failpoint failAfterBulkLoadDocInsert enabled. Throwing "
-              "WriteConflictException.",
-              "ns_ns"_attr = _ns.ns());
+              "WriteConflictException",
+              "namespace"_attr = _ns);
         throw WriteConflictException();
     }
 
@@ -646,7 +654,7 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
     }
 
     int64_t keysInserted;
-    status = _indexCatalog->indexRecords(opCtx, bsonRecords, &keysInserted);
+    status = _indexCatalog->indexRecords(opCtx, this, bsonRecords, &keysInserted);
     if (opDebug) {
         opDebug->additiveMetrics.incrementKeysInserted(keysInserted);
     }
@@ -798,7 +806,7 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
         int64_t keysInserted, keysDeleted;
 
         uassertStatusOK(_indexCatalog->updateRecord(
-            opCtx, *args->preImageDoc, newDoc, oldLocation, &keysInserted, &keysDeleted));
+            opCtx, this, *args->preImageDoc, newDoc, oldLocation, &keysInserted, &keysDeleted));
 
         if (opDebug) {
             opDebug->additiveMetrics.incrementKeysInserted(keysInserted);
@@ -1196,7 +1204,7 @@ void CollectionImpl::setNs(NamespaceString nss) {
 void CollectionImpl::indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) {
     DurableCatalog::get(opCtx)->indexBuildSuccess(
         opCtx, getCatalogId(), index->descriptor()->indexName());
-    _indexCatalog->indexBuildSuccess(opCtx, index);
+    _indexCatalog->indexBuildSuccess(opCtx, this, index);
 }
 
 void CollectionImpl::establishOplogCollectionForLogging(OperationContext* opCtx) {

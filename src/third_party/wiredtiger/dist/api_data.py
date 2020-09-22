@@ -522,6 +522,14 @@ connection_runtime_config = [
             is not limited to not skewing newest, not favoring leaf pages,
             and modifying the eviction score mechanism.''',
             type='boolean'),
+        Config('log_retention', '0', r'''
+            adjust log archiving to retain at least this number of log files, ignored if set to 0.
+            (Warning: this option can remove log files required for recovery if no checkpoints
+            have yet been done and the number of log files exceeds the configured value. As
+            WiredTiger cannot detect the difference between a system that has not yet checkpointed
+            and one that will never checkpoint, it might discard log files before any checkpoint is
+            done.)''',
+            min='0', max='1024'),
         Config('realloc_exact', 'false', r'''
             if true, reallocation of memory will only provide the exact
             amount requested. This will help with spotting memory allocation
@@ -699,9 +707,9 @@ connection_runtime_config = [
         intended for use with internal stress testing of WiredTiger.''',
         type='list', undoc=True,
         choices=[
-        'aggressive_sweep', 'checkpoint_slow', 'history_store_sweep_race',
-        'split_1', 'split_2', 'split_3', 'split_4', 'split_5', 'split_6',
-        'split_7', 'split_8']),
+        'aggressive_sweep', 'checkpoint_slow', 'history_store_checkpoint_delay',
+        'history_store_sweep_race', 'split_1', 'split_2', 'split_3', 'split_4', 'split_5',
+        'split_6', 'split_7', 'split_8']),
     Config('verbose', '', r'''
         enable messages for various events. Options are given as a
         list, such as <code>"verbose=[evictserver,read]"</code>''',
@@ -1261,10 +1269,11 @@ methods = {
         configure the cursor for dump format inputs and outputs: "hex"
         selects a simple hexadecimal format, "json" selects a JSON format
         with each record formatted as fields named by column names if
-        available, and "print" selects a format where only non-printing
-        characters are hexadecimal encoded.  These formats are compatible
-        with the @ref util_dump and @ref util_load commands''',
-        choices=['hex', 'json', 'print']),
+        available, "pretty" selects a human-readable format (making it
+        incompatible with the "load") and "print" selects a format where only
+        non-printing characters are hexadecimal encoded.  These formats are
+        compatible with the @ref util_dump and @ref util_load commands''',
+        choices=['hex', 'json', 'pretty', 'print']),
     Config('incremental', '', r'''
         configure the cursor for block incremental backup usage. These formats
         are only compatible with the backup data source; see @ref backup''',
@@ -1286,7 +1295,7 @@ methods = {
             this setting manages the granularity of how WiredTiger maintains modification
             maps internally. The larger the granularity, the smaller amount of information
             WiredTiger need to maintain''',
-            min='1MB', max='2GB'),
+            min='4KB', max='2GB'),
         Config('src_id', '', r'''
             a string that identifies a previous checkpoint backup source as the source
             of this incremental backup. This identifier must have already been created

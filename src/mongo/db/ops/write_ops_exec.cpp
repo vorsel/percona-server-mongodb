@@ -127,13 +127,12 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
                     curOp->getReadWriteType());
 
         if (!curOp->debug().errInfo.isOK()) {
-            LOGV2_DEBUG(
-                20886,
-                3,
-                "Caught Assertion in {logicalOpToString_curOp_getLogicalOp}: {curOp_debug_errInfo}",
-                "logicalOpToString_curOp_getLogicalOp"_attr =
-                    redact(logicalOpToString(curOp->getLogicalOp())),
-                "curOp_debug_errInfo"_attr = curOp->debug().errInfo.toString());
+            LOGV2_DEBUG(20886,
+                        3,
+                        "Caught Assertion in finishCurOp. Op: {operation}, error: {error}",
+                        "Caught Assertion in finishCurOp",
+                        "operation"_attr = redact(logicalOpToString(curOp->getLogicalOp())),
+                        "error"_attr = curOp->debug().errInfo.toString());
         }
 
         // Mark the op as complete, and log it if appropriate. Returns a boolean indicating whether
@@ -151,7 +150,10 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
         // We need to ignore all errors here. We don't want a successful op to fail because of a
         // failure to record stats. We also don't want to replace the error reported for an op that
         // is failing.
-        LOGV2(20887, "Ignoring error from finishCurOp: {ex}", "ex"_attr = redact(ex));
+        LOGV2(20887,
+              "Ignoring error from finishCurOp: {error}",
+              "Ignoring error from finishCurOp",
+              "error"_attr = redact(ex));
     }
 }
 
@@ -174,9 +176,9 @@ public:
             replClientInfo().setLastOpToSystemLastOpTimeIgnoringInterrupt(_opCtx);
             LOGV2_DEBUG(20888,
                         5,
-                        "Set last op to system time: {replClientInfo_getLastOp_getTimestamp}",
-                        "replClientInfo_getLastOp_getTimestamp"_attr =
-                            replClientInfo().getLastOp().getTimestamp());
+                        "Set last op to system time: {timestamp}",
+                        "Set last op to system time",
+                        "timestamp"_attr = replClientInfo().getLastOp().getTimestamp());
         }
     }
 
@@ -219,7 +221,7 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
         if (!CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
                 opCtx,
                 ns)) {  // someone else may have beat us to it.
-            uassertStatusOK(userAllowedCreateNS(ns.db(), ns.coll()));
+            uassertStatusOK(userAllowedCreateNS(ns));
             WriteUnitOfWork wuow(opCtx);
             CollectionOptions defaultCollectionOptions;
             uassertStatusOK(db.getDb()->userCreateNS(opCtx, ns, defaultCollectionOptions));
@@ -276,10 +278,6 @@ bool handleError(OperationContext* opCtx,
 
     out->results.emplace_back(ex.toStatus());
     return !wholeOp.getOrdered();
-}
-
-LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
-    return nss.isSystemDotViews() ? MODE_X : mode;
 }
 
 void insertDocuments(OperationContext* opCtx,
@@ -370,10 +368,11 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
         "hangDuringBatchInsert",
         [&wholeOp]() {
             LOGV2(20889,
-                  "batch insert - hangDuringBatchInsert fail point enabled for namespace "
-                  "{wholeOp_getNamespace}. Blocking "
-                  "until fail point is disabled.",
-                  "wholeOp_getNamespace"_attr = wholeOp.getNamespace());
+                  "Batch insert - hangDuringBatchInsert fail point enabled for namespace "
+                  "{namespace}. Blocking until fail point is disabled",
+                  "Batch insert - hangDuringBatchInsert fail point enabled for a namespace. "
+                  "Blocking until fail point is disabled",
+                  "namespace"_attr = wholeOp.getNamespace());
         },
         true,  // Check for interrupt periodically.
         wholeOp.getNamespace());
@@ -626,10 +625,11 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
         "hangDuringBatchUpdate",
         [&ns]() {
             LOGV2(20890,
-                  "batch update - hangDuringBatchUpdate fail point enabled for nss {ns}. Blocking "
-                  "until "
-                  "fail point is disabled.",
-                  "ns"_attr = ns);
+                  "Batch update - hangDuringBatchUpdate fail point enabled for namespace "
+                  "{namespace}. Blocking until fail point is disabled",
+                  "Batch update - hangDuringBatchUpdate fail point enabled for a namespace. "
+                  "Blocking until fail point is disabled",
+                  "namespace"_attr = ns);
         },
         false /*checkForInterrupt*/,
         ns);
@@ -675,12 +675,12 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
         CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
     }
 
-    uassertStatusOK(exec->executePlan());
+    exec->executePlan();
 
     PlanSummaryStats summary;
     Explain::getSummaryStats(*exec, &summary);
-    if (collection->getCollection()) {
-        CollectionQueryInfo::get(collection->getCollection()).notifyOfQuery(opCtx, summary);
+    if (auto coll = collection->getCollection()) {
+        CollectionQueryInfo::get(coll).notifyOfQuery(opCtx, coll, summary);
     }
 
     if (curOp.shouldDBProfile()) {
@@ -885,8 +885,8 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         "hangDuringBatchRemove",
         []() {
             LOGV2(20891,
-                  "batch remove - hangDuringBatchRemove fail point enabled. Blocking "
-                  "until fail point is disabled.");
+                  "Batch remove - hangDuringBatchRemove fail point enabled. Blocking until fail "
+                  "point is disabled");
         },
         true  // Check for interrupt periodically.
     );
@@ -913,14 +913,14 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
     }
 
-    uassertStatusOK(exec->executePlan());
+    exec->executePlan();
     long long n = DeleteStage::getNumDeleted(*exec);
     curOp.debug().additiveMetrics.ndeleted = n;
 
     PlanSummaryStats summary;
     Explain::getSummaryStats(*exec, &summary);
-    if (collection.getCollection()) {
-        CollectionQueryInfo::get(collection.getCollection()).notifyOfQuery(opCtx, summary);
+    if (auto coll = collection.getCollection()) {
+        CollectionQueryInfo::get(coll).notifyOfQuery(opCtx, coll, summary);
     }
     curOp.debug().setPlanSummaryMetrics(summary);
 

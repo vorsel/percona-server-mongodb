@@ -1613,6 +1613,42 @@ TEST_F(RadixStoreTest, MergeSharedSubKey) {
     ASSERT_TRUE(thisStore == expected);
 }
 
+TEST_F(RadixStoreTest, MergeInternalNodeTest) {
+    baseStore.insert({"a", "a"});
+    baseStore.insert({"aaaa", "a"});
+    baseStore.insert({"aaab", "a"});
+
+    otherStore = baseStore;
+    otherStore.insert({"aaa", "a"});
+
+    thisStore = baseStore;
+    thisStore.insert({"aa", "a"});
+
+    thisStore.merge3(baseStore, otherStore);
+
+    expected.insert({"a", "a"});
+    expected.insert({"aa", "a"});
+    expected.insert({"aaa", "a"});
+    expected.insert({"aaaa", "a"});
+    expected.insert({"aaab", "a"});
+    ASSERT_TRUE(thisStore == expected);
+}
+
+TEST_F(RadixStoreTest, MergeBaseKeyNegativeCharTest) {
+    baseStore.insert({"aaa\xffq", "q"});
+
+    otherStore = baseStore;
+    otherStore.insert({"aab", "b"});
+
+    thisStore = baseStore;
+    thisStore.insert({"aac", "c"});
+
+    thisStore.merge3(baseStore, otherStore);
+    ASSERT_EQ(thisStore.find("aaa\xffq")->second, "q");
+    ASSERT_EQ(thisStore.find("aab")->second, "b");
+    ASSERT_EQ(thisStore.find("aac")->second, "c");
+}
+
 TEST_F(RadixStoreTest, MergeConflictingModifications) {
     value_type value1 = std::make_pair("foo", "1");
     value_type value2 = std::make_pair("foo", "2");
@@ -1671,6 +1707,25 @@ TEST_F(RadixStoreTest, MergeConflictingInsertions) {
     otherStore.insert(value_type(value1));
 
     ASSERT_THROWS(thisStore.merge3(baseStore, otherStore), merge_conflict_exception);
+}
+
+TEST_F(RadixStoreTest, MergeDifferentLeafNodesSameDataTest) {
+    baseStore.insert({"a", "a"});
+    baseStore.insert({"aa", "a"});
+
+    otherStore = baseStore;
+    otherStore.insert({"aaa", "a"});
+    otherStore.erase("aaa");
+
+    thisStore = baseStore;
+    thisStore.insert({"aab", "b"});
+    thisStore.erase("aab");
+
+    thisStore.merge3(baseStore, otherStore);
+
+    expected.insert({"a", "a"});
+    expected.insert({"aa", "a"});
+    ASSERT_TRUE(thisStore == expected);
 }
 
 TEST_F(RadixStoreTest, UpperBoundTest) {

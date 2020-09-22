@@ -29,49 +29,19 @@
 
 #pragma once
 
-#include "mongo/base/status_with.h"
-#include "mongo/db/signed_logical_time.h"
+#include <string>
+
+#include "mongo/bson/bsonobj.h"
 
 namespace mongo {
 
-class BSONElement;
-class BSONObjBuilder;
+class Client;
 
-namespace rpc {
+namespace rename_collection {
 
-/**
- * Format:
- * logicalTime: {
- *     clusterTime: <Timestamp>,
- *     signature: {
- *         hash: <SHA1 hash of clusterTime as BinData>,
- *         keyId: <long long>
- *     }
- * }
- */
-class LogicalTimeMetadata {
-public:
-    LogicalTimeMetadata() = default;
-    explicit LogicalTimeMetadata(SignedLogicalTime time);
+Status checkAuthForRenameCollectionCommand(Client* client,
+                                           const std::string& dbname,
+                                           const BSONObj& cmdObj);
 
-    /**
-     * Parses the metadata from BSON. Returns an empty LogicalTimeMetadata If the metadata is not
-     * present.
-     */
-    static StatusWith<LogicalTimeMetadata> readFromMetadata(const BSONObj& metadata);
-    static StatusWith<LogicalTimeMetadata> readFromMetadata(const BSONElement& metadataElem);
-
-    void writeToMetadata(BSONObjBuilder* metadataBuilder) const;
-
-    const SignedLogicalTime& getSignedTime() const;
-
-    static StringData fieldName() {
-        return "$clusterTime";
-    }
-
-private:
-    SignedLogicalTime _clusterTime;
-};
-
-}  // namespace rpc
+}  // namespace rename_collection
 }  // namespace mongo
