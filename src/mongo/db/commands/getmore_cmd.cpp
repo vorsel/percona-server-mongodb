@@ -378,34 +378,8 @@ public:
             boost::optional<AutoGetCollectionForRead> readLock;
             boost::optional<AutoStatsTracker> statsTracker;
 
-            {
-                // We call RecoveryUnit::setTimestampReadSource() before acquiring a lock on the
-                // collection via AutoGetCollectionForRead in order to ensure the comparison to the
-                // collection's minimum visible snapshot is accurate.
-                PlanExecutor* exec = cursorPin->getExecutor();
-                const auto* cq = exec->getCanonicalQuery();
-
-                if (auto clusterTime =
-                        (cq ? cq->getQueryRequest().getReadAtClusterTime() : boost::none)) {
-                    // We don't compare 'clusterTime' to the last applied opTime or to the
-                    // all-committed timestamp because the testing infrastructure won't use the
-                    // $_internalReadAtClusterTime option in any test suite where rollback is
-                    // expected to occur.
-
-                    // The $_internalReadAtClusterTime option causes any storage-layer cursors
-                    // created during plan execution to read from a consistent snapshot of data at
-                    // the supplied clusterTime, even across yields.
-                    opCtx->recoveryUnit()->setTimestampReadSource(
-                        RecoveryUnit::ReadSource::kProvided, clusterTime);
-
-                    // The $_internalReadAtClusterTime option also causes any storage-layer cursors
-                    // created during plan execution to block on prepared transactions. Since the
-                    // getMore command ignores prepare conflicts by default, change the behavior.
-                    opCtx->recoveryUnit()->setPrepareConflictBehavior(
-                        PrepareConflictBehavior::kEnforce);
-                }
-            }
-            if (cursorPin->lockPolicy() == ClientCursorParams::LockPolicy::kLocksInternally) {
+            if (cursorPin->getExecutor()->lockPolicy() ==
+                PlanExecutor::LockPolicy::kLocksInternally) {
                 if (!_request.nss.isCollectionlessCursorNamespace()) {
                     statsTracker.emplace(
                         opCtx,
@@ -415,8 +389,8 @@ public:
                         CollectionCatalog::get(opCtx).getDatabaseProfileLevel(_request.nss.db()));
                 }
             } else {
-                invariant(cursorPin->lockPolicy() ==
-                          ClientCursorParams::LockPolicy::kLockExternally);
+                invariant(cursorPin->getExecutor()->lockPolicy() ==
+                          PlanExecutor::LockPolicy::kLockExternally);
 
                 if (MONGO_unlikely(GetMoreHangBeforeReadLock.shouldFail())) {
                     LOGV2(20477,
@@ -572,7 +546,9 @@ public:
 
             CursorId respondWithId = 0;
             CursorResponseBuilder::Options options;
-            options.atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+            if (!opCtx->inMultiDocumentTransaction()) {
+                options.atClusterTime = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime();
+            }
             CursorResponseBuilder nextBatch(reply, options);
             BSONObj obj;
             std::uint64_t numResults = 0;
@@ -638,7 +614,8 @@ public:
             // would be useful to have this info for an aggregation, but the source PlanExecutor
             // could be destroyed before we know if we need 'execStats' and we do not want to
             // generate the stats eagerly for all operations due to cost.
-            if (cursorPin->lockPolicy() != ClientCursorParams::LockPolicy::kLocksInternally &&
+            if (cursorPin->getExecutor()->lockPolicy() !=
+                    PlanExecutor::LockPolicy::kLocksInternally &&
                 curOp->shouldDBProfile()) {
                 BSONObjBuilder execStatsBob;
                 Explain::getWinningPlanStats(exec, &execStatsBob);

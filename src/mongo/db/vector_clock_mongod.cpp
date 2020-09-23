@@ -30,7 +30,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/logical_time_validator.h"
-#include "mongo/db/replica_set_aware_service.h"
+#include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/vector_clock_mutable.h"
 
 namespace mongo {
@@ -69,8 +69,8 @@ protected:
     bool _permitRefreshDuringGossipOut() const override;
 
 private:
-    void onStepUpBegin(OperationContext* opCtx) override {}
-    void onStepUpComplete(OperationContext* opCtx) override {}
+    void onStepUpBegin(OperationContext* opCtx, long long term) override {}
+    void onStepUpComplete(OperationContext* opCtx, long long term) override {}
     void onStepDown() override {}
     void onBecomeArbiter() override;
 };

@@ -1,13 +1,13 @@
 """Tools to dump debug info for each OS."""
 
-from abc import ABCMeta, abstractmethod
+import itertools
 import logging
 import os
 import sys
 import tempfile
-import itertools
-from distutils import spawn  # pylint: disable=no-name-in-module
+from abc import ABCMeta, abstractmethod
 from collections import namedtuple
+from distutils import spawn  # pylint: disable=no-name-in-module
 
 from buildscripts.resmokelib.hang_analyzer.process import call, callo, find_program
 from buildscripts.resmokelib.hang_analyzer.process_list import Pinfo
@@ -225,11 +225,13 @@ class LLDBDumper(Dumper):
                 self._root_logger.info("Dumping core to %s", dump_file)
 
             cmds += [
+                "platform shell kill -CONT %d" % pid,
                 "attach -p %d" % pid,
                 "target modules list",
                 "thread backtrace all",
                 dump_command,
                 "process detach",
+                "platform shell kill -STOP %d" % pid,
             ]
 
         return cmds
@@ -367,6 +369,7 @@ class GDBDumper(Dumper):
 
             cmds += [
                 "attach %d" % pid,
+                "handle SIGSTOP ignore noprint",
                 "info sharedlibrary",
                 "info threads",  # Dump a simple list of commands to get the thread name
             ] + raw_stacks_commands + [

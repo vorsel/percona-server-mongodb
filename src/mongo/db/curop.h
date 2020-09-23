@@ -233,7 +233,7 @@ public:
     Status errInfo = Status::OK();
 
     // response info
-    long long executionTimeMicros{0};
+    Microseconds executionTime{0};
     long long nreturned{-1};
     int responseLength{-1};
 
@@ -477,12 +477,8 @@ public:
     bool isStarted() const {
         return _start > 0;
     }
-    long long startTime() {  // micros
-        ensureStarted();
-        return _start;
-    }
     void done() {
-        _end = curTimeMicros64();
+        _end = _tickSource->getTicks();
     }
     bool isDone() const {
         return _end > 0;
@@ -501,7 +497,7 @@ public:
     void pauseTimer() {
         invariant(isStarted());
         invariant(_lastPauseTime == 0);
-        _lastPauseTime = curTimeMicros64();
+        _lastPauseTime = _tickSource->getTicks();
     }
 
     /**
@@ -512,7 +508,7 @@ public:
         invariant(isStarted());
         invariant(_lastPauseTime > 0);
         _totalPausedDuration +=
-            Microseconds{static_cast<long long>(curTimeMicros64()) - _lastPauseTime};
+            _tickSource->ticksTo<Microseconds>(_tickSource->getTicks() - _lastPauseTime);
         _lastPauseTime = 0;
     }
 
@@ -560,7 +556,9 @@ public:
         if (_debug.remoteOpWaitTime) {
             Microseconds end = elapsedTimeTotal();
             invariant(_remoteOpStartTime);
-            // A backward shift of the realtime system clock could lead to a negative delta.
+            // On most systems a monotonic clock source will be used to measure time. When a
+            // monotonic clock is not available we fallback to using the realtime system clock. When
+            // used, a backward shift of the realtime system clock could lead to a negative delta.
             Microseconds delta = std::max((end - *_remoteOpStartTime), Microseconds{0});
             *_debug.remoteOpWaitTime += delta;
             _remoteOpStartTime = boost::none;
@@ -582,9 +580,9 @@ public:
         }
 
         if (!_end) {
-            return Microseconds{static_cast<long long>(curTimeMicros64() - startTime())};
+            return _tickSource->ticksTo<Microseconds>(_tickSource->getTicks() - startTime());
         } else {
-            return Microseconds{static_cast<long long>(_end - startTime())};
+            return _tickSource->ticksTo<Microseconds>(_end - startTime());
         }
     }
 
@@ -726,8 +724,17 @@ public:
         return _lockStatsBase;
     }
 
+    void setTickSource_forTest(TickSource* tickSource) {
+        _tickSource = tickSource;
+    }
+
 private:
     class CurOpStack;
+
+    TickSource::Tick startTime() {
+        ensureStarted();
+        return _start;
+    }
 
     static const OperationContext::Decoration<CurOpStack> _curopStack;
 
@@ -738,14 +745,14 @@ private:
     const Command* _command{nullptr};
 
     // The time at which this CurOp instance was marked as started.
-    long long _start{0};
+    TickSource::Tick _start{0};
 
     // The time at which this CurOp instance was marked as done.
-    long long _end{0};
+    TickSource::Tick _end{0};
 
     // The time at which this CurOp instance had its timer paused, or 0 if the timer is not
     // currently paused.
-    long long _lastPauseTime{0};
+    TickSource::Tick _lastPauseTime{0};
 
     // The cumulative duration for which the timer has been paused.
     Microseconds _totalPausedDuration{0};
@@ -784,6 +791,7 @@ private:
     // (serverGlobalParams.rateLimit > 1)
     bool _shouldDBProfileWithRateLimit();
 
+    TickSource* _tickSource = nullptr;
 };
 
 /**

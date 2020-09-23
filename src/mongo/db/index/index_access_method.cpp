@@ -471,7 +471,13 @@ public:
 
     int64_t getKeysInserted() const final;
 
+    Sorter::State getSorterState() const final;
+
+    void persistDataForShutdown() final;
+
 private:
+    void _addMultikeyMetadataKeysIntoSorter();
+
     std::unique_ptr<Sorter> _sorter;
     IndexCatalogEntry* _indexCatalogEntry;
     int64_t _keysInserted = 0;
@@ -581,15 +587,29 @@ bool AbstractIndexAccessMethod::BulkBuilderImpl::isMultikey() const {
 
 IndexAccessMethod::BulkBuilder::Sorter::Iterator*
 AbstractIndexAccessMethod::BulkBuilderImpl::done() {
-    for (const auto& keyString : _multikeyMetadataKeys) {
-        _sorter->add(keyString, mongo::NullValue());
-        ++_keysInserted;
-    }
+    _addMultikeyMetadataKeysIntoSorter();
     return _sorter->done();
 }
 
 int64_t AbstractIndexAccessMethod::BulkBuilderImpl::getKeysInserted() const {
     return _keysInserted;
+}
+
+AbstractIndexAccessMethod::BulkBuilder::Sorter::State
+AbstractIndexAccessMethod::BulkBuilderImpl::getSorterState() const {
+    return _sorter->getState();
+}
+
+void AbstractIndexAccessMethod::BulkBuilderImpl::persistDataForShutdown() {
+    _addMultikeyMetadataKeysIntoSorter();
+    _sorter->persistDataForShutdown();
+}
+
+void AbstractIndexAccessMethod::BulkBuilderImpl::_addMultikeyMetadataKeysIntoSorter() {
+    for (const auto& keyString : _multikeyMetadataKeys) {
+        _sorter->add(keyString, mongo::NullValue());
+        ++_keysInserted;
+    }
 }
 
 Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,

@@ -62,6 +62,7 @@
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/shutdown_in_progress_quiesce_info.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/logv2/log.h"
@@ -3309,7 +3310,7 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceMode) {
 
     // Ensure that awaitIsMasterResponse() is called before entering quiesce mode.
     waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
-    ASSERT(getReplCoord()->enterQuiesceModeIfSecondary());
+    ASSERT(getReplCoord()->enterQuiesceModeIfSecondary(Milliseconds(0)));
     ASSERT_EQUALS(currentTopologyVersion.getCounter() + 1,
                   getTopoCoord().getTopologyVersion().getCounter());
     // Check that the cached topologyVersion counter was updated correctly.
@@ -3355,7 +3356,7 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceModeAfterWaitingTimes
 
     // Ensure that waiting for a topology change timed out before entering quiesce mode.
     failPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
-    ASSERT(getReplCoord()->enterQuiesceModeIfSecondary());
+    ASSERT(getReplCoord()->enterQuiesceModeIfSecondary(Milliseconds(0)));
     failPoint->setMode(FailPoint::off, 0);
 
     // Advance the clock so that pauseWhileSet() will wake up.
@@ -3380,7 +3381,7 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorInQuiesceMode) {
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
 
     auto currentTopologyVersion = getTopoCoord().getTopologyVersion();
-    ASSERT(getReplCoord()->enterQuiesceModeIfSecondary());
+    ASSERT(getReplCoord()->enterQuiesceModeIfSecondary(Milliseconds(1000)));
     ASSERT_EQUALS(currentTopologyVersion.getCounter() + 1,
                   getTopoCoord().getTopologyVersion().getCounter());
     // Check that the cached topologyVersion counter was updated correctly.
@@ -3419,14 +3420,68 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorInQuiesceMode) {
         getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none),
         AssertionException,
         ErrorCodes::ShutdownInProgress);
+
+    // Check that status includes an extraErrorInfo class. Since we did not advance the clock, we
+    // should still have the full quiesceTime as our remaining quiesceTime.
+    try {
+        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, currentTopologyVersion, deadline);
+    } catch (const DBException& ex) {
+        ASSERT(ex.extraInfo());
+        ASSERT(ex.extraInfo<ShutdownInProgressQuiesceInfo>());
+        ASSERT_EQ(ex.extraInfo<ShutdownInProgressQuiesceInfo>()->getRemainingQuiesceTimeMillis(),
+                  1000);
+    }
 }
+
+TEST_F(ReplCoordTest, QuiesceModeErrorsReturnAccurateRemainingQuiesceTime) {
+    init();
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 1 << "members"
+                            << BSON_ARRAY(BSON("host"
+                                               << "node1:12345"
+                                               << "_id" << 0))),
+                       HostAndPort("node1", 12345));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+
+    auto currentTopologyVersion = getTopoCoord().getTopologyVersion();
+    auto totalQuiesceTime = Milliseconds(1000);
+    ASSERT(getReplCoord()->enterQuiesceModeIfSecondary(totalQuiesceTime));
+    ASSERT_EQUALS(currentTopologyVersion.getCounter() + 1,
+                  getTopoCoord().getTopologyVersion().getCounter());
+    // Check that the cached topologyVersion counter was updated correctly.
+    ASSERT_EQUALS(getTopoCoord().getTopologyVersion().getCounter(),
+                  getReplCoord()->getTopologyVersion().getCounter());
+
+    auto opCtx = makeOperationContext();
+    auto maxAwaitTime = Milliseconds(5000);
+    auto deadline = getNet()->now() + maxAwaitTime;
+    auto halfwayThroughQuiesce = getNet()->now() + totalQuiesceTime / 2;
+
+    getNet()->enterNetwork();
+    // Advance the clock halfway to the quiesce deadline.
+    getNet()->advanceTime(halfwayThroughQuiesce);
+    getNet()->exitNetwork();
+
+    // Check that status includes an extraErrorInfo class. Since we advanced the clock halfway to
+    // the quiesce deadline, we should have half of the total quiesceTime left, 500 ms.
+    try {
+        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, currentTopologyVersion, deadline);
+    } catch (const DBException& ex) {
+        ASSERT(ex.extraInfo());
+        ASSERT(ex.extraInfo<ShutdownInProgressQuiesceInfo>());
+        ASSERT_EQ(ex.extraInfo<ShutdownInProgressQuiesceInfo>()->getRemainingQuiesceTimeMillis(),
+                  500);
+    }
+}
+
 
 TEST_F(ReplCoordTest, DoNotEnterQuiesceModeInStatesOtherThanSecondary) {
     init();
 
     // Do not enter quiesce mode in state RS_STARTUP.
     ASSERT_TRUE(getReplCoord()->getMemberState().startup());
-    ASSERT_FALSE(getReplCoord()->enterQuiesceModeIfSecondary());
+    ASSERT_FALSE(getReplCoord()->enterQuiesceModeIfSecondary(Milliseconds(0)));
 
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -3441,7 +3496,7 @@ TEST_F(ReplCoordTest, DoNotEnterQuiesceModeInStatesOtherThanSecondary) {
 
     // Do not enter quiesce mode in state RS_STARTUP2.
     ASSERT_TRUE(getReplCoord()->getMemberState().startup2());
-    ASSERT_FALSE(getReplCoord()->enterQuiesceModeIfSecondary());
+    ASSERT_FALSE(getReplCoord()->enterQuiesceModeIfSecondary(Milliseconds(0)));
 
     // Become primary.
     ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
@@ -3451,7 +3506,7 @@ TEST_F(ReplCoordTest, DoNotEnterQuiesceModeInStatesOtherThanSecondary) {
     ASSERT(getReplCoord()->getMemberState().primary());
 
     // Do not enter quiesce mode in state RS_PRIMARY.
-    ASSERT_FALSE(getReplCoord()->enterQuiesceModeIfSecondary());
+    ASSERT_FALSE(getReplCoord()->enterQuiesceModeIfSecondary(Milliseconds(0)));
 }
 
 TEST_F(ReplCoordTest, IsMasterReturnsErrorInQuiesceModeWhenNodeIsRemoved) {
@@ -3471,7 +3526,7 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorInQuiesceModeWhenNodeIsRemoved) {
 
     // Enter quiesce mode. Test that we increment the topology version.
     auto topologyVersionBeforeQuiesceMode = getTopoCoord().getTopologyVersion();
-    ASSERT(getReplCoord()->enterQuiesceModeIfSecondary());
+    ASSERT(getReplCoord()->enterQuiesceModeIfSecondary(Milliseconds(0)));
     auto topologyVersionAfterQuiesceMode = getTopoCoord().getTopologyVersion();
     ASSERT_EQUALS(topologyVersionBeforeQuiesceMode.getCounter() + 1,
                   topologyVersionAfterQuiesceMode.getCounter());
@@ -5808,7 +5863,7 @@ TEST_F(StableOpTimeTest, AdvanceCommitPointSetsStableOpTimeForStorage) {
     simulateSuccessfulV1Election();
 
     Timestamp stableTimestamp;
-    long long term = 2;
+    long long term = 1;
 
     getStorageInterface()->supportsDocLockingBool = true;
     getStorageInterface()->allDurableTimestamp = Timestamp(2, 1);
@@ -6568,7 +6623,7 @@ TEST_F(ReplCoordTest, PrepareOplogQueryMetadata) {
     ASSERT_OK(replMetadata.getStatus());
     ASSERT_EQ(replMetadata.getValue().getLastOpCommitted().opTime, optime1);
     ASSERT_EQ(replMetadata.getValue().getLastOpCommitted().wallTime, wallTime1);
-    ASSERT_EQ(replMetadata.getValue().getLastOpVisible(), OpTime());
+    ASSERT_EQ(replMetadata.getValue().getLastOpVisible(), optime1);
     ASSERT_EQ(replMetadata.getValue().getConfigVersion(), 2);
     ASSERT_EQ(replMetadata.getValue().getConfigTerm(), 0);
     ASSERT_EQ(replMetadata.getValue().getTerm(), 0);
@@ -7018,40 +7073,6 @@ TEST_F(ReplCoordTest, CancelAndRescheduleElectionTimeoutLogging) {
     ASSERT_EQ(2, countTextFormatLogLinesContaining("Canceling election timeout callback"));
 }
 
-TEST_F(ReplCoordTest, AdvanceCommittedSnapshotToMostRecentSnapshotPriorToOpTimeWhenOpTimeChanges) {
-    init("mySet");
-
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version" << 1 << "members"
-                            << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                     << "test1:1234"))),
-                       HostAndPort("test1", 1234));
-
-    auto opCtx = makeOperationContext();
-    runSingleNodeElection(opCtx.get());
-
-    OpTime time1(Timestamp(100, 1), 1);
-    OpTime time2(Timestamp(100, 2), 1);
-    OpTime time3(Timestamp(100, 3), 1);
-    OpTime time4(Timestamp(100, 4), 1);
-    OpTime time5(Timestamp(100, 5), 1);
-    OpTime time6(Timestamp(100, 6), 1);
-
-    replCoordSetMyLastAppliedOpTime(time1, Date_t() + Seconds(100));
-    replCoordSetMyLastAppliedOpTime(time2, Date_t() + Seconds(100));
-    replCoordSetMyLastAppliedOpTime(time5, Date_t() + Seconds(100));
-
-    // ensure current snapshot follows price is right rules (closest but not greater than)
-
-    replCoordSetMyLastDurableOpTime(time3, Date_t() + Seconds(100));
-    ASSERT_EQUALS(time2, getReplCoord()->getCurrentCommittedSnapshotOpTime());
-    replCoordSetMyLastDurableOpTime(time4, Date_t() + Seconds(100));
-    ASSERT_EQUALS(time2, getReplCoord()->getCurrentCommittedSnapshotOpTime());
-    replCoordSetMyLastDurableOpTime(time5, Date_t() + Seconds(100));
-    ASSERT_EQUALS(time5, getReplCoord()->getCurrentCommittedSnapshotOpTime());
-}
-
 TEST_F(ReplCoordTest, ZeroCommittedSnapshotWhenAllSnapshotsAreDropped) {
     init("mySet");
 
@@ -7238,6 +7259,8 @@ TEST_F(ReplCoordTest, OnlyForwardSyncProgressForOtherNodesWhenTheNodesAreBelieve
              << "protocolVersion" << 1 << "settings"
              << BSON("electionTimeoutMillis" << 2000 << "heartbeatIntervalMillis" << 40000)),
         HostAndPort("test1", 1234));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+
     OpTime optime(Timestamp(100, 2), 0);
     replCoordSetMyLastAppliedOpTime(optime, Date_t() + Seconds(100));
     replCoordSetMyLastDurableOpTime(optime, Date_t() + Seconds(100));
@@ -7308,6 +7331,8 @@ TEST_F(ReplCoordTest, UpdatePositionCmdHasMetadata) {
              << "protocolVersion" << 1 << "settings"
              << BSON("electionTimeoutMillis" << 2000 << "heartbeatIntervalMillis" << 40000)),
         HostAndPort("test1", 1234));
+    ASSERT_OK(getReplCoord()->setFollowerMode(MemberState::RS_SECONDARY));
+
     OpTime optime(Timestamp(100, 2), 0);
     replCoordSetMyLastAppliedOpTime(optime, Date_t() + Seconds(100));
     replCoordSetMyLastDurableOpTime(optime, Date_t() + Seconds(100));

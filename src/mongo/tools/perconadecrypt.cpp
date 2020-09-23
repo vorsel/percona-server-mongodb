@@ -216,7 +216,7 @@ int decryptGCM(boost::uintmax_t fsize, std::ifstream& src, std::ofstream& dst) {
 
 int decryptMain(int argc, char** argv, char** envp) {
     int ret{EXIT_BADOPTIONS};
-    runGlobalInitializersOrDie(argc, argv, envp);
+    runGlobalInitializersOrDie(std::vector<std::string>(argv, argv + argc));
 
     try{
         std::string encoded_key;

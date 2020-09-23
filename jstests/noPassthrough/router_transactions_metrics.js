@@ -1,10 +1,10 @@
 // Tests multi-statement transactions metrics in the serverStatus output from mongos in various
 // basic cases.
-// TODO (SERVER-48341): Remove requires_fcv_46 after backporting SERVER-48307 to 4.4.
-// @tags: [requires_fcv_46, uses_transactions, uses_multi_shard_transaction]
+// @tags: [uses_transactions, uses_multi_shard_transaction]
 (function() {
 "use strict";
 
+load("jstests/libs/curop_helpers.js");   // For waitForCurOpByFailPoint().
 load("jstests/libs/parallelTester.js");  // for Thread.
 load("jstests/sharding/libs/sharded_transactions_helpers.js");
 
@@ -657,11 +657,7 @@ jsTest.log("Active transaction.");
     txnThread.start();
 
     // Wait until we know the failpoint has been reached.
-    assert.soon(function() {
-        const filter = {"failpointMsg": "waitInFindBeforeMakingBatch"};
-        return assert.commandWorked(st.rs0.getPrimary().getDB("admin").currentOp(filter))
-                   .inprog.length === 1;
-    });
+    waitForCurOpByFailPointNoNS(st.rs0.getPrimary().getDB("admin"), "waitInFindBeforeMakingBatch");
 
     expectedStats.currentOpen += 1;
     expectedStats.currentActive += 1;

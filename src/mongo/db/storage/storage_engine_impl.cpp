@@ -91,7 +91,6 @@ StorageEngineImpl::StorageEngineImpl(std::unique_ptr<KVEngine> engine, StorageEn
           TimestampMonitor::TimestampType::kMinOfCheckpointAndOldest,
           [this](Timestamp timestamp) { _onMinOfCheckpointAndOldestTimestampChanged(timestamp); }),
       _supportsDocLocking(_engine->supportsDocLocking()),
-      _supportsDBLocking(_engine->supportsDBLocking()),
       _supportsCappedCollections(_engine->supportsCappedCollections()) {
     uassert(28601,
             "Storage engine does not support --directoryperdb",
@@ -260,10 +259,6 @@ void StorageEngineImpl::loadCatalog(OperationContext* opCtx) {
 
     KVPrefix::setLargestPrefix(maxSeenPrefix);
     opCtx->recoveryUnit()->abandonSnapshot();
-
-    // Unset the unclean shutdown flag to avoid executing special behavior if this method is called
-    // after startup.
-    startingAfterUncleanShutdown(getGlobalServiceContext()) = false;
 }
 
 void StorageEngineImpl::_initCollection(OperationContext* opCtx,
@@ -392,9 +387,10 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
             continue;
         }
 
-        // Internal idents are dropped at the end after those left over from index builds are
-        // identified.
-        if (_catalog->isInternalIdent(it)) {
+        // When starting up after an unclean shutdown, we do not attempt to recover any state from
+        // the internal idents. Thus, we drop them in this case.
+        if (startingAfterUncleanShutdown(opCtx->getServiceContext()) &&
+            _catalog->isInternalIdent(it)) {
             internalIdentsToDrop.insert(it);
             continue;
         }
@@ -807,6 +803,10 @@ void StorageEngineImpl::setStableTimestamp(Timestamp stableTimestamp, bool force
 void StorageEngineImpl::setInitialDataTimestamp(Timestamp initialDataTimestamp) {
     _initialDataTimestamp = initialDataTimestamp;
     _engine->setInitialDataTimestamp(initialDataTimestamp);
+}
+
+Timestamp StorageEngineImpl::getInitialDataTimestamp() {
+    return _engine->getInitialDataTimestamp();
 }
 
 void StorageEngineImpl::setOldestTimestampFromStable() {

@@ -1,12 +1,14 @@
 """Miscellaneous utility functions used by the hang analyzer."""
 
+import logging
 import os
+import signal
+import subprocess
 import sys
 import time
-import signal
-import logging
-import subprocess
 from distutils import spawn  # pylint: disable=no-name-in-module
+
+import psutil
 
 from buildscripts.resmokelib import core
 
@@ -106,3 +108,37 @@ def signal_process(logger, pid, signalnum):
 
     except AttributeError:
         logger.error("Cannot send signal to a process on Windows")
+
+
+def pause_process(logger, pname, pid):
+    """Pausing process."""
+
+    logger.info("Suspending process %s with PID %d", pname, pid)
+    try:
+        psutil.Process(pid).suspend()
+    except psutil.NoSuchProcess as err:
+        logger.error("Process not found: %s", err.msg)
+
+
+def resume_process(logger, pname, pid):
+    """Resuming  process."""
+
+    logger.info("Resuming process %s with PID %d", pname, pid)
+    try:
+        psutil.Process(pid).resume()
+    except psutil.NoSuchProcess as err:
+        logger.error("Process not found: %s", err.msg)
+
+
+def kill_processes(logger, processes):
+    """Kill processes with SIGKILL."""
+    logger.info("Starting to kill processes. Logs should be ignored from this point.")
+    for pinfo in processes:
+        for pid in pinfo.pidv:
+            try:
+                proc = psutil.Process(pid)
+                logger.info("Killing process %s with pid %d", pinfo.name, pid)
+                proc.kill()
+            except psutil.NoSuchProcess:
+                # Process has already terminated.
+                pass

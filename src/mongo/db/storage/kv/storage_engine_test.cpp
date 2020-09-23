@@ -136,12 +136,37 @@ TEST_F(StorageEngineTest, ReconcileDropsTemporary) {
 
     ASSERT(identExists(opCtx.get(), ident));
 
+    // Reconcile will only drop temporary idents when starting up after an unclean shutdown.
+    startingAfterUncleanShutdown(opCtx->getServiceContext()) = true;
+
     auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
     ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
 
     // The storage engine is responsible for dropping its temporary idents.
     ASSERT(!identExists(opCtx.get(), ident));
+
+    rs->finalizeTemporaryTable(opCtx.get(), TemporaryRecordStore::FinalizationAction::kDelete);
+}
+
+TEST_F(StorageEngineTest, ReconcileKeepsTemporary) {
+    auto opCtx = cc().makeOperationContext();
+
+    Lock::GlobalLock lk(&*opCtx, MODE_IS);
+
+    auto rs = makeTemporary(opCtx.get());
+    ASSERT(rs.get());
+    const std::string ident = rs->rs()->getIdent();
+
+    ASSERT(identExists(opCtx.get(), ident));
+
+    auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
+    ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+
+    // The storage engine does not drop its temporary idents outside of starting up after an
+    // unclean shutdown.
+    ASSERT(identExists(opCtx.get(), ident));
 
     rs->finalizeTemporaryTable(opCtx.get(), TemporaryRecordStore::FinalizationAction::kDelete);
 }
@@ -536,18 +561,18 @@ TEST_F(TimestampKVEngineTest, TimestampMonitorNotifiesListeners) {
 
 TEST_F(TimestampKVEngineTest, TimestampAdvancesOnNotification) {
     Timestamp previous = Timestamp();
-    int timesNotified = 0;
+    AtomicWord<int> timesNotified{0};
 
     TimestampListener listener(stable, [&](Timestamp timestamp) {
         ASSERT_TRUE(previous < timestamp);
         previous = timestamp;
-        timesNotified++;
+        timesNotified.fetchAndAdd(1);
     });
     _storageEngine->getTimestampMonitor()->addListener(&listener);
 
     // Let three rounds of notifications happen while ensuring that each new notification produces
     // an increasing timestamp.
-    while (timesNotified < 3) {
+    while (timesNotified.load() < 3) {
         sleepmillis(100);
     }
 

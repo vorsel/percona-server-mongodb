@@ -48,9 +48,6 @@ public:
     bool supportsDocLocking() const final {
         return false;
     }
-    bool supportsDBLocking() const final {
-        return true;
-    }
     bool supportsCappedCollections() const final {
         return true;
     }
@@ -137,6 +134,9 @@ public:
     }
     void setStableTimestamp(Timestamp stableTimestamp, bool force = false) final {}
     void setInitialDataTimestamp(Timestamp timestamp) final {}
+    Timestamp getInitialDataTimestamp() {
+        return Timestamp();
+    }
     void setOldestTimestampFromStable() final {}
     void setOldestTimestamp(Timestamp timestamp) final {}
     void setOldestActiveTransactionTimestampCallback(

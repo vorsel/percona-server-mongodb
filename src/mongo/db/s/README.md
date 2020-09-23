@@ -314,6 +314,88 @@ The config server replica set durably stores settings for the maximum chunk size
 should be automatically split and balanced.
 
 ## Auto-splitting
+When the mongos routes an update or insert to a chunk, the chunk may grow beyond the configured
+chunk size (specified by the server parameter maxChunkSizeBytes) and trigger an auto-split, which
+partitions the oversized chunk into smaller chunks. The shard that houses the chunk is responsible
+for:
+* determining if the chunk should be auto-split
+* selecting the split points
+* committing the split points to the config server
+* refreshing the routing table cache
+* updating in memory chunk size estimates
+
+### Deciding when to auto-split a chunk
+The server schedules an auto-split if:
+1. it detected that the chunk exceeds a threshold based on the maximum chunk size
+2. there is not already a split in progress for the chunk
+
+Every time an update or insert gets routed to a chunk, the server tracks the bytes written to the
+chunk in memory through the collection's ChunkManager. The ChunkManager has a ChunkInfo object for
+each of the collection's entries in the local config.chunks. Through the ChunkManager, the server
+retrieves the chunk's ChunkInfo and uses its ChunkWritesTracker to increment the estimated chunk
+size.
+
+Even if the new size estimate exceeds the maximum chunk size, the server still needs to check that
+there is not already a split in progress for the chunk. If the ChunkWritesTracker is locked, there
+is already a split in progress on the chunk and trying to start another split is prohibited.
+Otherwise, if the chunk is oversized and there is no split for the chunk in progress, the server
+submits the chunk to the ChunkSplitter to be auto-split.
+
+### The auto split task
+The ChunkSplitter is a replica set primary-only service that manages the process of auto-splitting
+chunks. The ChunkSplitter runs auto-split tasks asynchronously - thus, multiple chunks can undergo
+an auto-split concurrently, provided they don't overlap.
+
+To prepare for the split point selection process, the ChunkSplitter flags that an auto-split for the
+chunk is in progress. There may be incoming writes to the original chunk while the split is in
+progress. For this reason, the estimated data size in the ChunkWritesTracker for this chunk is
+reset, and the same counter is used to track the number of bytes written to the chunk while the
+auto-split is in progress.
+
+splitVector manages the bulk of the split point selection logic. First, the data size and number of
+records are retrieved from the storage engine to approximate the number of keys that each chunk
+partition should have. This number is calculated such that if each document were uniform in size,
+each chunk would be half of maxChunkSizeBytes.
+
+If the actual data size is less than the maximum chunk size, no splits are made at all.
+Additionally, if all documents in the chunk have the same shard key, no splits can be made. In this
+case, the chunk may be classified as a jumbo chunk.
+
+In the general case, splitVector:
+* performs an index scan on the shard key index
+* adds every k'th key to the vector of split points, where k is the approximate number of keys each chunk should have
+* returns the split points
+
+If no split points were returned, then the auto-split task gets abandoned and the task is done.
+
+If split points are successfully generated, the ChunkSplitter executes the final steps of the
+auto-split task where the shard:
+* commits the split points to config.chunks on the config server by removing the document containing
+  the original chunk and inserting new documents corresponding to the new chunks indicated by the
+split points
+* refreshes the routing table cache
+* replaces the original oversized chunk's ChunkInfo with a ChunkInfo object for each partition. The
+  estimated data size for each new chunk is the number bytes written to the original chunk while the
+auto-split was in progress
+
+### Top Chunk Optimization
+While there are several optimizations in the auto-split process that won't be covered here, it's
+worthwhile to note the concept of top chunk optimization. If the chunk being split is the first or
+last one on the collection, there is an assumption that the chunk is likely to see more insertions
+if the user is inserting in ascending/descending order with respect to the shard key. So, in top
+chunk optimization, the first (or last) key in the chunk is set as a split point. Once the split
+points get committed to the config server, and the shard refreshes its CatalogCache, the
+ChunkSplitter tries to move the top chunk out of the shard to prevent the hot spot from sitting on a
+single shard.
+
+#### Code references
+* [**ChunkInfo**](https://github.com/mongodb/mongo/blob/18f88ce0680ab946760b599437977ffd60c49678/src/mongo/s/chunk.h#L44) class
+* [**ChunkManager**](https://github.com/mongodb/mongo/blob/master/src/mongo/s/chunk_manager.h) class
+* [**ChunkSplitter**](https://github.com/mongodb/mongo/blob/master/src/mongo/db/s/chunk_splitter.h) class
+* [**ChunkWritesTracker**](https://github.com/mongodb/mongo/blob/master/src/mongo/s/chunk_writes_tracker.h) class
+* [**splitVector**](https://github.com/mongodb/mongo/blob/18f88ce0680ab946760b599437977ffd60c49678/src/mongo/db/s/split_vector.cpp#L61) method
+* [**splitChunk**](https://github.com/mongodb/mongo/blob/18f88ce0680ab946760b599437977ffd60c49678/src/mongo/db/s/split_chunk.cpp#L128) method
+* [**commitSplitChunk**](https://github.com/mongodb/mongo/blob/18f88ce0680ab946760b599437977ffd60c49678/src/mongo/db/s/config/sharding_catalog_manager_chunk_operations.cpp#L316) method where chunk splits are committed
 
 ## Auto-balancing
 
@@ -653,9 +735,10 @@ four steps to this process:
 
 ### Periodic cleanup of the session catalog and transactions table
 
-The logical session cache class holds the periodic job to clean up the session catalog and
-transactions table. Inside the class, this is known as the "reap" function. Every five (5) minutes
-(user-configurable), the following steps will be performed:
+The logical session cache class holds the periodic job to clean up the
+[session catalog](#the-logical-session-catalog) and [transactions table](#the-transactions-table].
+Inside the class, this is known as the "reap" function. Every five (5) minutes (user-configurable),
+the following steps will be performed:
 
 1. Find all sessions in the session catalog that were last checked out more than thirty minutes ago (default session expiration time).
 1. For each session gathered in step 1, if the session no longer exists in the sessions collection (i.e. the session has expired or was explicitly ended), remove the session from the session catalog.
@@ -690,18 +773,23 @@ or yield the session.
 
 The runtime state for a session consists of the last checkout time and operation, the number of operations
 waiting to check out the session, and the number of kills requested. The last checkout time is used by
-the periodic job inside the logical session cache to determine when a session should be reaped from the
-session catalog, whereas the number of operations waiting to check out a session is used to block reaping
-of sessions that are still in use. The last checkout operation is used to determine the operation to kill
-when a session is killed, whereas the number of kills requested is used to make sure that sessions
-are only killed on the first kill request.
+the [periodic job inside the logical session cache](#periodic-cleanup-of-the-session-catalog-and-transactions-table)
+to determine when a session should be reaped from the session catalog, whereas the number of
+operations waiting to check out a session is used to block reaping of sessions that are still in
+use. The last checkout operation is used to determine the operation to kill when a session is
+killed, whereas the number of kills requested is used to make sure that sessions are only killed on
+the first kill request.
 
-To keep the in-memory transaction state of all sessions in sync with the content of the `config.transactions`
-collection (the collection that stores documents used to support retryable writes and transactions, also
-referred to as the transaction table), the transaction state and the session catalog on each mongod is
-[invalidated](https://github.com/mongodb/mongo/blob/56655b06ac46825c5937ccca5947dc84ccbca69c/src/mongo/db/session_catalog_mongod.cpp#L324) whenever the `config.transactions` collection is dropped and whenever
-there is a rollback. When invalidation occurs, all active sessions are killed, and the in-memory transaction
-state is marked as invalid to force it to be [reloaded from storage the next time a session is checked out](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session_catalog_mongod.cpp#L426).
+### The transactions table
+
+The runtime state in a node's in-memory session catalog is made durable in the node's
+`config.transactions` collection, also called its transactions table. The in-memory session catalog
+ is
+[invalidated](https://github.com/mongodb/mongo/blob/56655b06ac46825c5937ccca5947dc84ccbca69c/src/mongo/db/session_catalog_mongod.cpp#L324)
+if the `config.transactions` collection is dropped and whenever there is a rollback. When
+invalidation occurs, all active sessions are killed, and the in-memory transaction state is marked
+as invalid to force it to be
+[reloaded from storage the next time a session is checked out](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session_catalog_mongod.cpp#L426).
 
 #### Code references
 * [**SessionCatalog class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/session_catalog.h)
@@ -754,8 +842,6 @@ to disk and [updates](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/
 * How mongos [assigns statement ids to writes in a batch write command](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/s/write_ops/batch_write_op.cpp#L483-L486)
 * How mongod [assigns statement ids to insert operations](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/ops/write_ops_exec.cpp#L573)
 * [Retryable writes specifications](https://github.com/mongodb/specifications/blob/49589d66d49517f10cc8e1e4b0badd61dbb1917e/source/retryable-writes/retryable-writes.rst)
-
-## The historical routing table
 
 ## Transactions
 
@@ -850,14 +936,86 @@ been started on the session and the session is still alive. In both cases, the m
 to all participant shards.
 
 #### Code references
-* [**TransactioRouter class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/s/transaction_router.h)
-* [**TransactioCoordinatorService class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/s/transaction_coordinator_service.h)
-* [**TransactioCoordinator class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/s/transaction_coordinator.h)
+* [**TransactionRouter class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/s/transaction_router.h)
+* [**TransactionCoordinatorService class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/s/transaction_coordinator_service.h)
+* [**TransactionCoordinator class**](https://github.com/mongodb/mongo/blob/r4.3.4/src/mongo/db/s/transaction_coordinator.h)
+
+## The historical routing table
+
+When a mongos or mongod executes a command that requires shard targeting, it must use routing information
+that matches the read concern of the command. If the command uses `"snapshot"` read concern, it must use
+the historical routing table at the selected read timestamp. If the command uses any other read concern,
+it must use the latest cached routing table.
+
+The [routing table cache](#the-routing-table-cache) provides an interface for obtaining the routing table
+at a particular timestamp and collection version, namely the `ChunkManager`. The `ChunkManager` has an
+optional clusterTime associated with it and a `RoutingTableHistory` that contains historical routing
+information for all chunks in the collection. That information is stored in an ordered map from the max
+key of each chunk to an entry that contains routing information for the chunk, such as chunk range,
+chunk version and chunk history. The chunk history contains the shard id for the shard that currently
+owns the chunk, and the shard id for any other shards that used to own the chunk in the past
+`minSnapshotHistoryWindowInSeconds` (defaults to 10 seconds). It corresponds to the chunk history in
+the `config.chunks` document for the chunk which gets updated whenever the chunk goes through an
+operation, such as merge or migration. The `ChunkManager` uses this information to determine the
+shards to target for a query. If the clusterTime is not provided, it will return the shards that
+currently own the target chunks. Otherwise, it will return the shards that owned the target chunks
+at that clusterTime and will throw a `StaleChunkHistory` error if it cannot find them.
+
+#### Code references
+* [**ChunkManager class**](https://github.com/mongodb/mongo/blob/r4.3.6/src/mongo/s/chunk_manager.h#L233-L451)
+* [**RoutingTableHistory class**](https://github.com/mongodb/mongo/blob/r4.3.6/src/mongo/s/chunk_manager.h#L70-L231)
+* [**ChunkHistory class**](https://github.com/mongodb/mongo/blob/r4.3.6/src/mongo/s/catalog/type_chunk.h#L131-L145)
 
 ---
 
 # Node startup and shutdown
 
-## Sharding component initialization and shutdown
+## Startup and sharding component initialization
+The mongod intialization process is split into three phases. The first phase runs on startup and initializes the set of stateless components based on the cluster role. The second phase then initializes additional components that must be initialized with state read from the config server. The third phase is run on the [transition to primary](https://github.com/mongodb/mongo/blob/879d50a73179d0dd94fead476468af3ee4511b8f/src/mongo/db/repl/replication_coordinator_external_state_impl.cpp#L822-L901) and starts services that only run on primaries.
 
-## Quiesce mode on shutdown
+### Shard Server initialization
+
+#### Phase 1:
+1. On a shard server, the `CollectionShardingState` factory is set to an instance of the `CollectionShardingStateFactoryShard` implementation. The component lives on the service context.
+1. The sharding [OpObservers are created](https://github.com/mongodb/mongo/blob/0e08b33037f30094e9e213eacfe16fe88b52ff84/src/mongo/db/mongod_main.cpp#L1000-L1001) and registered with the service context. The `OpObserverShardingImpl` class forwards operations during migration to the chunk cloner. The `ShardServerOpObserver` class is used to handle the majority of sharding related events. These include loading the shard identity document when it is inserted and performing range deletions when they are marked as ready.
+
+#### Phase 2:
+1. The [shardIdentity document is loaded](https://github.com/mongodb/mongo/blob/37ff80f6234137fd314d00e2cd1ff77cde90ce11/src/mongo/db/s/sharding_initialization_mongod.cpp#L366-L373) if it already exists on startup. For shards, the shard identity document specifies the config server connection string. If the shard does not have a shardIdentity document, it has not been added to a cluster yet, and the "Phase 2" initialization happens when the shard receives a shardIdentity document as part of addShard.
+1. If the shard identity document was found, then the [ShardingState is intialized](https://github.com/mongodb/mongo/blob/37ff80f6234137fd314d00e2cd1ff77cde90ce11/src/mongo/db/s/sharding_initialization_mongod.cpp#L416-L462) from its fields.
+1. The global sharding state is set on the Grid. The Grid contains the sharding context for a running server. It exists both on mongod and mongos because the Grid holds all the components needed for routing, and both mongos and shard servers can act as routers.
+1. `KeysCollectionManager` is set on the `LogicalTimeValidator`.
+1. The `ShardingReplicaSetChangeListener` is instantiated and set on the `ReplicaSetMonitor`.
+1. The remaining sharding components are [initialized for the current replica set role](https://github.com/mongodb/mongo/blob/37ff80f6234137fd314d00e2cd1ff77cde90ce11/src/mongo/db/s/sharding_initialization_mongod.cpp#L255-L286) before the Grid is marked as initialized.
+
+#### Phase 3:
+Shard servers [start up several services](https://github.com/mongodb/mongo/blob/879d50a73179d0dd94fead476468af3ee4511b8f/src/mongo/db/repl/replication_coordinator_external_state_impl.cpp#L885-L894) that only run on primaries.
+
+### Config Server initialization
+
+#### Phase 1:
+The sharding [OpObservers are created](https://github.com/mongodb/mongo/blob/0e08b33037f30094e9e213eacfe16fe88b52ff84/src/mongo/db/mongod_main.cpp#L1000-L1001) and registered with the service context. The config server registers the OpObserverImpl and ConfigServerOpObserver observers.
+
+#### Phase 2:
+The global sharding state is set on the Grid. The Grid contains the sharding context for a running server. The config server does not need to be provided with the config server connection string explicitly as it is part of its local state.
+
+#### Phase 3:
+Config servers [run some services](https://github.com/mongodb/mongo/blob/879d50a73179d0dd94fead476468af3ee4511b8f/src/mongo/db/repl/replication_coordinator_external_state_impl.cpp#L866-L867) that only run on primaries.
+
+### Mongos initialization
+#### Phase 2:
+The global sharding state is set on the Grid. The Grid contains the sharding context for a running server. Mongos is provided with the config server connection string as a startup parameter.
+
+#### Code references
+* Function to [initialize global sharding state](https://github.com/mongodb/mongo/blob/eeca550092d9601d433e04c3aa71b8e1ff9795f7/src/mongo/s/sharding_initialization.cpp#L188-L237).
+* Function to [initialize sharding environment](https://github.com/mongodb/mongo/blob/37ff80f6234137fd314d00e2cd1ff77cde90ce11/src/mongo/db/s/sharding_initialization_mongod.cpp#L255-L286) on shard server.
+* Hook for sharding [transition to primary](https://github.com/mongodb/mongo/blob/879d50a73179d0dd94fead476468af3ee4511b8f/src/mongo/db/repl/replication_coordinator_external_state_impl.cpp#L822-L901).
+
+## Shutdown
+
+If the mongod server is primary, it will [try to step down](https://github.com/mongodb/mongo/blob/0987c120f552ab6d347f6b1b6574345e8c938c32/src/mongo/db/mongod_main.cpp#L1046-L1072). Mongod and mongos then run their respective shutdown tasks which cleanup the remaining sharding components.
+
+#### Code references
+* [Shutdown logic](https://github.com/mongodb/mongo/blob/2bb2f2225d18031328722f98fe05a169064a8a8a/src/mongo/db/mongod_main.cpp#L1163) for mongod.
+* [Shutdown logic](https://github.com/mongodb/mongo/blob/30f5448e95114d344e6acffa92856536885e35dd/src/mongo/s/mongos_main.cpp#L336-L354) for mongos.
+
+### Quiesce mode on shutdown

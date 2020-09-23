@@ -83,10 +83,6 @@ public:
         return _supportsDocLocking;
     }
 
-    virtual bool supportsDBLocking() const override {
-        return _supportsDBLocking;
-    }
-
     virtual bool supportsCappedCollections() const override {
         return _supportsCappedCollections;
     }
@@ -129,6 +125,8 @@ public:
     virtual void setStableTimestamp(Timestamp stableTimestamp, bool force = false) override;
 
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
+
+    virtual Timestamp getInitialDataTimestamp() override;
 
     virtual void setOldestTimestampFromStable() override;
 
@@ -405,7 +403,6 @@ private:
     TimestampMonitor::TimestampListener _minOfCheckpointAndOldestTimestampListener;
 
     const bool _supportsDocLocking;
-    const bool _supportsDBLocking;
     const bool _supportsCappedCollections;
     Timestamp _initialDataTimestamp = Timestamp::kAllowUnstableCheckpointsSentinel;
 

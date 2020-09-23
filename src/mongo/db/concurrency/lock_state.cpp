@@ -390,21 +390,13 @@ void LockerImpl::lockGlobal(OperationContext* opCtx, LockMode mode, Date_t deadl
         _modeForTicket = mode;
     }
 
-    LockMode actualLockMode = mode;
-    if (opCtx) {
-        auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-        if (storageEngine && !storageEngine->supportsDBLocking()) {
-            actualLockMode = isSharedLockMode(mode) ? MODE_S : MODE_X;
-        }
-    }
-
-    const LockResult result = _lockBegin(opCtx, resourceIdGlobal, actualLockMode);
+    const LockResult result = _lockBegin(opCtx, resourceIdGlobal, mode);
     // Fast, uncontended path
     if (result == LOCK_OK)
         return;
 
     invariant(result == LOCK_WAITING);
-    _lockComplete(opCtx, resourceIdGlobal, actualLockMode, deadline);
+    _lockComplete(opCtx, resourceIdGlobal, mode, deadline);
 }
 
 bool LockerImpl::unlockGlobal() {
@@ -681,17 +673,7 @@ void LockerImpl::setGlobalLockTakenInMode(LockMode mode) {
 ResourceId LockerImpl::getWaitingResource() const {
     scoped_spinlock scopedLock(_lock);
 
-    LockRequestsMap::ConstIterator it = _requests.begin();
-    while (!it.finished()) {
-        if (it->status == LockRequest::STATUS_WAITING ||
-            it->status == LockRequest::STATUS_CONVERTING) {
-            return it.key();
-        }
-
-        it.next();
-    }
-
-    return ResourceId();
+    return _waitingResource;
 }
 
 void LockerImpl::getLockerInfo(LockerInfo* lockerInfo,
@@ -888,6 +870,7 @@ LockResult LockerImpl::_lockBegin(OperationContext* opCtx, ResourceId resId, Loc
     if (result == LOCK_WAITING) {
         globalStats.recordWait(_id, resId, mode);
         _stats.recordWait(resId, mode);
+        _setWaitingResource(resId);
     } else if (result == LOCK_OK && opCtx && _uninterruptibleLocksRequested == 0) {
         // Lock acquisitions are not allowed to succeed when opCtx is marked as interrupted, unless
         // the caller requested an uninterruptible lock.
@@ -913,6 +896,7 @@ void LockerImpl::_lockComplete(OperationContext* opCtx,
         LockRequestsMap::Iterator it = _requests.find(resId);
         invariant(it);
         _unlockImpl(&it);
+        _setWaitingResource(ResourceId());
     });
 
     // This failpoint is used to time out non-intent locks if they cannot be granted immediately
@@ -996,6 +980,7 @@ void LockerImpl::_lockComplete(OperationContext* opCtx,
 
     invariant(result == LOCK_OK);
     unlockOnErrorGuard.dismiss();
+    _setWaitingResource(ResourceId());
 }
 
 void LockerImpl::getFlowControlTicket(OperationContext* opCtx, LockMode lockMode) {
@@ -1069,6 +1054,12 @@ bool LockerImpl::_unlockImpl(LockRequestsMap::Iterator* it) {
 bool LockerImpl::isGlobalLockedRecursively() {
     auto globalLockRequest = _requests.find(resourceIdGlobal);
     return !globalLockRequest.finished() && globalLockRequest->recursiveCount > 1;
+}
+
+void LockerImpl::_setWaitingResource(ResourceId resId) {
+    scoped_spinlock scopedLock(_lock);
+
+    _waitingResource = resId;
 }
 
 //

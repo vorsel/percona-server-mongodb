@@ -394,7 +394,7 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::rebuildIndex
         return status;
     }
 
-    auto& collectionCatalog = CollectionCatalog::get(getGlobalServiceContext());
+    auto& collectionCatalog = CollectionCatalog::get(opCtx->getServiceContext());
     Collection* collection = collectionCatalog.lookupCollectionByNamespace(opCtx, nss);
 
     // Complete the index build.
@@ -420,7 +420,7 @@ Status IndexBuildsCoordinator::_startIndexBuildForRecovery(OperationContext* opC
         indexNames.push_back(name);
     }
 
-    auto& collectionCatalog = CollectionCatalog::get(getGlobalServiceContext());
+    auto& collectionCatalog = CollectionCatalog::get(opCtx->getServiceContext());
     Collection* collection = collectionCatalog.lookupCollectionByNamespace(opCtx, nss);
     auto indexCatalog = collection->getIndexCatalog();
     {
@@ -569,12 +569,6 @@ std::vector<UUID> IndexBuildsCoordinator::abortCollectionIndexBuilds(
     const NamespaceString collectionNss,
     const UUID collectionUUID,
     const std::string& reason) {
-    LOGV2(23879,
-          "About to abort all index builders",
-          "namespace"_attr = collectionNss,
-          "uuid"_attr = collectionUUID,
-          "reason"_attr = reason);
-
     auto collIndexBuilds = [&]() -> std::vector<std::shared_ptr<ReplIndexBuildState>> {
         stdx::unique_lock<Latch> lk(_mutex);
         auto indexBuildFilter = [=](const auto& replState) {
@@ -582,6 +576,16 @@ std::vector<UUID> IndexBuildsCoordinator::abortCollectionIndexBuilds(
         };
         return _filterIndexBuilds_inlock(lk, indexBuildFilter);
     }();
+
+    if (collIndexBuilds.empty()) {
+        return {};
+    }
+
+    LOGV2(23879,
+          "About to abort all index builders",
+          "namespace"_attr = collectionNss,
+          "uuid"_attr = collectionUUID,
+          "reason"_attr = reason);
 
     std::vector<UUID> buildUUIDs;
     for (auto replState : collIndexBuilds) {

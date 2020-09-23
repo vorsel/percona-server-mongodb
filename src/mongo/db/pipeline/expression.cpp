@@ -2363,10 +2363,13 @@ intrusive_ptr<Expression> ExpressionLet::parse(ExpressionContext* const expCtx,
     auto& inPtr = children.emplace_back(nullptr);
 
     std::vector<boost::intrusive_ptr<Expression>>::size_type index = 0;
+    std::vector<Variables::Id> orderedVariableIds;
     for (auto&& varElem : varsObj) {
         const string varName = varElem.fieldName();
         Variables::validateNameForUserWrite(varName);
         Variables::Id id = vpsSub.defineVariable(varName);
+
+        orderedVariableIds.push_back(id);
 
         vars.emplace(id, NameAndExpression{varName, children[index]});  // only has outer vars
         ++index;
@@ -2375,14 +2378,17 @@ intrusive_ptr<Expression> ExpressionLet::parse(ExpressionContext* const expCtx,
     // parse "in"
     inPtr = parseOperand(expCtx, inElem, vpsSub);  // has our vars
 
-    return new ExpressionLet(expCtx, std::move(vars), std::move(children));
+    return new ExpressionLet(
+        expCtx, std::move(vars), std::move(children), std::move(orderedVariableIds));
 }
 
 ExpressionLet::ExpressionLet(ExpressionContext* const expCtx,
                              VariableMap&& vars,
-                             std::vector<boost::intrusive_ptr<Expression>> children)
+                             std::vector<boost::intrusive_ptr<Expression>> children,
+                             std::vector<Variables::Id> orderedVariableIds)
     : Expression(expCtx, std::move(children)),
       _variables(std::move(vars)),
+      _orderedVariableIds(std::move(orderedVariableIds)),
       _subExpression(_children.back()) {}
 
 intrusive_ptr<Expression> ExpressionLet::optimize() {
@@ -6433,34 +6439,11 @@ ExpressionRandom::ExpressionRandom(ExpressionContext* const expCtx) : Expression
 intrusive_ptr<Expression> ExpressionRandom::parse(ExpressionContext* const expCtx,
                                                   BSONElement exprElement,
                                                   const VariablesParseState& vps) {
-    bool hasConstField = false;
-    bool isConst = false;
-
     uassert(3040500,
-            str::stream() << "$rand not allowed inside collection validators",
+            "$rand not allowed inside collection validators",
             !expCtx->isParsingCollectionValidator);
 
-    for (const auto& elem : exprElement.Obj()) {
-        const auto fieldName = elem.fieldNameStringData();
-        if (fieldName == "const"_sd) {
-            uassert(
-                3040501, str::stream() << "'const' must be specified just once", !hasConstField);
-
-            uassert(3040502,
-                    str::stream() << "'const' argument must be a boolean, found "
-                                  << typeName(elem.type()),
-                    elem.type() == Bool);
-            isConst = elem.boolean();
-            hasConstField = true;
-        } else {
-            uasserted(3040503, str::stream() << "Unknown argument: " << fieldName);
-        }
-    }
-
-    if (isConst) {
-        ExpressionRandom exprRandom(expCtx);
-        return ExpressionConstant::create(expCtx, Value(exprRandom.getRandomValue()));
-    }
+    uassert(3040501, "$rand does not currently accept arguments", exprElement.Obj().isEmpty());
 
     return new ExpressionRandom(expCtx);
 }
@@ -6478,7 +6461,6 @@ Value ExpressionRandom::evaluate(const Document& root, Variables* variables) con
 }
 
 intrusive_ptr<Expression> ExpressionRandom::optimize() {
-    // Already optimized to ExpressionConstant if "const" option passed in.
     return intrusive_ptr<Expression>(this);
 }
 
@@ -6487,6 +6469,6 @@ void ExpressionRandom::_doAddDependencies(DepsTracker* deps) const {
 }
 
 Value ExpressionRandom::serialize(const bool explain) const {
-    return Value(DOC(getOpName() << DOC("const"_sd << Value(false))));
+    return Value(DOC(getOpName() << Document()));
 }
 }  // namespace mongo

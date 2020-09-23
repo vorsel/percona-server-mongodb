@@ -796,7 +796,6 @@ StatusWith<std::pair<OCSPCertIDSet, Date_t>> parseAndValidateOCSPResponse(
                                  << "Response Status: " << responseStatus);
         case OCSP_RESPONSE_STATUS_TRYLATER:
         case OCSP_RESPONSE_STATUS_INTERNALERROR:
-            // TODO: SERVER-42936 Add support for tlsAllowInvalidCertificates
             return getSSLFailure(str::stream()
                                  << "Error querying the OCSP responder, an error occured in the "
                                  << "responder itself. Response Status: " << responseStatus);
@@ -1874,21 +1873,11 @@ Status SSLManagerOpenSSL::initSSLContext(SSL_CTX* context,
 
     ::SSL_CTX_set_options(context, options);
 
-    // HIGH - Enable strong ciphers
-    // !EXPORT - Disable export ciphers (40/56 bit)
-    // !aNULL - Disable anonymous auth ciphers
-    // @STRENGTH - Sort ciphers based on strength
-    std::string cipherConfig = "HIGH:!EXPORT:!aNULL@STRENGTH";
-
-    // Allow the cipher configuration string to be overriden by --sslCipherConfig
-    if (!params.sslCipherConfig.empty()) {
-        cipherConfig = params.sslCipherConfig;
-    }
-
-    if (0 == ::SSL_CTX_set_cipher_list(context, cipherConfig.c_str())) {
+    if (0 == ::SSL_CTX_set_cipher_list(context, params.sslCipherConfig.c_str())) {
         return Status(ErrorCodes::InvalidSSLConfiguration,
-                      str::stream() << "Can not set supported cipher suites: "
-                                    << getSSLErrorMessage(ERR_get_error()));
+                      str::stream() << "Can not set supported cipher suites with config string \""
+                                    << params.sslCipherConfig
+                                    << "\": " << getSSLErrorMessage(ERR_get_error()));
     }
 
     // We use the address of the context as the session id context.

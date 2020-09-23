@@ -276,13 +276,6 @@ public:
     /**
      * This must not change over the lifetime of the engine.
      */
-    virtual bool supportsDBLocking() const {
-        return true;
-    }
-
-    /**
-     * This must not change over the lifetime of the engine.
-     */
     virtual bool supportsCappedCollections() const {
         return true;
     }
@@ -339,6 +332,13 @@ public:
      * See `StorageEngine::setInitialDataTimestamp`
      */
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) {}
+
+    /**
+     * See `StorageEngine::getInitialDataTimestamp`
+     */
+    virtual Timestamp getInitialDataTimestamp() {
+        return Timestamp();
+    }
 
     /**
      * See `StorageEngine::setOldestTimestampFromStable`

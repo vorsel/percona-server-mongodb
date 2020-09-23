@@ -105,12 +105,6 @@ configs:
         arg_vartype: String
         default: asio
         hidden: true
-    'net.serviceExecutor':
-        description: 'Sets the service executor implementation'
-        short_name: serviceExecutor
-        arg_vartype: String
-        default: synchronous
-        hidden: true
     'security.redactClientLogData':
         description: 'Redact client data written to the diagnostics log'
         short_name: redactClientLogData

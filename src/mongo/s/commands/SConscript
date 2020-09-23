@@ -154,7 +154,7 @@ env.Library(
     ],
     LIBDEPS=[
         'cluster_commands',
-        '$BUILD_DIR/mongo/s/catalog_cache_test_fixture',
+        '$BUILD_DIR/mongo/s/sharding_router_test_fixture',
     ]
 )
 
@@ -174,5 +174,6 @@ env.CppUnitTest(
         'cluster_command_test_fixture',
         '$BUILD_DIR/mongo/db/auth/authmocks',
         '$BUILD_DIR/mongo/db/auth/saslauth',
+        '$BUILD_DIR/mongo/db/pipeline/process_interface/mongos_process_interface_factory',
     ],
 )

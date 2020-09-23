@@ -53,7 +53,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
-#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/curop.h"
@@ -78,6 +77,7 @@
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
 #include "mongo/db/repl/repl_set_request_votes_args.h"
 #include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/repl/replication_coordinator_impl_gen.h"
 #include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/replication_process.h"
@@ -85,8 +85,8 @@
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/vote_requester.h"
-#include "mongo/db/replica_set_aware_service.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/shutdown_in_progress_quiesce_info.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/db/vector_clock_mutable.h"
@@ -103,6 +103,7 @@
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/stacktrace.h"
+#include "mongo/util/testing_proctor.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/timer.h"
 
@@ -221,8 +222,8 @@ StatusOrStatusWith<T> futureGetNoThrowWithDeadline(OperationContext* opCtx,
     }
 }
 
-const Status kQuiesceModeShutdownStatus =
-    Status(ErrorCodes::ShutdownInProgress, "The server is in quiesce mode and will shut down");
+constexpr StringData kQuiesceModeShutdownMessage =
+    "The server is in quiesce mode and will shut down"_sd;
 
 }  // namespace
 
@@ -299,6 +300,11 @@ InitialSyncerOptions createInitialSyncerOptions(
                                               ReplicationCoordinator::DataConsistency consistency) {
         // Note that setting the last applied opTime forward also advances the global timestamp.
         replCoord->setMyLastAppliedOpTimeAndWallTimeForward(opTimeAndWallTime, consistency);
+        // The oplog application phase of initial sync starts timestamping writes, causing
+        // WiredTiger to pin this data in memory. Advancing the oldest timestamp in step with the
+        // last applied optime here will permit WiredTiger to evict this data as it sees fit.
+        replCoord->getServiceContext()->getStorageEngine()->setOldestTimestamp(
+            opTimeAndWallTime.opTime.getTimestamp());
     };
     options.resetOptimes = [replCoord]() { replCoord->resetMyLastOpTimes(); };
     options.syncSourceSelector = replCoord;
@@ -655,7 +661,7 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
             lastOpTimeAndWallTime = lastOpTimeAndWallTimeStatus.getValue();
         }
     } else {
-        _externalState->onBecomeArbiterHook();
+        ReplicaSetAwareServiceRegistry::get(_service).onBecomeArbiter();
     }
 
     const auto lastOpTime = lastOpTimeAndWallTime.opTime;
@@ -711,7 +717,7 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     _performPostMemberStateUpdateAction(action);
 
     if (!isArbiter) {
-        _externalState->startThreads(_settings);
+        _externalState->startThreads();
         _startDataReplication(opCtx.get());
     }
 }
@@ -923,7 +929,7 @@ void ReplicationCoordinatorImpl::enterTerminalShutdown() {
     _inTerminalShutdown = true;
 }
 
-bool ReplicationCoordinatorImpl::enterQuiesceModeIfSecondary() {
+bool ReplicationCoordinatorImpl::enterQuiesceModeIfSecondary(Milliseconds quiesceTime) {
     LOGV2_INFO(4794602, "Attempting to enter quiesce mode");
 
     stdx::lock_guard lk(_mutex);
@@ -933,6 +939,7 @@ bool ReplicationCoordinatorImpl::enterQuiesceModeIfSecondary() {
     }
 
     _inQuiesceMode = true;
+    _quiesceDeadline = _replExecutor->now() + quiesceTime;
 
     // Increment the topology version and respond to all waiting isMaster requests with an error.
     _fulfillTopologyChangePromise(lk);
@@ -1153,6 +1160,7 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
     lk.unlock();
 
     _externalState->onDrainComplete(opCtx);
+    ReplicaSetAwareServiceRegistry::get(_service).onStepUpBegin(opCtx, termWhenBufferIsEmpty);
 
     if (MONGO_unlikely(hangBeforeRSTLOnDrainComplete.shouldFail())) {
         LOGV2(4712800, "Hanging due to hangBeforeRSTLOnDrainComplete failpoint");
@@ -1227,6 +1235,8 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
 
         AllowNonLocalWritesBlock writesAllowed(opCtx);
         OpTime firstOpTime = _externalState->onTransitionToPrimary(opCtx);
+        ReplicaSetAwareServiceRegistry::get(_service).onStepUpComplete(opCtx,
+                                                                       firstOpTime.getTerm());
         lk.lock();
 
         auto status = _topCoord->completeTransitionToPrimary(firstOpTime);
@@ -1238,6 +1248,8 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
             return;
         }
         invariant(status);
+        invariant(firstOpTime.getTerm() == _topCoord->getTerm());
+        invariant(termWhenBufferIsEmpty == _topCoord->getTerm());
     }
 
     // Must calculate the commit level again because firstOpTimeOfMyTerm wasn't set when we logged
@@ -1435,11 +1447,6 @@ void ReplicationCoordinatorImpl::_setMyLastAppliedOpTimeAndWallTime(
             !serverGlobalParams.enableMajorityReadConcern) {
             _setStableTimestampForStorage(lk);
         }
-    } else if (_getMemberState_inlock().startup2()) {
-        // The oplog application phase of initial sync starts timestamping writes, causing
-        // WiredTiger to pin this data in memory. Advancing the oldest timestamp in step with the
-        // last applied optime here will permit WiredTiger to evict this data as it sees fit.
-        _service->getStorageEngine()->setOldestTimestamp(opTime.getTimestamp());
     }
 }
 
@@ -1987,7 +1994,7 @@ ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorImpl::awaitRepli
         status = Status{ErrorCodes::WriteConcernFailed, "waiting for replication timed out"};
     }
 
-    if (getTestCommandsEnabled() && !status.isOK()) {
+    if (TestingProctor::instance().isEnabled() && !status.isOK()) {
         stdx::lock_guard lock(_mutex);
         LOGV2(21339,
               "Replication failed for write concern: {writeConcern}, waiting for optime: {opTime}, "
@@ -2144,10 +2151,20 @@ void ReplicationCoordinatorImpl::updateAndLogStateTransitionMetrics(
           "metrics"_attr = bob.obj());
 }
 
+long long ReplicationCoordinatorImpl::_calculateRemainingQuiesceTimeMillis() const {
+    auto remainingQuiesceTimeMillis =
+        std::max(Milliseconds::zero(), _quiesceDeadline - _replExecutor->now());
+    // Turn remainingQuiesceTimeMillis into an int64 so that it's a supported BSONElement.
+    long long remainingQuiesceTimeLong = durationCount<Milliseconds>(remainingQuiesceTimeMillis);
+    return remainingQuiesceTimeLong;
+}
+
 std::shared_ptr<IsMasterResponse> ReplicationCoordinatorImpl::_makeIsMasterResponse(
     boost::optional<StringData> horizonString, WithLock lock, const bool hasValidConfig) const {
-    uassert(
-        kQuiesceModeShutdownStatus.code(), kQuiesceModeShutdownStatus.reason(), !_inQuiesceMode);
+
+    uassert(ShutdownInProgressQuiesceInfo(_calculateRemainingQuiesceTimeMillis()),
+            kQuiesceModeShutdownMessage,
+            !_inQuiesceMode);
 
     if (!hasValidConfig) {
         auto response = std::make_shared<IsMasterResponse>();
@@ -2190,8 +2207,9 @@ ReplicationCoordinatorImpl::_getIsMasterResponseFuture(
     boost::optional<StringData> horizonString,
     boost::optional<TopologyVersion> clientTopologyVersion) {
 
-    uassert(
-        kQuiesceModeShutdownStatus.code(), kQuiesceModeShutdownStatus.reason(), !_inQuiesceMode);
+    uassert(ShutdownInProgressQuiesceInfo(_calculateRemainingQuiesceTimeMillis()),
+            kQuiesceModeShutdownMessage,
+            !_inQuiesceMode);
 
     const bool hasValidConfig = horizonString != boost::none;
 
@@ -3905,7 +3923,7 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
     // A configuration passed to replSetInitiate() with the current node as an arbiter
     // will fail validation with a "replSet initiate got ... while validating" reason.
     invariant(!newConfig.getMemberAt(myIndex.getValue()).isArbiter());
-    _externalState->startThreads(_settings);
+    _externalState->startThreads();
     _startDataReplication(opCtx);
 
     configStateGuard.dismiss();
@@ -3981,7 +3999,9 @@ void ReplicationCoordinatorImpl::_fulfillTopologyChangePromise(WithLock lock) {
          iter != _horizonToTopologyChangePromiseMap.end();
          iter++) {
         if (_inQuiesceMode) {
-            iter->second->setError(kQuiesceModeShutdownStatus);
+            iter->second->setError(
+                Status(ShutdownInProgressQuiesceInfo(_calculateRemainingQuiesceTimeMillis()),
+                       kQuiesceModeShutdownMessage));
         } else {
             StringData horizonString = iter->first;
             auto response = _makeIsMasterResponse(horizonString, lock, hasValidConfig);
@@ -4169,6 +4189,7 @@ void ReplicationCoordinatorImpl::_performPostMemberStateUpdateAction(
         /* FALLTHROUGH */
         case kActionSteppedDown:
             _externalState->onStepDownHook();
+            ReplicaSetAwareServiceRegistry::get(_service).onStepDown();
             break;
         case kActionStartSingleNodeElection:
             _startElectSelfIfEligibleV1(StartElectionReasonEnum::kElectionTimeout);
@@ -4910,20 +4931,64 @@ boost::optional<OpTimeAndWallTime> ReplicationCoordinatorImpl::_recalculateStabl
         invariant(snapshotOpTime <= commitPoint.opTime);
     }
 
-    // When majority read concern is disabled, the stable opTime is set to the lastApplied, rather
-    // than the commit point.
+    //
+    // The stable timestamp must be a "consistent" timestamp with respect to the oplog. Intuitively,
+    // it must be a timestamp at which the oplog history is "set in stone" i.e. no writes will
+    // commit at earlier timestamps. More precisely, it must be a timestamp T such that future
+    // writers only commit at times greater than T and readers only read at, or earlier than, T.  We
+    // refer to this timestamp as the "no-overlap" point, since it is the timestamp that delineates
+    // these non overlapping readers and writers. The calculation of this value differs on primary
+    // and secondary nodes due to their distinct behaviors, as described below.
+    //
+
+    // On a primary node that supports document level locking, oplog writes may commit out of
+    // timestamp order, which can lead to the creation of oplog "holes". On a primary the
+    // all_durable timestamp tracks the newest timestamp T such that no future transactions will
+    // commit behind T. Since all_durable is a timestamp, however, without a term, we need to
+    // construct an optime with a proper term. If we are primary, then the all_durable should always
+    // correspond to a timestamp at or newer than the first write completed by this node as primary,
+    // since we write down a new oplog entry before allowing writes as a new primary. Thus, it can
+    // be assigned the current term of this primary.
+    OpTime allDurableOpTime = OpTime::max();
+    if (_readWriteAbility->canAcceptNonLocalWrites(lk) && _storage->supportsDocLocking(_service)) {
+        allDurableOpTime =
+            OpTime(_storage->getAllDurableTimestamp(getServiceContext()), _topCoord->getTerm());
+    }
+
+    // On a secondary, oplog entries are written in parallel, and so may be written out of timestamp
+    // order. Because of this, the stable timestamp must not fall in the middle of a batch while it
+    // is being applied. To prevent this we ensure the no-overlap point does not surpass the
+    // lastApplied, which is only advanced at the end of secondary batch application.
+    OpTime noOverlap = std::min(_topCoord->getMyLastAppliedOpTime(), allDurableOpTime);
+
+    // The stable optime must always be less than or equal to the no overlap point. When majority
+    // reads are enabled, the stable optime must also not surpass the majority commit point. When
+    // majority reads are disabled, the stable optime is not required to be majority committed.
+    boost::optional<OpTimeAndWallTime> stableOpTime;
     auto maximumStableOpTime = serverGlobalParams.enableMajorityReadConcern
         ? commitPoint
         : _topCoord->getMyLastAppliedOpTimeAndWallTime();
 
-    // Compute the current stable optime.
-    auto stableOpTime =
-        _chooseStableOpTimeFromCandidates(lk, _stableOpTimeCandidates, maximumStableOpTime);
+    // Make sure the stable optime does not surpass its maximum.
+    stableOpTime = OpTimeAndWallTime(std::min(noOverlap, maximumStableOpTime.opTime), Date_t());
+
+    // Keep EMRC=false behavior the same for now.
+    // TODO (SERVER-47844) Don't use stable optime candidates here.
+    if (!serverGlobalParams.enableMajorityReadConcern) {
+        stableOpTime =
+            _chooseStableOpTimeFromCandidates(lk, _stableOpTimeCandidates, maximumStableOpTime);
+    }
+
     if (stableOpTime) {
-        // Check that the selected stable optime does not exceed our maximum.
+        // Check that the selected stable optime does not exceed our maximum and that it does not
+        // surpass the no-overlap point.
         invariant(stableOpTime.get().opTime.getTimestamp() <=
                   maximumStableOpTime.opTime.getTimestamp());
         invariant(stableOpTime.get().opTime <= maximumStableOpTime.opTime);
+        if (serverGlobalParams.enableMajorityReadConcern) {
+            invariant(stableOpTime.get().opTime.getTimestamp() <= noOverlap.getTimestamp());
+            invariant(stableOpTime.get().opTime <= noOverlap);
+        }
     }
 
     return stableOpTime;
@@ -4936,8 +5001,43 @@ void ReplicationCoordinatorImpl::_setStableTimestampForStorage(WithLock lk) {
         LOGV2_DEBUG(21395, 2, "Not setting stable timestamp for storage");
         return;
     }
+
+    // Don't update the stable optime if we are in initial sync. We advance the oldest timestamp
+    // continually to the lastApplied optime during initial sync oplog application, so if we learned
+    // about an earlier commit point during this period, we would risk setting the stable timestamp
+    // behind the oldest timestamp, which is prohibited in the storage engine. Note that we don't
+    // take stable checkpoints during initial sync, so the stable timestamp during this period
+    // doesn't play a functionally important role anyway.
+    auto memberState = _getMemberState_inlock();
+    if (memberState.startup2()) {
+        LOGV2_DEBUG(
+            2139501, 2, "Not updating stable timestamp", "state"_attr = memberState.toString());
+        return;
+    }
+
     // Get the current stable optime.
     auto stableOpTime = _recalculateStableOpTime(lk);
+
+    // Don't update the stable timestamp if it is earlier than the initial data timestamp.
+    // Timestamps before the initialDataTimestamp are not consistent and so are not safe to use for
+    // the stable timestamp or the committed snapshot, which is the timestamp used by majority
+    // readers. This also prevents us from setting the stable timestamp behind the oldest timestamp
+    // after leaving initial sync, since the initialDataTimestamp and oldest timestamp will be equal
+    // after initial sync oplog application has completed.
+    auto initialDataTimestamp = _service->getStorageEngine()->getInitialDataTimestamp();
+    if (stableOpTime && stableOpTime->opTime.getTimestamp() < initialDataTimestamp) {
+        LOGV2_DEBUG(2139504,
+                    2,
+                    "Not updating stable timestamp since it is less than the initialDataTimestamp",
+                    "stableTimestamp"_attr = stableOpTime->opTime.getTimestamp(),
+                    "initialDataTimestamp"_attr = initialDataTimestamp);
+        return;
+    }
+
+    if (stableOpTime && stableOpTime->opTime.getTimestamp().isNull()) {
+        LOGV2_DEBUG(2139502, 2, "Not updating stable timestamp to a null timestamp");
+        return;
+    }
 
     // If there is a valid stable optime, set it for the storage engine, and then remove any
     // old, unneeded stable optime candidates.

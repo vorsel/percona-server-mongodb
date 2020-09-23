@@ -6,15 +6,16 @@ import time
 import pymongo
 import pymongo.errors
 
-from . import interface
-from . import standalone
-from . import replicaset
-from ... import config
-from ... import core
-from ... import errors
-from ... import utils
-from ...utils import registry
-from ...multiversionconstants import LAST_STABLE_MONGOS_BINARY
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import logging
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.multiversionconstants import LAST_STABLE_MONGOS_BINARY
+from buildscripts.resmokelib.testing.fixtures import interface
+from buildscripts.resmokelib.testing.fixtures import replicaset
+from buildscripts.resmokelib.testing.fixtures import standalone
+from buildscripts.resmokelib.utils import registry
 
 
 class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-instance-attributes
@@ -244,7 +245,9 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
     def _new_configsvr(self):
         """Return a replicaset.ReplicaSetFixture configured as the config server."""
 
-        mongod_logger = self.logger.new_fixture_node_logger("configsvr")
+        shard_logging_prefix = "configsvr"
+        mongod_logger = logging.loggers.new_fixture_node_logger(self.__class__.__name__,
+                                                                self.job_num, shard_logging_prefix)
 
         configsvr_options = self.configsvr_options.copy()
 
@@ -266,12 +269,14 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
             mongod_logger, self.job_num, mongod_options=mongod_options,
             preserve_dbpath=preserve_dbpath, num_nodes=num_nodes, auth_options=auth_options,
             mixed_bin_versions=None, replset_config_options=replset_config_options,
-            **configsvr_options)
+            shard_logging_prefix=shard_logging_prefix, **configsvr_options)
 
     def _new_rs_shard(self, index, num_rs_nodes_per_shard):
         """Return a replicaset.ReplicaSetFixture configured as a shard in a sharded cluster."""
 
-        mongod_logger = self.logger.new_fixture_node_logger("shard{}".format(index))
+        shard_logging_prefix = f"shard{index}"
+        mongod_logger = logging.loggers.new_fixture_node_logger(self.__class__.__name__,
+                                                                self.job_num, shard_logging_prefix)
 
         shard_options = self.shard_options.copy()
 
@@ -297,12 +302,14 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
             mongod_logger, self.job_num, mongod_options=mongod_options,
             preserve_dbpath=preserve_dbpath, num_nodes=num_rs_nodes_per_shard,
             auth_options=auth_options, replset_config_options=replset_config_options,
-            mixed_bin_versions=mixed_bin_versions, **shard_options)
+            mixed_bin_versions=mixed_bin_versions, shard_logging_prefix=shard_logging_prefix,
+            **shard_options)
 
     def _new_standalone_shard(self, index):
         """Return a standalone.MongoDFixture configured as a shard in a sharded cluster."""
 
-        mongod_logger = self.logger.new_fixture_node_logger("shard{}".format(index))
+        mongod_logger = logging.loggers.new_fixture_node_logger(
+            self.__class__.__name__, self.job_num, "shard{}".format(index))
 
         shard_options = self.shard_options.copy()
 
@@ -330,7 +337,8 @@ class ShardedClusterFixture(interface.Fixture):  # pylint: disable=too-many-inst
         else:
             logger_name = "mongos{}".format(index)
 
-        mongos_logger = self.logger.new_fixture_node_logger(logger_name)
+        mongos_logger = logging.loggers.new_fixture_node_logger(self.__class__.__name__,
+                                                                self.job_num, logger_name)
 
         mongos_options = self.mongos_options.copy()
         mongos_options["configdb"] = self.configsvr.get_internal_connection_string()

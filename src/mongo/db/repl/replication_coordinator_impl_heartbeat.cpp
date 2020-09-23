@@ -50,6 +50,7 @@
 #include "mongo/db/repl/repl_set_config_checks.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_set_heartbeat_response.h"
+#include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/repl/replication_coordinator_impl.h"
 #include "mongo/db/repl/replication_metrics.h"
 #include "mongo/db/repl/replication_process.h"
@@ -686,7 +687,7 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigStore(
             newConfig.getMemberAt(myIndex.getValue()).isArbiter();
 
         if (isArbiter) {
-            _externalState->onBecomeArbiterHook();
+            ReplicaSetAwareServiceRegistry::get(_service).onBecomeArbiter();
         }
 
         if (!isArbiter && isFirstConfig) {
@@ -708,7 +709,7 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigStore(
     if (shouldStartDataReplication) {
         auto opCtx = cc().makeOperationContext();
         _replicationProcess->getConsistencyMarkers()->initializeMinValidDocument(opCtx.get());
-        _externalState->startThreads(_settings);
+        _externalState->startThreads();
         _startDataReplication(opCtx.get());
     }
 }
@@ -921,7 +922,7 @@ void ReplicationCoordinatorImpl::_handleLivenessTimeout(
     // Don't mind potential asynchronous stepdown as this is the last step of
     // liveness check.
     lk = _handleHeartbeatResponseAction_inlock(
-        action, makeStatusWith<ReplSetHeartbeatResponse>(), std::move(lk));
+        action, StatusWith(ReplSetHeartbeatResponse()), std::move(lk));
 
     _scheduleNextLivenessUpdate_inlock();
 }

@@ -53,6 +53,7 @@ namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(skipDatabaseVersionMetadataRefresh);
 MONGO_FAIL_POINT_DEFINE(skipShardFilteringMetadataRefresh);
+MONGO_FAIL_POINT_DEFINE(hangInRecoverRefreshThread);
 
 namespace {
 void onDbVersionMismatch(OperationContext* opCtx,
@@ -82,8 +83,6 @@ void onDbVersionMismatch(OperationContext* opCtx,
     forceDatabaseRefresh(opCtx, dbName);
 }
 
-}  // namespace
-
 SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext,
                                                   const NamespaceString nss,
                                                   bool runRecover) {
@@ -94,19 +93,21 @@ SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext
                 stdx::lock_guard<Client> lk(*tc.get());
                 tc->setSystemOperationKillable(lk);
             }
+
+            if (MONGO_unlikely(hangInRecoverRefreshThread.shouldFail())) {
+                hangInRecoverRefreshThread.pauseWhileSet();
+            }
+
             auto opCtx = tc->makeOperationContext();
 
             ON_BLOCK_EXIT([&] {
                 UninterruptibleLockGuard noInterrupt(opCtx->lockState());
-                // TODO (SERVER-48394): Views must not cause stale shard version
-                Lock::DBLock autoDb(opCtx.get(), nss.db(), MODE_IX);
-                Lock::CollectionLock collLock(opCtx.get(), nss, MODE_IX);
+                AutoGetCollection autoColl(
+                    opCtx.get(), nss, MODE_IX, AutoGetCollection::ViewMode::kViewsForbidden);
+
                 auto* const csr = CollectionShardingRuntime::get(opCtx.get(), nss);
                 auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx.get(), csr);
                 csr->resetShardVersionRecoverRefreshFuture(csrLock);
-                if (runRecover) {
-                    csr->exitCriticalSection(opCtx.get());
-                }
             });
 
             if (runRecover) {
@@ -122,12 +123,18 @@ SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext
         .share();
 }
 
+}  // namespace
+
 void onShardVersionMismatch(OperationContext* opCtx,
                             const NamespaceString& nss,
                             boost::optional<ChunkVersion> shardVersionReceived) {
     invariant(!opCtx->lockState()->isLocked());
     invariant(!opCtx->getClient()->isInDirectClient());
     invariant(ShardingState::get(opCtx)->canAcceptShardedCommands());
+
+    if (nss.isNamespaceAlwaysUnsharded()) {
+        return;
+    }
 
     ShardingStatistics::get(opCtx).countStaleConfigErrors.addAndFetch(1);
 
@@ -153,9 +160,8 @@ void onShardVersionMismatch(OperationContext* opCtx,
         bool triggeredRecoverRefresh = false;
 
         {
-            // TODO (SERVER-48394): Views must not cause stale shard version
             AutoGetCollection autoColl(
-                opCtx, nss, MODE_IS, AutoGetCollection::ViewMode::kViewsPermitted);
+                opCtx, nss, MODE_IS, AutoGetCollection::ViewMode::kViewsForbidden);
 
             auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
 
@@ -191,11 +197,6 @@ void onShardVersionMismatch(OperationContext* opCtx,
                     csr->getCriticalSectionSignal(opCtx, ShardingMigrationCriticalSection::kWrite);
 
                 if (!inRecoverOrRefresh && !critSecSignal) {
-                    if (runRecover) {
-                        CollectionShardingRuntime::get(opCtx, nss)
-                            ->enterCriticalSectionCatchUpPhase(csrLock);
-                    }
-
                     csr->setShardVersionRecoverRefreshFuture(
                         recoverRefreshShardVersion(opCtx->getServiceContext(), nss, runRecover),
                         csrLock);
@@ -294,7 +295,7 @@ void ScopedShardVersionCriticalSection::enterCommitPhase() {
 
 Status onShardVersionMismatchNoExcept(OperationContext* opCtx,
                                       const NamespaceString& nss,
-                                      ChunkVersion shardVersionReceived) noexcept {
+                                      boost::optional<ChunkVersion> shardVersionReceived) noexcept {
     try {
         onShardVersionMismatch(opCtx, nss, shardVersionReceived);
         return Status::OK();
@@ -306,6 +307,27 @@ Status onShardVersionMismatchNoExcept(OperationContext* opCtx,
               "error"_attr = redact(ex));
         return ex.toStatus();
     }
+}
+
+CollectionMetadata forceGetCurrentMetadata(OperationContext* opCtx, const NamespaceString& nss) {
+    invariant(!opCtx->lockState()->isLocked());
+    invariant(!opCtx->getClient()->isInDirectClient());
+
+    if (MONGO_unlikely(skipShardFilteringMetadataRefresh.shouldFail())) {
+        uasserted(ErrorCodes::InternalError, "skipShardFilteringMetadataRefresh failpoint");
+    }
+
+    auto* const shardingState = ShardingState::get(opCtx);
+    invariant(shardingState->canAcceptShardedCommands());
+
+    auto routingInfo = uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(opCtx, nss, true));
+
+    if (!routingInfo.cm()) {
+        return CollectionMetadata();
+    }
+
+    return CollectionMetadata(routingInfo.cm(), shardingState->shardId());
 }
 
 ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
@@ -327,6 +349,7 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
     auto cm = routingInfo.cm();
 
     if (!cm) {
+        // TODO SERVER-43633 change to AutoGetCollection
         // No chunk manager, so unsharded. Avoid using AutoGetCollection() as it returns the
         // InvalidViewDefinition error code if an invalid view is in the 'system.views' collection.
         AutoGetDb autoDb(opCtx, nss.db(), MODE_IX);
@@ -340,6 +363,7 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
     // Optimistic check with only IS lock in order to avoid threads piling up on the collection X
     // lock below
     {
+        // TODO SERVER-43633 change to AutoGetCollection
         // Avoid using AutoGetCollection() as it returns the InvalidViewDefinition error code
         // if an invalid view is in the 'system.views' collection.
         AutoGetDb autoDb(opCtx, nss.db(), MODE_IS);

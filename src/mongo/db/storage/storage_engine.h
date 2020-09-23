@@ -195,11 +195,6 @@ public:
     virtual bool supportsDocLocking() const = 0;
 
     /**
-     * Returns whether the storage engine supports locking at a database level.
-     */
-    virtual bool supportsDBLocking() const = 0;
-
-    /**
      * Returns whether the storage engine supports capped collections.
      */
     virtual bool supportsCappedCollections() const = 0;
@@ -494,6 +489,11 @@ public:
      * timestamps are not persisted in the storage layer.
      */
     virtual void setInitialDataTimestamp(Timestamp timestamp) = 0;
+
+    /**
+     * Returns the initial data timestamp.
+     */
+    virtual Timestamp getInitialDataTimestamp() = 0;
 
     /**
      * Uses the current stable timestamp to set the oldest timestamp for which the storage engine

@@ -3,18 +3,18 @@
 import os.path
 import time
 
-import bson.errors
 import pymongo
 import pymongo.errors
 import pymongo.write_concern
 
-from . import interface
-from . import replicaset_utils
-from . import standalone
-from ... import config
-from ... import errors
-from ... import utils
-from ...multiversionconstants import LAST_STABLE_MONGOD_BINARY
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import errors
+from buildscripts.resmokelib import logging
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.multiversionconstants import LAST_STABLE_MONGOD_BINARY
+from buildscripts.resmokelib.testing.fixtures import interface
+from buildscripts.resmokelib.testing.fixtures import replicaset_utils
+from buildscripts.resmokelib.testing.fixtures import standalone
 
 
 class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-instance-attributes
@@ -28,7 +28,8 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             num_nodes=2, start_initial_sync_node=False, write_concern_majority_journal_default=None,
             auth_options=None, replset_config_options=None, voting_secondaries=True,
             all_nodes_electable=False, use_replica_set_connection_string=None, linear_chain=False,
-            mixed_bin_versions=None, default_read_concern=None, default_write_concern=None):
+            mixed_bin_versions=None, default_read_concern=None, default_write_concern=None,
+            shard_logging_prefix=None):
         """Initialize ReplicaSetFixture."""
 
         interface.ReplFixture.__init__(self, logger, job_num, dbpath_prefix=dbpath_prefix)
@@ -47,6 +48,7 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
         self.mixed_bin_versions = utils.default_if_none(mixed_bin_versions,
                                                         config.MIXED_BIN_VERSIONS)
         self.mixed_bin_versions_config = self.mixed_bin_versions
+        self.shard_logging_prefix = shard_logging_prefix
 
         # Use the values given from the command line if they exist for linear_chain and num_nodes.
         linear_chain_option = utils.default_if_none(config.LINEAR_CHAIN, linear_chain)
@@ -548,7 +550,13 @@ class ReplicaSetFixture(interface.ReplFixture):  # pylint: disable=too-many-inst
             suffix = str(index - 1) if self.num_nodes > 2 else ""
             node_name = "secondary{}".format(suffix)
 
-        return self.logger.new_fixture_node_logger(node_name)
+        if self.shard_logging_prefix is not None:
+            node_name = f"{self.shard_logging_prefix}:{node_name}"
+            return logging.loggers.new_fixture_node_logger("ShardedClusterFixture", self.job_num,
+                                                           node_name)
+
+        return logging.loggers.new_fixture_node_logger(self.__class__.__name__, self.job_num,
+                                                       node_name)
 
     def get_internal_connection_string(self):
         """Return the internal connection string."""

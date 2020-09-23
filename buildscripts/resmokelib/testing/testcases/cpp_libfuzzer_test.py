@@ -1,13 +1,13 @@
 """The libfuzzertest.TestCase for C++ libfuzzer tests."""
 
-import subprocess
-import os
 import datetime
+import os
+import subprocess
 
+from buildscripts.resmokelib import core
+from buildscripts.resmokelib import utils
 from buildscripts.resmokelib.testing.fixtures import interface as fixture_interface
-from . import interface
-from ... import core
-from ... import utils
+from buildscripts.resmokelib.testing.testcases import interface
 
 
 class CPPLibfuzzerTestCase(interface.ProcessTestCase):

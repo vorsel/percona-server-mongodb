@@ -131,7 +131,7 @@ void generateLegacyQueryErrorResponse(const AssertionException& exception,
                                       Message* response) {
     curop->debug().errInfo = exception.toStatus();
 
-    if (queryMessage.query.valid(BSONVersion::kLatest))
+    if (queryMessage.query.valid())
         LOGV2_OPTIONS(51777,
                       {logv2::LogComponent::kQuery},
                       "Assertion {error} ns: {namespace} query: {query}",
@@ -1131,7 +1131,7 @@ void execCommandDatabase(OperationContext* opCtx,
             oss.initializeClientRoutingVersionsFromCommand(invocation->ns(), request.body);
 
             auto const shardingState = ShardingState::get(opCtx);
-            if (oss.hasShardVersion() || oss.hasDbVersion()) {
+            if (OperationShardingState::isOperationVersioned(opCtx) || oss.hasDbVersion()) {
                 uassertStatusOK(shardingState->canAcceptShardedCommands());
             }
 

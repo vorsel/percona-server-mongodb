@@ -141,11 +141,11 @@ __wt_txn_release_snapshot(WT_SESSION_IMPL *session)
 }
 
 /*
- * __wt_txn_get_snapshot --
- *     Allocate a snapshot.
+ * __txn_get_snapshot_int --
+ *     Allocate a snapshot, optionally update our shared txn ids.
  */
-void
-__wt_txn_get_snapshot(WT_SESSION_IMPL *session)
+static void
+__txn_get_snapshot_int(WT_SESSION_IMPL *session, bool publish)
 {
     WT_CONNECTION_IMPL *conn;
     WT_TXN *txn;
@@ -177,16 +177,21 @@ __wt_txn_get_snapshot(WT_SESSION_IMPL *session)
     /*
      * Include the checkpoint transaction, if one is running: we should ignore any uncommitted
      * changes the checkpoint has written to the metadata. We don't have to keep the checkpoint's
-     * changes pinned so don't including it in the published pinned ID.
+     * changes pinned so don't go including it in the published pinned ID.
+     *
+     * We can assume that if a function calls without intention to publish then it is the special
+     * case of checkpoint calling it twice. In which case do not include the checkpoint id.
      */
     if ((id = txn_global->checkpoint_txn_shared.id) != WT_TXN_NONE) {
-        txn->snapshot[n++] = id;
-        txn_shared->metadata_pinned = id;
+        if (txn->id != id)
+            txn->snapshot[n++] = id;
+        if (publish)
+            txn_shared->metadata_pinned = id;
     }
 
     /* For pure read-only workloads, avoid scanning. */
     if (prev_oldest_id == current_id) {
-        txn_shared->pinned_id = current_id;
+        pinned_id = current_id;
         /* Check that the oldest ID has not moved in the meantime. */
         WT_ASSERT(session, prev_oldest_id == txn_global->oldest_id);
         goto done;
@@ -240,11 +245,31 @@ __wt_txn_get_snapshot(WT_SESSION_IMPL *session)
      */
     WT_ASSERT(session, WT_TXNID_LE(prev_oldest_id, pinned_id));
     WT_ASSERT(session, prev_oldest_id == txn_global->oldest_id);
-    txn_shared->pinned_id = pinned_id;
-
 done:
+    if (publish)
+        txn_shared->pinned_id = pinned_id;
     __wt_readunlock(session, &txn_global->rwlock);
     __txn_sort_snapshot(session, n, current_id);
+}
+
+/*
+ * __wt_txn_get_snapshot --
+ *     Common case, allocate a snapshot and update our shared ids.
+ */
+void
+__wt_txn_get_snapshot(WT_SESSION_IMPL *session)
+{
+    __txn_get_snapshot_int(session, true);
+}
+
+/*
+ * __wt_txn_bump_snapshot --
+ *     Uncommon case, allocate a snapshot but skip updating our shared ids.
+ */
+void
+__wt_txn_bump_snapshot(WT_SESSION_IMPL *session)
+{
+    __txn_get_snapshot_int(session, false);
 }
 
 /*
@@ -629,23 +654,39 @@ __txn_append_hs_record(WT_SESSION_IMPL *session, WT_CURSOR *hs_cursor, WT_ITEM *
     WT_ERR(__wt_scr_alloc(session, 0, &hs_key));
     WT_ERR(__wt_scr_alloc(session, 0, &hs_value));
 
-    WT_ERR(hs_cursor->get_key(hs_cursor, &hs_btree_id, hs_key, &hs_start_ts, &hs_counter));
+    for (; ret == 0; ret = hs_cursor->prev(hs_cursor)) {
+        WT_ERR(hs_cursor->get_key(hs_cursor, &hs_btree_id, hs_key, &hs_start_ts, &hs_counter));
 
-    /* Not found if we cross the tree boundary. */
-    if (hs_btree_id != S2BT(session)->id) {
-        ret = WT_NOTFOUND;
-        goto done;
+        /* Stop before crossing over to the next btree */
+        if (hs_btree_id != S2BT(session)->id) {
+            ret = WT_NOTFOUND;
+            goto done;
+        }
+
+        /*
+         * Keys are sorted in an order, skip the ones before the desired key, and bail out if we
+         * have crossed over the desired key and not found the record we are looking for.
+         */
+        WT_ERR(__wt_compare(session, NULL, hs_key, key, &cmp));
+        if (cmp != 0) {
+            ret = WT_NOTFOUND;
+            goto done;
+        }
+
+        /*
+         * If the stop time pair on the tombstone in the history store is already globally visible
+         * we can skip it.
+         */
+        if (!__wt_txn_visible_all(
+              session, hs_cbt->upd_value->tw.stop_txn, hs_cbt->upd_value->tw.durable_stop_ts))
+            break;
+        else
+            WT_STAT_CONN_INCR(session, cursor_prev_hs_tombstone);
     }
 
-    /*
-     * Keys are sorted in an order, skip the ones before the desired key, and bail out if we have
-     * crossed over the desired key and not found the record we are looking for.
-     */
-    WT_ERR(__wt_compare(session, NULL, hs_key, key, &cmp));
-    if (cmp != 0) {
-        ret = WT_NOTFOUND;
+    /* We walked off the top of the history store. */
+    if (ret == WT_NOTFOUND)
         goto done;
-    }
 
     /*
      * As part of the history store search, we never get an exact match based on our search criteria
@@ -686,6 +727,7 @@ __txn_append_hs_record(WT_SESSION_IMPL *session, WT_CURSOR *hs_cursor, WT_ITEM *
 
     /* If the history store record has a valid stop time point, append it. */
     if (hs_stop_durable_ts != WT_TS_MAX) {
+        WT_ASSERT(session, hs_cbt->upd_value->tw.stop_ts != WT_TS_MAX);
         WT_ERR(__wt_upd_alloc(session, NULL, WT_UPDATE_TOMBSTONE, &tombstone, &size));
         tombstone->durable_ts = hs_cbt->upd_value->tw.durable_stop_ts;
         tombstone->start_ts = hs_cbt->upd_value->tw.stop_ts;
@@ -920,8 +962,8 @@ __txn_resolve_prepared_op(WT_SESSION_IMPL *session, WT_TXN_OP *op, bool commit, 
          * Scan the history store for the given btree and key with maximum start timestamp to let
          * the search point to the last version of the key.
          */
-        WT_ERR_NOTFOUND_OK(
-          __wt_hs_cursor_position(session, hs_cursor, hs_btree_id, &op->u.op_row.key, WT_TS_MAX),
+        WT_ERR_NOTFOUND_OK(__wt_hs_cursor_position(
+                             session, hs_cursor, hs_btree_id, &op->u.op_row.key, WT_TS_MAX, NULL),
           true);
 
         if (ret == 0)

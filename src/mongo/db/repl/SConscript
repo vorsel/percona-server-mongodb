@@ -135,7 +135,6 @@ env.Library(
     LIBDEPS_PRIVATE=[
         'repl_server_parameters',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
-        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
     ],
 )
 
@@ -603,7 +602,6 @@ env.Library(
         'replmocks',
         'storage_interface_impl',
         '$BUILD_DIR/mongo/db/catalog/document_validation',
-        '$BUILD_DIR/mongo/db/s/op_observer_sharding_impl',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger',
     ],
@@ -691,12 +689,12 @@ env.Library(
         '$BUILD_DIR/mongo/rpc/metadata',
         '$BUILD_DIR/mongo/transport/transport_layer_common',
         '$BUILD_DIR/mongo/util/fail_point',
-        '$BUILD_DIR/mongo/db/repl/replication_metrics',
         'initial_syncer',
         'data_replicator_external_state_initial_sync',
         'repl_coordinator_interface',
         'repl_settings',
         'replica_set_messages',
+        'replication_metrics',
         'replication_process',
         'reporter',
         'scatter_gather',
@@ -709,6 +707,7 @@ env.Library(
         '$BUILD_DIR/mongo/idl/server_parameter',
         'local_oplog_info',
         'repl_server_parameters',
+        'replica_set_aware_service',
         'split_horizon',
     ],
 )
@@ -755,6 +754,16 @@ env.Library(
 )
 
 env.Library(
+    target='replica_set_aware_service',
+    source=[
+        'replica_set_aware_service.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
+)
+
+env.Library(
     target='replmocks',
     source=[
         'replication_consistency_markers_mock.cpp',
@@ -771,7 +780,6 @@ env.Library(
         'storage_interface',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/db/replica_set_aware_service',
         '$BUILD_DIR/mongo/executor/network_interface_mock',
     ],
 )
@@ -1156,6 +1164,19 @@ env.Library(
 )
 
 env.Library(
+    target='migrating_tenant_access_blocker',
+    source=[
+        'migrating_tenant_access_blocker.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/service_context',
+        'optime',
+        'repl_coordinator_impl'
+    ],
+)
+
+env.Library(
     target="serveronly_repl",
     source=[
         'noop_writer.cpp',
@@ -1188,6 +1209,7 @@ env.Library(
         '$BUILD_DIR/mongo/util/fail_point',
         'bgsync',
         'drop_pending_collection_reaper',
+        'migrating_tenant_access_blocker',
         'oplog_application',
         'oplog_buffer_collection',
         'oplog_interface_remote',
@@ -1203,9 +1225,8 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
-        '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
-        '$BUILD_DIR/mongo/db/replica_set_aware_service',
+        '$BUILD_DIR/mongo/db/storage/flow_control',
         '$BUILD_DIR/mongo/db/storage/storage_control',
         'local_oplog_info',
         'repl_server_parameters',
@@ -1257,6 +1278,7 @@ env.CppUnitTest(
         'repl_set_heartbeat_response_test.cpp',
         'repl_set_tag_test.cpp',
         'repl_set_write_concern_mode_definitions_test.cpp',
+        'replica_set_aware_service_test.cpp',
         'replication_consistency_markers_impl_test.cpp',
         'replication_process_test.cpp',
         'replication_recovery_test.cpp',
@@ -1290,7 +1312,6 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/logical_time',
         '$BUILD_DIR/mongo/db/op_observer',
         '$BUILD_DIR/mongo/db/query/command_request_response',
-        '$BUILD_DIR/mongo/db/s/op_observer_sharding_impl',
         '$BUILD_DIR/mongo/db/service_context_d',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
@@ -1330,6 +1351,7 @@ env.CppUnitTest(
         'repl_coordinator_impl',
         'repl_server_parameters',
         'replica_set_messages',
+        'replica_set_aware_service',
         'replication_consistency_markers_impl',
         'replication_process',
         'replication_recovery',

@@ -76,7 +76,6 @@ public:
                                               OrphanCleanupPolicy orphanCleanupPolicy) override;
 
     ScopedCollectionDescription getCollectionDescription(OperationContext* opCtx) override;
-    ScopedCollectionDescription getCollectionDescription_DEPRECATED() override;
 
     void checkShardVersionOrThrow(OperationContext* opCtx) override;
 
@@ -120,8 +119,6 @@ public:
      * with both the collection lock and CSRLock held in exclusive mode.
      *
      * In these methods, the CSRLock ensures concurrent access to the critical section.
-     *
-     * The shardVersionRecoverRefresh future must be boost::none when invoking these methods.
      */
     void enterCriticalSectionCatchUpPhase(const CSRLock&);
     void enterCriticalSectionCommitPhase(const CSRLock&);
@@ -286,6 +283,13 @@ private:
 
 /**
  * RAII-style class, which obtains a reference to the critical section for the specified collection.
+ *
+ *
+ * Shard version recovery/refresh procedures always wait for the critical section to be released in
+ * order to serialise with concurrent moveChunk/shardCollection commit operations.
+ *
+ * Entering the critical section doesn't serialise with concurrent recovery/refresh, because
+ * causally such refreshes would have happened *before* the critical section was entered.
  */
 class CollectionCriticalSection {
     CollectionCriticalSection(const CollectionCriticalSection&) = delete;

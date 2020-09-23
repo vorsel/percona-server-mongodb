@@ -39,7 +39,6 @@
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
-#include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
@@ -71,7 +70,12 @@ using rpc::ReplSetMetadata;
 using std::vector;
 using unittest::assertGet;
 
-using ShardingCatalogClientTest = ShardingTestFixture;
+class ShardingCatalogClientTest : public ShardingTestFixture {
+protected:
+    DistLockManagerMock* distLock() const {
+        return dynamic_cast<DistLockManagerMock*>(ShardingTestFixture::distLock());
+    }
+};
 
 const int kMaxCommandRetry = 3;
 const NamespaceString kNamespace("TestDB", "TestColl");

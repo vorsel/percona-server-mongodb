@@ -58,6 +58,7 @@
 #include "mongo/util/log_with_sampling.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/str.h"
+#include "mongo/util/system_tick_source.h"
 #include <mongo/db/stats/timer_stats.h>
 
 namespace mongo {
@@ -349,6 +350,8 @@ CurOp::CurOp(OperationContext* opCtx) : CurOp(opCtx, &_curopStack(opCtx)) {
 }
 
 CurOp::CurOp(OperationContext* opCtx, CurOpStack* stack) : _stack(stack) {
+    _tickSource = SystemTickSource::get();
+
     if (opCtx) {
         _stack->push(opCtx, this);
     } else {
@@ -409,7 +412,7 @@ void CurOp::setNS_inlock(StringData ns) {
 
 void CurOp::ensureStarted() {
     if (_start == 0) {
-        _start = curTimeMicros64();
+        _start = _tickSource->getTicks();
     }
 }
 
@@ -436,10 +439,10 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
     }
 
     // Obtain the total execution time of this operation.
-    _end = curTimeMicros64();
-    _debug.executionTimeMicros = durationCount<Microseconds>(elapsedTimeExcludingPauses());
+    _end = _tickSource->getTicks();
+    _debug.executionTime = duration_cast<Microseconds>(elapsedTimeExcludingPauses());
 
-    const auto executionTimeMillis = _debug.executionTimeMicros / 1000;
+    const auto executionTimeMillis = durationCount<Milliseconds>(_debug.executionTime);
 
     if (_debug.isReplOplogGetMore) {
         oplogGetMoreStats.recordMillis(executionTimeMillis);
@@ -543,9 +546,11 @@ void appendAsObjOrString(StringData name,
     if (!maxSize || static_cast<size_t>(obj.objsize()) <= *maxSize) {
         builder->append(name, obj);
     } else {
-        // Generate an abbreviated serialization for the object, by passing false as the
-        // "full" argument to obj.toString().
-        std::string objToString = obj.toString();
+        // Generate an abbreviated serialization for the object, by passing false as the "full"
+        // argument to obj.toString(). Remove "comment" field from the object, if present, since
+        // this will be promoted to a top-level field in the output.
+        std::string objToString =
+            (obj.hasField("comment") ? obj.removeField("comment") : obj).toString();
         if (objToString.size() > *maxSize) {
             // objToString is still too long, so we append to the builder a truncated form
             // of objToString concatenated with "...".  Instead of creating a new string
@@ -866,7 +871,7 @@ string OpDebug::report(OperationContext* opCtx, const SingleThreadedLockStats* l
         s << " remoteOpWaitMillis:" << durationCount<Milliseconds>(*remoteOpWaitTime);
     }
 
-    s << " " << (executionTimeMicros / 1000) << "ms";
+    s << " " << durationCount<Milliseconds>(executionTime) << "ms";
 
     return s.str();
 }
@@ -1035,7 +1040,7 @@ void OpDebug::report(OperationContext* opCtx,
         pAttrs->add("remoteOpWaitMillis", durationCount<Milliseconds>(*remoteOpWaitTime));
     }
 
-    pAttrs->add("durationMillis", (executionTimeMicros / 1000));
+    pAttrs->add("durationMillis", durationCount<Milliseconds>(executionTime));
 }
 
 
@@ -1157,9 +1162,9 @@ void OpDebug::append(OperationContext* opCtx,
         b.append("remoteOpWaitMillis", durationCount<Milliseconds>(*remoteOpWaitTime));
     }
 
-    b.appendIntOrLL("millis", executionTimeMicros / 1000);
+    b.appendIntOrLL("millis", durationCount<Milliseconds>(executionTime));
     b.append("rateLimit",
-             executionTimeMicros >= serverGlobalParams.slowMS * 1000LL ? 1 : serverGlobalParams.rateLimit);
+             durationCount<Milliseconds>(executionTime) >= serverGlobalParams.slowMS ? 1 : serverGlobalParams.rateLimit);
 
     if (!curop.getPlanSummary().empty()) {
         b.append("planSummary", curop.getPlanSummary());

@@ -77,7 +77,7 @@ public:
      *
      * NOTE: Only starts threads if they are not already started,
      */
-    virtual void startThreads(const ReplSettings& settings) = 0;
+    virtual void startThreads() = 0;
 
     /**
      * Returns true if an incomplete initial sync is detected.
@@ -226,11 +226,6 @@ public:
      * removal, so this function must also be able to handle those situations.
      */
     virtual void onStepDownHook() = 0;
-
-    /**
-     * Called after this node has become an arbiter.
-     */
-    virtual void onBecomeArbiterHook() = 0;
 
     /**
      * Notifies the bgsync and syncSourceFeedback threads to choose a new sync source.

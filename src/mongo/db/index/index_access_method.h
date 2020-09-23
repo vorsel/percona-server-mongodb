@@ -229,6 +229,16 @@ public:
          * Returns number of keys inserted using this BulkBuilder.
          */
         virtual int64_t getKeysInserted() const = 0;
+
+        /**
+         * Returns the current state of this BulkBuilder's underlying Sorter.
+         */
+        virtual Sorter::State getSorterState() const = 0;
+
+        /**
+         * Persists on disk the keys that have been inserted using this BulkBuilder.
+         */
+        virtual void persistDataForShutdown() = 0;
     };
 
     /**

@@ -76,6 +76,7 @@ var ChunkHelper = (function() {
             cmd,
             res => (res.code === ErrorCodes.ConflictingOperationInProgress ||
                     res.code === ErrorCodes.ChunkRangeCleanupPending ||
+                    res.code === ErrorCodes.LockTimeout ||
                     // The chunk migration has surely been aborted if the startCommit of the
                     // procedure was interrupted by a stepdown.
                     (runningWithStepdowns && res.code === ErrorCodes.CommandFailed &&
@@ -83,7 +84,11 @@ var ChunkHelper = (function() {
                     // The chunk migration has surely been aborted if the recipient shard didn't
                     // believe there was an active chunk migration.
                     (runningWithStepdowns && res.code === ErrorCodes.OperationFailed &&
-                     res.errmsg.includes("NotYetInitialized"))));
+                     res.errmsg.includes("NotYetInitialized")) ||
+                    // The chunk migration has surely been aborted if there was another active
+                    // chunk migration on the donor.
+                    (runningWithStepdowns && res.code === ErrorCodes.OperationFailed &&
+                     res.errmsg.includes("does not match active session id"))));
     }
 
     function mergeChunks(db, collName, bounds) {

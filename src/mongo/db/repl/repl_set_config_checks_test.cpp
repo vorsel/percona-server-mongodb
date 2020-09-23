@@ -63,7 +63,7 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_VersionMustBe1) {
                                                                            << "h1"))),
                                              newReplSetId);
     ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible,
-                  validateConfigForInitiate(&rses, config, getGlobalServiceContext()).getStatus());
+                  validateConfigForInitiate(&rses, config, getServiceContext()).getStatus());
 }
 
 TEST_F(ServiceContextTest, ValidateConfigForInitiate_TermIsAlwaysInitialTerm) {
@@ -79,8 +79,25 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_TermIsAlwaysInitialTerm) {
                                                        << BSON_ARRAY(BSON("_id" << 1 << "host"
                                                                                 << "h1"))),
                                                   newReplSetId);
-    ASSERT_OK(validateConfigForInitiate(&rses, config, getGlobalServiceContext()).getStatus());
+    ASSERT_OK(validateConfigForInitiate(&rses, config, getServiceContext()).getStatus());
     ASSERT_EQUALS(config.getConfigTerm(), OpTime::kInitialTerm);
+}
+
+TEST_F(ServiceContextTest, ValidateConfigForInitiate_memberId) {
+    ReplicationCoordinatorExternalStateMock rses;
+    rses.addSelf(HostAndPort("h1"));
+
+    // Config with Member id > 255.
+    OID newReplSetId = OID::gen();
+    auto validConfig =
+        ReplSetConfig::parseForInitiate(BSON("_id"
+                                             << "rs0"
+                                             << "version" << 1 << "protocolVersion" << 1
+                                             << "members"
+                                             << BSON_ARRAY(BSON("_id" << 256 << "host"
+                                                                      << "h1"))),
+                                        newReplSetId);
+    ASSERT_OK(validateConfigForInitiate(&rses, validConfig, getGlobalServiceContext()).getStatus());
 }
 
 TEST_F(ServiceContextTest, ValidateConfigForInitiate_MustFindSelf) {
@@ -104,17 +121,15 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_MustFindSelf) {
     presentTwiceExternalState.addSelf(HostAndPort("h3"));
     presentTwiceExternalState.addSelf(HostAndPort("h1"));
 
-    ASSERT_EQUALS(
-        ErrorCodes::NodeNotFound,
-        validateConfigForInitiate(&notPresentExternalState, config, getGlobalServiceContext())
-            .getStatus());
-    ASSERT_EQUALS(
-        ErrorCodes::InvalidReplicaSetConfig,
-        validateConfigForInitiate(&presentTwiceExternalState, config, getGlobalServiceContext())
-            .getStatus());
+    ASSERT_EQUALS(ErrorCodes::NodeNotFound,
+                  validateConfigForInitiate(&notPresentExternalState, config, getServiceContext())
+                      .getStatus());
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
+                  validateConfigForInitiate(&presentTwiceExternalState, config, getServiceContext())
+                      .getStatus());
     ASSERT_EQUALS(1,
                   unittest::assertGet(validateConfigForInitiate(
-                      &presentOnceExternalState, config, getGlobalServiceContext())));
+                      &presentOnceExternalState, config, getServiceContext())));
 }
 
 TEST_F(ServiceContextTest, ValidateConfigForInitiate_SelfMustBeElectable) {
@@ -135,10 +150,9 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_SelfMustBeElectable) {
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
 
-    ASSERT_EQUALS(
-        ErrorCodes::NodeNotElectable,
-        validateConfigForInitiate(&presentOnceExternalState, config, getGlobalServiceContext())
-            .getStatus());
+    ASSERT_EQUALS(ErrorCodes::NodeNotElectable,
+                  validateConfigForInitiate(&presentOnceExternalState, config, getServiceContext())
+                      .getStatus());
 }
 
 TEST_F(ServiceContextTest, ValidateConfigForInitiate_WriteConcernMustBeSatisfiable) {
@@ -157,10 +171,9 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_WriteConcernMustBeSatisfiab
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
 
-    ASSERT_EQUALS(
-        ErrorCodes::UnsatisfiableWriteConcern,
-        validateConfigForInitiate(&presentOnceExternalState, config, getGlobalServiceContext())
-            .getStatus());
+    ASSERT_EQUALS(ErrorCodes::UnsatisfiableWriteConcern,
+                  validateConfigForInitiate(&presentOnceExternalState, config, getServiceContext())
+                      .getStatus());
 }
 
 TEST_F(ServiceContextTest, ValidateConfigForInitiate_ArbiterPriorityMustBeZeroOrOne) {
@@ -209,15 +222,13 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_ArbiterPriorityMustBeZeroOr
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h1"));
 
-    ASSERT_OK(
-        validateConfigForInitiate(&presentOnceExternalState, zeroConfig, getGlobalServiceContext())
-            .getStatus());
-    ASSERT_OK(
-        validateConfigForInitiate(&presentOnceExternalState, oneConfig, getGlobalServiceContext())
-            .getStatus());
+    ASSERT_OK(validateConfigForInitiate(&presentOnceExternalState, zeroConfig, getServiceContext())
+                  .getStatus());
+    ASSERT_OK(validateConfigForInitiate(&presentOnceExternalState, oneConfig, getServiceContext())
+                  .getStatus());
     ASSERT_EQUALS(
         ErrorCodes::InvalidReplicaSetConfig,
-        validateConfigForInitiate(&presentOnceExternalState, twoConfig, getGlobalServiceContext())
+        validateConfigForInitiate(&presentOnceExternalState, twoConfig, getServiceContext())
             .getStatus());
 }
 
@@ -260,14 +271,14 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_NewlyAddedFieldNotAllowed) 
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h1"));
 
-    auto status = validateConfigForInitiate(
-                      &presentOnceExternalState, firstNewlyAdded, getGlobalServiceContext())
-                      .getStatus();
+    auto status =
+        validateConfigForInitiate(&presentOnceExternalState, firstNewlyAdded, getServiceContext())
+            .getStatus();
     ASSERT_EQUALS(status, ErrorCodes::InvalidReplicaSetConfig);
     ASSERT_TRUE(status.reason().find("newly_added_h1") != std::string::npos);
-    status = validateConfigForInitiate(
-                 &presentOnceExternalState, lastNewlyAdded, getGlobalServiceContext())
-                 .getStatus();
+    status =
+        validateConfigForInitiate(&presentOnceExternalState, lastNewlyAdded, getServiceContext())
+            .getStatus();
     ASSERT_EQUALS(status, ErrorCodes::InvalidReplicaSetConfig);
     ASSERT_TRUE(status.reason().find("newly_added_h3") != std::string::npos);
 }
@@ -315,6 +326,52 @@ TEST_F(ServiceContextTest, ValidateConfigForReconfig_NewConfigVersionNumberMustB
     ASSERT_EQUALS(ErrorCodes::NewReplicaSetConfigurationIncompatible,
                   validateConfigForReconfig(newConfig, oldConfig, false));
 }
+
+TEST_F(ServiceContextTest, ValidateConfigForReconfig_memberId) {
+    ReplicationCoordinatorExternalStateMock externalState;
+    externalState.addSelf(HostAndPort("h1"));
+
+    ReplSetConfig oldConfig;
+    ReplSetConfig newConfig;
+
+    // Case 1: Add a new node with member id > 255.
+    oldConfig = ReplSetConfig::parse(BSON("_id"
+                                          << "rs0"
+                                          << "version" << 1 << "protocolVersion" << 1 << "members"
+                                          << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                   << "h1"))));
+    newConfig = ReplSetConfig::parse(BSON("_id"
+                                          << "rs0"
+                                          << "version" << 2 << "protocolVersion" << 1 << "members"
+                                          << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                   << "h1")
+                                                        << BSON("_id" << 256 << "host"
+                                                                      << "h2"))));
+    ASSERT_OK(oldConfig.validate());
+    ASSERT_OK(newConfig.validate());
+    ASSERT_OK(validateConfigForReconfig(oldConfig, newConfig, false));
+
+    // Case 2: Change the member config setting for the existing member with member id > 255.
+    oldConfig = ReplSetConfig::parse(BSON("_id"
+                                          << "rs0"
+                                          << "version" << 1 << "protocolVersion" << 1 << "members"
+                                          << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                   << "h1")
+                                                        << BSON("_id" << 256 << "host"
+                                                                      << "h2"))));
+    newConfig = ReplSetConfig::parse(BSON("_id"
+                                          << "rs0"
+                                          << "version" << 2 << "protocolVersion" << 1 << "members"
+                                          << BSON_ARRAY(BSON("_id" << 1 << "host"
+                                                                   << "h1")
+                                                        << BSON("_id" << 256 << "host"
+                                                                      << "h2"
+                                                                      << "priority" << 0))));
+    ASSERT_OK(oldConfig.validate());
+    ASSERT_OK(newConfig.validate());
+    ASSERT_OK(validateConfigForReconfig(oldConfig, newConfig, false));
+}
+
 
 TEST_F(ServiceContextTest, ValidateConfigForReconfig_NewConfigMustNotChangeSetName) {
     ReplicationCoordinatorExternalStateMock externalState;
@@ -681,7 +738,7 @@ TEST_F(ServiceContextTest, ValidateConfigForInitiate_NewConfigInvalid) {
     presentOnceExternalState.addSelf(HostAndPort("h2"));
     ASSERT_EQUALS(
         ErrorCodes::BadValue,
-        validateConfigForInitiate(&presentOnceExternalState, newConfig, getGlobalServiceContext())
+        validateConfigForInitiate(&presentOnceExternalState, newConfig, getServiceContext())
             .getStatus());
 }
 
@@ -758,7 +815,7 @@ TEST_F(ServiceContextTest, ValidateConfigForStartUp_NewConfigInvalid) {
     presentOnceExternalState.addSelf(HostAndPort("h2"));
     ASSERT_EQUALS(
         ErrorCodes::BadValue,
-        validateConfigForStartUp(&presentOnceExternalState, newConfig, getGlobalServiceContext())
+        validateConfigForStartUp(&presentOnceExternalState, newConfig, getServiceContext())
             .getStatus());
 }
 
@@ -777,9 +834,8 @@ TEST_F(ServiceContextTest, ValidateConfigForStartUp_NewConfigValid) {
 
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
-    ASSERT_OK(
-        validateConfigForStartUp(&presentOnceExternalState, newConfig, getGlobalServiceContext())
-            .getStatus());
+    ASSERT_OK(validateConfigForStartUp(&presentOnceExternalState, newConfig, getServiceContext())
+                  .getStatus());
 }
 
 TEST_F(ServiceContextTest, ValidateConfigForStartUp_NewConfigWriteConcernNotSatisfiable) {
@@ -797,9 +853,8 @@ TEST_F(ServiceContextTest, ValidateConfigForStartUp_NewConfigWriteConcernNotSati
 
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
-    ASSERT_OK(
-        validateConfigForStartUp(&presentOnceExternalState, newConfig, getGlobalServiceContext())
-            .getStatus());
+    ASSERT_OK(validateConfigForStartUp(&presentOnceExternalState, newConfig, getServiceContext())
+                  .getStatus());
 }
 
 TEST_F(ServiceContextTest, ValidateConfigForHeartbeatReconfig_NewConfigInvalid) {
@@ -819,7 +874,7 @@ TEST_F(ServiceContextTest, ValidateConfigForHeartbeatReconfig_NewConfigInvalid) 
     presentOnceExternalState.addSelf(HostAndPort("h2"));
     ASSERT_EQUALS(ErrorCodes::BadValue,
                   validateConfigForHeartbeatReconfig(
-                      &presentOnceExternalState, newConfig, getGlobalServiceContext())
+                      &presentOnceExternalState, newConfig, getServiceContext())
                       .getStatus());
 }
 
@@ -838,7 +893,7 @@ TEST_F(ServiceContextTest, ValidateConfigForHeartbeatReconfig_NewConfigValid) {
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
     ASSERT_OK(validateConfigForHeartbeatReconfig(
-                  &presentOnceExternalState, newConfig, getGlobalServiceContext())
+                  &presentOnceExternalState, newConfig, getServiceContext())
                   .getStatus());
 }
 
@@ -859,7 +914,7 @@ TEST_F(ServiceContextTest, ValidateConfigForHeartbeatReconfig_NewConfigWriteConc
     ReplicationCoordinatorExternalStateMock presentOnceExternalState;
     presentOnceExternalState.addSelf(HostAndPort("h2"));
     ASSERT_OK(validateConfigForHeartbeatReconfig(
-                  &presentOnceExternalState, newConfig, getGlobalServiceContext())
+                  &presentOnceExternalState, newConfig, getServiceContext())
                   .getStatus());
 }
 
@@ -919,6 +974,15 @@ BSONObj m3_NonVoting = BSON("_id" << 3 << "host"
 BSONObj m4_NonVoting = BSON("_id" << 4 << "host"
                                   << "h4"
                                   << "votes" << 0 << "priority" << 0);
+BSONObj m2_NewlyAdded = BSON("_id" << 2 << "host"
+                                   << "h2"
+                                   << "newlyAdded" << true << "votes" << 1);
+BSONObj m3_NewlyAdded = BSON("_id" << 3 << "host"
+                                   << "h3"
+                                   << "newlyAdded" << true << "votes" << 1);
+BSONObj m4_NewlyAdded = BSON("_id" << 4 << "host"
+                                   << "h4"
+                                   << "newlyAdded" << true << "votes" << 1);
 
 // Test helper to initialize config more concisely.
 ReplSetConfig initializeConfig(std::string id, int version, BSONArray members) {
@@ -1009,6 +1073,129 @@ TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeAdditionOfArbitersDisall
     BSONArray newMembers = BSON_ARRAY(m1 << m2 << m3_Arbiter << m4_Arbiter);  // add two arbiters.
     ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
                   validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_SingleNodeAdditionOfNewlyAddedAllowed) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2);
+    BSONArray newMembers = BSON_ARRAY(m1 << m2 << m3_NewlyAdded);  // add 1 'newlyAdded' node.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeAdditionOfNewlyAddedAllowed) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2);
+    BSONArray newMembers =
+        BSON_ARRAY(m1 << m2 << m3_NewlyAdded << m4_NewlyAdded);  // add 2 'newlyAdded' nodes.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_MultiNodeRemovalOfNewlyAddedAllowed) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2_NewlyAdded << m3_NewlyAdded);
+    BSONArray newMembers = BSON_ARRAY(m1);  // Remove 2 'newlyAdded' nodes.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_SimultaneousAddAndRemoveOfNewlyAddedAllowed) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2_NewlyAdded);
+    BSONArray newMembers =
+        BSON_ARRAY(m1 << m3_NewlyAdded);  // Remove 'newlyAdded' 2, add 'newlyAdded' 3.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_SingleAutoReconfigAllowed) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2_NewlyAdded);
+    BSONArray newMembers = BSON_ARRAY(m1 << m2);  // Remove 'newlyAdded' 2, add voting node 2.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest, ValidateForReconfig_MultiAutoReconfigDisallowed) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2_NewlyAdded << m3_NewlyAdded);
+    BSONArray newMembers =
+        BSON_ARRAY(m1 << m2 << m3);  // Remove 'newlyAdded' 2 & 3, add voting node 2 & 3.
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
+                  validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest,
+       ValidateForReconfig_SimultaneousAutoReconfigAndAdditionOfVoterNodeDisallowed) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2_NewlyAdded);
+    BSONArray newMembers =
+        BSON_ARRAY(m1 << m2 << m3);  // Remove 'newlyAdded' 2, add voting node 2 & 3.
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
+                  validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest,
+       ValidateForReconfig_SimultaneousAutoReconfigAndRemovalOfVoterNodeDisallowed) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2_NewlyAdded << m3);
+    BSONArray newMembers =
+        BSON_ARRAY(m1 << m2);  // Remove 'newlyAdded' 2 and voter node 3, add voting node 2.
+    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
+                  validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest,
+       ValidateForReconfig_SimultaneousAutoReconfigAndAdditionOfNewlyAddedAllowed) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2_NewlyAdded);
+    BSONArray newMembers = BSON_ARRAY(
+        m1 << m2 << m3_NewlyAdded);  // Remove 'newlyAdded' 2, add voting node 2 & 'newlyAdded' 3.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
+}
+
+TEST_F(ServiceContextTest,
+       ValidateForReconfig_SimultaneousAutoReconfigAndRemovalOfNewlyAddedAllowed) {
+    // Set the flag to add the 'newlyAdded' field to MemberConfigs.
+    enableAutomaticReconfig = true;
+    // Set the flag back to false after this test exits.
+    ON_BLOCK_EXIT([] { enableAutomaticReconfig = false; });
+
+    BSONArray oldMembers = BSON_ARRAY(m1 << m2_NewlyAdded << m3_NewlyAdded);
+    BSONArray newMembers = BSON_ARRAY(m1 << m2);  // Remove 'newlyAdded' 2 & 3, add voting node 2.
+    ASSERT_OK(validateMemberReconfig(oldMembers, newMembers, m1));
 }
 
 TEST_F(ServiceContextTest, SameConfigContents) {
@@ -1102,29 +1289,28 @@ TEST_F(ServiceContextTest, FindSelfInConfig) {
     presentThriceExternalState.addSelf(HostAndPort("h1"));
 
     // Test 'findSelfInConfig'.
-    ASSERT_EQUALS(ErrorCodes::NodeNotFound,
-                  findSelfInConfig(&notPresentExternalState, newConfig, getGlobalServiceContext())
-                      .getStatus());
+    ASSERT_EQUALS(
+        ErrorCodes::NodeNotFound,
+        findSelfInConfig(&notPresentExternalState, newConfig, getServiceContext()).getStatus());
     ASSERT_EQUALS(
         ErrorCodes::InvalidReplicaSetConfig,
-        findSelfInConfig(&presentThriceExternalState, newConfig, getGlobalServiceContext())
-            .getStatus());
+        findSelfInConfig(&presentThriceExternalState, newConfig, getServiceContext()).getStatus());
     ASSERT_EQUALS(1,
-                  unittest::assertGet(findSelfInConfig(
-                      &presentOnceExternalState, newConfig, getGlobalServiceContext())));
+                  unittest::assertGet(
+                      findSelfInConfig(&presentOnceExternalState, newConfig, getServiceContext())));
 
     // The same rules apply to 'findSelfInConfigIfElectable'.
     ASSERT_EQUALS(
         ErrorCodes::NodeNotFound,
-        findSelfInConfigIfElectable(&notPresentExternalState, newConfig, getGlobalServiceContext())
+        findSelfInConfigIfElectable(&notPresentExternalState, newConfig, getServiceContext())
             .getStatus());
-    ASSERT_EQUALS(ErrorCodes::InvalidReplicaSetConfig,
-                  findSelfInConfigIfElectable(
-                      &presentThriceExternalState, newConfig, getGlobalServiceContext())
-                      .getStatus());
+    ASSERT_EQUALS(
+        ErrorCodes::InvalidReplicaSetConfig,
+        findSelfInConfigIfElectable(&presentThriceExternalState, newConfig, getServiceContext())
+            .getStatus());
     ASSERT_EQUALS(1,
                   unittest::assertGet(findSelfInConfigIfElectable(
-                      &presentOnceExternalState, newConfig, getGlobalServiceContext())));
+                      &presentOnceExternalState, newConfig, getServiceContext())));
 
     // We must be electable in the new config.
     newConfig = ReplSetConfig::parse(BSON("_id"
@@ -1140,7 +1326,7 @@ TEST_F(ServiceContextTest, FindSelfInConfig) {
 
     ASSERT_EQUALS(
         ErrorCodes::NodeNotElectable,
-        findSelfInConfigIfElectable(&presentOnceExternalState, newConfig, getGlobalServiceContext())
+        findSelfInConfigIfElectable(&presentOnceExternalState, newConfig, getServiceContext())
             .getStatus());
 }
 

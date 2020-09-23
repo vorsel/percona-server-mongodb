@@ -360,6 +360,21 @@ tests.push(function assertCallsHangAnalyzer() {
         },
     };
 
+    const lockTimeoutError = {
+        ok: 0,
+        errmsg: "Unable to acquire lock",
+        code: ErrorCodes.LockTimeout,
+        codeName: "LockTimeout",
+    };
+
+    const lockTimeoutTransientTransactionError = {
+        errorLabels: ["TransientTransactionError"],
+        ok: 0,
+        errmsg: "Unable to acquire lock",
+        code: ErrorCodes.LockTimeout,
+        codeName: "LockTimeout",
+    };
+
     runAssertTest(() => assert.commandWorked(sampleWriteConcernError), true);
     runAssertTest(() => assert.commandWorked(nonTimeOutWriteConcernError), false);
 
@@ -376,12 +391,35 @@ tests.push(function assertCallsHangAnalyzer() {
 
     runAssertTest(() => assert.commandWorkedIgnoringWriteConcernErrors(sampleWriteConcernError),
                   false);
+
+    runAssertTest(() => assert.commandWorked(lockTimeoutError), true);
+    runAssertTest(() => assert.commandFailed(lockTimeoutError), false);
+    runAssertTest(() => assert.commandFailedWithCode(lockTimeoutError, ErrorCodes.DuplicateKey),
+                  true);
+    runAssertTest(() => assert.commandFailedWithCode(lockTimeoutError, ErrorCodes.LockTimeout),
+                  false);
+
+    runAssertTest(() => assert.commandWorked(lockTimeoutTransientTransactionError), false);
+    runAssertTest(() => assert.commandFailed(lockTimeoutTransientTransactionError), false);
+    runAssertTest(() => assert.commandFailedWithCode(lockTimeoutTransientTransactionError,
+                                                     ErrorCodes.DuplicateKey),
+                  false);
+    runAssertTest(() => assert.commandFailedWithCode(lockTimeoutTransientTransactionError,
+                                                     ErrorCodes.LockTimeout),
+                  false);
 });
 
 tests.forEach((test) => {
     jsTest.log(`Starting test '${test.name}'`);
     setup();
-    test();
+    const oldMongoRunner = MongoRunner;
+    try {
+        // We shouldn't actually run the hang-analyzer for these tests.
+        MongoRunner.runHangAnalyzer = Function.prototype;
+        test();
+    } finally {
+        MongoRunner = oldMongoRunner;
+    }
 });
 
 /* cleanup */

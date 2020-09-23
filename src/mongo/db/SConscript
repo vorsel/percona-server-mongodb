@@ -66,7 +66,18 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/index_names',
         '$BUILD_DIR/mongo/db/write_concern_options',
+        'shutdown_in_progress_quiesce_info',
     ]
+)
+
+env.Library(
+    target='shutdown_in_progress_quiesce_info',
+    source= [
+        'shutdown_in_progress_quiesce_info.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
 )
 
 env.Library(
@@ -456,16 +467,6 @@ env.Library(
 )
 
 env.Library(
-    target='replica_set_aware_service',
-    source=[
-        'replica_set_aware_service.cpp',
-    ],
-    LIBDEPS_PRIVATE=[
-        'service_context',
-    ],
-)
-
-env.Library(
     target='service_context',
     source=[
         'baton.cpp',
@@ -818,7 +819,6 @@ env.Library(
     ],
 )
 
-
 env.Library(
     target="op_observer_impl",
     source=[
@@ -1120,6 +1120,7 @@ env.Library(
         'exec/near.cpp',
         'exec/or.cpp',
         'exec/pipeline_proxy.cpp',
+        'exec/plan_cache_util.cpp',
         'exec/plan_stage.cpp',
         'exec/projection.cpp',
         'exec/queued_data_stage.cpp',
@@ -1137,6 +1138,7 @@ env.Library(
         'exec/text.cpp',
         'exec/text_match.cpp',
         'exec/text_or.cpp',
+        'exec/trial_period_utils.cpp',
         'exec/trial_stage.cpp',
         'exec/update_stage.cpp',
         'exec/upsert_stage.cpp',
@@ -1147,14 +1149,28 @@ env.Library(
         'pipeline/document_source_cursor.cpp',
         'pipeline/document_source_geo_near_cursor.cpp',
         'pipeline/pipeline_d.cpp',
+        'query/classic_stage_builder.cpp',
         'query/explain.cpp',
         'query/find.cpp',
         'query/get_executor.cpp',
         'query/internal_plans.cpp',
         'query/plan_executor_impl.cpp',
+        'query/plan_executor_sbe.cpp',
         'query/plan_ranker.cpp',
-        'query/plan_yield_policy.cpp',
-        'query/stage_builder.cpp',
+        'query/plan_yield_policy_impl.cpp',
+        'query/plan_yield_policy_sbe.cpp',
+        'query/sbe_cached_solution_planner.cpp',
+        'query/sbe_multi_planner.cpp',
+        'query/sbe_plan_ranker.cpp',
+        'query/sbe_runtime_planner.cpp',
+        'query/sbe_stage_builder.cpp',
+        'query/sbe_stage_builder_coll_scan.cpp',
+        'query/sbe_stage_builder_expression.cpp',
+        'query/sbe_stage_builder_filter.cpp',
+        'query/sbe_stage_builder_index_scan.cpp',
+        'query/sbe_stage_builder_projection.cpp',
+        'query/sbe_sub_planner.cpp',
+        'query/stage_builder_util.cpp',
         'run_op_kill_cursors.cpp',
     ],
     LIBDEPS=[
@@ -1179,6 +1195,7 @@ env.Library(
         'db_raii',
         'dbdirectclient',
         'exec/projection_executor',
+        'exec/sbe/query_sbe_storage',
         'exec/scoped_timer',
         'exec/sort_executor',
         'exec/working_set',
@@ -1189,6 +1206,7 @@ env.Library(
         'matcher/expressions_mongod_only',
         'ops/parsed_update',
         'pipeline/pipeline',
+        'query/plan_yield_policy',
         'query/query_common',
         'query/query_planner',
         'repl/repl_coordinator_interface',
@@ -1530,6 +1548,17 @@ env.Library(
 )
 
 env.Library(
+    target='rs_local_client',
+    source=[
+        'rs_local_client.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        'dbdirectclient',
+    ],
+)
+
+env.Library(
     target='keys_collection_document',
     source=[
         'keys_collection_document.cpp',
@@ -1546,11 +1575,13 @@ env.Library(
         'keys_collection_client_direct.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client',
+        '$BUILD_DIR/mongo/s/client/shard_interface',
         'keys_collection_document',
         'logical_time',
-        '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client',
-        '$BUILD_DIR/mongo/s/client/rs_local_client',
-        '$BUILD_DIR/mongo/s/client/shard_interface',
+    ],
+    LIBDEPS_PRIVATE=[
+        'rs_local_client',
     ],
 )
 
@@ -1614,7 +1645,7 @@ env.Library(
         'vector_clock_mutable',
     ],
     LIBDEPS_PRIVATE=[
-        'replica_set_aware_service',
+        'repl/replica_set_aware_service',
         'server_options_core',
     ],
 )
@@ -1658,11 +1689,11 @@ env.Library(
         'logical_clock_test_fixture.cpp',
     ],
     LIBDEPS= [
+        '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/util/clock_source_mock',
+        's/sharding_mongod_test_fixture',
         'signed_logical_time',
         'vector_clock',
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/s/sharding_mongod_test_fixture',
-        '$BUILD_DIR/mongo/util/clock_source_mock'
     ],
 )
 
@@ -1686,7 +1717,6 @@ env.Library(
         'service_context_d_test_fixture.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/unittest/unittest',
         'service_context_test_fixture',
     ],
     LIBDEPS_PRIVATE=[
@@ -1872,7 +1902,6 @@ envWithAsio.CppUnitTest(
         'read_write_concern_defaults_test.cpp',
         'read_write_concern_provenance_test.cpp',
         'record_id_test.cpp',
-        'replica_set_aware_service_test.cpp',
         'server_options_test.cpp',
         'session_catalog_mongod_test.cpp',
         'session_catalog_test.cpp',
@@ -1936,9 +1965,8 @@ envWithAsio.CppUnitTest(
         'repl/mock_repl_coord_server_fixture',
         'repl/oplog_interface_local',
         'repl/repl_coordinator_interface',
-        'repl/storage_interface_impl',
         'repl/replmocks',
-        'replica_set_aware_service',
+        'repl/storage_interface_impl',
         'server_options_servers',
         'service_context',
         'service_context_d',
@@ -1976,8 +2004,8 @@ envWithAsio.CppUnitTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
-        '$BUILD_DIR/mongo/s/config_server_test_fixture',
         'auth/authmocks',
+        's/config_server_test_fixture',
         'vector_clock',
     ],
 )
@@ -2012,7 +2040,7 @@ env.CppLibfuzzerTest(
         '$BUILD_DIR/mongo/transport/service_entry_point',
         '$BUILD_DIR/mongo/transport/transport_layer_mock',
         '$BUILD_DIR/mongo/db/repl/replmocks',
-        '$BUILD_DIR/mongo/unittest/unittest/',
+        '$BUILD_DIR/mongo/unittest/unittest',
     ],
 )
 

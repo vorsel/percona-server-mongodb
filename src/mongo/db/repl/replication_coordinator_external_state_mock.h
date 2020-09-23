@@ -59,7 +59,7 @@ public:
 
     ReplicationCoordinatorExternalStateMock();
     virtual ~ReplicationCoordinatorExternalStateMock();
-    virtual void startThreads(const ReplSettings& settings) override;
+    virtual void startThreads() override;
     virtual void startSteadyStateReplication(OperationContext* opCtx,
                                              ReplicationCoordinator* replCoord) override;
     virtual void stopDataReplication(OperationContext* opCtx) override;
@@ -87,7 +87,6 @@ public:
     virtual StatusWith<OpTimeAndWallTime> loadLastOpTimeAndWallTime(OperationContext* opCtx);
     virtual void closeConnections();
     virtual void onStepDownHook();
-    virtual void onBecomeArbiterHook();
     virtual void signalApplierToChooseNewSyncSource();
     virtual void stopProducer();
     virtual void startProducerIfStopped();

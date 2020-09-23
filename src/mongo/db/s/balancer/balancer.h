@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "mongo/db/replica_set_aware_service.h"
+#include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/s/balancer/balancer_chunk_selection_policy.h"
 #include "mongo/db/s/balancer/balancer_random.h"
 #include "mongo/db/s/balancer/migration_manager.h"
@@ -167,8 +167,8 @@ private:
     /**
      * ReplicaSetAwareService entry points.
      */
-    void onStepUpBegin(OperationContext* opCtx) final;
-    void onStepUpComplete(OperationContext* opCtx) final;
+    void onStepUpBegin(OperationContext* opCtx, long long term) final;
+    void onStepUpComplete(OperationContext* opCtx, long long term) final;
     void onStepDown() final;
     void onBecomeArbiter() final;
 

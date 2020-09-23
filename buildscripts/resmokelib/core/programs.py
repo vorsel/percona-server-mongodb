@@ -7,14 +7,13 @@ import json
 import os
 import os.path
 import stat
-import sys
 
+from buildscripts.resmokelib import config
+from buildscripts.resmokelib import utils
+from buildscripts.resmokelib.core import jasper_process
+from buildscripts.resmokelib.core import process
 from buildscripts.resmokelib.multiversionconstants import LAST_STABLE_MONGOD_BINARY
 from buildscripts.resmokelib.multiversionconstants import LAST_STABLE_MONGOS_BINARY
-from . import jasper_process
-from . import process
-from .. import config
-from .. import utils
 
 # The below parameters define the default 'logComponentVerbosity' object passed to mongod processes
 # started either directly via resmoke or those that will get started by the mongo shell. We allow
@@ -215,7 +214,6 @@ def mongod_program(  # pylint: disable=too-many-branches,too-many-statements
     shortcut_opts = {
         "enableMajorityReadConcern": config.MAJORITY_READ_CONCERN,
         "nojournal": config.NO_JOURNAL,
-        "serviceExecutor": config.SERVICE_EXECUTOR,
         "storageEngine": config.STORAGE_ENGINE,
         "transportLayer": config.TRANSPORT_LAYER,
         "wiredTigerCollectionConfigString": config.WT_COLL_CONFIG,
@@ -324,10 +322,10 @@ def mongo_shell_program(  # pylint: disable=too-many-branches,too-many-locals,to
     else:
         test_name = None
     shortcut_opts = {
+        "backupOnRestartDir": (config.BACKUP_ON_RESTART_DIR, None),
         "enableMajorityReadConcern": (config.MAJORITY_READ_CONCERN, True),
         "mixedBinVersions": (config.MIXED_BIN_VERSIONS, ""),
         "noJournal": (config.NO_JOURNAL, False),
-        "serviceExecutor": (config.SERVICE_EXECUTOR, ""),
         "storageEngine": (config.STORAGE_ENGINE, ""),
         "storageEngineCacheSizeGB": (config.STORAGE_ENGINE_CACHE_SIZE, ""),
         "testName": (test_name, ""),
