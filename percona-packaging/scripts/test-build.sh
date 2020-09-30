@@ -17,9 +17,17 @@ function prepare {
     mkdir -p "$CURDIR"/temp
     mkdir -p "$TMP_DIR"/db "$TMP_DIR"/tests
 
+    if [ -f /etc/redhat-release ]; then
+        GLIBC_VER="$(rpm glibc -qa --qf %{VERSION})"
+    else
+        GLIBC_VER="$(dpkg-query -W -f='${Version}' libc6 | awk -F'-' '{print $1}')"
+    fi
+
     TARBALLS=""
     for tarball in $(find . -name "*.tar.gz"); do
-        TARBALLS+=" $(basename $tarball)"
+        if [[ "$(echo $tarball | grep -o "glibc2.*" | awk -F '.' '{print $2}')" -le "$(echo $GLIBC_VER | awk -F '.' '{print $2}')" ]]; then
+            TARBALLS+=" $(basename $tarball)"
+        fi
     done
     DIRLIST="bin lib/private"
 }
