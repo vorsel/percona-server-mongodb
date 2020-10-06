@@ -300,6 +300,12 @@ Status OpenLDAPAuthenticationSession::step(StringData inputData, std::string* ou
         const char* dn = userid + std::strlen(userid) + 1; // authentication id
         const char* pw = dn + std::strlen(dn) + 1; // password
 
+        if(strlen(pw) == 0) {
+            return Status(ErrorCodes::LDAPLibraryError,
+                          "Failed to authenticate '{}'; No password provided."_format(
+                              dn));
+        }
+
         // transform user to DN
         std::string mappedUser;
         {
