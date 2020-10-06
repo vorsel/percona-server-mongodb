@@ -242,7 +242,7 @@ struct __wt_connection_impl {
     TAILQ_HEAD(__wt_block_qh, __wt_block) blockqh;
 
     /* Locked: handles in each bucket */
-    u_int *dh_bucket_count;
+    u_int dh_bucket_count[WT_HASH_ARRAY_SIZE];
     u_int dhandle_count;        /* Locked: handles in the queue */
     u_int open_btree_count;     /* Locked: open writable btree count */
     uint32_t next_file_id;      /* Locked: file ID counter */
