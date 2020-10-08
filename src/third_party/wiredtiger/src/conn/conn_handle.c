@@ -16,8 +16,14 @@ int
 __wt_connection_init(WT_CONNECTION_IMPL *conn)
 {
     WT_SESSION_IMPL *session;
+    u_int i;
 
     session = conn->default_session;
+
+    for (i = 0; i < WT_HASH_ARRAY_SIZE; i++) {
+        TAILQ_INIT(&conn->dhhash[i]); /* Data handle hash lists */
+        TAILQ_INIT(&conn->fhhash[i]); /* File handle hash lists */
+    }
 
     TAILQ_INIT(&conn->dhqh);        /* Data handle list */
     TAILQ_INIT(&conn->dlhqh);       /* Library list */
@@ -73,36 +79,9 @@ __wt_connection_init(WT_CONNECTION_IMPL *conn)
      * opaque, but for now this is simpler.
      */
     WT_RET(__wt_spin_init(session, &conn->block_lock, "block manager"));
-    TAILQ_INIT(&conn->blockqh); /* Block manager list */
-
-    return (0);
-}
-
-/*
- * __wt_connection_hash_arrays_init --
- *     Allocate and init arrays whose size depends on configuration
- */
-int
-__wt_connection_hash_arrays_init(WT_CONNECTION_IMPL *conn)
-{
-    WT_SESSION_IMPL *session;
-    u_int i;
-
-    session = conn->default_session;
-
-    WT_RET(__wt_calloc_def(session, conn->big_hash_array_size, &conn->dh_bucket_count));
-
-    WT_RET(__wt_calloc_def(session, conn->big_hash_array_size, &conn->dhhash));
-    for (i = 0; i < conn->big_hash_array_size; i++)
-        TAILQ_INIT(&conn->dhhash[i]); /* Data handle hash lists */
-
-    WT_RET(__wt_calloc_def(session, conn->big_hash_array_size, &conn->fhhash));
-    for (i = 0; i < conn->big_hash_array_size; i++)
-        TAILQ_INIT(&conn->fhhash[i]); /* File handle hash lists */
-
-    WT_RET(__wt_calloc_def(session, conn->big_hash_array_size, &conn->blockhash));
-    for (i = 0; i < conn->big_hash_array_size; i++)
+    for (i = 0; i < WT_HASH_ARRAY_SIZE; i++)
         TAILQ_INIT(&conn->blockhash[i]); /* Block handle hash lists */
+    TAILQ_INIT(&conn->blockqh);          /* Block manager list */
 
     return (0);
 }
@@ -158,14 +137,6 @@ __wt_connection_destroy(WT_CONNECTION_IMPL *conn)
     __wt_free(session, conn->home);
     __wt_free(session, conn->sessions);
     __wt_stat_connection_discard(session, conn);
-
-    /* Free allocated hash arrays. */
-    __wt_free(session, conn->dhhash);
-    __wt_free(session, conn->fhhash);
-    __wt_free(session, conn->blockhash);
-
-    /* Free conn->dh_bucket_count */
-    __wt_free(session, conn->dh_bucket_count);
 
     __wt_free(NULL, conn);
 }

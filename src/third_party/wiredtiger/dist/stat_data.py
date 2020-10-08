@@ -519,8 +519,6 @@ connection_stats = [
     # Session operations
     ##########################################
     SessionOpStat('session_open', 'open session count', 'no_clear,no_scale'),
-    SessionOpStat('session_cursor_cache_size', 'session cursor cache size', 'no_clear,no_scale'),
-    SessionOpStat('session_dhhash_size', 'session dhandle hash size', 'no_clear,no_scale'),
     SessionOpStat('session_query_ts', 'session query timestamp calls'),
     SessionOpStat('session_table_alter_fail', 'table alter failed calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_alter_skip', 'table alter unchanged and skipped', 'no_clear,no_scale'),
@@ -556,8 +554,6 @@ connection_stats = [
     ##########################################
     TxnStat('txn_begin', 'transaction begins'),
     TxnStat('txn_checkpoint', 'transaction checkpoints'),
-    TxnStat('txn_checkpoint_prepare_time', 'transaction checkpoint prepare time (usecs)'),
-    TxnStat('txn_checkpoint_tree_helper_time', 'transaction checkpoint tree helper time (usecs)'),
     TxnStat('txn_checkpoint_fsync_post', 'transaction fsync calls for checkpoint after allocating the transaction ID'),
     TxnStat('txn_checkpoint_fsync_post_duration', 'transaction fsync duration for checkpoint after allocating the transaction ID (usecs)', 'no_clear,no_scale'),
     TxnStat('txn_checkpoint_generation', 'transaction checkpoint generation', 'no_clear,no_scale'),
