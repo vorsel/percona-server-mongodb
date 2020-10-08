@@ -187,6 +187,7 @@ const allCommands = {
     grantPrivilegesToRole: {skip: isPrimaryOnly},
     grantRolesToRole: {skip: isPrimaryOnly},
     grantRolesToUser: {skip: isPrimaryOnly},
+    hello: {skip: isNotAUserDataRead},
     hostInfo: {skip: isNotAUserDataRead},
     httpClientRequest: {skip: isNotAUserDataRead},
     insert: {skip: isPrimaryOnly},

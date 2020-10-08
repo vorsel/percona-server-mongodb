@@ -585,7 +585,7 @@ DB.prototype.help = function() {
     print("\tdb.getLastErrorObj() - return full status object");
     print("\tdb.getLogComponents()");
     print("\tdb.getMongo() get the server connection object");
-    print("\tdb.getMongo().setSlaveOk() allow queries on a replication slave server");
+    print("\tdb.getMongo().setSecondaryOk() allow queries on a replication secondary server");
     print("\tdb.getName()");
     print("\tdb.getProfilingLevel() - deprecated");
     print("\tdb.getProfilingStatus() - returns if profiling is on and slow threshold");
@@ -595,6 +595,7 @@ DB.prototype.help = function() {
         "\tdb.getWriteConcern() - returns the write concern used for any operations on this db, inherited from server object if set");
     print("\tdb.hostInfo() get details about the server's host");
     print("\tdb.isMaster() check replica primary status");
+    print("\tdb.hello() check replica primary status");
     print("\tdb.killOp(opid) kills the current operation in the db");
     print("\tdb.listCommands() lists all the db commands");
     print("\tdb.loadServerScripts() loads all the scripts in db.system.js");
@@ -602,7 +603,7 @@ DB.prototype.help = function() {
     print("\tdb.printCollectionStats()");
     print("\tdb.printReplicationInfo()");
     print("\tdb.printShardingStatus()");
-    print("\tdb.printSlaveReplicationInfo()");
+    print("\tdb.printSecondaryReplicationInfo()");
     print("\tdb.resetError()");
     print(
         "\tdb.runCommand(cmdObj) run a database command.  if cmdObj is a string, turns it into {cmdObj: 1}");
@@ -927,6 +928,10 @@ DB.prototype.isMaster = function() {
     return this.runCommand("isMaster");
 };
 
+DB.prototype.hello = function() {
+    return this.runCommand("hello");
+};
+
 var commandUnsupported = function(res) {
     return (!res.ok &&
             (res.errmsg.startsWith("no such cmd") || res.errmsg.startsWith("no such command") ||
@@ -1060,8 +1065,8 @@ DB.prototype.printReplicationInfo = function() {
             print("cannot provide replication status from an arbiter.");
             return;
         } else if (!isMaster.ismaster) {
-            print("this is a slave, printing slave replication info.");
-            this.printSlaveReplicationInfo();
+            print("this is a secondary, printing secondary replication info.");
+            this.printSecondaryReplicationInfo();
             return;
         }
         print(tojson(result));
@@ -1075,6 +1080,12 @@ DB.prototype.printReplicationInfo = function() {
 };
 
 DB.prototype.printSlaveReplicationInfo = function() {
+    print(
+        "WARNING: printSlaveReplicationInfo is deprecated and may be removed in the next major release. Please use printSecondaryReplicationInfo instead.");
+    this.printSecondaryReplicationInfo();
+};
+
+DB.prototype.printSecondaryReplicationInfo = function() {
     var startOptimeDate = null;
     var primary = null;
 
@@ -1092,7 +1103,7 @@ DB.prototype.printSlaveReplicationInfo = function() {
         print("\t" + Math.round(ago) + " secs (" + hrs + " hrs) behind the " + suffix);
     }
 
-    function getMaster(members) {
+    function getPrimary(members) {
         for (i in members) {
             var row = members[i];
             if (row.state === 1) {
@@ -1104,7 +1115,7 @@ DB.prototype.printSlaveReplicationInfo = function() {
     }
 
     function g(x) {
-        assert(x, "how could this be null (printSlaveReplicationInfo gx)");
+        assert(x, "how could this be null (printSecondaryReplicationInfo gx)");
         print("source: " + x.host);
         if (x.syncedTo) {
             var st = new Date(DB.tsToSeconds(x.syncedTo) * 1000);
@@ -1115,7 +1126,7 @@ DB.prototype.printSlaveReplicationInfo = function() {
     }
 
     function r(x) {
-        assert(x, "how could this be null (printSlaveReplicationInfo rx)");
+        assert(x, "how could this be null (printSecondaryReplicationInfo rx)");
         if (x.state == 1 || x.state == 7) {  // ignore primaries (1) and arbiters (7)
             return;
         }
@@ -1132,7 +1143,7 @@ DB.prototype.printSlaveReplicationInfo = function() {
 
     if (L.system.replset.count() != 0) {
         var status = this.adminCommand({'replSetGetStatus': 1});
-        primary = getMaster(status.members);
+        primary = getPrimary(status.members);
         if (primary) {
             startOptimeDate = primary.optimeDate;
         }
@@ -1267,20 +1278,32 @@ DB.autocomplete = function(obj) {
 };
 
 DB.prototype.setSlaveOk = function(value) {
-    if (value == undefined)
-        value = true;
-    this._slaveOk = value;
+    print(
+        "WARNING: setSlaveOk() is deprecated and may be removed in the next major release. Please use setSecondaryOk() instead.");
+    this.setSecondaryOk(value);
 };
 
 DB.prototype.getSlaveOk = function() {
-    if (this._slaveOk != undefined)
-        return this._slaveOk;
-    return this._mongo.getSlaveOk();
+    print(
+        "WARNING: getSlaveOk() is deprecated and may be removed in the next major release. Please use getSecondaryOk() instead.");
+    return this.getSecondaryOk();
+};
+
+DB.prototype.setSecondaryOk = function(value) {
+    if (value == undefined)
+        value = true;
+    this._secondaryOk = value;
+};
+
+DB.prototype.getSecondaryOk = function() {
+    if (this._secondaryOk != undefined)
+        return this._secondaryOk;
+    return this._mongo.getSecondaryOk();
 };
 
 DB.prototype.getQueryOptions = function() {
     var options = 0;
-    if (this.getSlaveOk())
+    if (this.getSecondaryOk())
         options |= 4;
     return options;
 };

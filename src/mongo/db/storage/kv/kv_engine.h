@@ -324,6 +324,13 @@ public:
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) {}
 
     /**
+     * See `StorageEngine::getInitialDataTimestamp`
+     */
+    virtual Timestamp getInitialDataTimestamp() {
+        return Timestamp();
+    }
+
+    /**
      * See `StorageEngine::setOldestTimestampFromStable`
      */
     virtual void setOldestTimestampFromStable() {}

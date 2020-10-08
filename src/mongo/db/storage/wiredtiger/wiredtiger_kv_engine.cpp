@@ -2538,6 +2538,10 @@ void WiredTigerKVEngine::setInitialDataTimestamp(Timestamp initialDataTimestamp)
     _initialDataTimestamp.store(initialDataTimestamp.asULL());
 }
 
+Timestamp WiredTigerKVEngine::getInitialDataTimestamp() {
+    return Timestamp(_initialDataTimestamp.load());
+}
+
 bool WiredTigerKVEngine::supportsRecoverToStableTimestamp() const {
     if (!_keepDataHistory) {
         return false;
@@ -2795,10 +2799,6 @@ Timestamp WiredTigerKVEngine::getOldestTimestamp() const {
 
 Timestamp WiredTigerKVEngine::getCheckpointTimestamp() const {
     return Timestamp(_getCheckpointTimestamp());
-}
-
-Timestamp WiredTigerKVEngine::getInitialDataTimestamp() const {
-    return Timestamp(_initialDataTimestamp.load());
 }
 
 std::uint64_t WiredTigerKVEngine::_getCheckpointTimestamp() const {

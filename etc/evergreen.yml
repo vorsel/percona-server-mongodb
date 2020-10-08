@@ -976,21 +976,10 @@ functions:
             --out-file bypass_compile_expansions.yml                           \
             --version-id ${version_id}                                         \
             --json-artifact artifacts.json
-
-        # For patch builds determine if we can bypass compile.
-        elif [[ "${is_patch}" = "true" && "${task_name}" = "compile" ]]; then
-          ${activate_virtualenv}
-          # Evergreen executable is in $HOME, so add that to the path.
-          PATH=$PATH:$HOME $python buildscripts/bypass_compile_and_fetch_binaries.py            \
-            --project ${project}                                               \
-            --buildVariant ${build_variant}                                    \
-            --revision ${revision}                                             \
-            --patchFile patch_files.txt                                        \
-            --outFile bypass_compile_expansions.yml                            \
-            --jsonArtifact artifacts.json
         fi
 
-  ### Set expansion macros used in each task ###
+  ### Set expansion macros used in each task.
+  ### Note that this function will override task expansions set in update_bypass_expansions
   "set task expansion macros": &set_task_expansion_macros
     command: expansions.update
     params:
@@ -5682,7 +5671,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_replication
-  tags: ["concurrency", "common", "read_concern_maj"]
+  tags: ["concurrency", "common", "read_concern_maj", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5692,7 +5681,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_replication_with_balancer
-  tags: ["concurrency", "common", "read_concern_maj"]
+  tags: ["concurrency", "common", "read_concern_maj", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5702,7 +5691,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_replication_no_txns
-  tags: ["concurrency", "no_txns"]
+  tags: ["concurrency", "no_txns", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5712,7 +5701,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_replication_no_txns_with_balancer
-  tags: ["concurrency", "no_txns"]
+  tags: ["concurrency", "no_txns", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5722,7 +5711,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_clusterwide_ops_add_remove_shards
-  tags: ["concurrency", "common", "read_concern_maj"]
+  tags: ["concurrency", "common", "read_concern_maj", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5742,7 +5731,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_causal_consistency_and_balancer
-  tags: ["concurrency"]
+  tags: ["concurrency", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5752,7 +5741,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_with_stepdowns
-  tags: ["concurrency", "stepdowns"]
+  tags: ["concurrency", "stepdowns", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5762,7 +5751,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_with_stepdowns_and_balancer
-  tags: ["concurrency", "stepdowns"]
+  tags: ["concurrency", "stepdowns", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5772,7 +5761,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_terminate_primary_with_balancer
-  tags: ["concurrency", "stepdowns", "kill_terminate"]
+  tags: ["concurrency", "stepdowns", "kill_terminate", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5782,7 +5771,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_kill_primary_with_balancer
-  tags: ["concurrency", "stepdowns", "kill_terminate"]
+  tags: ["concurrency", "stepdowns", "kill_terminate", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5792,7 +5781,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_multi_stmt_txn
-  tags: ["concurrency"]
+  tags: ["concurrency", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5802,7 +5791,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_multi_stmt_txn_with_balancer
-  tags: ["concurrency"]
+  tags: ["concurrency", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5812,7 +5801,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_local_read_write_multi_stmt_txn
-  tags: ["concurrency"]
+  tags: ["concurrency", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5822,7 +5811,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
-  tags: ["concurrency"]
+  tags: ["concurrency", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5832,7 +5821,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_multi_stmt_txn_with_stepdowns
-  tags: ["concurrency", "stepdowns"]
+  tags: ["concurrency", "stepdowns", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5842,7 +5831,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_multi_stmt_txn_terminate_primary
-  tags: ["concurrency", "stepdowns", "kill_terminate"]
+  tags: ["concurrency", "stepdowns", "kill_terminate", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -5852,7 +5841,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_multi_stmt_txn_kill_primary
-  tags: ["concurrency", "stepdowns", "kill_terminate"]
+  tags: ["concurrency", "stepdowns", "kill_terminate", "large"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -7827,38 +7816,6 @@ buildvariants:
     distros:
     - ubuntu1804-test
 
-- name: ubuntu1804-s390x
-  display_name: SSL Ubuntu 18.04 s390x
-  run_on:
-  - ubuntu1804-zseries-test
-  batchtime: 10080 # 7 days
-  expansions:
-    push_path: linux
-    push_bucket: downloads.mongodb.org
-    push_name: linux
-    push_arch: s390x-ubuntu1804
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1804 --release --jlink=3 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-    multiversion_platform: ubuntu1804
-    multiversion_edition: targeted
-    multiversion_architecture: s390x
-    has_packages: true
-    packager_script: packager.py
-    packager_arch: s390x
-    packager_distro: ubuntu1804
-    repo_edition: org
-    tooltags: "ssl"
-    build_mongoreplay: true
-  tasks:
-  - name: compile_all_run_unittests_TG
-    distros:
-    - ubuntu1804-zseries-build
-  - name: jsCore
-  - name: replica_sets_jscore_passthrough
-  - name: ssl_gen
-  - name: .publish
-    distros:
-    - ubuntu1804-test
-
 - name: enterprise-ubuntu1804-s390x
   display_name: Enterprise Ubuntu 18.04 s390x
   modules:
@@ -8827,15 +8784,35 @@ buildvariants:
   - name: concurrency_replication
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_replication_with_balancer
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_clusterwide_ops_add_remove_shards
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_local_read_write_multi_stmt_txn
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_multi_stmt_txn
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_multi_stmt_txn_with_balancer
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_multi_stmt_txn_with_stepdowns
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_with_stepdowns
+    distros:
+    - rhel62-large
   - name: concurrency_sharded_with_stepdowns_and_balancer
+    distros:
+    - rhel62-large
   - name: jsCore
   - name: jsCore_txns
   - name: logical_session_cache_replication_100ms_refresh_jscore_passthrough_gen
@@ -8935,6 +8912,8 @@ buildvariants:
   - name: .concurrency .no_txns
   - name: concurrency_sharded_causal_consistency_gen
   - name: concurrency_sharded_causal_consistency_and_balancer
+    distros:
+    - rhel62-large
   - name: concurrency_replication_causal_consistency
     distros:
     - rhel62-large
@@ -9322,7 +9301,10 @@ buildvariants:
   - name: .auth !.multiversion !.audit
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
-  - name: .concurrency .common
+  - name: .concurrency .common !.large
+  - name: .concurrency .common .large
+    distros:
+      - rhel62-large
   - name: concurrency_replication_causal_consistency
     distros:
       - rhel62-large
@@ -9696,64 +9678,6 @@ buildvariants:
     distros:
     - rhel62-small
 
-- name: rhel-72-s390x
-  display_name: SSL RHEL 7.2 s390x
-  run_on:
-  - rhel72-zseries-test
-  batchtime: 1440 # 1 day
-  expansions:
-    compile_flags: --ssl MONGO_DISTMOD=rhel72 --release -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-    has_packages: true
-    packager_script: packager.py
-    packager_arch: s390x
-    packager_distro: rhel72
-    push_path: linux
-    push_bucket: downloads.mongodb.org
-    push_name: linux
-    push_arch: s390x-rhel72
-    repo_edition: org
-    build_mongoreplay: true
-    tooltags: "ssl"
-  tasks:
-  - name: compile_all_run_unittests_TG
-    distros:
-    - rhel72-zseries-build
-  - name: jsCore
-  - name: replica_sets_jscore_passthrough
-  - name: ssl_gen
-  - name: .publish
-    distros:
-    - rhel70-small
-
-- name: rhel-67-s390x
-  display_name: SSL RHEL 6.7 s390x
-  run_on:
-  - rhel67-zseries-test
-  batchtime: 1440 # 1 day
-  expansions:
-    compile_flags: --ssl MONGO_DISTMOD=rhel67 --release -j3 CCFLAGS="-march=z9-109 -mtune=z10" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --use-hardware-crc32=off
-    has_packages: true
-    packager_script: packager.py
-    packager_arch: s390x
-    packager_distro: rhel67
-    push_path: linux
-    push_bucket: downloads.mongodb.org
-    push_name: linux
-    push_arch: s390x-rhel67
-    repo_edition: org
-    build_mongoreplay: true
-    tooltags: "ssl"
-  tasks:
-  - name: compile_all_run_unittests_TG
-    distros:
-    - rhel67-zseries-build
-  - name: jsCore
-  - name: replica_sets_jscore_passthrough
-  - name: ssl_gen
-  - name: .publish
-    distros:
-    - rhel62-small
-
 ###########################################
 #          Ubuntu buildvariants           #
 ###########################################
@@ -9955,40 +9879,6 @@ buildvariants:
     distros:
     - suse12-test
 
-- name: suse12-s390x
-  display_name: SSL SLES 12 s390x
-  run_on:
-  - suse12-zseries-test
-  batchtime: 10080 # 7 days
-  stepback: false
-  expansions:
-    push_path: linux
-    push_bucket: downloads.mongodb.org
-    push_name: linux
-    push_arch: s390x-suse12
-    compile_flags: --ssl MONGO_DISTMOD=suse12 --release -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-    has_packages: true
-    packager_script: packager.py
-    packager_arch: s390x
-    packager_distro: suse12
-    repo_edition: org
-    tooltags: "ssl sasl gssapi"
-    build_mongoreplay: true
-    multiversion_platform: suse12
-    multiversion_architecture: s390x
-    multiversion_edition: targeted
-  tasks:
-  - name: compile_all_run_unittests_TG
-    distros:
-    - suse12-zseries-build
-  - name: jsCore
-  - name: replica_sets_jscore_passthrough
-  - name: ssl_gen
-  - name: .publish
-    distros:
-    - suse12-test
-
-
 - name: suse12
   display_name: SSL SUSE 12
   run_on:
@@ -10019,7 +9909,10 @@ buildvariants:
   - name: .auth !.audit !.multiversion
   - name: causally_consistent_jscore_txns_passthrough
   - name: .misc_js
-  - name: .concurrency .common
+  - name: .concurrency .common !.large
+  - name: .concurrency .common .large
+    distros:
+      - suse12-build
   - name: concurrency_replication_causal_consistency
     distros:
       - suse12-build

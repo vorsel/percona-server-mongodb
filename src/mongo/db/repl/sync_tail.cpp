@@ -270,10 +270,6 @@ Status finishAndLogApply(ClockSource* clockSource,
     return finalStatus;
 }
 
-LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
-    return nss.isSystemDotViews() ? MODE_X : mode;
-}
-
 }  // namespace
 
 // static
@@ -567,6 +563,20 @@ void tryToGoLiveAsASecondary(OperationContext* opCtx,
         LOG(2) << "We cannot transition to SECONDARY state because our 'lastApplied' optime is "
                   "less than the 'minValid' optime. minValid optime: "
                << minValid << ", lastApplied optime: " << lastApplied;
+        return;
+    }
+
+    // Rolling back with eMRC false, we set initialDataTimestamp to max(local oplog top, source's
+    // oplog top), then rollback via refetch. Data is inconsistent until lastApplied >=
+    // initialDataTimestamp.
+    auto initialTs = opCtx->getServiceContext()->getStorageEngine()->getInitialDataTimestamp();
+    if (lastApplied.getTimestamp() < initialTs) {
+        invariant(!serverGlobalParams.enableMajorityReadConcern);
+        LOG(2) << "We cannot transition to SECONDARY state because our 'lastApplied' optime is "
+                  "less than the initial data timestamp and enableMajorityReadConcern = false. "
+                  "minValid optime: "
+               << minValid << ", lastApplied optime: " << lastApplied
+               << ", initialDataTimestamp: " << initialTs;
         return;
     }
 

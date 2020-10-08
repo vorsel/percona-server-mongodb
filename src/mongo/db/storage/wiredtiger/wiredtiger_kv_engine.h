@@ -219,6 +219,8 @@ public:
 
     void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
+    Timestamp getInitialDataTimestamp() override;
+
     void setOldestTimestampFromStable() override;
 
     /**
@@ -337,8 +339,6 @@ public:
     Timestamp getStableTimestamp() const override;
     Timestamp getOldestTimestamp() const override;
     Timestamp getCheckpointTimestamp() const override;
-
-    Timestamp getInitialDataTimestamp() const;
 
     /**
      * Returns the data file path associated with an ident on disk. Returns boost::none if the data

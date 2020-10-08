@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -46,9 +47,14 @@
 namespace mongo {
 namespace {
 
-class CmdIsMaster : public BasicCommand {
+constexpr auto kHelloString = "hello"_sd;
+// Aliases for the hello command in order to provide backwards compatibility.
+constexpr auto kCamelCaseIsMasterString = "isMaster"_sd;
+constexpr auto kLowerCaseIsMasterString = "ismaster"_sd;
+
+class CmdHello : public BasicCommand {
 public:
-    CmdIsMaster() : BasicCommand("isMaster", "ismaster") {}
+    CmdHello() : BasicCommand(kHelloString, {kCamelCaseIsMasterString, kLowerCaseIsMasterString}) {}
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -77,6 +83,12 @@ public:
              const BSONObj& cmdObj,
              BSONObjBuilder& result) override {
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+
+        // Parse the command name, which should be one of the following: hello, isMaster, or
+        // ismaster. If the command is "hello", we must attach an "isWritablePrimary" response field
+        // instead of "ismaster".
+        bool useLegacyResponseFields = (cmdObj.firstElementFieldNameStringData() != kHelloString);
+
         auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx->getClient());
         bool seenIsMaster = clientMetadataIsMasterState.hasSeenIsMaster();
         if (!seenIsMaster) {
@@ -106,7 +118,11 @@ public:
                 opCtx->getClient(), std::move(swParseClientMetadata.getValue()));
         }
 
-        result.appendBool("ismaster", true);
+        if (useLegacyResponseFields) {
+            result.appendBool("ismaster", true);
+        } else {
+            result.appendBool("isWritablePrimary", true);
+        }
         result.append("msg", "isdbgrid");
         result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
         result.appendNumber("maxMessageSizeBytes", MaxMessageSizeBytes);
@@ -135,7 +151,7 @@ public:
         return true;
     }
 
-} isMaster;
+} hello;
 
 }  // namespace
 }  // namespace mongo
