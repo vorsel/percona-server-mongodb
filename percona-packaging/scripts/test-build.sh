@@ -11,10 +11,19 @@ function check_libs {
 function prepare {
     CURDIR=$(pwd)
 
-    mkdir -p $CURDIR/temp
-    TMP_DIR=$CURDIR/temp
-    
-    TARBALL=$(basename $(find . -name "*glibc2.12.tar.gz" | sort))
+    if [ -f /etc/redhat-release ]; then
+        GLIBC_VER="$(rpm glibc -qa --qf %{VERSION})"
+    else
+        GLIBC_VER="$(dpkg-query -W -f='${Version}' libc6 | awk -F'-' '{print $1}')"
+    fi
+
+    TARBALLS=""
+    for tarball in $(find . -name "*.tar.gz"); do
+        if [[ "$(echo $tarball | grep -o "glibc2.*" | awk -F '.' '{print $2}')" -le "$(echo $GLIBC_VER | awk -F '.' '{print $2}')" ]]; then
+            TARBALLS+=" $(basename $tarball)"
+        fi
+    done
+    DIRLIST="bin lib/private"
 }
 
 function install_deps {
