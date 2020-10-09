@@ -949,9 +949,6 @@ wiredtiger_open_common =\
         We recommend making a backup copy of all files with the
         WiredTiger prefix prior to passing this flag.''',
         type='boolean'),
-    Config('big_hash_array_size', '512', r'''
-        size of several connection-level arrays which are considered big''',
-        min='512', max='1048576'),
     Config('session_max', '100', r'''
         maximum expected number of sessions (including server
         threads)''',
