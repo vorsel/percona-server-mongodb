@@ -552,8 +552,6 @@ extern int __wt_verbose_dump_handles(WT_SESSION_IMPL *session)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern int __wt_connection_init(WT_CONNECTION_IMPL *conn)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
-extern int __wt_connection_hash_arrays_init(WT_CONNECTION_IMPL *conn)
-  WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
 extern void __wt_connection_destroy(WT_CONNECTION_IMPL *conn);
 extern int __wt_logmgr_reconfig(WT_SESSION_IMPL *session, const char **cfg)
   WT_GCC_FUNC_DECL_ATTRIBUTE((warn_unused_result));
