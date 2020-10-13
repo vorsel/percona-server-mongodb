@@ -614,8 +614,6 @@ struct __wt_connection_stats {
     int64_t rec_split_stashed_bytes;
     int64_t rec_split_stashed_objects;
     int64_t session_open;
-    int64_t session_cursor_cache_size;
-    int64_t session_dhhash_size;
     int64_t session_query_ts;
     int64_t session_table_alter_fail;
     int64_t session_table_alter_success;
@@ -690,11 +688,9 @@ struct __wt_connection_stats {
     int64_t txn_checkpoint_time_max;
     int64_t txn_checkpoint_time_min;
     int64_t txn_checkpoint_time_recent;
-    int64_t txn_checkpoint_prepare_time;
     int64_t txn_checkpoint_scrub_target;
     int64_t txn_checkpoint_scrub_time;
     int64_t txn_checkpoint_time_total;
-    int64_t txn_checkpoint_tree_helper_time;
     int64_t txn_checkpoint;
     int64_t txn_checkpoint_skipped;
     int64_t txn_fail_cache;

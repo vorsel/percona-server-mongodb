@@ -2318,14 +2318,6 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
     WT_ERR(__conn_config_env(session, cfg, i1));
 
     /*
-     * Need to init big hash arrays as soon as possible
-     * (we can do this only after reading 'big_hash_array_size' from config)
-     */
-    WT_ERR(__wt_config_gets(session, cfg, "big_hash_array_size", &cval));
-    conn->big_hash_array_size = cval.val;
-    WT_ERR(__wt_connection_hash_arrays_init(conn));
-
-    /*
      * We need to know if configured for read-only or in-memory behavior
      * before reading/writing the filesystem. The only way the application
      * can configure that before we touch the filesystem is the wiredtiger
@@ -2482,12 +2474,6 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
 
     WT_ERR(__wt_config_gets(session, cfg, "session_scratch_max", &cval));
     conn->session_scratch_max = (size_t)cval.val;
-
-    WT_ERR(__wt_config_gets(session, cfg, "session_dhhash_size", &cval));
-    conn->session_dhhash_size = cval.val;
-
-    WT_ERR(__wt_config_gets(session, cfg, "session_cursor_cache_size", &cval));
-    conn->session_cursor_cache_size = cval.val;
 
     /*
      * If buffer alignment is not configured, use zero unless direct I/O is also configured, in
