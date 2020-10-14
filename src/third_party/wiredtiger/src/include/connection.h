@@ -219,26 +219,24 @@ struct __wt_connection_impl {
      * maintain both a simple list and a hash table of lists. The hash table key is based on a hash
      * of the table URI.
      */
-    /* Size of dhhash, fhhash, blockhash arrays */
-    uint32_t big_hash_array_size;
     /* Locked: data handle hash array */
-    TAILQ_HEAD(__wt_dhhash, __wt_data_handle) * dhhash;
+    TAILQ_HEAD(__wt_dhhash, __wt_data_handle) dhhash[WT_HASH_ARRAY_SIZE];
     /* Locked: data handle list */
     TAILQ_HEAD(__wt_dhandle_qh, __wt_data_handle) dhqh;
     /* Locked: LSM handle list. */
     TAILQ_HEAD(__wt_lsm_qh, __wt_lsm_tree) lsmqh;
     /* Locked: file list */
-    TAILQ_HEAD(__wt_fhhash, __wt_fh) * fhhash;
+    TAILQ_HEAD(__wt_fhhash, __wt_fh) fhhash[WT_HASH_ARRAY_SIZE];
     TAILQ_HEAD(__wt_fh_qh, __wt_fh) fhqh;
     /* Locked: library list */
     TAILQ_HEAD(__wt_dlh_qh, __wt_dlh) dlhqh;
 
     WT_SPINLOCK block_lock; /* Locked: block manager list */
-    TAILQ_HEAD(__wt_blockhash, __wt_block) * blockhash;
+    TAILQ_HEAD(__wt_blockhash, __wt_block) blockhash[WT_HASH_ARRAY_SIZE];
     TAILQ_HEAD(__wt_block_qh, __wt_block) blockqh;
 
     /* Locked: handles in each bucket */
-    u_int *dh_bucket_count;
+    u_int dh_bucket_count[WT_HASH_ARRAY_SIZE];
     u_int dhandle_count;        /* Locked: handles in the queue */
     u_int open_btree_count;     /* Locked: open writable btree count */
     uint32_t next_file_id;      /* Locked: file ID counter */
@@ -259,9 +257,6 @@ struct __wt_connection_impl {
     uint32_t session_cnt;      /* Session count */
 
     size_t session_scratch_max; /* Max scratch memory per session */
-
-    uint32_t session_dhhash_size;       /* Session dhandle hash array size */
-    uint32_t session_cursor_cache_size; /* Session cursor cache size */
 
     WT_CACHE *cache;              /* Page cache */
     volatile uint64_t cache_size; /* Cache size (either statically
