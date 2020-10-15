@@ -852,7 +852,7 @@ build_tarball(){
     if [ ! -d lib/private ]; then
         mkdir -p lib/private
     fi
-    LIBLIST="libcrypto.so libssl.so libpcap.so libsasl2.so libgssapi_krb5.so libkrb5.so libkrb5support.so libk5crypto.so libgssapi.so libsmime3.so libnss3.so libss3.so libnssutil3.so libplc4.so libnspr4.so libplds4.so libidn.so"
+    LIBLIST="libcrypto.so libssl.so libpcap.so libsasl2.so libsmime3.so libnss3.so libss3.so libnssutil3.so libplc4.so libnspr4.so libplds4.so libidn.so"
     DIRLIST="bin lib/private"
 
     LIBPATH=""
@@ -867,7 +867,7 @@ build_tarball(){
                     lib_realpath_basename="$(basename $(readlink -f ${libfromelf}))"
                     lib_without_version_suffix=$(echo ${lib_realpath_basename} | awk -F"." 'BEGIN { OFS = "." }{ print $1, $2}')
 
-                    if [ ! -f "lib/private/${lib_realpath_basename}" ] && [ ! -L "lib/private/${lib_realpath_basename}" ]; then
+                    if [ ! -f "lib/private/${lib_realpath_basename}" ] && [ ! -L "lib/private/${lib_without_version_suffix}" ]; then
                     
                         echo "Copying lib ${lib_realpath_basename}"
                         cp ${lib_realpath} lib/private
