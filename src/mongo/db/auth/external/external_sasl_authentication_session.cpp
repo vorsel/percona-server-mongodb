@@ -159,7 +159,7 @@ StatusWith<std::tuple<bool, std::string>> OpenLDAPServerMechanism::stepImpl(
         if(strlen(pw) == 0) {
             return Status(ErrorCodes::LDAPLibraryError,
                           "Failed to authenticate '{}'; No password provided."_format(
-                              dn));
+                              authn_id));
         }
 
         // transform user to DN
