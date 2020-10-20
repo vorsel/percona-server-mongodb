@@ -337,13 +337,6 @@ install_deps() {
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
         ln -s /usr/bin/python2.7 /usr/bin/python2
-        wget http://curl.haxx.se/download/curl-7.26.0.tar.gz
-        tar -xvzf curl-7.26.0.tar.gz
-        cd curl-7.26.0
-          ./configure
-          make
-          make install
-        cd ../
       elif [ x"$RHEL" = x7 ]; then
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint rpm-build git python-pip python-devel libopcodes libcurl-devel e2fsprogs-devel expat-devel lz4-devel which
         yum -y install python2-scons python2-pip python36-devel redhat-rpm-config python2-devel
@@ -362,6 +355,13 @@ install_deps() {
         pip3.6 install --user typing pyyaml regex Cheetah3
         pip2.7 install --user typing pyyaml regex Cheetah
       fi
+      wget http://curl.haxx.se/download/curl-7.66.0.tar.gz
+      tar -xvzf curl-7.66.0.tar.gz
+      cd curl-7.66.0
+        ./configure
+        make
+        make install
+      cd ../
       install_golang
       install_gcc_54_centos
     else
