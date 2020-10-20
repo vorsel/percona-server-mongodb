@@ -304,7 +304,7 @@ Status OpenLDAPAuthenticationSession::step(StringData inputData, std::string* ou
         if(strlen(pw) == 0) {
             return Status(ErrorCodes::LDAPLibraryError,
                           "Failed to authenticate '{}'; No password provided."_format(
-                              dn));
+                              authn_id));
         }
 
         // transform user to DN
