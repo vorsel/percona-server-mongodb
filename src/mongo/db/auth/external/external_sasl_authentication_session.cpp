@@ -156,6 +156,12 @@ StatusWith<std::tuple<bool, std::string>> OpenLDAPServerMechanism::stepImpl(
         const char* authn_id = authz_id + std::strlen(authz_id) + 1; // authentication id
         const char* pw = authn_id + std::strlen(authn_id) + 1; // password
 
+        if(strlen(pw) == 0) {
+            return Status(ErrorCodes::LDAPLibraryError,
+                          "Failed to authenticate '{}'; No password provided."_format(
+                              dn));
+        }
+
         // transform user to DN
         std::string mappedUser;
         {
