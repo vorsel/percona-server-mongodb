@@ -345,23 +345,20 @@ install_deps() {
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
         ln -s /usr/bin/python2.7 /usr/bin/python2
-        wget http://curl.haxx.se/download/curl-7.26.0.tar.gz
-        tar -xvzf curl-7.26.0.tar.gz
-        cd curl-7.26.0
-          ./configure
-          make
-          make install
-        cd ../
       elif [ x"$RHEL" = x7 ]; then
         yum -y install epel-release
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint
-        yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel
+        yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel which
         yum -y install openldap-devel krb5-devel
+        pip install --upgrade pip
+        pip2.7 install --user setuptools --upgrade
+        pip3.6 install --user typing pyyaml regex Cheetah3
+        pip2.7 install --user typing pyyaml regex Cheetah Cheetah3
       else
         yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
         yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
-        yum -y install python2-scons python2-pip python36-devel
+        yum -y install python2-scons python2-pip python36-devel which
         yum -y install redhat-rpm-config python2-devel e2fsprogs-devel expat-devel lz4-devel
         yum -y install openldap-devel krb5-devel
       fi
@@ -370,6 +367,13 @@ install_deps() {
         /usr/bin/pip2.7 install --user typing pyyaml regex Cheetah
       fi
 #
+      wget http://curl.haxx.se/download/curl-7.66.0.tar.gz
+      tar -xvzf curl-7.66.0.tar.gz
+      cd curl-7.66.0
+        ./configure
+        make
+        make install
+      cd ../
       install_golang
       install_gcc_8_centos
       if [ -f /opt/rh/devtoolset-8/enable ]; then
@@ -379,6 +383,8 @@ install_deps() {
       pip install --upgrade pip
 
     else
+      apt-get -y update
+      DEBIAN_FRONTEND=noninteractive apt-get -y install curl wget lsb-release
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
       if [ x"${DEBIAN}" = xjessie ]; then
@@ -393,7 +399,7 @@ EOL
       wget https://repo.percona.com/apt/percona-release_latest.$(lsb_release -sc)_all.deb && dpkg -i percona-release_latest.$(lsb_release -sc)_all.deb
       percona-release enable tools testing
       apt-get update
-      INSTALL_LIST="python3 python3-dev python3-pip valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl"
+      INSTALL_LIST="git python3 python3-dev python3-pip valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl"
       INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev libldap2-dev libkrb5-dev patchelf"
       until apt-get -y install dirmngr; do
         sleep 1
