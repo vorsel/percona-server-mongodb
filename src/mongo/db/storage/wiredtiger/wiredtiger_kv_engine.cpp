@@ -1106,8 +1106,8 @@ int WiredTigerKVEngine::flushAllFiles(OperationContext* opCtx, bool sync) {
     }
     syncSizeInfo(false);
     const bool forceCheckpoint = true;
-    // If there's no journal, we must take a full checkpoint.
-    const bool stableCheckpoint = _durable;
+    // If there's no journal or if majority read concern is off, we must take a full checkpoint.
+    const bool stableCheckpoint = _durable && serverGlobalParams.enableMajorityReadConcern;
     _sessionCache->waitUntilDurable(forceCheckpoint, stableCheckpoint);
 
     return 1;
@@ -2138,9 +2138,14 @@ void WiredTigerKVEngine::setOldestTimestamp(Timestamp oldestTimestamp, bool forc
 }
 
 void WiredTigerKVEngine::setInitialDataTimestamp(Timestamp initialDataTimestamp) {
+    _initialDataTimestamp.store(initialDataTimestamp.asULL());
     if (_checkpointThread) {
         _checkpointThread->setInitialDataTimestamp(initialDataTimestamp);
     }
+}
+
+Timestamp WiredTigerKVEngine::getInitialDataTimestamp() const {
+    return Timestamp(_initialDataTimestamp.load());
 }
 
 bool WiredTigerKVEngine::supportsRecoverToStableTimestamp() const {

@@ -50,6 +50,8 @@ MONGO_EXPORT_SERVER_PARAMETER(internalQueryCacheEvictionRatio, double, 10.0);
 
 MONGO_EXPORT_SERVER_PARAMETER(internalQueryPlannerMaxIndexedSolutions, int, 64);
 
+MONGO_EXPORT_SERVER_PARAMETER(internalQueryEnumerationPreferLockstepOrEnumeration, bool, false);
+
 MONGO_EXPORT_SERVER_PARAMETER(internalQueryEnumerationMaxOrSolutions, int, 10);
 
 MONGO_EXPORT_SERVER_PARAMETER(internalQueryEnumerationMaxIntersectPerAnd, int, 3);
@@ -71,6 +73,15 @@ MONGO_EXPORT_SERVER_PARAMETER(internalQueryExecYieldIterations, int, 128);
 MONGO_EXPORT_SERVER_PARAMETER(internalQueryExecYieldPeriodMS, int, 10);
 
 MONGO_EXPORT_SERVER_PARAMETER(internalQueryFacetBufferSizeBytes, int, 100 * 1024 * 1024);
+
+MONGO_EXPORT_SERVER_PARAMETER(internalQueryFacetMaxOutputDocSizeBytes, long long, 100 * 1024 * 1024)
+    ->withValidator([](const long long& newVal) {
+        if (newVal <= 0) {
+            return Status(ErrorCodes::BadValue,
+                          "internalQueryFacetMaxOutputDocSizeBytes must be positive");
+        }
+        return Status::OK();
+    });
 
 MONGO_EXPORT_SERVER_PARAMETER(internalLookupStageIntermediateDocumentMaxSizeBytes,
                               long long,

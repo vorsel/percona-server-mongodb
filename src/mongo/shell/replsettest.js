@@ -123,7 +123,7 @@ var ReplSetTest = function(opts) {
         var twoPrimaries = false;
         self.nodes.forEach(function(node) {
             try {
-                node.setSlaveOk();
+                node.setSecondaryOk();
                 var n = node.getDB('admin').runCommand({ismaster: 1});
                 self._liveNodes.push(node);
                 if (n.ismaster == true) {
@@ -490,6 +490,13 @@ var ReplSetTest = function(opts) {
         }
 
         return undefined;
+    };
+
+    this.getDbPath = function(node) {
+        // Get a replica set node (check for use of bridge).
+        const n = this.getNodeId(node);
+        const replNode = _useBridge ? _unbridgedNodes[n] : this.nodes[n];
+        return replNode.dbpath;
     };
 
     this.getPort = function(n) {

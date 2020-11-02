@@ -203,6 +203,7 @@
             expectFailure: true,
             expectedErrorCode: ErrorCodes.NotMasterOrSecondary
         },
+        hello: {skip: isNotAUserDataRead},
         hostInfo: {skip: isNotAUserDataRead},
         httpClientRequest: {skip: isNotAUserDataRead},
         insert: {skip: isPrimaryOnly},

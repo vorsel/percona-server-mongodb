@@ -245,6 +245,10 @@ void WiredTigerSessionCache::waitUntilDurable(bool forceCheckpoint, bool stableC
         return;
     }
 
+    if (stableCheckpoint) {
+        invariant(serverGlobalParams.enableMajorityReadConcern);
+    }
+
     const int shuttingDown = _shuttingDown.fetchAndAdd(1);
     ON_BLOCK_EXIT([this] { _shuttingDown.fetchAndSubtract(1); });
 

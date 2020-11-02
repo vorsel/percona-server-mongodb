@@ -237,7 +237,7 @@ if (typeof _threadInject != "undefined") {
         // The following tests cannot run when shell readMode is legacy.
         if (db.getMongo().readMode() === "legacy") {
             var requires_find_command = [
-                "explode_for_sort_collation.js",
+                "merge_sort_collation.js",
                 "views/views_aggregation.js",
                 "views/views_change.js",
                 "views/views_drop.js",
@@ -396,11 +396,19 @@ if (typeof _threadInject != "undefined") {
         for (var i in params) {
             var param = params[i];
             var test = param.shift();
+
+            // Make a shallow copy of TestData so we can override the test name to
+            // prevent tests on different threads that to use jsTestName() as the
+            // collection name from colliding.
+            const clonedTestData = Object.assign({}, TestData);
+            clonedTestData.testName = `ParallelTesterThread${i}`;
+
             var t;
             if (newScopes)
-                t = new ScopedThread(wrapper, test, param, {TestData: TestData});
+                t = new ScopedThread(wrapper, test, param, {TestData: clonedTestData});
             else
-                t = new Thread(wrapper, test, param, {TestData: TestData});
+                t = new Thread(wrapper, test, param, {TestData: clonedTestData});
+
             runners.push(t);
         }
 

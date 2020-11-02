@@ -216,6 +216,7 @@
             behavior: "unshardedOnly"
         },
         handshake: {skip: "does not return user data"},
+        hello: {skip: "does not return user data"},
         hostInfo: {skip: "does not return user data"},
         insert: {skip: "primary only"},
         invalidateUserCache: {skip: "does not return user data"},

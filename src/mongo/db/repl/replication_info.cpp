@@ -33,6 +33,7 @@
 #include <list>
 #include <vector>
 
+#include "mongo/base/string_data.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/client.h"
@@ -74,20 +75,27 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(impersonateFullyUpgradedFutureVersion);
 
-void appendReplicationInfo(OperationContext* opCtx, BSONObjBuilder& result, int level) {
+constexpr auto kHelloString = "hello"_sd;
+constexpr auto kCamelCaseIsMasterString = "isMaster"_sd;
+constexpr auto kLowerCaseIsMasterString = "ismaster"_sd;
+
+void appendReplicationInfo(OperationContext* opCtx,
+                           BSONObjBuilder& result,
+                           int level,
+                           bool useLegacyResponseFields) {
     ReplicationCoordinator* replCoord = ReplicationCoordinator::get(opCtx);
     if (replCoord->getSettings().usingReplSets()) {
         const auto& horizonParams = SplitHorizon::getParameters(opCtx->getClient());
         IsMasterResponse isMasterResponse;
         replCoord->fillIsMasterForReplSet(&isMasterResponse, horizonParams);
-        result.appendElements(isMasterResponse.toBSON());
+        result.appendElements(isMasterResponse.toBSON(useLegacyResponseFields));
         if (level) {
             replCoord->appendSlaveInfoData(&result);
         }
         return;
     }
 
-    result.appendBool("ismaster",
+    result.appendBool((useLegacyResponseFields ? "ismaster" : "isWritablePrimary"),
                       ReplicationCoordinator::get(opCtx)->isMasterForReportingPurposes());
 
     if (level) {
@@ -169,7 +177,10 @@ public:
         int level = configElement.numberInt();
 
         BSONObjBuilder result;
-        appendReplicationInfo(opCtx, result, level);
+
+        // TODO SERVER-50219: Change useLegacyResponseFields to false once the serverStatus changes
+        // to remove master-slave terminology are merged.
+        appendReplicationInfo(opCtx, result, level, true /* useLegacyResponseFields */);
 
         auto rbid = ReplicationProcess::get(opCtx)->getRollbackID();
         if (ReplicationProcess::kUninitializedRollbackId != rbid) {
@@ -207,8 +218,10 @@ public:
     }
 } oplogInfoServerStatus;
 
-class CmdIsMaster : public BasicCommand {
+class CmdHello : public BasicCommand {
 public:
+    CmdHello() : CmdHello(kHelloString, {}) {}
+
     bool requiresAuth() const override {
         return false;
     }
@@ -217,7 +230,7 @@ public:
     }
     std::string help() const override {
         return "Check if this server is primary for a replica set\n"
-               "{ isMaster : 1 }";
+               "{ hello : 1 }";
     }
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -225,7 +238,6 @@ public:
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) const {}  // No auth required
-    CmdIsMaster() : BasicCommand("isMaster", "ismaster") {}
     virtual bool run(OperationContext* opCtx,
                      const string&,
                      const BSONObj& cmdObj,
@@ -345,7 +357,7 @@ public:
                 });
         }
 
-        appendReplicationInfo(opCtx, result, 0);
+        appendReplicationInfo(opCtx, result, 0, useLegacyResponseFields());
 
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             const int configServerModeNumber = 2;
@@ -391,7 +403,35 @@ public:
 
         return true;
     }
-} cmdismaster;
+
+protected:
+    CmdHello(const StringData cmdName, const std::initializer_list<StringData>& alias)
+        : BasicCommand(cmdName, alias) {}
+
+    virtual bool useLegacyResponseFields() {
+        return false;
+    }
+
+} cmdhello;
+
+class CmdIsMaster : public CmdHello {
+public:
+    CmdIsMaster() : CmdHello(kCamelCaseIsMasterString, {kLowerCaseIsMasterString}) {}
+
+    std::string help() const override {
+        return "Check if this server is primary for a replica set\n"
+               "{ isMaster : 1 }";
+    }
+
+protected:
+    // Parse the command name, which should be one of the following: hello, isMaster, or
+    // ismaster. If the command is "hello", we must attach an "isWritablePrimary" response field
+    // instead of "ismaster" and "secondaryDelaySecs" response field instead of "slaveDelay".
+    bool useLegacyResponseFields() override {
+        return true;
+    }
+
+} cmdIsMaster;
 
 OpCounterServerStatusSection replOpCounterServerStatusSection("opcountersRepl", &replOpCounters);
 
