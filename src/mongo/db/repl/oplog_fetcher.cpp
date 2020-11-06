@@ -55,6 +55,7 @@ MONGO_FAIL_POINT_DEFINE(hangAfterOplogFetcherCallbackScheduled);
 MONGO_FAIL_POINT_DEFINE(hangBeforeStartingOplogFetcher);
 MONGO_FAIL_POINT_DEFINE(hangBeforeOplogFetcherRetries);
 MONGO_FAIL_POINT_DEFINE(hangBeforeProcessingSuccessfulBatch);
+MONGO_FAIL_POINT_DEFINE(hangOplogFetcherBeforeAdvancingLastFetched);
 
 namespace {
 class OplogBatchStats {
@@ -307,8 +308,7 @@ Milliseconds OplogFetcher::_getRetriedFindMaxTime() const {
 
 void OplogFetcher::_finishCallback(Status status) {
     invariant(isActive());
-
-    _onShutdownCallbackFn(status);
+    _onShutdownCallbackFn(status, _requiredRBID);
 
     decltype(_onShutdownCallbackFn) onShutdownCallbackFn;
     decltype(_oplogFetcherRestartDecision) oplogFetcherRestartDecision;
@@ -717,6 +717,10 @@ Status OplogFetcher::_onSuccessfulBatch(const Documents& documents) {
         return status;
     }
 
+    if (MONGO_unlikely(hangOplogFetcherBeforeAdvancingLastFetched.shouldFail())) {
+        hangOplogFetcherBeforeAdvancingLastFetched.pauseWhileSet();
+    }
+
     // Start skipping the first doc after at least one doc has been enqueued in the lifetime
     // of this fetcher.
     _startingPoint = StartingPoint::kSkipFirstDoc;
@@ -764,15 +768,19 @@ Status OplogFetcher::_checkRemoteOplogStart(const OplogFetcher::Documents& docum
                                             int remoteRBID) {
     using namespace fmt::literals;
 
-    // Once we establish our cursor, we need to ensure that our upstream node hasn't rolled back
-    // since that could cause it to not have our required minValid point. The cursor will be
-    // killed if the upstream node rolls back so we don't need to keep checking once the cursor
-    // is established.
-    if (remoteRBID != _requiredRBID) {
+    // Once we establish our cursor, if we use rollback-via-refetch, we need to ensure that our
+    // upstream node hasn't rolled back since that could cause it to not have our required minValid
+    // point. The cursor will be killed if the upstream node rolls back so we don't need to keep
+    // checking once the cursor is established. If we do not use rollback-via-refetch, this check is
+    // not necessary, and _requiredRBID will be set to kUninitializedRollbackId in that case.
+    if (_requiredRBID != ReplicationProcess::kUninitializedRollbackId &&
+        remoteRBID != _requiredRBID) {
         return Status(ErrorCodes::InvalidSyncSource,
                       "Upstream node rolled back after choosing it as a sync source. Choosing "
                       "new sync source.");
     }
+    // Set _requiredRBID to remoteRBID so that it can be returned when the oplog fetcher shuts down.
+    _requiredRBID = remoteRBID;
 
     // Sometimes our remoteLastOpApplied may be stale; if we received a document with an
     // opTime later than remoteLastApplied, we can assume the remote is at least up to that

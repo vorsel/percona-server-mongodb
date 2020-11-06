@@ -132,8 +132,13 @@ void doLogImpl(int32_t id,
                StringData message,
                TypeErasedAttributeStorage const& attrs) {
     dassert(options.component() != LogComponent::kNumLogComponents);
-    if (TestingProctor::instance().isEnabled())
+    // TestingProctor isEnabled cannot be called before it has been
+    // initialized. But log statements occurring earlier than that still need
+    // to be checked. Log performance isn't as important at startup, so until
+    // the proctor is initialized, we check everything.
+    if (const auto& tp = TestingProctor::instance(); !tp.isInitialized() || tp.isEnabled()) {
         checkUniqueAttrs(id, attrs);
+    }
 
     auto& source = options.domain().internal().source();
     auto record = source.open_record(id,
