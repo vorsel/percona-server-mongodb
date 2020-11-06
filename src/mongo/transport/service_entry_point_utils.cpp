@@ -33,6 +33,7 @@
 
 #include "mongo/transport/service_entry_point_utils.h"
 
+#include <fmt/format.h>
 #include <functional>
 #include <memory>
 
@@ -50,6 +51,8 @@
 #define __has_feature(x) 0
 #endif
 
+using namespace fmt::literals;
+
 namespace mongo {
 
 namespace {
@@ -61,7 +64,7 @@ void* runFunc(void* ctx) {
 }
 }  // namespace
 
-Status launchServiceWorkerThread(std::function<void()> task) {
+Status launchServiceWorkerThread(std::function<void()> task) noexcept {
 
     try {
 #if defined(_WIN32)
@@ -110,21 +113,15 @@ Status launchServiceWorkerThread(std::function<void()> task) {
         int failed = pthread_create(&thread, &attrs, runFunc, ctx.get());
 
         pthread_attr_destroy(&attrs);
-
-        if (failed) {
-            LOGV2(22948,
-                  "pthread_create failed: {errno}",
-                  "pthread_create failed",
-                  "error"_attr = errnoWithDescription(failed));
-            throw std::system_error(
-                std::make_error_code(std::errc::resource_unavailable_try_again));
-        }
+        uassert(4850900, "pthread_create failed: {}"_format(errnoWithDescription(failed)), !failed);
 
         ctx.release();
 #endif
 
-    } catch (...) {
-        return {ErrorCodes::InternalError, "failed to create service entry worker thread"};
+    } catch (const std::exception& e) {
+        LOGV2_ERROR(22948, "Thread creation failed", "error"_attr = e.what());
+        return {ErrorCodes::InternalError,
+                format(FMT_STRING("Failed to create service entry worker thread: {}"), e.what())};
     }
 
     return Status::OK();

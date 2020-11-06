@@ -236,6 +236,12 @@ OpTime ReplicationCoordinatorNoOp::getMyLastDurableOpTime() const {
     MONGO_UNREACHABLE;
 }
 
+Status ReplicationCoordinatorNoOp::waitUntilMajorityOpTime(OperationContext* opCtx,
+                                                           OpTime targetOpTime,
+                                                           boost::optional<Date_t> deadline) {
+    MONGO_UNREACHABLE;
+}
+
 Status ReplicationCoordinatorNoOp::waitUntilOpTimeForRead(OperationContext*,
                                                           const ReadConcernArgs& readConcern) {
     MONGO_UNREACHABLE;
@@ -293,7 +299,8 @@ ReplSetConfig ReplicationCoordinatorNoOp::getConfig() const {
 }
 
 void ReplicationCoordinatorNoOp::processReplSetGetConfig(BSONObjBuilder* result,
-                                                         bool commitmentStatus) {
+                                                         bool commitmentStatus,
+                                                         bool includeNewlyAdded) {
     MONGO_UNREACHABLE;
 }
 

@@ -432,6 +432,13 @@ public:
     virtual OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const = 0;
 
     /**
+     * Waits until the majority committed snapshot is at least the 'targetOpTime'.
+     */
+    virtual Status waitUntilMajorityOpTime(OperationContext* opCtx,
+                                           OpTime targetOpTime,
+                                           boost::optional<Date_t> deadline = boost::none) = 0;
+
+    /**
      * Waits until the optime of the current node is at least the opTime specified in 'settings'.
      *
      * Returns whether the wait was successful.
@@ -627,8 +634,12 @@ public:
      *
      * If commitmentStatus is true, adds a boolean 'commitmentStatus' field to 'result' indicating
      * whether the current config is committed.
+     *
+     * If includeNewlyAdded is true, does not omit 'newlyAdded' fields from the config.
      */
-    virtual void processReplSetGetConfig(BSONObjBuilder* result, bool commitmentStatus = false) = 0;
+    virtual void processReplSetGetConfig(BSONObjBuilder* result,
+                                         bool commitmentStatus = false,
+                                         bool includeNewlyAdded = false) = 0;
 
     /**
      * Processes the ReplSetMetadata returned from a command run against another

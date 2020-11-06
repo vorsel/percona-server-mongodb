@@ -251,6 +251,12 @@ OpTime ReplicationCoordinatorEmbedded::getMyLastDurableOpTime() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
+Status ReplicationCoordinatorEmbedded::waitUntilMajorityOpTime(OperationContext* opCtx,
+                                                               repl::OpTime targetOpTime,
+                                                               boost::optional<Date_t> deadline) {
+    UASSERT_NOT_IMPLEMENTED;
+}
+
 Status ReplicationCoordinatorEmbedded::waitUntilOpTimeForRead(OperationContext*,
                                                               const ReadConcernArgs& readConcern) {
     // nothing to wait for
@@ -318,7 +324,8 @@ ReplSetConfig ReplicationCoordinatorEmbedded::getConfig() const {
 }
 
 void ReplicationCoordinatorEmbedded::processReplSetGetConfig(BSONObjBuilder*,
-                                                             bool commitmentStatus) {
+                                                             bool commitmentStatus,
+                                                             bool includeNewlyAdded) {
     UASSERT_NOT_IMPLEMENTED;
 }
 

@@ -188,6 +188,10 @@ public:
     virtual OpTime getMyLastDurableOpTime() const override;
     virtual OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const override;
 
+    virtual Status waitUntilMajorityOpTime(OperationContext* opCtx,
+                                           OpTime targetOpTime,
+                                           boost::optional<Date_t> deadline = boost::none) override;
+
     virtual Status waitUntilOpTimeForReadUntil(OperationContext* opCtx,
                                                const ReadConcernArgs& readConcern,
                                                boost::optional<Date_t> deadline) override;
@@ -224,7 +228,8 @@ public:
     virtual ReplSetConfig getConfig() const override;
 
     virtual void processReplSetGetConfig(BSONObjBuilder* result,
-                                         bool commitmentStatus = false) override;
+                                         bool commitmentStatus = false,
+                                         bool includeNewlyAdded = false) override;
 
     virtual void processReplSetMetadata(const rpc::ReplSetMetadata& replMetadata) override;
 
@@ -1404,13 +1409,6 @@ private:
     Status _waitUntilOpTime(OperationContext* opCtx,
                             OpTime targetOpTime,
                             boost::optional<Date_t> deadline = boost::none);
-
-    /**
-     * Waits until the majority committed snapshot is at least the 'targetOpTime'.
-     */
-    Status _waitUntilMajorityOpTime(OperationContext* opCtx,
-                                    OpTime targetOpTime,
-                                    boost::optional<Date_t> deadline = boost::none);
 
     /**
      * Waits until the optime of the current node is at least the opTime specified in 'readConcern'.

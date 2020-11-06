@@ -150,6 +150,7 @@ namespace mongo {
     X(replSetReconfig) /* ID only */                                                  \
     X(replSetResizeOplog)                                                             \
     X(replSetStateChange)                                                             \
+    X(reshardCollection)                                                              \
     X(resync)                                                                         \
     X(revokeRole)                                                                     \
     X(revokePrivilegesFromRole) /* ID only */                                         \
