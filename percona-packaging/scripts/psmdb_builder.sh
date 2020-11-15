@@ -207,11 +207,11 @@ get_system(){
 }
 
 install_golang() {
-    wget https://dl.google.com/go/go1.11.4.linux-amd64.tar.gz -O /tmp/golang1.11.tar.gz
-    tar --transform=s,go,go1.11, -zxf /tmp/golang1.11.tar.gz
-    rm -rf /usr/local/go1.11  /usr/local/go1.8 /usr/local/go1.9 /usr/local/go1.9.2 /usr/local/go
-    mv go1.11 /usr/local/
-    ln -s /usr/local/go1.11 /usr/local/go
+    wget https://golang.org/dl/go1.12.17.linux-amd64.tar.gz -O /tmp/golang1.12.tar.gz
+    tar --transform=s,go,go1.12, -zxf /tmp/golang1.12.tar.gz
+    rm -rf /usr/local/go1.12 /usr/local/go1.11  /usr/local/go1.8 /usr/local/go1.9 /usr/local/go1.9.2 /usr/local/go
+    mv go1.12 /usr/local/
+    ln -s /usr/local/go1.12 /usr/local/go
 }
 
 install_gcc_8_centos(){
@@ -343,13 +343,6 @@ install_deps() {
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
         ln -s /usr/bin/python2.7 /usr/bin/python2
-        wget http://curl.haxx.se/download/curl-7.26.0.tar.gz
-        tar -xvzf curl-7.26.0.tar.gz
-        cd curl-7.26.0
-          ./configure
-          make
-          make install
-        cd ../
       elif [ x"$RHEL" = x7 ]; then
         yum -y install epel-release
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
@@ -367,6 +360,13 @@ install_deps() {
         /usr/bin/pip3.6 install --user typing pyyaml regex Cheetah3
         /usr/bin/pip2.7 install --user typing pyyaml regex Cheetah
       fi
+      wget https://curl.se/download/curl-7.66.0.tar.gz
+      tar -xvzf curl-7.66.0.tar.gz
+      cd curl-7.66.0
+        ./configure
+        make
+        make install
+      cd ../
 #
       install_golang
       install_gcc_8_centos
@@ -715,6 +715,10 @@ build_deb(){
       CURL_LINKFLAGS=$(pkg-config libcurl --static --libs)
       export LINKFLAGS="${LINKFLAGS} ${CURL_LINKFLAGS}"
     fi
+    export GOROOT="/usr/local/go/"
+    export GOPATH=$PWD/../
+    export PATH="/usr/local/go/bin:$PATH:$GOPATH"
+    export GOBINPATH="/usr/local/go/bin"
     dpkg-buildpackage -rfakeroot -us -uc -b
     mkdir -p $CURDIR/deb
     mkdir -p $WORKDIR/deb
@@ -859,26 +863,21 @@ build_tarball(){
     cd ${WORKDIR}
     #
     # Build mongo tools
-    cd ${TOOLSDIR}
     mkdir -p build_tools/src/github.com/mongodb/mongo-tools
     export GOROOT="/usr/local/go/"
     export GOPATH=$PWD/
     export PATH="/usr/local/go/bin:$PATH:$GOPATH"
     export GOBINPATH="/usr/local/go/bin"
-    rm -rf vendor/pkg
-    cp -r $(ls | grep -v build_tools) build_tools/src/github.com/mongodb/mongo-tools/
-    cd build_tools/src/github.com/mongodb/mongo-tools
+    mkdir -p $GOPATH/src/github.com/mongodb
+    cd $GOPATH/src/github.com/mongodb
+    cp -r ${WORKDIR}/${TOOLSDIR} ./
+    cd mongo-tools
     . ./set_tools_revision.sh
-    sed -i 's|VersionStr="$(go run release/release.go get-version)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
-    sed -i 's|GitCommit="$(git rev-parse HEAD)"|GitCommit="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
-    . ./set_goenv.sh
-    if [ ${DEBUG} = 0 ]; then
-        sed -i 's|go build|go build -a -x|' build.sh
-    else
-        sed -i 's|go build|go build -a |' build.sh
-    fi
-    sed -i 's|exit $ec||' build.sh
-    . ./build.sh ${TOOLS_TAGS}
+    sed -i '12d' buildscript/build.go
+    sed -i '169,178d' buildscript/build.go
+    sed -i "s:versionStr,:\"$PSMDB_TOOLS_REVISION\",:" buildscript/build.go
+    sed -i "s:gitCommit):\"$PSMDB_TOOLS_COMMIT_HASH\"):" buildscript/build.go
+    ./make build
     # move mongo tools to PSM installation dir
     mv bin/* ${PSMDIR_ABS}/${PSMDIR}/bin
     # end build tools
