@@ -347,13 +347,6 @@ install_deps() {
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
         ln -s /usr/bin/python2.7 /usr/bin/python2
-        wget http://curl.haxx.se/download/curl-7.26.0.tar.gz
-        tar -xvzf curl-7.26.0.tar.gz
-        cd curl-7.26.0
-          ./configure
-          make
-          make install
-        cd ../
       elif [ x"$RHEL" = x7 ]; then
         yum -y install epel-release
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
@@ -371,6 +364,13 @@ install_deps() {
         /usr/bin/pip3.6 install --user typing pyyaml regex Cheetah3
         /usr/bin/pip2.7 install --user typing pyyaml regex Cheetah
       fi
+        wget https://curl.se/download/curl-7.66.0.tar.gz
+        tar -xvzf curl-7.66.0.tar.gz
+        cd curl-7.66.0
+          ./configure
+          make
+          make install
+        cd ../
 #
       install_golang
       install_gcc_8_centos
