@@ -34,21 +34,20 @@ percona-server-mongodb:
 
 compile-mongo-tools:
 	mkdir $(PSMSRC)/bin || true;
-	mkdir -p $(PSMSRC)/build_tools/src/github.com/mongodb/mongo-tools;
-	cp -r $(PSMSRC)/mongo-tools/* $(PSMSRC)/build_tools/src/github.com/mongodb/mongo-tools;
-	#mv $(PSMSRC)/build_tools $(PSMSRC)/mongo-tools/;
-	cp -r $(PSMSRC)/build_tools $(PSMSRC)/mongo-tools/;
-	cd $(PSMSRC)/mongo-tools/build_tools/src/github.com/mongodb/mongo-tools; \
+	mkdir -p $(PSMSRC)/../src/github.com/mongodb;
+	cp -r $(PSMSRC)/mongo-tools $(PSMSRC)/../src/github.com/mongodb;
 	export GOROOT="/usr/local/go/"; \
-	export GOPATH=$(PWD)/; \
-	export PATH="/usr/local/go/bin:$(PATH):$(GOPATH)"; \
-	export GOBINPATH="/usr/local/go/bin"; \
-	. ./set_tools_revision.sh; \
-	. ./set_goenv.sh; \
-	mkdir -p bin; \
-	bash -x ./build.sh ${TOOLS_TAGS};
-	cp -av $(PSMSRC)/mongo-tools/build_tools/src/github.com/mongodb/mongo-tools/bin/* $(PSMSRC)/bin; \
-	cd $(PSMSRC)/mongo-tools;
+        export GOPATH=$(PSMSRC)/../; \
+        export PATH="/usr/local/go/bin:$(PATH):$(GOPATH)"; \
+        export GOBINPATH="/usr/local/go/bin"
+	cd $(PSMSRC)/../src/github.com/mongodb/mongo-tools; \
+        sed -i '12d' buildscript/build.go; \
+        sed -i '169,178d' buildscript/build.go; \
+        sed -i "s:versionStr,:\"$(PSMDB_TOOLS_REVISION)\",:" buildscript/build.go; \
+        sed -i "s:gitCommit):\"$(PSMDB_TOOLS_COMMIT_HASH)\"):" buildscript/build.go; \
+        ./make build;
+	cp -av $(PSMSRC)/../src/github.com/mongodb/mongo-tools/bin/* $(PSMSRC)/bin; \
+        cd $(PSMSRC);
 
 build: percona-server-mongodb compile-mongo-tools
 

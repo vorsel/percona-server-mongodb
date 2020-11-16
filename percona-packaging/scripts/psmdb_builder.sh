@@ -708,6 +708,10 @@ build_deb(){
       CURL_LINKFLAGS=$(pkg-config libcurl --static --libs)
       export LINKFLAGS="${LINKFLAGS} ${CURL_LINKFLAGS}"
     fi
+    export GOROOT="/usr/local/go/"
+    export GOPATH=$PWD/../
+    export PATH="/usr/local/go/bin:$PATH:$GOPATH"
+    export GOBINPATH="/usr/local/go/bin"
     dpkg-buildpackage -rfakeroot -us -uc -b
     mkdir -p $CURDIR/deb
     mkdir -p $WORKDIR/deb
@@ -854,29 +858,23 @@ build_tarball(){
     cd ${WORKDIR}
     #
     # Build mongo tools
-    cd ${TOOLSDIR}
     mkdir -p build_tools/src/github.com/mongodb/mongo-tools
     export GOROOT="/usr/local/go/"
     export GOPATH=$PWD/
     export PATH="/usr/local/go/bin:$PATH:$GOPATH"
     export GOBINPATH="/usr/local/go/bin"
-    rm -rf vendor/pkg
-    cp -r $(ls | grep -v build_tools) build_tools/src/github.com/mongodb/mongo-tools/
-    cd build_tools/src/github.com/mongodb/mongo-tools
+    mkdir -p $GOPATH/src/github.com/mongodb
+    cd $GOPATH/src/github.com/mongodb
+    cp -r ${WORKDIR}/${TOOLSDIR} ./
+    cd mongo-tools
     . ./set_tools_revision.sh
-    sed -i 's|VersionStr="$(git describe)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
-    sed -i 's|Gitspec="$(git rev-parse HEAD)"|Gitspec="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
-    . ./set_goenv.sh
-    if [ ${DEBUG} = 0 ]; then
-        sed -i 's|go build|go build -a -x|' build.sh
-    else
-        sed -i 's|go build|go build -a |' build.sh
-    fi
-    sed -i 's|exit $ec||' build.sh
-    . ./build.sh ${TOOLS_TAGS}
+    sed -i '12d' buildscript/build.go
+    sed -i '169,178d' buildscript/build.go
+    sed -i "s:versionStr,:\"$PSMDB_TOOLS_REVISION\",:" buildscript/build.go
+    sed -i "s:gitCommit):\"$PSMDB_TOOLS_COMMIT_HASH\"):" buildscript/build.go
+    ./make build
     # move mongo tools to PSM installation dir
     mv bin/* ${PSMDIR_ABS}/${PSMDIR}/bin
-    # end build tools
     #
     sed -i "s:TARBALL=0:TARBALL=1:" ${PSMDIR_ABS}/percona-packaging/conf/percona-server-mongodb-enable-auth.sh
     cp ${PSMDIR_ABS}/percona-packaging/conf/percona-server-mongodb-enable-auth.sh ${PSMDIR_ABS}/${PSMDIR}/bin
