@@ -123,7 +123,7 @@ This package contains various tools from MongoDB project, recompiled for Percona
 
 export CC=${CC:-gcc}
 export CXX=${CXX:-g++}
-export PSM_TARGETS="mongod mongos mongo perconadecrypt"
+export PSM_TARGETS="mongod mongos mongo perconadecrypt mongobridge"
 export INSTALLDIR=$RPM_BUILD_DIR/install
 export INSTALLDIR_AWS=$RPM_BUILD_DIR/install_aws
 export TOOLS_TAGS="ssl sasl"
@@ -218,6 +218,7 @@ install -m 755 mongo %{buildroot}/%{_bindir}/
 install -m 755 mongod %{buildroot}/%{_bindir}/
 install -m 755 mongos %{buildroot}/%{_bindir}/
 install -m 755 perconadecrypt %{buildroot}/%{_bindir}/
+install -m 755 mongobridge %{buildroot}/%{_bindir}/
 
 install -m 755 $RPM_BUILD_DIR/%{src_dir}/bin/* %{buildroot}/%{_bindir}/
 
@@ -234,6 +235,7 @@ install -m 644 $RPM_BUILD_DIR/%{src_dir}/manpages/* %{buildroot}/%{_mandir}/man1
 %defattr(-,root,root,-)
 %{_bindir}/mongod
 %{_bindir}/perconadecrypt
+%{_bindir}/mongobridge
 %{_mandir}/man1/mongod.1.gz
 %{_bindir}/percona-server-mongodb-helper.sh
 %{_bindir}/percona-server-mongodb-enable-auth.sh
