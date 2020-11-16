@@ -147,7 +147,7 @@ error_code("PooledConnectionsDropped", 145)
 error_code("ExceededMemoryLimit", 146)
 error_code("ZLibError", 147)
 error_code("ReadConcernMajorityNotEnabled", 148)
-error_code("NoConfigMaster", 149)
+error_code("NoConfigPrimary", 149)
 error_code("StaleEpoch", 150)
 error_code("OperationCannotBeBatched", 151)
 error_code("OplogOutOfOrder", 152)
@@ -294,13 +294,14 @@ error_code("WaitForMajorityServiceEarlierOpTimeAvailable", 289)
 error_code("NoQueryExecutionPlans", 291)
 error_code("HierarchicalAcquisitionLevelViolation", 297)
 error_code("PeriodicJobIsStopped", 310)
+error_code("OplogQueryMinTsMissing", 326)
 
 # Error codes 4000-8999 are reserved.
 
 # Non-sequential error codes (for compatibility only)
 error_code("SocketException", 9001)
 error_code("OBSOLETE_RecvStaleConfig", 9996)
-error_code("NotMaster", 10107)
+error_code("NotWritablePrimary", 10107)
 error_code("CannotGrowDocumentInCappedNamespace", 10003)
 error_code("BSONObjectTooLarge", 10334)
 error_code("DuplicateKey", 11000, extra="DuplicateKeyErrorInfo")
@@ -312,8 +313,8 @@ error_code("OutOfDiskSpace", 14031 )
 error_code("KeyTooLong", 17280);
 error_code("BackgroundOperationInProgressForDatabase", 12586);
 error_code("BackgroundOperationInProgressForNamespace", 12587);
-error_code("NotMasterOrSecondary", 13436);
-error_code("NotMasterNoSlaveOk", 13435);
+error_code("NotPrimaryOrSecondary", 13436);
+error_code("NotPrimaryNoSecondaryOk", 13435);
 error_code("ShardKeyTooBig", 13334);
 error_code("StaleConfig", 13388, extra="StaleConfigInfo");
 error_code("DatabaseDifferCase", 13297);
@@ -336,13 +337,13 @@ error_class("Interruption", ["Interrupted",
                              "ClientDisconnect",
                              "ClientMarkedKilled"])
 
-# isNotMasterError() includes all codes that indicate that the node that received the request was
-# not master at some point during command processing, regardless of whether some write may have
+# isNotPrimaryError() includes all codes that indicate that the node that received the request was
+# not primary at some point during command processing, regardless of whether some write may have
 # happened. If you care about whether a write could have happened, check for individual codes.
-error_class("NotMasterError", [
-    "NotMaster",
-    "NotMasterNoSlaveOk",
-    "NotMasterOrSecondary",
+error_class("NotPrimaryError", [
+    "NotWritablePrimary",
+    "NotPrimaryNoSecondaryOk",
+    "NotPrimaryOrSecondary",
     "InterruptedDueToReplStateChange",
     "PrimarySteppedDown",
     ])
@@ -376,9 +377,9 @@ error_class("VoteAbortError", ["NoSuchTransaction", "ReadConcernMajorityNotEnabl
 
 error_class("NonResumableChangeStreamError", ["ChangeStreamFatalError", "ChangeStreamHistoryLost"])
 error_class("RetriableError", [
-    "NotMaster",
-    "NotMasterNoSlaveOk",
-    "NotMasterOrSecondary",
+    "NotWritablePrimary",
+    "NotPrimaryNoSecondaryOk",
+    "NotPrimaryOrSecondary",
     "InterruptedDueToReplStateChange",
     "PrimarySteppedDown",
     "WriteConcernFailed",

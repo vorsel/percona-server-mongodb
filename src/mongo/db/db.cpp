@@ -452,6 +452,10 @@ ExitCode _initAndListen(int listenPort) {
         log() << "Flow Control is enabled on this deployment.";
     }
 
+    // Notify the storage engine that startup is completed before repair exits below, as repair sets
+    // the upgrade flag to true.
+    serviceContext->getStorageEngine()->notifyStartupComplete();
+
     if (storageGlobalParams.upgrade) {
         log() << "finished checking dbs";
         exitCleanly(EXIT_CLEAN);
@@ -481,7 +485,7 @@ ExitCode _initAndListen(int listenPort) {
             log() << redact(status);
             if (status == ErrorCodes::AuthSchemaIncompatible) {
                 exitCleanly(EXIT_NEED_UPGRADE);
-            } else if (status == ErrorCodes::NotMaster) {
+            } else if (status == ErrorCodes::NotWritablePrimary) {
                 // Try creating the indexes if we become master.  If we do not become master,
                 // the master will create the indexes and we will replicate them.
             } else {

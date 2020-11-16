@@ -72,7 +72,7 @@ const allCommands = {
     aggregate: {
         command: {aggregate: collName, pipeline: [{$match: {}}], cursor: {}},
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary,
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary,
     },
     appendOplogNote: {skip: isPrimaryOnly},
     applyOps: {skip: isPrimaryOnly},
@@ -90,7 +90,7 @@ const allCommands = {
     collStats: {
         command: {aggregate: collName, pipeline: [{$collStats: {count: {}}}], cursor: {}},
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary,
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary,
     },
     commitTransaction: {skip: isPrimaryOnly},
     compact: {skip: isNotAUserDataRead},
@@ -103,7 +103,7 @@ const allCommands = {
     count: {
         command: {count: collName},
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary,
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary,
     },
     cpuload: {skip: isNotAUserDataRead},
     create: {skip: isPrimaryOnly},
@@ -122,13 +122,13 @@ const allCommands = {
     dbStats: {
         command: {dbStats: 1},
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary,
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary,
     },
     delete: {skip: isPrimaryOnly},
     distinct: {
         command: {distinct: collName, key: "a"},
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary,
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary,
     },
     driverOIDTest: {skip: isNotAUserDataRead},
     drop: {skip: isPrimaryOnly},
@@ -145,14 +145,14 @@ const allCommands = {
     explain: {
         command: {count: collName},
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary,
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary,
     },
     features: {skip: isNotAUserDataRead},
     filemd5: {skip: isNotAUserDataRead},
     find: {
         command: {find: collName, filter: {a: 1}},
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary,
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary,
     },
     findAndModify: {skip: isPrimaryOnly},
     flushRouterConfig: {skip: isNotAUserDataRead},
@@ -165,7 +165,7 @@ const allCommands = {
             near: [-42, 42],
         },
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary
     },
     getCmdLineOpts: {skip: isNotAUserDataRead},
     getDatabaseVersion: {skip: isNotAUserDataRead},
@@ -177,7 +177,7 @@ const allCommands = {
     getMore: {
         command: {getMore: NumberLong(123), collection: collName},
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary
     },
     getParameter: {skip: isNotAUserDataRead},
     getShardMap: {skip: isNotAUserDataRead},
@@ -202,22 +202,23 @@ const allCommands = {
     listCollections: {
         command: {listCollections: 1},
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary
     },
     listCommands: {command: {listCommands: 1}},
     listDatabases: {
         command: {listDatabases: 1},
         isAdminCommand: true,
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary
     },
     listIndexes: {
         command: {listIndexes: collName},
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary
     },
     lockInfo: {skip: isPrimaryOnly},
     logApplicationMessage: {skip: isNotAUserDataRead},
+    logMessage: {skip: isNotAUserDataRead},
     logRotate: {skip: isNotAUserDataRead},
     logout: {skip: isNotAUserDataRead},
     makeSnapshot: {skip: isNotAUserDataRead},
@@ -229,7 +230,7 @@ const allCommands = {
             out: {inline: 1}
         },
         expectFailure: true,
-        expectedErrorCode: ErrorCodes.NotMasterOrSecondary,
+        expectedErrorCode: ErrorCodes.NotPrimaryOrSecondary,
     },
     "mapreduce.shardedfinish": {skip: isAnInternalCommand},
     mergeChunks: {skip: isPrimaryOnly},

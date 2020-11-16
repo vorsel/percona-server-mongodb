@@ -977,6 +977,10 @@ WiredTigerKVEngine::~WiredTigerKVEngine() {
     _encryptionKeyDB.reset(nullptr);
 }
 
+void WiredTigerKVEngine::notifyStartupComplete() {
+    WiredTigerUtil::notifyStartupComplete();
+}
+
 void WiredTigerKVEngine::appendGlobalStats(BSONObjBuilder& b) {
     BSONObjBuilder bb(b.subobjStart("concurrentTransactions"));
     {
@@ -1107,6 +1111,8 @@ void WiredTigerKVEngine::cleanShutdown() {
     log() << "WiredTigerKVEngine shutting down";
     // Ensure that key db is destroyed on exit
     ON_BLOCK_EXIT([&] { _encryptionKeyDB.reset(nullptr); });
+    WiredTigerUtil::resetTableLoggingInfo();
+
     if (!_readOnly)
         syncSizeInfo(true);
     if (!_conn) {

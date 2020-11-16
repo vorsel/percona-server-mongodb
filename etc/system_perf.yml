@@ -80,7 +80,6 @@ functions:
         linkbench2: ${linkbench2_rev}
         genny: ${genny_rev}
         workloads: ${workloads_rev}
-        wtdevelop: ${wtdevelop_rev}
         signal-processing: ${signal-processing_rev}
 
   "compile mongodb":
@@ -876,11 +875,6 @@ modules:
   prefix: workloads
   branch: master
 
-- name: wtdevelop
-  repo: git@github.com:wiredtiger/wiredtiger.git
-  prefix: src/third_party
-  branch: develop
-
 - name: linkbench
   repo: git@github.com:10gen/linkbench.git
   prefix: linkbench
@@ -912,7 +906,6 @@ buildvariants:
 - &compile-linux-64-amzn
   name: compile-linux-64-amzn
   display_name: Compile on Linux64 Amazon
-  batchtime: 10080 # 7 days
   expansions: &compile-linux-64-amzn-expansions
     compile_flags: >-
       --ssl
@@ -929,20 +922,10 @@ buildvariants:
   tasks:
     - name: compile
 
-- <<: *compile-linux-64-amzn
-  name: wtdevelop-compile-linux-64-amzn
-  display_name: WT Develop Compile on Linux64 Amazon
-  modules:
-    - wtdevelop
-  expansions:
-    <<: *compile-linux-64-amzn-expansions
-    compile-variant: -wtdevelop
-
 - name: compile-amazon2
   display_name: Compile on Amazon Linux 2
   modules:
     - enterprise
-  batchtime: 10080 # 7 days
   expansions:
     <<: *compile-linux-64-amzn-expansions
     compile_flags: >-
@@ -961,7 +944,6 @@ buildvariants:
   display_name: Compile on Rhel70
   modules:
     - enterprise
-  batchtime: 10080 # 7 days
   expansions:
     <<: *compile-linux-64-amzn-expansions
     compile_flags: >-
@@ -981,7 +963,6 @@ buildvariants:
 #######################################
 - name: linux-1-node-replSet
   display_name: Linux 1-Node ReplSet
-  batchtime: 10080 # 7 days
   modules: &modules
     - dsi
     - genny
@@ -1029,7 +1010,6 @@ buildvariants:
 
 - name: linux-standalone
   display_name: Linux Standalone
-  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: standalone
@@ -1066,7 +1046,6 @@ buildvariants:
 
 - name: linux-standalone-audit
   display_name: Linux Standalone Audit
-  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: standalone-audit
@@ -1088,7 +1067,6 @@ buildvariants:
 
 - name: linux-1-node-replSet-ese-cbc
   display_name: Linux 1-Node ReplSet ESE CBC
-  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: single-replica-ese-cbc
@@ -1109,7 +1087,6 @@ buildvariants:
 
 - name: linux-1-node-replSet-ese-gcm
   display_name: Linux 1-Node ReplSet ESE GCM
-  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: single-replica-ese-gcm
@@ -1131,7 +1108,6 @@ buildvariants:
 
 - name: linux-3-shard
   display_name: Linux 3-Shard Cluster
-  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: shard
@@ -1162,7 +1138,6 @@ buildvariants:
 
 - name: linux-shard-lite
   display_name: Linux Shard Lite Cluster
-  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: shard-lite
@@ -1199,7 +1174,6 @@ buildvariants:
 
 - name: linux-3-node-replSet
   display_name: Linux 3-Node ReplSet
-  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: replica
@@ -1246,7 +1220,6 @@ buildvariants:
 
 - name: linux-3-node-replSet-noflowcontrol
   display_name: Linux 3-Node ReplSet (Flow Control off)
-  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: replica-noflowcontrol
@@ -1277,7 +1250,6 @@ buildvariants:
 
 - name: linux-3-node-replSet-ssl
   display_name: Linux 3-Node ReplSet (SSL)
-  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: replica-ssl
@@ -1297,7 +1269,6 @@ buildvariants:
 
 - name: linux-3-node-replSet-initialsync
   display_name: Linux 3-Node ReplSet Initial Sync
-  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: replica-2node
@@ -1318,7 +1289,6 @@ buildvariants:
 
 - name: linux-replSet-initialsync-logkeeper
   display_name: Linux ReplSet Initial Sync LogKeeper
-  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: initialsync-logkeeper
@@ -1343,7 +1313,6 @@ buildvariants:
 #######################################
 - name: atlas-like-M60
   display_name: M60-Like 3-Node ReplSet
-  batchtime: 10080 # 7 days
   modules: *modules
   expansions:
     setup: atlas-like-replica
@@ -1384,84 +1353,3 @@ buildvariants:
     # - name: tpcc # TPCC with SSL currently broken https://jira.mongodb.org/browse/TIG-1681
     - name: linkbench
     # - name: big_update
-
-
-#######################################
-#  WT Develop Linux Buildvariants     #
-#######################################
-- name: wtdevelop-1-node-replSet
-  display_name: WT Develop 1-Node ReplSet
-  batchtime: 10080 # 7 days
-  modules: *modules
-  expansions:
-    setup: single-replica
-    cluster: single
-    platform: linux
-    project_dir: *project_dir
-    compile-variant: -wtdevelop
-    authentication: enabled
-    storageEngine: wiredTiger
-  run_on:
-      - "rhel70-perf-single"
-  depends_on:
-      - name: compile
-        variant: wtdevelop-compile-linux-64-amzn
-  tasks: *1nodetasks
-
-- name: wtdevelop-standalone
-  display_name: WT Develop Standalone
-  batchtime: 10080 # 7 days
-  modules: *modules
-  expansions:
-    setup: standalone
-    cluster: single
-    platform: linux
-    project_dir: *project_dir
-    compile-variant: -wtdevelop
-    authentication: enabled
-    storageEngine: wiredTiger
-  run_on:
-      - "rhel70-perf-single"
-  depends_on:
-      - name: compile
-        variant: wtdevelop-compile-linux-64-amzn
-  tasks: *standalonetasks
-
-- name: wtdevelop-3-node-replSet
-  display_name: WT Develop 3-Node ReplSet
-  batchtime: 10080 # 7 days
-  modules: *modules
-  expansions:
-    setup: replica
-    cluster: replica
-    platform: linux
-    project_dir: *project_dir
-    compile-variant: -wtdevelop
-    authentication: enabled
-    storageEngine: wiredTiger
-  run_on:
-      - "rhel70-perf-replset"
-  depends_on:
-      - name: compile
-        variant: wtdevelop-compile-linux-64-amzn
-  tasks: *3nodetasks
-
-# Disabled: SERVER-35586
-#- name: wtdevelop-shard-lite
-#  display_name: WT Develop Shard Lite Cluster
-#  batchtime: 10080 # 7 days
-#  modules: *modules
-#  expansions:
-#    setup: shard-lite
-#    cluster: shard-lite
-#    platform: linux
-#    project_dir: *project_dir
-#    compile-variant: -wtdevelop
-#    authentication: enabled
-#    storageEngine: wiredTiger
-#  run_on:
-#      - "rhel70-perf-shard-lite"
-#  depends_on:
-#      - name: compile
-#        variant: wtdevelop-compile-linux-64-amzn
-#  tasks: *shardlitetasks

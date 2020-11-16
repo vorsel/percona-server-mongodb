@@ -59,6 +59,7 @@
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl.hpp"
 #include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/ssl_parameters_gen.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/str.h"
 #include "mongo/util/text.h"
@@ -1287,8 +1288,8 @@ Status SSLManagerWindows::_loadCertificates(const SSLParams& params) {
         }
 
         _clientEngine.CAstore = std::move(swChain.getValue());
-        _clientEngine.hasCRL = !params.sslCRLFile.empty();
     }
+    _clientEngine.hasCRL = !params.sslCRLFile.empty();
 
     const auto serverCAFile =
         params.sslClusterCAFile.empty() ? params.sslCAFile : params.sslClusterCAFile;
@@ -1299,8 +1300,8 @@ Status SSLManagerWindows::_loadCertificates(const SSLParams& params) {
         }
 
         _serverEngine.CAstore = std::move(swChain.getValue());
-        _serverEngine.hasCRL = !params.sslCRLFile.empty();
     }
+    _serverEngine.hasCRL = !params.sslCRLFile.empty();
 
     if (hasCertificateSelector(params.sslCertificateSelector)) {
         auto swCert = loadAndValidateCertificateSelector(params.sslCertificateSelector);
@@ -1699,6 +1700,8 @@ Status validatePeerCertificate(const std::string& remoteHost,
         certChainPara.RequestedUsage.Usage.rgpszUsageIdentifier = usage;
     }
 
+    certChainPara.dwUrlRetrievalTimeout = gTLSOCSPVerifyTimeoutSecs * 1000;
+
     PCCERT_CHAIN_CONTEXT chainContext;
     BOOL ret = CertGetCertificateChain(certChainEngine,
                                        cert,
@@ -1737,6 +1740,10 @@ Status validatePeerCertificate(const std::string& remoteHost,
     memset(&chain_policy_para, 0, sizeof(chain_policy_para));
     chain_policy_para.cbSize = sizeof(chain_policy_para);
     chain_policy_para.pvExtraPolicyPara = &sslCertChainPolicy;
+
+    if (!hasCRL) {
+        chain_policy_para.dwFlags |= CERT_CHAIN_POLICY_IGNORE_ALL_REV_UNKNOWN_FLAGS;
+    }
 
     CERT_CHAIN_POLICY_STATUS certChainPolicyStatus;
     memset(&certChainPolicyStatus, 0, sizeof(certChainPolicyStatus));

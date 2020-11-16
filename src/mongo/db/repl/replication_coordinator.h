@@ -199,7 +199,7 @@ public:
      *     the data has been sufficiently replicated
      * ErrorCodes::ExceededTimeLimit if the opCtx->getMaxTimeMicrosRemaining is reached before
      *     the data has been sufficiently replicated
-     * ErrorCodes::NotMaster if the node is not Primary/Master
+     * ErrorCodes::NotWritablePrimary if the node is not a writable primary
      * ErrorCodes::UnknownReplWriteConcern if the writeConcern.wMode contains a write concern
      *     mode that is not known
      * ErrorCodes::ShutdownInProgress if we are mid-shutdown
@@ -708,7 +708,7 @@ public:
      * Returns Status::OK() if all updates are processed correctly, NodeNotFound
      * if any updating node cannot be found in the config, InvalidReplicaSetConfig if the
      * "configVersion" sent in any of the updates doesn't match our config version, or
-     * NotMasterOrSecondary if we are in state REMOVED or otherwise don't have a valid
+     * NotPrimaryOrSecondary if we are in state REMOVED or otherwise don't have a valid
      * replica set config.
      * If a non-OK status is returned, it is unspecified whether none or some of the updates
      * were applied.

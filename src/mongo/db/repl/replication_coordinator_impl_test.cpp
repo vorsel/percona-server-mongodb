@@ -611,7 +611,7 @@ TEST_F(ReplCoordTest, NodeReturnsImmediatelyWhenAwaitReplicationIsRanAgainstASta
     ASSERT_OK(statusAndDur.status);
 }
 
-TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenRunningAwaitReplicationAgainstASecondaryNode) {
+TEST_F(ReplCoordTest, NodeReturnsNotPrimaryWhenRunningAwaitReplicationAgainstASecondaryNode) {
     assertStartSuccess(BSON("_id"
                             << "mySet"
                             << "version" << 2 << "members"
@@ -1188,9 +1188,9 @@ TEST_F(ReplCoordTest,
     awaiter.reset();
 }
 
-TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenSteppingDownBeforeSatisfyingAWriteConcern) {
-    // Test that a thread blocked in awaitReplication will be woken up and return NotMaster
-    // if the node steps down while it is waiting.
+TEST_F(ReplCoordTest, NodeReturnsNotPrimaryWhenSteppingDownBeforeSatisfyingAWriteConcern) {
+    // Test that a thread blocked in awaitReplication will be woken up and return PrimarySteppedDown
+    // (a NotPrimaryError) if the node steps down while it is waiting.
     assertStartSuccess(BSON("_id"
                             << "mySet"
                             << "version" << 2 << "members"
@@ -1909,7 +1909,7 @@ TEST_F(StepDownTestWithUnelectableNode,
     ASSERT_TRUE(repl->getMemberState().secondary());
 }
 
-TEST_F(StepDownTest, NodeReturnsNotMasterWhenAskedToStepDownAsANonPrimaryNode) {
+TEST_F(StepDownTest, NodeReturnsNotWritablePrimaryWhenAskedToStepDownAsANonPrimaryNode) {
     const auto opCtx = makeOperationContext();
 
     OpTimeWithTermOne optime1(100, 1);
@@ -1922,7 +1922,7 @@ TEST_F(StepDownTest, NodeReturnsNotMasterWhenAskedToStepDownAsANonPrimaryNode) {
     ASSERT_THROWS_CODE(
         getReplCoord()->stepDown(opCtx.get(), false, Milliseconds(0), Milliseconds(0)),
         AssertionException,
-        ErrorCodes::NotMaster);
+        ErrorCodes::NotWritablePrimary);
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
 }
 

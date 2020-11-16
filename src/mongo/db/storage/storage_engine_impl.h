@@ -79,6 +79,8 @@ public:
 
     virtual RecoveryUnit* newRecoveryUnit();
 
+    virtual void notifyStartupComplete() override;
+
     virtual std::vector<std::string> listDatabases() const;
 
     virtual bool supportsDocLocking() const {

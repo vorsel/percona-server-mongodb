@@ -652,7 +652,7 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     LOG(1) << "Current term is now " << term;
     _performPostMemberStateUpdateAction(action);
 
-    if (!isArbiter) {
+    if (!isArbiter && myIndex.getValue() != -1) {
         _externalState->startThreads(_settings);
         _startDataReplication(opCtx.get());
     }
@@ -681,6 +681,11 @@ void ReplicationCoordinatorImpl::_stopDataReplication(OperationContext* opCtx) {
 
 void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
                                                        stdx::function<void()> startCompleted) {
+    if (_startedSteadyStateReplication.load()) {
+        return;
+    }
+
+    _startedSteadyStateReplication.store(true);
     // Check to see if we need to do an initial sync.
     const auto lastOpTime = getMyLastAppliedOpTime();
     const auto needsInitialSync =
@@ -2030,7 +2035,9 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     // Note this check is inherently racy - it's always possible for the node to stepdown from some
     // other path before we acquire the global exclusive lock.  This check is just to try to save us
     // from acquiring the global X lock unnecessarily.
-    uassert(ErrorCodes::NotMaster, "not primary so can't step down", getMemberState().primary());
+    uassert(ErrorCodes::NotWritablePrimary,
+            "not primary so can't step down",
+            getMemberState().primary());
 
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &stepdownHangBeforeRSTLEnqueue, opCtx, "stepdownHangBeforeRSTLEnqueue");
@@ -2323,7 +2330,7 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
         stdx::lock_guard<Latch> lock(_mutex);
         if ((_memberState.startup() && client->isFromUserConnection()) || _memberState.startup2() ||
             _memberState.rollback()) {
-            return Status{ErrorCodes::NotMasterOrSecondary,
+            return Status{ErrorCodes::NotPrimaryOrSecondary,
                           "Oplog collection reads are not allowed while in the rollback or "
                           "startup state."};
         }
@@ -2335,7 +2342,7 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
 
     if (opCtx->inMultiDocumentTransaction()) {
         if (!_readWriteAbility->canAcceptNonLocalWrites_UNSAFE()) {
-            return Status(ErrorCodes::NotMaster,
+            return Status(ErrorCodes::NotWritablePrimary,
                           "Multi-document transactions are only allowed on replica set primaries.");
         }
     }
@@ -2344,10 +2351,10 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
         if (isPrimaryOrSecondary) {
             return Status::OK();
         }
-        return Status(ErrorCodes::NotMasterOrSecondary,
+        return Status(ErrorCodes::NotPrimaryOrSecondary,
                       "not master or secondary; cannot currently read from this replSet member");
     }
-    return Status(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
+    return Status(ErrorCodes::NotPrimaryNoSecondaryOk, "not master and slaveOk=false");
 }
 
 bool ReplicationCoordinatorImpl::isInPrimaryOrSecondaryState(OperationContext* opCtx) const {
@@ -2636,7 +2643,7 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
     invariant(_rsConfig.isInitialized());
 
     if (!args.force && !_getMemberState_inlock().primary()) {
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream()
                           << "replSetReconfig should only be run on PRIMARY, but my state is "
                           << _getMemberState_inlock().toString()
@@ -3276,47 +3283,50 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
     _rsConfig = newConfig;
     _protVersion.store(_rsConfig.getProtocolVersion());
 
-    // Warn if running --nojournal and writeConcernMajorityJournalDefault = true
+    // Warn if using the in-memory (ephemeral) storage engine or running running --nojournal with
+    // writeConcernMajorityJournalDefault=true.
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    if (storageEngine && !storageEngine->isDurable() &&
-        (newConfig.getWriteConcernMajorityShouldJournal() &&
-         (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
-        log() << startupWarningsLog;
-        log() << "** WARNING: This replica set node is running without journaling enabled but the "
-              << startupWarningsLog;
-        log() << "**          writeConcernMajorityJournalDefault option to the replica set config "
-              << startupWarningsLog;
-        log() << "**          is set to true. The writeConcernMajorityJournalDefault "
-              << startupWarningsLog;
-        log() << "**          option to the replica set config must be set to false "
-              << startupWarningsLog;
-        log() << "**          or w:majority write concerns will never complete."
-              << startupWarningsLog;
-        log() << "**          In addition, this node's memory consumption may increase until all"
-              << startupWarningsLog;
-        log() << "**          available free RAM is exhausted." << startupWarningsLog;
-        log() << startupWarningsLog;
-    }
-
-    // Warn if using the in-memory (ephemeral) storage engine with
-    // writeConcernMajorityJournalDefault = true
-    if (storageEngine && storageEngine->isEphemeral() &&
-        (newConfig.getWriteConcernMajorityShouldJournal() &&
-         (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
-        log() << startupWarningsLog;
-        log() << "** WARNING: This replica set node is using in-memory (ephemeral) storage with the"
-              << startupWarningsLog;
-        log() << "**          writeConcernMajorityJournalDefault option to the replica set config "
-              << startupWarningsLog;
-        log() << "**          set to true. The writeConcernMajorityJournalDefault option to the "
-              << startupWarningsLog;
-        log() << "**          replica set config must be set to false " << startupWarningsLog;
-        log() << "**          or w:majority write concerns will never complete."
-              << startupWarningsLog;
-        log() << "**          In addition, this node's memory consumption may increase until all"
-              << startupWarningsLog;
-        log() << "**          available free RAM is exhausted." << startupWarningsLog;
-        log() << startupWarningsLog;
+    if (storageEngine && newConfig.getWriteConcernMajorityShouldJournal() &&
+        (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal())) {
+        if (storageEngine->isEphemeral()) {
+            log() << startupWarningsLog;
+            log() << "** WARNING: This replica set node is using in-memory (ephemeral) storage "
+                     "with the"
+                  << startupWarningsLog;
+            log() << "**          writeConcernMajorityJournalDefault option to the replica set "
+                     "config "
+                  << startupWarningsLog;
+            log()
+                << "**          set to true. The writeConcernMajorityJournalDefault option to the "
+                << startupWarningsLog;
+            log() << "**          replica set config must be set to false " << startupWarningsLog;
+            log() << "**          or w:majority write concerns will never complete."
+                  << startupWarningsLog;
+            log()
+                << "**          In addition, this node's memory consumption may increase until all"
+                << startupWarningsLog;
+            log() << "**          available free RAM is exhausted." << startupWarningsLog;
+            log() << startupWarningsLog;
+        } else if (!storageEngine->isDurable()) {
+            log() << startupWarningsLog;
+            log() << "** WARNING: This replica set node is running without journaling enabled but "
+                     "the "
+                  << startupWarningsLog;
+            log() << "**          writeConcernMajorityJournalDefault option to the replica set "
+                     "config "
+                  << startupWarningsLog;
+            log() << "**          is set to true. The writeConcernMajorityJournalDefault "
+                  << startupWarningsLog;
+            log() << "**          option to the replica set config must be set to false "
+                  << startupWarningsLog;
+            log() << "**          or w:majority write concerns will never complete."
+                  << startupWarningsLog;
+            log()
+                << "**          In addition, this node's memory consumption may increase until all"
+                << startupWarningsLog;
+            log() << "**          available free RAM is exhausted." << startupWarningsLog;
+            log() << startupWarningsLog;
+        }
     }
 
 

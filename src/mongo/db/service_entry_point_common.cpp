@@ -778,13 +778,13 @@ void execCommandDatabase(OperationContext* opCtx,
                 couldHaveOptedIn && ReadPreferenceSetting::get(opCtx).canRunOnSecondary();
             bool canRunHere = commandCanRunHere(opCtx, dbname, command, inMultiDocumentTransaction);
             if (!canRunHere && couldHaveOptedIn) {
-                uasserted(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
+                uasserted(ErrorCodes::NotPrimaryNoSecondaryOk, "not master and slaveOk=false");
             }
 
             if (MONGO_FAIL_POINT(respondWithNotPrimaryInCommandDispatch)) {
-                uassert(ErrorCodes::NotMaster, "not primary", canRunHere);
+                uassert(ErrorCodes::NotWritablePrimary, "not primary", canRunHere);
             } else {
-                uassert(ErrorCodes::NotMaster, "not master", canRunHere);
+                uassert(ErrorCodes::NotWritablePrimary, "not master", canRunHere);
             }
 
             if (!command->maintenanceOk() &&
@@ -792,14 +792,14 @@ void execCommandDatabase(OperationContext* opCtx,
                 !replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, dbname) &&
                 !replCoord->getMemberState().secondary()) {
 
-                uassert(ErrorCodes::NotMasterOrSecondary,
+                uassert(ErrorCodes::NotPrimaryOrSecondary,
                         "node is recovering",
                         !replCoord->getMemberState().recovering());
-                uassert(ErrorCodes::NotMasterOrSecondary,
+                uassert(ErrorCodes::NotPrimaryOrSecondary,
                         "node is not in primary or recovering state",
                         replCoord->getMemberState().primary());
                 // Check ticket SERVER-21432, slaveOk commands are allowed in drain mode
-                uassert(ErrorCodes::NotMasterOrSecondary,
+                uassert(ErrorCodes::NotPrimaryOrSecondary,
                         "node is in drain mode",
                         optedIn || alwaysAllowed);
             }
@@ -1073,9 +1073,9 @@ DbResponse receivedCommands(OperationContext* opCtx,
 
     if (OpMsg::isFlagSet(message, OpMsg::kMoreToCome)) {
         // Close the connection to get client to go through server selection again.
-        if (LastError::get(opCtx->getClient()).hadNotMasterError()) {
+        if (LastError::get(opCtx->getClient()).hadNotPrimaryError()) {
             notMasterUnackWrites.increment();
-            uasserted(ErrorCodes::NotMaster,
+            uasserted(ErrorCodes::NotWritablePrimary,
                       str::stream()
                           << "Not-master error while processing '" << request.getCommandName()
                           << "' operation  on '" << request.getDatabase() << "' database via "
@@ -1400,12 +1400,13 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
                    << redact(ue);
             debug.errInfo = ue.toStatus();
         }
-        // A NotMaster error can be set either within receivedInsert/receivedUpdate/receivedDelete
-        // or within the AssertionException handler above.  Either way, we want to throw an
-        // exception here, which will cause the client to be disconnected.
-        if (LastError::get(opCtx->getClient()).hadNotMasterError()) {
+        // A NotWritablePrimary error can be set either within
+        // receivedInsert/receivedUpdate/receivedDelete or within the AssertionException handler
+        // above.  Either way, we want to throw an exception here, which will cause the client to be
+        // disconnected.
+        if (LastError::get(opCtx->getClient()).hadNotPrimaryError()) {
             notMasterLegacyUnackWrites.increment();
-            uasserted(ErrorCodes::NotMaster,
+            uasserted(ErrorCodes::NotWritablePrimary,
                       str::stream()
                           << "Not-master error while processing '" << networkOpToString(op)
                           << "' operation  on '" << nsString << "' namespace via legacy "
