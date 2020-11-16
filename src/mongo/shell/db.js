@@ -622,6 +622,7 @@ var DB;
             "\tdb.getWriteConcern() - returns the write concern used for any operations on this db, inherited from server object if set");
         print("\tdb.hostInfo() get details about the server's host");
         print("\tdb.isMaster() check replica primary status");
+        print("\tdb.hello() check replica primary status");
         print("\tdb.killOp(opid) kills the current operation in the db");
         print("\tdb.listCommands() lists all the db commands");
         print("\tdb.loadServerScripts() loads all the scripts in db.system.js");
@@ -629,7 +630,7 @@ var DB;
         print("\tdb.printCollectionStats()");
         print("\tdb.printReplicationInfo()");
         print("\tdb.printShardingStatus()");
-        print("\tdb.printSlaveReplicationInfo()");
+        print("\tdb.printSecondaryReplicationInfo()");
         print("\tdb.dropUser(username)");
         print("\tdb.repairDatabase()");
         print("\tdb.resetError()");
@@ -978,6 +979,10 @@ var DB;
         return this.runCommand("isMaster");
     };
 
+    DB.prototype.hello = function() {
+        return this.runCommand("hello");
+    };
+
     var commandUnsupported = function(res) {
         return (!res.ok &&
                 (res.errmsg.startsWith("no such cmd") || res.errmsg.startsWith("no such command") ||
@@ -1118,8 +1123,8 @@ var DB;
                 print("cannot provide replication status from an arbiter.");
                 return;
             } else if (!isMaster.ismaster) {
-                print("this is a slave, printing slave replication info.");
-                this.printSlaveReplicationInfo();
+                print("this is a secondary, printing secondary replication info.");
+                this.printSecondaryReplicationInfo();
                 return;
             }
             print(tojson(result));
@@ -1134,6 +1139,12 @@ var DB;
     };
 
     DB.prototype.printSlaveReplicationInfo = function() {
+        print(
+            "WARNING: printSlaveReplicationInfo is deprecated and may be removed in the next major release. Please use printSecondaryReplicationInfo instead.");
+        this.printSecondaryReplicationInfo();
+    };
+
+    DB.prototype.printSecondaryReplicationInfo = function() {
         var startOptimeDate = null;
         var primary = null;
 
@@ -1151,7 +1162,7 @@ var DB;
             print("\t" + Math.round(ago) + " secs (" + hrs + " hrs) behind the " + suffix);
         }
 
-        function getMaster(members) {
+        function getPrimary(members) {
             for (i in members) {
                 var row = members[i];
                 if (row.state === 1) {
@@ -1163,7 +1174,7 @@ var DB;
         }
 
         function g(x) {
-            assert(x, "how could this be null (printSlaveReplicationInfo gx)");
+            assert(x, "how could this be null (printSecondaryReplicationInfo gx)");
             print("source: " + x.host);
             if (x.syncedTo) {
                 var st = new Date(DB.tsToSeconds(x.syncedTo) * 1000);
@@ -1174,7 +1185,7 @@ var DB;
         }
 
         function r(x) {
-            assert(x, "how could this be null (printSlaveReplicationInfo rx)");
+            assert(x, "how could this be null (printSecondaryReplicationInfo rx)");
             if (x.state == 1 || x.state == 7) {  // ignore primaries (1) and arbiters (7)
                 return;
             }
@@ -1191,7 +1202,7 @@ var DB;
 
         if (L.system.replset.count() != 0) {
             var status = this.adminCommand({'replSetGetStatus': 1});
-            primary = getMaster(status.members);
+            primary = getPrimary(status.members);
             if (primary) {
                 startOptimeDate = primary.optimeDate;
             }

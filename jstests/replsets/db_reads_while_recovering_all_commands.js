@@ -201,6 +201,7 @@
             expectedErrorCode: ErrorCodes.NotMasterOrSecondary
         },
         handshake: {skip: isNotAUserDataRead},
+        hello: {skip: isNotAUserDataRead},
         hostInfo: {skip: isNotAUserDataRead},
         httpClientRequest: {skip: isNotAUserDataRead},
         insert: {skip: isPrimaryOnly},
@@ -232,6 +233,7 @@
         },
         lockInfo: {skip: isPrimaryOnly},
         logApplicationMessage: {skip: isNotAUserDataRead},
+        logMessage: {skip: isNotAUserDataRead},
         logRotate: {skip: isNotAUserDataRead},
         logout: {skip: isNotAUserDataRead},
         makeSnapshot: {skip: isNotAUserDataRead},

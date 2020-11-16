@@ -233,6 +233,7 @@
             behavior: "unshardedOnly"
         },
         handshake: {skip: "does not return user data"},
+        hello: {skip: "does not return user data"},
         hostInfo: {skip: "does not return user data"},
         insert: {skip: "primary only"},
         invalidateUserCache: {skip: "does not return user data"},
@@ -251,6 +252,7 @@
         listShards: {skip: "does not return user data"},
         lockInfo: {skip: "primary only"},
         logApplicationMessage: {skip: "primary only"},
+        logMessage: {skip: "does not return user data"},
         logRotate: {skip: "does not return user data"},
         logout: {skip: "does not return user data"},
         makeSnapshot: {skip: "does not return user data"},

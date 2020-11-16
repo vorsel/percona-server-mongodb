@@ -34,6 +34,7 @@
 
 #include <time.h>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/dbclient_rs.h"
@@ -71,6 +72,8 @@ namespace {
 using std::string;
 using std::stringstream;
 using std::vector;
+
+constexpr auto kIsMasterString = "isMaster"_sd;
 
 class CmdBuildInfo : public BasicCommand {
 public:
@@ -278,33 +281,33 @@ public:
                      const string& ns,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        // sort the commands before building the result BSON
-        std::vector<Command*> commands;
+        // Sort the command names before building the result BSON.
+        std::vector<std::string> commandNames;
         for (const auto command : allCommands()) {
-            // don't show oldnames
+            // Don't show oldnames
             if (command.first == command.second->getName())
-                commands.push_back(command.second);
+                commandNames.push_back(command.first);
         }
-        std::sort(commands.begin(), commands.end(), [](Command* lhs, Command* rhs) {
-            return (lhs->getName()) < (rhs->getName());
-        });
+        std::sort(commandNames.begin(), commandNames.end());
 
         BSONObjBuilder b(result.subobjStart("commands"));
-        for (const auto& c : commands) {
-            BSONObjBuilder temp(b.subobjStart(c->getName()));
-
+        for (const auto& c : commandNames) {
+            const auto command = findCommand(c);
+            auto name = (c == kIsMasterString) ? kIsMasterString : command->getName();
+            BSONObjBuilder temp(b.subobjStart(name));
             {
                 stringstream help;
-                c->help(help);
+                command->help(help);
                 temp.append("help", help.str());
             }
-            temp.append("slaveOk", c->slaveOk());
-            temp.append("adminOnly", c->adminOnly());
+            temp.append("slaveOk", command->slaveOk());
+            temp.append("adminOnly", command->adminOnly());
             // optionally indicates that the command can be forced to run on a slave/secondary
-            if (c->slaveOverrideOk())
-                temp.append("slaveOverrideOk", c->slaveOverrideOk());
+            if (command->slaveOverrideOk())
+                temp.append("slaveOverrideOk", command->slaveOverrideOk());
             temp.done();
         }
+
         b.done();
 
         return 1;
@@ -496,6 +499,53 @@ public:
 
 MONGO_FP_DECLARE(crashOnShutdown);
 int* volatile illegalAddress;  // NOLINT - used for fail point only
+
+class CmdLogMessage : public BasicCommand {
+public:
+    CmdLogMessage() : BasicCommand("logMessage") {}
+
+    void help(stringstream& help) const final {
+        help << "Send a message to the server log";
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const final {
+        return false;
+    }
+
+    bool slaveOk() const final {
+        return true;
+    }
+
+    bool adminOnly() const final {
+        return true;
+    }
+
+    void addRequiredPrivileges(const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               std::vector<Privilege>* out) final {
+        out->push_back(
+            Privilege(ResourcePattern::forClusterResource(), ActionType::applicationMessage));
+    }
+
+    bool run(OperationContext* opCtx,
+             const std::string& ns,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) final {
+        auto msgElem = cmdObj["logMessage"];
+        uassert(ErrorCodes::BadValue, "logMessage must be a string", msgElem.type() == String);
+
+        log() << "logMessage: " << msgElem.valueStringData();
+        return true;
+    }
+};
+
+MONGO_INITIALIZER(RegisterCmdLogMessage)(InitializerContext* context) {
+    if (Command::testCommandsEnabled) {
+        // Leaked intentionally: a Command registers itself when constructed.
+        new CmdLogMessage();
+    }
+    return Status::OK();
+}
 
 }  // namespace
 

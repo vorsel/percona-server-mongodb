@@ -917,6 +917,11 @@ TEST(RegexMatchExpression, TooLargePattern) {
     ASSERT(!regex.init("a", tooLargePattern, "").isOK());
 }
 
+TEST(RegexMatchExpression, RegexCannotBeInvalidUTF8) {
+    ASSERT_NOT_OK(RegexMatchExpression().init("path", "^\xff\xff", ""));
+    ASSERT_NOT_OK(RegexMatchExpression().init("path", "^42", "\xff\xff"));
+}
+
 TEST(RegexMatchExpression, MatchesElementSimplePrefix) {
     BSONObj match = BSON("x"
                          << "abc");

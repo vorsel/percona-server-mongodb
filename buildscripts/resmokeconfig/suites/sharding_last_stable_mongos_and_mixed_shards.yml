@@ -28,6 +28,8 @@ selector:
   - jstests/sharding/index_and_collection_option_propagation.js
   # New feature in v3.6 mongos
   - jstests/sharding/logical_time_metadata.js
+  # New feature in v3.6 mongod.
+  - jstests/sharding/balancing_sessions_collection.js
   # New feature in v3.6 mongos and mongod.
   - jstests/sharding/advance_cluster_time_action_type.js
   - jstests/sharding/advance_logical_time_with_valid_signature.js
@@ -122,6 +124,8 @@ selector:
   - jstests/sharding/explain_cmd.js
   # Enable when SERVER-44733 is backported
   - jstests/sharding/change_streams_update_lookup_shard_metadata_missing.js
+  # Cannot run in multiversion scenario since the hello alias will not exist in 3.4.
+  - jstests/sharding/ismaster.js
 executor:
   config:
     shell_options:

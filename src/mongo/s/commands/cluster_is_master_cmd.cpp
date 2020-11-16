@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/logical_session_cache.h"
@@ -48,9 +49,13 @@
 namespace mongo {
 namespace {
 
-class CmdIsMaster : public BasicCommand {
+constexpr auto kHelloString = "hello"_sd;
+constexpr auto kCamelCaseIsMasterString = "isMaster"_sd;
+constexpr auto kLowerCaseIsMasterString = "ismaster"_sd;
+
+class CmdHello : public BasicCommand {
 public:
-    CmdIsMaster() : BasicCommand("isMaster", "ismaster") {}
+    CmdHello() : CmdHello(kHelloString, {}) {}
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -112,7 +117,11 @@ public:
                 opCtx->getClient(), std::move(swParseClientMetadata.getValue()));
         }
 
-        result.appendBool("ismaster", true);
+        if (useLegacyResponseFields()) {
+            result.appendBool("ismaster", true);
+        } else {
+            result.appendBool("isWritablePrimary", true);
+        }
         result.append("msg", "isdbgrid");
         result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
         result.appendNumber("maxMessageSizeBytes", MaxMessageSizeBytes);
@@ -138,6 +147,26 @@ public:
         MessageCompressorManager::forSession(opCtx->getClient()->session())
             .serverNegotiate(cmdObj, &result);
 
+        return true;
+    }
+
+protected:
+    CmdHello(const StringData cmdName, const std::initializer_list<StringData>& alias)
+        : BasicCommand(cmdName, alias) {}
+
+    virtual bool useLegacyResponseFields() {
+        return false;
+    }
+
+} hello;
+
+class CmdIsMaster : public CmdHello {
+
+public:
+    CmdIsMaster() : CmdHello(kCamelCaseIsMasterString, {kLowerCaseIsMasterString}) {}
+
+protected:
+    bool useLegacyResponseFields() override {
         return true;
     }
 
