@@ -356,9 +356,9 @@ install_deps() {
         /usr/bin/pip3.6 install --user typing pyyaml regex Cheetah3
         /usr/bin/pip2.7 install --user typing pyyaml regex Cheetah
       fi
-      wget https://curl.se/download/curl-7.32.0.tar.gz
-      tar -xvzf curl-7.32.0.tar.gz
-      cd curl-7.32.0
+      wget https://curl.se/download/curl-7.66.0.tar.gz
+      tar -xvzf curl-7.66.0.tar.gz
+      cd curl-7.66.0
         ./configure
          make
          make install
