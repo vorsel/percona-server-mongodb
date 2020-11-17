@@ -113,7 +113,7 @@ Conflicts: Percona-Server-MongoDB-tools Percona-Server-MongoDB-32-tools Percona-
 
 export CC=${CC:-gcc}
 export CXX=${CXX:-g++}
-export PSM_TARGETS="mongod mongos mongo perconadecrypt"
+export PSM_TARGETS="mongod mongos mongo perconadecrypt mongobridge"
 export INSTALLDIR=$RPM_BUILD_DIR/install
 export INSTALLDIR_AWS=$RPM_BUILD_DIR/install_aws
 export AWS_LIBS="/usr/local"
@@ -155,22 +155,25 @@ rm -fr resmoke.ini
 popd
 
 # Mongo Tools compilation
-pushd $RPM_BUILD_DIR/%{src_dir}/mongo-tools
-mkdir -p build_tools/src/github.com/mongodb/mongo-tools
 mkdir -p $RPM_BUILD_DIR/%{src_dir}/bin
-cp -r $(ls | grep -v build_tools) build_tools/src/github.com/mongodb/mongo-tools/
-pushd build_tools/src/github.com/mongodb/mongo-tools
-sed -i 's|VersionStr="$(go run release/release.go get-version)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
-sed -i 's|GitCommit="$(git rev-parse HEAD)"|GitCommit="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
-sed -i 's|go build|go build -a -x|' build.sh
-sed -i 's|exit $ec||' build.sh
+pushd $RPM_BUILD_DIR/
+[[ ${PATH} == *"/usr/local/go/bin"* && -x /usr/local/go/bin/go ]] || export PATH=/usr/local/go/bin:${PATH}
+export GOROOT="/usr/local/go/"
+export GOPATH=$(pwd)/
+export PATH="/usr/local/go/bin:$PATH:$GOPATH"
+export GOBINPATH="/usr/local/go/bin"
+mkdir -p $GOPATH/src/github.com/mongodb
+cp -r $RPM_BUILD_DIR/%{src_dir}/mongo-tools ${GOPATH}/src/github.com/mongodb
+pushd ${GOPATH}/src/github.com/mongodb/mongo-tools
 . ./set_tools_revision.sh
-. ./set_goenv.sh
-mkdir -p bin
-. ./build.sh ${TOOLS_TAGS}
+sed -i '12d' buildscript/build.go
+sed -i '169,178d' buildscript/build.go
+sed -i "s:versionStr,:\"$PSMDB_TOOLS_REVISION\",:" buildscript/build.go
+sed -i "s:gitCommit):\"$PSMDB_TOOLS_COMMIT_HASH\"):" buildscript/build.go
+./make build
 mv bin/* $RPM_BUILD_DIR/%{src_dir}/bin
 popd
-popd
+
 
 %install
 #
@@ -208,6 +211,7 @@ install -m 755 mongo %{buildroot}/%{_bindir}/
 install -m 755 mongod %{buildroot}/%{_bindir}/
 install -m 755 mongos %{buildroot}/%{_bindir}/
 install -m 755 perconadecrypt %{buildroot}/%{_bindir}/
+install -m 755 mongobridge %{buildroot}/%{_bindir}/
 
 install -m 755 $RPM_BUILD_DIR/%{src_dir}/bin/* %{buildroot}/%{_bindir}/
 
@@ -224,6 +228,7 @@ install -m 644 $RPM_BUILD_DIR/%{src_dir}/manpages/* %{buildroot}/%{_mandir}/man1
 %defattr(-,root,root,-)
 %{_bindir}/mongod
 %{_bindir}/perconadecrypt
+%{_bindir}/mongobridge
 %{_mandir}/man1/mongod.1.gz
 %{_bindir}/percona-server-mongodb-helper.sh
 %{_bindir}/percona-server-mongodb-enable-auth.sh
