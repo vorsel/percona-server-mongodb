@@ -53,7 +53,8 @@ const st = new ShardingTest({
     let failpoint =
         configureFailPoint(originalRS0Primary, "setFCVHangWhileEnumeratingOrphanedRanges");
     const awaitResult = startParallelShell(() => {
-        assert.commandWorked(db.adminCommand({setFeatureCompatibilityVersion: "4.4"}));
+        assert.soon(() => db.adminCommand({setFeatureCompatibilityVersion: "4.4"}).ok,
+                    'failed to setFCV');
     }, st.s.port);
     failpoint.wait();
 
@@ -77,7 +78,8 @@ const st = new ShardingTest({
     let failpoint =
         configureFailPoint(originalRS0Primary, "setFCVHangWhileEnumeratingOrphanedRanges");
     const awaitResult = startParallelShell(() => {
-        assert.commandWorked(db.adminCommand({setFeatureCompatibilityVersion: "4.4"}));
+        assert.soon(() => db.adminCommand({setFeatureCompatibilityVersion: "4.4"}).ok,
+                    'failed to setFCV');
     }, st.s.port);
     failpoint.wait();
 
@@ -99,7 +101,8 @@ const st = new ShardingTest({
     let failpoint =
         configureFailPoint(originalRS0Primary, "setFCVHangWhileInsertingRangeDeletionTasks");
     const awaitResult = startParallelShell(() => {
-        assert.commandWorked(db.adminCommand({setFeatureCompatibilityVersion: "4.4"}));
+        assert.soon(() => db.adminCommand({setFeatureCompatibilityVersion: "4.4"}).ok,
+                    'failed to setFCV');
     }, st.s.port);
     failpoint.wait();
 
@@ -123,7 +126,8 @@ const st = new ShardingTest({
     let failpoint =
         configureFailPoint(originalRS0Primary, "setFCVHangWhileInsertingRangeDeletionTasks");
     const awaitResult = startParallelShell(() => {
-        assert.commandWorked(db.adminCommand({setFeatureCompatibilityVersion: "4.4"}));
+        assert.soon(() => db.adminCommand({setFeatureCompatibilityVersion: "4.4"}).ok,
+                    'failed to setFCV');
     }, st.s.port);
     failpoint.wait();
 

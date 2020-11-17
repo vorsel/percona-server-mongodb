@@ -95,7 +95,7 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
 
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (opCtx->writesAreReplicated() && !replCoord->canAcceptWritesFor(opCtx, source))
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while renaming collection " << source << " to "
                                     << target);
 
@@ -331,11 +331,12 @@ Status renameCollectionWithinDB(OperationContext* opCtx,
     Collection* const targetColl =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, target);
 
-    AutoStatsTracker statsTracker(opCtx,
-                                  source,
-                                  Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateCurOp,
-                                  db->getProfilingLevel());
+    AutoStatsTracker statsTracker(
+        opCtx,
+        source,
+        Top::LockType::NotLocked,
+        AutoStatsTracker::LogMode::kUpdateCurOp,
+        CollectionCatalog::get(opCtx).getDatabaseProfileLevel(source.db()));
 
     if (!targetColl) {
         return renameCollectionDirectly(opCtx, db, sourceColl->uuid(), source, target, options);
@@ -371,11 +372,12 @@ Status renameCollectionWithinDBForApplyOps(OperationContext* opCtx,
     Collection* const sourceColl =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
 
-    AutoStatsTracker statsTracker(opCtx,
-                                  source,
-                                  Top::LockType::NotLocked,
-                                  AutoStatsTracker::LogMode::kUpdateCurOp,
-                                  db->getProfilingLevel());
+    AutoStatsTracker statsTracker(
+        opCtx,
+        source,
+        Top::LockType::NotLocked,
+        AutoStatsTracker::LogMode::kUpdateCurOp,
+        CollectionCatalog::get(opCtx).getDatabaseProfileLevel(source.db()));
 
     return writeConflictRetry(opCtx, "renameCollection", target.ns(), [&] {
         Collection* targetColl =
@@ -488,12 +490,13 @@ Status renameBetweenDBs(OperationContext* opCtx,
     if (!sourceDB)
         return Status(ErrorCodes::NamespaceNotFound, "source namespace does not exist");
 
-    boost::optional<AutoStatsTracker> statsTracker(boost::in_place_init,
-                                                   opCtx,
-                                                   source,
-                                                   Top::LockType::NotLocked,
-                                                   AutoStatsTracker::LogMode::kUpdateCurOp,
-                                                   sourceDB->getProfilingLevel());
+    boost::optional<AutoStatsTracker> statsTracker(
+        boost::in_place_init,
+        opCtx,
+        source,
+        Top::LockType::NotLocked,
+        AutoStatsTracker::LogMode::kUpdateCurOp,
+        CollectionCatalog::get(opCtx).getDatabaseProfileLevel(source.db()));
 
     Collection* const sourceColl =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, source);
@@ -693,12 +696,12 @@ Status renameBetweenDBs(OperationContext* opCtx,
             // Cursor is left one past the end of the batch inside writeConflictRetry.
             auto beginBatchId = record->id;
             Status status = writeConflictRetry(opCtx, "renameCollection", tmpName.ns(), [&] {
-                WriteUnitOfWork wunit(opCtx);
                 // Need to reset cursor if it gets a WCE midway through.
                 if (!record || (beginBatchId != record->id)) {
                     record = cursor->seekExact(beginBatchId);
                 }
                 for (int i = 0; record && (i < internalInsertMaxBatchSize.load()); i++) {
+                    WriteUnitOfWork wunit(opCtx);
                     const InsertStatement stmt(record->data.releaseToBson());
                     OpDebug* const opDebug = nullptr;
                     auto status = tmpColl->insertDocument(opCtx, stmt, opDebug, true);
@@ -706,6 +709,12 @@ Status renameBetweenDBs(OperationContext* opCtx,
                         return status;
                     }
                     record = cursor->next();
+
+                    // Used to make sure that a WCE can be handled by this logic without data loss.
+                    if (MONGO_unlikely(writeConflictInRenameCollCopyToTmp.shouldFail())) {
+                        throw WriteConflictException();
+                    }
+                    wunit.commit();
                 }
 
                 // Time to yield; make a safe copy of the current record before releasing our
@@ -719,11 +728,6 @@ Status renameBetweenDBs(OperationContext* opCtx,
                     writeConflictRetry(
                         opCtx, "retryRestoreCursor", ns, [&cursor] { cursor->restore(); });
                 });
-                // Used to make sure that a WCE can be handled by this logic without data loss.
-                if (MONGO_unlikely(writeConflictInRenameCollCopyToTmp.shouldFail())) {
-                    throw WriteConflictException();
-                }
-                wunit.commit();
                 return Status::OK();
             });
             if (!status.isOK())

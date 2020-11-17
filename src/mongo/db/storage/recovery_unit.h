@@ -377,16 +377,18 @@ public:
     }
 
     /**
+     * Refreshes a read transaction by starting a new one at the same read timestamp and then ending
+     * the current one.
+     */
+    virtual void refreshSnapshot() {}
+
+    /**
      * The ReadSource indicates which external or provided timestamp to read from for future
      * transactions.
      */
     enum ReadSource {
         /**
-         * Do not read from a timestamp. This is the default.
-         */
-        kUnset,
-        /**
-         * Read without a timestamp explicitly.
+         * Read without a timestamp. This is the default.
          */
         kNoTimestamp,
         /**
@@ -414,8 +416,6 @@ public:
 
     static std::string toString(ReadSource rs) {
         switch (rs) {
-            case ReadSource::kUnset:
-                return "kUnset";
             case ReadSource::kNoTimestamp:
                 return "kNoTimestamp";
             case ReadSource::kMajorityCommitted:
@@ -445,7 +445,7 @@ public:
                                         boost::optional<Timestamp> provided = boost::none) {}
 
     virtual ReadSource getTimestampReadSource() const {
-        return ReadSource::kUnset;
+        return ReadSource::kNoTimestamp;
     };
 
     /**
@@ -623,6 +623,14 @@ public:
         _mustBeTimestamped = true;
     }
 
+    void setNoEvictionAfterRollback() {
+        _noEvictionAfterRollback = true;
+    }
+
+    bool getNoEvictionAfterRollback() const {
+        return _noEvictionAfterRollback;
+    }
+
 protected:
     RecoveryUnit();
 
@@ -662,6 +670,8 @@ protected:
     }
 
     bool _mustBeTimestamped = false;
+
+    bool _noEvictionAfterRollback = false;
 
 private:
     // Sets the snapshot associated with this RecoveryUnit to a new globally unique id number.

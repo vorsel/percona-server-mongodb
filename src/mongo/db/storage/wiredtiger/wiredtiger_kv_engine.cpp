@@ -329,8 +329,8 @@ public:
 
             if (_shuttingDown) {
                 LOGV2_DEBUG(22306, 1, "stopping {name} thread", "name"_attr = name());
-                _nextSharedPromise->setError(
-                    Status(ErrorCodes::ShutdownInProgress, "The storage catalog is being closed."));
+                invariant(!_shutdownReason.isOK());
+                _nextSharedPromise->setError(_shutdownReason);
                 stdx::lock_guard<Latch> lk(_opCtxMutex);
                 _uniqueCtx.reset();
                 return;
@@ -343,12 +343,14 @@ public:
     }
 
     /**
-     * Signals the thread to quit and then waits until it does.
+     * Signals the thread to quit and then waits until it does. The given 'reason' is returned to
+     * any operations that were waiting for the journal to flush.
      */
-    void shutdown() {
+    void shutdown(const Status& reason) {
         {
             stdx::lock_guard<Latch> lk(_stateMutex);
             _shuttingDown = true;
+            _shutdownReason = reason;
             _flushJournalNowCV.notify_one();
         }
         wait();
@@ -415,6 +417,7 @@ private:
 
     bool _flushJournalNow = false;
     bool _shuttingDown = false;
+    Status _shutdownReason = Status::OK();
 
     // New callers get a future from nextSharedPromise. The JournalFlusher thread will swap that to
     // currentSharedPromise at the start of every round of flushing, and reset nextSharedPromise
@@ -1197,6 +1200,10 @@ void WiredTigerKVEngine::startAsyncThreads() {
     }
 }
 
+void WiredTigerKVEngine::notifyStartupComplete() {
+    WiredTigerUtil::notifyStartupComplete();
+}
+
 void WiredTigerKVEngine::appendGlobalStats(BSONObjBuilder& b) {
     BSONObjBuilder bb(b.subobjStart("concurrentTransactions"));
     {
@@ -1216,6 +1223,21 @@ void WiredTigerKVEngine::appendGlobalStats(BSONObjBuilder& b) {
     bb.done();
 }
 
+/**
+ * Table of MongoDB<->WiredTiger<->Log version numbers:
+ *
+ * |                MongoDB | WiredTiger | Log |
+ * |------------------------+------------+-----|
+ * |                 3.0.15 |      2.5.3 |   1 |
+ * |                 3.2.20 |      2.9.2 |   1 |
+ * |                 3.4.15 |      2.9.2 |   1 |
+ * |                  3.6.4 |      3.0.1 |   2 |
+ * |                 4.0.16 |      3.1.1 |   3 |
+ * |                  4.2.1 |      3.2.2 |   3 |
+ * |                  4.2.6 |      3.3.0 |   3 |
+ * | 4.2.6 (blessed by 4.4) |      3.3.0 |   4 |
+ * |                  4.4.0 |     10.0.0 |   5 |
+ */
 void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::string& wtOpenConfig) {
     // MongoDB 4.4 will always run in compatibility version 10.0.
     std::string configStr = wtOpenConfig + ",compatibility=(require_min=\"10.0.0\")";
@@ -1295,6 +1317,8 @@ void WiredTigerKVEngine::cleanShutdown() {
     LOGV2(22317, "WiredTigerKVEngine shutting down");
     // Ensure that key db is destroyed on exit
     ON_BLOCK_EXIT([&] { _encryptionKeyDB.reset(nullptr); });
+    WiredTigerUtil::resetTableLoggingInfo();
+
     if (!_readOnly)
         syncSizeInfo(true);
     if (!_conn) {
@@ -1309,7 +1333,8 @@ void WiredTigerKVEngine::cleanShutdown() {
     }
     if (_journalFlusher) {
         LOGV2(22320, "Shutting down journal flusher thread");
-        _journalFlusher->shutdown();
+        _journalFlusher->shutdown(
+            {ErrorCodes::ShutdownInProgress, "The storage catalog is being closed."});
         LOGV2(22321, "Finished shutting down journal flusher thread");
     }
     if (_checkpointThread) {
@@ -3167,7 +3192,8 @@ StatusWith<Timestamp> WiredTigerKVEngine::recoverToStableTimestamp(OperationCont
             "WiredTiger::RecoverToStableTimestamp shutting down journal and checkpoint threads.");
         // Shutdown WiredTigerKVEngine owned accesses into the storage engine.
         if (_durable) {
-            _journalFlusher->shutdown();
+            _journalFlusher->shutdown(
+                {ErrorCodes::InterruptedDueToReplStateChange, "Rollback in progress."});
         }
         _checkpointThread->shutdown();
     }

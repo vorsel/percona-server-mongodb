@@ -59,23 +59,11 @@ AutoStatsTracker::AutoStatsTracker(OperationContext* opCtx,
                                    const NamespaceString& nss,
                                    Top::LockType lockType,
                                    LogMode logMode,
-                                   boost::optional<int> dbProfilingLevel,
+                                   int dbProfilingLevel,
                                    Date_t deadline)
     : _opCtx(opCtx), _lockType(lockType), _nss(nss), _logMode(logMode) {
     if (_logMode == LogMode::kUpdateTop) {
         return;
-    }
-
-    if (!dbProfilingLevel) {
-        // No profiling level was determined, attempt to read the profiling level from the Database
-        // object. Since we are only reading the in-memory profiling level out of the database
-        // object (which is configured on a per-node basis and not replicated or persisted), we
-        // never need to conflict with secondary batch application.
-        ShouldNotConflictWithSecondaryBatchApplicationBlock noConflict(opCtx->lockState());
-        AutoGetDb autoDb(_opCtx, _nss.db(), MODE_IS, deadline);
-        if (autoDb.getDb()) {
-            dbProfilingLevel = autoDb.getDb()->getProfilingLevel();
-        }
     }
 
     stdx::lock_guard<Client> clientLock(*_opCtx->getClient());
@@ -102,6 +90,10 @@ AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
                                                    const NamespaceStringOrUUID& nsOrUUID,
                                                    AutoGetCollection::ViewMode viewMode,
                                                    Date_t deadline) {
+    // The caller was expecting to conflict with batch application before entering this function.
+    // i.e. the caller does not currently have a ShouldNotConflict... block in scope.
+    bool callerWasConflicting = opCtx->lockState()->shouldConflictWithSecondaryBatchApplication();
+
     // Don't take the ParallelBatchWriterMode lock when the server parameter is set and our
     // storage engine supports snapshot reads.
     if (gAllowSecondaryReadsDuringBatchApplication.load() &&
@@ -111,11 +103,6 @@ AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
     }
     const auto collectionLockMode = getLockModeForQuery(opCtx, nsOrUUID.nss());
     _autoColl.emplace(opCtx, nsOrUUID, collectionLockMode, viewMode, deadline);
-
-    // If the read source is explicitly set to kNoTimestamp, we read the most up to date data and do
-    // not consider changing our ReadSource (e.g. FTDC needs that).
-    if (opCtx->recoveryUnit()->getTimestampReadSource() == RecoveryUnit::ReadSource::kNoTimestamp)
-        return;
 
     repl::ReplicationCoordinator* const replCoord = repl::ReplicationCoordinator::get(opCtx);
     const auto readConcernLevel = repl::ReadConcernArgs::get(opCtx).getLevel();
@@ -145,6 +132,32 @@ AutoGetCollectionForRead::AutoGetCollectionForRead(OperationContext* opCtx,
         if (auto newReadSource = SnapshotHelper::getNewReadSource(opCtx, nss)) {
             opCtx->recoveryUnit()->setTimestampReadSource(*newReadSource);
             readSource = *newReadSource;
+        }
+
+        // This assertion protects operations from reading inconsistent data on secondaries when
+        // using the default ReadSource of kNoTimestamp.
+
+        // Reading at lastApplied on secondaries is the safest behavior and is enabled for all user
+        // and DBDirectClient reads using 'local' and 'available' readConcerns. If an internal
+        // operation wishes to read without a timestamp during a batch, a ShouldNotConflict can
+        // suppress this fatal assertion with the following considerations:
+        // * The operation is not reading replicated data in a replication state where batch
+        //   application is active OR
+        // * Reading inconsistent, out-of-order data is either inconsequential or required by
+        //   the operation.
+
+        // If the caller entered this function expecting to conflict with batch application
+        // (i.e. no ShouldNotConflict block in scope), but they are reading without a timestamp and
+        // not holding the PBWM lock, then there is a possibility that this reader may
+        // unintentionally see inconsistent data during a batch. Certain namespaces are applied
+        // serially in oplog application, and therefore can be safely read without taking the PBWM
+        // lock or reading at a timestamp.
+        if (readSource == RecoveryUnit::ReadSource::kNoTimestamp && callerWasConflicting &&
+            !nss.isAdminDB() && !nss.mustBeAppliedInOwnOplogBatch() &&
+            SnapshotHelper::shouldReadAtLastApplied(opCtx, nss)) {
+            LOGV2_FATAL(4728700,
+                        "Reading from replicated collection without read timestamp or PBWM lock",
+                        "collection"_attr = nss);
         }
 
         const auto readTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
@@ -238,13 +251,13 @@ AutoGetCollectionForReadCommand::AutoGetCollectionForReadCommand(
     Date_t deadline,
     AutoStatsTracker::LogMode logMode)
     : _autoCollForRead(opCtx, nsOrUUID, viewMode, deadline),
-      _statsTracker(opCtx,
-                    _autoCollForRead.getNss(),
-                    Top::LockType::ReadLocked,
-                    logMode,
-                    _autoCollForRead.getDb() ? _autoCollForRead.getDb()->getProfilingLevel()
-                                             : kDoNotChangeProfilingLevel,
-                    deadline) {
+      _statsTracker(
+          opCtx,
+          _autoCollForRead.getNss(),
+          Top::LockType::ReadLocked,
+          logMode,
+          CollectionCatalog::get(opCtx).getDatabaseProfileLevel(_autoCollForRead.getNss().db()),
+          deadline) {
 
     // Perform the check early so the query planner would be able to extract the correct
     // shard key. Also make sure that version is compatible if query planner decides to
@@ -278,7 +291,8 @@ OldClientContext::OldClientContext(OperationContext* opCtx, const std::string& n
     }
 
     stdx::lock_guard<Client> lk(*_opCtx->getClient());
-    currentOp->enter_inlock(ns.c_str(), _db->getProfilingLevel());
+    currentOp->enter_inlock(ns.c_str(),
+                            CollectionCatalog::get(opCtx).getDatabaseProfileLevel(_db->name()));
 }
 
 OldClientContext::~OldClientContext() {

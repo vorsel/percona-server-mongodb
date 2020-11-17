@@ -452,6 +452,7 @@ let testCases = {
     grantPrivilegesToRole: {skip: "always targets the config server"},
     grantRolesToRole: {skip: "always targets the config server"},
     grantRolesToUser: {skip: "always targets the config server"},
+    hello: {skip: "executes locally on mongos (not sent to any remote node)"},
     hostInfo: {skip: "executes locally on mongos (not sent to any remote node)"},
     insert: {
         run: {
@@ -490,6 +491,7 @@ let testCases = {
     },
     listShards: {skip: "does not forward command to primary shard"},
     logApplicationMessage: {skip: "not on a user database", conditional: true},
+    logMessage: {skip: "not on a user database"},
     logRotate: {skip: "executes locally on mongos (not sent to any remote node)"},
     logout: {skip: "not on a user database"},
     mapReduce: {

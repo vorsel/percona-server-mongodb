@@ -838,6 +838,8 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
     invariant(hbStats.getLastHeartbeatStartDate() != Date_t());
     const bool isUnauthorized = (hbResponse.getStatus().code() == ErrorCodes::Unauthorized) ||
         (hbResponse.getStatus().code() == ErrorCodes::AuthenticationFailed);
+
+    // Replication of auth changes can cause temporary auth failures.
     if (hbResponse.isOK() || isUnauthorized) {
         hbStats.hit(networkRoundTripTime);
     } else {
@@ -932,15 +934,14 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
     if (!_rsConfig.isInitialized()) {
         return nextAction;
     }
-    // If we're not in the config, we don't need to respond to heartbeats.
+    // This server is not in the config, either because it was removed or a DNS error finding self.
     if (_selfIndex == -1) {
-        LOGV2_DEBUG(21805,
-                    1,
-                    "Could not find ourself in current config so ignoring heartbeat from {target} "
-                    "-- current config: {currentConfig}",
-                    "Could not find ourself in current config so ignoring heartbeat",
-                    "target"_attr = target,
-                    "currentConfig"_attr = _rsConfig.toBSON());
+        LOGV2(3564900,
+              "Could not find self in current config, retrying DNS resolution of members",
+              "target"_attr = target,
+              "currentConfig"_attr = _rsConfig.toBSON());
+        nextAction = HeartbeatResponseAction::makeRetryReconfigAction();
+        nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
         return nextAction;
     }
     const int memberIndex = _rsConfig.findMemberIndexByHostAndPort(target);
@@ -1249,7 +1250,7 @@ StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::Up
                                                     long long* configVersion) {
     if (_selfIndex == -1) {
         // Ignore updates when we're in state REMOVED.
-        return Status(ErrorCodes::NotMasterOrSecondary,
+        return Status(ErrorCodes::NotPrimaryOrSecondary,
                       "Received replSetUpdatePosition command but we are in state REMOVED");
     }
     invariant(_rsConfig.isInitialized());  // Can only use setLastOptime in replSet mode.
@@ -1589,7 +1590,7 @@ TopologyCoordinator::prepareForStepDownAttempt() {
     }
 
     if (_leaderMode == LeaderMode::kNotLeader) {
-        return Status{ErrorCodes::NotMaster, "This node is not a primary."};
+        return Status{ErrorCodes::NotWritablePrimary, "This node is not a primary."};
     }
 
     invariant(_leaderMode == LeaderMode::kMaster || _leaderMode == LeaderMode::kLeaderElect);
@@ -2811,24 +2812,22 @@ bool TopologyCoordinator::canCompleteTransitionToPrimary(long long termWhenDrain
     }
     // Allow completing the transition to primary even when in the middle of a stepdown attempt,
     // in case the stepdown attempt fails.
-    if (_leaderMode != LeaderMode::kLeaderElect && _leaderMode != LeaderMode::kAttemptingStepDown) {
+    if (_leaderMode != LeaderMode::kLeaderElect && _leaderMode != LeaderMode::kAttemptingStepDown &&
+        _leaderMode != LeaderMode::kSteppingDown) {
         return false;
     }
 
     return true;
 }
 
-Status TopologyCoordinator::completeTransitionToPrimary(const OpTime& firstOpTimeOfTerm) {
-    if (!canCompleteTransitionToPrimary(firstOpTimeOfTerm.getTerm())) {
-        return Status(ErrorCodes::PrimarySteppedDown,
-                      "By the time this node was ready to complete its transition to PRIMARY it "
-                      "was no longer eligible to do so");
-    }
+void TopologyCoordinator::completeTransitionToPrimary(const OpTime& firstOpTimeOfTerm) {
+    invariant(canCompleteTransitionToPrimary(firstOpTimeOfTerm.getTerm()));
+
     if (_leaderMode == LeaderMode::kLeaderElect) {
         _setLeaderMode(LeaderMode::kMaster);
     }
+
     _firstOpTimeOfMyTerm = firstOpTimeOfTerm;
-    return Status::OK();
 }
 
 void TopologyCoordinator::adjustMaintenanceCountBy(int inc) {

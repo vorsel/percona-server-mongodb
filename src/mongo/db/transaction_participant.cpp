@@ -87,6 +87,8 @@ MONGO_FAIL_POINT_DEFINE(skipCommitTxnCheckPrepareMajorityCommitted);
 
 MONGO_FAIL_POINT_DEFINE(restoreLocksFail);
 
+MONGO_FAIL_POINT_DEFINE(failTransactionNoopWrite);
+
 const auto getTransactionParticipant = Session::declareDecoration<TransactionParticipant>();
 
 // The command names that are allowed in a prepared transaction.
@@ -121,8 +123,9 @@ struct ActiveTransactionHistory {
 
 ActiveTransactionHistory fetchActiveTransactionHistory(OperationContext* opCtx,
                                                        const LogicalSessionId& lsid) {
-    // Restore the current timestamp read source after fetching transaction history.
-    ReadSourceScope readSourceScope(opCtx);
+    // Restore the current timestamp read source after fetching transaction history using
+    // DBDirectClient, which may change our ReadSource.
+    ReadSourceScope readSourceScope(opCtx, RecoveryUnit::ReadSource::kNoTimestamp);
 
     ActiveTransactionHistory result;
 
@@ -317,11 +320,16 @@ void TransactionParticipant::performNoopWrite(OperationContext* opCtx, StringDat
     // been satisfied.
     invariant(!opCtx->lockState()->hasMaxLockTimeout());
 
-    {
-        Lock::DBLock dbLock(opCtx, "local", MODE_IX);
-        Lock::CollectionLock collectionLock(opCtx, NamespaceString::kRsOplogNamespace, MODE_IX);
+    // Simulate an operation timeout and fail the noop write if the fail point is enabled. This is
+    // to test that NoSuchTransaction error is not considered transient if the noop write cannot
+    // occur.
+    if (MONGO_unlikely(failTransactionNoopWrite.shouldFail())) {
+        uasserted(ErrorCodes::MaxTimeMSExpired, "failTransactionNoopWrite fail point enabled");
+    }
 
-        uassert(ErrorCodes::NotMaster,
+    {
+        AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
+        uassert(ErrorCodes::NotWritablePrimary,
                 "Not primary when performing noop write for {}"_format(msg),
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
 
@@ -487,7 +495,7 @@ void TransactionParticipant::Participant::beginOrContinue(OperationContext* opCt
     repl::ReplicationStateTransitionLockGuard rstl(opCtx, MODE_IX);
     if (opCtx->writesAreReplicated()) {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        uassert(ErrorCodes::NotMaster,
+        uassert(ErrorCodes::NotWritablePrimary,
                 "Not primary so we cannot begin or continue a transaction",
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
         // Disallow multi-statement transactions on shard servers that have
@@ -816,6 +824,10 @@ void TransactionParticipant::TxnResources::release(OperationContext* opCtx) {
 
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     readConcernArgs = _readConcernArgs;
+}
+
+void TransactionParticipant::TxnResources::setNoEvictionAfterRollback() {
+    _recoveryUnit->setNoEvictionAfterRollback();
 }
 
 TransactionParticipant::SideTransactionBlock::SideTransactionBlock(OperationContext* opCtx)
@@ -1339,7 +1351,7 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
 
     if (opCtx->writesAreReplicated()) {
-        uassert(ErrorCodes::NotMaster,
+        uassert(ErrorCodes::NotWritablePrimary,
                 "Not primary so we cannot commit a prepared transaction",
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
     }
@@ -1513,7 +1525,7 @@ void TransactionParticipant::Participant::_abortActivePreparedTransaction(Operat
 
     if (opCtx->writesAreReplicated()) {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        uassert(ErrorCodes::NotMaster,
+        uassert(ErrorCodes::NotWritablePrimary,
                 "Not primary so we cannot abort a prepared transaction",
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
     }
@@ -1635,6 +1647,9 @@ void TransactionParticipant::Participant::_abortTransactionOnSession(OperationCo
                                                      : TransactionState::kAbortedWithoutPrepare;
 
     stdx::lock_guard<Client> lk(*opCtx->getClient());
+    if (o().txnResourceStash && opCtx->recoveryUnit()->getNoEvictionAfterRollback()) {
+        o(lk).txnResourceStash->setNoEvictionAfterRollback();
+    }
     _resetTransactionState(lk, nextState);
 }
 

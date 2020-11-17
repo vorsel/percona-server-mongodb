@@ -14,7 +14,7 @@ mongobridge = env.Program(
         "bridge.cpp",
         "bridge_commands.cpp",
         "mongobridge_options.cpp",
-        env.Idlc("mongobridge_options.idl")[0],
+        "mongobridge_options.idl",
         "mongobridge_options_init.cpp"
     ],
     LIBDEPS=[
@@ -37,7 +37,7 @@ perconadecrypt = env.Program(
     source=[
         'perconadecrypt.cpp',
         'perconadecrypt_options.cpp',
-        env.Idlc("perconadecrypt_options.idl")[0],
+        'perconadecrypt_options.idl',
         'perconadecrypt_options_init.cpp'
     ],
     LIBDEPS=[

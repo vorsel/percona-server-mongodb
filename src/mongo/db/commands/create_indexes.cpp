@@ -544,7 +544,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
         Lock::DBLock dbLock(opCtx, ns.db(), MODE_IX);
         checkDatabaseShardingState(opCtx, ns);
         if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
-            uasserted(ErrorCodes::NotMaster,
+            uasserted(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while creating indexes in " << ns.ns());
         }
 
@@ -594,12 +594,11 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
 
     // Use AutoStatsTracker to update Top.
     boost::optional<AutoStatsTracker> statsTracker;
-    const boost::optional<int> dbProfilingLevel = boost::none;
     statsTracker.emplace(opCtx,
                          ns,
                          Top::LockType::WriteLocked,
                          AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                         dbProfilingLevel);
+                         CollectionCatalog::get(opCtx).getDatabaseProfileLevel(ns.db()));
 
     auto buildUUID = UUID::gen();
     ReplIndexBuildState::IndexCatalogStats stats;
@@ -667,7 +666,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
                       "buildUUID"_attr = buildUUID);
             }
             throw;
-        } catch (const ExceptionForCat<ErrorCategory::NotMasterError>& ex) {
+        } catch (const ExceptionForCat<ErrorCategory::NotPrimaryError>& ex) {
             LOGV2(20444,
                   "Index build: received interrupt signal due to change in replication state",
                   "buildUUID"_attr = buildUUID,
@@ -685,8 +684,9 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
                                                   << ex.toString());
             indexBuildsCoord->abortIndexBuildByBuildUUID(
                 opCtx, buildUUID, IndexBuildAction::kPrimaryAbort, abortReason);
-            LOGV2(
-                20446, "Index build: aborted due to NotMaster error", "buildUUID"_attr = buildUUID);
+            LOGV2(20446,
+                  "Index build: aborted due to NotPrimary error",
+                  "buildUUID"_attr = buildUUID);
             throw;
         }
 

@@ -31,10 +31,6 @@ class Stat:
     def __cmp__(self, other):
         return cmp(self.desc.lower(), other.desc.lower())
 
-class AsyncStat(Stat):
-    prefix = 'async'
-    def __init__(self, name, desc, flags=''):
-        Stat.__init__(self, name, AsyncStat.prefix, desc, flags)
 class BlockStat(Stat):
     prefix = 'block-manager'
     def __init__(self, name, desc, flags=''):
@@ -157,6 +153,8 @@ connection_stats = [
     ##########################################
     # System statistics
     ##########################################
+    ConnStat('buckets', 'hash bucket array size general', 'no_clear,no_scale,size'),
+    ConnStat('buckets_dh', 'hash bucket array size for data handles', 'no_clear,no_scale,size'),
     ConnStat('cond_auto_wait', 'auto adjusting condition wait calls'),
     ConnStat('cond_auto_wait_reset', 'auto adjusting condition resets'),
     ConnStat('cond_auto_wait_skipped', 'auto adjusting condition wait raced to update timeout and skipped updating'),
@@ -171,23 +169,6 @@ connection_stats = [
     ConnStat('rwlock_write', 'pthread mutex shared lock write-lock calls'),
     ConnStat('time_travel', 'detected system time went backwards'),
     ConnStat('write_io', 'total write I/Os'),
-
-    ##########################################
-    # Async API statistics
-    ##########################################
-    AsyncStat('async_alloc_race', 'number of allocation state races'),
-    AsyncStat('async_alloc_view', 'number of operation slots viewed for allocation'),
-    AsyncStat('async_cur_queue', 'current work queue length', 'no_scale'),
-    AsyncStat('async_flush', 'number of flush calls'),
-    AsyncStat('async_full', 'number of times operation allocation failed'),
-    AsyncStat('async_max_queue', 'maximum work queue length', 'no_clear,no_scale'),
-    AsyncStat('async_nowork', 'number of times worker found no work'),
-    AsyncStat('async_op_alloc', 'total allocations'),
-    AsyncStat('async_op_compact', 'total compact calls'),
-    AsyncStat('async_op_insert', 'total insert calls'),
-    AsyncStat('async_op_remove', 'total remove calls'),
-    AsyncStat('async_op_search', 'total search calls'),
-    AsyncStat('async_op_update', 'total update calls'),
 
     ##########################################
     # Block manager statistics
@@ -263,6 +244,7 @@ connection_stats = [
     CacheStat('cache_eviction_pages_queued_urgent', 'pages queued for urgent eviction'),
     CacheStat('cache_eviction_pages_seen', 'pages seen by eviction walk'),
     CacheStat('cache_eviction_pages_already_queued', 'pages seen by eviction walk that are already queued'),
+    CacheStat('cache_eviction_pages_in_parallel_with_checkpoint', 'pages evicted in parallel with checkpoint'),
     CacheStat('cache_eviction_queue_empty', 'eviction server candidate queue empty when topping up'),
     CacheStat('cache_eviction_queue_not_empty', 'eviction server candidate queue not empty when topping up'),
     CacheStat('cache_eviction_server_evicting', 'eviction server evicting pages'),
@@ -284,6 +266,7 @@ connection_stats = [
     CacheStat('cache_eviction_walk_from_root', 'eviction walks started from root of tree'),
     CacheStat('cache_eviction_walk_leaf_notfound', 'eviction server waiting for a leaf page'),
     CacheStat('cache_eviction_walk_passes', 'eviction passes of a file'),
+    CacheStat('cache_eviction_walk_restart', 'eviction walks restarted'),
     CacheStat('cache_eviction_walk_saved_pos', 'eviction walks started from saved location in tree'),
     CacheStat('cache_eviction_walks_abandoned', 'eviction walks abandoned'),
     CacheStat('cache_eviction_walks_active', 'files with active eviction walks', 'no_clear,no_scale'),
@@ -302,7 +285,6 @@ connection_stats = [
     CacheStat('cache_hs_insert_restart', 'history store table insert calls that returned restart'),
     CacheStat('cache_hs_key_truncate', 'history store table truncation to remove an update'),
     CacheStat('cache_hs_key_truncate_mix_ts', 'history store table truncation to remove range of updates due to mixed timestamps'),
-    CacheStat('cache_hs_key_truncate_mix_ts_restart', 'history store table truncation due to mixed timestamps that returned restart'),
     CacheStat('cache_hs_key_truncate_onpage_removal', 'history store table truncation to remove range of updates due to key being removed from the data page during reconciliation'),
     CacheStat('cache_hs_key_truncate_rts', 'history store table truncation by rollback to stable to remove an update'),
     CacheStat('cache_hs_key_truncate_rts_unstable', 'history store table truncation by rollback to stable to remove an unstable update'),
@@ -368,6 +350,8 @@ connection_stats = [
     CursorStat('cursor_modify_bytes', 'cursor modify key and value bytes affected', 'size'),
     CursorStat('cursor_modify_bytes_touch', 'cursor modify value bytes modified', 'size'),
     CursorStat('cursor_next', 'cursor next calls'),
+    CursorStat('cursor_next_hs_tombstone', 'cursor next calls that skip due to a globally visible history store tombstone'),
+    CursorStat('cursor_next_hs_tombstone_rts', 'cursor next calls that skip due to a globally visible history store tombstone in rollback to stable'),
     CursorStat('cursor_next_skip_ge_100', 'cursor next calls that skip greater than or equal to 100 entries'),
     CursorStat('cursor_next_skip_lt_100', 'cursor next calls that skip less than 100 entries'),
     CursorStat('cursor_next_skip_total', 'Total number of entries skipped by cursor next calls'),
@@ -562,7 +546,7 @@ connection_stats = [
     RecStat('rec_time_aggr_newest_stop_ts', 'pages written including an aggregated newest stop timestamp '),
     RecStat('rec_time_aggr_newest_stop_txn', 'pages written including an aggregated newest stop transaction ID'),
     RecStat('rec_time_aggr_oldest_start_ts', 'pages written including an aggregated oldest start timestamp '),
-    RecStat('rec_time_aggr_oldest_start_txn', 'pages written including an aggregated oldest start transaction ID '),
+    RecStat('rec_time_aggr_newest_txn', 'pages written including an aggregated newest transaction ID '),
     RecStat('rec_time_aggr_prepared', 'pages written including an aggregated prepare'),
     RecStat('rec_time_window_bytes_ts', 'approximate byte size of timestamps in pages written'),
     RecStat('rec_time_window_bytes_txn', 'approximate byte size of transaction IDs in pages written'),
@@ -595,10 +579,6 @@ connection_stats = [
     SessionOpStat('session_table_create_success', 'table create successful calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_drop_fail', 'table drop failed calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_drop_success', 'table drop successful calls', 'no_clear,no_scale'),
-    SessionOpStat('session_table_import_fail', 'table import failed calls', 'no_clear,no_scale'),
-    SessionOpStat('session_table_import_success', 'table import successful calls', 'no_clear,no_scale'),
-    SessionOpStat('session_table_rebalance_fail', 'table rebalance failed calls', 'no_clear,no_scale'),
-    SessionOpStat('session_table_rebalance_success', 'table rebalance successful calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_rename_fail', 'table rename failed calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_rename_success', 'table rename successful calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_salvage_fail', 'table salvage failed calls', 'no_clear,no_scale'),
@@ -622,6 +602,12 @@ connection_stats = [
     TxnStat('txn_checkpoint', 'transaction checkpoints'),
     TxnStat('txn_checkpoint_fsync_post', 'transaction fsync calls for checkpoint after allocating the transaction ID'),
     TxnStat('txn_checkpoint_fsync_post_duration', 'transaction fsync duration for checkpoint after allocating the transaction ID (usecs)', 'no_clear,no_scale'),
+    TxnStat('txn_checkpoint_handle_applied', 'transaction checkpoint most recent handles applied'),
+    TxnStat('txn_checkpoint_handle_skipped', 'transaction checkpoint most recent handles skipped'),
+    TxnStat('txn_checkpoint_handle_walked', 'transaction checkpoint most recent handles walked'),
+    TxnStat('txn_checkpoint_handle_duration', 'transaction checkpoint most recent duration for gathering all handles (usecs)', 'no_clear,no_scale'),
+    TxnStat('txn_checkpoint_handle_duration_apply', 'transaction checkpoint most recent duration for gathering applied handles (usecs)', 'no_clear,no_scale'),
+    TxnStat('txn_checkpoint_handle_duration_skip', 'transaction checkpoint most recent duration for gathering skipped handles (usecs)', 'no_clear,no_scale'),
     TxnStat('txn_hs_ckpt_duration', 'transaction checkpoint history store file duration (usecs)'),
     TxnStat('txn_checkpoint_generation', 'transaction checkpoint generation', 'no_clear,no_scale'),
     TxnStat('txn_checkpoint_prep_max', 'transaction checkpoint prepare max time (msecs)', 'no_clear,no_scale'),
@@ -773,6 +759,7 @@ dsrc_stats = [
     CacheStat('cache_eviction_target_page_lt64', 'eviction walk target pages histogram - 32-63'),
     CacheStat('cache_eviction_walk_from_root', 'eviction walks started from root of tree'),
     CacheStat('cache_eviction_walk_passes', 'eviction walk passes of a file'),
+    CacheStat('cache_eviction_walk_restart', 'eviction walks restarted'),
     CacheStat('cache_eviction_walk_saved_pos', 'eviction walks started from saved location in tree'),
     CacheStat('cache_eviction_walks_abandoned', 'eviction walks abandoned'),
     CacheStat('cache_eviction_walks_ended', 'eviction walks reached end of tree'),
@@ -907,7 +894,7 @@ dsrc_stats = [
     RecStat('rec_time_aggr_newest_stop_ts', 'pages written including an aggregated newest stop timestamp '),
     RecStat('rec_time_aggr_newest_stop_txn', 'pages written including an aggregated newest stop transaction ID'),
     RecStat('rec_time_aggr_oldest_start_ts', 'pages written including an aggregated oldest start timestamp '),
-    RecStat('rec_time_aggr_oldest_start_txn', 'pages written including an aggregated oldest start transaction ID '),
+    RecStat('rec_time_aggr_newest_txn', 'pages written including an aggregated newest transaction ID '),
     RecStat('rec_time_aggr_prepared', 'pages written including an aggregated prepare'),
     RecStat('rec_time_window_bytes_ts', 'approximate byte size of timestamps in pages written'),
     RecStat('rec_time_window_bytes_txn', 'approximate byte size of transaction IDs in pages written'),

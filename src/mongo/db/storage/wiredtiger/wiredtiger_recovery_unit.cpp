@@ -332,6 +332,41 @@ void WiredTigerRecoveryUnit::preallocateSnapshot() {
     getSession();
 }
 
+void WiredTigerRecoveryUnit::refreshSnapshot() {
+    // First, start a new transaction at the same timestamp as the current one.  Then end the
+    // current transaction.  This overlap will prevent WT from cleaning up history required to serve
+    // the read timestamp.
+
+    // Currently, this code only works for kNoOverlap or kNoTimestamp.
+    invariant(_timestampReadSource == ReadSource::kNoOverlap ||
+              _timestampReadSource == ReadSource::kNoTimestamp);
+    invariant(_isActive());
+    invariant(!_inUnitOfWork());
+    invariant(!_noEvictionAfterRollback);
+
+    auto newSession = _sessionCache->getSession();
+    WiredTigerBeginTxnBlock txnOpen(newSession->getSession(),
+                                    _prepareConflictBehavior,
+                                    _roundUpPreparedTimestamps,
+                                    RoundUpReadTimestamp::kNoRoundForce);
+    if (_timestampReadSource != ReadSource::kNoTimestamp) {
+        auto status = txnOpen.setReadSnapshot(_readAtTimestamp);
+        fassert(5035300, status);
+    }
+    txnOpen.done();
+
+    // Now end the previous transaction.
+    auto wtSession = _session->getSession();
+    auto wtRet = wtSession->rollback_transaction(wtSession, nullptr);
+    invariantWTOK(wtRet);
+    LOGV2_DEBUG(5035301,
+                3,
+                "WT begin_transaction & rollback_transaction",
+                "snapshotId"_attr = getSnapshotId().toNumber());
+
+    _session = std::move(newSession);
+}
+
 void WiredTigerRecoveryUnit::_txnClose(bool commit) {
     invariant(_isActive(), toString(_getState()));
     WT_SESSION* s = _session->getSession();
@@ -372,17 +407,28 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
         }
 
         wtRet = s->commit_transaction(s, conf.str().c_str());
+
         LOGV2_DEBUG(22412,
                     3,
-                    "WT commit_transaction for snapshot id {getSnapshotId_toNumber}",
-                    "getSnapshotId_toNumber"_attr = getSnapshotId().toNumber());
+                    "WT commit_transaction for snapshot id {snapshotId}",
+                    "WT commit_transaction",
+                    "snapshotId"_attr = getSnapshotId().toNumber());
     } else {
-        wtRet = s->rollback_transaction(s, nullptr);
-        invariant(!wtRet);
+        StringBuilder config;
+        if (_noEvictionAfterRollback) {
+            // The only point at which rollback_transaction() can time out is in the bonus-eviction
+            // phase. If the timeout expires here, the function will stop the eviction and return
+            // success. It cannot return an error due to timeout.
+            config << "operation_timeout_ms=1,";
+        }
+
+        wtRet = s->rollback_transaction(s, config.str().c_str());
+
         LOGV2_DEBUG(22413,
                     3,
-                    "WT rollback_transaction for snapshot id {getSnapshotId_toNumber}",
-                    "getSnapshotId_toNumber"_attr = getSnapshotId().toNumber());
+                    "WT rollback_transaction for snapshot id {snapshotId}",
+                    "WT rollback_transaction",
+                    "snapshotId"_attr = getSnapshotId().toNumber());
     }
 
     if (_isTimestamped) {
@@ -438,7 +484,6 @@ boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp()
     // transaction to establish a read timestamp, but only for ReadSources that are expected to have
     // read timestamps.
     switch (_timestampReadSource) {
-        case ReadSource::kUnset:
         case ReadSource::kNoTimestamp:
             return boost::none;
         case ReadSource::kMajorityCommitted:
@@ -477,7 +522,6 @@ boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp()
             return _readAtTimestamp;
 
         // The follow ReadSources returned values in the first switch block.
-        case ReadSource::kUnset:
         case ReadSource::kNoTimestamp:
         case ReadSource::kMajorityCommitted:
         case ReadSource::kProvided:
@@ -500,7 +544,6 @@ void WiredTigerRecoveryUnit::_txnOpen() {
     WT_SESSION* session = _session->getSession();
 
     switch (_timestampReadSource) {
-        case ReadSource::kUnset:
         case ReadSource::kNoTimestamp: {
             if (_isOplogReader) {
                 _oplogVisibleTs = static_cast<std::int64_t>(_oplogManager->getOplogReadTimestamp());
@@ -572,6 +615,17 @@ Timestamp WiredTigerRecoveryUnit::_beginTransactionAtAllDurableTimestamp(WT_SESS
     return readTimestamp;
 }
 
+namespace {
+/**
+ * This mutex serializes starting read transactions at lastApplied. This throttles new transactions
+ * so they do not overwhelm the WiredTiger spinlock that manages the global read timestamp queue.
+ * Because this queue can grow larger than the number of active transactions, the MongoDB ticketing
+ * system alone cannot restrict its growth and thus bound the amount of time the queue is locked.
+ * TODO: WT-6709
+ */
+Mutex _lastAppliedTxnMutex = MONGO_MAKE_LATCH("lastAppliedTxnMutex");
+}  // namespace
+
 Timestamp WiredTigerRecoveryUnit::_beginTransactionAtLastAppliedTimestamp(WT_SESSION* session) {
     auto lastApplied = _sessionCache->snapshotManager().getLastApplied();
     if (!lastApplied) {
@@ -591,13 +645,16 @@ Timestamp WiredTigerRecoveryUnit::_beginTransactionAtLastAppliedTimestamp(WT_SES
         return Timestamp();
     }
 
-    WiredTigerBeginTxnBlock txnOpen(session,
-                                    _prepareConflictBehavior,
-                                    _roundUpPreparedTimestamps,
-                                    RoundUpReadTimestamp::kRound);
-    auto status = txnOpen.setReadSnapshot(*lastApplied);
-    fassert(4847501, status);
-    txnOpen.done();
+    {
+        stdx::lock_guard<Mutex> lock(_lastAppliedTxnMutex);
+        WiredTigerBeginTxnBlock txnOpen(session,
+                                        _prepareConflictBehavior,
+                                        _roundUpPreparedTimestamps,
+                                        RoundUpReadTimestamp::kRound);
+        auto status = txnOpen.setReadSnapshot(*lastApplied);
+        fassert(4847501, status);
+        txnOpen.done();
+    }
 
     // We might have rounded to oldest between calling getLastApplied and setReadSnapshot. We
     // need to get the actual read timestamp we used.
@@ -817,7 +874,6 @@ void WiredTigerRecoveryUnit::setTimestampReadSource(ReadSource readSource,
                 "setting timestamp read source",
                 "readSource"_attr = toString(readSource),
                 "provided"_attr = ((provided) ? provided->toString() : "none"));
-
     invariant(!_isActive() || _timestampReadSource == readSource,
               str::stream() << "Current state: " << toString(_getState())
                             << ". Invalid internal state while setting timestamp read source: "

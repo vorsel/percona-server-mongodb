@@ -305,19 +305,6 @@ struct __wt_connection_stats {
     int64_t lsm_work_units_done;
     int64_t lsm_work_units_created;
     int64_t lsm_work_queue_max;
-    int64_t async_cur_queue;
-    int64_t async_max_queue;
-    int64_t async_alloc_race;
-    int64_t async_flush;
-    int64_t async_alloc_view;
-    int64_t async_full;
-    int64_t async_nowork;
-    int64_t async_op_alloc;
-    int64_t async_op_compact;
-    int64_t async_op_insert;
-    int64_t async_op_remove;
-    int64_t async_op_search;
-    int64_t async_op_update;
     int64_t block_preload;
     int64_t block_read;
     int64_t block_write;
@@ -372,6 +359,7 @@ struct __wt_connection_stats {
     int64_t cache_eviction_walks_gave_up_no_targets;
     int64_t cache_eviction_walks_gave_up_ratio;
     int64_t cache_eviction_walks_ended;
+    int64_t cache_eviction_walk_restart;
     int64_t cache_eviction_walk_from_root;
     int64_t cache_eviction_walk_saved_pos;
     int64_t cache_eviction_active_workers;
@@ -411,7 +399,6 @@ struct __wt_connection_stats {
     int64_t cache_hs_read_squash;
     int64_t cache_hs_key_truncate_rts_unstable;
     int64_t cache_hs_key_truncate_rts;
-    int64_t cache_hs_key_truncate_mix_ts_restart;
     int64_t cache_hs_key_truncate;
     int64_t cache_hs_key_truncate_onpage_removal;
     int64_t cache_hs_key_truncate_mix_ts;
@@ -434,6 +421,7 @@ struct __wt_connection_stats {
     int64_t cache_write_hs;
     int64_t cache_pages_inuse;
     int64_t cache_eviction_app;
+    int64_t cache_eviction_pages_in_parallel_with_checkpoint;
     int64_t cache_eviction_pages_queued;
     int64_t cache_eviction_pages_queued_post_lru;
     int64_t cache_eviction_pages_queued_urgent;
@@ -480,6 +468,8 @@ struct __wt_connection_stats {
     int64_t cond_auto_wait_skipped;
     int64_t time_travel;
     int64_t file_open;
+    int64_t buckets_dh;
+    int64_t buckets;
     int64_t memory_allocation;
     int64_t memory_free;
     int64_t memory_grow;
@@ -502,6 +492,8 @@ struct __wt_connection_stats {
     int64_t cursor_modify_bytes;
     int64_t cursor_modify_bytes_touch;
     int64_t cursor_next;
+    int64_t cursor_next_hs_tombstone;
+    int64_t cursor_next_hs_tombstone_rts;
     int64_t cursor_next_skip_ge_100;
     int64_t cursor_next_skip_lt_100;
     int64_t cursor_restart;
@@ -647,8 +639,8 @@ struct __wt_connection_stats {
     int64_t rec_time_aggr_newest_stop_durable_ts;
     int64_t rec_time_aggr_newest_stop_ts;
     int64_t rec_time_aggr_newest_stop_txn;
+    int64_t rec_time_aggr_newest_txn;
     int64_t rec_time_aggr_oldest_start_ts;
-    int64_t rec_time_aggr_oldest_start_txn;
     int64_t rec_time_aggr_prepared;
     int64_t rec_time_window_pages_prepared;
     int64_t rec_time_window_pages_durable_start_ts;
@@ -677,10 +669,6 @@ struct __wt_connection_stats {
     int64_t session_table_create_success;
     int64_t session_table_drop_fail;
     int64_t session_table_drop_success;
-    int64_t session_table_import_fail;
-    int64_t session_table_import_success;
-    int64_t session_table_rebalance_fail;
-    int64_t session_table_rebalance_success;
     int64_t session_table_rename_fail;
     int64_t session_table_rename_success;
     int64_t session_table_salvage_fail;
@@ -747,6 +735,12 @@ struct __wt_connection_stats {
     int64_t txn_hs_ckpt_duration;
     int64_t txn_checkpoint_time_max;
     int64_t txn_checkpoint_time_min;
+    int64_t txn_checkpoint_handle_duration;
+    int64_t txn_checkpoint_handle_duration_apply;
+    int64_t txn_checkpoint_handle_duration_skip;
+    int64_t txn_checkpoint_handle_applied;
+    int64_t txn_checkpoint_handle_skipped;
+    int64_t txn_checkpoint_handle_walked;
     int64_t txn_checkpoint_time_recent;
     int64_t txn_checkpoint_prep_running;
     int64_t txn_checkpoint_prep_max;
@@ -838,6 +832,7 @@ struct __wt_dsrc_stats {
     int64_t cache_eviction_walks_gave_up_no_targets;
     int64_t cache_eviction_walks_gave_up_ratio;
     int64_t cache_eviction_walks_ended;
+    int64_t cache_eviction_walk_restart;
     int64_t cache_eviction_walk_from_root;
     int64_t cache_eviction_walk_saved_pos;
     int64_t cache_eviction_hazard;
@@ -942,8 +937,8 @@ struct __wt_dsrc_stats {
     int64_t rec_time_aggr_newest_stop_durable_ts;
     int64_t rec_time_aggr_newest_stop_ts;
     int64_t rec_time_aggr_newest_stop_txn;
+    int64_t rec_time_aggr_newest_txn;
     int64_t rec_time_aggr_oldest_start_ts;
-    int64_t rec_time_aggr_oldest_start_txn;
     int64_t rec_time_aggr_prepared;
     int64_t rec_time_window_pages_prepared;
     int64_t rec_time_window_pages_durable_start_ts;

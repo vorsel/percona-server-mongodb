@@ -30,6 +30,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/client.h"
@@ -51,11 +52,11 @@
 
 namespace mongo {
 
-// Hangs in the beginning of each isMaster command when set.
-MONGO_FAIL_POINT_DEFINE(waitInIsMaster);
-// Awaitable isMaster requests with the proper topologyVersions are expected to sleep for
+// Hangs in the beginning of each hello command when set.
+MONGO_FAIL_POINT_DEFINE(waitInHello);
+// Awaitable hello requests with the proper topologyVersions are expected to sleep for
 // maxAwaitTimeMS on mongos. This failpoint will hang right before doing this sleep when set.
-MONGO_FAIL_POINT_DEFINE(hangWhileWaitingForIsMasterResponse);
+MONGO_FAIL_POINT_DEFINE(hangWhileWaitingForHelloResponse);
 
 TopologyVersion mongosTopologyVersion;
 
@@ -66,9 +67,14 @@ MONGO_INITIALIZER(GenerateMongosTopologyVersion)(InitializerContext*) {
 
 namespace {
 
-class CmdIsMaster : public BasicCommandWithReplyBuilderInterface {
+constexpr auto kHelloString = "hello"_sd;
+constexpr auto kCamelCaseIsMasterString = "isMaster"_sd;
+constexpr auto kLowerCaseIsMasterString = "ismaster"_sd;
+
+
+class CmdHello : public BasicCommandWithReplyBuilderInterface {
 public:
-    CmdIsMaster() : BasicCommandWithReplyBuilderInterface("isMaster", "ismaster") {}
+    CmdHello() : CmdHello(kHelloString, {}) {}
 
     bool supportsWriteConcern(const BSONObj& cmd) const override {
         return false;
@@ -98,7 +104,7 @@ public:
                              rpc::ReplyBuilderInterface* replyBuilder) final {
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
 
-        waitInIsMaster.pauseWhileSet(opCtx);
+        waitInHello.pauseWhileSet(opCtx);
 
         auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx->getClient());
         bool seenIsMaster = clientMetadataIsMasterState.hasSeenIsMaster();
@@ -164,9 +170,9 @@ public:
                 IsMasterMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
                 ON_BLOCK_EXIT(
                     [&] { IsMasterMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges(); });
-                if (MONGO_unlikely(hangWhileWaitingForIsMasterResponse.shouldFail())) {
-                    LOGV2(31463, "hangWhileWaitingForIsMasterResponse failpoint enabled.");
-                    hangWhileWaitingForIsMasterResponse.pauseWhileSet(opCtx);
+                if (MONGO_unlikely(hangWhileWaitingForHelloResponse.shouldFail())) {
+                    LOGV2(31463, "hangWhileWaitingForHelloResponse failpoint enabled.");
+                    hangWhileWaitingForHelloResponse.pauseWhileSet(opCtx);
                 }
                 opCtx->sleepFor(Milliseconds(maxAwaitTimeMS));
             }
@@ -179,7 +185,11 @@ public:
         }
 
         auto result = replyBuilder->getBodyBuilder();
-        result.appendBool("ismaster", true);
+        if (useLegacyResponseFields()) {
+            result.appendBool("ismaster", true);
+        } else {
+            result.appendBool("isWritablePrimary", true);
+        }
         result.append("msg", "isdbgrid");
         result.appendNumber("maxBsonObjectSize", BSONObjMaxUserSize);
         result.appendNumber("maxMessageSizeBytes", MaxMessageSizeBytes);
@@ -210,15 +220,16 @@ public:
         topologyVersionBuilder.done();
 
         if (opCtx->isExhaust()) {
-            LOGV2_DEBUG(23872, 3, "Using exhaust for isMaster protocol");
+            LOGV2_DEBUG(23872, 3, "Using exhaust for isMaster or hello protocol");
 
             uassert(51763,
-                    "An isMaster request with exhaust must specify 'maxAwaitTimeMS'",
+                    "An isMaster or hello request with exhaust must specify 'maxAwaitTimeMS'",
                     maxAwaitTimeMSField);
             invariant(clientTopologyVersion);
 
             InExhaustIsMaster::get(opCtx->getClient()->session().get())
-                ->setInExhaustIsMaster(true /* inExhaustIsMaster */);
+                ->setInExhaustIsMaster(true /* inExhaust */,
+                                       cmdObj.firstElementFieldNameStringData());
 
             if (clientTopologyVersion->getProcessId() == mongosTopologyVersion.getProcessId() &&
                 clientTopologyVersion->getCounter() == mongosTopologyVersion.getCounter()) {
@@ -242,6 +253,26 @@ public:
 
         handleIsMasterSpeculativeAuth(opCtx, cmdObj, &result);
 
+        return true;
+    }
+
+protected:
+    CmdHello(const StringData cmdName, const std::initializer_list<StringData>& alias)
+        : BasicCommandWithReplyBuilderInterface(cmdName, alias) {}
+
+    virtual bool useLegacyResponseFields() {
+        return false;
+    }
+
+} hello;
+
+class CmdIsMaster : public CmdHello {
+
+public:
+    CmdIsMaster() : CmdHello(kCamelCaseIsMasterString, {kLowerCaseIsMasterString}) {}
+
+protected:
+    bool useLegacyResponseFields() override {
         return true;
     }
 

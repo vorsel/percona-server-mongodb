@@ -72,15 +72,29 @@ Status checkView(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status checkReplState(OperationContext* opCtx, NamespaceStringOrUUID dbAndUUID) {
-    bool writesAreReplicatedAndNotPrimary = opCtx->writesAreReplicated() &&
-        !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, dbAndUUID);
+Status checkReplState(OperationContext* opCtx,
+                      NamespaceStringOrUUID dbAndUUID,
+                      Collection* collection) {
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    auto canAcceptWrites = replCoord->canAcceptWritesFor(opCtx, dbAndUUID);
+    bool writesAreReplicatedAndNotPrimary = opCtx->writesAreReplicated() && !canAcceptWrites;
 
     if (writesAreReplicatedAndNotPrimary) {
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while dropping indexes on database "
                                     << dbAndUUID.db() << " with collection " << dbAndUUID.uuid());
     }
+
+    // Disallow index drops on drop-pending namespaces (system.drop.*) if we are primary.
+    auto isPrimary = replCoord->getSettings().usingReplSets() && canAcceptWrites;
+    const auto& nss = collection->ns();
+    if (isPrimary && nss.isDropPendingNamespace()) {
+        return Status(ErrorCodes::NamespaceNotFound,
+                      str::stream() << "Cannot drop indexes on drop-pending namespace " << nss
+                                    << " in database " << dbAndUUID.db() << " with uuid "
+                                    << dbAndUUID.uuid());
+    }
+
     return Status::OK();
 }
 
@@ -319,7 +333,7 @@ Status dropIndexes(OperationContext* opCtx,
     const UUID collectionUUID = collection->uuid();
     const NamespaceStringOrUUID dbAndUUID = {nss.db().toString(), collectionUUID};
 
-    status = checkReplState(opCtx, dbAndUUID);
+    status = checkReplState(opCtx, dbAndUUID, collection);
     if (!status.isOK()) {
         return status;
     }
@@ -328,6 +342,7 @@ Status dropIndexes(OperationContext* opCtx,
         LOGV2(51806,
               "CMD: dropIndexes",
               "namespace"_attr = nss,
+              "uuid"_attr = collectionUUID,
               "indexes"_attr = cmdObj[kIndexFieldName].toString(false));
     }
 
@@ -399,7 +414,7 @@ Status dropIndexes(OperationContext* opCtx,
                                         << " with collection " << dbAndUUID.uuid());
         }
 
-        status = checkReplState(opCtx, dbAndUUID);
+        status = checkReplState(opCtx, dbAndUUID, collection);
         if (!status.isOK()) {
             return status;
         }

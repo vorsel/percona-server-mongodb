@@ -31,8 +31,8 @@ all:
     test_file: jstests/core/geo_near_tailable.js
   - ticket: SERVER-48614
     test_file: jstests/core/wildcard_index_partial_index.js
-  - ticket: SERVER-48993
-    test_file: jstests/core/explode_for_sort_collation.js
+  - ticket: SERVER-51120
+    test_file: jstests/core/merge_sort_collation.js
   - ticket: SERVER-42825
     test_file: jstests/replsets/kill_reads_with_prepare_conflicts_during_step_down.js
   - ticket: SERVER-42825
@@ -79,6 +79,14 @@ all:
     test_file: jstests/replsets/step_down_chaining_disabled.js
   - ticket: SERVER-49990
     test_file: jstests/replsets/secondaryOk_slaveOk_aliases.js
+  - ticket: SERVER-49987
+    test_file: jstests/core/ismaster.js
+  - ticket: SERVER-49988
+    test_file: jstests/sharding/ismaster.js
+  - ticket: SERVER-49987
+    test_file: jstests/replsets/ismaster1.js
+  - ticket: SERVER-46625
+    test_file: jstests/core/command_json_schema_field.js
 
 suites:
 
@@ -87,17 +95,25 @@ suites:
   concurrency_replication_multiversion:
 
   replica_sets_jscore_multiversion_passthrough:
+  - ticket: SERVER-47469
+    test_file: jstests/core/apply_ops_system_dot_views.js
 
   replica_sets_multiversion:
   - ticket: SERVER-47645
     test_file: jstests/replsets/invalidate_sessions_on_stepdown.js
   - ticket: SERVER-48518
     test_file: jstests/replsets/rollback_via_refetch_anomaly.js
+  - ticket: SERVER-35649
+    test_file: jstests/replsets/disallow_adding_initialized_node1.js
 
   concurrency_sharded_replication_multiversion:
 
   sharding_jscore_multiversion_passthrough:
+  - ticket: SERVER-47469
+    test_file: jstests/core/apply_ops_system_dot_views.js
 
   sharded_collections_jscore_multiversion_passthrough:
+  - ticket: SERVER-47469
+    test_file: jstests/core/apply_ops_system_dot_views.js
 
   sharding_multiversion:

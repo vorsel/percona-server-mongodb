@@ -1027,7 +1027,7 @@ bool IndexBuildsCoordinator::abortIndexBuildByBuildUUID(OperationContext* opCtx,
 
             if (IndexBuildAction::kPrimaryAbort == signalAction &&
                 !replCoord->canAcceptWritesFor(opCtx, dbAndUUID)) {
-                uassertStatusOK({ErrorCodes::NotMaster,
+                uassertStatusOK({ErrorCodes::NotWritablePrimary,
                                  str::stream()
                                      << "Unable to abort index build because we are not primary: "
                                      << buildUUID});
@@ -1744,7 +1744,7 @@ IndexBuildsCoordinator::PostSetupAction IndexBuildsCoordinator::_setUpIndexBuild
     // so we must fail the index build. During initial sync, there is no commit timestamp set.
     if (replSetAndNotPrimary &&
         indexBuildOptions.applicationMode != ApplicationMode::kInitialSync) {
-        uassert(ErrorCodes::NotMaster,
+        uassert(ErrorCodes::NotWritablePrimary,
                 str::stream() << "Replication state changed while setting up the index build: "
                               << replState->buildUUID,
                 !startTimestamp.isNull());
@@ -2105,7 +2105,8 @@ void IndexBuildsCoordinator::_buildIndex(OperationContext* opCtx,
                                          const IndexBuildOptions& indexBuildOptions) {
     // Read without a timestamp. When we commit, we block writes which guarantees all writes are
     // visible.
-    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+    invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
+              opCtx->recoveryUnit()->getTimestampReadSource());
     _scanCollectionAndInsertKeysIntoSorter(opCtx, replState);
     _insertKeysFromSideTablesWithoutBlockingWrites(opCtx, replState);
     _signalPrimaryForCommitReadiness(opCtx, replState);
@@ -2169,7 +2170,7 @@ void IndexBuildsCoordinator::_insertKeysFromSideTablesWithoutBlockingWrites(
         uassertStatusOK(_indexBuildsManager.drainBackgroundWrites(
             opCtx,
             replState->buildUUID,
-            RecoveryUnit::ReadSource::kUnset,
+            RecoveryUnit::ReadSource::kNoTimestamp,
             IndexBuildInterceptor::DrainYieldPolicy::kYield));
     }
 
@@ -2195,7 +2196,7 @@ void IndexBuildsCoordinator::_insertKeysFromSideTablesBlockingWrites(
         uassertStatusOK(_indexBuildsManager.drainBackgroundWrites(
             opCtx,
             replState->buildUUID,
-            RecoveryUnit::ReadSource::kUnset,
+            RecoveryUnit::ReadSource::kNoTimestamp,
             IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
     }
 
@@ -2278,7 +2279,7 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
     uassertStatusOK(_indexBuildsManager.drainBackgroundWrites(
         opCtx,
         replState->buildUUID,
-        RecoveryUnit::ReadSource::kUnset,
+        RecoveryUnit::ReadSource::kNoTimestamp,
         IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
 
     try {
@@ -2296,7 +2297,7 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
         if (!isMaster && IndexBuildAction::kSinglePhaseCommit == action &&
             !indexBuildOptions.replSetAndNotPrimaryAtStart) {
             uassertStatusOK(
-                {ErrorCodes::NotMaster,
+                {ErrorCodes::NotWritablePrimary,
                  str::stream() << "Unable to commit index build because we are no longer primary: "
                                << replState->buildUUID});
         }
@@ -2437,7 +2438,15 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::_runIndexReb
 
         std::tie(numRecords, dataSize) =
             uassertStatusOK(_indexBuildsManager.startBuildingIndexForRecovery(
-                opCtx, collection->ns(), buildUUID, repair));
+                opCtx, collection, buildUUID, repair));
+
+        // Since we are holding an exclusive collection lock to stop new writes, do not yield locks
+        // while draining.
+        uassertStatusOK(_indexBuildsManager.drainBackgroundWrites(
+            opCtx,
+            replState->buildUUID,
+            RecoveryUnit::ReadSource::kNoTimestamp,
+            IndexBuildInterceptor::DrainYieldPolicy::kNoYield));
 
         uassertStatusOK(
             _indexBuildsManager.checkIndexConstraintViolations(opCtx, replState->buildUUID));
