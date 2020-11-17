@@ -272,7 +272,6 @@ __wt_evict_thread_run(WT_SESSION_IMPL *session, WT_THREAD *thread)
     WT_CACHE *cache;
     WT_CONNECTION_IMPL *conn;
     WT_DECL_RET;
-    uint32_t session_flags;
     bool did_work, was_intr;
 
     conn = S2C(session);
@@ -283,12 +282,7 @@ __wt_evict_thread_run(WT_SESSION_IMPL *session, WT_THREAD *thread)
      * busy and then opens a different file (in this case, the HS file), it can deadlock with a
      * thread waiting for the first file to drain from the eviction queue. See WT-5946 for details.
      */
-    if (session->hs_cursor == NULL && !F_ISSET(conn, WT_CONN_IN_MEMORY | WT_CONN_READONLY)) {
-        session_flags = 0; /* [-Werror=maybe-uninitialized] */
-        WT_RET(__wt_hs_cursor_open(session, &session_flags));
-        WT_RET(__wt_hs_cursor_close(session, session_flags));
-    }
-
+    WT_RET(__wt_hs_cursor_cache(session));
     if (conn->evict_server_running && __wt_spin_trylock(session, &cache->evict_pass_lock) == 0) {
         /*
          * Cannot use WT_WITH_PASS_LOCK because this is a try lock. Fix when that is supported. We
@@ -1325,7 +1319,7 @@ __evict_walk_choose_dhandle(WT_SESSION_IMPL *session, WT_DATA_HANDLE **dhandle_p
      * If we don't have many dhandles, most hash buckets will be empty. Just pick a random dhandle
      * from the list in that case.
      */
-    if (conn->dhandle_count < WT_HASH_ARRAY_SIZE / 4) {
+    if (conn->dhandle_count < conn->dh_hash_size / 4) {
         rnd_dh = __wt_random(&session->rnd) % conn->dhandle_count;
         dhandle = TAILQ_FIRST(&conn->dhqh);
         for (; rnd_dh > 0; rnd_dh--)
@@ -1338,7 +1332,7 @@ __evict_walk_choose_dhandle(WT_SESSION_IMPL *session, WT_DATA_HANDLE **dhandle_p
      * Keep picking up a random bucket until we find one that is not empty.
      */
     do {
-        rnd_bucket = __wt_random(&session->rnd) % WT_HASH_ARRAY_SIZE;
+        rnd_bucket = __wt_random(&session->rnd) & (conn->dh_hash_size - 1);
     } while ((dh_bucket_count = conn->dh_bucket_count[rnd_bucket]) == 0);
 
     /* We can't pick up an empty bucket with a non zero bucket count. */
@@ -1538,7 +1532,7 @@ retry:
      */
     if (slot < max_entries &&
       (retries < 2 ||
-          (retries < WT_RETRY_MAX && (slot == queue->evict_entries || slot > start_slot)))) {
+        (retries < WT_RETRY_MAX && (slot == queue->evict_entries || slot > start_slot)))) {
         start_slot = slot;
         ++retries;
         goto retry;
@@ -1793,9 +1787,15 @@ __evict_walk_tree(WT_SESSION_IMPL *session, WT_EVICT_QUEUE *queue, u_int max_ent
         read_flags = WT_READ_CACHE | WT_READ_NO_EVICT | WT_READ_NO_GEN | WT_READ_NO_WAIT |
           WT_READ_NOTFOUND_OK | WT_READ_RESTART_OK;
         if (btree->evict_ref == NULL) {
-            /* Ensure internal pages indexes remain valid */
-            WT_WITH_PAGE_INDEX(
-              session, ret = __wt_random_descent(session, &btree->evict_ref, read_flags));
+            for (;;) {
+                /* Ensure internal pages indexes remain valid */
+                WT_WITH_PAGE_INDEX(
+                  session, ret = __wt_random_descent(session, &btree->evict_ref, read_flags));
+                if (ret != WT_RESTART)
+                    break;
+                WT_STAT_CONN_INCR(session, cache_eviction_walk_restart);
+                WT_STAT_DATA_INCR(session, cache_eviction_walk_restart);
+            }
             WT_RET_NOTFOUND_OK(ret);
         }
         break;
@@ -1923,6 +1923,17 @@ __evict_walk_tree(WT_SESSION_IMPL *session, WT_EVICT_QUEUE *queue, u_int max_ent
         /* Pages that are empty or from dead trees are fast-tracked. */
         if (__wt_page_is_empty(page) || F_ISSET(session->dhandle, WT_DHANDLE_DEAD))
             goto fast;
+
+        /*
+         * Do not evict a clean metadata page that contains historical data needed to satisfy a
+         * reader. Since there is no history store for metadata, we won't be able to serve an older
+         * reader if we evict this page.
+         */
+        if (WT_IS_METADATA(session->dhandle) && F_ISSET(cache, WT_CACHE_EVICT_CLEAN_HARD) &&
+          F_ISSET(ref, WT_REF_FLAG_LEAF) && !modified && page->modify != NULL &&
+          !__wt_txn_visible_all(
+            session, page->modify->rec_max_txn, page->modify->rec_max_timestamp))
+            continue;
 
         /* Skip pages we don't want. */
         want_page = (F_ISSET(cache, WT_CACHE_EVICT_CLEAN) && !modified) ||
@@ -2091,7 +2102,7 @@ __evict_get_ref(WT_SESSION_IMPL *session, bool is_server, WT_BTREE **btreep, WT_
       !__evict_queue_full(cache->evict_current_queue) &&
       !__evict_queue_full(cache->evict_fill_queue) &&
       (cache->evict_empty_score > WT_EVICT_SCORE_CUTOFF ||
-          __evict_queue_empty(cache->evict_fill_queue, false)))
+        __evict_queue_empty(cache->evict_fill_queue, false)))
         return (WT_NOTFOUND);
 
     __wt_spin_lock(session, &cache->evict_queue_lock);
@@ -2215,6 +2226,7 @@ __evict_page(WT_SESSION_IMPL *session, bool is_server)
     WT_REF *ref;
     WT_TRACK_OP_DECL;
     uint64_t time_start, time_stop;
+    uint32_t flags;
     uint8_t previous_state;
     bool app_timer;
 
@@ -2226,6 +2238,8 @@ __evict_page(WT_SESSION_IMPL *session, bool is_server)
     app_timer = false;
     cache = S2C(session)->cache;
     time_start = time_stop = 0;
+
+    flags = 0;
 
     /*
      * An internal session flags either the server itself or an eviction worker thread.
@@ -2245,6 +2259,10 @@ __evict_page(WT_SESSION_IMPL *session, bool is_server)
         }
     }
 
+    /* Set a flag to indicate that either eviction server or worker thread is evicting the page. */
+    if (F_ISSET(session, WT_SESSION_INTERNAL))
+        LF_SET(WT_REC_EVICTION_THREAD);
+
     /*
      * In case something goes wrong, don't pick the same set of pages every time.
      *
@@ -2254,7 +2272,7 @@ __evict_page(WT_SESSION_IMPL *session, bool is_server)
      */
     __wt_cache_read_gen_bump(session, ref->page);
 
-    WT_WITH_BTREE(session, btree, ret = __wt_evict(session, ref, previous_state, 0));
+    WT_WITH_BTREE(session, btree, ret = __wt_evict(session, ref, previous_state, flags));
 
     (void)__wt_atomic_subv32(&btree->evict_busy, 1);
 
@@ -2276,6 +2294,7 @@ __wt_cache_eviction_worker(WT_SESSION_IMPL *session, bool busy, bool readonly, d
 {
     WT_CACHE *cache;
     WT_CONNECTION_IMPL *conn;
+    WT_CURSOR *hs_cursor_saved;
     WT_DECL_RET;
     WT_TRACK_OP_DECL;
     WT_TXN_GLOBAL *txn_global;
@@ -2286,11 +2305,29 @@ __wt_cache_eviction_worker(WT_SESSION_IMPL *session, bool busy, bool readonly, d
 
     WT_TRACK_OP_INIT(session);
 
+    app_thread = false;
     conn = S2C(session);
     cache = conn->cache;
     time_start = time_stop = 0;
     txn_global = &conn->txn_global;
     txn_shared = WT_SESSION_TXN_SHARED(session);
+
+    /*
+     * If we have a history store cursor, save it. This ensures that if eviction needs to access the
+     * history store, it will get its own cursor, avoiding potential problems if it were to
+     * reposition or reset a history store cursor that we're in the middle of using for something
+     * else.
+     */
+    hs_cursor_saved = session->hs_cursor;
+    session->hs_cursor = NULL;
+
+    /*
+     * Before we enter the eviction generation, make sure this session has a cached history store
+     * cursor, otherwise we can deadlock with a session wanting exclusive access to a handle: that
+     * session will have a handle list write lock and will be waiting on eviction to drain, we'll be
+     * inside eviction waiting on a handle list read lock to open a history store cursor.
+     */
+    WT_ERR(__wt_hs_cursor_cache(session));
 
     /*
      * It is not safe to proceed if the eviction server threads aren't setup yet.
@@ -2321,6 +2358,16 @@ __wt_cache_eviction_worker(WT_SESSION_IMPL *session, bool busy, bool readonly, d
             }
             WT_ERR(ret);
         }
+
+        /*
+         * Check if we've exceeded our operation timeout, this would also get called from the
+         * previous txn is blocking call, however it won't pickup transactions that have been
+         * committed or rolled back as their mod count is 0, and that txn needs to be the oldest.
+         *
+         * Additionally we don't return rollback which could confuse the caller.
+         */
+        if (__wt_op_timer_fired(session))
+            break;
 
         /*
          * Check if we have become busy.
@@ -2380,6 +2427,13 @@ err:
 
 done:
     WT_TRACK_OP_END(session);
+
+    /* If the caller was using a history store cursor they should have closed it by now. */
+    WT_ASSERT(session, session->hs_cursor == NULL);
+
+    /* Restore the caller's history store cursor. */
+    session->hs_cursor = hs_cursor_saved;
+
     return (ret);
 }
 
@@ -2590,8 +2644,9 @@ __verbose_dump_cache_apply(WT_SESSION_IMPL *session, uint64_t *total_bytesp,
           F_ISSET(dhandle, WT_DHANDLE_DISCARD))
             continue;
 
-        WT_WITH_DHANDLE(session, dhandle, ret = __verbose_dump_cache_single(session, total_bytesp,
-                                            total_dirty_bytesp, total_updates_bytesp));
+        WT_WITH_DHANDLE(session, dhandle,
+          ret = __verbose_dump_cache_single(
+            session, total_bytesp, total_dirty_bytesp, total_updates_bytesp));
         if (ret != 0)
             WT_RET(ret);
     }
@@ -2628,8 +2683,9 @@ __wt_verbose_dump_cache(WT_SESSION_IMPL *session)
     needed = __wt_eviction_updates_needed(session, &pct);
     WT_RET(__wt_msg(session, "cache updates check: %s (%2.3f%%)", needed ? "yes" : "no", pct));
 
-    WT_WITH_HANDLE_LIST_READ_LOCK(session, ret = __verbose_dump_cache_apply(session, &total_bytes,
-                                             &total_dirty_bytes, &total_updates_bytes));
+    WT_WITH_HANDLE_LIST_READ_LOCK(session,
+      ret = __verbose_dump_cache_apply(
+        session, &total_bytes, &total_dirty_bytes, &total_updates_bytes));
     WT_RET(ret);
 
     /*
@@ -2637,10 +2693,9 @@ __wt_verbose_dump_cache(WT_SESSION_IMPL *session)
      */
     total_bytes = __wt_cache_bytes_plus_overhead(conn->cache, total_bytes);
 
-    WT_RET(__wt_msg(session,
-      "cache dump: "
-      "total found: %" PRIu64 "MB vs tracked inuse %" PRIu64 "MB",
-      total_bytes / WT_MEGABYTE, cache->bytes_inmem / WT_MEGABYTE));
+    WT_RET(
+      __wt_msg(session, "cache dump: total found: %" PRIu64 "MB vs tracked inuse %" PRIu64 "MB",
+        total_bytes / WT_MEGABYTE, cache->bytes_inmem / WT_MEGABYTE));
     WT_RET(__wt_msg(session, "total dirty bytes: %" PRIu64 "MB vs tracked dirty %" PRIu64 "MB",
       total_dirty_bytes / WT_MEGABYTE,
       (cache->bytes_dirty_intl + cache->bytes_dirty_leaf) / WT_MEGABYTE));

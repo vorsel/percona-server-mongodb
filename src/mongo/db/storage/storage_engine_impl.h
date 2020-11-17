@@ -77,6 +77,8 @@ public:
 
     virtual void finishInit() override;
 
+    virtual void notifyStartupComplete() override;
+
     virtual RecoveryUnit* newRecoveryUnit() override;
 
     virtual std::vector<std::string> listDatabases() const override;
@@ -272,12 +274,6 @@ public:
          * Monitor changes in timestamps and to notify the listeners on change.
          */
         void startup();
-
-        /**
-         * Notify all of the listeners listening for the given TimestampType when a change for that
-         * timestamp has occured.
-         */
-        void notifyAll(TimestampType type, Timestamp newTimestamp);
 
         /**
          * Adds a new listener to the monitor if it isn't already registered. A listener can only be

@@ -504,18 +504,18 @@ void appendErrorLabelsAndTopologyVersion(OperationContext* opCtx,
         getErrorLabels(opCtx, sessionOptions, commandName, code, wcCode, isInternalClient);
     commandBodyFieldsBob->appendElements(errorLabels);
 
-    auto isNotMasterError = false;
+    auto isNotPrimaryError = false;
     if (code) {
-        isNotMasterError = ErrorCodes::isA<ErrorCategory::NotMasterError>(*code);
+        isNotPrimaryError = ErrorCodes::isA<ErrorCategory::NotPrimaryError>(*code);
     }
 
-    if (!isNotMasterError && wcCode) {
-        isNotMasterError = ErrorCodes::isA<ErrorCategory::NotMasterError>(*wcCode);
+    if (!isNotPrimaryError && wcCode) {
+        isNotPrimaryError = ErrorCodes::isA<ErrorCategory::NotPrimaryError>(*wcCode);
     }
 
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (replCoord->getReplicationMode() != repl::ReplicationCoordinator::modeReplSet ||
-        !isNotMasterError) {
+        !isNotPrimaryError) {
         return;
     }
     const auto topologyVersion = replCoord->getTopologyVersion();
@@ -1037,13 +1037,13 @@ void execCommandDatabase(OperationContext* opCtx,
                 couldHaveOptedIn && ReadPreferenceSetting::get(opCtx).canRunOnSecondary();
             bool canRunHere = commandCanRunHere(opCtx, dbname, command, inMultiDocumentTransaction);
             if (!canRunHere && couldHaveOptedIn) {
-                uasserted(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
+                uasserted(ErrorCodes::NotPrimaryNoSecondaryOk, "not master and slaveOk=false");
             }
 
             if (MONGO_unlikely(respondWithNotPrimaryInCommandDispatch.shouldFail())) {
-                uassert(ErrorCodes::NotMaster, "not primary", canRunHere);
+                uassert(ErrorCodes::NotWritablePrimary, "not primary", canRunHere);
             } else {
-                uassert(ErrorCodes::NotMaster, "not master", canRunHere);
+                uassert(ErrorCodes::NotWritablePrimary, "not master", canRunHere);
             }
 
             if (!command->maintenanceOk() &&
@@ -1051,14 +1051,14 @@ void execCommandDatabase(OperationContext* opCtx,
                 !replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, dbname) &&
                 !replCoord->getMemberState().secondary()) {
 
-                uassert(ErrorCodes::NotMasterOrSecondary,
+                uassert(ErrorCodes::NotPrimaryOrSecondary,
                         "node is recovering",
                         !replCoord->getMemberState().recovering());
-                uassert(ErrorCodes::NotMasterOrSecondary,
+                uassert(ErrorCodes::NotPrimaryOrSecondary,
                         "node is not in primary or recovering state",
                         replCoord->getMemberState().primary());
                 // Check ticket SERVER-21432, slaveOk commands are allowed in drain mode
-                uassert(ErrorCodes::NotMasterOrSecondary,
+                uassert(ErrorCodes::NotPrimaryOrSecondary,
                         "node is in drain mode",
                         optedIn || alwaysAllowed);
             }
@@ -1379,8 +1379,10 @@ DbResponse receivedCommands(OperationContext* opCtx,
 
             const auto session = opCtx->getClient()->session();
             if (session) {
-                if (!opCtx->isExhaust() || c->getName() != "isMaster"_sd) {
-                    InExhaustIsMaster::get(session.get())->setInExhaustIsMaster(false);
+                if (!opCtx->isExhaust() ||
+                    (c->getName() != "hello"_sd && c->getName() != "isMaster"_sd)) {
+                    InExhaustIsMaster::get(session.get())
+                        ->setInExhaustIsMaster(false, request.getCommandName());
                 }
             }
 
@@ -1414,10 +1416,10 @@ DbResponse receivedCommands(OperationContext* opCtx,
 
     if (OpMsg::isFlagSet(message, OpMsg::kMoreToCome)) {
         // Close the connection to get client to go through server selection again.
-        if (LastError::get(opCtx->getClient()).hadNotMasterError()) {
+        if (LastError::get(opCtx->getClient()).hadNotPrimaryError()) {
             if (c && c->getReadWriteType() == Command::ReadWriteType::kWrite)
                 notMasterUnackWrites.increment();
-            uasserted(ErrorCodes::NotMaster,
+            uasserted(ErrorCodes::NotWritablePrimary,
                       str::stream()
                           << "Not-master error while processing '" << request.getCommandName()
                           << "' operation  on '" << request.getDatabase() << "' database via "
@@ -1715,9 +1717,10 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     DbResponse dbresponse;
     if (op == dbMsg || (op == dbQuery && isCommand)) {
         dbresponse = receivedCommands(opCtx, m, behaviors);
-        // IsMaster should take kMaxAwaitTimeMs at most, log if it takes twice that.
+        // The hello/isMaster commands should take kMaxAwaitTimeMs at most, log if it takes twice
+        // that.
         if (auto command = currentOp.getCommand();
-            command && (command->getName() == "ismaster" || command->getName() == "isMaster")) {
+            command && (command->getName() == "hello" || command->getName() == "isMaster")) {
             slowMsOverride =
                 2 * durationCount<Milliseconds>(SingleServerIsMasterMonitor::kMaxAwaitTime);
         }
@@ -1773,12 +1776,13 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
                         "error"_attr = redact(ue));
             debug.errInfo = ue.toStatus();
         }
-        // A NotMaster error can be set either within receivedInsert/receivedUpdate/receivedDelete
-        // or within the AssertionException handler above.  Either way, we want to throw an
-        // exception here, which will cause the client to be disconnected.
-        if (LastError::get(opCtx->getClient()).hadNotMasterError()) {
+        // A NotWritablePrimary error can be set either within
+        // receivedInsert/receivedUpdate/receivedDelete or within the AssertionException handler
+        // above.  Either way, we want to throw an exception here, which will cause the client to be
+        // disconnected.
+        if (LastError::get(opCtx->getClient()).hadNotPrimaryError()) {
             notMasterLegacyUnackWrites.increment();
-            uasserted(ErrorCodes::NotMaster,
+            uasserted(ErrorCodes::NotWritablePrimary,
                       str::stream()
                           << "Not-master error while processing '" << networkOpToString(op)
                           << "' operation  on '" << nsString << "' namespace via legacy "
@@ -1787,8 +1791,8 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     }
 
     // Mark the op as complete, and log it if appropriate. Returns a boolean indicating whether
-    // this op should be sampled for profiling.
-    const bool shouldSample = currentOp.completeAndLogOperation(
+    // this op should be written to the profiler.
+    const bool shouldProfile = currentOp.completeAndLogOperation(
         opCtx, MONGO_LOGV2_DEFAULT_COMPONENT, dbresponse.response.size(), slowMsOverride, forceLog);
 
     Top::get(opCtx->getServiceContext())
@@ -1797,7 +1801,7 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
             durationCount<Microseconds>(currentOp.elapsedTimeExcludingPauses()),
             currentOp.getReadWriteType());
 
-    if (currentOp.shouldDBProfile(shouldSample)) {
+    if (shouldProfile) {
         // Performance profiling is on
         if (opCtx->lockState()->isReadLocked()) {
             LOGV2_DEBUG(21970, 1, "Note: not profiling because of recursive read lock");

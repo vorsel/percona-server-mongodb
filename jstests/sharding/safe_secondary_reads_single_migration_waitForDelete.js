@@ -203,6 +203,7 @@ let testCases = {
     grantRolesToRole: {skip: "primary only"},
     grantRolesToUser: {skip: "primary only"},
     handshake: {skip: "does not return user data"},
+    hello: {skip: "does not return user data"},
     hostInfo: {skip: "does not return user data"},
     insert: {skip: "primary only"},
     invalidateUserCache: {skip: "does not return user data"},
@@ -220,6 +221,7 @@ let testCases = {
     listShards: {skip: "does not return user data"},
     lockInfo: {skip: "primary only"},
     logApplicationMessage: {skip: "primary only"},
+    logMessage: {skip: "does not return user data"},
     logRotate: {skip: "does not return user data"},
     logout: {skip: "does not return user data"},
     makeSnapshot: {skip: "does not return user data"},
@@ -461,7 +463,8 @@ for (let command of commands) {
         profilerHasSingleMatchingEntryOrThrow({
             profileDB: recipientShardSecondary.getDB(db),
             filter: Object.extend({
-                "command.shardVersion": {"$exists": true},
+                "command.shardVersion":
+                    {"$exists": true, $ne: [Timestamp(0, 0), ObjectId("00000000ffffffffffffffff")]},
                 "command.$readPreference": {"mode": "secondary"},
                 "command.readConcern": {"level": "local"},
                 "errCode": {"$ne": ErrorCodes.StaleConfig},

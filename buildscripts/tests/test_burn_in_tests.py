@@ -93,10 +93,9 @@ class TestAcceptance(unittest.TestCase):
             variant,
             "project",
         )  # yapf: disable
-        evg_conf_mock = MagicMock()
-        evg_conf_mock.get_task_names_by_tag.return_value = set()
 
-        under_test.burn_in(repeat_config, gen_config, "", "testfile.json", False, None, repos, None)
+        under_test.burn_in(repeat_config, gen_config, "", "testfile.json", False, None, repos, None,
+                           None)
 
         write_json_mock.assert_called_once()
         written_config = json.loads(write_json_mock.call_args[0][1])
@@ -127,7 +126,7 @@ class TestAcceptance(unittest.TestCase):
         evg_config = get_evergreen_config("etc/evergreen.yml")
 
         under_test.burn_in(repeat_config, gen_config, "", "testfile.json", False, evg_config, repos,
-                           None)
+                           None, None)
 
         write_json_mock.assert_called_once()
         written_config = json.loads(write_json_mock.call_args[0][1])

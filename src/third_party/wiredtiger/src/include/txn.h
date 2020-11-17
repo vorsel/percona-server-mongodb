@@ -76,11 +76,12 @@ typedef enum {
         (s)->txn->isolation = saved_txn_iso;                                    \
         WT_ASSERT((s), (s)->txn->forced_iso > 0);                               \
         (s)->txn->forced_iso--;                                                 \
-        WT_ASSERT((s), txn_shared->id == saved_txn_shared.id &&                 \
+        WT_ASSERT((s),                                                          \
+          txn_shared->id == saved_txn_shared.id &&                              \
             (txn_shared->metadata_pinned == saved_txn_shared.metadata_pinned || \
-                         saved_txn_shared.metadata_pinned == WT_TXN_NONE) &&    \
+              saved_txn_shared.metadata_pinned == WT_TXN_NONE) &&               \
             (txn_shared->pinned_id == saved_txn_shared.pinned_id ||             \
-                         saved_txn_shared.pinned_id == WT_TXN_NONE));           \
+              saved_txn_shared.pinned_id == WT_TXN_NONE));                      \
         txn_shared->metadata_pinned = saved_txn_shared.metadata_pinned;         \
         txn_shared->pinned_id = saved_txn_shared.pinned_id;                     \
     } while (0)
@@ -166,11 +167,10 @@ struct __wt_txn_global {
      * We rely on the fact that (a) the only table a checkpoint updates is the metadata; and (b)
      * once checkpoint has finished reading a table, it won't revisit it.
      */
-    volatile bool checkpoint_running;           /* Checkpoint running */
-    volatile uint32_t checkpoint_id;            /* Checkpoint's session ID */
-    WT_TXN_SHARED checkpoint_txn_shared;        /* Checkpoint's txn shared state */
-    wt_timestamp_t checkpoint_timestamp;        /* Checkpoint's timestamp */
-    wt_timestamp_t checkpoint_oldest_timestamp; /* The oldest timestamp at the time of checkpoint */
+    volatile bool checkpoint_running;    /* Checkpoint running */
+    volatile uint32_t checkpoint_id;     /* Checkpoint's session ID */
+    WT_TXN_SHARED checkpoint_txn_shared; /* Checkpoint's txn shared state */
+    wt_timestamp_t checkpoint_timestamp; /* Checkpoint's timestamp */
 
     volatile uint64_t debug_ops;       /* Debug mode op counter */
     uint64_t debug_rollback;           /* Debug mode rollback */
@@ -346,9 +346,10 @@ struct __wt_txn {
 #define WT_TXN_TS_DURABLE_ALWAYS 0x020000u
 #define WT_TXN_TS_DURABLE_KEYS 0x040000u
 #define WT_TXN_TS_DURABLE_NEVER 0x080000u
-#define WT_TXN_TS_ROUND_PREPARED 0x100000u
-#define WT_TXN_TS_ROUND_READ 0x200000u
-#define WT_TXN_UPDATE 0x400000u
+#define WT_TXN_TS_READ_BEFORE_OLDEST 0x100000u
+#define WT_TXN_TS_ROUND_PREPARED 0x200000u
+#define WT_TXN_TS_ROUND_READ 0x400000u
+#define WT_TXN_UPDATE 0x800000u
     /* AUTOMATIC FLAG VALUE GENERATION STOP */
     uint32_t flags;
 

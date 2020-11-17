@@ -95,9 +95,9 @@ function isRetryableError(error) {
         "HostNotFound",
         "NetworkTimeout",
         "SocketException",
-        "NotMaster",
-        "NotMasterNoSlaveOk",
-        "NotMasterOrSecondary",
+        "NotWritablePrimary",
+        "NotPrimaryNoSecondaryOk",
+        "NotPrimaryOrSecondary",
         "PrimarySteppedDown",
         "WriteConcernFailed",
         "WriteConcernLegacyOK",
@@ -1474,6 +1474,7 @@ rs.help = function() {
     print(
         "\trs.printSecondaryReplicationInfo()             check replica set members and replication lag");
     print("\tdb.isMaster()                              check who is primary");
+    print("\tdb.hello()                              check who is primary");
     print();
     print("\treconfiguration helpers disconnect from the database so the shell will display");
     print("\tan error, even if the command succeeds.");
@@ -1493,6 +1494,9 @@ rs.status = function() {
 };
 rs.isMaster = function() {
     return db.isMaster();
+};
+rs.hello = function() {
+    return db.hello();
 };
 rs.initiate = function(c) {
     return db._adminCommand({replSetInitiate: c});

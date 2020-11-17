@@ -68,7 +68,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> buildPipelineFromViewDefinition(
     auto unionExpCtx = expCtx->copyForSubPipeline(resolvedNs.ns);
 
     if (resolvedNs.pipeline.empty()) {
-        return Pipeline::parse(std::move(currentPipeline), unionExpCtx, validatorCallback);
+        return Pipeline::parse(currentPipeline, unionExpCtx, validatorCallback);
     }
     auto resolvedPipeline = std::move(resolvedNs.pipeline);
     resolvedPipeline.reserve(currentPipeline.size() + resolvedPipeline.size());
@@ -253,26 +253,43 @@ void DocumentSourceUnionWith::doDispose() {
 
 Value DocumentSourceUnionWith::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
     if (explain) {
-
-        auto pipeCopy = Pipeline::create(_pipeline->getSources(), _pipeline->getContext());
-
-        // If we have already started getting documents from the sub-pipeline, this is an explain
-        // that has done some execution. We don't want to serialize the mergeCursors stage, and
-        // explain will attach a new cursor stage if we were reading local only. Therefore, remove
-        // the cursor stage of the pipeline. There is an implicit invariant that if we are in
-        // either of these states, the pipeline starts with one of the two cursor stages.
-        if (_executionState != ExecutionProgress::kStartingSubPipeline &&
-            _executionState != ExecutionProgress::kIteratingSource) {
-            pipeCopy->popFront();
+        // There are several different possible states depending on the explain verbosity as well as
+        // the other stages in the pipeline:
+        //  * If verbosity is queryPlanner, then the sub-pipeline should be untouched and we can
+        //  explain it directly.
+        //  * If verbosity is execStats or allPlansExecution, then whether or not to explain the
+        //  sub-pipeline depends on if we've started reading from it. For instance, there could be a
+        //  $limit stage after the $unionWith which results in only reading from the base collection
+        //  branch and not the sub-pipeline.
+        Pipeline* pipeCopy = nullptr;
+        if (*explain == ExplainOptions::Verbosity::kQueryPlanner) {
+            pipeCopy = Pipeline::create(_pipeline->getSources(), _pipeline->getContext()).release();
+        } else if (*explain >= ExplainOptions::Verbosity::kExecStats &&
+                   _executionState > ExecutionProgress::kIteratingSource) {
+            // We've either exhausted the sub-pipeline or at least started iterating it. Use the
+            // cached pipeline to get the explain output since the '_pipeline' may have been
+            // modified for any optimizations or pushdowns into the initial $cursor stage.
+            pipeCopy = Pipeline::create(_cachedPipeline, _pipeline->getContext()).release();
+        } else {
+            // The plan does not require reading from the sub-pipeline, so just include the
+            // serialization in the explain output.
+            BSONArrayBuilder bab;
+            for (auto&& stage : _pipeline->serialize())
+                bab << stage;
+            return Value(DOC(getSourceName() << DOC("coll" << _pipeline->getContext()->ns.coll()
+                                                           << "pipeline" << bab.arr())));
         }
-        BSONObj explainObj = pExpCtx->mongoProcessInterface->attachCursorSourceAndExplain(
-            pipeCopy.release(), *explain);
+
+        invariant(pipeCopy);
+        BSONObj explainLocal =
+            pExpCtx->mongoProcessInterface->preparePipelineAndExplain(pipeCopy, *explain);
         LOGV2_DEBUG(4553501, 3, "$unionWith attached cursor to pipeline for explain");
         // We expect this to be an explanation of a pipeline -- there should only be one field.
-        invariant(explainObj.nFields() == 1);
+        invariant(explainLocal.nFields() == 1);
+
         return Value(
             DOC(getSourceName() << DOC("coll" << _pipeline->getContext()->ns.coll() << "pipeline"
-                                              << explainObj.firstElement())));
+                                              << explainLocal.firstElement())));
     } else {
         BSONArrayBuilder bab;
         for (auto&& stage : _pipeline->serialize())

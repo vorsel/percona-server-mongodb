@@ -86,7 +86,7 @@ public:
      * On success, `numKeysOut` if non-null will contain the number of keys added or removed.
      */
     Status sideWrite(OperationContext* opCtx,
-                     const std::vector<KeyString::Value>& keys,
+                     const KeyStringSet& keys,
                      const KeyStringSet& multikeyMetadataKeys,
                      const MultikeyPaths& multikeyPaths,
                      RecordId loc,
@@ -94,10 +94,10 @@ public:
                      int64_t* const numKeysOut);
 
     /**
-     * Given a set of duplicate keys, record the keys for later verification by a call to
+     * Given a duplicate key, record the key for later verification by a call to
      * checkDuplicateKeyConstraints();
      */
-    Status recordDuplicateKeys(OperationContext* opCtx, const std::vector<BSONObj>& keys);
+    Status recordDuplicateKey(OperationContext* opCtx, const KeyString::Value& key);
 
     /**
      * Returns Status::OK if all previously recorded duplicate key constraint violations have been

@@ -171,8 +171,7 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
     bool bm_start, quit;
 
 #if 0
-    /* FIXME-WT-6263: Temporarily disable history store verification. */
-    uint32_t session_flags;
+    /* FIXME-WT-6682: temporarily disable history store verification. */
     bool skip_hs;
 #endif
 
@@ -183,10 +182,9 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
     bm_start = false;
 
 #if 0
-    /* FIXME-WT-6263: Temporarily disable history store verification. */
-    session_flags = 0; /* -Wuninitialized */
-
     /*
+     * FIXME-WT-6682: temporarily disable history store verification.
+     *
      * Skip the history store explicit call if we're performing a metadata verification. The
      * metadata file is verified before we verify the history store, and it makes no sense to verify
      * the history store against itself.
@@ -261,8 +259,8 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
              */
             memset(&addr_unpack, 0, sizeof(addr_unpack));
             WT_TIME_AGGREGATE_COPY(&addr_unpack.ta, &ckpt->ta);
-            if (ckpt->write_gen <= S2C(session)->base_write_gen) {
-                addr_unpack.ta.oldest_start_txn = WT_TXN_NONE;
+            if (ckpt->write_gen <= btree->base_write_gen) {
+                addr_unpack.ta.newest_txn = WT_TXN_NONE;
                 addr_unpack.ta.newest_stop_txn = WT_TXN_MAX;
             }
             if (ckpt->ta.prepare)
@@ -275,6 +273,8 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
 
 #if 0
             /*
+             * FIXME-WT-6682: temporarily disable history store verification.
+             *
              * The checkpoints are in time-order, so the last one in the list is the most recent. If
              * this is the most recent checkpoint, verify the history store against it.
              *
@@ -282,9 +282,9 @@ __wt_verify(WT_SESSION_IMPL *session, const char *cfg[])
              */
             if (ret == 0 && (ckpt + 1)->name == NULL && !skip_hs) {
                 /* Open a history store cursor. */
-                WT_ERR(__wt_hs_cursor_open(session, &session_flags);
+                WT_ERR(__wt_hs_cursor_open(session));
                 WT_TRET(__wt_history_store_verify_one(session));
-                WT_TRET(__wt_hs_cursor_close(session, session_flags);
+                WT_TRET(__wt_hs_cursor_close(session));
                 /*
                  * We cannot error out here. If we got an error verifying the history store, we need
                  * to follow through with reacquiring the exclusive call below. We'll error out
@@ -474,8 +474,9 @@ __verify_tree(
     case WT_PAGE_COL_INT:
     case WT_PAGE_COL_VAR:
         if (ref->ref_recno != vs->records_so_far + 1)
-            WT_RET_MSG(session, WT_ERROR, "page at %s has a starting record of %" PRIu64
-                                          " when the expected starting record is %" PRIu64,
+            WT_RET_MSG(session, WT_ERROR,
+              "page at %s has a starting record of %" PRIu64
+              " when the expected starting record is %" PRIu64,
               __verify_addr_string(session, ref, vs->tmp1), ref->ref_recno, vs->records_so_far + 1);
         break;
     }
@@ -524,10 +525,10 @@ __verify_tree(
     case WT_PAGE_ROW_INT:
         if (addr_unpack->raw != WT_CELL_ADDR_INT)
 celltype_err:
-        WT_RET_MSG(session, WT_ERROR,
-          "page at %s, of type %s, is referenced in its parent by a cell of type %s",
-          __verify_addr_string(session, ref, vs->tmp1), __wt_page_type_string(page->type),
-          __wt_cell_type_string(addr_unpack->raw));
+            WT_RET_MSG(session, WT_ERROR,
+              "page at %s, of type %s, is referenced in its parent by a cell of type %s",
+              __verify_addr_string(session, ref, vs->tmp1), __wt_page_type_string(page->type),
+              __wt_cell_type_string(addr_unpack->raw));
         break;
     }
 
@@ -625,9 +626,10 @@ __verify_row_int_key_order(
     /* Compare the key against the largest key we've seen so far. */
     WT_RET(__wt_compare(session, btree->collator, &item, vs->max_key, &cmp));
     if (cmp <= 0)
-        WT_RET_MSG(session, WT_ERROR, "the internal key in entry %" PRIu32
-                                      " on the page at %s sorts before the last key appearing on "
-                                      "page %s, earlier in the tree: %s, %s",
+        WT_RET_MSG(session, WT_ERROR,
+          "the internal key in entry %" PRIu32
+          " on the page at %s sorts before the last key appearing on page %s, earlier in the tree: "
+          "%s, %s",
           entry, __verify_addr_string(session, ref, vs->tmp1), (char *)vs->max_addr->data,
           __wt_buf_set_printable(session, item.data, item.size, vs->tmp2),
           __wt_buf_set_printable(session, vs->max_key->data, vs->max_key->size, vs->tmp3));
@@ -877,8 +879,9 @@ __verify_page_content_int(
         ++cell_num;
 
         if (!__wt_cell_type_check(unpack.type, dsk->type))
-            WT_RET_MSG(session, WT_ERROR, "illegal cell and page type combination: cell %" PRIu32
-                                          " on page at %s is a %s cell on a %s page",
+            WT_RET_MSG(session, WT_ERROR,
+              "illegal cell and page type combination: cell %" PRIu32
+              " on page at %s is a %s cell on a %s page",
               cell_num - 1, __verify_addr_string(session, ref, vs->tmp1),
               __wt_cell_type_string(unpack.type), __wt_page_type_string(dsk->type));
 
@@ -952,8 +955,9 @@ __verify_page_content_leaf(
         ++cell_num;
 
         if (!__wt_cell_type_check(unpack.type, dsk->type))
-            WT_RET_MSG(session, WT_ERROR, "illegal cell and page type combination: cell %" PRIu32
-                                          " on page at %s is a %s cell on a %s page",
+            WT_RET_MSG(session, WT_ERROR,
+              "illegal cell and page type combination: cell %" PRIu32
+              " on page at %s is a %s cell on a %s page",
               cell_num - 1, __verify_addr_string(session, ref, vs->tmp1),
               __wt_cell_type_string(unpack.type), __wt_page_type_string(dsk->type));
 

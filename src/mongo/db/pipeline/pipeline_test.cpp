@@ -88,8 +88,8 @@ BSONObj pipelineFromJsonArray(const std::string& jsonArray) {
 }
 
 class StubExplainInterface : public StubMongoProcessInterface {
-    BSONObj attachCursorSourceAndExplain(Pipeline* ownedPipeline,
-                                         ExplainOptions::Verbosity verbosity) override {
+    BSONObj preparePipelineAndExplain(Pipeline* ownedPipeline,
+                                      ExplainOptions::Verbosity verbosity) override {
         std::unique_ptr<Pipeline, PipelineDeleter> pipeline(
             ownedPipeline, PipelineDeleter(ownedPipeline->getContext()->opCtx));
         BSONArrayBuilder bab;
@@ -290,6 +290,22 @@ TEST(PipelineOptimizationTest, SortMatchProjSkipLimBecomesMatchTopKSortSkipProj)
         ",{$project : {_id: true, a: true}}"
         "]";
 
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, SortLimitSortWithDifferentSortPatterns) {
+    std::string inputPipe =
+        "[{$sort: {a: 1}}"
+        ",{$limit: 12}"
+        ",{$sort: {b: 1}}"
+        "]";
+
+    std::string outputPipe =
+        "[{$sort: {sortKey: {a: 1}, limit: 12}}"
+        ",{$sort: {sortKey: {b: 1}}}"
+        "]";
+
+    std::string serializedPipe = inputPipe;
     assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 
@@ -500,6 +516,24 @@ TEST(PipelineOptimizationTest, LookupShouldAbsorbUnwindMatch) {
         "'z'}}, "
         "{$unwind: {path: '$asField'}}, "
         "{$match: {'asField.subfield': {$eq: 1}}}]";
+    assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
+}
+
+TEST(PipelineOptimizationTest, LookupShouldAbsorbUnwindAndTypeMatch) {
+    string inputPipe =
+        "[{$lookup: {from: 'lookupColl', as: 'asField', localField: 'y', foreignField: "
+        "'z'}}, "
+        "{$unwind: '$asField'}, "
+        "{$match: {'asField.subfield': {$type: [2]}}}]";
+    string outputPipe =
+        "[{$lookup: {from: 'lookupColl', as: 'asField', localField: 'y', foreignField: 'z', "
+        "            unwinding: {preserveNullAndEmptyArrays: false}, "
+        "            matching: {subfield: {$type: [2]}}}}]";
+    string serializedPipe =
+        "[{$lookup: {from: 'lookupColl', as: 'asField', localField: 'y', foreignField: "
+        "'z'}}, "
+        "{$unwind: {path: '$asField'}}, "
+        "{$match: {'asField.subfield': {$type: [2]}}}]";
     assertPipelineOptimizesAndSerializesTo(inputPipe, outputPipe, serializedPipe);
 }
 

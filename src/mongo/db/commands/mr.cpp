@@ -1482,7 +1482,7 @@ bool runMapReduce(OperationContext* opCtx,
             if (state.isOnDisk()) {
                 // This means that it will be doing a write operation, make sure it is safe to
                 // do so
-                uassert(ErrorCodes::NotMaster,
+                uassert(ErrorCodes::NotWritablePrimary,
                         "not master",
                         repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx,
                                                                                      config.nss));
@@ -1583,7 +1583,7 @@ bool runMapReduce(OperationContext* opCtx,
             curOp->debug().setPlanSummaryMetrics(stats);
             CollectionQueryInfo::get(scopedAutoColl->getCollection()).notifyOfQuery(opCtx, stats);
 
-            if (curOp->shouldDBProfile()) {
+            if (curOp->shouldDBProfile(opCtx)) {
                 BSONObjBuilder execStatsBob;
                 Explain::getWinningPlanStats(exec.get(), &execStatsBob);
                 curOp->debug().execStats = execStatsBob.obj();

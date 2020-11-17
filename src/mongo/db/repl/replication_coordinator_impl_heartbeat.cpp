@@ -325,6 +325,9 @@ stdx::unique_lock<Latch> ReplicationCoordinatorImpl::_handleHeartbeatResponseAct
             invariant(responseStatus.isOK());
             _scheduleHeartbeatReconfig(lock, responseStatus.getValue().getConfig());
             break;
+        case HeartbeatResponseAction::RetryReconfig:
+            _scheduleHeartbeatReconfig(lock, _rsConfig);
+            break;
         case HeartbeatResponseAction::StepDownSelf:
             invariant(action.getPrimaryConfigIndex() == _selfIndex);
             if (_topCoord->prepareForUnconditionalStepDown()) {
@@ -556,7 +559,8 @@ void ReplicationCoordinatorImpl::_scheduleHeartbeatReconfig(WithLock lk,
 
     _setConfigState_inlock(kConfigHBReconfiguring);
     invariant(!_rsConfig.isInitialized() ||
-              _rsConfig.getConfigVersionAndTerm() < newConfig.getConfigVersionAndTerm());
+              _rsConfig.getConfigVersionAndTerm() < newConfig.getConfigVersionAndTerm() ||
+              _selfIndex < 0);
     _replExecutor
         ->scheduleWork([=](const executor::TaskExecutor::CallbackArgs& cbData) {
             _heartbeatReconfigStore(cbData, newConfig);
@@ -766,7 +770,8 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
 
     invariant(_rsConfigState == kConfigHBReconfiguring);
     invariant(!_rsConfig.isInitialized() ||
-              _rsConfig.getConfigVersionAndTerm() < newConfig.getConfigVersionAndTerm());
+              _rsConfig.getConfigVersionAndTerm() < newConfig.getConfigVersionAndTerm() ||
+              _selfIndex < 0);
 
     if (!myIndex.isOK()) {
         switch (myIndex.getStatus().code()) {
@@ -805,19 +810,9 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigFinish(
     // installing the new config, to avoid triggering a storage invariant that has initial
     // sync as a special case.  We'll still fatally fail, but with a more meaningful error.
     if (_initialSyncer && _memberState.startup2() && myIndexValue == -1) {
-        // The initial syncer may not be called inside the replication lock.
-        auto initialSyncerCopy = _initialSyncer;
-        LOGV2(4848000, "Canceling initial sync as this node is no longer in the configuration");
-        lk.unlock();
-        const auto status = initialSyncerCopy->shutdown();
-        if (!status.isOK()) {
-            LOGV2_WARNING(4848001, "InitialSyncer shutdown failed", "error"_attr = status);
-        }
-        initialSyncerCopy->join();
         LOGV2_FATAL(4848002,
                     "Initial sync failed due to node being removed from the configuration. "
                     "Shutting down now. Restart the server to attempt a new initial sync");
-        lk.lock();
     }
 
     const PostMemberStateUpdateAction action =

@@ -41,6 +41,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/find_and_modify_common.h"
+#include "mongo/db/commands/update_metrics.h"
 #include "mongo/db/commands_in_multi_doc_txn_params_gen.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
@@ -177,7 +178,7 @@ void appendCommandResponse(const PlanExecutor* exec,
 }
 
 void assertCanWrite(OperationContext* opCtx, const NamespaceString& nsString) {
-    uassert(ErrorCodes::NotMaster,
+    uassert(ErrorCodes::NotWritablePrimary,
             str::stream() << "Not primary while running findAndModify command on collection "
                           << nsString.ns(),
             repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nsString));
@@ -212,7 +213,8 @@ void checkIfTransactionOnCappedColl(Collection* coll, bool inTransaction) {
 
 class CmdFindAndModify : public BasicCommand {
 public:
-    CmdFindAndModify() : BasicCommand("findAndModify", "findandmodify") {}
+    CmdFindAndModify()
+        : BasicCommand("findAndModify", "findandmodify"), _updateMetrics{"findAndModify"} {}
 
     std::string help() const override {
         return "{ findAndModify: \"collection\", query: {processed:false}, update: {$set: "
@@ -324,6 +326,9 @@ public:
         auto const curOp = CurOp::get(opCtx);
         OpDebug* const opDebug = &curOp->debug();
 
+        // Collect metrics.
+        _updateMetrics.collectMetrics(cmdObj);
+
         boost::optional<DisableDocumentValidation> maybeDisableValidation;
         if (shouldBypassDocumentValidationForCommand(cmdObj)) {
             maybeDisableValidation.emplace(opCtx);
@@ -377,14 +382,11 @@ public:
                 uassertStatusOK(parsedDelete.parseRequest());
 
                 AutoGetCollection autoColl(opCtx, nsString, MODE_IX);
-
                 {
-                    boost::optional<int> dbProfilingLevel;
-                    if (autoColl.getDb())
-                        dbProfilingLevel = autoColl.getDb()->getProfilingLevel();
-
                     stdx::lock_guard<Client> lk(*opCtx->getClient());
-                    CurOp::get(opCtx)->enter_inlock(nsString.ns().c_str(), dbProfilingLevel);
+                    CurOp::get(opCtx)->enter_inlock(
+                        nsString.ns().c_str(),
+                        CollectionCatalog::get(opCtx).getDatabaseProfileLevel(nsString.db()));
                 }
 
                 assertCanWrite(opCtx, nsString);
@@ -415,7 +417,7 @@ public:
                 // Fill out OpDebug with the number of deleted docs.
                 opDebug->additiveMetrics.ndeleted = DeleteStage::getNumDeleted(*exec);
 
-                if (curOp->shouldDBProfile()) {
+                if (curOp->shouldDBProfile(opCtx)) {
                     BSONObjBuilder execStatsBob;
                     Explain::getWinningPlanStats(exec.get(), &execStatsBob);
                     curOp->debug().execStats = execStatsBob.obj();
@@ -441,11 +443,10 @@ public:
                 Database* db = autoColl.ensureDbExists();
 
                 {
-                    boost::optional<int> dbProfilingLevel;
-                    dbProfilingLevel = db->getProfilingLevel();
-
                     stdx::lock_guard<Client> lk(*opCtx->getClient());
-                    CurOp::get(opCtx)->enter_inlock(nsString.ns().c_str(), dbProfilingLevel);
+                    CurOp::get(opCtx)->enter_inlock(
+                        nsString.ns().c_str(),
+                        CollectionCatalog::get(opCtx).getDatabaseProfileLevel(nsString.db()));
                 }
 
                 assertCanWrite(opCtx, nsString);
@@ -517,7 +518,7 @@ public:
                                                         opDebug);
                 opDebug->setPlanSummaryMetrics(summaryStats);
 
-                if (curOp->shouldDBProfile()) {
+                if (curOp->shouldDBProfile(opCtx)) {
                     BSONObjBuilder execStatsBob;
                     Explain::getWinningPlanStats(exec.get(), &execStatsBob);
                     curOp->debug().execStats = execStatsBob.obj();
@@ -552,6 +553,9 @@ public:
         bob->append("singleBatch", true);
     }
 
+private:
+    // Update related command execution metrics.
+    UpdateMetrics _updateMetrics;
 } cmdFindAndModify;
 
 }  // namespace

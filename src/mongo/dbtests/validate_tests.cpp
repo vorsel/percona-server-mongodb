@@ -38,6 +38,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_debug_util.h"
@@ -877,7 +878,7 @@ public:
         {
             WriteUnitOfWork wunit(&_opCtx);
             int64_t numDeleted;
-            InsertResult insertResult;
+            int64_t numInserted;
             const BSONObj actualKey = BSON("a" << 1);
             const BSONObj badKey = BSON("a" << -1);
             InsertDeleteOptions options;
@@ -894,12 +895,11 @@ public:
                          id1,
                          IndexAccessMethod::kNoopOnSuppressedErrorFn);
 
-            auto removeStatus =
-                iam->removeKeys(&_opCtx, {keys.begin(), keys.end()}, id1, options, &numDeleted);
-            auto insertStatus = iam->insert(&_opCtx, badKey, id1, options, &insertResult);
+            auto removeStatus = iam->removeKeys(&_opCtx, keys, id1, options, &numDeleted);
+            auto insertStatus = iam->insert(&_opCtx, badKey, id1, options, nullptr, &numInserted);
 
             ASSERT_EQUALS(numDeleted, 1);
-            ASSERT_EQUALS(insertResult.numInserted, 1);
+            ASSERT_EQUALS(numInserted, 1);
             ASSERT_OK(removeStatus);
             ASSERT_OK(insertStatus);
             wunit.commit();
@@ -1308,8 +1308,7 @@ public:
                          nullptr,
                          rid,
                          IndexAccessMethod::kNoopOnSuppressedErrorFn);
-            auto removeStatus =
-                iam->removeKeys(&_opCtx, {keys.begin(), keys.end()}, rid, options, &numDeleted);
+            auto removeStatus = iam->removeKeys(&_opCtx, keys, rid, options, &numDeleted);
 
             ASSERT_EQUALS(numDeleted, 1);
             ASSERT_OK(removeStatus);
@@ -1541,8 +1540,7 @@ public:
                          nullptr,
                          rid,
                          IndexAccessMethod::kNoopOnSuppressedErrorFn);
-            auto removeStatus =
-                iam->removeKeys(&_opCtx, {keys.begin(), keys.end()}, rid, options, &numDeleted);
+            auto removeStatus = iam->removeKeys(&_opCtx, keys, rid, options, &numDeleted);
 
             ASSERT_EQUALS(numDeleted, 1);
             ASSERT_OK(removeStatus);
@@ -1577,8 +1575,7 @@ public:
                          nullptr,
                          rid,
                          IndexAccessMethod::kNoopOnSuppressedErrorFn);
-            auto removeStatus =
-                iam->removeKeys(&_opCtx, {keys.begin(), keys.end()}, rid, options, &numDeleted);
+            auto removeStatus = iam->removeKeys(&_opCtx, keys, rid, options, &numDeleted);
 
             ASSERT_EQUALS(numDeleted, 1);
             ASSERT_OK(removeStatus);
@@ -1665,10 +1662,11 @@ public:
 
             IndexCatalog* indexCatalog = coll->getIndexCatalog();
 
-            WriteUnitOfWork wunit(&_opCtx);
             InsertDeleteOptions options;
             options.logIfError = true;
             options.dupsAllowed = true;
+
+            WriteUnitOfWork wunit(&_opCtx);
 
             // Insert a record and its keys separately. We do this to bypass duplicate constraint
             // checking. Inserting a record and all of its keys ensures that validation fails
@@ -1678,11 +1676,17 @@ public:
                 &_opCtx, dupObj.objdata(), dupObj.objsize(), Timestamp());
             ASSERT_OK(swRecordId);
 
+            wunit.commit();
+
             // Insert the key on _id.
             {
+                WriteUnitOfWork wunit(&_opCtx);
+
                 auto descriptor = indexCatalog->findIdIndex(&_opCtx);
-                auto iam = const_cast<IndexAccessMethod*>(
-                    indexCatalog->getEntry(descriptor)->accessMethod());
+                auto entry = const_cast<IndexCatalogEntry*>(indexCatalog->getEntry(descriptor));
+                auto iam = entry->accessMethod();
+                auto interceptor = std::make_unique<IndexBuildInterceptor>(&_opCtx, entry);
+
                 KeyStringSet keys;
                 iam->getKeys(dupObj,
                              IndexAccessMethod::GetKeysMode::kRelaxConstraints,
@@ -1694,28 +1698,37 @@ public:
                              IndexAccessMethod::kNoopOnSuppressedErrorFn);
                 ASSERT_EQ(1, keys.size());
 
-                InsertResult result;
-                auto insertStatus = iam->insertKeys(&_opCtx,
-                                                    {keys.begin(), keys.end()},
-                                                    {},
-                                                    MultikeyPaths{},
-                                                    swRecordId.getValue(),
-                                                    options,
-                                                    &result);
+                int64_t numInserted;
+                auto insertStatus = iam->insertKeys(
+                    &_opCtx,
+                    keys,
+                    swRecordId.getValue(),
+                    options,
+                    [this, &interceptor](const KeyString::Value& duplicateKey) {
+                        return interceptor->recordDuplicateKey(&_opCtx, duplicateKey);
+                    },
+                    &numInserted);
 
-                ASSERT_EQUALS(result.dupsInserted.size(), 0);
-                ASSERT_EQUALS(result.numInserted, 1);
+                wunit.commit();
+
+                ASSERT_OK(interceptor->checkDuplicateKeyConstraints(&_opCtx));
+                ASSERT_EQUALS(numInserted, 1);
                 ASSERT_OK(insertStatus);
+
+                interceptor->deleteTemporaryTables(&_opCtx);
             }
 
             // Insert the key on "a".
             {
+                WriteUnitOfWork wunit(&_opCtx);
+
                 auto descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
-                auto iam = const_cast<IndexAccessMethod*>(
-                    indexCatalog->getEntry(descriptor)->accessMethod());
+                auto entry = const_cast<IndexCatalogEntry*>(indexCatalog->getEntry(descriptor));
+                auto iam = entry->accessMethod();
+                auto interceptor = std::make_unique<IndexBuildInterceptor>(&_opCtx, entry);
 
                 KeyStringSet keys;
-                InsertResult result;
+                int64_t numInserted;
                 iam->getKeys(dupObj,
                              IndexAccessMethod::GetKeysMode::kRelaxConstraints,
                              IndexAccessMethod::GetKeysContext::kAddingKeys,
@@ -1725,19 +1738,24 @@ public:
                              swRecordId.getValue(),
                              IndexAccessMethod::kNoopOnSuppressedErrorFn);
                 ASSERT_EQ(1, keys.size());
-                auto insertStatus = iam->insertKeys(&_opCtx,
-                                                    {keys.begin(), keys.end()},
-                                                    {},
-                                                    MultikeyPaths{},
-                                                    swRecordId.getValue(),
-                                                    options,
-                                                    &result);
+                auto insertStatus = iam->insertKeys(
+                    &_opCtx,
+                    keys,
+                    swRecordId.getValue(),
+                    options,
+                    [this, &interceptor](const KeyString::Value& duplicateKey) {
+                        return interceptor->recordDuplicateKey(&_opCtx, duplicateKey);
+                    },
+                    &numInserted);
 
-                ASSERT_EQUALS(result.dupsInserted.size(), 1);
-                ASSERT_EQUALS(result.numInserted, 1);
+                wunit.commit();
+
+                ASSERT_NOT_OK(interceptor->checkDuplicateKeyConstraints(&_opCtx));
+                ASSERT_EQUALS(numInserted, 1);
                 ASSERT_OK(insertStatus);
+
+                interceptor->deleteTemporaryTables(&_opCtx);
             }
-            wunit.commit();
 
             releaseDb();
         }
