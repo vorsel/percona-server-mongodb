@@ -154,7 +154,7 @@ void endQueryOp(OperationContext* opCtx,
         CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, summaryStats);
     }
 
-    if (curOp->shouldDBProfile()) {
+    if (curOp->shouldDBProfile(opCtx)) {
         BSONObjBuilder statsBob;
         Explain::getWinningPlanStats(&exec, &statsBob);
         curOp->debug().execStats = statsBob.obj();
@@ -300,14 +300,11 @@ Message getMore(OperationContext* opCtx,
     if (cursorPin->lockPolicy() == ClientCursorParams::LockPolicy::kLocksInternally) {
         if (!nss.isCollectionlessCursorNamespace()) {
             AutoGetDb autoDb(opCtx, nss.db(), MODE_IS);
-            const auto profilingLevel = autoDb.getDb()
-                ? boost::optional<int>{autoDb.getDb()->getProfilingLevel()}
-                : boost::none;
             statsTracker.emplace(opCtx,
                                  nss,
                                  Top::LockType::NotLocked,
                                  AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                                 profilingLevel);
+                                 CollectionCatalog::get(opCtx).getDatabaseProfileLevel(nss.db()));
             auto view = autoDb.getDb() ? ViewCatalog::get(autoDb.getDb())->lookup(opCtx, nss.ns())
                                        : nullptr;
             uassert(
@@ -320,13 +317,11 @@ Message getMore(OperationContext* opCtx,
         }
     } else {
         readLock.emplace(opCtx, nss);
-        const int doNotChangeProfilingLevel = 0;
         statsTracker.emplace(opCtx,
                              nss,
                              Top::LockType::ReadLocked,
                              AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                             readLock->getDb() ? readLock->getDb()->getProfilingLevel()
-                                               : doNotChangeProfilingLevel);
+                             CollectionCatalog::get(opCtx).getDatabaseProfileLevel(nss.db()));
 
         // This checks to make sure the operation is allowed on a replicated node.  Since we are not
         // passing in a query object (necessary to check SlaveOK query option), we allow reads
@@ -530,7 +525,7 @@ Message getMore(OperationContext* opCtx,
     // need 'execStats' and we do not want to generate the stats eagerly for all operations due to
     // cost.
     if (cursorPin->lockPolicy() != ClientCursorParams::LockPolicy::kLocksInternally &&
-        curOp.shouldDBProfile()) {
+        curOp.shouldDBProfile(opCtx)) {
         BSONObjBuilder execStatsBob;
         Explain::getWinningPlanStats(exec, &execStatsBob);
         curOp.debug().execStats = execStatsBob.obj();

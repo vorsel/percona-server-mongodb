@@ -139,10 +139,10 @@ void finishCurOp(OperationContext* opCtx, CurOp* curOp) {
 
         // Mark the op as complete, and log it if appropriate. Returns a boolean indicating whether
         // this op should be sampled for profiling.
-        const bool shouldSample =
+        const bool shouldProfile =
             curOp->completeAndLogOperation(opCtx, MONGO_LOGV2_DEFAULT_COMPONENT);
 
-        if (curOp->shouldDBProfile(shouldSample)) {
+        if (shouldProfile) {
             // Stash the current transaction so that writes to the profile collection are not
             // done as part of the transaction.
             TransactionParticipant::SideTransactionBlock sideTxn(opCtx);
@@ -308,10 +308,6 @@ bool handleError(OperationContext* opCtx,
     return !wholeOp.getOrdered();
 }
 
-LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
-    return nss.isSystemDotViews() ? MODE_X : mode;
-}
-
 void insertDocuments(OperationContext* opCtx,
                      Collection* collection,
                      std::vector<InsertStatement>::iterator begin,
@@ -427,7 +423,8 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
             makeCollection(opCtx, wholeOp.getNamespace());
         }
 
-        curOp.raiseDbProfileLevel(collection->getDb()->getProfilingLevel());
+        curOp.raiseDbProfileLevel(
+            CollectionCatalog::get(opCtx).getDatabaseProfileLevel(wholeOp.getNamespace().db()));
         assertCanWrite_inlock(opCtx, wholeOp.getNamespace());
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
@@ -693,7 +690,7 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
     auto& curOp = *CurOp::get(opCtx);
 
     if (collection->getDb()) {
-        curOp.raiseDbProfileLevel(collection->getDb()->getProfilingLevel());
+        curOp.raiseDbProfileLevel(CollectionCatalog::get(opCtx).getDatabaseProfileLevel(ns.db()));
     }
 
     assertCanWrite_inlock(opCtx, ns);
@@ -714,7 +711,7 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
         CollectionQueryInfo::get(collection->getCollection()).notifyOfQuery(opCtx, summary);
     }
 
-    if (curOp.shouldDBProfile()) {
+    if (curOp.shouldDBProfile(opCtx)) {
         BSONObjBuilder execStatsBob;
         Explain::getWinningPlanStats(exec.get(), &execStatsBob);
         curOp.debug().execStats = execStatsBob.obj();
@@ -922,7 +919,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
     AutoGetCollection collection(opCtx, ns, fixLockModeForSystemDotViewsChanges(ns, MODE_IX));
 
     if (collection.getDb()) {
-        curOp.raiseDbProfileLevel(collection.getDb()->getProfilingLevel());
+        curOp.raiseDbProfileLevel(CollectionCatalog::get(opCtx).getDatabaseProfileLevel(ns.db()));
     }
 
     assertCanWrite_inlock(opCtx, ns);
@@ -949,7 +946,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
     }
     curOp.debug().setPlanSummaryMetrics(summary);
 
-    if (curOp.shouldDBProfile()) {
+    if (curOp.shouldDBProfile(opCtx)) {
         BSONObjBuilder execStatsBob;
         Explain::getWinningPlanStats(exec.get(), &execStatsBob);
         curOp.debug().execStats = execStatsBob.obj();

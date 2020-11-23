@@ -235,7 +235,7 @@ __wt_bulk_insert_row(WT_SESSION_IMPL *session, WT_CURSOR_BULK *cbulk)
             WT_RET(__wt_rec_dict_replace(session, r, &tw, 0, val));
         __wt_rec_image_copy(session, r, val);
     }
-    WT_TIME_AGGREGATE_UPDATE(&r->cur_ptr->ta, &tw);
+    WT_TIME_AGGREGATE_UPDATE(session, &r->cur_ptr->ta, &tw);
 
     /* Update compression state. */
     __rec_key_state_update(r, ovfl_key);
@@ -279,7 +279,7 @@ __rec_row_merge(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_PAGE *page)
         /* Copy the key and value onto the page. */
         __wt_rec_image_copy(session, r, key);
         __wt_rec_image_copy(session, r, val);
-        WT_TIME_AGGREGATE_MERGE(&r->cur_ptr->ta, &addr->ta);
+        WT_TIME_AGGREGATE_MERGE(session, &r->cur_ptr->ta, &addr->ta);
 
         /* Update compression state. */
         __rec_key_state_update(r, ovfl_key);
@@ -509,7 +509,7 @@ __wt_rec_row_int(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_PAGE *page)
         /* Copy the key and value onto the page. */
         __wt_rec_image_copy(session, r, key);
         __wt_rec_image_copy(session, r, val);
-        WT_TIME_AGGREGATE_MERGE(&r->cur_ptr->ta, &ta);
+        WT_TIME_AGGREGATE_MERGE(session, &r->cur_ptr->ta, &ta);
 
         /* Update compression state. */
         __rec_key_state_update(r, ovfl_key);
@@ -655,7 +655,7 @@ __rec_row_leaf_insert(WT_SESSION_IMPL *session, WT_RECONCILE *r, WT_INSERT *ins)
                 WT_RET(__wt_rec_dict_replace(session, r, &tw, 0, val));
             __wt_rec_image_copy(session, r, val);
         }
-        WT_TIME_AGGREGATE_UPDATE(&r->cur_ptr->ta, &tw);
+        WT_TIME_AGGREGATE_UPDATE(session, &r->cur_ptr->ta, &tw);
 
         /* Update compression state. */
         __rec_key_state_update(r, ovfl_key);
@@ -720,7 +720,7 @@ __wt_rec_row_leaf(
     WT_UPDATE *upd;
     WT_UPDATE_SELECT upd_select;
     uint64_t slvg_skip;
-    uint32_t i, session_flags;
+    uint32_t i;
     bool dictionary, key_onpage_ovfl, ovfl_key;
     void *copy;
 
@@ -918,9 +918,10 @@ __wt_rec_row_leaf(
                      * ever need to blow away history store content, so we can skip this.
                      */
                     if (!F_ISSET(session, WT_SESSION_NO_DATA_HANDLES)) {
-                        WT_ERR(__wt_hs_cursor_open(session, &session_flags));
-                        WT_ERR(__wt_hs_delete_key_from_ts(session, btree->id, tmpkey, WT_TS_NONE));
-                        WT_ERR(__wt_hs_cursor_close(session, session_flags));
+                        WT_ERR(__wt_hs_cursor_open(session));
+                        WT_ERR(__wt_hs_delete_key_from_ts(
+                          session, btree->id, tmpkey, WT_TS_NONE, false));
+                        WT_ERR(__wt_hs_cursor_close(session));
                         WT_STAT_CONN_INCR(session, cache_hs_key_truncate_onpage_removal);
                     }
                 }
@@ -1023,7 +1024,7 @@ build:
                 WT_ERR(__wt_rec_dict_replace(session, r, &tw, 0, val));
             __wt_rec_image_copy(session, r, val);
         }
-        WT_TIME_AGGREGATE_UPDATE(&r->cur_ptr->ta, &tw);
+        WT_TIME_AGGREGATE_UPDATE(session, &r->cur_ptr->ta, &tw);
 
         /* Update compression state. */
         __rec_key_state_update(r, ovfl_key);

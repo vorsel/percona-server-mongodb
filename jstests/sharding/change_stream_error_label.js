@@ -28,11 +28,11 @@ const expectedStopShardErrors = [
     ErrorCodes.SocketException,
     ErrorCodes.ShutdownInProgress,
     ErrorCodes.PrimarySteppedDown,
-    ErrorCodes.NotMaster,
+    ErrorCodes.NotWritablePrimary,
     ErrorCodes.InterruptedAtShutdown,
     ErrorCodes.InterruptedDueToReplStateChange,
-    ErrorCodes.NotMasterNoSlaveOk,
-    ErrorCodes.NotMasterOrSecondary
+    ErrorCodes.NotPrimaryNoSecondaryOk,
+    ErrorCodes.NotPrimaryOrSecondary
 ];
 
 // First, verify that the 'failGetMoreAfterCursorCheckout' failpoint can effectively exercise the

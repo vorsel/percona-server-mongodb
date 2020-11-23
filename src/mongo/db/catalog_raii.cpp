@@ -147,6 +147,10 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
             !_view || viewMode == kViewsPermitted);
 }
 
+LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
+    return nss.isSystemDotViews() ? MODE_X : mode;
+}
+
 AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* opCtx,
                                      StringData dbName,
                                      LockMode mode,
@@ -185,6 +189,25 @@ ReadSourceScope::~ReadSourceScope() {
     } else {
         _opCtx->recoveryUnit()->setTimestampReadSource(_originalReadSource);
     }
+}
+
+AutoGetOplog::AutoGetOplog(OperationContext* opCtx, OplogAccessMode mode, Date_t deadline)
+    : _shouldNotConflictWithSecondaryBatchApplicationBlock(opCtx->lockState()) {
+    auto lockMode = (mode == OplogAccessMode::kRead) ? MODE_IS : MODE_IX;
+    if (mode == OplogAccessMode::kLogOp) {
+        // Invariant that global lock is already held for kLogOp mode.
+        invariant(opCtx->lockState()->isWriteLocked());
+    } else {
+        _globalLock.emplace(opCtx, lockMode, deadline, Lock::InterruptBehavior::kThrow);
+    }
+
+    // Obtain database and collection intent locks for non-document-locking storage engines.
+    if (!opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking()) {
+        _dbWriteLock.emplace(opCtx, NamespaceString::kLocalDb, lockMode, deadline);
+        _collWriteLock.emplace(opCtx, NamespaceString::kRsOplogNamespace, lockMode, deadline);
+    }
+    _oplogInfo = repl::LocalOplogInfo::get(opCtx);
+    _oplog = _oplogInfo->getCollection();
 }
 
 }  // namespace mongo

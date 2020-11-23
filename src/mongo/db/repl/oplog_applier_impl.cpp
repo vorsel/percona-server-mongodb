@@ -130,10 +130,6 @@ Status finishAndLogApply(OperationContext* opCtx,
     return finalStatus;
 }
 
-LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
-    return nss.isSystemDotViews() ? MODE_X : mode;
-}
-
 /**
  * Caches per-collection properties which are relevant for oplog application, so that they don't
  * have to be retrieved repeatedly for each op.
@@ -772,8 +768,12 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
             // the first timestamp in the batch since we do not have enough information to find out
             // the timestamp of the first write that set the given multikey path.
             fassert(50686,
-                    _storageInterface->setIndexIsMultikey(
-                        opCtx, info.nss, info.indexName, info.multikeyPaths, firstTimeInBatch));
+                    _storageInterface->setIndexIsMultikey(opCtx,
+                                                          info.nss,
+                                                          info.indexName,
+                                                          info.multikeyMetadataKeys,
+                                                          info.multikeyPaths,
+                                                          firstTimeInBatch));
         }
     }
 
@@ -1030,8 +1030,9 @@ Status OplogApplierImpl::applyOplogBatchPerWorker(OperationContext* opCtx,
     // destroyed by unstash in its destructor. Thus we set the flag explicitly.
     opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
 
-    // Explicitly start future read transactions without a timestamp.
-    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+    // Ensure future transactions read without a timestamp.
+    invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
+              opCtx->recoveryUnit()->getTimestampReadSource());
 
     // When querying indexes, we return the record matching the key if it exists, or an adjacent
     // document. This means that it is possible for us to hit a prepare conflict if we query for an

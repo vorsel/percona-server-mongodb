@@ -27,13 +27,18 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/generic_gen.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/log_process_details.h"
+#include "mongo/logv2/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/ramlog.h"
 
@@ -156,10 +161,10 @@ public:
                      const string& ns,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
-        // sort the commands before building the result BSON
+        // Sort the command names before building the result BSON.
         std::vector<Command*> commands;
         for (const auto command : globalCommandRegistry()->allCommands()) {
-            // don't show oldnames
+            // Don't show oldnames
             if (command.first == command.second->getName())
                 commands.push_back(command.second);
         }
@@ -168,26 +173,110 @@ public:
         });
 
         BSONObjBuilder b(result.subobjStart("commands"));
-        for (const auto& c : commands) {
-            BSONObjBuilder temp(b.subobjStart(c->getName()));
-            temp.append("help", c->help());
-            temp.append("requiresAuth", c->requiresAuth());
+        for (const auto& command : commands) {
+            BSONObjBuilder temp(b.subobjStart(command->getName()));
+            temp.append("help", command->help());
+            temp.append("requiresAuth", command->requiresAuth());
             temp.append("slaveOk",
-                        c->secondaryAllowed(opCtx->getServiceContext()) ==
+                        command->secondaryAllowed(opCtx->getServiceContext()) ==
                             Command::AllowedOnSecondary::kAlways);
-            temp.append("adminOnly", c->adminOnly());
-            // optionally indicates that the command can be forced to run on a slave/secondary
-            if (c->secondaryAllowed(opCtx->getServiceContext()) ==
+            temp.append("adminOnly", command->adminOnly());
+            // Optionally indicates that the command can be forced to run on a secondary.
+            if (command->secondaryAllowed(opCtx->getServiceContext()) ==
                 Command::AllowedOnSecondary::kOptIn)
                 temp.append("slaveOverrideOk", true);
             temp.done();
         }
+
         b.done();
 
         return 1;
     }
 
 } listCommandsCmd;
+
+class CmdLogMessage : public TypedCommand<CmdLogMessage> {
+public:
+    using Request = LogMessageCommand;
+
+    class Invocation final : public InvocationBase {
+    public:
+        using InvocationBase::InvocationBase;
+
+        void typedRun(OperationContext* opCtx) {
+            auto cmd = request();
+
+            logv2::DynamicAttributes attrs;
+            attrs.add("msg", cmd.getCommandParameter());
+            if (auto extra = cmd.getExtra()) {
+                attrs.add("extra", *extra);
+            }
+
+            auto options = logv2::LogOptions{logv2::LogComponent::kDefault};
+            LOGV2_IMPL(5060500, getSeverity(cmd), options, "logMessage", attrs);
+        }
+
+    private:
+        static logv2::LogSeverity getSeverity(const Request& cmd) {
+            auto severity = cmd.getSeverity();
+            auto optDebugLevel = cmd.getDebugLevel();
+
+            if (optDebugLevel && (severity != MessageSeverityEnum::kDebug)) {
+                auto obj = cmd.toBSON({});
+                LOGV2_DEBUG(5060599,
+                            3,
+                            "Non-debug severity levels must not pass 'debugLevel'",
+                            "severity"_attr = obj[Request::kSeverityFieldName].valueStringData(),
+                            "debugLevel"_attr = optDebugLevel.get());
+            }
+
+            switch (severity) {
+                case MessageSeverityEnum::kSevere:
+                    return logv2::LogSeverity::Severe();
+                case MessageSeverityEnum::kError:
+                    return logv2::LogSeverity::Error();
+                case MessageSeverityEnum::kWarning:
+                    return logv2::LogSeverity::Warning();
+                case MessageSeverityEnum::kInfo:
+                    return logv2::LogSeverity::Info();
+                case MessageSeverityEnum::kLog:
+                    return logv2::LogSeverity::Log();
+                case MessageSeverityEnum::kDebug:
+                    return logv2::LogSeverity::Debug(
+                        boost::get_optional_value_or(optDebugLevel, 1));
+            }
+
+            MONGO_UNREACHABLE;
+        }
+
+        bool supportsWriteConcern() const final {
+            return false;
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            auto* client = opCtx->getClient();
+            auto* as = AuthorizationSession::get(client);
+            uassert(ErrorCodes::Unauthorized,
+                    "Not authorized to send custom message to log",
+                    as->isAuthorizedForActionsOnResource(ResourcePattern::forClusterResource(),
+                                                         ActionType::applicationMessage));
+        }
+
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName(), "");
+        }
+    };
+
+    bool adminOnly() const final {
+        return true;
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kAlways;
+    }
+};
+
+MONGO_REGISTER_TEST_COMMAND(CmdLogMessage);
 
 }  // namespace
 }  // namespace mongo

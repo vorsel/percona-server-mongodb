@@ -33,6 +33,7 @@
 #include <list>
 #include <vector>
 
+#include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_connection.h"
@@ -49,7 +50,6 @@
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/is_master_response.h"
-#include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_auth.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_process.h"
@@ -68,8 +68,8 @@
 
 namespace mongo {
 
-// Hangs in the beginning of each isMaster command when set.
-MONGO_FAIL_POINT_DEFINE(waitInIsMaster);
+// Hangs in the beginning of each hello command when set.
+MONGO_FAIL_POINT_DEFINE(waitInHello);
 // Awaitable isMaster requests with the proper topologyVersions will sleep for maxAwaitTimeMS on
 // standalones. This failpoint will hang right before doing this sleep when set.
 MONGO_FAIL_POINT_DEFINE(hangWaitingForIsMasterResponseOnStandalone);
@@ -81,6 +81,11 @@ using std::unique_ptr;
 
 namespace repl {
 namespace {
+
+constexpr auto kHelloString = "hello"_sd;
+constexpr auto kCamelCaseIsMasterString = "isMaster"_sd;
+constexpr auto kLowerCaseIsMasterString = "ismaster"_sd;
+
 /**
  * Appends replication-related fields to the isMaster response. Returns the topology version that
  * was included in the response.
@@ -88,6 +93,7 @@ namespace {
 TopologyVersion appendReplicationInfo(OperationContext* opCtx,
                                       BSONObjBuilder& result,
                                       int level,
+                                      bool useLegacyResponseFields,
                                       boost::optional<TopologyVersion> clientTopologyVersion,
                                       boost::optional<long long> maxAwaitTimeMS) {
     TopologyVersion topologyVersion;
@@ -102,7 +108,7 @@ TopologyVersion appendReplicationInfo(OperationContext* opCtx,
         }
         auto isMasterResponse =
             replCoord->awaitIsMasterResponse(opCtx, horizonParams, clientTopologyVersion, deadline);
-        result.appendElements(isMasterResponse->toBSON());
+        result.appendElements(isMasterResponse->toBSON(useLegacyResponseFields));
         if (level) {
             replCoord->appendSlaveInfoData(&result);
         }
@@ -136,7 +142,7 @@ TopologyVersion appendReplicationInfo(OperationContext* opCtx,
         opCtx->sleepFor(Milliseconds(*maxAwaitTimeMS));
     }
 
-    result.appendBool("ismaster",
+    result.appendBool((useLegacyResponseFields ? "ismaster" : "isWritablePrimary"),
                       ReplicationCoordinator::get(opCtx)->isMasterForReportingPurposes());
 
     if (level) {
@@ -232,9 +238,12 @@ public:
         int level = configElement.numberInt();
 
         BSONObjBuilder result;
+        // TODO SERVER-50219: Change useLegacyResponseFields to false once the serverStatus changes
+        // to remove master-slave terminology are merged.
         appendReplicationInfo(opCtx,
                               result,
                               level,
+                              true /* useLegacyResponseFields */,
                               boost::none /* clientTopologyVersion */,
                               boost::none /* maxAwaitTimeMS */);
 
@@ -268,11 +277,11 @@ public:
         result.append("latestOptime", replCoord->getMyLastAppliedOpTime().getTimestamp());
 
         auto earliestOplogTimestampFetch = [&] {
-            AutoGetCollection oplog(opCtx, NamespaceString::kRsOplogNamespace, MODE_IS);
-            if (!oplog.getCollection()) {
+            AutoGetOplog oplogRead(opCtx, OplogAccessMode::kRead);
+            if (!oplogRead.getCollection()) {
                 return StatusWith<Timestamp>(ErrorCodes::NamespaceNotFound, "oplog doesn't exist");
             }
-            return oplog.getCollection()->getRecordStore()->getEarliestOplogTimestamp(opCtx);
+            return oplogRead.getCollection()->getRecordStore()->getEarliestOplogTimestamp(opCtx);
         }();
 
         if (earliestOplogTimestampFetch.getStatus() == ErrorCodes::OplogOperationUnsupported) {
@@ -292,9 +301,9 @@ public:
     }
 } oplogInfoServerStatus;
 
-class CmdIsMaster final : public BasicCommandWithReplyBuilderInterface {
+class CmdHello : public BasicCommandWithReplyBuilderInterface {
 public:
-    CmdIsMaster() : BasicCommandWithReplyBuilderInterface("isMaster", "ismaster") {}
+    CmdHello() : CmdHello(kHelloString, {}) {}
 
     bool requiresAuth() const final {
         return false;
@@ -306,7 +315,7 @@ public:
 
     std::string help() const override {
         return "Check if this server is primary for a replica set\n"
-               "{ isMaster : 1 }";
+               "{ hello : 1 }";
     }
 
     bool supportsWriteConcern(const BSONObj& cmd) const final {
@@ -323,7 +332,7 @@ public:
                              rpc::ReplyBuilderInterface* replyBuilder) final {
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
 
-        waitInIsMaster.pauseWhileSet(opCtx);
+        waitInHello.pauseWhileSet(opCtx);
 
         /* currently request to arbiter is (somewhat arbitrarily) an ismaster request that is not
            authenticated.
@@ -474,8 +483,8 @@ public:
         }
 
         auto result = replyBuilder->getBodyBuilder();
-        auto currentTopologyVersion =
-            appendReplicationInfo(opCtx, result, 0, clientTopologyVersion, maxAwaitTimeMS);
+        auto currentTopologyVersion = appendReplicationInfo(
+            opCtx, result, 0, useLegacyResponseFields(), clientTopologyVersion, maxAwaitTimeMS);
 
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             const int configServerModeNumber = 2;
@@ -518,15 +527,16 @@ public:
         saslMechanismRegistry.advertiseMechanismNamesForUser(opCtx, cmdObj, &result);
 
         if (opCtx->isExhaust()) {
-            LOGV2_DEBUG(23905, 3, "Using exhaust for isMaster protocol");
+            LOGV2_DEBUG(23905, 3, "Using exhaust for isMaster or hello protocol");
 
             uassert(51756,
-                    "An isMaster request with exhaust must specify 'maxAwaitTimeMS'",
+                    "An isMaster or hello request with exhaust must specify 'maxAwaitTimeMS'",
                     maxAwaitTimeMSField);
             invariant(clientTopologyVersion);
 
             InExhaustIsMaster::get(opCtx->getClient()->session().get())
-                ->setInExhaustIsMaster(true /* inExhaustIsMaster */);
+                ->setInExhaustIsMaster(true /* inExhaust */,
+                                       cmdObj.firstElementFieldNameStringData());
 
             if (clientTopologyVersion->getProcessId() == currentTopologyVersion.getProcessId() &&
                 clientTopologyVersion->getCounter() == currentTopologyVersion.getCounter()) {
@@ -552,7 +562,35 @@ public:
 
         return true;
     }
-} cmdismaster;
+
+protected:
+    CmdHello(const StringData cmdName, const std::initializer_list<StringData>& alias)
+        : BasicCommandWithReplyBuilderInterface(cmdName, alias) {}
+
+    virtual bool useLegacyResponseFields() {
+        return false;
+    }
+
+} cmdhello;
+
+class CmdIsMaster : public CmdHello {
+public:
+    CmdIsMaster() : CmdHello(kCamelCaseIsMasterString, {kLowerCaseIsMasterString}) {}
+
+    std::string help() const override {
+        return "Check if this server is primary for a replica set\n"
+               "{ isMaster : 1 }";
+    }
+
+protected:
+    // Parse the command name, which should be one of the following: hello, isMaster, or
+    // ismaster. If the command is "hello", we must attach an "isWritablePrimary" response field
+    // instead of "ismaster" and "secondaryDelaySecs" response field instead of "slaveDelay".
+    bool useLegacyResponseFields() override {
+        return true;
+    }
+
+} cmdIsMaster;
 
 OpCounterServerStatusSection replOpCounterServerStatusSection("opcountersRepl", &replOpCounters);
 

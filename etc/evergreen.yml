@@ -193,7 +193,7 @@ variables:
   - func: "apply compile expansions"
   - func: "set task expansion macros"
   teardown_task:
-  - func: "attach scons config log"
+  - func: "attach scons logs"
   - func: "attach report"
   - func: "attach artifacts"
   - func: "kill processes"
@@ -313,6 +313,7 @@ variables:
     - func: "apply compile expansions"
     - func: "set task expansion macros"
   teardown_task:
+  - func: "attach scons logs"
   setup_group_can_fail_task: true
   setup_group:
     - func: "kill processes"
@@ -356,6 +357,7 @@ variables:
   - enterprise-rhel-72-s390x
   - enterprise-rhel-72-s390x-inmem
   - enterprise-rhel-80-64-bit
+  - enterprise-rhel-82-arm64
   - enterprise-suse12-64
   - enterprise-suse15-64
   - enterprise-suse12-s390x
@@ -388,6 +390,7 @@ variables:
   - enterprise-macos
   - enterprise-rhel-62-64-bit
   - enterprise-rhel-70-64-bit
+  - enterprise-rhel-82-arm64
   - enterprise-ubuntu1604-64
   - enterprise-ubuntu1804-64
   - enterprise-windows-required
@@ -415,7 +418,9 @@ variables:
   - enterprise-rhel-81-ppc64le
   - enterprise-rhel-72-s390x
   - rhel80
+  - rhel-82-arm64
   - enterprise-rhel-80-64-bit
+  - enterprise-rhel-82-arm64
   - suse12
   - suse12-s390x
   - enterprise-suse12-64
@@ -841,7 +846,6 @@ functions:
   "upload debugsymbols": &upload_debugsymbols
     command: s3.put
     params:
-      optional: true
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: src/mongo-debugsymbols.${ext|tgz}
@@ -1301,6 +1305,31 @@ functions:
           --architecture $architecture                       \
           --useLatest 4.2 4.2.1
 
+        # The platform and architecture for how some of the binaries are reported in
+        # https://downloads.mongodb.org/full.json changed between MongoDB 4.2 and MongoDB 4.4.
+        # Certain build variants define additional multiversion_*_44_or_later expansions in order to
+        # be able to fetch a complete set of versions.
+
+        if [ ! -z "${multiversion_edition_44_or_later}" ]; then
+          edition="${multiversion_edition_44_or_later}"
+        fi
+
+        if [ ! -z "${multiversion_platform_44_or_later}" ]; then
+          platform="${multiversion_platform_44_or_later}"
+        fi
+
+        if [ ! -z "${multiversion_architecture_44_or_later}" ]; then
+          architecture="${multiversion_architecture_44_or_later}"
+        fi
+
+        $python buildscripts/setup_multiversion_mongodb.py   \
+          --installDir /data/install                         \
+          --linkDir /data/multiversion                       \
+          --edition $edition                                 \
+          --platform $platform                               \
+          --architecture $architecture                       \
+          --useLatest 4.4.1
+
   "execute resmoke tests": &execute_resmoke_tests
     command: shell.exec
     type: test
@@ -1399,7 +1428,6 @@ functions:
             ${gcov_environment}                           \
             ${lang_environment}                           \
             ${san_options}                                \
-            ${san_symbolizer}                             \
             ${snmp_config_path}                           \
             ${resmoke_wrapper}                            \
             $python buildscripts/resmoke.py run   \
@@ -1811,6 +1839,11 @@ functions:
           extra_args="$extra_args --release"
         fi
 
+        if [ "Windows_NT" = "$OS" ]; then
+          vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"
+          export PATH="$(echo "$(cd "$vcvars" && cmd /C "vcvarsall.bat amd64 && C:/cygwin/bin/bash -c 'echo \$PATH'")" | tail -n +6)":$PATH
+        fi
+
         ${activate_virtualenv}
 
         ${compile_env|} $python ./buildscripts/scons.py                                     \
@@ -1819,10 +1852,6 @@ functions:
             ${targets} MONGO_VERSION=${version} || exit_status=$?
         # If compile fails we do not run any tests
         if [[ $exit_status -ne 0 ]]; then
-          if [[ "${dump_scons_config_on_failure}" == true ]]; then
-            echo "Dumping build/scons/config.log"
-            cat build/scons/config.log
-          fi
           touch ${skip_tests}
         fi
         exit $exit_status
@@ -3685,18 +3714,30 @@ functions:
   - *archive_system_resource_information
 
   ### Attach report & artifacts ###
-  "attach scons config log":
-    command: s3.put
-    params:
-      optional: true
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: src/build/scons/config.log
-      remote_file: ${project}/${build_variant}/${revision}/artifacts/config-${build_id}.log
-      bucket: mciuploads
-      permissions: public-read
-      content_type: text/plain
-      display_name: config.log
+  "attach scons logs":
+    - command: s3.put
+      params:
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/build/scons/config.log
+        remote_file: ${project}/${build_variant}/${revision}/artifacts/scons-config.log.${build_id}-${task_name}-${execution}
+        bucket: mciuploads
+        permissions: public-read
+        content_type: text/plain
+        display_name: SCons configure log
+
+    - command: s3.put
+      params:
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/scons_cache.log
+        content_type: text/plain
+        remote_file: ${project}/${build_variant}/${revision}/artifacts/scons-cache.log.${build_id}-${task_name}.${execution}
+        bucket: mciuploads
+        permissions: public-read
+        display_name: SCons cache debug log
 
   "attach report":
     command: attach.results
@@ -3839,17 +3880,7 @@ tasks:
         permissions: public-read
         content_type: application/tar
         display_name: Artifacts
-    - command: s3.put
-      params:
-        optional: true
-        aws_key: ${aws_key}
-        aws_secret: ${aws_secret}
-        local_file: src/scons_cache.log
-        content_type: text/plain
-        remote_file: ${project}/${build_variant}/${revision}/scons-cache-${build_id}-${execution}.log
-        bucket: mciuploads
-        permissions: public-read
-        display_name: SCons cache debug log
+
     # For patch builds that bypass compile, we upload links to pre-existing tarballs, except for the
     # artifacts.tgz.
     - command: attach.artifacts
@@ -3880,14 +3911,57 @@ tasks:
         task_install_action:
             default
         task_compile_flags: >-
-          --ninja=next
+          --ninja
         targets:
           build.ninja
     - command: shell.exec
       params:
         working_dir: src
         shell: bash
-        script: ninja -f build.ninja
+        script: |
+          ${activate_virtualenv}
+          if [ "Windows_NT" = "$OS" ]; then
+            vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"
+            cd "$vcvars" && cmd /K "vcvarsall.bat amd64 && cd ${workdir}\src"
+          fi
+          python -m pip install ninja
+          ninja install-core
+
+- name: compile_ninja_next
+  commands:
+    - func: "scons compile"
+      vars:
+        task_install_action:
+            default
+        task_compile_flags: >-
+          --build-tools=next
+          --ninja
+        targets:
+          generate-ninja
+    - command: shell.exec
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          ${activate_virtualenv}
+          if [ "Windows_NT" = "$OS" ]; then
+            vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"
+            cd "$vcvars" && cmd /K "vcvarsall.bat amd64 && cd ${workdir}\src"
+          fi
+          python -m pip install ninja
+          ninja install-core
+
+
+- name: compile_build_tools_next
+  commands:
+    - func: "scons compile"
+      vars:
+        task_install_action:
+            default
+        task_compile_flags: >-
+          --build-tools=next
+        targets:
+          install-core
 
 ## compile_all - build all scons targets ##
 - name: compile_all
@@ -4328,6 +4402,7 @@ tasks:
       vars:
         targets: install-benchmarks
         compiling_for_test: true
+    - func: "attach scons logs"
     - command: archive.targz_pack
       params:
         target: "benchmarks.tgz"
@@ -4471,7 +4546,7 @@ tasks:
         fi
         burn_in_args="$burn_in_args --repeat-tests-min=2 --repeat-tests-max=1000 --repeat-tests-secs=600"
         # Evergreen executable is in $HOME.
-        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --project=${project} $build_variant_opts --distro=${distro_id} --generate-tasks-file=burn_in_tests_gen.json $burn_in_args --verbose
+        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --project=${project} $build_variant_opts --distro=${distro_id} --generate-tasks-file=burn_in_tests_gen.json --task_id ${task_id} $burn_in_args --verbose
   - command: archive.targz_pack
     params:
       target: src/burn_in_tests_gen.tgz
@@ -4704,7 +4779,7 @@ tasks:
 ## Standalone generational fuzzer for multiversion aggregation expressions ##
 - <<: *jstestfuzz_template
   name: aggregation_expression_multiversion_fuzzer_gen
-  tags: ["aggfuzzer"]
+  tags: ["aggfuzzer", "multiversion"]
   commands:
   - func: "generate fuzzer tasks"
     vars:
@@ -5774,6 +5849,7 @@ tasks:
       bypass_compile: false
       task_compile_flags: >-
         --detect-odr-violations
+  - func: "attach scons logs"
   - func: "run tests"
     vars:
       resmoke_args: --suites=integration_tests_standalone --storageEngine=wiredTiger
@@ -5795,6 +5871,7 @@ tasks:
       bypass_compile: false
       task_compile_flags: >-
         --detect-odr-violations
+  - func: "attach scons logs"
   - func: "run tests"
     vars:
       resmoke_args: --suites=integration_tests_standalone_audit --storageEngine=wiredTiger
@@ -5816,6 +5893,7 @@ tasks:
       bypass_compile: false
       task_compile_flags: >-
         --detect-odr-violations
+  - func: "attach scons logs"
   - func: "run tests"
     vars:
       resmoke_args: --suites=integration_tests_replset --storageEngine=wiredTiger
@@ -5837,6 +5915,7 @@ tasks:
       bypass_compile: false
       task_compile_flags: >-
         --detect-odr-violations
+  - func: "attach scons logs"
   - func: "run tests"
     vars:
       resmoke_args: --suites=integration_tests_sharded --storageEngine=wiredTiger
@@ -7484,7 +7563,7 @@ tasks:
 
 - <<: *task_template
   name: ocsp
-  tags: ["ssl", "ocsp"]
+  tags: ["ssl", "encrypt", "ocsp"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -8543,6 +8622,17 @@ task_groups:
   tasks:
   - compile_core_tools
 - <<: *compile_task_group_template
+  name: compile_ninja_next_TG
+  tasks:
+  - compile_build_tools_next
+  - compile_ninja_next
+
+- <<: *compile_task_group_template
+  name: compile_build_tools_next_TG
+  tasks:
+  - compile_build_tools_next
+
+- <<: *compile_task_group_template
   name: compile_ninja_TG
   tasks:
   - compile_ninja
@@ -8627,6 +8717,7 @@ task_groups:
     - func: "set task expansion macros"
     - func: "apply compile expansions"
   teardown_task:
+      - func: "attach scons logs"
   tasks:
   - "embedded_sdk_build_cdriver"
   - "embedded_sdk_install_dev"
@@ -8708,7 +8799,7 @@ buildvariants:
 - &linux-64-debug-template
   name: linux-64-debug
   display_name: "! Linux DEBUG"
-  batchtime: 180 # 3 hours
+  batchtime: 240 # 4 hours
   run_on:
   - rhel62-large
   expansions:
@@ -8858,6 +8949,9 @@ buildvariants:
   - name: compile_all_run_unittests_TG
     distros:
     - ubuntu1804-build
+  - name: compile_ninja_next_TG
+    distros:
+    - ubuntu1804-build
   - name: compile_ninja_TG
   - name: .aggfuzzer .common
   - name: audit
@@ -8976,6 +9070,7 @@ buildvariants:
     multiversion_architecture: arm64
     multiversion_architecture_42_or_later: aarch64
     multiversion_edition: enterprise
+    scons_cache_scope: shared
   tasks:
   - name: compile_all_run_unittests_TG
   - name: aggregation
@@ -9017,6 +9112,7 @@ buildvariants:
     multiversion_architecture: arm64
     multiversion_architecture_42_or_later: aarch64
     multiversion_edition: enterprise
+    scons_cache_scope: shared
   tasks:
   - name: compile_all_run_unittests_TG
   - name: aggregation
@@ -9061,6 +9157,7 @@ buildvariants:
     multiversion_architecture: arm64
     multiversion_architecture_42_or_later: aarch64
     multiversion_edition: targeted
+    scons_cache_scope: shared
   tasks:
   - name: compile_all_run_unittests_TG
   - name: free_monitoring
@@ -9269,6 +9366,9 @@ buildvariants:
   - name: compile_all_run_unittests_TG
     distros:
     - ubuntu2004-large
+  - name: compile_ninja_next_TG
+    distros:
+    - ubuntu2004-large
   - name: compile_ninja_TG
   - name: .aggfuzzer .common !.multiversion
   - name: audit
@@ -9317,6 +9417,7 @@ buildvariants:
     multiversion_architecture: arm64
     multiversion_architecture_42_or_later: aarch64
     multiversion_edition: enterprise
+    scons_cache_scope: shared
   tasks:
   - name: compile_all_run_unittests_TG
   - name: aggregation
@@ -9361,6 +9462,7 @@ buildvariants:
     multiversion_architecture: arm64
     multiversion_architecture_42_or_later: aarch64
     multiversion_edition: targeted
+    scons_cache_scope: shared
   tasks:
   - name: compile_all_run_unittests_TG
   - name: free_monitoring
@@ -9603,7 +9705,7 @@ buildvariants:
 
 - name: windows-debug
   display_name: "* Windows DEBUG"
-  batchtime: 180 # 3 hours
+  batchtime: 240 # 4 hours
   run_on:
   - windows-64-vs2019-small
   expansions:
@@ -9618,6 +9720,9 @@ buildvariants:
     large_distro_name: windows-64-vs2019-large
   tasks:
   - name: compile_all_run_unittests_TG
+    distros:
+    - windows-64-vs2019-large
+  - name: compile_build_tools_next_TG
     distros:
     - windows-64-vs2019-large
   - name: .aggregation !.auth !.encrypt !.large
@@ -9667,15 +9772,14 @@ buildvariants:
 
 - name: enterprise-windows-required
   display_name: "! Enterprise Windows"
-  batchtime: 60 # 1 hours
+  batchtime: 240 # 4 hourss
   modules:
   - enterprise
   run_on:
   - windows-64-vs2019-small
   expansions:
     exe: ".exe"
-    additional_package_targets: archive-mongocryptd archive-mongocryptd-debug msi
-    mh_target: archive-mh archive-mh-debug
+    additional_package_targets: archive-mongocryptd archive-mongocryptd-debug msi archive-mh archive-mh-debug
     content_type: application/zip
     compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=win10
     num_scons_link_jobs_available: 0.5
@@ -9696,6 +9800,9 @@ buildvariants:
   - name: compile_TG
     distros:
     - windows-64-vs2019-large
+  - name: compile_build_tools_next_TG
+    distros:
+    - windows-64-vs2019-large
   - name: burn_in_tests_gen
   - name: buildscripts_test
   - name: noPassthrough_gen
@@ -9708,15 +9815,14 @@ buildvariants:
 
 - name: enterprise-windows
   display_name: "* Enterprise Windows"
-  batchtime: 180 # 3 hours
+  batchtime: 240 # 4 hours
   modules:
     - enterprise
   run_on:
     - windows-64-vs2019-small
   expansions:
     exe: ".exe"
-    additional_package_targets: archive-mongocryptd archive-mongocryptd-debug msi
-    mh_target: archive-mh archive-mh-debug
+    additional_package_targets: archive-mongocryptd archive-mongocryptd-debug msi archive-mh archive-mh-debug
     content_type: application/zip
     compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=win10
     num_scons_link_jobs_available: 0.5
@@ -9840,6 +9946,7 @@ buildvariants:
     push_arch: x86_64
     multiversion_platform: windows_x86_64-2008plus-ssl
     multiversion_platform_42_or_later: windows_x86_64-2012plus
+    multiversion_platform_44_or_later: windows
     content_type: application/zip
     compile_flags: --ssl MONGO_DISTMOD=windows -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=win10
     num_scons_link_jobs_available: 0.5
@@ -9913,6 +10020,9 @@ buildvariants:
   - name: compile_TG
     distros:
     - windows-64-vs2019-large
+  - name: compile_ninja_next_TG
+    distros:
+    - windows-64-vs2019-large
   - name: audit
   # Do not add more tasks to this list.
 
@@ -9968,7 +10078,7 @@ buildvariants:
 
 - name: macos-debug
   display_name: "* macOS DEBUG"
-  batchtime: 60 # 1 hour
+  batchtime: 240 # 4 hours
   run_on:
   - macos-1014
   expansions:
@@ -9977,6 +10087,7 @@ buildvariants:
     compile_flags: --ssl --dbg=on --opt=on -j$(sysctl -n hw.logicalcpu) --libc++ --variables-files=etc/scons/xcode_macosx.vars
   tasks:
   - name: compile_all_run_unittests_TG
+  - name: compile_build_tools_next_TG
   - name: aggregation
   - name: auth_gen
   - name: causally_consistent_jscore_txns_passthrough
@@ -10007,6 +10118,7 @@ buildvariants:
     resmoke_jobs_max: 6
   tasks:
   - name: compile_all_run_unittests_TG
+  - name: compile_ninja_next_TG
   - name: audit
   - name: auth_audit_gen
   - name: causally_consistent_jscore_txns_passthrough
@@ -10051,7 +10163,6 @@ buildvariants:
         -DENABLE_ZLIB=BUNDLED
         -DCMAKE_C_FLAGS="-Wunguarded-availability"
     disable_unit_tests: true
-    dump_scons_config_on_failure: true
   tasks:
   - name: embedded_sdk_build_and_test
 
@@ -10073,7 +10184,6 @@ buildvariants:
         -DCMAKE_C_FLAGS="-flto"
         -DCMAKE_INSTALL_RPATH=\$ORIGIN/../lib
     disable_unit_tests: true
-    dump_scons_config_on_failure: true
   tasks:
   - name: embedded_sdk_build_and_test
 
@@ -10083,7 +10193,7 @@ buildvariants:
 
 - name: enterprise-rhel-62-64-bit
   display_name: "! Enterprise RHEL 6.2"
-  batchtime: 60 # 1 hour
+  batchtime: 240 # 4 hours
   modules:
   - enterprise
   run_on:
@@ -10585,7 +10695,7 @@ buildvariants:
 - &enterprise-rhel-70-64-bit-template
   name: enterprise-rhel-70-64-bit
   display_name: "* Enterprise RHEL 7.0"
-  batchtime: 180 # 3 hours
+  batchtime: 240 # 4 hours
   modules:
   - enterprise
   run_on:
@@ -10607,6 +10717,9 @@ buildvariants:
     scons_cache_scope: shared
   tasks:
   - name: compile_all_run_unittests_TG
+    distros:
+    - rhel70
+  - name: compile_build_tools_next_TG
     distros:
     - rhel70
   - name: .aggfuzzer
@@ -10694,6 +10807,56 @@ buildvariants:
   - name: test_packages
     distros:
     - ubuntu1604-packer
+  - name: .publish
+    distros:
+    - rhel80-small
+
+- name: enterprise-rhel-82-arm64
+  display_name: "Enterprise RHEL 8.2 arm64"
+  modules:
+  - enterprise
+  run_on:
+  - rhel82-arm64-small
+  expansions:
+    additional_package_targets: archive-mongocryptd archive-mongocryptd-debug archive-mh archive-mh-debug
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: aarch64-enterprise-rhel82
+    compile_flags: --ssl MONGO_DISTMOD=rhel82 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    has_packages: true
+    packager_script: packager_enterprise.py
+    packager_arch: arm64
+    packager_distro: rhel82
+    repo_edition: enterprise
+    scons_cache_scope: shared
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - rhel82-arm64-large
+  - name: .aggfuzzer !.multiversion
+  - name: audit
+  - name: auth_audit_gen
+  - name: auth_gen
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: .encrypt !.sharding !.replica_sets !.aggregation !.jscore
+  - name: external_auth
+  - name: external_auth_aws
+  - name: .jscore .common !.compat !.decimal !.sharding
+  - name: jsCore_txns_large_txns_format
+  - name: .jstestfuzz .common
+  - name: .logical_session_cache .one_sec
+  - name: replica_sets_auth_gen
+  - name: replica_sets_jscore_passthrough
+  - name: .replica_sets .multi_oplog
+  - name: sasl
+  - name: search
+  - name: search_auth
+  - name: search_ssl
+  - name: sharding_auth_audit_gen
+  - name: sharding_auth_gen
+  - name: snmp
+  - name: .stitch
   - name: .publish
     distros:
     - rhel80-small
@@ -10821,7 +10984,7 @@ buildvariants:
 
 - name: ubuntu1604-debug
   display_name: "* Ubuntu 16.04 DEBUG"
-  batchtime: 180 # 3 hours
+  batchtime: 240 # 4 hours
   run_on:
   - ubuntu1604-test
   expansions:
@@ -10830,6 +10993,9 @@ buildvariants:
     scons_cache_scope: shared
   tasks:
   - name: compile_TG
+    distros:
+    - ubuntu1604-build
+  - name: compile_build_tools_next_TG
     distros:
     - ubuntu1604-build
   - name: jsCore
@@ -11015,6 +11181,51 @@ buildvariants:
     distros:
     - rhel80-small
 
+- name: rhel-82-arm64
+  display_name: RHEL 8.2 arm64
+  run_on:
+  - rhel82-arm64-small
+  expansions:
+    push_path: linux
+    push_bucket: downloads.mongodb.org
+    push_name: linux
+    push_arch: aarch64-rhel82
+    compile_flags: --ssl MONGO_DISTMOD=rhel82 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    has_packages: true
+    packager_script: packager.py
+    packager_arch: arm64
+    packager_distro: rhel82
+    repo_edition: org
+    scons_cache_scope: shared
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - rhel82-arm64-large
+  - name: aggregation
+  - name: .auth !.audit !.multiversion
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: .misc_js
+  - name: .concurrency .common
+    distros:
+      - rhel82-arm64-large
+  - name: concurrency_replication_causal_consistency
+    distros:
+      - rhel82-arm64-large
+  - name: disk_wiredtiger
+  - name: free_monitoring
+  - name: .jscore .common
+  - name: .jstestfuzz .common
+  - name: .logical_session_cache .one_sec
+  - name: replica_sets
+  - name: .replica_sets .common
+  - name: .sharding .txns
+  - name: .sharding .common !.op_query !.csrs !.multiversion
+  - name: .ssl
+  - name: .stitch
+  - name: .publish
+    distros:
+    - rhel80-small
+
 # This variant compiles on RHEL 7.0 and runs tests on RHEL 7.6
 - name: rhel76_compile_rhel70
   display_name: RHEL 7.0/7.6 Cross-ABI
@@ -11026,7 +11237,7 @@ buildvariants:
   - name: compile_TG
     distros:
     - rhel70
-  - name: ssl_gen
+  - name: .ssl
   - name: jsCore
   - name: external_auth
 
@@ -11284,7 +11495,7 @@ buildvariants:
 
 - name: enterprise-ubuntu-dynamic-1604-clang
   display_name: "! Shared Library Enterprise Ubuntu 16.04 (Clang)"
-  batchtime: 180 # 3 hours
+  batchtime: 240 # 4 hours
   modules:
   - enterprise
   run_on:
@@ -11312,7 +11523,7 @@ buildvariants:
 
 - name: enterprise-ubuntu-dynamic-1604-clang-tidy
   display_name: "* Enterprise Clang Tidy"
-  batchtime: 180 # 3 hours
+  batchtime: 240 # 4 hours
   modules:
   - enterprise
   run_on:
@@ -11333,7 +11544,7 @@ buildvariants:
 
 - name: ubuntu-dynamic-1604-clang
   display_name: "* Shared Library Ubuntu 16.04 (Clang)"
-  batchtime: 180 # 3 hours
+  batchtime: 240 # 4 hours
   run_on:
    - ubuntu1604-test
   expansions:
@@ -11822,20 +12033,6 @@ buildvariants:
 # storage engine buildvariants #
 ################################
 
-- name: rhel-62-64-bit-biggie
-  display_name: RHEL 6.2 (Biggie)
-  run_on:
-  - rhel62-small
-  expansions:
-    test_flags: --storageEngine=biggie --excludeWithAnyTags=SERVER-38379,requires_persistence,requires_journaling,uses_transactions,requires_wiredtiger,requires_snapshot_read
-    compile_flags: MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-    scons_cache_scope: shared
-  tasks:
-  - name: compile_all_run_unittests_TG
-    distros:
-    - rhel62-large
-  - name: jsCore
-
 - name: enterprise-rhel-62-benchmarks
   display_name: Enterprise RHEL 6.2 (Benchmarks)
   modules:
@@ -12043,10 +12240,10 @@ buildvariants:
   stepback: false
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
-    # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
-    variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
-    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
+    # If you add anything to san_options, make sure the appropriate changes are
+    # also made to SConstruct.
+    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer" ASAN_OPTIONS="detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer"
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=address --ssl --enable-free-mon=on -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform: ubuntu1804
     multiversion_edition: enterprise
@@ -12110,10 +12307,8 @@ buildvariants:
   - ubuntu1804-build
   stepback: true
   expansions:
-    # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
-    variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
-    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
+    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer" ASAN_OPTIONS="detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer"
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --opt=on --allocator=system --sanitize=address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform: ubuntu1804
     multiversion_edition: enterprise
@@ -12137,10 +12332,10 @@ buildvariants:
   stepback: false
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
-    # We need llvm-symbolizer in the PATH for UBSAN.
-    variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
-    san_options: UBSAN_OPTIONS="print_stacktrace=1"
+    # If you add anything to san_options, make sure the appropriate changes are
+    # also made to SConstruct.
+    san_options: UBSAN_OPTIONS="print_stacktrace=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer"
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --sanitize=undefined --ssl --enable-free-mon=on -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     multiversion_platform: ubuntu1804
     multiversion_edition: enterprise
@@ -12194,7 +12389,7 @@ buildvariants:
 
 - name: ubuntu1804-debug-aubsan-lite
   display_name: "! {A,UB}SAN Enterprise Ubuntu 18.04 DEBUG"
-  batchtime: 180 # 3 hours
+  batchtime: 240 # 4 hours
   modules:
   - enterprise
   run_on:
@@ -12202,10 +12397,10 @@ buildvariants:
   stepback: true
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
-    # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
-    variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
-    san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
+    # If you add anything to san_options, make sure the appropriate changes are
+    # also made to SConstruct.
+    san_options: UBSAN_OPTIONS="print_stacktrace=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS="detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer"
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
     hang_analyzer_dump_core: false
@@ -12227,10 +12422,10 @@ buildvariants:
   stepback: false
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
-    # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
-    variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
-    san_options: UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
+    # If you add anything to san_options, make sure the appropriate changes are
+    # also made to SConstruct.
+    san_options: UBSAN_OPTIONS="print_stacktrace=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS="detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer"
     compile_flags: LINKFLAGS=-nostdlib++ LIBS=stdc++ --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address,fuzzer --ssl -j$(grep -c ^processor /proc/cpuinfo) --nostrip
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
     hang_analyzer_dump_core: false
@@ -12242,7 +12437,7 @@ buildvariants:
 
 - name: enterprise-ubuntu-dynamic-1604-64-bit
   display_name: "* Shared Library Enterprise Ubuntu 16.04"
-  batchtime: 180 # 3 hours
+  batchtime: 240 # 4 hours
   modules:
   - enterprise
   expansions:

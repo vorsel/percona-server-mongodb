@@ -304,7 +304,7 @@ pipelineEnv.Library(
 env.Library(
     target='runtime_constants_idl',
     source=[
-        env.Idlc('runtime_constants.idl')[0]
+        'runtime_constants.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/idl/idl_parser',
@@ -314,14 +314,14 @@ env.Library(
 env.Library(
     target='document_sources_idl',
     source=[
-        env.Idlc('document_source_change_stream.idl')[0],
-        env.Idlc('document_source_list_sessions.idl')[0],
-        env.Idlc('document_source_merge.idl')[0],
-        env.Idlc('document_source_merge_modes.idl')[0],
-        env.Idlc('document_source_replace_root.idl')[0],
-        env.Idlc('document_source_union_with.idl')[0],
-        env.Idlc('exchange_spec.idl')[0],
-        env.Idlc('value.idl')[0],
+        'document_source_change_stream.idl',
+        'document_source_list_sessions.idl',
+        'document_source_merge.idl',
+        'document_source_merge_modes.idl',
+        'document_source_replace_root.idl',
+        'document_source_union_with.idl',
+        'exchange_spec.idl',
+        'value.idl',
         'document_source_merge_spec.cpp',
         'resume_token.cpp'
     ],
@@ -407,6 +407,7 @@ env.CppUnitTest(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/catalog/catalog_impl',
         '$BUILD_DIR/mongo/db/exec/document_value/document_value',
         '$BUILD_DIR/mongo/db/exec/document_value/document_value_test_util',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface_mock',
@@ -417,6 +418,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/service_context_d',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/db/storage/devnull/storage_devnull_core',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
         '$BUILD_DIR/mongo/s/catalog_cache_test_fixture',
         '$BUILD_DIR/mongo/s/is_mongos',

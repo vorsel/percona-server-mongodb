@@ -718,13 +718,18 @@ TEST_F(TransactionCoordinatorDriverPersistenceTest,
 
 TEST_F(TransactionCoordinatorDriverPersistenceTest,
        PersistCommitDecisionWhenNoDocumentForTransactionExistsCanBeInterruptedAndReturnsError) {
-    Future<repl::OpTime> future =
-        txn::persistDecision(*_aws, _lsid, _txnNumber, _participants, [&] {
+    Future<repl::OpTime> future;
+
+    {
+        FailPointEnableBlock failpoint("hangBeforeWritingDecision");
+        future = txn::persistDecision(*_aws, _lsid, _txnNumber, _participants, [&] {
             txn::CoordinatorCommitDecision decision(txn::CommitDecision::kCommit);
             decision.setCommitTimestamp(_commitTimestamp);
             return decision;
         }());
-    _aws->shutdown({ErrorCodes::TransactionCoordinatorSteppingDown, "Shutdown for test"});
+        failpoint->waitForTimesEntered(failpoint.initialTimesEntered() + 1);
+        _aws->shutdown({ErrorCodes::TransactionCoordinatorSteppingDown, "Shutdown for test"});
+    }
 
     ASSERT_THROWS_CODE(
         future.get(), AssertionException, ErrorCodes::TransactionCoordinatorSteppingDown);
@@ -1015,13 +1020,12 @@ TEST_F(TransactionCoordinatorTest,
 class TransactionCoordinatorMetricsTest : public TransactionCoordinatorTestBase {
 public:
     void setUp() override {
-        TransactionCoordinatorTestBase::setUp();
-
         getServiceContext()->setPreciseClockSource(std::make_unique<ClockSourceMock>());
-
         auto tickSource = std::make_unique<TickSourceMock<Microseconds>>();
         tickSource->reset(1);
         getServiceContext()->setTickSource(std::move(tickSource));
+
+        TransactionCoordinatorTestBase::setUp();
     }
 
     ServerTransactionCoordinatorsMetrics* metrics() {

@@ -72,7 +72,8 @@ struct ServerGlobalParams {
 
     bool objcheck = true;  // --objcheck
 
-    int defaultProfile = 0;                // --profile
+    int defaultProfile = 0;  // --profile
+    boost::optional<BSONObj> defaultProfileFilter;
     int slowMS = 100;                      // --time in ms that is "slow"
     int rateLimit = 1;                     // --rate limit in the range 1-RATE_LIMIT_MAX represents a  1/N probability that a query will be profiled
     double sampleRate = 1.0;               // --samplerate rate at which to sample slow queries

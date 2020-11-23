@@ -36,6 +36,7 @@
 #include "mongo/db/catalog/uncommitted_collections.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
@@ -421,6 +422,28 @@ std::vector<std::string> CollectionCatalog::getAllDbNames() const {
         iter = _orderedCollections.upper_bound(std::make_pair(dbName, maxUuid));
     }
     return ret;
+}
+
+void CollectionCatalog::setDatabaseProfileSettings(
+    StringData dbName, CollectionCatalog::ProfileSettings newProfileSettings) {
+    stdx::lock_guard<Latch> lock(_profileSettingsLock);
+    _databaseProfileSettings[dbName] = newProfileSettings;
+}
+
+CollectionCatalog::ProfileSettings CollectionCatalog::getDatabaseProfileSettings(
+    StringData dbName) const {
+    stdx::lock_guard<Latch> lock(_profileSettingsLock);
+    auto it = _databaseProfileSettings.find(dbName);
+    if (it != _databaseProfileSettings.end()) {
+        return it->second;
+    }
+
+    return {serverGlobalParams.defaultProfile, ProfileFilter::getDefault()};
+}
+
+void CollectionCatalog::clearDatabaseProfileSettings(StringData dbName) {
+    stdx::lock_guard<Latch> lock(_profileSettingsLock);
+    _databaseProfileSettings.erase(dbName);
 }
 
 void CollectionCatalog::registerCollection(CollectionUUID uuid, std::unique_ptr<Collection>* coll) {

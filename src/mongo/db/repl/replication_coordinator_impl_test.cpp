@@ -618,7 +618,7 @@ TEST_F(ReplCoordTest, NodeReturnsImmediatelyWhenAwaitReplicationIsRanAgainstASta
     ASSERT_OK(statusAndDur.status);
 }
 
-TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenRunningAwaitReplicationAgainstASecondaryNode) {
+TEST_F(ReplCoordTest, NodeReturnsNotPrimaryWhenRunningAwaitReplicationAgainstASecondaryNode) {
     assertStartSuccess(BSON("_id"
                             << "mySet"
                             << "version" << 2 << "members"
@@ -1195,9 +1195,9 @@ TEST_F(ReplCoordTest,
     awaiter.reset();
 }
 
-TEST_F(ReplCoordTest, NodeReturnsNotMasterWhenSteppingDownBeforeSatisfyingAWriteConcern) {
-    // Test that a thread blocked in awaitReplication will be woken up and return NotMaster
-    // if the node steps down while it is waiting.
+TEST_F(ReplCoordTest, NodeReturnsNotPrimaryWhenSteppingDownBeforeSatisfyingAWriteConcern) {
+    // Test that a thread blocked in awaitReplication will be woken up and return PrimarySteppedDown
+    // (a NotPrimaryError) if the node steps down while it is waiting.
     assertStartSuccess(BSON("_id"
                             << "mySet"
                             << "version" << 2 << "members"
@@ -1665,14 +1665,17 @@ TEST_F(ReplCoordTest, DrainCompletionMidStepDown) {
     ASSERT(updateTermEvh.isValid());
     ASSERT(termUpdated == TopologyCoordinator::UpdateTermResult::kTriggerStepDown);
 
+    // Set 'firstOpTimeOfMyTerm' to have term 1, so that the node will see that the noop entry has
+    // the correct term at the end of signalDrainComplete.
+    getExternalState()->setFirstOpTimeOfMyTerm(OpTime(Timestamp(100, 1), 1));
     // Now signal that replication applier is finished draining its buffer.
     getReplCoord()->signalDrainComplete(opCtx.get(), getReplCoord()->getTerm());
 
     // Now wait for stepdown to complete
     getReplExec()->waitForEvent(updateTermEvh);
 
-    // By now drain mode should be cancelled.
-    ASSERT_OK(getReplCoord()->waitForDrainFinish(Milliseconds(0)));
+    // By now, the node should have left drain mode.
+    ASSERT(ReplicationCoordinator::ApplierState::Draining != getReplCoord()->getApplierState());
 
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
     // ASSERT_EQUALS(2, getReplCoord()->getTerm()); // SERVER-28290
@@ -1898,7 +1901,7 @@ TEST_F(StepDownTestWithUnelectableNode,
     ASSERT_TRUE(repl->getMemberState().secondary());
 }
 
-TEST_F(StepDownTest, NodeReturnsNotMasterWhenAskedToStepDownAsANonPrimaryNode) {
+TEST_F(StepDownTest, NodeReturnsNotWritablePrimaryWhenAskedToStepDownAsANonPrimaryNode) {
     const auto opCtx = makeOperationContext();
 
     OpTimeWithTermOne optime1(100, 1);
@@ -1911,7 +1914,7 @@ TEST_F(StepDownTest, NodeReturnsNotMasterWhenAskedToStepDownAsANonPrimaryNode) {
     ASSERT_THROWS_CODE(
         getReplCoord()->stepDown(opCtx.get(), false, Milliseconds(0), Milliseconds(0)),
         AssertionException,
-        ErrorCodes::NotMaster);
+        ErrorCodes::NotWritablePrimary);
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
 }
 
@@ -3181,9 +3184,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnStepDown) {
 
     auto opCtx = makeOperationContext();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -3223,7 +3226,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnStepDown) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before triggering a stepdown.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     // A topology change should cause the server to respond to the waiting IsMasterResponse.
     getReplCoord()->stepDown(opCtx.get(), true, Milliseconds(0), Milliseconds(1000));
     ASSERT_TRUE(getTopoCoord().getMemberState().secondary());
@@ -3324,9 +3327,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsErrorOnHorizonChange) {
     auto deadline = getNet()->now() + maxAwaitTime;
     auto opCtx = makeOperationContext();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -3340,7 +3343,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsErrorOnHorizonChange) {
     });
 
     // Ensure that the isMaster request is waiting before doing a reconfig.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     BSONObjBuilder garbage;
     ReplSetReconfigArgs args;
     // Use force to bypass the oplog commitment check, which we're not worried about testing here.
@@ -3386,7 +3389,7 @@ TEST_F(ReplCoordTest, NonAwaitableIsMasterReturnsNoConfigsOnNodeWithUninitialize
     ASSERT_FALSE(response->isConfigSet());
 }
 
-TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfig) {
+TEST_F(ReplCoordTest, AwaitableHelloOnNodeWithUninitializedConfig) {
     init("mySet");
     start(HostAndPort("node1", 12345));
     auto opCtx = makeOperationContext();
@@ -3421,9 +3424,9 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfig) {
     ASSERT_TRUE(isMasterReturned);
     getNet()->exitNetwork();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     deadline = getNet()->now() + maxAwaitTime;
     stdx::thread awaitIsMasterInitiate([&] {
@@ -3439,7 +3442,7 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfig) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before initiating.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     BSONObjBuilder result;
     auto status =
@@ -3531,9 +3534,9 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigInvalidHoriz
     ASSERT_FALSE(initialResponse->isSecondary());
     ASSERT_FALSE(initialResponse->isConfigSet());
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     stdx::thread awaitIsMasterInitiate([&] {
         const auto topologyVersion = getTopoCoord().getTopologyVersion();
@@ -3544,7 +3547,7 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigInvalidHoriz
     });
 
     // Ensure that the isMaster request has started waiting before initiating.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     // Call replSetInitiate with no horizon configured. This should return an error to the isMaster
     // request that is currently waiting on a horizonParam that doesn't exit in the config.
@@ -3572,9 +3575,9 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigSpecifiedHor
     const std::string horizonSniName = "horizon.com";
     const auto horizonParam = SplitHorizon::Parameters(horizonSniName);
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     const std::string horizonOneSniName = "horizon1.com";
     const auto horizonOne = SplitHorizon::Parameters(horizonOneSniName);
@@ -3593,7 +3596,7 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigSpecifiedHor
         ASSERT_TRUE(response->isConfigSet());
     });
 
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     // Call replSetInitiate with a horizon configured.
     BSONObjBuilder result;
@@ -3961,9 +3964,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
     auto deadline = net->now() + maxAwaitTime;
     auto opCtx = makeOperationContext();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     stdx::thread getIsMasterWaitingForRemovedNodeThread([&] {
         const auto topologyVersion = getTopoCoord().getTopologyVersion();
@@ -3980,7 +3983,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before triggering a reconfig.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     enterNetwork();
     ASSERT_TRUE(net->hasReadyRequests());
@@ -4025,7 +4028,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
                            AssertionException,
                            ErrorCodes::SplitHorizonChange);
     });
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
 
     const auto newHorizonNodeOne = "newhorizon.com:100";
     const auto newHorizonNodeTwo = "newhorizon.com:200";
@@ -4108,9 +4111,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionTimeout) {
     auto expectedCounter = currentTopologyVersion.getCounter() + 1;
     auto opCtx = makeOperationContext();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -4127,7 +4130,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionTimeout) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before triggering an election timeout.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     getNet()->enterNetwork();
     // Primary steps down after not receiving a response within the election timeout.
     getNet()->advanceTime(electionTimeoutDate);
@@ -4173,9 +4176,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
     ASSERT_TRUE(response->isSecondary());
     ASSERT_FALSE(response->hasPrimary());
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -4212,7 +4215,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before finishing the election.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
     ASSERT_NOT_EQUALS(Date_t(), electionTimeoutWhen);
     LOGV2(21505,
@@ -4220,7 +4223,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
           "electionTimeoutWhen"_attr = electionTimeoutWhen);
     simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTimeoutWhen, opCtx.get());
 
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
     signalDrainComplete(opCtx.get());
     ASSERT(getReplCoord()->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
 
@@ -4264,12 +4267,12 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
     ASSERT_TRUE(response->isSecondary());
     ASSERT_FALSE(response->hasPrimary());
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
     auto hangAfterReconfigFailPoint =
         globalFailPointRegistry().find("hangAfterReconfigOnDrainComplete");
 
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -4321,7 +4324,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before finishing the election.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
     ASSERT_NOT_EQUALS(Date_t(), electionTimeoutWhen);
     LOGV2(4508104,
@@ -4329,7 +4332,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
           "electionTimeoutWhen"_attr = electionTimeoutWhen);
     simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTimeoutWhen, opCtx.get());
 
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
     signalDrainComplete(opCtx.get());
     ASSERT(getReplCoord()->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
 
@@ -4756,9 +4759,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfig) {
     auto expectedCounter = currentTopologyVersion.getCounter() + 1;
     auto opCtx = makeOperationContext();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -4776,7 +4779,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfig) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before triggering a reconfig.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     // Do a reconfig to add a third node to the replica set. A reconfig should cause the server to
     // respond to the waiting IsMasterResponse.
@@ -4907,9 +4910,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfigOnSecondary) 
     auto expectedCounter = currentTopologyVersion.getCounter() + 1;
     auto opCtx = makeOperationContext();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -4928,7 +4931,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfigOnSecondary) 
     });
 
     // Ensure that awaitIsMasterResponse() is called before triggering a reconfig.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     // Do a reconfig to remove a node from the replica set. A reconfig should cause the server to
     // respond to the waiting isMaster request.
@@ -7223,43 +7226,6 @@ TEST_F(ReplCoordTest, WaitForMemberState) {
     ASSERT_OK(replCoord->waitForMemberState(MemberState::RS_PRIMARY, Milliseconds(0)));
     ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit,
                   replCoord->waitForMemberState(MemberState::RS_ARBITER, Milliseconds(0)));
-}
-
-TEST_F(ReplCoordTest, WaitForDrainFinish) {
-    init("mySet");
-
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version" << 1 << "members"
-                            << BSON_ARRAY(BSON("_id" << 0 << "host"
-                                                     << "test1:1234"))),
-                       HostAndPort("test1", 1234));
-    auto replCoord = getReplCoord();
-    auto initialTerm = replCoord->getTerm();
-    replCoordSetMyLastAppliedOpTime(OpTime(Timestamp(1, 1), 0), Date_t() + Seconds(100));
-    replCoordSetMyLastDurableOpTime(OpTime(Timestamp(1, 1), 0), Date_t() + Seconds(100));
-    ASSERT_OK(replCoord->setFollowerMode(MemberState::RS_SECONDARY));
-
-    // Single node cluster - this node should start election on setFollowerMode() completion.
-    replCoord->waitForElectionFinish_forTest();
-
-    // Successful dry run election increases term.
-    ASSERT_EQUALS(initialTerm + 1, replCoord->getTerm());
-
-    auto timeout = Milliseconds(1);
-    ASSERT_OK(replCoord->waitForMemberState(MemberState::RS_PRIMARY, timeout));
-
-    ASSERT(replCoord->getApplierState() == ReplicationCoordinator::ApplierState::Draining);
-    ASSERT_EQUALS(ErrorCodes::ExceededTimeLimit, replCoord->waitForDrainFinish(timeout));
-
-    ASSERT_EQUALS(ErrorCodes::BadValue, replCoord->waitForDrainFinish(Milliseconds(-1)));
-
-    const auto opCtx = makeOperationContext();
-    signalDrainComplete(opCtx.get());
-    ASSERT_OK(replCoord->waitForDrainFinish(timeout));
-
-    // Zero timeout is fine.
-    ASSERT_OK(replCoord->waitForDrainFinish(Milliseconds(0)));
 }
 
 TEST_F(

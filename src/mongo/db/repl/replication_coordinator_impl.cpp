@@ -118,10 +118,10 @@ MONGO_FAIL_POINT_DEFINE(stepdownHangBeforeRSTLEnqueue);
 // Fail setMaintenanceMode with ErrorCodes::NotSecondary to simulate a concurrent election.
 MONGO_FAIL_POINT_DEFINE(setMaintenanceModeFailsWithNotSecondary);
 MONGO_FAIL_POINT_DEFINE(forceSyncSourceRetryWaitForInitialSync);
-// Signals that an isMaster request has started waiting.
-MONGO_FAIL_POINT_DEFINE(waitForIsMasterResponse);
-// Will cause an isMaster request to hang as it starts waiting.
-MONGO_FAIL_POINT_DEFINE(hangWhileWaitingForIsMasterResponse);
+// Signals that a hello request has started waiting.
+MONGO_FAIL_POINT_DEFINE(waitForHelloResponse);
+// Will cause a hello request to hang as it starts waiting.
+MONGO_FAIL_POINT_DEFINE(hangWhileWaitingForHelloResponse);
 MONGO_FAIL_POINT_DEFINE(skipDurableTimestampUpdates);
 // Will cause a reconfig to hang after completing the config quorum check.
 MONGO_FAIL_POINT_DEFINE(omitConfigQuorumCheck);
@@ -1141,7 +1141,7 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
                       "Automatic reconfig to increment the config term on stepup failed",
                       "error"_attr = reconfigStatus);
                 // If the node stepped down after we released the lock, we can just return.
-                if (ErrorCodes::isNotMasterError(reconfigStatus.code())) {
+                if (ErrorCodes::isNotPrimaryError(reconfigStatus.code())) {
                     return;
                 }
                 // Writing this new config with a new term is somewhat "best effort", and if we get
@@ -1165,15 +1165,7 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
         OpTime firstOpTime = _externalState->onTransitionToPrimary(opCtx);
         lk.lock();
 
-        auto status = _topCoord->completeTransitionToPrimary(firstOpTime);
-        if (status.code() == ErrorCodes::PrimarySteppedDown) {
-            LOGV2(21330,
-                  "Transition to primary failed {error}",
-                  "Transition to primary failed",
-                  "error"_attr = causedBy(status));
-            return;
-        }
-        invariant(status);
+        _topCoord->completeTransitionToPrimary(firstOpTime);
     }
 
     // Must calculate the commit level again because firstOpTimeOfMyTerm wasn't set when we logged
@@ -1188,21 +1180,6 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
     LOGV2(21331, "Transition to primary complete; database writes are now permitted");
     _drainFinishedCond.notify_all();
     _externalState->startNoopWriter(_getMyLastAppliedOpTime_inlock());
-}
-
-Status ReplicationCoordinatorImpl::waitForDrainFinish(Milliseconds timeout) {
-    if (timeout < Milliseconds(0)) {
-        return Status(ErrorCodes::BadValue, "Timeout duration cannot be negative");
-    }
-
-    stdx::unique_lock<Latch> lk(_mutex);
-    auto pred = [this]() { return _applierState != ApplierState::Draining; };
-    if (!_drainFinishedCond.wait_for(lk, timeout.toSystemDuration(), pred)) {
-        return Status(ErrorCodes::ExceededTimeLimit,
-                      "Timed out waiting to finish draining applier buffer");
-    }
-
-    return Status::OK();
 }
 
 void ReplicationCoordinatorImpl::signalUpstreamUpdater() {
@@ -2214,14 +2191,14 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMaste
     IsMasterMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
     lk.unlock();
 
-    if (MONGO_unlikely(waitForIsMasterResponse.shouldFail())) {
+    if (MONGO_unlikely(waitForHelloResponse.shouldFail())) {
         // Used in tests that wait for this failpoint to be entered before triggering a topology
         // change.
-        LOGV2(31464, "waitForIsMasterResponse failpoint enabled");
+        LOGV2(31464, "waitForHelloResponse failpoint enabled");
     }
-    if (MONGO_unlikely(hangWhileWaitingForIsMasterResponse.shouldFail())) {
-        LOGV2(21341, "Hanging due to hangWhileWaitingForIsMasterResponse failpoint");
-        hangWhileWaitingForIsMasterResponse.pauseWhileSet(opCtx);
+    if (MONGO_unlikely(hangWhileWaitingForHelloResponse.shouldFail())) {
+        LOGV2(21341, "Hanging due to hangWhileWaitingForHelloResponse failpoint");
+        hangWhileWaitingForHelloResponse.pauseWhileSet(opCtx);
     }
 
     // Wait for a topology change with timeout set to deadline.
@@ -2259,7 +2236,7 @@ StatusWith<OpTime> ReplicationCoordinatorImpl::getLatestWriteOpTime(OperationCon
     Lock::GlobalLock globalLock(opCtx, MODE_IS);
     // Check if the node is primary after acquiring global IS lock.
     if (!canAcceptNonLocalWrites()) {
-        return {ErrorCodes::NotMaster, "Not primary so can't get latest write optime"};
+        return {ErrorCodes::NotWritablePrimary, "Not primary so can't get latest write optime"};
     }
     auto oplog = LocalOplogInfo::get(opCtx)->getCollection();
     if (!oplog) {
@@ -2295,7 +2272,7 @@ BSONObj ReplicationCoordinatorImpl::runCmdOnPrimaryAndAwaitResponse(
 
     const auto primaryHostAndPort = getCurrentPrimaryHostAndPort();
     if (primaryHostAndPort.empty()) {
-        uassertStatusOK(Status{ErrorCodes::NoConfigMaster, "Primary is unknown/down."});
+        uassertStatusOK(Status{ErrorCodes::NoConfigPrimary, "Primary is unknown/down."});
     }
 
     // Run the command via AsyncDBClient which performs a network call. This is also the desired
@@ -2494,7 +2471,9 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     // Note this check is inherently racy - it's always possible for the node to stepdown from some
     // other path before we acquire the global exclusive lock.  This check is just to try to save us
     // from acquiring the global X lock unnecessarily.
-    uassert(ErrorCodes::NotMaster, "not primary so can't step down", getMemberState().primary());
+    uassert(ErrorCodes::NotWritablePrimary,
+            "not primary so can't step down",
+            getMemberState().primary());
 
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &stepdownHangBeforeRSTLEnqueue, opCtx, "stepdownHangBeforeRSTLEnqueue");
@@ -2830,7 +2809,7 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
         stdx::lock_guard<Latch> lock(_mutex);
         if ((_memberState.startup() && client->isFromUserConnection()) || _memberState.startup2() ||
             _memberState.rollback()) {
-            return Status{ErrorCodes::NotMasterOrSecondary,
+            return Status{ErrorCodes::NotPrimaryOrSecondary,
                           "Oplog collection reads are not allowed while in the rollback or "
                           "startup state."};
         }
@@ -2842,7 +2821,7 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
 
     if (opCtx->inMultiDocumentTransaction()) {
         if (!_readWriteAbility->canAcceptNonLocalWrites_UNSAFE()) {
-            return Status(ErrorCodes::NotMaster,
+            return Status(ErrorCodes::NotWritablePrimary,
                           "Multi-document transactions are only allowed on replica set primaries.");
         }
     }
@@ -2851,10 +2830,10 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
         if (isPrimaryOrSecondary) {
             return Status::OK();
         }
-        return Status(ErrorCodes::NotMasterOrSecondary,
+        return Status(ErrorCodes::NotPrimaryOrSecondary,
                       "not master or secondary; cannot currently read from this replSet member");
     }
-    return Status(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
+    return Status(ErrorCodes::NotPrimaryNoSecondaryOk, "not master and slaveOk=false");
 }
 
 bool ReplicationCoordinatorImpl::isInPrimaryOrSecondaryState(OperationContext* opCtx) const {
@@ -2996,7 +2975,7 @@ void ReplicationCoordinatorImpl::processReplSetGetConfig(BSONObjBuilder* result,
     result->append("config", _rsConfig.toBSON());
 
     if (commitmentStatus) {
-        uassert(ErrorCodes::NotMaster,
+        uassert(ErrorCodes::NotWritablePrimary,
                 "commitmentStatus is only supported on primary.",
                 _readWriteAbility->canAcceptNonLocalWrites(lock));
         auto configWriteConcern = _getConfigReplicationWriteConcern();
@@ -3220,7 +3199,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
 
     if (!force && !_readWriteAbility->canAcceptNonLocalWrites(lk)) {
         return Status(
-            ErrorCodes::NotMaster,
+            ErrorCodes::NotWritablePrimary,
             str::stream()
                 << "Safe reconfig is only allowed on a writable PRIMARY. Current state is "
                 << _getMemberState_inlock().toString());
@@ -3347,7 +3326,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     {
         Lock::GlobalLock globalLock(opCtx, LockMode::MODE_IX);
         if (!force && !_readWriteAbility->canAcceptNonLocalWrites(opCtx)) {
-            return {ErrorCodes::NotMaster, "Stepped down when persisting new config"};
+            return {ErrorCodes::NotWritablePrimary, "Stepped down when persisting new config"};
         }
 
         // Don't write no-op for internal and external force reconfig.
@@ -4166,71 +4145,67 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
     _rsConfig = newConfig;
     _protVersion.store(_rsConfig.getProtocolVersion());
 
-    // Warn if running --nojournal and writeConcernMajorityJournalDefault = true
+    // Warn if using the in-memory (ephemeral) storage engine or running running --nojournal with
+    // writeConcernMajorityJournalDefault=true.
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    if (storageEngine && !storageEngine->isDurable() &&
-        (newConfig.getWriteConcernMajorityShouldJournal() &&
-         (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
-        LOGV2_OPTIONS(21369, {logv2::LogTag::kStartupWarnings}, "");
-        LOGV2_OPTIONS(
-            21370,
-            {logv2::LogTag::kStartupWarnings},
-            "** WARNING: This replica set node is running without journaling enabled but the ");
-        LOGV2_OPTIONS(
-            21371,
-            {logv2::LogTag::kStartupWarnings},
-            "**          writeConcernMajorityJournalDefault option to the replica set config ");
-        LOGV2_OPTIONS(21372,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          is set to true. The writeConcernMajorityJournalDefault ");
-        LOGV2_OPTIONS(21373,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          option to the replica set config must be set to false ");
-        LOGV2_OPTIONS(21374,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          or w:majority write concerns will never complete.");
-        LOGV2_OPTIONS(
-            21375,
-            {logv2::LogTag::kStartupWarnings},
-            "**          In addition, this node's memory consumption may increase until all");
-        LOGV2_OPTIONS(21376,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          available free RAM is exhausted.");
-        LOGV2_OPTIONS(21377, {logv2::LogTag::kStartupWarnings}, "");
-    }
-
-    // Warn if using the in-memory (ephemeral) storage engine with
-    // writeConcernMajorityJournalDefault = true
-    if (storageEngine && storageEngine->isEphemeral() &&
-        (newConfig.getWriteConcernMajorityShouldJournal() &&
-         (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
-        LOGV2_OPTIONS(21378, {logv2::LogTag::kStartupWarnings}, "");
-        LOGV2_OPTIONS(
-            21379,
-            {logv2::LogTag::kStartupWarnings},
-            "** WARNING: This replica set node is using in-memory (ephemeral) storage with the");
-        LOGV2_OPTIONS(
-            21380,
-            {logv2::LogTag::kStartupWarnings},
-            "**          writeConcernMajorityJournalDefault option to the replica set config ");
-        LOGV2_OPTIONS(
-            21381,
-            {logv2::LogTag::kStartupWarnings},
-            "**          set to true. The writeConcernMajorityJournalDefault option to the ");
-        LOGV2_OPTIONS(21382,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          replica set config must be set to false ");
-        LOGV2_OPTIONS(21383,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          or w:majority write concerns will never complete.");
-        LOGV2_OPTIONS(
-            21384,
-            {logv2::LogTag::kStartupWarnings},
-            "**          In addition, this node's memory consumption may increase until all");
-        LOGV2_OPTIONS(21385,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          available free RAM is exhausted.");
-        LOGV2_OPTIONS(21386, {logv2::LogTag::kStartupWarnings}, "");
+    if (storageEngine && newConfig.getWriteConcernMajorityShouldJournal() &&
+        (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal())) {
+        if (storageEngine->isEphemeral()) {
+            LOGV2_OPTIONS(21378, {logv2::LogTag::kStartupWarnings}, "");
+            LOGV2_OPTIONS(21379,
+                          {logv2::LogTag::kStartupWarnings},
+                          "** WARNING: This replica set node is using in-memory (ephemeral) "
+                          "storage with the");
+            LOGV2_OPTIONS(
+                21380,
+                {logv2::LogTag::kStartupWarnings},
+                "**          writeConcernMajorityJournalDefault option to the replica set config ");
+            LOGV2_OPTIONS(
+                21381,
+                {logv2::LogTag::kStartupWarnings},
+                "**          set to true. The writeConcernMajorityJournalDefault option to the ");
+            LOGV2_OPTIONS(21382,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          replica set config must be set to false ");
+            LOGV2_OPTIONS(21383,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          or w:majority write concerns will never complete.");
+            LOGV2_OPTIONS(
+                21384,
+                {logv2::LogTag::kStartupWarnings},
+                "**          In addition, this node's memory consumption may increase until all");
+            LOGV2_OPTIONS(21385,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          available free RAM is exhausted.");
+            LOGV2_OPTIONS(21386, {logv2::LogTag::kStartupWarnings}, "");
+        } else if (!storageEngine->isDurable()) {
+            LOGV2_OPTIONS(21369, {logv2::LogTag::kStartupWarnings}, "");
+            LOGV2_OPTIONS(
+                21370,
+                {logv2::LogTag::kStartupWarnings},
+                "** WARNING: This replica set node is running without journaling enabled but the ");
+            LOGV2_OPTIONS(
+                21371,
+                {logv2::LogTag::kStartupWarnings},
+                "**          writeConcernMajorityJournalDefault option to the replica set config ");
+            LOGV2_OPTIONS(21372,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          is set to true. The writeConcernMajorityJournalDefault ");
+            LOGV2_OPTIONS(21373,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          option to the replica set config must be set to false ");
+            LOGV2_OPTIONS(21374,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          or w:majority write concerns will never complete.");
+            LOGV2_OPTIONS(
+                21375,
+                {logv2::LogTag::kStartupWarnings},
+                "**          In addition, this node's memory consumption may increase until all");
+            LOGV2_OPTIONS(21376,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          available free RAM is exhausted.");
+            LOGV2_OPTIONS(21377, {logv2::LogTag::kStartupWarnings}, "");
+        }
     }
 
     // Since the ReplSetConfig always has a WriteConcernOptions, the only way to know if it has been

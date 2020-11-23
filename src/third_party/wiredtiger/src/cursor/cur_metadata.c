@@ -46,9 +46,7 @@ __schema_source_config(
     WT_ERR(__wt_buf_fmt(session, buf, "%.*s", (int)cval.len, cval.str));
     srch->set_key(srch, buf->data);
     if ((ret = srch->search(srch)) != 0)
-        WT_ERR_MSG(session, ret,
-          "metadata information for source configuration"
-          " \"%s\" not found",
+        WT_ERR_MSG(session, ret, "metadata information for source configuration \"%s\" not found",
           (const char *)buf->data);
     WT_ERR(srch->get_value(srch, &v));
     WT_ERR(__wt_strdup(session, v, result));
@@ -62,8 +60,9 @@ err:
  * __schema_create_collapse --
  *     Discard any configuration information from a schema entry that is not applicable to an
  *     session.create call. For a table URI that contains no named column groups, fold in the
- *     configuration from the implicit column group and its source. For a named column group URI,
- *     fold in its source.
+ *     configuration from the implicit column group and its source. For a named column group or
+ *     index URI, fold in its source. For a table URI that contains named column groups, we return
+ *     only the table portion.
  */
 static int
 __schema_create_collapse(WT_SESSION_IMPL *session, WT_CURSOR_METADATA *mdc, const char *key,
@@ -81,14 +80,17 @@ __schema_create_collapse(WT_SESSION_IMPL *session, WT_CURSOR_METADATA *mdc, cons
     c = NULL;
     if (key != NULL && WT_PREFIX_SKIP(key, "table:")) {
         /*
-         * Check if the table has declared column groups. If it does, don't attempt to open the
-         * automatically created column group for simple tables.
+         * Check if the table has declared column groups. If it does, return just the table info.
+         * One can get the creation metadata for an index or column group table itself or for simple
+         * tables.
          */
         WT_RET(__wt_config_getones(session, value, "colgroups", &cgconf));
 
         __wt_config_subinit(session, &cparser, &cgconf);
-        if ((ret = __wt_config_next(&cparser, &ckey, &cval)) == 0)
+        if ((ret = __wt_config_next(&cparser, &ckey, &cval)) == 0) {
+            firstcfg = cfg;
             goto skip;
+        }
         WT_RET_NOTFOUND_OK(ret);
 
         c = mdc->create_cursor;
@@ -100,13 +102,12 @@ __schema_create_collapse(WT_SESSION_IMPL *session, WT_CURSOR_METADATA *mdc, cons
         c->set_key(c, buf->data);
         if ((ret = c->search(c)) != 0)
             WT_ERR_MSG(session, ret,
-              "metadata information for source configuration"
-              " \"%s\" not found",
+              "metadata information for source configuration \"%s\" not found",
               (const char *)buf->data);
         WT_ERR(c->get_value(c, &v));
         WT_ERR(__wt_strdup(session, v, --cfg));
         WT_ERR(__schema_source_config(session, c, v, --cfg));
-    } else if (key != NULL && WT_PREFIX_SKIP(key, "colgroup:")) {
+    } else if (key != NULL && (WT_PREFIX_SKIP(key, "colgroup:") || WT_PREFIX_SKIP(key, "index:"))) {
         if (strchr(key, ':') != NULL) {
             c = mdc->create_cursor;
             WT_ERR(__wt_strdup(session, value, --cfg));
@@ -114,9 +115,9 @@ __schema_create_collapse(WT_SESSION_IMPL *session, WT_CURSOR_METADATA *mdc, cons
         }
     }
 
-skip:
     firstcfg = cfg;
     *--firstcfg = WT_CONFIG_BASE(session, WT_SESSION_create);
+skip:
     WT_ERR(__wt_config_collapse(session, firstcfg, value_ret));
 
 err:
@@ -167,9 +168,10 @@ err:
  * Check if a key matches the metadata. The public value is "metadata:", but also check for the
  * internal version of the URI.
  */
-#define WT_KEY_IS_METADATA(key)                                                            \
-    ((key)->size > 0 && (WT_STRING_MATCH(WT_METADATA_URI, (key)->data, (key)->size - 1) || \
-                          WT_STRING_MATCH(WT_METAFILE_URI, (key)->data, (key)->size - 1)))
+#define WT_KEY_IS_METADATA(key)                                          \
+    ((key)->size > 0 &&                                                  \
+      (WT_STRING_MATCH(WT_METADATA_URI, (key)->data, (key)->size - 1) || \
+        WT_STRING_MATCH(WT_METAFILE_URI, (key)->data, (key)->size - 1)))
 
 /*
  * __curmetadata_metadata_search --

@@ -135,20 +135,6 @@ public:
 
             uassertStatusOK(status);
             return true;
-        } else if (cmdObj.hasElement("waitForDrainFinish")) {
-            long long timeoutMillis;
-            auto status = bsonExtractIntegerField(cmdObj, "waitForDrainFinish", &timeoutMillis);
-            uassertStatusOK(status);
-            Milliseconds timeout(timeoutMillis);
-            LOGV2(21575,
-                  "replSetTest: waiting {timeout} for applier buffer to finish draining",
-                  "replSetTest: waiting for applier buffer to finish draining",
-                  "timeout"_attr = timeout);
-
-            status = replCoord->waitForDrainFinish(timeout);
-
-            uassertStatusOK(status);
-            return true;
         } else if (cmdObj.hasElement("getLastStableRecoveryTimestamp")) {
             boost::optional<Timestamp> ts =
                 StorageInterface::get(getGlobalServiceContext())
@@ -429,8 +415,8 @@ public:
                 // Convert the error code to be more specific.
                 uasserted(ErrorCodes::CurrentConfigNotCommittedYet, status.reason());
             } else if (status == ErrorCodes::PrimarySteppedDown) {
-                // Return NotMaster since the command has no side effect yet.
-                status = {ErrorCodes::NotMaster, status.reason()};
+                // Return NotWritablePrimary since the command has no side effect yet.
+                status = {ErrorCodes::NotWritablePrimary, status.reason()};
             }
             uassertStatusOK(status);
         }

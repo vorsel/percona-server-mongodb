@@ -251,9 +251,6 @@ static CONFIG c[] = {
     NULL},
 
   /* 100% */
-  {"ops.rebalance", "configure rebalance", C_BOOL, 100, 1, 0, &g.c_rebalance, NULL},
-
-  /* 100% */
   {"ops.salvage", "configure salvage", C_BOOL, 100, 1, 0, &g.c_salvage, NULL},
 
   /* 100% */
@@ -298,6 +295,10 @@ static CONFIG c[] = {
 
   /* 2% */
   {"stress.checkpoint", "stress checkpoints", C_BOOL, 2, 0, 0, &g.c_timing_stress_checkpoint, NULL},
+
+  /* 2% */
+  {"stress.checkpoint_prepare", "stress checkpoint prepare", C_BOOL, 2, 0, 0,
+    &g.c_timing_stress_checkpoint_prepare, NULL},
 
   /* 2% */
   {"stress.hs_checkpoint_delay", "stress history store checkpoint delay", C_BOOL, 2, 0, 0,

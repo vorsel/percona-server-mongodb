@@ -71,6 +71,7 @@ __wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, bool *skipp)
             return (0);
         }
 
+        WT_RET(__wt_hs_cursor_cache(session));
         (void)__wt_atomic_addv32(&S2BT(session)->evict_busy, 1);
         ret = __wt_evict(session, ref, previous_state, 0);
         (void)__wt_atomic_subv32(&S2BT(session)->evict_busy, 1);
@@ -115,7 +116,7 @@ __wt_delete_page(WT_SESSION_IMPL *session, WT_REF *ref, bool *skipp)
         goto err;
     if (addr.type != WT_ADDR_LEAF_NO)
         goto err;
-    if (!__wt_txn_visible(session, addr.ta.oldest_start_txn, addr.ta.oldest_start_ts))
+    if (!__wt_txn_visible(session, addr.ta.newest_txn, addr.ta.newest_start_durable_ts))
         goto err;
 
     /*
@@ -244,7 +245,7 @@ __wt_delete_page_skip(WT_SESSION_IMPL *session, WT_REF *ref, bool visible_all)
      */
     if (skip && ref->page_del != NULL &&
       (visible_all ||
-          __wt_txn_visible_all(session, ref->page_del->txnid, ref->page_del->timestamp))) {
+        __wt_txn_visible_all(session, ref->page_del->txnid, ref->page_del->timestamp))) {
         __wt_free(session, ref->page_del->update_list);
         __wt_free(session, ref->page_del);
     }
