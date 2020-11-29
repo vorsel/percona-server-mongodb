@@ -34,6 +34,7 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 
 #include <regex>
 
+#include <boost/algorithm/string/split.hpp>
 #include <fmt/format.h>
 
 #include "mongo/bson/json.h"
@@ -44,17 +45,48 @@ using namespace fmt::literals;
 
 LDAPGlobalParams ldapGlobalParams;
 
+std::string LDAPGlobalParams::getServersStr() const {
+    std::string ldap_servers;
+    std::string pfx;
+    auto guard = *ldapServers;
+    for (auto& s: *guard) {
+        ldap_servers += pfx;
+        ldap_servers += s;
+        pfx = ",";
+    }
+    return ldap_servers;
+}
+
+void LDAPGlobalParams::setServersStr(const std::string& ldap_servers) {
+    auto guard = *ldapServers;
+    boost::split(*guard,
+                 ldap_servers,
+                 [](char c) { return c == ','; },
+                 boost::token_compress_on);
+}
+
 std::string LDAPGlobalParams::logString() const {
     return fmt::format(
         "ldapServers: {}; "
         "ldapTransportSecurity: {}; "
         "ldapBindMethod: {}; "
         "ldapBindSaslMechanisms: {}",
-        std::string{*ldapServers},
+        getServersStr(),
         ldapTransportSecurity,
         ldapBindMethod,
         ldapBindSaslMechanisms);
 }
+
+
+void LDAPServersParameter::append(OperationContext *, BSONObjBuilder& b, const std::string& name) {
+    b.append(name, ldapGlobalParams.getServersStr());
+}
+
+Status LDAPServersParameter::setFromString(const std::string& newValueString) {
+    ldapGlobalParams.setServersStr(newValueString);
+    return Status::OK();
+}
+
 
 Status validateLDAPBindMethod(const std::string& value) {
     constexpr auto kSimple = "simple"_sd;

@@ -282,6 +282,7 @@ env.Library(
     target='ldap_options',
     source=[
         'ldap_options.cpp',
+        env.Idlc('ldap_options.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -293,7 +294,6 @@ env.Library(
   target='ldap_options_init',
   source=[
       'ldap_options_init.cpp',
-       env.Idlc('ldap_options.idl')[0],
   ],
   LIBDEPS=[
     'ldap_options'
