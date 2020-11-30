@@ -731,6 +731,7 @@ build_deb(){
     sed -i 's|GitCommit="$(git rev-parse HEAD)"|GitCommit="$PSMDB_TOOLS_COMMIT_HASH"|' mongo-tools/set_goenv.sh
     sed -i 's|go build|go build -a -x|' mongo-tools/build.sh
     sed -i 's|exit $ec||' mongo-tools/build.sh
+    . ./mongo-tools/set_tools_revision.sh
     dch -m -D "${DEBIAN}" --force-distribution -v "${VERSION}-${RELEASE}.${DEBIAN}" 'Update distribution'
     export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     if [ x"${DEBIAN}" = "xstretch" ]; then
