@@ -315,13 +315,8 @@ public:
     }
 
     LDAP* create_connection() {
-
-        const char* ldapprot = "ldaps";
-        if (ldapGlobalParams.ldapTransportSecurity == "none")
-            ldapprot = "ldap";
-        auto uri = "{}://{}/"_format(ldapprot, ldapGlobalParams.ldapServers->front());
-
         LDAP* ldap;
+        auto uri = ldapGlobalParams.ldapURIList();
 
         auto res = ldap_initialize(&ldap, uri.c_str());
         if (res != LDAP_SUCCESS) {
@@ -625,7 +620,7 @@ Status LDAPManagerImpl::mapUserToDN(const std::string& user, std::string& out) {
                 return Status::OK();
             // in ldapQuery mode we need to execute query and make decision based on query result
             auto ldapurl = fmt::format("ldap://{Servers}/{Query}",
-                fmt::arg("Servers", ldapGlobalParams.ldapServers->front()),
+                fmt::arg("Servers", "ldap.server"),
                 fmt::arg("Query", out));
             std::vector<std::string> qresult;
             auto status = execQuery(ldapurl, qresult);
@@ -656,7 +651,7 @@ Status LDAPManagerImpl::queryUserRoles(const UserName& userName, stdx::unordered
     }
 
     auto ldapurl = fmt::format("ldap://{Servers}/{Query}",
-            fmt::arg("Servers", ldapGlobalParams.ldapServers->front()),
+            fmt::arg("Servers", "ldap.server"),
             fmt::arg("Query", ldapGlobalParams.ldapQueryTemplate.get()));
     ldapurl = fmt::format(ldapurl,
             fmt::arg("USER", mappedUser),
