@@ -316,10 +316,7 @@ Status OpenLDAPAuthenticationSession::step(StringData inputData, std::string* ou
                 return mapRes;
         }
 
-        const char* ldapprot = "ldaps";
-        if (ldapGlobalParams.ldapTransportSecurity == "none")
-            ldapprot = "ldap";
-        auto uri = "{}://{}/"_format(ldapprot, ldapGlobalParams.ldapServers->front());
+        auto uri = ldapGlobalParams.ldapURIList();
         int res = ldap_initialize(&_ld, uri.c_str());
         if (res != LDAP_SUCCESS) {
             return Status(ErrorCodes::LDAPLibraryError,

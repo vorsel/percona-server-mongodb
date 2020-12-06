@@ -77,6 +77,22 @@ std::string LDAPGlobalParams::logString() const {
         ldapBindSaslMechanisms);
 }
 
+// build comma separated list of URIs containing schema (protocol)
+std::string LDAPGlobalParams::ldapURIList() const {
+    const char* ldapprot = "ldaps";
+    if (ldapTransportSecurity == "none")
+        ldapprot = "ldap";
+    std::string uri;
+    auto backins = std::back_inserter(uri);
+    auto guard = ldapServers.synchronize();
+    for (auto& s: *guard) {
+        if (!uri.empty())
+            backins = ',';
+        fmt::format_to(backins, "{}://{}/", ldapprot, s);
+    }
+    return uri;
+}
+
 Status addLDAPOptions(moe::OptionSection* options) {
 
     options
