@@ -77,6 +77,22 @@ std::string LDAPGlobalParams::logString() const {
         ldapBindSaslMechanisms);
 }
 
+// build comma separated list of URIs containing schema (protocol)
+std::string LDAPGlobalParams::ldapURIList() const {
+    const char* ldapprot = "ldaps";
+    if (ldapTransportSecurity == "none")
+        ldapprot = "ldap";
+    std::string uri;
+    auto backins = std::back_inserter(uri);
+    auto guard = *ldapServers;
+    for (auto& s: *guard) {
+        if (!uri.empty())
+            backins = ',';
+        fmt::format_to(backins, "{}://{}/", ldapprot, s);
+    }
+    return uri;
+}
+
 
 void LDAPServersParameter::append(OperationContext *, BSONObjBuilder& b, const std::string& name) {
     b.append(name, ldapGlobalParams.getServersStr());
@@ -86,6 +102,7 @@ Status LDAPServersParameter::setFromString(const std::string& newValueString) {
     ldapGlobalParams.setServersStr(newValueString);
     return Status::OK();
 }
+
 
 Status validateLDAPBindMethod(const std::string& value) {
     constexpr auto kSimple = "simple"_sd;

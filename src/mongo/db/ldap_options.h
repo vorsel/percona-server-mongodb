@@ -68,6 +68,7 @@ struct LDAPGlobalParams {
     std::string getServersStr() const;
     void setServersStr(const std::string&);
     std::string logString() const;
+    std::string ldapURIList() const;
 };
 
 Status validateLDAPBindMethod(const std::string&);
