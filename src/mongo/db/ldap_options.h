@@ -67,6 +67,7 @@ struct LDAPGlobalParams {
     AtomicInt32  ldapConnectionPoolSizePerHost{2};
 
     std::string logString() const;
+    std::string ldapURIList() const;
 };
 
 extern LDAPGlobalParams ldapGlobalParams;
