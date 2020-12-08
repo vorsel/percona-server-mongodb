@@ -64,6 +64,9 @@ int cb_add(LDAP *ld, Sockbuf *sb, LDAPURLDesc *srv, struct sockaddr *addr,
 void cb_del(LDAP *ld, Sockbuf *sb, struct ldap_conncb *ctx);
 
 int rebindproc(LDAP* ld, const char* /* url */, ber_tag_t /* request */, ber_int_t /* msgid */, void* arg);
+
+int cb_urllist_proc( LDAP *ld, LDAPURLDesc **urllist, LDAPURLDesc **url, void *params);
+
 }
 }
 
@@ -336,6 +339,12 @@ public:
             }
         }
 
+        res = ldap_set_urllist_proc(ldap, cb_urllist_proc, nullptr);
+        if (res != LDAP_OPT_SUCCESS) {
+            LOG(1) << "Cannot set LDAP URLlist callback procedure; LDAP error: ", << ldap_err2string(res);
+            return nullptr;
+        }
+
         static ldap_conncb conncb;
         conncb.lc_add = cb_add;
         conncb.lc_del = cb_del;
@@ -417,6 +426,27 @@ int rebindproc(LDAP* ld, const char* /* url */, ber_tag_t /* request */, ber_int
       return LDAP_INAPPROPRIATE_AUTH;
     }
 }
+
+// example of this callback is in the OpenLDAP's
+// servers/slapd/back-meta/bind.c (meta_back_default_urllist)
+int cb_urllist_proc( LDAP *ld, LDAPURLDesc **urllist, LDAPURLDesc **url, void *params) {
+    if (urllist == url)
+        return LDAP_SUCCESS;
+
+    LDAPURLDesc **urltail;
+    for ( urltail = &(*url)->lud_next; *urltail; urltail = &(*urltail)->lud_next )
+        /* count */ ;
+
+    // all failed hosts go to the end of list
+    *urltail = *urllist;
+    // succeeded host becomes first
+    *urllist = *url;
+    // mark end of list
+    *url = nullptr;
+
+    return LDAP_SUCCESS;
+}
+
 }
 
 
