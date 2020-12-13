@@ -64,6 +64,7 @@ struct LDAPGlobalParams {
     AtomicWord<bool> ldapDebug;
     AtomicWord<bool> ldapFollowReferrals;
     AtomicWord<int>  ldapConnectionPoolSizePerHost;
+    bool ldapValidateLDAPServerConfig = true;
 
     std::string getServersStr() const;
     void setServersStr(const std::string&);

@@ -147,6 +147,47 @@ struct LDAPConnInfo {
 
 using namespace fmt::literals;
 
+static LDAP* create_connection(void* connect_cb_arg = nullptr) {
+    LDAP* ldap;
+    auto uri = ldapGlobalParams.ldapURIList();
+
+    auto res = ldap_initialize(&ldap, uri.c_str());
+    if (res != LDAP_SUCCESS) {
+        LOG(1) << "Cannot initialize LDAP structure for " << uri
+               << "; LDAP error: " << ldap_err2string(res);
+        return nullptr;
+    }
+
+    if (!ldapGlobalParams.ldapFollowReferrals.load()) {
+        LOG(2) << "Disabling referrals";
+        res = ldap_set_option(ldap, LDAP_OPT_REFERRALS, LDAP_OPT_OFF);
+        if (res != LDAP_OPT_SUCCESS) {
+            LOG(1) << "Cannot disable LDAP referrals; LDAP error: " << ldap_err2string(res);
+            return nullptr;
+        }
+    }
+
+    res = ldap_set_urllist_proc(ldap, cb_urllist_proc, nullptr);
+    if (res != LDAP_OPT_SUCCESS) {
+        LOG(1) << "Cannot set LDAP URLlist callback procedure; LDAP error: " << ldap_err2string(res);
+        return nullptr;
+    }
+
+    if (connect_cb_arg) {
+        static ldap_conncb conncb;
+        conncb.lc_add = cb_add;
+        conncb.lc_del = cb_del;
+        conncb.lc_arg = connect_cb_arg;
+        res = ldap_set_option(ldap, LDAP_OPT_CONNECT_CB, &conncb);
+        if (res != LDAP_OPT_SUCCESS) {
+            LOG(1) << "Cannot set LDAP connection callbacks; LDAP error: " << ldap_err2string(res);
+            return nullptr;
+        }
+    }
+
+    return ldap;
+}
+
 class LDAPManagerImpl::ConnectionPoller : public BackgroundJob {
 public:
     ConnectionPoller(LDAPManagerImpl* manager)
@@ -299,7 +340,7 @@ public:
         }
         // no available connection, pool has space => create one
         // _poll_fds will be registered in the callback
-        return create_connection();
+        return create_connection(this);
     }
 
     void return_ldap_connection(LDAP* ldap) {
@@ -317,45 +358,6 @@ public:
         if (found) {
             _condvar_pool.notify_one();
         }
-    }
-
-    LDAP* create_connection() {
-        LDAP* ldap;
-        auto uri = ldapGlobalParams.ldapURIList();
-
-        auto res = ldap_initialize(&ldap, uri.c_str());
-        if (res != LDAP_SUCCESS) {
-            LOG(1) << "Cannot initialize LDAP structure for " << uri
-                   << "; LDAP error: " << ldap_err2string(res);
-            return nullptr;
-        }
-
-        if (!ldapGlobalParams.ldapFollowReferrals.load()) {
-            LOG(2) << "Disabling referrals";
-            res = ldap_set_option(ldap, LDAP_OPT_REFERRALS, LDAP_OPT_OFF);
-            if (res != LDAP_OPT_SUCCESS) {
-                LOG(1) << "Cannot disable LDAP referrals; LDAP error: " << ldap_err2string(res);
-                return nullptr;
-            }
-        }
-
-        res = ldap_set_urllist_proc(ldap, cb_urllist_proc, nullptr);
-        if (res != LDAP_OPT_SUCCESS) {
-            LOG(1) << "Cannot set LDAP URLlist callback procedure; LDAP error: ", << ldap_err2string(res);
-            return nullptr;
-        }
-
-        static ldap_conncb conncb;
-        conncb.lc_add = cb_add;
-        conncb.lc_del = cb_del;
-        conncb.lc_arg = this;
-        res = ldap_set_option(ldap, LDAP_OPT_CONNECT_CB, &conncb);
-        if (res != LDAP_OPT_SUCCESS) {
-            LOG(1) << "Cannot set LDAP connection callbacks; LDAP error: " << ldap_err2string(res);
-            return nullptr;
-        }
-
-        return ldap;
     }
 
 private:
@@ -750,6 +752,24 @@ Status LDAPbind(LDAP* ld, const char* usr, const char* psw) {
 Status LDAPbind(LDAP* ld, const std::string& usr, const std::string& psw) {
     return LDAPbind(ld, usr.c_str(), psw.c_str());
 }
+
+namespace {
+
+ServiceContext::ConstructorActionRegisterer ldapServerConfigValidationRegisterer{
+    "ldapServerConfigValidationRegisterer", [](ServiceContext* svcCtx) {
+        if (!ldapGlobalParams.ldapServers->empty()
+            && ldapGlobalParams.ldapValidateLDAPServerConfig) {
+            LDAP* ld = create_connection();
+            ON_BLOCK_EXIT([ld]{ ldap_unbind_ext(ld, nullptr, nullptr); });
+            uassertStatusOK(LDAPbind(ld,
+                        ldapGlobalParams.ldapQueryUser.get(),
+                        ldapGlobalParams.ldapQueryPassword.get()));
+
+        }
+    }
+};
+
+}  // namespace
 
 }  // namespace mongo
 

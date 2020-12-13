@@ -66,6 +66,9 @@ Status storeLDAPOptions(const moe::Environment& params) {
     if (params.count("security.ldap.userToDNMapping")) {
         ldapGlobalParams.ldapUserToDNMapping = params["security.ldap.userToDNMapping"].as<std::string>();
     }
+    if (params.count("security.ldap.validateLDAPServerConfig")) {
+        ldapGlobalParams.ldapValidateLDAPServerConfig = params["security.ldap.validateLDAPServerConfig"].as<bool>();
+    }
     return Status::OK();
 }
 
