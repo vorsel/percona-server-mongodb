@@ -164,6 +164,14 @@ Status addLDAPOptions(moe::OptionSection* options) {
         .setSources(moe::SourceYAMLCLI)
         .setDefault(moe::Value{"[{match: \"(.+)\", substitution: \"{0}\"}]"});
 
+    options
+        ->addOptionChaining("security.ldap.validateLDAPServerConfig",
+                            "ldapValidateLDAPServerConfig",
+                            moe::Bool,
+                            "Enables LDAP server availability check on startup. Default is true")
+        .setSources(moe::SourceYAMLCLI)
+        .setDefault(moe::Value{true});
+
     return Status::OK();
 }
 
@@ -287,6 +295,9 @@ Status storeLDAPOptions(const moe::Environment& params) {
         if (!ret.isOK())
             return ret;
         ldapGlobalParams.ldapUserToDNMapping = new_value;
+    }
+    if (params.count("security.ldap.validateLDAPServerConfig")) {
+        ldapGlobalParams.ldapValidateLDAPServerConfig = params["security.ldap.validateLDAPServerConfig"].as<bool>();
     }
     return Status::OK();
 }

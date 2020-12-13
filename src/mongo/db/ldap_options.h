@@ -65,6 +65,7 @@ struct LDAPGlobalParams {
     AtomicBool ldapDebug{false};
     AtomicBool ldapFollowReferrals{false};
     AtomicInt32  ldapConnectionPoolSizePerHost{2};
+    bool ldapValidateLDAPServerConfig = true;
 
     std::string logString() const;
     std::string ldapURIList() const;
