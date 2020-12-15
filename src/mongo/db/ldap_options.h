@@ -33,6 +33,7 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 
 #include <atomic>
 #include <string>
+#include <vector>
 
 #include <boost/thread/synchronized_value.hpp>
 
@@ -49,7 +50,7 @@ class Environment;
 namespace moe = optionenvironment;
 
 struct LDAPGlobalParams {
-    boost::synchronized_value<std::string> ldapServers;
+    boost::synchronized_value<std::vector<std::string>> ldapServers;
     std::string ldapTransportSecurity;
     std::string ldapBindMethod;
     std::string ldapBindSaslMechanisms;
@@ -64,8 +65,10 @@ struct LDAPGlobalParams {
     AtomicBool ldapDebug{false};
     AtomicBool ldapFollowReferrals{false};
     AtomicInt32  ldapConnectionPoolSizePerHost{2};
+    bool ldapValidateLDAPServerConfig = true;
 
     std::string logString() const;
+    std::string ldapURIList() const;
 };
 
 extern LDAPGlobalParams ldapGlobalParams;
