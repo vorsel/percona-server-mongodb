@@ -33,6 +33,8 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 
 #include "mongo/db/ldap_options.h"
 
+#include <boost/algorithm/string/split.hpp>
+
 #include "mongo/base/status.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/util/log.h"
@@ -54,15 +56,41 @@ using namespace fmt::literals;
 LDAPGlobalParams ldapGlobalParams;
 
 std::string LDAPGlobalParams::logString() const {
+    std::string ldap_servers;
+    {
+        auto guard = ldapServers.synchronize();
+        std::string pfx;
+        for (auto& s: *guard) {
+            ldap_servers += pfx;
+            ldap_servers += s;
+            pfx = ",";
+        }
+    }
     return fmt::format(
         "ldapServers: {}; "
         "ldapTransportSecurity: {}; "
         "ldapBindMethod: {}; "
         "ldapBindSaslMechanisms: {}",
-        std::string{*ldapServers},
+        ldap_servers,
         ldapTransportSecurity,
         ldapBindMethod,
         ldapBindSaslMechanisms);
+}
+
+// build comma separated list of URIs containing schema (protocol)
+std::string LDAPGlobalParams::ldapURIList() const {
+    const char* ldapprot = "ldaps";
+    if (ldapTransportSecurity == "none")
+        ldapprot = "ldap";
+    std::string uri;
+    auto backins = std::back_inserter(uri);
+    auto guard = ldapServers.synchronize();
+    for (auto& s: *guard) {
+        if (!uri.empty())
+            backins = ',';
+        fmt::format_to(backins, "{}://{}/", ldapprot, s);
+    }
+    return uri;
 }
 
 Status addLDAPOptions(moe::OptionSection* options) {
@@ -135,6 +163,14 @@ Status addLDAPOptions(moe::OptionSection* options) {
                             "to a LDAP Distinguished Name (DN)")
         .setSources(moe::SourceAll)
         .setDefault(moe::Value{"[{match: \"(.+)\", substitution: \"{0}\"}]"});
+
+    options
+        ->addOptionChaining("security.ldap.validateLDAPServerConfig",
+                            "ldapValidateLDAPServerConfig",
+                            moe::Bool,
+                            "Enables LDAP server availability check on startup. Default is true")
+        .setSources(moe::SourceAll)
+        .setDefault(moe::Value{true});
 
     return Status::OK();
 }
@@ -218,7 +254,12 @@ Status validateLDAPTransportSecurity(const std::string& value) {
 
 Status storeLDAPOptions(const moe::Environment& params) {
     if (params.count("security.ldap.servers")) {
-        ldapGlobalParams.ldapServers = params["security.ldap.servers"].as<std::string>();
+        std::string ldap_servers = params["security.ldap.servers"].as<std::string>();
+        auto guard = ldapGlobalParams.ldapServers.synchronize();
+        boost::split(*guard,
+                     ldap_servers,
+                     [](char c) { return c == ','; },
+                     boost::token_compress_on);
     }
     if (params.count("security.ldap.transportSecurity")) {
         auto new_value = params["security.ldap.transportSecurity"].as<std::string>();
@@ -255,6 +296,9 @@ Status storeLDAPOptions(const moe::Environment& params) {
             return ret;
         ldapGlobalParams.ldapUserToDNMapping = new_value;
     }
+    if (params.count("security.ldap.validateLDAPServerConfig")) {
+        ldapGlobalParams.ldapValidateLDAPServerConfig = params["security.ldap.validateLDAPServerConfig"].as<bool>();
+    }
     return Status::OK();
 }
 
@@ -265,8 +309,36 @@ MONGO_STARTUP_OPTIONS_STORE(LDAPOptions)(InitializerContext* context) {
 
 // Server parameter declarations
 
-ExportedServerParameter<std::string, ServerParameterType::kRuntimeOnly> ldapServersParam{
-    ServerParameterSet::getGlobal(), "ldapServers", &ldapGlobalParams.ldapServers};
+class LDAPServersParameter
+    : public BoundServerParameter<std::string> {
+public:
+    LDAPServersParameter()
+        : BoundServerParameter<std::string>(
+                ServerParameterSet::getGlobal(),
+                {"ldapServers"},
+                // setter: stdx::function<Status(const T&)>
+                [](const std::string& v) {
+                    auto guard = ldapGlobalParams.ldapServers.synchronize();
+                    boost::split(*guard,
+                                 v,
+                                 [](char c) { return c == ','; },
+                                 boost::token_compress_on);
+                    return Status::OK();
+                },
+                // getter: stdx::function<T()>
+                [] {
+                    std::string ldap_servers;
+                    std::string pfx;
+                    auto guard = ldapGlobalParams.ldapServers.synchronize();
+                    for (auto& s: *guard) {
+                        ldap_servers += pfx;
+                        ldap_servers += s;
+                        pfx = ",";
+                    }
+                    return ldap_servers;
+                },
+                ServerParameterType::kRuntimeOnly) {}
+} ldapServersParam;
 
 ExportedServerParameter<int, ServerParameterType::kRuntimeOnly> ldapTimeoutMSParam{
     ServerParameterSet::getGlobal(), "ldapTimeoutMS", &ldapGlobalParams.ldapTimeoutMS};
