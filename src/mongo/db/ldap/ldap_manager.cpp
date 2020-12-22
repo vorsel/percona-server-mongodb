@@ -68,7 +68,8 @@ void LDAPManager::set(ServiceContext* service,
 }
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(CreateLDAPManager,
-                                     ("EndStartupOptionStorage"))
+                                     ("EndStartupOptionStorage",
+                                      "SetGlobalEnvironment"))
 (InitializerContext* context) {
     if (!ldapGlobalParams.ldapServers->empty()) {
         auto ldapManager = LDAPManager::create();
