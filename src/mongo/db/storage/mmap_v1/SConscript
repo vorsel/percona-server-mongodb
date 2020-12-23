@@ -226,6 +226,7 @@ if mmapv1:
         source=['record_store_v1_simple_test.cpp',
                 ],
         LIBDEPS=[
+            '$BUILD_DIR/mongo/db/service_context_noop_init',
             '$BUILD_DIR/mongo/util/decorable',
             'record_store_v1_test_help'
             ]
@@ -236,6 +237,7 @@ if mmapv1:
         source=['record_store_v1_capped_test.cpp',
                 ],
         LIBDEPS=[
+            '$BUILD_DIR/mongo/db/service_context_noop_init',
             '$BUILD_DIR/mongo/util/decorable',
             'record_store_v1_test_help'
             ]
@@ -248,6 +250,7 @@ if mmapv1:
                 ],
         LIBDEPS=[
             'record_store_v1_test_help',
+            '$BUILD_DIR/mongo/db/service_context_noop_init',
             '$BUILD_DIR/mongo/db/storage/record_store_test_harness'
             ]
         )
@@ -269,6 +272,7 @@ if mmapv1:
         source=['btree/btree_logic_test.cpp'
                 ],
         LIBDEPS=[
+            '$BUILD_DIR/mongo/db/service_context_noop_init',
             '$BUILD_DIR/mongo/util/decorable',
             'btree_test_help'
             ]
@@ -280,6 +284,7 @@ if mmapv1:
                 ],
         LIBDEPS=[
             'btree_test_help',
+            '$BUILD_DIR/mongo/db/service_context_noop_init',
             '$BUILD_DIR/mongo/db/storage/sorted_data_interface_test_harness'
             ]
         )

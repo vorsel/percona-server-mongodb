@@ -170,6 +170,7 @@ env.CppUnitTest(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/db/logical_session_id",
+        "$BUILD_DIR/mongo/db/service_context_noop_init",
         "$BUILD_DIR/mongo/util/clock_source_mock",
         "cluster_client_cursor_mock",
         "cluster_cursor_manager",
