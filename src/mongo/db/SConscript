@@ -929,7 +929,7 @@ env.Library(
     ],
     LIBDEPS=[
         'logical_session_id',
-        '$BUILD_DIR/mongo/db/auth/authcore',
+        '$BUILD_DIR/mongo/db/auth/authcorebase',
     ],
 )
 
@@ -1380,7 +1380,7 @@ env.Library(
         'service_context',
         'signed_logical_time',
         'time_proof_service',
-        '$BUILD_DIR/mongo/db/auth/authcore',
+        '$BUILD_DIR/mongo/db/auth/authcorebase',
     ],
 )
 

@@ -59,45 +59,59 @@ env.CppUnitTest(
 )
 
 
-# Just the data structures used
+# Split upstream's authcore to 'authcorebase' which should be used in
+# shell dependencies and 'authcore' for everything else
+# 'authcore' will depend on 'authcorebase'
+# this is necessary because 'authcore' depends on LDAPManager
+# and we don't need LDAPManager in the shell
 env.Library(
-    target='authcore',
+    target='authcorebase',
     source=[
         'authorization_manager.cpp',
         'authorization_session.cpp',
         'auth_decorations.cpp',
-        'authz_manager_external_state.cpp',
-        'authz_manager_external_state_local.cpp',
         'authz_session_external_state.cpp',
         'role_graph.cpp',
-        'role_graph_update.cpp',
         'role_graph_builtin_roles.cpp',
         'user.cpp',
         'user_document_parser.cpp',
-        'user_management_commands_parser.cpp',
         'user_set.cpp'
     ],
     LIBDEPS=[
              'address_restriction',
              'authprivilege',
+             'user_name',
+             '$BUILD_DIR/mongo/db/catalog/document_validation',
+             '$BUILD_DIR/mongo/db/mongod_options',
+             '$BUILD_DIR/mongo/db/pipeline/lite_parsed_document_source',
+             '$BUILD_DIR/mongo/db/update/update_driver',
+    ],
+)
+
+# Just the data structures used
+env.Library(
+    target='authcore',
+    source=[
+        'authz_manager_external_state.cpp',
+        'authz_manager_external_state_local.cpp',
+        'role_graph_update.cpp',
+        'user_management_commands_parser.cpp',
+    ],
+    LIBDEPS=[
+             'authcorebase',
              'auth_rolename',
              'authentication_restriction',
              'sasl_options',
-             'user_name',
              '$BUILD_DIR/mongo/base',
              '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
              '$BUILD_DIR/mongo/bson/util/bson_extract',
              '$BUILD_DIR/mongo/crypto/scramauth',
-             '$BUILD_DIR/mongo/db/catalog/document_validation',
              '$BUILD_DIR/mongo/db/common',
-             '$BUILD_DIR/mongo/db/mongod_options',
              '$BUILD_DIR/mongo/db/ldap_options',
              '$BUILD_DIR/mongo/db/ldap/ldapmanager',
              '$BUILD_DIR/mongo/db/namespace_string',
-             '$BUILD_DIR/mongo/db/pipeline/lite_parsed_document_source',
              '$BUILD_DIR/mongo/db/server_parameters',
              '$BUILD_DIR/mongo/db/service_context',
-             '$BUILD_DIR/mongo/db/update/update_driver',
              '$BUILD_DIR/mongo/util/md5',
              '$BUILD_DIR/mongo/util/net/network',
     ],
