@@ -42,7 +42,7 @@ server_parameters:
     ldapServers:
         description: "Comma separated list of LDAP servers"
         set_at: runtime
-        cpp_varname: "ldapGlobalParams.ldapServers"
+        cpp_class: LDAPServersParameter
     ldapTimeoutMS:
         description: "Timeout to wait for response from LDAP server in millisecons. Default is 10000"
         set_at: runtime
@@ -135,3 +135,8 @@ configs:
         arg_vartype: String
         validator:
             callback: validateLDAPUserToDNMapping
+    'security.ldap.validateLDAPServerConfig':
+        description: 'Enables LDAP server availability check on startup. Default is true'
+        short_name: ldapValidateLDAPServerConfig
+        arg_vartype: Bool
+        default: true

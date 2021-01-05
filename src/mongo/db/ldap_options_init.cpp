@@ -42,7 +42,8 @@ namespace mongo {
 
 Status storeLDAPOptions(const moe::Environment& params) {
     if (params.count("security.ldap.servers")) {
-        ldapGlobalParams.ldapServers = params["security.ldap.servers"].as<std::string>();
+        std::string ldap_servers = params["security.ldap.servers"].as<std::string>();
+        ldapGlobalParams.setServersStr(ldap_servers);
     }
     if (params.count("security.ldap.transportSecurity")) {
         ldapGlobalParams.ldapTransportSecurity = params["security.ldap.transportSecurity"].as<std::string>();
@@ -64,6 +65,9 @@ Status storeLDAPOptions(const moe::Environment& params) {
     }
     if (params.count("security.ldap.userToDNMapping")) {
         ldapGlobalParams.ldapUserToDNMapping = params["security.ldap.userToDNMapping"].as<std::string>();
+    }
+    if (params.count("security.ldap.validateLDAPServerConfig")) {
+        ldapGlobalParams.ldapValidateLDAPServerConfig = params["security.ldap.validateLDAPServerConfig"].as<bool>();
     }
     return Status::OK();
 }
