@@ -58,6 +58,7 @@
 #include "mongo/db/initialize_server_security_state.h"
 #include "mongo/db/kill_sessions.h"
 #include "mongo/db/lasterror.h"
+#include "mongo/db/ldap/ldap_manager.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_session_cache_impl.h"
@@ -734,6 +735,10 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
 
     if (mongosGlobalParams.scriptingEnabled) {
         ScriptEngine::setup();
+    }
+
+    if (auto const globalLDAPManager = LDAPManager::get(serviceContext)) {
+        globalLDAPManager->start_threads();
     }
 
     Status status = AuthorizationManager::get(serviceContext)->initialize(opCtx);
