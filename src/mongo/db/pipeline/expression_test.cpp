@@ -2683,6 +2683,20 @@ TEST(ExpressionMetaTest, ExpressionMetaTextScore) {
     Value val = expressionMeta->evaluate(doc.freeze(), &expCtx->variables);
     ASSERT_EQ(val.getDouble(), 1.23);
 }
+
+TEST(ExpressionMetaTest, ExpressionMetaSearchScoreDetails) {
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    BSONObj expr = fromjson("{$meta: \"searchScoreDetails\"}");
+    auto expressionMeta =
+        ExpressionMeta::parse(expCtx, expr.firstElement(), expCtx->variablesParseState);
+
+    auto details = BSON("scoreDetails"
+                        << "foo");
+    MutableDocument doc;
+    doc.metadata().setSearchScoreDetails(details);
+    Value val = expressionMeta->evaluate(doc.freeze(), &expCtx->variables);
+    ASSERT_DOCUMENT_EQ(val.getDocument(), Document(details));
+}
 }  // namespace expression_meta_test
 
 namespace ExpressionRegexTest {
@@ -2987,4 +3001,39 @@ TEST(ExpressionRandom, Basic) {
     };
     assertRandomProperties(randFn);
 }
+
+TEST(ExpressionSubtractTest, OverflowLong) {
+    const auto maxLong = std::numeric_limits<long long int>::max();
+    const auto minLong = std::numeric_limits<long long int>::min();
+    intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+
+    // The following subtractions should not fit into a long long data type.
+    BSONObj obj = BSON("$subtract" << BSON_ARRAY(maxLong << minLong));
+    auto expression = Expression::parseExpression(expCtx, obj, expCtx->variablesParseState);
+    Value result = expression->evaluate({}, &expCtx->variables);
+    ASSERT_EQ(result.getType(), BSONType::NumberDouble);
+    ASSERT_EQ(result.getDouble(), static_cast<double>(maxLong) - minLong);
+
+    obj = BSON("$subtract" << BSON_ARRAY(minLong << maxLong));
+    expression = Expression::parseExpression(expCtx, obj, expCtx->variablesParseState);
+    result = expression->evaluate({}, &expCtx->variables);
+    ASSERT_EQ(result.getType(), BSONType::NumberDouble);
+    ASSERT_EQ(result.getDouble(), static_cast<double>(minLong) - maxLong);
+
+    // minLong = -1 - maxLong. The below subtraction should fit into long long data type.
+    obj = BSON("$subtract" << BSON_ARRAY(-1 << maxLong));
+    expression = Expression::parseExpression(expCtx, obj, expCtx->variablesParseState);
+    result = expression->evaluate({}, &expCtx->variables);
+    ASSERT_EQ(result.getType(), BSONType::NumberLong);
+    ASSERT_EQ(result.getLong(), -1LL - maxLong);
+
+    // The minLong's negation does not fit into long long, hence it should be converted to double
+    // data type.
+    obj = BSON("$subtract" << BSON_ARRAY(0 << minLong));
+    expression = Expression::parseExpression(expCtx, obj, expCtx->variablesParseState);
+    result = expression->evaluate({}, &expCtx->variables);
+    ASSERT_EQ(result.getType(), BSONType::NumberDouble);
+    ASSERT_EQ(result.getDouble(), static_cast<double>(minLong) * -1);
+}
+
 }  // namespace ExpressionTests

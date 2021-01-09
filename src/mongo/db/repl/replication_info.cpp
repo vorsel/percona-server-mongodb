@@ -40,6 +40,7 @@
 #include "mongo/db/auth/sasl_mechanism_registry.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/server_status.h"
+#include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/exec/working_set_common.h"
@@ -70,9 +71,9 @@ namespace mongo {
 
 // Hangs in the beginning of each hello command when set.
 MONGO_FAIL_POINT_DEFINE(waitInHello);
-// Awaitable isMaster requests with the proper topologyVersions will sleep for maxAwaitTimeMS on
+// Awaitable hello requests with the proper topologyVersions will sleep for maxAwaitTimeMS on
 // standalones. This failpoint will hang right before doing this sleep when set.
-MONGO_FAIL_POINT_DEFINE(hangWaitingForIsMasterResponseOnStandalone);
+MONGO_FAIL_POINT_DEFINE(hangWaitingForHelloResponseOnStandalone);
 
 using std::list;
 using std::string;
@@ -133,11 +134,11 @@ TopologyVersion appendReplicationInfo(OperationContext* opCtx,
 
         IsMasterMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
         ON_BLOCK_EXIT([&] { IsMasterMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges(); });
-        if (MONGO_unlikely(hangWaitingForIsMasterResponseOnStandalone.shouldFail())) {
+        if (MONGO_unlikely(hangWaitingForHelloResponseOnStandalone.shouldFail())) {
             // Used in tests that wait for this failpoint to be entered to guarantee that the
             // request is waiting and metrics have been updated.
-            LOGV2(31462, "Hanging due to hangWaitingForIsMasterResponseOnStandalone failpoint.");
-            hangWaitingForIsMasterResponseOnStandalone.pauseWhileSet(opCtx);
+            LOGV2(31462, "Hanging due to hangWaitingForHelloResponseOnStandalone failpoint.");
+            hangWaitingForHelloResponseOnStandalone.pauseWhileSet(opCtx);
         }
         opCtx->sleepFor(Milliseconds(*maxAwaitTimeMS));
     }
@@ -452,8 +453,10 @@ public:
         // present if and only if topologyVersion is present in the request.
         auto topologyVersionElement = cmdObj["topologyVersion"];
         auto maxAwaitTimeMSField = cmdObj["maxAwaitTimeMS"];
+        auto curOp = CurOp::get(opCtx);
         boost::optional<TopologyVersion> clientTopologyVersion;
         boost::optional<long long> maxAwaitTimeMS;
+        boost::optional<ScopeGuard<std::function<void()>>> timerGuard;
         if (topologyVersionElement && maxAwaitTimeMSField) {
             clientTopologyVersion = TopologyVersion::parse(IDLParserErrorContext("TopologyVersion"),
                                                            topologyVersionElement.Obj());
@@ -472,8 +475,8 @@ public:
 
             LOGV2_DEBUG(23904, 3, "Using maxAwaitTimeMS for awaitable isMaster protocol.");
 
-            // Awaitable isMaster commands have high latency by design.
-            opCtx->setShouldIncrementLatencyStats(false);
+            curOp->pauseTimer();
+            timerGuard.emplace([curOp]() { curOp->resumeTimer(); });
         } else {
             uassert(31368,
                     (topologyVersionElement
@@ -485,6 +488,8 @@ public:
         auto result = replyBuilder->getBodyBuilder();
         auto currentTopologyVersion = appendReplicationInfo(
             opCtx, result, 0, useLegacyResponseFields(), clientTopologyVersion, maxAwaitTimeMS);
+
+        timerGuard.reset();  // Resume curOp timer.
 
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             const int configServerModeNumber = 2;

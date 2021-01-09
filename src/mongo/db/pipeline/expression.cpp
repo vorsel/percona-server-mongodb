@@ -2619,6 +2619,7 @@ const std::string geoNearPointName = "geoNearPoint";
 const std::string recordIdName = "recordId";
 const std::string indexKeyName = "indexKey";
 const std::string sortKeyName = "sortKey";
+const std::string searchScoreDetailsName = "searchScoreDetails";
 
 using MetaType = DocumentMetadataFields::MetaType;
 const StringMap<DocumentMetadataFields::MetaType> kMetaNameToMetaType = {
@@ -2629,6 +2630,7 @@ const StringMap<DocumentMetadataFields::MetaType> kMetaNameToMetaType = {
     {recordIdName, MetaType::kRecordId},
     {searchHighlightsName, MetaType::kSearchHighlights},
     {searchScoreName, MetaType::kSearchScore},
+    {searchScoreDetailsName, MetaType::kSearchScoreDetails},
     {sortKeyName, MetaType::kSortKey},
     {textScoreName, MetaType::kTextScore},
 };
@@ -2641,6 +2643,7 @@ const stdx::unordered_map<DocumentMetadataFields::MetaType, StringData> kMetaTyp
     {MetaType::kRecordId, recordIdName},
     {MetaType::kSearchHighlights, searchHighlightsName},
     {MetaType::kSearchScore, searchScoreName},
+    {MetaType::kSearchScoreDetails, searchScoreDetailsName},
     {MetaType::kSortKey, sortKeyName},
     {MetaType::kTextScore, textScoreName},
 };
@@ -2730,6 +2733,9 @@ Value ExpressionMeta::evaluate(const Document& root, Variables* variables) const
             } else {
                 return Value();
             }
+        case MetaType::kSearchScoreDetails:
+            return metadata.hasSearchScoreDetails() ? Value(metadata.getSearchScoreDetails())
+                                                    : Value();
         default:
             MONGO_UNREACHABLE;
     }
@@ -2737,9 +2743,10 @@ Value ExpressionMeta::evaluate(const Document& root, Variables* variables) const
 }
 
 void ExpressionMeta::_doAddDependencies(DepsTracker* deps) const {
-    if (_metaType == MetaType::kSearchScore || _metaType == MetaType::kSearchHighlights) {
-        // We do not add the dependencies for SEARCH_SCORE or SEARCH_HIGHLIGHTS because those values
-        // are not stored in the collection (or in mongod at all).
+    if (_metaType == MetaType::kSearchScore || _metaType == MetaType::kSearchHighlights ||
+        _metaType == MetaType::kSearchScoreDetails) {
+        // We do not add the dependencies for searchScore, searchHighlights, or searchScoreDetails
+        // because those values are not stored in the collection (or in mongod at all).
         return;
     }
 
@@ -4763,9 +4770,13 @@ Value ExpressionSubtract::evaluate(const Document& root, Variables* variables) c
         double left = lhs.coerceToDouble();
         return Value(left - right);
     } else if (diffType == NumberLong) {
-        long long right = rhs.coerceToLong();
-        long long left = lhs.coerceToLong();
-        return Value(left - right);
+        long long result;
+
+        // If there is an overflow, convert the values to doubles.
+        if (overflow::sub(lhs.coerceToLong(), rhs.coerceToLong(), &result)) {
+            return Value(lhs.coerceToDouble() - rhs.coerceToDouble());
+        }
+        return Value(result);
     } else if (diffType == NumberInt) {
         long long right = rhs.coerceToLong();
         long long left = lhs.coerceToLong();
@@ -6564,4 +6575,11 @@ void ExpressionRandom::_doAddDependencies(DepsTracker* deps) const {
 Value ExpressionRandom::serialize(const bool explain) const {
     return Value(DOC(getOpName() << Document()));
 }
+
+MONGO_INITIALIZER(expressionParserMap)(InitializerContext*) {
+    // Nothing to do. This initializer exists to tie together all the individual initializers
+    // defined by REGISTER_EXPRESSION / REGISTER_EXPRESSION_WITH_MIN_VERSION.
+    return Status::OK();
+}
+
 }  // namespace mongo

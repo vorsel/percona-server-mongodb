@@ -49,7 +49,25 @@ const requiredFCV = jsTest.options().forceValidationWithFeatureCompatibilityVers
 let originalFCV;
 let originalTransactionLifetimeLimitSeconds;
 
+let skipFCV = false;
+
 if (requiredFCV) {
+    // Can't set the FCV to 4.2 while having long collection names present.
+    adminDB.runCommand("listDatabases").databases.forEach(function(d) {
+        const mdb = adminDB.getSiblingDB(d.name);
+        try {
+            mdb.getCollectionInfos().forEach(function(c) {
+                const namespace = d.name + "." + c.name;
+                const namespaceLenBytes = encodeURIComponent(namespace).length;
+                if (namespaceLenBytes > 120) {
+                    skipFCV = true;
+                }
+            });
+        } catch (e) {
+            skipFCV = true;
+        }
+    });
+
     // Running the setFeatureCompatibilityVersion command may implicitly involve running a
     // multi-statement transaction. We temporarily raise the transactionLifetimeLimitSeconds to be
     // 24 hours to avoid spurious failures from it having been set to a lower value.
@@ -73,12 +91,14 @@ if (requiredFCV) {
 
     // Now that we are certain that an upgrade or downgrade of the FCV is not in progress, ensure
     // the 'requiredFCV' is set.
-    assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: requiredFCV}));
+    if (!skipFCV) {
+        assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: requiredFCV}));
+    }
 }
 
-new CollectionValidator().validateNodes(hostList);
+new CollectionValidator().validateNodes(hostList, skipFCV);
 
-if (originalFCV && originalFCV.version !== requiredFCV) {
+if (originalFCV && originalFCV.version !== requiredFCV && !skipFCV) {
     assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: originalFCV.version}));
 }
 

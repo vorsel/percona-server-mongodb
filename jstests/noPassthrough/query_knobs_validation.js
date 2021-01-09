@@ -15,10 +15,10 @@ const expectedParamDefaults = {
     internalQueryPlanEvaluationCollFraction: 0.3,
     internalQueryPlanEvaluationMaxResults: 101,
     internalQueryCacheSize: 5000,
-    internalQueryCacheFeedbacksStored: 20,
     internalQueryCacheEvictionRatio: 10.0,
     internalQueryCacheWorksGrowthCoefficient: 2.0,
     internalQueryCacheDisableInactiveEntries: false,
+    internalQueryCacheMaxSizeBytesBeforeStripDebugInfo: 512 * 1024 * 1024,
     internalQueryPlannerMaxIndexedSolutions: 64,
     internalQueryEnumerationMaxOrSolutions: 10,
     internalQueryEnumerationMaxIntersectPerAnd: 3,
@@ -35,6 +35,7 @@ const expectedParamDefaults = {
     internalDocumentSourceLookupCacheSizeBytes: 100 * 1024 * 1024,
     internalLookupStageIntermediateDocumentMaxSizeBytes: 100 * 1024 * 1024,
     internalDocumentSourceGroupMaxMemoryBytes: 100 * 1024 * 1024,
+    internalPipelineLengthLimit: 2147483647,  // INT_MAX
     internalQueryMaxJsEmitBytes: 100 * 1024 * 1024,
     internalQueryMaxPushBytes: 100 * 1024 * 1024,
     internalQueryMaxAddToSetBytes: 100 * 1024 * 1024,
@@ -90,9 +91,9 @@ assertSetParameterSucceeds("internalQueryCacheSize", 1);
 assertSetParameterSucceeds("internalQueryCacheSize", 0);
 assertSetParameterFails("internalQueryCacheSize", -1);
 
-assertSetParameterSucceeds("internalQueryCacheFeedbacksStored", 1);
-assertSetParameterSucceeds("internalQueryCacheFeedbacksStored", 0);
-assertSetParameterFails("internalQueryCacheFeedbacksStored", -1);
+assertSetParameterSucceeds("internalQueryCacheMaxSizeBytesBeforeStripDebugInfo", 1);
+assertSetParameterSucceeds("internalQueryCacheMaxSizeBytesBeforeStripDebugInfo", 0);
+assertSetParameterFails("internalQueryCacheMaxSizeBytesBeforeStripDebugInfo", -1);
 
 assertSetParameterSucceeds("internalQueryCacheEvictionRatio", 1.0);
 assertSetParameterSucceeds("internalQueryCacheEvictionRatio", 0.0);

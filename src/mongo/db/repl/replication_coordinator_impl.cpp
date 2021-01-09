@@ -672,7 +672,7 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     LOGV2_DEBUG(21320, 1, "Current term is now {term}", "Updated term", "term"_attr = term);
     _performPostMemberStateUpdateAction(action);
 
-    if (!isArbiter) {
+    if (!isArbiter && myIndex.getValue() != -1) {
         _externalState->startThreads(_settings);
         _startDataReplication(opCtx.get());
     }
@@ -708,6 +708,11 @@ void ReplicationCoordinatorImpl::_stopDataReplication(OperationContext* opCtx) {
 
 void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
                                                        std::function<void()> startCompleted) {
+    if (_startedSteadyStateReplication.swap(true)) {
+        // This is not the first call.
+        return;
+    }
+
     // Check to see if we need to do an initial sync.
     const auto lastOpTime = getMyLastAppliedOpTime();
     const auto needsInitialSync =
@@ -2926,6 +2931,10 @@ Status ReplicationCoordinatorImpl::processReplSetGetStatus(
         ReplicationMetrics::get(getServiceContext()).getElectionParticipantMetricsBSON();
 
     stdx::lock_guard<Latch> lk(_mutex);
+    if (_inShutdown) {
+        return Status(ErrorCodes::ShutdownInProgress, "shutdown in progress");
+    }
+
     Status result(ErrorCodes::InternalError, "didn't set status in prepareStatusResponse");
     _topCoord->prepareStatusResponse(
         TopologyCoordinator::ReplSetStatusArgs{
@@ -3866,6 +3875,17 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
     if (_memberState.secondary()) {
         _cancelCatchupTakeover_inlock();
         _cancelPriorityTakeover_inlock();
+    }
+
+    // Ensure replication is running if we are no longer REMOVED.
+    if (_memberState.removed() && !newState.arbiter()) {
+        LOGV2(5268000, "Scheduling a task to begin or continue replication");
+        _scheduleWorkAt(_replExecutor->now(),
+                        [=](const mongo::executor::TaskExecutor::CallbackArgs& cbData) {
+                            _externalState->startThreads(_settings);
+                            auto opCtx = cc().makeOperationContext();
+                            _startDataReplication(opCtx.get());
+                        });
     }
 
     LOGV2(21358,

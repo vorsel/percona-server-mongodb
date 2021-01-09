@@ -393,7 +393,7 @@ variables:
   - enterprise-rhel-82-arm64
   - enterprise-ubuntu1604-64
   - enterprise-ubuntu1804-64
-  - enterprise-windows-required
+  - enterprise-windows
 
 # List of all variants that use the packages.tgz
 - package_variants: &package_variants
@@ -1060,7 +1060,6 @@ functions:
   "bypass compile and fetch binaries":
     command: shell.exec
     params:
-      continue_on_err: true
       working_dir: src
       shell: bash
       script: |
@@ -1208,7 +1207,21 @@ functions:
           # Windows path separator
           toolchain_txt="$pip_dir/toolchain-requirements.txt"
           ${activate_virtualenv}
-          python -m pip install -r "$toolchain_txt" -q
+          pip_resolver=""
+          # Upgrade pip only on x86_64 systems. The upgraded pip is incompatible
+          # with older versions of setuptools, including those available on
+          # s390x, and arm64. See SERVER-53250
+          uname_arch=$(uname -m || echo "unknown")
+          if [[ "$uname_arch" == "x86_64" ]]; then
+            echo "Upgrading pip to 20.3.1"
+            python -m pip install "pip==20.3.1"
+            # this flag is only supported on the 20.x versions of pip.
+            pip_resolver="--use-deprecated=legacy-resolver"
+            echo "Upgraded pip to 20.3.1, using legacy resolver"
+          else
+            echo "Skipping pip upgrade, architecture was: $uname_arch"
+          fi
+          python -m pip install $pip_resolver -r "$toolchain_txt" -q
           python -m pip freeze > pip-requirements.txt
 
   "upload pip requirements": &upload_pip_requirements
@@ -5233,6 +5246,7 @@ tasks:
       suite: jstestfuzz_replication_fcv42
       is_jstestfuzz: true
       use_multiversion: /data/multiversion
+      task_path_suffix: /data/multiversion
       npm_command: jstestfuzz
       fallback_num_sub_suites: 4
 
@@ -5290,6 +5304,7 @@ tasks:
       suite: jstestfuzz_sharded_fcv42
       is_jstestfuzz: true
       use_multiversion: /data/multiversion
+      task_path_suffix: /data/multiversion
       npm_command: jstestfuzz
       fallback_num_sub_suites: 4
 
@@ -8778,6 +8793,7 @@ buildvariants:
     # generated suites. Once everything is converted to generated suites, we should remove the
     # '--repeatSuites=10' from the test_flags. This will be done in SERVER-38817.
     scons_cache_scope: shared
+    large_distro_name: rhel62-medium
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -8809,6 +8825,7 @@ buildvariants:
     test_flags: --excludeWithAnyTags=requires_http_client
     target_resmoke_time: 15
     max_sub_suites: 3
+    large_distro_name: rhel62-medium
   tasks:
   - name: compile_all_run_unittests_TG
   - name: .aggregation !.encrypt
@@ -8853,6 +8870,7 @@ buildvariants:
     # exclude those tests as well.
     test_flags: --nojournal --excludeWithAnyTags=requires_journaling,requires_replication,requires_sharding,uses_transactions,requires_http_client
     scons_cache_scope: shared
+    large_distro_name: rhel62-medium
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -8889,6 +8907,7 @@ buildvariants:
     packager_distro: ubuntu1804
     repo_edition: org
     scons_cache_scope: shared
+    large_distro_name: ubuntu1804-build
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -8945,6 +8964,7 @@ buildvariants:
     packager_distro: ubuntu1804
     repo_edition: enterprise
     scons_cache_scope: shared
+    large_distro_name: ubuntu1804-build
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -9001,6 +9021,7 @@ buildvariants:
     packager_distro: ubuntu1604
     repo_edition: org
     scons_cache_scope: shared
+    large_distro_name: ubuntu1604-build
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -9173,6 +9194,7 @@ buildvariants:
   - enterprise
   run_on:
   - ubuntu1804-power8-test
+  batchtime: 10080 # 7 days
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
     push_path: linux
@@ -9307,6 +9329,7 @@ buildvariants:
     packager_distro: ubuntu2004
     repo_edition: org
     scons_cache_scope: shared
+    large_distro_name: ubuntu2004-large
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -9362,6 +9385,7 @@ buildvariants:
     packager_distro: ubuntu2004
     repo_edition: enterprise
     scons_cache_scope: shared
+    large_distro_name: ubuntu2004-large
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -9983,7 +10007,7 @@ buildvariants:
   - name: .jstestfuzz !.initsync !.flow_control !.stepdowns
   - name: multiversion_gen
   - name: multiversion_auth_gen
-  - name: .powercycle
+  # - name: .powercycle
   - name: .query_fuzzer
   - name: .read_write_concern
   - name: replica_sets
@@ -10938,6 +10962,7 @@ buildvariants:
   - enterprise
   run_on:
   - rhel81-power8-small
+  batchtime: 10080 # 7 days
   stepback: false
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
@@ -11247,6 +11272,7 @@ buildvariants:
   - enterprise
   run_on:
   - rhel71-power8-test
+  batchtime: 10080 # 7 days
   stepback: false
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
@@ -11858,6 +11884,7 @@ buildvariants:
     packager_distro: debian92
     repo_edition: enterprise
     scons_cache_scope: shared
+    large_distro_name: debian92-build
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -11900,6 +11927,7 @@ buildvariants:
     packager_distro: debian92
     repo_edition: org
     scons_cache_scope: shared
+    large_distro_name: debian92-build
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -11954,6 +11982,7 @@ buildvariants:
     packager_distro: debian10
     repo_edition: enterprise
     scons_cache_scope: shared
+    large_distro_name: debian10-build
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -11996,6 +12025,7 @@ buildvariants:
     packager_distro: debian10
     repo_edition: org
     scons_cache_scope: shared
+    large_distro_name: debian10-build
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -12133,14 +12163,6 @@ buildvariants:
   - name: concurrency
     distros:
     - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
-  - name: concurrency_replication
-  - name: concurrency_replication_causal_consistency
-    distros:
-    - rhel62-large
-  - name: concurrency_simultaneous
-  - name: concurrency_simultaneous_replication
-    distros:
-    - rhel62-large
   - name: .integration !.audit
     distros:
     - rhel62-large
@@ -12497,6 +12519,7 @@ buildvariants:
       --mongosSetParameters="{replicaSetMonitorProtocol: scanning}"
       --mongodSetParameters="{replicaSetMonitorProtocol: scanning}"
       --excludeWithAnyTags=requires_streamable_rsm
+    large_distro_name: ubuntu1604-build
 
   tasks:
   - name: compile_all_run_unittests_TG
@@ -12528,7 +12551,7 @@ buildvariants:
       --mongosSetParameters="{replicaSetMonitorProtocol: sdam}"
       --mongodSetParameters="{replicaSetMonitorProtocol: sdam}"
       --excludeWithAnyTags=requires_streamable_rsm
-
+    large_distro_name: ubuntu1604-build
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -12557,6 +12580,7 @@ buildvariants:
     multiversion_edition: enterprise
     test_flags: |- # Set the taskExecutorPoolSize for all tests
         --mongosSetParameters="taskExecutorPoolSize: 4"
+    large_distro_name: ubuntu1604-build
   tasks:
   - name: compile_all_run_unittests_TG
     distros:

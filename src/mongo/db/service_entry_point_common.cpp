@@ -107,23 +107,23 @@ namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(rsStopGetMore);
 MONGO_FAIL_POINT_DEFINE(respondWithNotPrimaryInCommandDispatch);
-MONGO_FAIL_POINT_DEFINE(skipCheckingForNotMasterInCommandDispatch);
+MONGO_FAIL_POINT_DEFINE(skipCheckingForNotPrimaryInCommandDispatch);
 MONGO_FAIL_POINT_DEFINE(sleepMillisAfterCommandExecutionBegins);
 MONGO_FAIL_POINT_DEFINE(waitAfterNewStatementBlocksBehindPrepare);
 MONGO_FAIL_POINT_DEFINE(waitAfterCommandFinishesExecution);
 MONGO_FAIL_POINT_DEFINE(failWithErrorCodeInRunCommand);
 
 // Tracks the number of times a legacy unacknowledged write failed due to
-// not master error resulted in network disconnection.
-Counter64 notMasterLegacyUnackWrites;
-ServerStatusMetricField<Counter64> displayNotMasterLegacyUnackWrites(
-    "repl.network.notMasterLegacyUnacknowledgedWrites", &notMasterLegacyUnackWrites);
+// not primary error resulted in network disconnection.
+Counter64 notPrimaryLegacyUnackWrites;
+ServerStatusMetricField<Counter64> displayNotPrimaryLegacyUnackWrites(
+    "repl.network.notPrimaryLegacyUnacknowledgedWrites", &notPrimaryLegacyUnackWrites);
 
-// Tracks the number of times an unacknowledged write failed due to not master error
+// Tracks the number of times an unacknowledged write failed due to not primary error
 // resulted in network disconnection.
-Counter64 notMasterUnackWrites;
-ServerStatusMetricField<Counter64> displayNotMasterUnackWrites(
-    "repl.network.notMasterUnacknowledgedWrites", &notMasterUnackWrites);
+Counter64 notPrimaryUnackWrites;
+ServerStatusMetricField<Counter64> displayNotPrimaryUnackWrites(
+    "repl.network.notPrimaryUnacknowledgedWrites", &notPrimaryUnackWrites);
 
 namespace {
 
@@ -1027,7 +1027,7 @@ void execCommandDatabase(OperationContext* opCtx,
         const bool iAmPrimary = replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, dbname);
 
         if (!opCtx->getClient()->isInDirectClient() &&
-            !MONGO_unlikely(skipCheckingForNotMasterInCommandDispatch.shouldFail())) {
+            !MONGO_unlikely(skipCheckingForNotPrimaryInCommandDispatch.shouldFail())) {
             const bool inMultiDocumentTransaction = (sessionOptions.getAutocommit() == false);
             auto allowed = command->secondaryAllowed(opCtx->getServiceContext());
             bool alwaysAllowed = allowed == Command::AllowedOnSecondary::kAlways;
@@ -1418,7 +1418,7 @@ DbResponse receivedCommands(OperationContext* opCtx,
         // Close the connection to get client to go through server selection again.
         if (LastError::get(opCtx->getClient()).hadNotPrimaryError()) {
             if (c && c->getReadWriteType() == Command::ReadWriteType::kWrite)
-                notMasterUnackWrites.increment();
+                notPrimaryUnackWrites.increment();
             uasserted(ErrorCodes::NotWritablePrimary,
                       str::stream()
                           << "Not-master error while processing '" << request.getCommandName()
@@ -1717,13 +1717,6 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     DbResponse dbresponse;
     if (op == dbMsg || (op == dbQuery && isCommand)) {
         dbresponse = receivedCommands(opCtx, m, behaviors);
-        // The hello/isMaster commands should take kMaxAwaitTimeMs at most, log if it takes twice
-        // that.
-        if (auto command = currentOp.getCommand();
-            command && (command->getName() == "hello" || command->getName() == "isMaster")) {
-            slowMsOverride =
-                2 * durationCount<Milliseconds>(SingleServerIsMasterMonitor::kMaxAwaitTime);
-        }
     } else if (op == dbQuery) {
         invariant(!isCommand);
         opCtx->markKillOnClientDisconnect();
@@ -1781,7 +1774,7 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
         // above.  Either way, we want to throw an exception here, which will cause the client to be
         // disconnected.
         if (LastError::get(opCtx->getClient()).hadNotPrimaryError()) {
-            notMasterLegacyUnackWrites.increment();
+            notPrimaryLegacyUnackWrites.increment();
             uasserted(ErrorCodes::NotWritablePrimary,
                       str::stream()
                           << "Not-master error while processing '" << networkOpToString(op)
