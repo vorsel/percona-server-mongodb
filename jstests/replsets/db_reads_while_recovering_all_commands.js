@@ -236,6 +236,7 @@
         },
         lockInfo: {skip: isPrimaryOnly},
         logApplicationMessage: {skip: isNotAUserDataRead},
+        logMessage: {skip: isNotAUserDataRead},
         logRotate: {skip: isNotAUserDataRead},
         logout: {skip: isNotAUserDataRead},
         makeSnapshot: {skip: isNotAUserDataRead},

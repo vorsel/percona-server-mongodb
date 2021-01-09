@@ -94,7 +94,7 @@ namespace mongo {
 MONGO_FAIL_POINT_DEFINE(failCommand);
 MONGO_FAIL_POINT_DEFINE(rsStopGetMore);
 MONGO_FAIL_POINT_DEFINE(respondWithNotPrimaryInCommandDispatch);
-MONGO_FAIL_POINT_DEFINE(skipCheckingForNotMasterInCommandDispatch);
+MONGO_FAIL_POINT_DEFINE(skipCheckingForNotPrimaryInCommandDispatch);
 
 namespace {
 using logger::LogComponent;
@@ -406,10 +406,6 @@ LogicalTime computeOperationTime(OperationContext* opCtx, LogicalTime startOpera
     const bool isReplSet =
         replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
     invariant(isReplSet);
-
-    if (startOperationTime == LogicalTime::kUninitialized) {
-        return LogicalTime(replCoord->getMyLastAppliedOpTime().getTimestamp());
-    }
 
     auto operationTime = getClientOperationTime(opCtx);
     invariant(operationTime >= startOperationTime);
@@ -778,7 +774,7 @@ void execCommandDatabase(OperationContext* opCtx,
         const bool iAmPrimary = replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, dbname);
 
         if (!opCtx->getClient()->isInDirectClient() &&
-            !MONGO_FAIL_POINT(skipCheckingForNotMasterInCommandDispatch)) {
+            !MONGO_FAIL_POINT(skipCheckingForNotPrimaryInCommandDispatch)) {
             auto inMultiDocumentTransaction = static_cast<bool>(sessionOptions.getAutocommit());
             auto allowed = command->secondaryAllowed(opCtx->getServiceContext());
             bool alwaysAllowed = allowed == Command::AllowedOnSecondary::kAlways;

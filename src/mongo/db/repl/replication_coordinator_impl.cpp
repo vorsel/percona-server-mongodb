@@ -641,7 +641,7 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         _performPostMemberStateUpdateAction(action);
     }
 
-    if (!isArbiter) {
+    if (!isArbiter && myIndex.getValue() != -1) {
         _externalState->startThreads(_settings);
         _startDataReplication(opCtx.get());
     }
@@ -651,6 +651,11 @@ void ReplicationCoordinatorImpl::_stopDataReplication(OperationContext* opCtx) {
     std::shared_ptr<InitialSyncer> initialSyncerCopy;
     {
         stdx::lock_guard<stdx::mutex> lk(_mutex);
+        if (!_startedSteadyStateReplication) {
+            return;
+        }
+
+        _startedSteadyStateReplication = false;
         _initialSyncer.swap(initialSyncerCopy);
     }
     if (initialSyncerCopy) {
@@ -670,15 +675,24 @@ void ReplicationCoordinatorImpl::_stopDataReplication(OperationContext* opCtx) {
 
 void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
                                                        stdx::function<void()> startCompleted) {
+    stdx::unique_lock<stdx::mutex> lk(_mutex);
+    if (_startedSteadyStateReplication) {
+        return;
+    }
+
+    _startedSteadyStateReplication = true;
+
     // Check to see if we need to do an initial sync.
-    const auto lastOpTime = getMyLastAppliedOpTime();
+    const auto lastOpTime = _getMyLastAppliedOpTime_inlock();
     const auto needsInitialSync =
         lastOpTime.isNull() || _externalState->isInitialSyncFlagSet(opCtx);
     if (!needsInitialSync) {
         // Start steady replication, since we already have data.
         // ReplSetConfig has been installed, so it's either in STARTUP2 or REMOVED.
-        auto memberState = getMemberState();
+        auto memberState = _getMemberState_inlock();
         invariant(memberState.startup2() || memberState.removed());
+
+        lk.unlock();
         invariant(setFollowerMode(MemberState::RS_RECOVERING));
         _externalState->startSteadyStateReplication(opCtx, this);
         return;
@@ -732,8 +746,6 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
     std::shared_ptr<InitialSyncer> initialSyncerCopy;
     try {
         {
-            // Must take the lock to set _initialSyncer, but not call it.
-            stdx::lock_guard<stdx::mutex> lock(_mutex);
             if (_inShutdown) {
                 log() << "Initial Sync not starting because replication is shutting down.";
                 return;
@@ -750,6 +762,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
         }
         // InitialSyncer::startup() must be called outside lock because it uses features (eg.
         // setting the initial sync flag) which depend on the ReplicationCoordinatorImpl.
+        lk.unlock();
         uassertStatusOK(initialSyncerCopy->startup(opCtx, numInitialSyncAttempts.load()));
     } catch (...) {
         auto status = exceptionToStatus();
@@ -2747,6 +2760,17 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator_inlock(
         _cancelPriorityTakeover_inlock();
     }
 
+    // Ensure replication is running if we are no longer REMOVED.
+    if (_memberState.removed() && !newState.arbiter()) {
+        log() << "Scheduling a task to begin or continue replication";
+        _scheduleWorkAt(_replExecutor->now(),
+                        [=](const mongo::executor::TaskExecutor::CallbackArgs& cbData) {
+                            _externalState->startThreads(_settings);
+                            auto opCtx = cc().makeOperationContext();
+                            _startDataReplication(opCtx.get());
+                        });
+    }
+
     log() << "transition to " << newState << " from " << _memberState << rsLog;
     // Initializes the featureCompatibilityVersion to the latest value, because arbiters do not
     // receive the replicated version. This is to avoid bugs like SERVER-32639.
@@ -3026,47 +3050,50 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig_inlock(OperationContext* opCtx,
         log() << "**          in a future version." << startupWarningsLog;
     }
 
-    // Warn if running --nojournal and writeConcernMajorityJournalDefault = true
+    // Warn if using the in-memory (ephemeral) storage engine or running running --nojournal with
+    // writeConcernMajorityJournalDefault=true.
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    if (storageEngine && !storageEngine->isDurable() &&
-        (newConfig.getWriteConcernMajorityShouldJournal() &&
-         (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
-        log() << startupWarningsLog;
-        log() << "** WARNING: This replica set node is running without journaling enabled but the "
-              << startupWarningsLog;
-        log() << "**          writeConcernMajorityJournalDefault option to the replica set config "
-              << startupWarningsLog;
-        log() << "**          is set to true. The writeConcernMajorityJournalDefault "
-              << startupWarningsLog;
-        log() << "**          option to the replica set config must be set to false "
-              << startupWarningsLog;
-        log() << "**          or w:majority write concerns will never complete."
-              << startupWarningsLog;
-        log() << "**          In addition, this node's memory consumption may increase until all"
-              << startupWarningsLog;
-        log() << "**          available free RAM is exhausted." << startupWarningsLog;
-        log() << startupWarningsLog;
-    }
-
-    // Warn if using the in-memory (ephemeral) storage engine with
-    // writeConcernMajorityJournalDefault = true
-    if (storageEngine && storageEngine->isEphemeral() &&
-        (newConfig.getWriteConcernMajorityShouldJournal() &&
-         (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
-        log() << startupWarningsLog;
-        log() << "** WARNING: This replica set node is using in-memory (ephemeral) storage with the"
-              << startupWarningsLog;
-        log() << "**          writeConcernMajorityJournalDefault option to the replica set config "
-              << startupWarningsLog;
-        log() << "**          set to true. The writeConcernMajorityJournalDefault option to the "
-              << startupWarningsLog;
-        log() << "**          replica set config must be set to false " << startupWarningsLog;
-        log() << "**          or w:majority write concerns will never complete."
-              << startupWarningsLog;
-        log() << "**          In addition, this node's memory consumption may increase until all"
-              << startupWarningsLog;
-        log() << "**          available free RAM is exhausted." << startupWarningsLog;
-        log() << startupWarningsLog;
+    if (storageEngine && newConfig.getWriteConcernMajorityShouldJournal() &&
+        (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal())) {
+        if (storageEngine->isEphemeral()) {
+            log() << startupWarningsLog;
+            log() << "** WARNING: This replica set node is using in-memory (ephemeral) storage "
+                     "with the"
+                  << startupWarningsLog;
+            log() << "**          writeConcernMajorityJournalDefault option to the replica set "
+                     "config "
+                  << startupWarningsLog;
+            log()
+                << "**          set to true. The writeConcernMajorityJournalDefault option to the "
+                << startupWarningsLog;
+            log() << "**          replica set config must be set to false " << startupWarningsLog;
+            log() << "**          or w:majority write concerns will never complete."
+                  << startupWarningsLog;
+            log()
+                << "**          In addition, this node's memory consumption may increase until all"
+                << startupWarningsLog;
+            log() << "**          available free RAM is exhausted." << startupWarningsLog;
+            log() << startupWarningsLog;
+        } else if (!storageEngine->isDurable()) {
+            log() << startupWarningsLog;
+            log() << "** WARNING: This replica set node is running without journaling enabled but "
+                     "the "
+                  << startupWarningsLog;
+            log() << "**          writeConcernMajorityJournalDefault option to the replica set "
+                     "config "
+                  << startupWarningsLog;
+            log() << "**          is set to true. The writeConcernMajorityJournalDefault "
+                  << startupWarningsLog;
+            log() << "**          option to the replica set config must be set to false "
+                  << startupWarningsLog;
+            log() << "**          or w:majority write concerns will never complete."
+                  << startupWarningsLog;
+            log()
+                << "**          In addition, this node's memory consumption may increase until all"
+                << startupWarningsLog;
+            log() << "**          available free RAM is exhausted." << startupWarningsLog;
+            log() << startupWarningsLog;
+        }
     }
 
     log() << "New replica set config in use: " << _rsConfig.toBSON() << rsLog;

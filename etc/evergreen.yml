@@ -4583,6 +4583,16 @@ tasks:
       resmoke_args: --suites=replica_sets_multi_stmt_txn_jscore_passthrough --storageEngine=wiredTiger
 
 - <<: *task_template
+  name: replica_sets_abort_multi_stmt_txn_jscore_passthrough
+  depends_on:
+  - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_abort_multi_stmt_txn_jscore_passthrough --storageEngine=wiredTiger
+
+- <<: *task_template
   name: replica_sets_initsync_jscore_passthrough
   depends_on:
   - name: jsCore
@@ -4832,6 +4842,15 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=concurrency_replication_multi_stmt_txn --storageEngine=wiredTiger
+      resmoke_jobs_max: 1
+
+- <<: *task_template
+  name: concurrency_replication_abort_multi_stmt_txn
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_replication_abort_multi_stmt_txn --storageEngine=wiredTiger
       resmoke_jobs_max: 1
 
 - <<: *task_template
@@ -6416,6 +6435,7 @@ buildvariants:
   - name: concurrency_replication
   - name: concurrency_replication_causal_consistency
   - name: concurrency_replication_multi_stmt_txn
+  - name: concurrency_replication_abort_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency_gen
@@ -6463,6 +6483,7 @@ buildvariants:
   - name: replica_sets_initsync_static_jscore_passthrough
   - name: replica_sets_jscore_passthrough
   - name: replica_sets_multi_stmt_txn_jscore_passthrough
+  - name: replica_sets_abort_multi_stmt_txn_jscore_passthrough
   - name: replica_sets_kill_primary_jscore_passthrough
   - name: replica_sets_terminate_primary_jscore_passthrough
   - name: replica_sets_kill_secondaries_jscore_passthrough
@@ -6928,7 +6949,7 @@ buildvariants:
   - enterprise
   run_on:
   - ubuntu1604-power8-test
-  batchtime: 1440 # 1 day
+  batchtime: 10080 # 7 days
   expansions:
     push_path: linux
     push_bucket: downloads.10gen.com
@@ -7877,11 +7898,11 @@ buildvariants:
   - name: noPassthrough_gen
   - name: parallel_gen
   - name: parallel_compatibility
-  - name: powercycle
-  - name: powercycle_fcv3.6
-  - name: powercycle_kill_mongod
-  - name: powercycle_replication
-  - name: powercycle_syncdelay
+  # - name: powercycle
+  # - name: powercycle_fcv3.6
+  # - name: powercycle_kill_mongod
+  # - name: powercycle_replication
+  # - name: powercycle_syncdelay
   - name: read_concern_linearizable_passthrough
   - name: read_concern_majority_passthrough_gen
   - name: replica_sets
@@ -8305,6 +8326,7 @@ buildvariants:
     distros:
     - rhel62-large
   - name: concurrency_replication_multi_stmt_txn
+  - name: concurrency_replication_abort_multi_stmt_txn
   - name: concurrency_sharded_replication
   - name: concurrency_sharded_replication_with_balancer
   - name: concurrency_sharded_causal_consistency_gen
@@ -8390,6 +8412,9 @@ buildvariants:
     distros:
     - rhel62-small
   - name: replica_sets_multi_stmt_txn_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_abort_multi_stmt_txn_jscore_passthrough
     distros:
     - rhel62-large
   - name: replica_sets_kill_primary_jscore_passthrough
@@ -9200,7 +9225,7 @@ buildvariants:
   - enterprise
   run_on:
   - rhel71-power8-test
-  batchtime: 1440 # 1 day
+  batchtime: 10080 # 7 days
   stepback: false
   expansions:
     # We need to compensate for SMT8 setting the cpu count very high and lower the amount of parallelism down
