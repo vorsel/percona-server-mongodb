@@ -29,14 +29,18 @@ Copyright (C) 2021-present Percona and/or its affiliates. All rights reserved.
     it in the license file.
 ======= */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/document_source_backup_cursor.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
 using boost::intrusive_ptr;
 
+// We only link this file into mongod so this stage doesn't exist in mongos
 REGISTER_DOCUMENT_SOURCE(backupCursor,
                          LiteParsedDocumentSourceDefault::parse,
                          DocumentSourceBackupCursor::createFromBson,
@@ -48,39 +52,79 @@ const char* DocumentSourceBackupCursor::getSourceName() const {
 
 Value DocumentSourceBackupCursor::serialize(
     boost::optional<ExplainOptions::Verbosity> explain) const {
-    if (explain) {
-        BSONObjBuilder builder;
-        // TODO: reimplement
-        //_expression->serialize(&builder);
-        return Value(DOC(getSourceName() << Document(builder.obj())));
-    }
-    return Value(DOC(getSourceName() << 0));
+    return Value(DOC(getSourceName() << 1));
 }
+
 DocumentSource::GetNextResult DocumentSourceBackupCursor::doGetNext() {
-    // TODO: implement
-    return GetNextResult::makeEOF();
-    auto nextInput = pSource->getNext();
-    return nextInput;
+    if (_backupCursorState.preamble) {
+        Document doc = _backupCursorState.preamble.get();
+        _backupCursorState.preamble = boost::none;
+
+        return doc;
+    }
+
+    if (_docIt == _backupBlocks.cend()) {
+        constexpr std::size_t batchSize = 100;
+        _backupBlocks =
+            uassertStatusOK(_backupCursorState.streamingCursor->getNextBatch(batchSize));
+        _docIt = _backupBlocks.cbegin();
+        // Empty batch means streaming cursor is exhausted
+        if (_backupBlocks.empty()) {
+            return GetNextResult::makeEOF();
+        }
+    }
+
+    // If length or offset is not 0 then output 4 fields,
+    // otherwise output filename, fileSize only
+    Document doc;
+    if (_docIt->length != 0 || _docIt->offset != 0) {
+        doc = Document{{"filename"_sd, _docIt->filename},
+                       {"offset"_sd, static_cast<long long>(_docIt->offset)},
+                       {"length"_sd, static_cast<long long>(_docIt->length)},
+                       {"fileSize"_sd, static_cast<long long>(_docIt->fileSize)}};
+    } else {
+        doc = Document{{"filename"_sd, _docIt->filename},
+                       {"fileSize"_sd, static_cast<long long>(_docIt->fileSize)}};
+    }
+    ++_docIt;
+
+    return doc;
 }
 
 intrusive_ptr<DocumentSourceBackupCursor> DocumentSourceBackupCursor::create(
-    const BSONObj& filter, const intrusive_ptr<ExpressionContext>& expCtx) {
+    const BSONObj& options, const intrusive_ptr<ExpressionContext>& expCtx) {
     intrusive_ptr<DocumentSourceBackupCursor> backupCursor(
-        new DocumentSourceBackupCursor(filter, expCtx));
+        new DocumentSourceBackupCursor(options, expCtx));
     return backupCursor;
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceBackupCursor::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& pExpCtx) {
-    uassert(15959, "the match filter must be an expression in an object", elem.type() == Object);
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << kStageName
+                          << " value must be an object. Found: " << typeName(elem.type()),
+            elem.type() == Object);
 
     return DocumentSourceBackupCursor::create(elem.Obj(), pExpCtx);
 }
 
 DocumentSourceBackupCursor::DocumentSourceBackupCursor(
-    const BSONObj& query, const intrusive_ptr<ExpressionContext>& expCtx)
-    : DocumentSource(kStageName, expCtx) {
-    // TODO: reimplement
-    // rebuild(query);
+    const BSONObj& options, const intrusive_ptr<ExpressionContext>& expCtx)
+    : DocumentSource(kStageName, expCtx),
+      _backupCursorState(
+          pExpCtx->mongoProcessInterface->openBackupCursor(pExpCtx->opCtx, _backupOptions)),
+      _backupBlocks(std::move(_backupCursorState.otherBackupBlocks)),
+      _docIt(_backupBlocks.cbegin()) {}
+
+DocumentSourceBackupCursor::~DocumentSourceBackupCursor() {
+    try {
+        pExpCtx->mongoProcessInterface->closeBackupCursor(pExpCtx->opCtx,
+                                                          _backupCursorState.backupId);
+    } catch (DBException& exc) {
+        LOGV2_FATAL(29091,
+                    "Error closing a backup cursor with Id {backupId}",
+                    "Error closing a backup cursor.",
+                    "backupId"_attr = _backupCursorState.backupId);
+    }
 }
 }  // namespace mongo

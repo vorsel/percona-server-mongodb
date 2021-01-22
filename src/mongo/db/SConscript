@@ -2135,6 +2135,7 @@ env.Library(
         'mongod_options_init',
         'periodic_runner_job_abort_expired_transactions',
         'pipeline/aggregation',
+        'pipeline/pipeline_mongod',
         'pipeline/process_interface/mongod_process_interface_factory',
         'query_exec',
         'read_concern_d_impl',
