@@ -412,6 +412,7 @@ mongod = env.Program(
         'db/periodic_runner_job_abort_expired_transactions',
         'db/periodic_runner_job_decrease_snapshot_cache_pressure',
         'db/pipeline/aggregation',
+        'db/pipeline/pipeline_mongod',
         'db/pipeline/process_interface/mongod_process_interface_factory',
         'db/query_exec',
         'db/read_concern_d_impl',
