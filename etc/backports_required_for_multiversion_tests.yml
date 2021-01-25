@@ -74,6 +74,22 @@ all:
     test_file: jstests/replsets/ismaster1.js
   - ticket: SERVER-49991
     test_file: jstests/replsets/get_replication_info_helper.js
+  - ticket: SERVER-51262
+    test_file: jstests/replsets/read_operations_during_rollback.js
+  - ticket: SERVER-51262
+    test_file: jstests/replsets/transactions_on_secondaries_not_allowed.js
+  - ticket: SERVER-50416
+    test_file: jstests/replsets/disconnect_on_legacy_write_to_secondary.js
+  - ticket: SERVER-50417
+    test_file: jstests/replsets/no_disconnect_on_stepdown.js
+  - ticket: SERVER-50417
+    test_file: jstests/replsets/not_master_unacknowledged_write.js
+  - ticket: SERVER-50417
+    test_file: jstests/replsets/read_operations_during_step_down.js
+  - ticket: SERVER-50417
+    test_file: jstests/replsets/read_operations_during_step_up.js
+  - ticket: SERVER-50769
+    test_file: jstests/sharding/change_stream_empty_apply_ops.js
 
 # Tests that should only be excluded from particular suites should be listed under that suite.
 suites:

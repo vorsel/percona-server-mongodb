@@ -99,22 +99,22 @@ namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(rsStopGetMore);
 MONGO_FAIL_POINT_DEFINE(respondWithNotPrimaryInCommandDispatch);
-MONGO_FAIL_POINT_DEFINE(skipCheckingForNotMasterInCommandDispatch);
+MONGO_FAIL_POINT_DEFINE(skipCheckingForNotPrimaryInCommandDispatch);
 MONGO_FAIL_POINT_DEFINE(sleepMillisAfterCommandExecutionBegins);
 MONGO_FAIL_POINT_DEFINE(waitAfterCommandFinishesExecution);
 MONGO_FAIL_POINT_DEFINE(waitAfterNewStatementBlocksBehindPrepare);
 
 // Tracks the number of times a legacy unacknowledged write failed due to
-// not master error resulted in network disconnection.
-Counter64 notMasterLegacyUnackWrites;
-ServerStatusMetricField<Counter64> displayNotMasterLegacyUnackWrites(
-    "repl.network.notMasterLegacyUnacknowledgedWrites", &notMasterLegacyUnackWrites);
+// not primary error resulted in network disconnection.
+Counter64 notPrimaryLegacyUnackWrites;
+ServerStatusMetricField<Counter64> displayNotPrimaryLegacyUnackWrites(
+    "repl.network.notPrimaryLegacyUnacknowledgedWrites", &notPrimaryLegacyUnackWrites);
 
-// Tracks the number of times an unacknowledged write failed due to not master error
+// Tracks the number of times an unacknowledged write failed due to not primary error
 // resulted in network disconnection.
-Counter64 notMasterUnackWrites;
-ServerStatusMetricField<Counter64> displayNotMasterUnackWrites(
-    "repl.network.notMasterUnacknowledgedWrites", &notMasterUnackWrites);
+Counter64 notPrimaryUnackWrites;
+ServerStatusMetricField<Counter64> displayNotPrimaryUnackWrites(
+    "repl.network.notPrimaryUnacknowledgedWrites", &notPrimaryUnackWrites);
 
 namespace {
 using logger::LogComponent;
@@ -301,10 +301,6 @@ LogicalTime computeOperationTime(OperationContext* opCtx, LogicalTime startOpera
     const bool isReplSet =
         replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
     invariant(isReplSet);
-
-    if (startOperationTime == LogicalTime::kUninitialized) {
-        return LogicalTime(replCoord->getMyLastAppliedOpTime().getTimestamp());
-    }
 
     auto operationTime = getClientOperationTime(opCtx);
     invariant(operationTime >= startOperationTime);
@@ -768,7 +764,7 @@ void execCommandDatabase(OperationContext* opCtx,
         const bool iAmPrimary = replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, dbname);
 
         if (!opCtx->getClient()->isInDirectClient() &&
-            !MONGO_FAIL_POINT(skipCheckingForNotMasterInCommandDispatch)) {
+            !MONGO_FAIL_POINT(skipCheckingForNotPrimaryInCommandDispatch)) {
             const bool inMultiDocumentTransaction = (sessionOptions.getAutocommit() == false);
             auto allowed = command->secondaryAllowed(opCtx->getServiceContext());
             bool alwaysAllowed = allowed == Command::AllowedOnSecondary::kAlways;
@@ -1074,7 +1070,7 @@ DbResponse receivedCommands(OperationContext* opCtx,
     if (OpMsg::isFlagSet(message, OpMsg::kMoreToCome)) {
         // Close the connection to get client to go through server selection again.
         if (LastError::get(opCtx->getClient()).hadNotPrimaryError()) {
-            notMasterUnackWrites.increment();
+            notPrimaryUnackWrites.increment();
             uasserted(ErrorCodes::NotWritablePrimary,
                       str::stream()
                           << "Not-master error while processing '" << request.getCommandName()
@@ -1405,7 +1401,7 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
         // above.  Either way, we want to throw an exception here, which will cause the client to be
         // disconnected.
         if (LastError::get(opCtx->getClient()).hadNotPrimaryError()) {
-            notMasterLegacyUnackWrites.increment();
+            notPrimaryLegacyUnackWrites.increment();
             uasserted(ErrorCodes::NotWritablePrimary,
                       str::stream()
                           << "Not-master error while processing '" << networkOpToString(op)
