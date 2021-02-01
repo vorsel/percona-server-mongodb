@@ -214,7 +214,22 @@ void WiredTigerBackupCursorHooks::_closeBackupCursor(OperationContext* opCtx,
 BackupCursorExtendState WiredTigerBackupCursorHooks::extendBackupCursor(OperationContext* opCtx,
                                                                         const UUID& backupId,
                                                                         const Timestamp& extendTo) {
-    MONGO_UNREACHABLE;
+    stdx::lock_guard<stdx::mutex> lk(_mutex);
+    uassert(50887, "The node is currently fsyncLocked.", _state != kFsyncLocked);
+    uassert(50886,
+            "Cannot extend backup cursor because backup cursor is not open",
+            _state == kBackupCursorOpened);
+    uassert(29094,
+            "backupId provided to $backupCursorExtend does not match active backup",
+            _openCursor == backupId);
+    // TODO: validate extendTo (here or in DocumentSourceBackupCursorExtend)
+    // TODO: wait for extendTo
+    // TODO: use WiredTigerKVEngine::extendBackupCursor
+    auto res = _storageEngine->extendBackupCursor(opCtx);
+    if (!res.isOK()) {
+        LOGV2_FATAL(29095, "Failed to extend backup cursor", "reason"_attr = res.getStatus());
+    }
+    return {std::move(res.getValue())};
 }
 
 bool WiredTigerBackupCursorHooks::isBackupCursorOpen() const {
