@@ -95,6 +95,7 @@ public:
      * Interface for durability.  Caller DOES NOT own pointer.
      */
     RecoveryUnit* recoveryUnit() const {
+        invariant(_recoveryUnit);
         return _recoveryUnit.get();
     }
 
@@ -124,6 +125,7 @@ public:
      * Interface for locking.  Caller DOES NOT own pointer.
      */
     Locker* lockState() const {
+        invariant(_locker);
         return _locker.get();
     }
 
