@@ -211,8 +211,14 @@ err:
          */
         cfg[0] = WT_CONFIG_BASE(session, WT_SESSION_checkpoint);
         cfg[1] = "force=true";
+        /*
+         * Metadata checkpoints rely on read-committed isolation. Use that here no matter what
+         * isolation the caller's session sets for isolation.
+         */
         WT_WITH_DHANDLE(session, WT_SESSION_META_DHANDLE(session),
-          WT_WITH_METADATA_LOCK(session, ret = __wt_checkpoint(session, cfg)));
+          WT_WITH_METADATA_LOCK(session,
+            WT_WITH_TXN_ISOLATION(
+              session, WT_ISO_READ_COMMITTED, ret = __wt_checkpoint(session, cfg))));
     }
 
     /*
@@ -605,6 +611,11 @@ __backup_config(WT_SESSION_IMPL *session, WT_CURSOR_BACKUP *cb, const char *cfg[
               session, EINVAL, "Incremental primary cursor must have a known source identifier");
         F_SET(cb, WT_CURBACKUP_INCR);
     }
+
+    /* Return an error if block-based incremental backup is performed with open LSM trees. */
+    if (incremental_config && !TAILQ_EMPTY(&conn->lsmqh))
+        WT_ERR_MSG(session, ENOTSUP, "LSM does not work with block-based incremental backup");
+
 err:
     if (ret != 0 && cb->incr_src != NULL) {
         F_CLR(cb->incr_src, WT_BLKINCR_INUSE);
@@ -872,7 +883,8 @@ __backup_list_uri_append(WT_SESSION_IMPL *session, const char *name, bool *skip)
      */
     if (!WT_PREFIX_MATCH(name, "file:") && !WT_PREFIX_MATCH(name, "colgroup:") &&
       !WT_PREFIX_MATCH(name, "index:") && !WT_PREFIX_MATCH(name, "lsm:") &&
-      !WT_PREFIX_MATCH(name, WT_SYSTEM_PREFIX) && !WT_PREFIX_MATCH(name, "table:"))
+      !WT_PREFIX_MATCH(name, WT_SYSTEM_PREFIX) && !WT_PREFIX_MATCH(name, "table:") &&
+      !WT_PREFIX_MATCH(name, "tiered:"))
         WT_RET_MSG(session, ENOTSUP, "hot backup is not supported for objects of type %s", name);
 
     /* Add the metadata entry to the backup file. */

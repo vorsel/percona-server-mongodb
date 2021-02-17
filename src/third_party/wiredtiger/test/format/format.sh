@@ -55,8 +55,7 @@ smoke_list=(
 	# "$smoke_base_1 file_type=var huffman_value=1"
 
 	# LSM
-    # Temporarily disabled
-	# "$smoke_base_1 file_type=row data_source=lsm"
+	"$smoke_base_1 file_type=row data_source=lsm"
 
 	# Force the statistics server.
 	"$smoke_base_1 file_type=row statistics_server=1"
@@ -364,7 +363,7 @@ resolve()
 			grep 'data_source=file' $dir/CONFIG > /dev/null && uri="file:wt"
 
 			# Use the wt utility to recover & verify the object.
-			if  $($wt_binary -R -h $dir verify $uri >> $log 2>&1); then
+			if  $($wt_binary -m -R -h $dir verify $uri >> $log 2>&1); then
 				rm -rf $dir $dir.RECOVER $log
 				success=$(($success + 1))
 				verbose "$name: job in $dir successfully completed"

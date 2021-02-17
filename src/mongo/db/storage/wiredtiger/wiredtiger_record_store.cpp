@@ -104,6 +104,7 @@ void checkOplogFormatVersion(OperationContext* opCtx, const std::string& uri) {
 }
 }  // namespace
 
+MONGO_FAIL_POINT_DEFINE(WTCompactRecordStoreEBUSY);
 MONGO_FAIL_POINT_DEFINE(WTWriteConflictException);
 MONGO_FAIL_POINT_DEFINE(WTWriteConflictExceptionForReads);
 MONGO_FAIL_POINT_DEFINE(slowOplogSamplingReads);
@@ -249,6 +250,14 @@ void WiredTigerRecordStore::OplogStones::awaitHasExcessStonesOrDead() {
                 // size allotment.
                 auto stone = _stones.front();
                 invariant(stone.lastRecord.isValid());
+
+                LOGV2_DEBUG(5384100,
+                            2,
+                            "Oplog has excess stones",
+                            "lastRecord"_attr = stone.lastRecord,
+                            "wallTime"_attr = stone.wallTime,
+                            "pinnedOplog"_attr = _rs->getPinnedOplog());
+
                 if (static_cast<std::uint64_t>(stone.lastRecord.repr()) <
                     _rs->getPinnedOplog().asULL()) {
                     break;
@@ -305,16 +314,25 @@ void WiredTigerRecordStore::OplogStones::popOldestStone() {
 void WiredTigerRecordStore::OplogStones::createNewStoneIfNeeded(OperationContext* opCtx,
                                                                 RecordId lastRecord,
                                                                 Date_t wallTime) {
+    auto logFailedLockAcquisition = [&](const std::string& lock) {
+        LOGV2_DEBUG(5384101,
+                    2,
+                    "Failed to acquire lock to check if a new oplog stone is needed",
+                    "lock"_attr = lock);
+    };
+
     // Try to lock both mutexes, if we fail to lock a mutex then someone else is either already
     // creating a new stone or popping the oldest one. In the latter case, we let the next insert
     // trigger the new stone's creation.
     stdx::unique_lock<Latch> reclaimLk(_oplogReclaimMutex, stdx::try_to_lock);
     if (!reclaimLk) {
+        logFailedLockAcquisition("_oplogReclaimMutex");
         return;
     }
 
     stdx::unique_lock<Latch> lk(_mutex, stdx::try_to_lock);
     if (!lk) {
+        logFailedLockAcquisition("_mutex");
         return;
     }
 
@@ -330,13 +348,15 @@ void WiredTigerRecordStore::OplogStones::createNewStoneIfNeeded(OperationContext
         return;
     }
 
-    LOGV2_DEBUG(22381,
-                2,
-                "create new oplogStone, current stones:{stones_size}",
-                "stones_size"_attr = _stones.size());
-
     OplogStones::Stone stone(_currentRecords.swap(0), _currentBytes.swap(0), lastRecord, wallTime);
     _stones.push_back(stone);
+
+    LOGV2_DEBUG(22381,
+                2,
+                "Created a new oplog stone",
+                "lastRecord"_attr = stone.lastRecord,
+                "wallTime"_attr = stone.wallTime,
+                "numStones"_attr = _stones.size());
 
     _pokeReclaimThreadIfNeeded();
 }
@@ -1736,6 +1756,15 @@ Status WiredTigerRecordStore::compact(OperationContext* opCtx) {
         WT_SESSION* s = WiredTigerRecoveryUnit::get(opCtx)->getSession()->getSession();
         opCtx->recoveryUnit()->abandonSnapshot();
         int ret = s->compact(s, getURI().c_str(), "timeout=0");
+        if (MONGO_unlikely(WTCompactRecordStoreEBUSY.shouldFail())) {
+            ret = EBUSY;
+        }
+
+        if (ret == EBUSY) {
+            return Status(ErrorCodes::Interrupted,
+                          str::stream() << "Compaction interrupted on " << getURI().c_str()
+                                        << " due to cache eviction pressure");
+        }
         invariantWTOK(ret);
     }
     return Status::OK();

@@ -487,11 +487,6 @@ public:
     HeartbeatResponseAction checkMemberTimeouts(Date_t now);
 
     /**
-     * Set all nodes in memberData to not stale with a lastUpdate of "now".
-     */
-    void resetAllMemberTimeouts(Date_t now);
-
-    /**
      * Set all nodes in memberData that are present in member_set
      * to not stale with a lastUpdate of "now".
      */
@@ -717,9 +712,9 @@ public:
     void setStorageEngineSupportsReadCommitted(bool supported);
 
     /**
-     * Reset the booleans to record the last heartbeat restart.
+     * Reset the booleans to record the last heartbeat restart for the target node.
      */
-    void restartHeartbeats();
+    void restartHeartbeat(const Date_t now, const HostAndPort& target);
 
     /**
      * Increments the counter field of the current TopologyVersion.
@@ -748,10 +743,10 @@ public:
         const;
 
     /**
-     * Checks if the 'commitQuorum' can be satisifed by the current replica set config. Returns true
-     * if it can be satisfied.
+     * Checks if the 'commitQuorum' can be satisifed by the current replica set config. Returns an
+     * OK Status if it can be satisfied, and an error otherwise.
      */
-    bool checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum) const;
+    Status checkIfCommitQuorumCanBeSatisfied(const CommitQuorumOptions& commitQuorum) const;
 
     /**
      * Returns nullptr if there is no primary, or the MemberConfig* for the current primary.

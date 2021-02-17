@@ -100,7 +100,7 @@ __hs_cursor_position_int(WT_SESSION_IMPL *session, WT_CURSOR *cursor, uint32_t b
     int cmp, exact;
 
     /* The session should be pointing at the history store btree. */
-    WT_ASSERT(session, WT_IS_HS(S2BT(session)));
+    WT_ASSERT(session, WT_IS_HS((S2BT(session))->dhandle));
 
     if (user_srch_key == NULL)
         WT_RET(__wt_scr_alloc(session, 0, &srch_key));
@@ -130,8 +130,7 @@ __hs_cursor_position_int(WT_SESSION_IMPL *session, WT_CURSOR *cursor, uint32_t b
          * backwards until we land on our key.
          */
         while ((ret = cursor->prev(cursor)) == 0) {
-            WT_STAT_CONN_INCR(session, cursor_skip_hs_cur_position);
-            WT_STAT_DATA_INCR(session, cursor_skip_hs_cur_position);
+            WT_STAT_CONN_DATA_INCR(session, cursor_skip_hs_cur_position);
 
             WT_ERR(__wt_compare(session, NULL, &cursor->key, srch_key, &cmp));
             if (cmp <= 0)
@@ -181,7 +180,7 @@ __wt_hs_cursor_position(WT_SESSION_IMPL *session, WT_CURSOR *cursor, uint32_t bt
 static int
 __hs_find_upd_int(WT_SESSION_IMPL *session, uint32_t btree_id, WT_ITEM *key,
   const char *value_format, uint64_t recno, WT_UPDATE_VALUE *upd_value, bool allow_prepare,
-  WT_ITEM *on_disk_buf, WT_TIME_WINDOW *on_disk_tw)
+  WT_ITEM *base_value_buf)
 {
     WT_CURSOR *hs_cursor;
     WT_CURSOR_BTREE *hs_cbt;
@@ -210,8 +209,7 @@ __hs_find_upd_int(WT_SESSION_IMPL *session, uint32_t btree_id, WT_ITEM *key,
     txn_shared = WT_SESSION_TXN_SHARED(session);
     upd_found = false;
 
-    WT_STAT_CONN_INCR(session, cursor_search_hs);
-    WT_STAT_DATA_INCR(session, cursor_search_hs);
+    WT_STAT_CONN_DATA_INCR(session, cursor_search_hs);
 
     hs_cursor = session->hs_cursor;
     hs_cbt = (WT_CURSOR_BTREE *)hs_cursor;
@@ -278,8 +276,7 @@ __hs_find_upd_int(WT_SESSION_IMPL *session, uint32_t btree_id, WT_ITEM *key,
          * we can skip it.
          */
         if (__wt_txn_tw_stop_visible_all(session, &hs_cbt->upd_value->tw)) {
-            WT_STAT_CONN_INCR(session, cursor_prev_hs_tombstone);
-            WT_STAT_DATA_INCR(session, cursor_prev_hs_tombstone);
+            WT_STAT_CONN_DATA_INCR(session, cursor_prev_hs_tombstone);
             continue;
         }
         /*
@@ -336,14 +333,14 @@ __hs_find_upd_int(WT_SESSION_IMPL *session, uint32_t btree_id, WT_ITEM *key,
             WT_ERR_NOTFOUND_OK(__wt_hs_cursor_next(session, hs_cursor), true);
             if (ret == WT_NOTFOUND) {
                 /*
-                 * Fallback to the onpage value as the base value.
+                 * Fallback to the provided value as the base value.
                  *
                  * Work around of clang analyzer complaining the value is never read as it is reset
                  * again by the following WT_ERR macro.
                  */
                 WT_NOT_READ(ret, 0);
                 orig_hs_value_buf = hs_value;
-                hs_value = on_disk_buf;
+                hs_value = base_value_buf;
                 upd_type = WT_UPDATE_STANDARD;
                 break;
             }
@@ -359,9 +356,9 @@ __hs_find_upd_int(WT_SESSION_IMPL *session, uint32_t btree_id, WT_ITEM *key,
               hs_cursor, &hs_btree_id, &hs_key, &hs_start_ts_tmp, &hs_counter_tmp));
 
             if (hs_btree_id != btree_id) {
-                /* Fallback to the onpage value as the base value. */
+                /* Fallback to the provided value as the base value. */
                 orig_hs_value_buf = hs_value;
-                hs_value = on_disk_buf;
+                hs_value = base_value_buf;
                 upd_type = WT_UPDATE_STANDARD;
                 break;
             }
@@ -369,24 +366,22 @@ __hs_find_upd_int(WT_SESSION_IMPL *session, uint32_t btree_id, WT_ITEM *key,
             WT_ERR(__wt_compare(session, NULL, &hs_key, key, &cmp));
 
             if (cmp != 0) {
-                /* Fallback to the onpage value as the base value. */
+                /* Fallback to the provided value as the base value. */
                 orig_hs_value_buf = hs_value;
-                hs_value = on_disk_buf;
+                hs_value = base_value_buf;
                 upd_type = WT_UPDATE_STANDARD;
                 break;
             }
 
             /*
-             * If we find a history store record that either corresponds to the on-disk value or is
-             * newer than it then we should use the on-disk value as the base value and apply our
-             * modifies on top of it.
+             * If the stop time pair on the tombstone in the history store is already globally
+             * visible fall back to the base value. This is possible in scenarios where the latest
+             * updates are aborted by RTS according to stable timestamp.
              */
-            if (on_disk_tw->start_ts < hs_start_ts_tmp ||
-              (on_disk_tw->start_ts == hs_start_ts_tmp &&
-                on_disk_tw->start_txn <= hs_cbt->upd_value->tw.start_txn)) {
-                /* Fallback to the onpage value as the base value. */
+            if (__wt_txn_tw_stop_visible_all(session, &hs_cbt->upd_value->tw)) {
+                /* Fallback to the provided value as the base value. */
                 orig_hs_value_buf = hs_value;
-                hs_value = on_disk_buf;
+                hs_value = base_value_buf;
                 upd_type = WT_UPDATE_STANDARD;
                 break;
             }
@@ -401,8 +396,7 @@ __hs_find_upd_int(WT_SESSION_IMPL *session, uint32_t btree_id, WT_ITEM *key,
             WT_ERR(__wt_modify_apply_item(session, value_format, hs_value, mod_upd->data));
             __wt_free_update_list(session, &mod_upd);
         }
-        WT_STAT_CONN_INCR(session, cache_hs_read_squash);
-        WT_STAT_DATA_INCR(session, cache_hs_read_squash);
+        WT_STAT_CONN_DATA_INCR(session, cache_hs_read_squash);
     }
 
     /*
@@ -432,13 +426,11 @@ err:
     __wt_modify_vector_free(&modifies);
 
     if (ret == 0) {
-        if (upd_found) {
-            WT_STAT_CONN_INCR(session, cache_hs_read);
-            WT_STAT_DATA_INCR(session, cache_hs_read);
-        } else {
+        if (upd_found)
+            WT_STAT_CONN_DATA_INCR(session, cache_hs_read);
+        else {
             upd_value->type = WT_UPDATE_INVALID;
-            WT_STAT_CONN_INCR(session, cache_hs_read_miss);
-            WT_STAT_DATA_INCR(session, cache_hs_read_miss);
+            WT_STAT_CONN_DATA_INCR(session, cache_hs_read_miss);
         }
     }
 
@@ -457,7 +449,7 @@ err:
  */
 int
 __wt_hs_find_upd(WT_SESSION_IMPL *session, WT_ITEM *key, const char *value_format, uint64_t recno,
-  WT_UPDATE_VALUE *upd_value, bool allow_prepare, WT_ITEM *on_disk_buf, WT_TIME_WINDOW *on_disk_tw)
+  WT_UPDATE_VALUE *upd_value, bool allow_prepare, WT_ITEM *base_value_buf)
 {
     WT_BTREE *btree;
     WT_DECL_RET;
@@ -466,8 +458,8 @@ __wt_hs_find_upd(WT_SESSION_IMPL *session, WT_ITEM *key, const char *value_forma
 
     WT_RET(__wt_hs_cursor_open(session));
     WT_WITH_BTREE(session, CUR2BT(session->hs_cursor),
-      (ret = __hs_find_upd_int(session, btree->id, key, value_format, recno, upd_value,
-         allow_prepare, on_disk_buf, on_disk_tw)));
+      (ret = __hs_find_upd_int(
+         session, btree->id, key, value_format, recno, upd_value, allow_prepare, base_value_buf)));
     WT_TRET(__wt_hs_cursor_close(session));
     return (ret);
 }

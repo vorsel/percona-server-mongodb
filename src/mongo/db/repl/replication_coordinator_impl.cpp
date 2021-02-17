@@ -682,6 +682,11 @@ void ReplicationCoordinatorImpl::_stopDataReplication(OperationContext* opCtx) {
     std::shared_ptr<InitialSyncer> initialSyncerCopy;
     {
         stdx::lock_guard<Latch> lk(_mutex);
+        if (!_startedSteadyStateReplication) {
+            return;
+        }
+
+        _startedSteadyStateReplication = false;
         _initialSyncer.swap(initialSyncerCopy);
     }
     if (initialSyncerCopy) {
@@ -708,20 +713,24 @@ void ReplicationCoordinatorImpl::_stopDataReplication(OperationContext* opCtx) {
 
 void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
                                                        std::function<void()> startCompleted) {
-    if (_startedSteadyStateReplication.swap(true)) {
-        // This is not the first call.
+    stdx::unique_lock<Latch> lk(_mutex);
+    if (_startedSteadyStateReplication) {
         return;
     }
 
+    _startedSteadyStateReplication = true;
+
     // Check to see if we need to do an initial sync.
-    const auto lastOpTime = getMyLastAppliedOpTime();
+    const auto lastOpTime = _getMyLastAppliedOpTime_inlock();
     const auto needsInitialSync =
         lastOpTime.isNull() || _externalState->isInitialSyncFlagSet(opCtx);
     if (!needsInitialSync) {
         // Start steady replication, since we already have data.
         // ReplSetConfig has been installed, so it's either in STARTUP2 or REMOVED.
-        auto memberState = getMemberState();
+        auto memberState = _getMemberState_inlock();
         invariant(memberState.startup2() || memberState.removed());
+
+        lk.unlock();
         invariant(setFollowerMode(MemberState::RS_RECOVERING));
         // Set an initial sync ID, in case we were upgraded or restored from backup without doing
         // an initial sync.
@@ -784,8 +793,6 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
     std::shared_ptr<InitialSyncer> initialSyncerCopy;
     try {
         {
-            // Must take the lock to set _initialSyncer, but not call it.
-            stdx::lock_guard<Latch> lock(_mutex);
             if (_inShutdown) {
                 LOGV2(21326, "Initial Sync not starting because replication is shutting down");
                 return;
@@ -802,6 +809,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
         }
         // InitialSyncer::startup() must be called outside lock because it uses features (eg.
         // setting the initial sync flag) which depend on the ReplicationCoordinatorImpl.
+        lk.unlock();
         uassertStatusOK(initialSyncerCopy->startup(opCtx, numInitialSyncAttempts.load()));
     } catch (const DBException& e) {
         auto status = e.toStatus();
@@ -3951,8 +3959,13 @@ void ReplicationCoordinatorImpl::_postWonElectionUpdateMemberState(WithLock lk) 
     invariant(_getMemberState_inlock().primary());
     // Clear the sync source.
     _onFollowerModeStateChange();
-    // Notify all secondaries of the election win.
-    _restartHeartbeats_inlock();
+
+    // Notify all secondaries of the election win by cancelling all current heartbeats and sending
+    // new heartbeat requests to all nodes. We must cancel and start instead of restarting scheduled
+    // heartbeats because all heartbeats must be restarted upon election succeeding.
+    _cancelHeartbeats_inlock();
+    _startHeartbeats_inlock();
+
     invariant(!_catchupState);
     _catchupState = std::make_unique<CatchupState>(this);
     _catchupState->start_inlock();
@@ -4391,13 +4404,7 @@ Status ReplicationCoordinatorImpl::_checkIfCommitQuorumCanBeSatisfied(
 
     // We need to ensure that the 'commitQuorum' can be satisfied by all the members of this
     // replica set.
-    bool commitQuorumCanBeSatisfied = _topCoord->checkIfCommitQuorumCanBeSatisfied(commitQuorum);
-    if (!commitQuorumCanBeSatisfied) {
-        return Status(ErrorCodes::UnsatisfiableCommitQuorum,
-                      str::stream() << "Commit quorum cannot be satisfied with the current replica "
-                                    << "set configuration");
-    }
-    return Status::OK();
+    return _topCoord->checkIfCommitQuorumCanBeSatisfied(commitQuorum);
 }
 
 WriteConcernOptions ReplicationCoordinatorImpl::getGetLastErrorDefault() {
@@ -4473,7 +4480,7 @@ HostAndPort ReplicationCoordinatorImpl::chooseNewSyncSource(const OpTime& lastOp
     // of other members's state, allowing us to make informed sync source decisions.
     if (newSyncSource.empty() && !oldSyncSource.empty() && _selfIndex >= 0 &&
         !_getMemberState_inlock().primary()) {
-        _restartHeartbeats_inlock();
+        _restartScheduledHeartbeats_inlock();
     }
 
     return newSyncSource;
@@ -4981,7 +4988,7 @@ Status ReplicationCoordinatorImpl::processHeartbeatV1(const ReplSetHeartbeatArgs
                   "Scheduling heartbeat to fetch a new config since we are not "
                   "a member of our current config",
                   "senderHost"_attr = senderHost);
-            _scheduleHeartbeatToTarget_inlock(senderHost, -1, now);
+            _scheduleHeartbeatToTarget_inlock(senderHost, now);
         }
     } else if (result.isOK() &&
                response->getConfigVersionAndTerm() < args.getConfigVersionAndTerm()) {
@@ -5006,8 +5013,26 @@ Status ReplicationCoordinatorImpl::processHeartbeatV1(const ReplSetHeartbeatArgs
         // will trigger reconfig, which cancels and reschedules all heartbeats.
         else if (args.hasSender()) {
             LOGV2(21401, "Scheduling heartbeat to fetch a newer config", attr);
-            int senderIndex = _rsConfig.findMemberIndexByHostAndPort(senderHost);
-            _scheduleHeartbeatToTarget_inlock(senderHost, senderIndex, now);
+            _scheduleHeartbeatToTarget_inlock(senderHost, now);
+        }
+    } else if (result.isOK() && args.getPrimaryId() >= 0 &&
+               (!response->hasPrimaryId() || response->getPrimaryId() != args.getPrimaryId())) {
+        // If the sender thinks the primary is different from what we think and if the sender itself
+        // is the primary, then we want to update our view of primary by immediately sending out a
+        // new round of heartbeats, whose responses should inform us of the new primary. We only do
+        // this if the term of the heartbeat is greater than or equal to our own, to prevent
+        // updating our view to a stale primary.
+        if (args.hasSender() && args.getSenderId() == args.getPrimaryId() &&
+            args.getTerm() >= _topCoord->getTerm()) {
+            std::string myPrimaryId =
+                (response->hasPrimaryId() ? (str::stream() << response->getPrimaryId())
+                                          : std::string("none"));
+            LOGV2(2903000,
+                  "Restarting heartbeats after learning of a new primary",
+                  "myPrimaryId"_attr = myPrimaryId,
+                  "senderAndPrimaryId"_attr = args.getPrimaryId(),
+                  "senderTerm"_attr = args.getTerm());
+            _restartScheduledHeartbeats_inlock();
         }
     }
     return result;
