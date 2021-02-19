@@ -341,7 +341,7 @@ install_deps() {
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint rpm-build git python-pip python-devel libopcodes libcurl-devel e2fsprogs-devel expat-devel lz4-devel which
         yum -y install python2-scons python2-pip python36-devel redhat-rpm-config python2-devel
         yum -y install openldap-devel krb5-devel
-        pip install --upgrade pip
+        pip install --upgrade "pip < 21.0"
         pip2.7 install --user setuptools --upgrade
         pip3.6 install --user typing pyyaml regex Cheetah3
         pip2.7 install --user typing pyyaml regex Cheetah Cheetah3
