@@ -36,6 +36,7 @@
 #include <ostream>
 
 #include "mongo/base/error_codes.h"
+#include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog.h"
@@ -66,8 +67,8 @@ MONGO_FAIL_POINT_DEFINE(hangAfterSettingUpIndexBuild);
 MONGO_FAIL_POINT_DEFINE(hangAfterSettingUpIndexBuildUnlocked);
 MONGO_FAIL_POINT_DEFINE(hangAfterStartingIndexBuild);
 MONGO_FAIL_POINT_DEFINE(hangAfterStartingIndexBuildUnlocked);
-MONGO_FAIL_POINT_DEFINE(hangBeforeIndexBuildOf);
-MONGO_FAIL_POINT_DEFINE(hangAfterIndexBuildOf);
+MONGO_FAIL_POINT_DEFINE(hangIndexBuildDuringCollectionScanPhaseBeforeInsertion);
+MONGO_FAIL_POINT_DEFINE(hangIndexBuildDuringCollectionScanPhaseAfterInsertion);
 MONGO_FAIL_POINT_DEFINE(leaveIndexBuildUnfinishedForShutdown);
 
 MultiIndexBlock::~MultiIndexBlock() {
@@ -179,6 +180,7 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
                 index.block->finalizeTemporaryTables(
                     opCtx, TemporaryRecordStore::FinalizationAction::kDelete);
             }
+            _indexes.clear();
             _buildIsCleanedUp = true;
         });
 
@@ -187,9 +189,9 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
         for (const auto& info : indexSpecs) {
             if (info["background"].isBoolean() && !info["background"].Bool()) {
                 LOGV2(20383,
-                      "Ignoring obselete {{ background: false }} index build option because all "
+                      "Ignoring obsolete {{ background: false }} index build option because all "
                       "indexes are built in the background with the hybrid method",
-                      "Ignoring obselete { background: false } index build option because all "
+                      "Ignoring obsolete { background: false } index build option because all "
                       "indexes are built in the background with the hybrid method");
             }
         }
@@ -310,14 +312,20 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
 void failPointHangDuringBuild(FailPoint* fp, StringData where, const BSONObj& doc) {
     fp->executeIf(
         [&](const BSONObj& data) {
-            int i = doc.getIntField("i");
-            LOGV2(
-                20386, "Hanging {where} index build of i={i}", "where"_attr = where, "i"_attr = i);
+            LOGV2(20386,
+                  "Hanging index build during collection scan phase insertion",
+                  "where"_attr = where,
+                  "doc"_attr = doc);
+
             fp->pauseWhileSet();
         },
-        [&](const BSONObj& data) {
-            int i = doc.getIntField("i");
-            return data["i"].numberInt() == i;
+        [&doc](const BSONObj& data) {
+            auto fieldsToMatch = data.getObjectField("fieldsToMatch");
+            return std::all_of(
+                fieldsToMatch.begin(), fieldsToMatch.end(), [&doc](const auto& elem) {
+                    return SimpleBSONElementComparator::kInstance.evaluate(elem ==
+                                                                           doc[elem.fieldName()]);
+                });
         });
 }
 
@@ -407,16 +415,18 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(OperationContext* opCtx,
 
             progress->setTotalWhileRunning(collection->numRecords(opCtx));
 
-            failPointHangDuringBuild(&hangBeforeIndexBuildOf, "before", objToIndex);
+            failPointHangDuringBuild(
+                &hangIndexBuildDuringCollectionScanPhaseBeforeInsertion, "before", objToIndex);
 
             // The external sorter is not part of the storage engine and therefore does not need a
             // WriteUnitOfWork to write keys.
-            Status ret = insert(opCtx, objToIndex, loc);
+            Status ret = insertSingleDocumentForInitialSyncOrRecovery(opCtx, objToIndex, loc);
             if (!ret.isOK()) {
                 return ret;
             }
 
-            failPointHangDuringBuild(&hangAfterIndexBuildOf, "after", objToIndex);
+            failPointHangDuringBuild(
+                &hangIndexBuildDuringCollectionScanPhaseAfterInsertion, "after", objToIndex);
 
             // Go to the next document.
             progress->hit();
@@ -470,14 +480,15 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(OperationContext* opCtx,
     return Status::OK();
 }
 
-Status MultiIndexBlock::insert(OperationContext* opCtx, const BSONObj& doc, const RecordId& loc) {
+Status MultiIndexBlock::insertSingleDocumentForInitialSyncOrRecovery(OperationContext* opCtx,
+                                                                     const BSONObj& doc,
+                                                                     const RecordId& loc) {
     invariant(!_buildIsCleanedUp);
     for (size_t i = 0; i < _indexes.size(); i++) {
         if (_indexes[i].filterExpression && !_indexes[i].filterExpression->matchesBSON(doc)) {
             continue;
         }
 
-        InsertResult result;
         Status idxStatus = Status::OK();
 
         // When calling insert, BulkBuilderImpl's Sorter performs file I/O that may result in an
@@ -506,7 +517,8 @@ Status MultiIndexBlock::dumpInsertsFromBulk(OperationContext* opCtx,
     invariant(!_buildIsCleanedUp);
     invariant(opCtx->lockState()->isNoop() || !opCtx->lockState()->inAWriteUnitOfWork());
 
-    // Initial sync adds documents to the sorter using insert() instead of delegating to
+    // Initial sync adds documents to the sorter using
+    // insertSingleDocumentForInitialSyncOrRecovery() instead of delegating to
     // insertDocumentsInCollection() to scan and insert the contents of the collection.
     // Therefore, it is possible for the phase of this MultiIndexBlock to be kInitialized
     // rather than kCollection when this function is called.
@@ -515,11 +527,6 @@ Status MultiIndexBlock::dumpInsertsFromBulk(OperationContext* opCtx,
     _phase = Phase::kBulkLoad;
 
     for (size_t i = 0; i < _indexes.size(); i++) {
-        // If 'dupRecords' is provided, it will be used to store all records that would result in
-        // duplicate key errors. Only pass 'dupKeysInserted', which stores inserted duplicate keys,
-        // when 'dupRecords' is not used because these two vectors are mutually incompatible.
-        std::vector<BSONObj> dupKeysInserted;
-
         // When dupRecords is passed, 'dupsAllowed' should be passed to reflect whether or not the
         // index is unique.
         bool dupsAllowed = (dupRecords) ? !_indexes[i].block->getEntry()->descriptor()->unique()
@@ -535,29 +542,22 @@ Status MultiIndexBlock::dumpInsertsFromBulk(OperationContext* opCtx,
         // SERVER-41918 This call to commitBulk() results in file I/O that may result in an
         // exception.
         try {
-            Status status = _indexes[i].real->commitBulk(opCtx,
-                                                         _indexes[i].bulk.get(),
-                                                         dupsAllowed,
-                                                         dupRecords,
-                                                         (dupRecords) ? nullptr : &dupKeysInserted);
+            Status status = _indexes[i].real->commitBulk(
+                opCtx,
+                _indexes[i].bulk.get(),
+                dupsAllowed,
+                [=](const KeyString::Value& duplicateKey) {
+                    // Do not record duplicates when explicitly ignored. This may be the case on
+                    // secondaries.
+                    return dupsAllowed && !dupRecords && !_ignoreUnique &&
+                            entry->indexBuildInterceptor()
+                        ? entry->indexBuildInterceptor()->recordDuplicateKey(opCtx, duplicateKey)
+                        : Status::OK();
+                },
+                dupRecords);
 
             if (!status.isOK()) {
                 return status;
-            }
-
-            // Do not record duplicates when explicitly ignored. This may be the case on
-            // secondaries.
-            auto interceptor = entry->indexBuildInterceptor();
-            if (!interceptor || _ignoreUnique) {
-                continue;
-            }
-
-            // Record duplicate key insertions for later verification.
-            if (dupKeysInserted.size()) {
-                status = interceptor->recordDuplicateKeys(opCtx, dupKeysInserted);
-                if (!status.isOK()) {
-                    return status;
-                }
             }
         } catch (...) {
             return exceptionToStatus();

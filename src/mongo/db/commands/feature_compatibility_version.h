@@ -52,25 +52,44 @@ public:
     static Lock::ResourceMutex fcvLock;
 
     /**
-     * Records intent to perform a 4.4 -> 4.6 upgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=4.4, 'targetVersion'=4.6.
-     * Should be called before schemas are modified.
+     * Reads the featureCompatibilityVersion (FCV) document in admin.system.version and initializes
+     * the FCV global state. Returns an error if the FCV document exists and is invalid. Does not
+     * return an error if it is missing. This should be checked after startup with
+     * fassertInitializedAfterStartup.
+     *
+     * Throws a MustDowngrade error if an existing FCV document contains an invalid version.
      */
-    static void setTargetUpgrade(OperationContext* opCtx);
+    static void initializeForStartup(OperationContext* opCtx);
 
     /**
-     * Records intent to perform a 4.6 -> 4.4 downgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=4.4, 'targetVersion'=4.4.
-     * Should be called before schemas are modified.
+     * Fatally asserts if the featureCompatibilityVersion is not properly initialized after startup.
      */
-    static void setTargetDowngrade(OperationContext* opCtx);
+    static void fassertInitializedAfterStartup(OperationContext* opCtx);
 
     /**
-     * Records the completion of a 4.4 <-> 4.6 upgrade or downgrade by updating the on-disk feature
-     * compatibility version document to have 'version'=version and unsetting the 'targetVersion'
-     * field. Should be called after schemas are modified.
+     * Records intent to perform a currentVersion -> kLatest upgrade by updating the on-disk
+     * feature compatibility version document to have 'version'=currentVersion,
+     * 'targetVersion'=kLatest. Should be called before schemas are modified.
      */
-    static void unsetTargetUpgradeOrDowngrade(OperationContext* opCtx, StringData version);
+    static void setTargetUpgradeFrom(OperationContext* opCtx,
+                                     ServerGlobalParams::FeatureCompatibility::Version fromVersion);
+
+    /**
+     * Records intent to perform a downgrade from the latest version by updating the on-disk feature
+     * compatibility version document to have 'version'=version, 'targetVersion'=version and
+     * 'previousVersion'=kLatest. Should be called before schemas are modified.
+     */
+    static void setTargetDowngrade(OperationContext* opCtx,
+                                   ServerGlobalParams::FeatureCompatibility::Version version);
+
+    /**
+     * Records the completion of a upgrade or downgrade by updating the on-disk
+     * feature compatibility version document to have 'version'=version and unsetting the
+     * 'targetVersion' field and the 'previousVersion' field. Should be called after schemas are
+     * modified.
+     */
+    static void unsetTargetUpgradeOrDowngrade(
+        OperationContext* opCtx, ServerGlobalParams::FeatureCompatibility::Version version);
 
     /**
      * If there are no non-local databases, store the featureCompatibilityVersion document. If we
@@ -105,17 +124,6 @@ public:
     static void onReplicationRollback(OperationContext* opCtx);
 
 private:
-    /**
-     * Validate version. Uasserts if invalid.
-     */
-    static void _validateVersion(StringData version);
-
-    /**
-     * Build update command.
-     */
-    typedef std::function<void(BSONObjBuilder)> UpdateBuilder;
-    static void _runUpdateCommand(OperationContext* opCtx, UpdateBuilder callback);
-
     /**
      * Set the FCV to newVersion, making sure to close any outgoing connections with incompatible
      * servers and closing open transactions if necessary. Increments the server TopologyVersion.

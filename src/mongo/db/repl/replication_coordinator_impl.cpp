@@ -63,6 +63,7 @@
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/mongod_options_storage_gen.h"
 #include "mongo/db/prepare_conflict_tracker.h"
+#include "mongo/db/repl/always_allow_non_local_writes.h"
 #include "mongo/db/repl/check_quorum_for_config_change.h"
 #include "mongo/db/repl/data_replicator_external_state_initial_sync.h"
 #include "mongo/db/repl/is_master_response.h"
@@ -86,6 +87,7 @@
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/shutdown_in_progress_quiesce_info.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/vector_clock.h"
@@ -111,7 +113,6 @@ namespace mongo {
 namespace repl {
 
 MONGO_FAIL_POINT_DEFINE(stepdownHangBeforePerformingPostMemberStateUpdateActions);
-MONGO_FAIL_POINT_DEFINE(holdStableTimestampAtSpecificTimestamp);
 MONGO_FAIL_POINT_DEFINE(stepdownHangBeforeRSTLEnqueue);
 // Fail setMaintenanceMode with ErrorCodes::NotSecondary to simulate a concurrent election.
 MONGO_FAIL_POINT_DEFINE(setMaintenanceModeFailsWithNotSecondary);
@@ -174,34 +175,6 @@ using NextAction = Fetcher::NextAction;
 namespace {
 
 const char kLocalDB[] = "local";
-// Overrides _canAcceptLocalWrites for the decorated OperationContext.
-const OperationContext::Decoration<bool> alwaysAllowNonLocalWrites =
-    OperationContext::declareDecoration<bool>();
-
-/**
- * Allows non-local writes despite _canAcceptNonLocalWrites being false on a single OperationContext
- * while in scope.
- *
- * Resets to original value when leaving scope so it is safe to nest.
- */
-class AllowNonLocalWritesBlock {
-    AllowNonLocalWritesBlock(const AllowNonLocalWritesBlock&) = delete;
-    AllowNonLocalWritesBlock& operator=(const AllowNonLocalWritesBlock&) = delete;
-
-public:
-    AllowNonLocalWritesBlock(OperationContext* opCtx)
-        : _opCtx(opCtx), _initialState(alwaysAllowNonLocalWrites(_opCtx)) {
-        alwaysAllowNonLocalWrites(_opCtx) = true;
-    }
-
-    ~AllowNonLocalWritesBlock() {
-        alwaysAllowNonLocalWrites(_opCtx) = _initialState;
-    }
-
-private:
-    OperationContext* const _opCtx;
-    const bool _initialState;
-};
 
 void lockAndCall(stdx::unique_lock<Latch>* lk, const std::function<void()>& fn) {
     if (!lk->owns_lock()) {
@@ -296,10 +269,9 @@ InitialSyncerOptions createInitialSyncerOptions(
     InitialSyncerOptions options;
     options.getMyLastOptime = [replCoord]() { return replCoord->getMyLastAppliedOpTime(); };
     options.setMyLastOptime = [replCoord,
-                               externalState](const OpTimeAndWallTime& opTimeAndWallTime,
-                                              ReplicationCoordinator::DataConsistency consistency) {
+                               externalState](const OpTimeAndWallTime& opTimeAndWallTime) {
         // Note that setting the last applied opTime forward also advances the global timestamp.
-        replCoord->setMyLastAppliedOpTimeAndWallTimeForward(opTimeAndWallTime, consistency);
+        replCoord->setMyLastAppliedOpTimeAndWallTimeForward(opTimeAndWallTime);
         // The oplog application phase of initial sync starts timestamping writes, causing
         // WiredTiger to pin this data in memory. Advancing the oldest timestamp in step with the
         // last applied optime here will permit WiredTiger to evict this data as it sees fit.
@@ -676,7 +648,6 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     }
 
     auto opCtx = cc().makeOperationContext();
-    auto consistency = DataConsistency::Inconsistent;
     if (!lastOpTime.isNull()) {
 
         // If we have an oplog, it is still possible that our data is not in a consistent state. For
@@ -684,8 +655,19 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         // To detect this, we see if our last optime is >= the 'minValid' optime, which
         // should be persistent across node crashes.
         OpTime minValid = _replicationProcess->getConsistencyMarkers()->getMinValid(opCtx.get());
-        consistency =
-            (lastOpTime >= minValid) ? DataConsistency::Consistent : DataConsistency::Inconsistent;
+
+        // It is not safe to take stable checkpoints until we reach minValid, so we set our
+        // initialDataTimestamp to prevent this. It is expected that this is only necessary when
+        // enableMajorityReadConcern:false.
+        if (lastOpTime < minValid) {
+            LOGV2_DEBUG(4916700,
+                        2,
+                        "Setting initialDataTimestamp to minValid since our last optime is less "
+                        "than minValid",
+                        "lastOpTime"_attr = lastOpTime,
+                        "minValid"_attr = minValid);
+            _storage->setInitialDataTimestamp(getServiceContext(), minValid.getTimestamp());
+        }
     }
 
     // Update the global timestamp before setting the last applied opTime forward so the last
@@ -700,8 +682,7 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     // Set our last applied and durable optimes to the top of the oplog, if we have one.
     if (!lastOpTime.isNull()) {
         bool isRollbackAllowed = false;
-        _setMyLastAppliedOpTimeAndWallTime(
-            lock, lastOpTimeAndWallTime, isRollbackAllowed, consistency);
+        _setMyLastAppliedOpTimeAndWallTime(lock, lastOpTimeAndWallTime, isRollbackAllowed);
         _setMyLastDurableOpTimeAndWallTime(lock, lastOpTimeAndWallTime, isRollbackAllowed);
         _reportUpstream_inlock(std::move(lock));  // unlocks _mutex.
     } else {
@@ -800,8 +781,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
             }
 
             const auto lastApplied = opTimeStatus.getValue();
-            _setMyLastAppliedOpTimeAndWallTime(
-                lock, lastApplied, false, DataConsistency::Consistent);
+            _setMyLastAppliedOpTimeAndWallTime(lock, lastApplied, false);
         }
 
         // Clear maint. mode.
@@ -812,12 +792,16 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
         if (startCompleted) {
             startCompleted();
         }
-        // Because initial sync completed, we can only be in STARTUP2, not REMOVED.
         // Transition from STARTUP2 to RECOVERING and start the producer and the applier.
-        invariant(getMemberState().startup2());
+        // If the member state is REMOVED, this will do nothing until we receive a config with
+        // ourself in it.
+        const auto memberState = getMemberState();
+        invariant(memberState.startup2() || memberState.removed());
         invariant(setFollowerMode(MemberState::RS_RECOVERING));
         auto opCtxHolder = cc().makeOperationContext();
         _externalState->startSteadyStateReplication(opCtxHolder.get(), this);
+        // This log is used in tests to ensure we made it to this point.
+        LOGV2_DEBUG(4853000, 1, "initial sync complete.");
     };
 
     std::shared_ptr<InitialSyncer> initialSyncerCopy;
@@ -1093,7 +1077,7 @@ Status ReplicationCoordinatorImpl::_setFollowerMode(OperationContext* opCtx,
                       "Cannot set follower mode when node is currently the leader");
     }
 
-    if (auto electionFinishedEvent = _cancelElectionIfNeeded_inlock()) {
+    if (auto electionFinishedEvent = _cancelElectionIfNeeded(lk)) {
         // We were a candidate, which means _topCoord believed us to be in state RS_SECONDARY, and
         // we know that newState != RS_SECONDARY because we would have returned early, above if
         // the old and new state were equal. So, try again after the election is over to
@@ -1291,7 +1275,7 @@ void ReplicationCoordinatorImpl::setMyHeartbeatMessage(const std::string& msg) {
 }
 
 void ReplicationCoordinatorImpl::setMyLastAppliedOpTimeAndWallTimeForward(
-    const OpTimeAndWallTime& opTimeAndWallTime, DataConsistency consistency) {
+    const OpTimeAndWallTime& opTimeAndWallTime) {
     // Update the global timestamp before setting the last applied opTime forward so the last
     // applied optime is never greater than the latest cluster time in the logical clock.
     const auto opTime = opTimeAndWallTime.opTime;
@@ -1300,7 +1284,7 @@ void ReplicationCoordinatorImpl::setMyLastAppliedOpTimeAndWallTimeForward(
     stdx::unique_lock<Latch> lock(_mutex);
     auto myLastAppliedOpTime = _getMyLastAppliedOpTime_inlock();
     if (opTime > myLastAppliedOpTime) {
-        _setMyLastAppliedOpTimeAndWallTime(lock, opTimeAndWallTime, false, consistency);
+        _setMyLastAppliedOpTimeAndWallTime(lock, opTimeAndWallTime, false);
         _reportUpstream_inlock(std::move(lock));
     } else {
         if (opTime != myLastAppliedOpTime) {
@@ -1312,8 +1296,7 @@ void ReplicationCoordinatorImpl::setMyLastAppliedOpTimeAndWallTimeForward(
                       opTime.getTimestamp() < myLastAppliedOpTime.getTimestamp());
         }
 
-        if (consistency == DataConsistency::Consistent &&
-            _readWriteAbility->canAcceptNonLocalWrites(lock) && _rsConfig.getWriteMajority() == 1) {
+        if (_readWriteAbility->canAcceptNonLocalWrites(lock) && _rsConfig.getWriteMajority() == 1) {
             // Single vote primaries may have a lagged stable timestamp due to paring back the
             // stable timestamp to the all committed timestamp.
             _setStableTimestampForStorage(lock);
@@ -1344,7 +1327,7 @@ void ReplicationCoordinatorImpl::setMyLastAppliedOpTimeAndWallTime(
 
     stdx::unique_lock<Latch> lock(_mutex);
     // The optime passed to this function is required to represent a consistent database state.
-    _setMyLastAppliedOpTimeAndWallTime(lock, opTimeAndWallTime, false, DataConsistency::Consistent);
+    _setMyLastAppliedOpTimeAndWallTime(lock, opTimeAndWallTime, false);
     _reportUpstream_inlock(std::move(lock));
 }
 
@@ -1365,10 +1348,8 @@ void ReplicationCoordinatorImpl::_resetMyLastOpTimes(WithLock lk) {
     LOGV2_DEBUG(21332, 1, "Resetting durable/applied optimes");
     // Reset to uninitialized OpTime
     bool isRollbackAllowed = true;
-    _setMyLastAppliedOpTimeAndWallTime(
-        lk, OpTimeAndWallTime(), isRollbackAllowed, DataConsistency::Inconsistent);
+    _setMyLastAppliedOpTimeAndWallTime(lk, OpTimeAndWallTime(), isRollbackAllowed);
     _setMyLastDurableOpTimeAndWallTime(lk, OpTimeAndWallTime(), isRollbackAllowed);
-    _stableOpTimeCandidates.clear();
 }
 
 void ReplicationCoordinatorImpl::_reportUpstream_inlock(stdx::unique_lock<Latch> lock) {
@@ -1388,10 +1369,7 @@ void ReplicationCoordinatorImpl::_reportUpstream_inlock(stdx::unique_lock<Latch>
 }
 
 void ReplicationCoordinatorImpl::_setMyLastAppliedOpTimeAndWallTime(
-    WithLock lk,
-    const OpTimeAndWallTime& opTimeAndWallTime,
-    bool isRollbackAllowed,
-    DataConsistency consistency) {
+    WithLock lk, const OpTimeAndWallTime& opTimeAndWallTime, bool isRollbackAllowed) {
     const auto opTime = opTimeAndWallTime.opTime;
 
     // The last applied opTime should never advance beyond the global timestamp (i.e. the latest
@@ -1430,23 +1408,16 @@ void ReplicationCoordinatorImpl::_setMyLastAppliedOpTimeAndWallTime(
         return;
     }
 
-    // Add the new applied optime to the list of stable optime candidates and then set the last
-    // stable optime. Stable optimes are used to determine the last optime that it is safe to revert
-    // the database to, in the event of a rollback via the 'recover to timestamp' method. If we are
-    // setting our applied optime to a value that doesn't represent a consistent database state, we
-    // should not add it to the set of stable optime candidates. For example, if we are in
-    // RECOVERING after a rollback using the 'rollbackViaRefetch' algorithm, we will be inconsistent
-    // until we reach the 'minValid' optime.
-    if (consistency == DataConsistency::Consistent) {
-        invariant(opTime.getTimestamp().getInc() > 0,
-                  str::stream() << "Impossible optime received: " << opTime.toString());
-        _stableOpTimeCandidates.insert(opTimeAndWallTime);
-        // If we are lagged behind the commit optime, set a new stable timestamp here. When majority
-        // read concern is disabled, the stable timestamp is set to lastApplied.
-        if (opTime <= _topCoord->getLastCommittedOpTime() ||
-            !serverGlobalParams.enableMajorityReadConcern) {
-            _setStableTimestampForStorage(lk);
-        }
+    // Advance the stable timestamp if necessary. Stable timestamps are used to determine the latest
+    // timestamp that it is safe to revert the database to, in the event of a rollback via the
+    // 'recover to timestamp' method.
+    invariant(opTime.getTimestamp().getInc() > 0,
+              str::stream() << "Impossible optime received: " << opTime.toString());
+    // If we are lagged behind the commit optime, set a new stable timestamp here. When majority
+    // read concern is disabled, the stable timestamp is set to lastApplied.
+    if (opTime <= _topCoord->getLastCommittedOpTime() ||
+        !serverGlobalParams.enableMajorityReadConcern) {
+        _setStableTimestampForStorage(lk);
     }
 }
 
@@ -1954,6 +1925,10 @@ bool ReplicationCoordinatorImpl::_doneWaitingForReplication_inlock(
 
 ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorImpl::awaitReplication(
     OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern) {
+    // It is illegal to wait for replication with a session checked out because it can lead to
+    // deadlocks.
+    invariant(OperationContextSession::get(opCtx) == nullptr);
+
     Timer timer;
     WriteConcernOptions fixedWriteConcern = populateUnsetWriteConcernOptionsSyncMode(writeConcern);
 
@@ -2830,7 +2805,7 @@ bool ReplicationCoordinatorImpl::canAcceptWritesForDatabase_UNSAFE(OperationCont
     //
     // Stand-alone nodes and drained replica set primaries can always accept writes.  Writes are
     // always permitted to the "local" database.
-    if (_readWriteAbility->canAcceptNonLocalWrites_UNSAFE() || alwaysAllowNonLocalWrites(*opCtx)) {
+    if (_readWriteAbility->canAcceptNonLocalWrites_UNSAFE() || alwaysAllowNonLocalWrites(opCtx)) {
         return true;
     }
     if (dbName == kLocalDB) {
@@ -2875,7 +2850,7 @@ bool ReplicationCoordinatorImpl::canAcceptWritesFor_UNSAFE(OperationContext* opC
     // If we can accept non local writes (ie we're PRIMARY) then we must not be in ROLLBACK.
     // This check is redundant of the check of _memberState below, but since this can be checked
     // without locking, we do it as an optimization.
-    if (_readWriteAbility->canAcceptNonLocalWrites_UNSAFE() || alwaysAllowNonLocalWrites(*opCtx)) {
+    if (_readWriteAbility->canAcceptNonLocalWrites_UNSAFE() || alwaysAllowNonLocalWrites(opCtx)) {
         return true;
     }
 
@@ -3198,12 +3173,8 @@ Status ReplicationCoordinatorImpl::processReplSetFreeze(int secs, BSONObjBuilder
 }
 
 bool ReplicationCoordinatorImpl::_supportsAutomaticReconfig() const {
-    if (!enableAutomaticReconfig) {
-        return false;
-    }
-
     if (serverGlobalParams.featureCompatibility.getVersion() !=
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46) {
+        ServerGlobalParams::FeatureCompatibility::Version::kVersion451) {
         return false;
     }
 
@@ -3558,7 +3529,7 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
     executor::TaskExecutor::EventHandle electionFinishedEvent;
     {
         stdx::lock_guard<Latch> lk(_mutex);
-        electionFinishedEvent = _cancelElectionIfNeeded_inlock();
+        electionFinishedEvent = _cancelElectionIfNeeded(lk);
     }
 
     // If there is an election in-progress, there can be at most one. No new election can happen as
@@ -4145,16 +4116,7 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
         _dropAllSnapshots_inlock();
     }
 
-    // Upon transitioning out of ROLLBACK, we must clear any stable optime candidates that may have
-    // been rolled back.
     if (_memberState.rollback()) {
-        // Our 'lastApplied' optime at this point should be the rollback common point. We should
-        // remove any stable optime candidates greater than the common point.
-        auto lastApplied = _getMyLastAppliedOpTimeAndWallTime_inlock();
-        // The upper bound will give us the first optime T such that T > lastApplied.
-        auto deletePoint = _stableOpTimeCandidates.upper_bound(lastApplied);
-        _stableOpTimeCandidates.erase(deletePoint, _stableOpTimeCandidates.end());
-
         // Ensure that no snapshots were created while we were in rollback.
         invariant(!_currentCommittedSnapshot);
     }
@@ -4427,6 +4389,21 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
     _setConfigState_inlock(kConfigSteady);
 
     _topCoord->updateConfig(newConfig, myIndex, _replExecutor->now());
+
+    // It is only necessary to check if an arbiter is running on a quarterly binary version when a
+    // fresh node is added to the replica set as an arbiter and when an old secondary node is
+    // removed and then re-added to the replica set as an arbiter. That's why we only need to warn
+    // once per process as converting from secondary to arbiter normally requires a server shutdown.
+    static std::once_flag checkArbiterOnQuarterlyBinaryVersion;
+    std::call_once(checkArbiterOnQuarterlyBinaryVersion, [this] {
+        // Warn if an arbiter is running on a quarterly binary version.
+        if (_topCoord->getMemberState().arbiter() && !ServerGlobalParams::kIsLTSBinaryVersion) {
+            LOGV2_WARNING_OPTIONS(
+                4906901,
+                {logv2::LogTag::kStartupWarnings},
+                "** WARNING: Arbiters are not supported in quarterly binary versions");
+        }
+    });
 
     // updateConfig() can change terms, so update our term shadow to match.
     _termShadow.store(_topCoord->getTerm());
@@ -4781,8 +4758,7 @@ void ReplicationCoordinatorImpl::blacklistSyncSource(const HostAndPort& host, Da
     });
 }
 
-void ReplicationCoordinatorImpl::resetLastOpTimesFromOplog(OperationContext* opCtx,
-                                                           DataConsistency consistency) {
+void ReplicationCoordinatorImpl::resetLastOpTimesFromOplog(OperationContext* opCtx) {
     auto lastOpTimeAndWallTimeStatus = _externalState->loadLastOpTimeAndWallTime(opCtx);
     OpTimeAndWallTime lastOpTimeAndWallTime = {OpTime(), Date_t()};
     if (!lastOpTimeAndWallTimeStatus.getStatus().isOK()) {
@@ -4803,25 +4779,35 @@ void ReplicationCoordinatorImpl::resetLastOpTimesFromOplog(OperationContext* opC
 
     stdx::unique_lock<Latch> lock(_mutex);
     bool isRollbackAllowed = true;
-    _setMyLastAppliedOpTimeAndWallTime(lock, lastOpTimeAndWallTime, isRollbackAllowed, consistency);
+    _setMyLastAppliedOpTimeAndWallTime(lock, lastOpTimeAndWallTime, isRollbackAllowed);
     _setMyLastDurableOpTimeAndWallTime(lock, lastOpTimeAndWallTime, isRollbackAllowed);
     _reportUpstream_inlock(std::move(lock));
 }
 
-bool ReplicationCoordinatorImpl::shouldChangeSyncSource(const HostAndPort& currentSource,
-                                                        const rpc::ReplSetMetadata& replMetadata,
-                                                        const rpc::OplogQueryMetadata& oqMetadata,
-                                                        const OpTime& lastOpTimeFetched) {
+ChangeSyncSourceAction ReplicationCoordinatorImpl::shouldChangeSyncSource(
+    const HostAndPort& currentSource,
+    const rpc::ReplSetMetadata& replMetadata,
+    const rpc::OplogQueryMetadata& oqMetadata,
+    const OpTime& previousOpTimeFetched,
+    const OpTime& lastOpTimeFetched) {
     stdx::lock_guard<Latch> lock(_mutex);
     const auto now = _replExecutor->now();
+
     if (_topCoord->shouldChangeSyncSource(
             currentSource, replMetadata, oqMetadata, lastOpTimeFetched, now)) {
-        return true;
+        return ChangeSyncSourceAction::kStopSyncingAndEnqueueLastBatch;
     }
 
     const auto readPreference = _getSyncSourceReadPreference(lock);
-    return _topCoord->shouldChangeSyncSourceDueToPingTime(
-        currentSource, _getMemberState_inlock(), lastOpTimeFetched, now, readPreference);
+    if (_topCoord->shouldChangeSyncSourceDueToPingTime(
+            currentSource, _getMemberState_inlock(), previousOpTimeFetched, now, readPreference)) {
+        // We should drop the last batch if we find a significantly closer node. This is to
+        // avoid advancing our 'lastFetched', which makes it more likely that we will be able to
+        // choose the closer node as our sync source.
+        return ChangeSyncSourceAction::kStopSyncingAndDropLastBatch;
+    }
+
+    return ChangeSyncSourceAction::kContinueSyncing;
 }
 
 void ReplicationCoordinatorImpl::_updateLastCommittedOpTimeAndWallTime(WithLock lk) {
@@ -4830,110 +4816,18 @@ void ReplicationCoordinatorImpl::_updateLastCommittedOpTimeAndWallTime(WithLock 
     }
 }
 
-boost::optional<OpTimeAndWallTime> ReplicationCoordinatorImpl::_chooseStableOpTimeFromCandidates(
-    WithLock lk,
-    const std::set<OpTimeAndWallTime>& candidates,
-    OpTimeAndWallTime maximumStableOpTime) {
-
-    // No optime candidates.
-    if (candidates.empty()) {
-        return boost::none;
-    }
-
-    auto maximumStableTimestamp = maximumStableOpTime.opTime.getTimestamp();
-    if (_readWriteAbility->canAcceptNonLocalWrites(lk) && _storage->supportsDocLocking(_service)) {
-        // If the storage engine supports document level locking, then it is possible for oplog
-        // writes to commit out of order. In that case, we don't want to set the stable timestamp
-        // ahead of the all_durable timestamp. This is not a problem for oplog application
-        // because we only set lastApplied between batches when the all_durable timestamp cannot
-        // be behind. During oplog application the all_durable timestamp can jump around since
-        // we first write oplog entries to the oplog and then go back and apply them.
-        //
-        // We must construct an upper bound for the stable optime candidates such that the upper
-        // bound is at most 'maximumStableOpTime' and any candidate with a timestamp higher than the
-        // all_durable is greater than the upper bound. If the timestamp of 'maximumStableOpTime'
-        // is <= the all_durable, then we use 'maximumStableOpTime'. Otherwise, we construct an
-        // optime using the all_durable and the term of 'maximumStableOpTime'. We must argue that
-        // there are no stable optime candidates with a timestamp greater than the all_durable and
-        // a term less than that of 'maximumStableOpTime'. Suppose there were. The
-        // 'maximumStableOpTime' is either the commit point or the lastApplied, so the all_durable
-        // can only be behind 'maximumStableOpTime' on a primary. If there is a candidate with a
-        // higher timestamp than the all_durable but a lower term than 'maximumStableOpTime', then
-        // the all_durable corresponds to a write in an earlier term than the current one. But
-        // this is not possible on a primary, since on step-up, the primary storage commits a 'new
-        // primary' oplog entry in the new term before accepting any new writes, so the all
-        // durable must be in the current term.
-        maximumStableTimestamp = std::min(_storage->getAllDurableTimestamp(_service),
-                                          maximumStableOpTime.opTime.getTimestamp());
-    }
-
-    holdStableTimestampAtSpecificTimestamp.execute([&](const BSONObj& dataObj) {
-        const auto holdStableTimestamp = dataObj["timestamp"].timestamp();
-        maximumStableTimestamp = std::min(maximumStableTimestamp, holdStableTimestamp);
-    });
-
-    maximumStableOpTime = {OpTime(maximumStableTimestamp, maximumStableOpTime.opTime.getTerm()),
-                           maximumStableOpTime.wallTime};
-
-    // Find the greatest optime candidate that is less than or equal to 'maximumStableOpTime'. To do
-    // this we first find the upper bound of 'maximumStableOpTime', which points to the smallest
-    // element in 'candidates' that is greater than 'maximumStableOpTime'. We then step back one
-    // element, which should give us the largest element in 'candidates' that is less than or equal
-    // to the 'maximumStableOpTime'.
-    auto upperBoundIter = candidates.upper_bound(maximumStableOpTime);
-
-    // All optime candidates are greater than the commit point.
-    if (upperBoundIter == candidates.begin()) {
-        return boost::none;
-    }
-    // There is a valid stable optime.
-    else {
-        auto stableOpTime = *std::prev(upperBoundIter);
-        invariant(stableOpTime.opTime.getTimestamp() <= maximumStableTimestamp);
-        return stableOpTime;
-    }
-}
-
-void ReplicationCoordinatorImpl::_cleanupStableOpTimeCandidates(
-    std::set<OpTimeAndWallTime>* candidates, OpTimeAndWallTime stableOpTime) {
-    // Discard optime candidates earlier than the current stable optime, since we don't need
-    // them anymore. To do this, we find the lower bound of the 'stableOpTime' which is the first
-    // element that is greater than or equal to the 'stableOpTime'. Then we discard everything up
-    // to but not including this lower bound i.e. 'deletePoint'.
-    auto deletePoint = candidates->lower_bound(stableOpTime);
-
-    // Delete the entire range of unneeded optimes.
-    candidates->erase(candidates->begin(), deletePoint);
-}
-
-boost::optional<OpTimeAndWallTime>
-ReplicationCoordinatorImpl::chooseStableOpTimeFromCandidates_forTest(
-    const std::set<OpTimeAndWallTime>& candidates, const OpTimeAndWallTime& maximumStableOpTime) {
-    stdx::lock_guard<Latch> lk(_mutex);
-    return _chooseStableOpTimeFromCandidates(lk, candidates, maximumStableOpTime);
-}
-void ReplicationCoordinatorImpl::cleanupStableOpTimeCandidates_forTest(
-    std::set<OpTimeAndWallTime>* candidates, OpTimeAndWallTime stableOpTime) {
-    _cleanupStableOpTimeCandidates(candidates, stableOpTime);
-}
-
-std::set<OpTimeAndWallTime> ReplicationCoordinatorImpl::getStableOpTimeCandidates_forTest() {
-    stdx::unique_lock<Latch> lk(_mutex);
-    return _stableOpTimeCandidates;
-}
-
 void ReplicationCoordinatorImpl::attemptToAdvanceStableTimestamp() {
     stdx::unique_lock<Latch> lk(_mutex);
     _setStableTimestampForStorage(lk);
 }
 
-boost::optional<OpTimeAndWallTime> ReplicationCoordinatorImpl::_recalculateStableOpTime(
-    WithLock lk) {
-    auto commitPoint = _topCoord->getLastCommittedOpTimeAndWallTime();
+OpTime ReplicationCoordinatorImpl::_recalculateStableOpTime(WithLock lk) {
+    auto commitPoint = _topCoord->getLastCommittedOpTime();
+    auto lastApplied = _topCoord->getMyLastAppliedOpTime();
     if (_currentCommittedSnapshot) {
         auto snapshotOpTime = _currentCommittedSnapshot->opTime;
-        invariant(snapshotOpTime.getTimestamp() <= commitPoint.opTime.getTimestamp());
-        invariant(snapshotOpTime <= commitPoint.opTime);
+        invariant(snapshotOpTime.getTimestamp() <= commitPoint.getTimestamp());
+        invariant(snapshotOpTime <= commitPoint);
     }
 
     //
@@ -4964,37 +4858,24 @@ boost::optional<OpTimeAndWallTime> ReplicationCoordinatorImpl::_recalculateStabl
     // order. Because of this, the stable timestamp must not fall in the middle of a batch while it
     // is being applied. To prevent this we ensure the no-overlap point does not surpass the
     // lastApplied, which is only advanced at the end of secondary batch application.
-    OpTime noOverlap = std::min(_topCoord->getMyLastAppliedOpTime(), allDurableOpTime);
+    OpTime noOverlap = std::min(lastApplied, allDurableOpTime);
 
     // The stable optime must always be less than or equal to the no overlap point. When majority
     // reads are enabled, the stable optime must also not surpass the majority commit point. When
     // majority reads are disabled, the stable optime is not required to be majority committed.
-    boost::optional<OpTimeAndWallTime> stableOpTime;
-    auto maximumStableOpTime = serverGlobalParams.enableMajorityReadConcern
-        ? commitPoint
-        : _topCoord->getMyLastAppliedOpTimeAndWallTime();
+    OpTime stableOpTime;
+    auto maximumStableOpTime =
+        serverGlobalParams.enableMajorityReadConcern ? commitPoint : lastApplied;
 
     // Make sure the stable optime does not surpass its maximum.
-    stableOpTime = OpTimeAndWallTime(std::min(noOverlap, maximumStableOpTime.opTime), Date_t());
+    stableOpTime = std::min(noOverlap, maximumStableOpTime);
 
-    // Keep EMRC=false behavior the same for now.
-    // TODO (SERVER-47844) Don't use stable optime candidates here.
-    if (!serverGlobalParams.enableMajorityReadConcern) {
-        stableOpTime =
-            _chooseStableOpTimeFromCandidates(lk, _stableOpTimeCandidates, maximumStableOpTime);
-    }
-
-    if (stableOpTime) {
-        // Check that the selected stable optime does not exceed our maximum and that it does not
-        // surpass the no-overlap point.
-        invariant(stableOpTime.get().opTime.getTimestamp() <=
-                  maximumStableOpTime.opTime.getTimestamp());
-        invariant(stableOpTime.get().opTime <= maximumStableOpTime.opTime);
-        if (serverGlobalParams.enableMajorityReadConcern) {
-            invariant(stableOpTime.get().opTime.getTimestamp() <= noOverlap.getTimestamp());
-            invariant(stableOpTime.get().opTime <= noOverlap);
-        }
-    }
+    // Check that the selected stable optime does not exceed our maximum and that it does not
+    // surpass the no-overlap point.
+    invariant(stableOpTime.getTimestamp() <= maximumStableOpTime.getTimestamp());
+    invariant(stableOpTime <= maximumStableOpTime);
+    invariant(stableOpTime.getTimestamp() <= noOverlap.getTimestamp());
+    invariant(stableOpTime <= noOverlap);
 
     return stableOpTime;
 }
@@ -5021,7 +4902,7 @@ void ReplicationCoordinatorImpl::_setStableTimestampForStorage(WithLock lk) {
     }
 
     // Get the current stable optime.
-    auto stableOpTime = _recalculateStableOpTime(lk);
+    OpTime stableOpTime = _recalculateStableOpTime(lk);
 
     // Don't update the stable timestamp if it is earlier than the initial data timestamp.
     // Timestamps before the initialDataTimestamp are not consistent and so are not safe to use for
@@ -5030,63 +4911,61 @@ void ReplicationCoordinatorImpl::_setStableTimestampForStorage(WithLock lk) {
     // after leaving initial sync, since the initialDataTimestamp and oldest timestamp will be equal
     // after initial sync oplog application has completed.
     auto initialDataTimestamp = _service->getStorageEngine()->getInitialDataTimestamp();
-    if (stableOpTime && stableOpTime->opTime.getTimestamp() < initialDataTimestamp) {
+    if (stableOpTime.getTimestamp() < initialDataTimestamp) {
         LOGV2_DEBUG(2139504,
                     2,
                     "Not updating stable timestamp since it is less than the initialDataTimestamp",
-                    "stableTimestamp"_attr = stableOpTime->opTime.getTimestamp(),
+                    "stableTimestamp"_attr = stableOpTime.getTimestamp(),
                     "initialDataTimestamp"_attr = initialDataTimestamp);
         return;
     }
 
-    if (stableOpTime && stableOpTime->opTime.getTimestamp().isNull()) {
+    if (stableOpTime.getTimestamp().isNull()) {
         LOGV2_DEBUG(2139502, 2, "Not updating stable timestamp to a null timestamp");
         return;
     }
 
-    // If there is a valid stable optime, set it for the storage engine, and then remove any
-    // old, unneeded stable optime candidates.
-    if (stableOpTime) {
-        LOGV2_DEBUG(21396,
-                    2,
-                    "Setting replication's stable optime to {stableOpTime}",
-                    "Setting replication's stable optime",
-                    "stableOpTime"_attr = stableOpTime.value());
+    if (gTestingSnapshotBehaviorInIsolation) {
+        return;
+    }
 
-        if (!gTestingSnapshotBehaviorInIsolation) {
-            // Update committed snapshot and wake up any threads waiting on read concern or
-            // write concern.
-            if (serverGlobalParams.enableMajorityReadConcern) {
-                // When majority read concern is enabled, the committed snapshot is set to the new
-                // stable optime.
-                if (_updateCommittedSnapshot(lk, stableOpTime.value())) {
-                    // Update the stable timestamp for the storage engine.
-                    _storage->setStableTimestamp(getServiceContext(),
-                                                 stableOpTime->opTime.getTimestamp());
-                }
-            } else {
-                const auto lastCommittedOpTime = _topCoord->getLastCommittedOpTimeAndWallTime();
-                if (!lastCommittedOpTime.opTime.isNull()) {
-                    // When majority read concern is disabled, we set the stable timestamp to
-                    // be less than or equal to the all committed timestamp. This makes sure that
-                    // the committed snapshot is not past the all committed timestamp to guarantee
-                    // we can always read our own majority committed writes. This problem is
-                    // specific to the case where we have a single node replica set and the
-                    // lastCommittedOpTime is set to be the lastApplied which can be ahead of the
-                    // allCommitted.
-                    auto newCommittedSnapshot = std::min(lastCommittedOpTime, *stableOpTime);
-                    _updateCommittedSnapshot(lk, newCommittedSnapshot);
-                }
-                // Set the stable timestamp regardless of whether the majority commit point moved
-                // forward. If we are in rollback state, however, do not alter the stable timestamp,
-                // since it may be moved backwards explicitly by the rollback-via-refetch process.
-                if (!MONGO_unlikely(disableSnapshotting.shouldFail()) && !_memberState.rollback()) {
-                    _storage->setStableTimestamp(getServiceContext(),
-                                                 stableOpTime->opTime.getTimestamp());
-                }
-            }
+    // Set the stable timestamp and update the committed snapshot.
+    LOGV2_DEBUG(21396,
+                2,
+                "Setting replication's stable optime to {stableOpTime}",
+                "Setting replication's stable optime",
+                "stableOpTime"_attr = stableOpTime);
+
+    // Update committed snapshot and wake up any threads waiting on read concern or
+    // write concern.
+    if (serverGlobalParams.enableMajorityReadConcern) {
+        // When majority read concern is enabled, the committed snapshot is set to the new
+        // stable optime. The wall time of the committed snapshot is not used for anything so we can
+        // create a fake one.
+        if (_updateCommittedSnapshot(lk, OpTimeAndWallTime(stableOpTime, Date_t()))) {
+            // Update the stable timestamp for the storage engine.
+            _storage->setStableTimestamp(getServiceContext(), stableOpTime.getTimestamp());
         }
-        _cleanupStableOpTimeCandidates(&_stableOpTimeCandidates, stableOpTime.get());
+    } else {
+        const auto lastCommittedOpTime = _topCoord->getLastCommittedOpTime();
+        if (!lastCommittedOpTime.isNull()) {
+            // When majority read concern is disabled, we set the stable timestamp to be less than
+            // or equal to the all-durable timestamp. This makes sure that the committed snapshot is
+            // not past the all-durable timestamp to guarantee we can always read our own majority
+            // committed writes. This problem is specific to the case where we have a single node
+            // replica set and the lastCommittedOpTime is set to be the lastApplied which can be
+            // ahead of the all-durable.
+            OpTime newCommittedSnapshot = std::min(lastCommittedOpTime, stableOpTime);
+            // The wall clock time of the committed snapshot is not used for anything so we can
+            // create a fake one.
+            _updateCommittedSnapshot(lk, OpTimeAndWallTime(newCommittedSnapshot, Date_t()));
+        }
+        // Set the stable timestamp regardless of whether the majority commit point moved
+        // forward. If we are in rollback state, however, do not alter the stable timestamp,
+        // since it may be moved backwards explicitly by the rollback-via-refetch process.
+        if (!MONGO_unlikely(disableSnapshotting.shouldFail()) && !_memberState.rollback()) {
+            _storage->setStableTimestamp(getServiceContext(), stableOpTime.getTimestamp());
+        }
     }
 }
 
@@ -5165,8 +5044,7 @@ void ReplicationCoordinatorImpl::_advanceCommitPoint(
         if (_getMemberState_inlock().arbiter()) {
             // Arbiters do not store replicated data, so we consider their data trivially
             // consistent.
-            _setMyLastAppliedOpTimeAndWallTime(
-                lk, committedOpTimeAndWallTime, false, DataConsistency::Consistent);
+            _setMyLastAppliedOpTimeAndWallTime(lk, committedOpTimeAndWallTime, false);
         }
 
         _setStableTimestampForStorage(lk);
@@ -5567,14 +5445,26 @@ void ReplicationCoordinatorImpl::_dropAllSnapshots_inlock() {
 }
 
 void ReplicationCoordinatorImpl::waitForElectionFinish_forTest() {
-    if (_electionFinishedEvent.isValid()) {
-        _replExecutor->waitForEvent(_electionFinishedEvent);
+    EventHandle finishedEvent;
+    {
+        stdx::lock_guard lk(_mutex);
+        if (_electionState) {
+            finishedEvent = _electionState->getElectionFinishedEvent(lk);
+        }
+    }
+    if (finishedEvent.isValid()) {
+        _replExecutor->waitForEvent(finishedEvent);
     }
 }
 
 void ReplicationCoordinatorImpl::waitForElectionDryRunFinish_forTest() {
-    if (_electionDryRunFinishedEvent.isValid()) {
-        _replExecutor->waitForEvent(_electionDryRunFinishedEvent);
+    EventHandle finishedEvent;
+    if (_electionState) {
+        stdx::lock_guard lk(_mutex);
+        finishedEvent = _electionState->getElectionDryRunFinishedEvent(lk);
+    }
+    if (finishedEvent.isValid()) {
+        _replExecutor->waitForEvent(finishedEvent);
     }
 }
 
@@ -5640,7 +5530,10 @@ Status ReplicationCoordinatorImpl::stepUpIfEligible(bool skipDryRun) {
     EventHandle finishEvent;
     {
         stdx::lock_guard<Latch> lk(_mutex);
-        finishEvent = _electionFinishedEvent;
+        // A null _electionState indicates that the election has already completed.
+        if (_electionState) {
+            finishEvent = _electionState->getElectionFinishedEvent(lk);
+        }
     }
     if (finishEvent.isValid()) {
         _replExecutor->waitForEvent(finishEvent);
@@ -5658,13 +5551,14 @@ Status ReplicationCoordinatorImpl::stepUpIfEligible(bool skipDryRun) {
     return Status::OK();
 }
 
-executor::TaskExecutor::EventHandle ReplicationCoordinatorImpl::_cancelElectionIfNeeded_inlock() {
+executor::TaskExecutor::EventHandle ReplicationCoordinatorImpl::_cancelElectionIfNeeded(
+    WithLock lk) {
     if (_topCoord->getRole() != TopologyCoordinator::Role::kCandidate) {
         return {};
     }
-    invariant(_voteRequester);
-    _voteRequester->cancel();
-    return _electionFinishedEvent;
+    invariant(_electionState);
+    _electionState->cancel(lk);
+    return _electionState->getElectionFinishedEvent(lk);
 }
 
 int64_t ReplicationCoordinatorImpl::_nextRandomInt64_inlock(int64_t limit) {

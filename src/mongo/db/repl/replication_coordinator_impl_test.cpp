@@ -123,6 +123,17 @@ void killOperation(OperationContext* opCtx) {
     opCtx->getServiceContext()->killOperation(lkClient, opCtx);
 }
 
+std::shared_ptr<const repl::IsMasterResponse> awaitIsMasterWithNewOpCtx(
+    ReplicationCoordinatorImpl* replCoord,
+    TopologyVersion topologyVersion,
+    const repl::SplitHorizon::Parameters& horizonParams,
+    Date_t deadline) {
+    auto newClient = getGlobalServiceContext()->makeClient("awaitIsMaster");
+    auto newOpCtx = newClient->makeOperationContext();
+    return replCoord->awaitIsMasterResponse(
+        newOpCtx.get(), horizonParams, topologyVersion, deadline);
+}
+
 TEST_F(ReplCoordTest, IsMasterIsFalseDuringStepdown) {
     BSONObj configObj = BSON("_id"
                              << "mySet"
@@ -3083,8 +3094,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsCurrentTopologyVersionOnTimeOu
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
     stdx::thread getIsMasterThread([&] {
-        const auto response = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, expectedTopologyVersion, deadline);
+        const auto response =
+            awaitIsMasterWithNewOpCtx(getReplCoord(), expectedTopologyVersion, {}, deadline);
         auto topologyVersion = response->getTopologyVersion();
         // Assert that on timeout, the returned IsMasterResponse contains the same TopologyVersion.
         ASSERT_EQUALS(topologyVersion->getCounter(), expectedTopologyVersion.getCounter());
@@ -3243,8 +3254,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnStepDown) {
         // A topology change should increment the TopologyVersion counter.
         auto expectedCounter = currentTopologyVersion.getCounter() + 1;
 
-        const auto responseAfterDisablingWrites = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, currentTopologyVersion, deadline);
+        const auto responseAfterDisablingWrites =
+            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
         const auto topologyVersionAfterDisablingWrites =
             responseAfterDisablingWrites->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterDisablingWrites->getCounter(), expectedCounter);
@@ -3262,8 +3273,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnStepDown) {
         // TopologyVersion is now stale.
         expectedCounter = topologyVersionAfterDisablingWrites->getCounter() + 1;
         deadline = getNet()->now() + maxAwaitTime;
-        const auto responseStepdownComplete = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, topologyVersionAfterDisablingWrites, deadline);
+        const auto responseStepdownComplete = awaitIsMasterWithNewOpCtx(
+            getReplCoord(), topologyVersionAfterDisablingWrites.get(), {}, deadline);
         const auto topologyVersionStepDownComplete = responseStepdownComplete->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionStepDownComplete->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersionStepDownComplete->getProcessId(), expectedProcessId);
@@ -3302,10 +3313,10 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceMode) {
         auto maxAwaitTime = Milliseconds(5000);
         auto deadline = getNet()->now() + maxAwaitTime;
 
-        ASSERT_THROWS_CODE(getReplCoord()->awaitIsMasterResponse(
-                               opCtx.get(), {}, currentTopologyVersion, deadline),
-                           AssertionException,
-                           ErrorCodes::ShutdownInProgress);
+        ASSERT_THROWS_CODE(
+            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline),
+            AssertionException,
+            ErrorCodes::ShutdownInProgress);
     });
 
     // Ensure that awaitIsMasterResponse() is called before entering quiesce mode.
@@ -3336,13 +3347,13 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceModeAfterWaitingTimes
     auto maxAwaitTime = Milliseconds(5000);
     auto deadline = getNet()->now() + maxAwaitTime;
 
-    bool isMasterReturned = false;
+    AtomicWord<bool> isMasterReturned{false};
     stdx::thread getIsMasterThread([&] {
-        ASSERT_THROWS_CODE(getReplCoord()->awaitIsMasterResponse(
-                               opCtx.get(), {}, currentTopologyVersion, deadline),
-                           AssertionException,
-                           ErrorCodes::ShutdownInProgress);
-        isMasterReturned = true;
+        ASSERT_THROWS_CODE(
+            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline),
+            AssertionException,
+            ErrorCodes::ShutdownInProgress);
+        isMasterReturned.store(true);
     });
 
     auto failPoint = globalFailPointRegistry().find("hangAfterWaitingForTopologyChangeTimesOut");
@@ -3360,7 +3371,7 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceModeAfterWaitingTimes
     failPoint->setMode(FailPoint::off, 0);
 
     // Advance the clock so that pauseWhileSet() will wake up.
-    while (!isMasterReturned) {
+    while (!isMasterReturned.load()) {
         getNet()->enterNetwork();
         getNet()->advanceTime(getNet()->now() + Milliseconds(100));
         getNet()->exitNetwork();
@@ -3702,11 +3713,10 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsErrorOnHorizonChange) {
     // the current TopologyVersion of the server.
     stdx::thread getIsMasterThread([&] {
         auto currentTopologyVersion = getTopoCoord().getTopologyVersion();
-
-        ASSERT_THROWS_CODE(getReplCoord()->awaitIsMasterResponse(
-                               opCtx.get(), {}, currentTopologyVersion, deadline),
-                           AssertionException,
-                           ErrorCodes::SplitHorizonChange);
+        ASSERT_THROWS_CODE(
+            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline),
+            AssertionException,
+            ErrorCodes::SplitHorizonChange);
     });
 
     // Ensure that the isMaster request is waiting before doing a reconfig.
@@ -3765,12 +3775,12 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfig) {
     auto halfwayToDeadline = getNet()->now() + maxAwaitTime / 2;
     auto deadline = getNet()->now() + maxAwaitTime;
 
-    bool isMasterReturned = false;
+    AtomicWord<bool> isMasterReturned{false};
     stdx::thread awaitIsMasterTimeout([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
-        const auto response = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, expectedTopologyVersion, deadline);
-        isMasterReturned = true;
+        const auto response =
+            awaitIsMasterWithNewOpCtx(getReplCoord(), expectedTopologyVersion, {}, deadline);
+        isMasterReturned.store(true);
         auto responseTopologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(expectedTopologyVersion.getProcessId(),
                       responseTopologyVersion->getProcessId());
@@ -3783,12 +3793,12 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfig) {
     getNet()->enterNetwork();
     getNet()->advanceTime(halfwayToDeadline);
     ASSERT_EQUALS(halfwayToDeadline, getNet()->now());
-    ASSERT_FALSE(isMasterReturned);
+    ASSERT_FALSE(isMasterReturned.load());
 
     getNet()->advanceTime(deadline);
     ASSERT_EQUALS(deadline, getNet()->now());
     awaitIsMasterTimeout.join();
-    ASSERT_TRUE(isMasterReturned);
+    ASSERT_TRUE(isMasterReturned.load());
     getNet()->exitNetwork();
 
     auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
@@ -3799,7 +3809,7 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfig) {
     stdx::thread awaitIsMasterInitiate([&] {
         const auto topologyVersion = getTopoCoord().getTopologyVersion();
         const auto response =
-            getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, topologyVersion, deadline);
+            awaitIsMasterWithNewOpCtx(getReplCoord(), topologyVersion, {}, deadline);
         auto responseTopologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(topologyVersion.getProcessId(), responseTopologyVersion->getProcessId());
         ASSERT_EQUALS(topologyVersion.getCounter() + 1, responseTopologyVersion->getCounter());
@@ -3907,10 +3917,10 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigInvalidHoriz
 
     stdx::thread awaitIsMasterInitiate([&] {
         const auto topologyVersion = getTopoCoord().getTopologyVersion();
-        ASSERT_THROWS_CODE(getReplCoord()->awaitIsMasterResponse(
-                               opCtx.get(), horizonParam, topologyVersion, deadline),
-                           AssertionException,
-                           ErrorCodes::SplitHorizonChange);
+        ASSERT_THROWS_CODE(
+            awaitIsMasterWithNewOpCtx(getReplCoord(), topologyVersion, horizonParam, deadline),
+            AssertionException,
+            ErrorCodes::SplitHorizonChange);
     });
 
     // Ensure that the isMaster request has started waiting before initiating.
@@ -3951,8 +3961,8 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigSpecifiedHor
     const auto horizonOneView = HostAndPort("horizon1.com:12345");
     stdx::thread awaitIsMasterInitiate([&] {
         const auto topologyVersion = getTopoCoord().getTopologyVersion();
-        const auto response = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), horizonOne, topologyVersion, deadline);
+        const auto response =
+            awaitIsMasterWithNewOpCtx(getReplCoord(), topologyVersion, horizonOne, deadline);
         auto responseTopologyVersion = response->getTopologyVersion();
         const auto hosts = response->getHosts();
         ASSERT_EQUALS(hosts[0], horizonOneView);
@@ -4014,8 +4024,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterUsesDefaultHorizonWhenRequestedHorizonNotFoun
 
     stdx::thread getIsMasterOldHorizonThread([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
-        const auto response = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), oldHorizon, expectedTopologyVersion, deadline);
+        const auto response = awaitIsMasterWithNewOpCtx(
+            getReplCoord(), expectedTopologyVersion, oldHorizon, deadline);
         auto topologyVersion = response->getTopologyVersion();
         const auto hosts = response->getHosts();
         HostAndPort expectedNodeOneHorizonView(oldHorizonNodeOne);
@@ -4054,8 +4064,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterUsesDefaultHorizonWhenRequestedHorizonNotFoun
     stdx::thread getIsMasterDefaultHorizonThread([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
         // Sending an isMaster request with a removed horizon should return the default horizon.
-        const auto response = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), oldHorizon, expectedTopologyVersion, deadline);
+        const auto response = awaitIsMasterWithNewOpCtx(
+            getReplCoord(), expectedTopologyVersion, oldHorizon, deadline);
         auto topologyVersion = response->getTopologyVersion();
         const auto hosts = response->getHosts();
         HostAndPort expectedNodeOneHorizonView(nodeOneHostName);
@@ -4105,8 +4115,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsWithNewHorizon) {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
         // The isMaster response should use the default horizon since no horizon has been
         // configured.
-        const auto response = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), newHorizon, expectedTopologyVersion, deadline);
+        const auto response = awaitIsMasterWithNewOpCtx(
+            getReplCoord(), expectedTopologyVersion, newHorizon, deadline);
         const auto hosts = response->getHosts();
         HostAndPort expectedNodeOneHorizonView(nodeOneHostName);
         HostAndPort expectedNodeTwoHorizonView(nodeTwoHostName);
@@ -4149,8 +4159,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsWithNewHorizon) {
     stdx::thread getIsMasterNewHorizonThread([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
         // The isMaster response should now use the newly configured horizon.
-        const auto response = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), newHorizon, expectedTopologyVersion, deadline);
+        const auto response = awaitIsMasterWithNewOpCtx(
+            getReplCoord(), expectedTopologyVersion, newHorizon, deadline);
         const auto hosts = response->getHosts();
         HostAndPort expectedNodeOneHorizonView(newHorizonNodeOne);
         HostAndPort expectedNodeTwoHorizonView(newHorizonNodeTwo);
@@ -4276,17 +4286,15 @@ TEST_F(ReplCoordTest, IsMasterOnRemovedNode) {
     ASSERT_EQUALS(responseTopologyVersion->getProcessId(), currentTopologyVersion.getProcessId());
     ASSERT_EQUALS(responseTopologyVersion->getCounter(), currentTopologyVersion.getCounter());
     ASSERT_FALSE(response->isMaster());
-    ASSERT_FALSE(response->isSecondary());
-    ASSERT_FALSE(response->isConfigSet());
 
-    bool isMasterReturned = false;
+    AtomicWord<bool> isMasterReturned{false};
     // A request with an equal TopologyVersion should wait and timeout once the deadline is reached.
     const auto halfwayToDeadline = getNet()->now() + maxAwaitTime / 2;
     stdx::thread getIsMasterThread([&] {
         // Sending an isMaster request on a removed node should wait.
-        response = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, currentTopologyVersion, deadline);
-        isMasterReturned = true;
+        const auto response =
+            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
+        isMasterReturned.store(true);
         responseTopologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(responseTopologyVersion->getCounter(), currentTopologyVersion.getCounter());
         ASSERT_FALSE(response->isMaster());
@@ -4300,13 +4308,13 @@ TEST_F(ReplCoordTest, IsMasterOnRemovedNode) {
     // should still be waiting.
     net->advanceTime(halfwayToDeadline);
     ASSERT_EQUALS(halfwayToDeadline, net->now());
-    ASSERT_FALSE(isMasterReturned);
+    ASSERT_FALSE(isMasterReturned.load());
 
     // Set the network clock to the deadline.
     net->advanceTime(deadline);
     ASSERT_EQUALS(deadline, net->now());
     getIsMasterThread.join();
-    ASSERT_TRUE(isMasterReturned);
+    ASSERT_TRUE(isMasterReturned.load());
     net->exitNetwork();
 }
 
@@ -4340,7 +4348,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
         // The isMaster response should indicate that the node does not have a valid replica set
         // config.
         const auto response =
-            getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, topologyVersion, deadline);
+            awaitIsMasterWithNewOpCtx(getReplCoord(), topologyVersion, {}, deadline);
         const auto responseTopologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(responseTopologyVersion->getProcessId(), topologyVersion.getProcessId());
         ASSERT_EQUALS(responseTopologyVersion->getCounter(), topologyVersion.getCounter() + 1);
@@ -4390,10 +4398,10 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
     stdx::thread getIsMasterThread([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
         // Wait for the node to be readded to the set. This should return an error.
-        ASSERT_THROWS_CODE(getReplCoord()->awaitIsMasterResponse(
-                               opCtx.get(), {}, expectedTopologyVersion, deadline),
-                           AssertionException,
-                           ErrorCodes::SplitHorizonChange);
+        ASSERT_THROWS_CODE(
+            awaitIsMasterWithNewOpCtx(getReplCoord(), expectedTopologyVersion, {}, deadline),
+            AssertionException,
+            ErrorCodes::SplitHorizonChange);
     });
     waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
 
@@ -4427,8 +4435,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
     stdx::thread getIsMasterThreadNewHorizon([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
         // Sending an isMaster on the rejoined node should return the appropriate horizon view.
-        const auto response = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), newHorizon, expectedTopologyVersion, deadline);
+        const auto response = awaitIsMasterWithNewOpCtx(
+            getReplCoord(), expectedTopologyVersion, newHorizon, deadline);
         HostAndPort expectedNodeOneHorizonView(newHorizonNodeOne);
         HostAndPort expectedNodeTwoHorizonView(newHorizonNodeTwo);
         const auto hosts = response->getHosts();
@@ -4485,8 +4493,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionTimeout) {
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
     stdx::thread getIsMasterThread([&] {
-        const auto response = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, currentTopologyVersion, deadline);
+        const auto response =
+            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
         auto topologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(topologyVersion->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersion->getProcessId(), expectedProcessId);
@@ -4550,8 +4558,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
     stdx::thread getIsMasterThread([&] {
-        const auto responseAfterElection = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, currentTopologyVersion, deadline);
+        const auto responseAfterElection =
+            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
 
         const auto topologyVersionAfterElection = responseAfterElection->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterElection->getCounter(), expectedCounter);
@@ -4567,8 +4575,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
 
         // The server TopologyVersion will increment again once we exit drain mode.
         expectedCounter = topologyVersionAfterElection->getCounter() + 1;
-        const auto responseAfterDrainComplete = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, topologyVersionAfterElection, deadline);
+        const auto responseAfterDrainComplete = awaitIsMasterWithNewOpCtx(
+            getReplCoord(), topologyVersionAfterElection.get(), {}, deadline);
         const auto topologyVersionAfterDrainComplete =
             responseAfterDrainComplete->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterDrainComplete->getCounter(), expectedCounter);
@@ -4644,8 +4652,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
     stdx::thread getIsMasterThread([&] {
-        const auto responseAfterElection = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, currentTopologyVersion, deadline);
+        const auto responseAfterElection =
+            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
 
         const auto topologyVersionAfterElection = responseAfterElection->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterElection->getCounter(), expectedCounter);
@@ -4661,8 +4669,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
 
         // The server TopologyVersion will increment once we finish reconfig.
         expectedCounter = topologyVersionAfterElection->getCounter() + 1;
-        const auto responseAfterReconfig = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, topologyVersionAfterElection, deadline);
+        const auto responseAfterReconfig = awaitIsMasterWithNewOpCtx(
+            getReplCoord(), topologyVersionAfterElection.get(), {}, deadline);
         const auto topologyVersionAfterReconfig = responseAfterReconfig->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterReconfig->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersionAfterReconfig->getProcessId(), expectedProcessId);
@@ -4676,8 +4684,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
         hangAfterReconfigFailPoint->setMode(FailPoint::off);
         // The server TopologyVersion will increment again once we exit drain mode.
         expectedCounter = topologyVersionAfterReconfig->getCounter() + 1;
-        const auto responseAfterDrainComplete = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, topologyVersionAfterReconfig, deadline);
+        const auto responseAfterDrainComplete = awaitIsMasterWithNewOpCtx(
+            getReplCoord(), topologyVersionAfterReconfig.get(), {}, deadline);
         const auto topologyVersionAfterDrainComplete =
             responseAfterDrainComplete->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterDrainComplete->getCounter(), expectedCounter);
@@ -5133,8 +5141,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfig) {
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
     stdx::thread getIsMasterThread([&] {
-        const auto response = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, currentTopologyVersion, deadline);
+        const auto response =
+            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
         auto topologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(topologyVersion->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersion->getProcessId(), expectedProcessId);
@@ -5284,8 +5292,8 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfigOnSecondary) 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
     stdx::thread getIsMasterThread([&] {
-        const auto response = getReplCoord()->awaitIsMasterResponse(
-            opCtx.get(), {}, currentTopologyVersion, deadline);
+        const auto response =
+            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
         auto topologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(topologyVersion->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersion->getProcessId(), expectedProcessId);
@@ -5564,190 +5572,12 @@ TEST_F(ReplCoordTest,
  * Tests to ensure that ReplicationCoordinator correctly calculates and updates the stable
  * optime.
  */
-class StableOpTimeTest : public ReplCoordTest {
-protected:
-    /**
-     * Return a string representation of the given set 's'.
-     */
-    std::string opTimeSetString(std::set<OpTimeAndWallTime> s) {
-        std::stringstream ss;
-        ss << "{ ";
-        for (auto const& el : s) {
-            ss << el << " ";
-        }
-        ss << "}";
-        return ss.str();
-    }
-
-    void initReplSetMode() {
-        auto settings = ReplSettings();
-        settings.setReplSetString("replset");
-        init(settings);
-    }
-};
-
-// An equality assertion for two std::set<OpTime> values. Prints the elements of each set when
-// the assertion fails. Only to be used in a 'StableOpTimeTest' unit test function.
-#define ASSERT_OPTIME_SET_EQ(a, b) \
-    ASSERT(a == b) << (opTimeSetString(a) + " != " + opTimeSetString(b));
-
-TEST_F(StableOpTimeTest, CalculateStableOpTime) {
-
-    /**
-     * Tests the 'ReplicationCoordinatorImpl::_calculateStableOpTime' method.
-     */
-
-    initReplSetMode();
-    auto repl = getReplCoord();
-    OpTimeAndWallTime commitPoint;
-    boost::optional<OpTimeAndWallTime> expectedStableOpTime;
-    boost::optional<OpTimeAndWallTime> stableOpTime;
-    std::set<OpTimeAndWallTime> stableOpTimeCandidates;
-    long long term = 0;
-
-    // There is a valid stable optime less than the commit point.
-    commitPoint = {OpTime({0, 3}, term), Date_t()};
-    stableOpTimeCandidates = {{OpTime({0, 0}, term), Date_t()},
-                              {OpTime({0, 1}, term), Date_t()},
-                              {OpTime({0, 2}, term), Date_t() + Seconds(20)},
-                              {OpTime({0, 4}, term), Date_t()}};
-    expectedStableOpTime = makeOpTimeAndWallTime(OpTime({0, 2}, term), Date_t() + Seconds(20));
-    stableOpTime =
-        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
-    ASSERT_EQ(expectedStableOpTime, stableOpTime);
-
-    // There is a valid stable optime equal to the commit point.
-    commitPoint = {OpTime({0, 2}, term), Date_t()};
-    stableOpTimeCandidates = {{OpTime({0, 0}, term), Date_t()},
-                              {OpTime({0, 1}, term), Date_t()},
-                              {OpTime({0, 2}, term), Date_t() + Seconds(30)},
-                              {OpTime({0, 3}, term), Date_t()}};
-    expectedStableOpTime = makeOpTimeAndWallTime(OpTime({0, 2}, term), Date_t() + Seconds(30));
-    stableOpTime =
-        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
-    ASSERT_EQ(expectedStableOpTime, stableOpTime);
-
-    // There is a valid stable optime, all candidates are smaller than the commit point.
-    commitPoint = {OpTime({0, 4}, term), Date_t()};
-    stableOpTimeCandidates = {{OpTime({0, 1}, term), Date_t()},
-                              {OpTime({0, 2}, term), Date_t()},
-                              {OpTime({0, 3}, term), Date_t() + Seconds(40)}};
-    expectedStableOpTime = makeOpTimeAndWallTime(OpTime({0, 3}, term), Date_t() + Seconds(40));
-    stableOpTime =
-        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
-    ASSERT_EQ(expectedStableOpTime, stableOpTime);
-
-    // There is no valid stable optime, all candidates are greater than the commit point.
-    commitPoint = {OpTime({0, 0}, term), Date_t()};
-    stableOpTimeCandidates = {{OpTime({0, 1}, term), Date_t()},
-                              {OpTime({0, 2}, term), Date_t()},
-                              {OpTime({0, 3}, term), Date_t()}};
-    expectedStableOpTime = boost::none;
-    stableOpTime =
-        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
-    ASSERT_EQ(expectedStableOpTime, stableOpTime);
-
-    // There are no timestamp candidates.
-    commitPoint = {OpTime({0, 0}, term), Date_t()};
-    stableOpTimeCandidates = {};
-    expectedStableOpTime = boost::none;
-    stableOpTime =
-        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
-    ASSERT_EQ(expectedStableOpTime, stableOpTime);
-
-    // There is a single timestamp candidate which is equal to the commit point.
-    commitPoint = {OpTime({0, 1}, term), Date_t()};
-    stableOpTimeCandidates = {{OpTime({0, 1}, term), Date_t() + Seconds(60)}};
-    expectedStableOpTime = makeOpTimeAndWallTime(OpTime({0, 1}, term), Date_t() + Seconds(60));
-    stableOpTime =
-        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
-    ASSERT_EQ(expectedStableOpTime, stableOpTime);
-
-    // There is a single timestamp candidate which is greater than the commit point.
-    commitPoint = {OpTime({0, 0}, term), Date_t()};
-    stableOpTimeCandidates = {{OpTime({0, 1}, term), Date_t()}};
-    expectedStableOpTime = boost::none;
-    stableOpTime =
-        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
-    ASSERT_EQ(expectedStableOpTime, stableOpTime);
-
-    // There is a single timestamp candidate which is less than the commit point.
-    commitPoint = {OpTime({0, 2}, term), Date_t()};
-    stableOpTimeCandidates = {{OpTime({0, 1}, term), Date_t() + Seconds(70)}};
-    expectedStableOpTime = makeOpTimeAndWallTime(OpTime({0, 1}, term), Date_t() + Seconds(70));
-    stableOpTime =
-        repl->chooseStableOpTimeFromCandidates_forTest(stableOpTimeCandidates, commitPoint);
-    ASSERT_EQ(expectedStableOpTime, stableOpTime);
-}
-
-TEST_F(StableOpTimeTest, CleanupStableOpTimeCandidates) {
-
-    /**
-     * Tests the 'ReplicationCoordinatorImpl::_cleanupStableOpTimeCandidates' method.
-     */
-
-    initReplSetMode();
-    auto repl = getReplCoord();
-    OpTimeAndWallTime stableOpTime;
-    std::set<OpTimeAndWallTime> opTimeCandidates, expectedOpTimeCandidates;
-    long long term = 0;
-
-    // Cleanup should remove all timestamp candidates < the stable optime.
-    stableOpTime = makeOpTimeAndWallTime(OpTime({0, 3}, term));
-    opTimeCandidates = {makeOpTimeAndWallTime(OpTime({0, 1}, term)),
-                        makeOpTimeAndWallTime(OpTime({0, 2}, term)),
-                        makeOpTimeAndWallTime(OpTime({0, 3}, term), Date_t() + Seconds(80)),
-                        makeOpTimeAndWallTime(OpTime({0, 4}, term))};
-    expectedOpTimeCandidates = {makeOpTimeAndWallTime(OpTime({0, 3}, term), Date_t() + Seconds(80)),
-                                makeOpTimeAndWallTime(OpTime({0, 4}, term))};
-    repl->cleanupStableOpTimeCandidates_forTest(&opTimeCandidates, stableOpTime);
-    ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
-
-    // Cleanup should remove all timestamp candidates if they are all < the stable optime.
-    stableOpTime = makeOpTimeAndWallTime(OpTime({0, 5}, term));
-    opTimeCandidates = {makeOpTimeAndWallTime(OpTime({0, 1}, term)),
-                        makeOpTimeAndWallTime(OpTime({0, 2}, term)),
-                        makeOpTimeAndWallTime(OpTime({0, 3}, term)),
-                        makeOpTimeAndWallTime(OpTime({0, 4}, term))};
-    expectedOpTimeCandidates = {};
-    repl->cleanupStableOpTimeCandidates_forTest(&opTimeCandidates, stableOpTime);
-    ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
-
-    // Cleanup should have no effect when stable optime is less than all candidates.
-    stableOpTime = makeOpTimeAndWallTime(OpTime({0, 0}, term));
-    opTimeCandidates = {makeOpTimeAndWallTime(OpTime({0, 1}, term)),
-                        makeOpTimeAndWallTime(OpTime({0, 2}, term)),
-                        makeOpTimeAndWallTime(OpTime({0, 3}, term)),
-                        makeOpTimeAndWallTime(OpTime({0, 4}, term))};
-    expectedOpTimeCandidates = {makeOpTimeAndWallTime(OpTime({0, 1}, term)),
-                                makeOpTimeAndWallTime(OpTime({0, 2}, term)),
-                                makeOpTimeAndWallTime(OpTime({0, 3}, term)),
-                                makeOpTimeAndWallTime(OpTime({0, 4}, term))};
-    repl->cleanupStableOpTimeCandidates_forTest(&opTimeCandidates, stableOpTime);
-    ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
-
-    // Cleanup should have no effect for a single candidate that is equal to stable optime.
-    stableOpTime = makeOpTimeAndWallTime(OpTime({0, 1}, term));
-    opTimeCandidates = {makeOpTimeAndWallTime(OpTime({0, 1}, term))};
-    expectedOpTimeCandidates = {makeOpTimeAndWallTime(OpTime({0, 1}, term))};
-    repl->cleanupStableOpTimeCandidates_forTest(&opTimeCandidates, stableOpTime);
-    ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
-
-    // Cleanup should leave an empty candidate list unchanged.
-    stableOpTime = makeOpTimeAndWallTime(OpTime({0, 0}, term));
-    opTimeCandidates = {};
-    expectedOpTimeCandidates = {};
-    repl->cleanupStableOpTimeCandidates_forTest(&opTimeCandidates, stableOpTime);
-    ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
-}
-
+class StableOpTimeTest : public ReplCoordTest {};
 
 TEST_F(StableOpTimeTest, SetMyLastAppliedSetsStableOpTimeForStorage) {
 
     /**
-     * Test that 'setMyLastAppliedOpTime' sets the stable timestamp properly for the storage engine
-     * and that timestamp cleanup occurs. This test is not meant to fully exercise the stable
-     * optime calculation logic.
+     * Test that 'setMyLastAppliedOpTime' sets the stable timestamp properly for the storage engine.
      */
     init("mySet/test1:1234,test2:1234,test3:1234");
     assertStartSuccess(BSON("_id"
@@ -5761,7 +5591,6 @@ TEST_F(StableOpTimeTest, SetMyLastAppliedSetsStableOpTimeForStorage) {
                                                         << "test3:1234"))),
                        HostAndPort("test2", 1234));
 
-    auto repl = getReplCoord();
     Timestamp stableTimestamp;
 
     getStorageInterface()->supportsDocLockingBool = true;
@@ -5794,11 +5623,6 @@ TEST_F(StableOpTimeTest, SetMyLastAppliedSetsStableOpTimeForStorage) {
     replCoordSetMyLastAppliedOpTime(OpTimeWithTermOne(2, 2), Date_t() + Seconds(100));
     stableTimestamp = getStorageInterface()->getStableTimestamp();
     ASSERT_EQUALS(Timestamp(2, 2), stableTimestamp);
-
-    auto opTimeCandidates = repl->getStableOpTimeCandidates_forTest();
-    std::set<OpTimeAndWallTime> expectedOpTimeCandidates = {
-        makeOpTimeAndWallTime(OpTimeWithTermOne(2, 2), Date_t() + Seconds(100))};
-    ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
 }
 
 TEST_F(StableOpTimeTest, SetMyLastAppliedSetsStableOpTimeForStorageDisableMajorityReadConcern) {
@@ -5841,9 +5665,7 @@ TEST_F(StableOpTimeTest, SetMyLastAppliedSetsStableOpTimeForStorageDisableMajori
 TEST_F(StableOpTimeTest, AdvanceCommitPointSetsStableOpTimeForStorage) {
 
     /**
-     * Test that 'advanceCommitPoint' sets the stable optime for the storage engine and that
-     * timestamp cleanup occurs. This test is not meant to fully exercise the stable optime
-     * calculation logic.
+     * Test that 'advanceCommitPoint' sets the stable optime for the storage engine.
      */
 
     init("mySet/test1:1234,test2:1234,test3:1234");
@@ -5895,12 +5717,6 @@ TEST_F(StableOpTimeTest, AdvanceCommitPointSetsStableOpTimeForStorage) {
                   Date_t() + Seconds(3));
     stableTimestamp = getStorageInterface()->getStableTimestamp();
     ASSERT_EQUALS(Timestamp(3, 2), stableTimestamp);
-
-    // Check that timestamp candidate cleanup occurs.
-    auto opTimeCandidates = getReplCoord()->getStableOpTimeCandidates_forTest();
-    std::set<OpTimeAndWallTime> expectedOpTimeCandidates = {
-        makeOpTimeAndWallTime(OpTime({3, 2}, term), Date_t() + Seconds(3))};
-    ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
 }
 
 TEST_F(StableOpTimeTest,
@@ -5960,107 +5776,6 @@ TEST_F(StableOpTimeTest,
     // Make sure the stable timestamp did not move.
     ASSERT_EQUALS(Timestamp(1, 2), getStorageInterface()->getStableTimestamp());
 }
-
-TEST_F(StableOpTimeTest, ClearOpTimeCandidatesPastCommonPointAfterRollback) {
-
-    assertStartSuccess(BSON("_id"
-                            << "mySet"
-                            << "version" << 1 << "members"
-                            << BSON_ARRAY(BSON("host"
-                                               << "node1:12345"
-                                               << "_id" << 0))
-                            << "protocolVersion" << 1),
-                       HostAndPort("node1", 12345));
-
-    auto repl = getReplCoord();
-    long long term = 0;
-    ASSERT_OK(repl->setFollowerMode(MemberState::RS_SECONDARY));
-
-    OpTime rollbackCommonPoint = OpTime({1, 2}, term);
-    OpTimeAndWallTime commitPoint =
-        makeOpTimeAndWallTime(OpTime({1, 2}, term), Date_t() + Seconds(100));
-    ASSERT_EQUALS(Timestamp::min(), getStorageInterface()->getStableTimestamp());
-
-    replCoordSetMyLastAppliedOpTime(OpTime({0, 1}, term), Date_t() + Seconds(100));
-    // Advance commit point when it has the same term as the last applied.
-    replCoordAdvanceCommitPoint(commitPoint, false);
-
-    replCoordSetMyLastAppliedOpTime(OpTime({1, 1}, term), Date_t() + Seconds(100));
-    replCoordSetMyLastAppliedOpTime(OpTime({1, 2}, term), Date_t() + Seconds(100));
-    replCoordSetMyLastAppliedOpTime(OpTime({1, 3}, term), Date_t() + Seconds(100));
-    replCoordSetMyLastAppliedOpTime(OpTime({1, 4}, term), Date_t() + Seconds(100));
-
-    // The stable timestamp should be equal to the commit point timestamp.
-    const Timestamp stableTimestamp = getStorageInterface()->getStableTimestamp();
-    Timestamp expectedStableTimestamp = commitPoint.opTime.getTimestamp();
-    ASSERT_EQUALS(expectedStableTimestamp, stableTimestamp);
-
-    // The stable optime candidate set should contain optimes >= the stable optime.
-    std::set<OpTimeAndWallTime> opTimeCandidates = repl->getStableOpTimeCandidates_forTest();
-    std::set<OpTimeAndWallTime> expectedOpTimeCandidates = {
-        makeOpTimeAndWallTime(OpTime({1, 2}, term), Date_t() + Seconds(100)),
-        makeOpTimeAndWallTime(OpTime({1, 3}, term), Date_t() + Seconds(100)),
-        makeOpTimeAndWallTime(OpTime({1, 4}, term), Date_t() + Seconds(100))};
-    ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
-
-    // We must take the RSTL in mode X before transitioning to RS_ROLLBACK.
-    const auto opCtx = makeOperationContext();
-    ReplicationStateTransitionLockGuard transitionGuard(opCtx.get(), MODE_X);
-
-    // Transition to ROLLBACK. The set of stable optime candidates should not have changed.
-    ASSERT_OK(repl->setFollowerModeRollback(opCtx.get()));
-    opTimeCandidates = repl->getStableOpTimeCandidates_forTest();
-    ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
-
-    // Simulate a rollback to the common point.
-    getExternalState()->setLastOpTimeAndWallTime(rollbackCommonPoint,
-                                                 Date_t() + Seconds(rollbackCommonPoint.getSecs()));
-    repl->resetLastOpTimesFromOplog(opCtx.get(),
-                                    ReplicationCoordinator::DataConsistency::Inconsistent);
-
-    // Transition to RECOVERING from ROLLBACK.
-    ASSERT_OK(repl->setFollowerMode(MemberState::RS_RECOVERING));
-
-    // Make sure the stable optime candidate set has been cleared of all entries past the common
-    // point.
-    opTimeCandidates = repl->getStableOpTimeCandidates_forTest();
-    auto stableOpTime =
-        repl->chooseStableOpTimeFromCandidates_forTest(opTimeCandidates, commitPoint);
-    ASSERT(stableOpTime);
-    expectedOpTimeCandidates = {*stableOpTime};
-    ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, opTimeCandidates);
-}
-
-TEST_F(StableOpTimeTest, OpTimeCandidatesAreNotAddedWhenStateIsNotConsistent) {
-
-    initReplSetMode();
-    auto repl = getReplCoord();
-    long long term = getTopoCoord().getTerm();
-
-    OpTimeAndWallTime consistentOpTime =
-        makeOpTimeAndWallTime(OpTime({1, 1}, term), Date_t() + Seconds(100));
-    OpTimeAndWallTime inconsistentOpTime =
-        makeOpTimeAndWallTime(OpTime({1, 2}, term), Date_t() + Seconds(100));
-    std::set<OpTimeAndWallTime> expectedOpTimeCandidates = {
-        makeOpTimeAndWallTime(OpTime({1, 1}, term), Date_t() + Seconds(100))};
-
-    // Set the lastApplied optime forward when data is consistent, and check that it was added to
-    // the candidate set.
-    replCoordSetMyLastAppliedOpTimeForward(consistentOpTime.opTime,
-                                           ReplicationCoordinator::DataConsistency::Consistent,
-                                           consistentOpTime.wallTime);
-    ASSERT_EQUALS(consistentOpTime, repl->getMyLastAppliedOpTimeAndWallTime());
-    ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, repl->getStableOpTimeCandidates_forTest());
-
-    // Set the lastApplied optime forward when data is not consistent, and check that it wasn't
-    // added to the candidate set.
-    replCoordSetMyLastAppliedOpTimeForward(inconsistentOpTime.opTime,
-                                           ReplicationCoordinator::DataConsistency::Inconsistent,
-                                           inconsistentOpTime.wallTime);
-    ASSERT_EQUALS(inconsistentOpTime, repl->getMyLastAppliedOpTimeAndWallTime());
-    ASSERT_OPTIME_SET_EQ(expectedOpTimeCandidates, repl->getStableOpTimeCandidates_forTest());
-}
-
 
 TEST_F(ReplCoordTest, NodeReturnsShutdownInProgressWhenWaitingUntilAnOpTimeDuringShutdown) {
     assertStartSuccess(BSON("_id"
@@ -7143,12 +6858,11 @@ TEST_F(ReplCoordTest,
     OpTime time2(Timestamp(100, 2), term);
     OpTime time3(Timestamp(100, 3), term);
 
-    auto consistency = ReplicationCoordinator::DataConsistency::Consistent;
     replCoordSetMyLastAppliedOpTime(time1, Date_t() + Seconds(100));
     ASSERT_EQUALS(time1, getReplCoord()->getMyLastAppliedOpTime());
-    replCoordSetMyLastAppliedOpTimeForward(time3, consistency, Date_t() + Seconds(100));
+    replCoordSetMyLastAppliedOpTimeForward(time3, Date_t() + Seconds(100));
     ASSERT_EQUALS(time3, getReplCoord()->getMyLastAppliedOpTime());
-    replCoordSetMyLastAppliedOpTimeForward(time2, consistency, Date_t() + Seconds(100));
+    replCoordSetMyLastAppliedOpTimeForward(time2, Date_t() + Seconds(100));
     replCoordSetMyLastDurableOpTimeForward(time2, Date_t() + Seconds(100));
     ASSERT_EQUALS(time3, getReplCoord()->getMyLastAppliedOpTime());
 }
@@ -7168,12 +6882,11 @@ DEATH_TEST_F(ReplCoordTest,
     OpTime time1(Timestamp(100, 1), 1);
     OpTime time2(Timestamp(99, 1), 2);
 
-    auto consistency = ReplicationCoordinator::DataConsistency::Consistent;
     replCoordSetMyLastAppliedOpTime(time1, Date_t() + Seconds(100));
     ASSERT_EQUALS(time1, getReplCoord()->getMyLastAppliedOpTime());
     // Since in pv1, oplog entries are ordered by non-decreasing
     // term and strictly increasing timestamp, it leads to invariant failure.
-    replCoordSetMyLastAppliedOpTimeForward(time2, consistency, Date_t() + Seconds(100));
+    replCoordSetMyLastAppliedOpTimeForward(time2, Date_t() + Seconds(100));
 }
 
 DEATH_TEST_F(ReplCoordTest,
@@ -7191,12 +6904,11 @@ DEATH_TEST_F(ReplCoordTest,
     OpTime time1(Timestamp(100, 1), 1);
     OpTime time2(Timestamp(100, 1), 2);
 
-    auto consistency = ReplicationCoordinator::DataConsistency::Consistent;
     replCoordSetMyLastAppliedOpTime(time1, Date_t() + Seconds(100));
     ASSERT_EQUALS(time1, getReplCoord()->getMyLastAppliedOpTime());
     // Since in pv1, oplog entries are ordered by non-decreasing
     // term and strictly increasing timestamp, it leads to invariant failure.
-    replCoordSetMyLastAppliedOpTimeForward(time2, consistency, Date_t() + Seconds(100));
+    replCoordSetMyLastAppliedOpTimeForward(time2, Date_t() + Seconds(100));
 }
 
 DEATH_TEST_F(ReplCoordTest,
@@ -7214,12 +6926,11 @@ DEATH_TEST_F(ReplCoordTest,
     OpTime time1(Timestamp(100, 1), 1);
     OpTime time2(Timestamp(100, 2), 0);
 
-    auto consistency = ReplicationCoordinator::DataConsistency::Consistent;
     replCoordSetMyLastAppliedOpTime(time1, Date_t() + Seconds(100));
     ASSERT_EQUALS(time1, getReplCoord()->getMyLastAppliedOpTime());
     // Since in pv1, oplog entries are ordered by non-decreasing
     // term and strictly increasing timestamp, it leads to invariant failure.
-    replCoordSetMyLastAppliedOpTimeForward(time2, consistency, Date_t() + Seconds(100));
+    replCoordSetMyLastAppliedOpTimeForward(time2, Date_t() + Seconds(100));
 }
 
 DEATH_TEST_F(ReplCoordTest,
@@ -7237,12 +6948,11 @@ DEATH_TEST_F(ReplCoordTest,
     OpTime time1(Timestamp(100, 1), 1);
     OpTime time2(Timestamp(100, 1), 0);
 
-    auto consistency = ReplicationCoordinator::DataConsistency::Consistent;
     replCoordSetMyLastAppliedOpTime(time1, Date_t() + Seconds(100));
     ASSERT_EQUALS(time1, getReplCoord()->getMyLastAppliedOpTime());
     // Since in pv1, oplog entries are ordered by non-decreasing
     // term and strictly increasing timestamp, it leads to invariant failure.
-    replCoordSetMyLastAppliedOpTimeForward(time2, consistency, Date_t() + Seconds(100));
+    replCoordSetMyLastAppliedOpTimeForward(time2, Date_t() + Seconds(100));
 }
 
 TEST_F(ReplCoordTest, OnlyForwardSyncProgressForOtherNodesWhenTheNodesAreBelievedToBeUp) {

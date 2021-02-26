@@ -273,6 +273,21 @@ void _addOplogChainOpsToWriterVectors(OperationContext* opCtx,
 
 void stableSortByNamespace(std::vector<const OplogEntry*>* oplogEntryPointers) {
     auto nssComparator = [](const OplogEntry* l, const OplogEntry* r) {
+        // Specially sort collections that are $cmd first, before everything else.  This will
+        // move commands with the special $cmd collection name to the beginning, rather than sorting
+        // them potentially in the middle of the sorted vector of insert/update/delete ops.
+        // This special sort behavior is required because DDL operations need to run before
+        // create/update/delete operations in a multi-doc transaction.
+        if (l->getNss().isCommand()) {
+            if (r->getNss().isCommand())
+                // l == r; now compare the namespace
+                return l->getNss() < r->getNss();
+            // l < r
+            return true;
+        }
+        if (r->getNss().isCommand())
+            // l > r
+            return false;
         return l->getNss() < r->getNss();
     };
     std::stable_sort(oplogEntryPointers->begin(), oplogEntryPointers->end(), nssComparator);
@@ -288,17 +303,15 @@ public:
     ApplyBatchFinalizer(ReplicationCoordinator* replCoord) : _replCoord(replCoord) {}
     virtual ~ApplyBatchFinalizer(){};
 
-    virtual void record(const OpTimeAndWallTime& newOpTimeAndWallTime,
-                        ReplicationCoordinator::DataConsistency consistency) {
-        _recordApplied(newOpTimeAndWallTime, consistency);
+    virtual void record(const OpTimeAndWallTime& newOpTimeAndWallTime) {
+        _recordApplied(newOpTimeAndWallTime);
     };
 
 protected:
-    void _recordApplied(const OpTimeAndWallTime& newOpTimeAndWallTime,
-                        ReplicationCoordinator::DataConsistency consistency) {
+    void _recordApplied(const OpTimeAndWallTime& newOpTimeAndWallTime) {
         // We have to use setMyLastAppliedOpTimeAndWallTimeForward since this thread races with
         // ReplicationExternalStateImpl::onTransitionToPrimary.
-        _replCoord->setMyLastAppliedOpTimeAndWallTimeForward(newOpTimeAndWallTime, consistency);
+        _replCoord->setMyLastAppliedOpTimeAndWallTimeForward(newOpTimeAndWallTime);
     }
 
     void _recordDurable(const OpTimeAndWallTime& newOpTimeAndWallTime) {
@@ -319,8 +332,7 @@ public:
           _waiterThread{&ApplyBatchFinalizerForJournal::_run, this} {};
     ~ApplyBatchFinalizerForJournal();
 
-    void record(const OpTimeAndWallTime& newOpTimeAndWallTime,
-                ReplicationCoordinator::DataConsistency consistency) override;
+    void record(const OpTimeAndWallTime& newOpTimeAndWallTime) override;
 
 private:
     /**
@@ -351,9 +363,8 @@ ApplyBatchFinalizerForJournal::~ApplyBatchFinalizerForJournal() {
     _waiterThread.join();
 }
 
-void ApplyBatchFinalizerForJournal::record(const OpTimeAndWallTime& newOpTimeAndWallTime,
-                                           ReplicationCoordinator::DataConsistency consistency) {
-    _recordApplied(newOpTimeAndWallTime, consistency);
+void ApplyBatchFinalizerForJournal::record(const OpTimeAndWallTime& newOpTimeAndWallTime) {
+    _recordApplied(newOpTimeAndWallTime);
 
     stdx::unique_lock<Latch> lock(_mutex);
     _latestOpTimeAndWallTime = newOpTimeAndWallTime;
@@ -516,16 +527,8 @@ void OplogApplierImpl::_run(OplogBuffer* oplogBuffer) {
         _storageInterface->oplogDiskLocRegister(
             &opCtx, lastOpTimeInBatch.getTimestamp(), orderedCommit);
 
-        // 4. Finalize this batch. We are at a consistent optime if our current optime is >= the
-        // current 'minValid' optime. Note that recording the lastOpTime in the finalizer includes
-        // advancing the global timestamp to at least its timestamp.
-        const auto minValid = _consistencyMarkers->getMinValid(&opCtx);
-        auto consistency = (lastOpTimeInBatch >= minValid)
-            ? ReplicationCoordinator::DataConsistency::Consistent
-            : ReplicationCoordinator::DataConsistency::Inconsistent;
-
-        // The finalizer advances the global timestamp to lastOpTimeInBatch.
-        finalizer->record({lastOpTimeInBatch, lastWallTimeInBatch}, consistency);
+        // 4. Finalize this batch. The finalizer advances the global timestamp to lastOpTimeInBatch.
+        finalizer->record({lastOpTimeInBatch, lastWallTimeInBatch});
     }
 }
 
@@ -1027,6 +1030,8 @@ Status OplogApplierImpl::applyOplogBatchPerWorker(OperationContext* opCtx,
     opCtx->recoveryUnit()->setPrepareConflictBehavior(
         PrepareConflictBehavior::kIgnoreConflictsAllowWrites);
 
+    // Group the operations by namespace in order to get larger groups for bulk inserts, but do not
+    // mix up the current order of oplog entries within the same namespace (thus *stable* sort).
     stableSortByNamespace(ops);
 
     const auto oplogApplicationMode = getOptions().mode;

@@ -11,6 +11,7 @@ import os.path
 import subprocess
 import sys
 import threading
+from datetime import datetime
 
 from buildscripts.resmokelib import config as _config
 from buildscripts.resmokelib import errors
@@ -120,12 +121,15 @@ class Process(object):
                 close_fds=close_fds, env=self.env, creationflags=creation_flags, cwd=self._cwd)
             self.pid = self._process.pid
 
-            # TODO: check path exists
             if _config.UNDO_RECORDER_PATH is not None and ("mongod" in self.args[0]
                                                            or "mongos" in self.args[0]):
+                now_str = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+                recorder_output_file = "{logger}-{process}-{pid}-{t}.undo".format(
+                    logger=self.logger.name.replace('/', '-'),
+                    process=os.path.basename(self.args[0]), pid=self.pid, t=now_str)
                 recorder_args = [
                     _config.UNDO_RECORDER_PATH, "--thread-fuzzing", "-p",
-                    str(self.pid)
+                    str(self.pid), "-o", recorder_output_file
                 ]
                 self._recorder = subprocess.Popen(recorder_args, bufsize=buffer_size, env=self.env,
                                                   creationflags=creation_flags)

@@ -31,23 +31,121 @@
 
 #include "mongo/platform/basic.h"
 
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "mongo/bson/bsonmisc.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/oid.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/cst/key_fieldname.h"
 #include "mongo/db/cst/key_value.h"
+#include "mongo/platform/decimal128.h"
 #include "mongo/stdx/variant.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
 using UserFieldname = std::string;
+// These are the non-compound types from bsonspec.org.
 using UserDouble = double;
 using UserString = std::string;
+using UserBinary = BSONBinData;
+struct UserUndefined {};
+using UserObjectId = OID;
+using UserBoolean = bool;
+using UserDate = Date_t;
+struct UserNull {};
+using UserRegex = BSONRegEx;
+using UserDBPointer = BSONDBRef;
+using UserJavascript = BSONCode;
+using UserSymbol = BSONSymbol;
+using UserJavascriptWithScope = BSONCodeWScope;
+using UserInt = int;
+using UserTimestamp = Timestamp;
+using UserLong = long long;
+using UserDecimal = Decimal128;
+struct UserMinKey {};
+struct UserMaxKey {};
 
 struct CNode {
+    static auto noopLeaf() {
+        return CNode{ObjectChildren{}};
+    }
+
+    /**
+     * Produce a string formatted with tabs and endlines that describes the CST underneath this
+     * CNode.
+     */
     auto toString() const {
-        return toStringHelper(0);
+        return toStringHelper(0) + "\n";
+    }
+
+    /**
+     * Produce BSON representing this CST. This is for debugging and testing with structured output,
+     * not for decompiling to the input query. The produced BSON will consist of arrays, objects,
+     * and descriptive strings only. This version also returns bool that indicates if the returned
+     * BSON is a BSONArray.
+     */
+    std::pair<BSONObj, bool> toBsonWithArrayIndicator() const;
+    /**
+     * Produce BSON representing this CST. This is for debugging and testing with structured output,
+     * not for decompiling to the input query. The produced BSON will consist of arrays, objects,
+     * and descriptive strings only.
+     */
+    BSONObj toBson() const {
+        return toBsonWithArrayIndicator().first;
+    }
+
+    /*
+     * Produce the children of this CNode representing an array. Throws a fatal exception if this
+     * CNode does not represent an array. Const version.
+     */
+    auto& arrayChildren() const {
+        return stdx::get<ArrayChildren>(payload);
+    }
+    /*
+     * Produce the children of this CNode representing an array. Throws a fatal exception if this
+     * CNode does not represent an array. Non-const version.
+     */
+    auto& arrayChildren() {
+        return stdx::get<ArrayChildren>(payload);
+    }
+
+    /*
+     * Produce the children of this CNode representing an object. Throws a fatal exception if this
+     * CNode does not represent an object. Const version.
+     */
+    auto& objectChildren() const {
+        return stdx::get<ObjectChildren>(payload);
+    }
+    /*
+     * Produce the children of this CNode representing an object. Throws a fatal exception if this
+     * CNode does not represent an object. Non-const version.
+     */
+    auto& objectChildren() {
+        return stdx::get<ObjectChildren>(payload);
+    }
+
+    /*
+     * Produce the KeyFieldname of the first element of this CNode representing an object. Throws a
+     * fatal exception if this CNode does not represent an object, if it is an empty object or if
+     * the first element does not have a KeyFieldname. Const version.
+     */
+    auto& firstKeyFieldname() const {
+        dassert(objectChildren().size() > 0);
+        return stdx::get<KeyFieldname>(objectChildren().begin()->first);
+    }
+    /*
+     * Produce the KeyFieldname of the first element of this CNode representing an object. Throws a
+     * fatal exception if this CNode does not represent an object, if it is an empty object or if
+     * the first element does not have a KeyFieldname. Non-const version.
+     */
+    auto& firstKeyFieldname() {
+        dassert(objectChildren().size() > 0);
+        return stdx::get<KeyFieldname>(objectChildren().begin()->first);
     }
 
 private:
@@ -55,8 +153,31 @@ private:
 
 public:
     using Fieldname = stdx::variant<KeyFieldname, UserFieldname>;
-    using Children = std::vector<std::pair<Fieldname, CNode>>;
-    stdx::variant<Children, KeyValue, UserDouble, UserString> payload;
+    using ArrayChildren = std::vector<CNode>;
+    using ObjectChildren = std::vector<std::pair<Fieldname, CNode>>;
+    stdx::variant<ArrayChildren,
+                  ObjectChildren,
+                  KeyValue,
+                  UserDouble,
+                  UserString,
+                  UserBinary,
+                  UserUndefined,
+                  UserObjectId,
+                  UserBoolean,
+                  UserDate,
+                  UserNull,
+                  UserRegex,
+                  UserDBPointer,
+                  UserJavascript,
+                  UserSymbol,
+                  UserJavascriptWithScope,
+                  UserInt,
+                  UserTimestamp,
+                  UserLong,
+                  UserDecimal,
+                  UserMinKey,
+                  UserMaxKey>
+        payload;
 };
 
 }  // namespace mongo

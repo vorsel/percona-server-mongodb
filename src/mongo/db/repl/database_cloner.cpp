@@ -34,6 +34,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/commands/list_collections_filter.h"
 #include "mongo/db/repl/database_cloner.h"
+#include "mongo/db/repl/database_cloner_common.h"
 #include "mongo/db/repl/database_cloner_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
@@ -56,11 +57,6 @@ DatabaseCloner::DatabaseCloner(const std::string& dbName,
 
 BaseCloner::ClonerStages DatabaseCloner::getStages() {
     return {&_listCollectionsStage};
-}
-
-/* static */
-CollectionOptions DatabaseCloner::parseCollectionOptions(const BSONObj& obj) {
-    return uassertStatusOK(CollectionOptions::parse(obj, CollectionOptions::parseForStorage));
 }
 
 void DatabaseCloner::preStage() {

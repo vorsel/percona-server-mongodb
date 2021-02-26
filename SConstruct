@@ -2946,6 +2946,20 @@ def doConfigure(myenv):
             myenv.AppendUnique(CPPDEFINES=['ADDRESS_SANITIZER'])
 
         if using_tsan:
+
+            if use_libunwind:
+                # TODO: SERVER-48622
+                #
+                # See https://github.com/google/sanitizers/issues/943
+                # for why we disallow combining TSAN with
+                # libunwind. We could, atlernatively, have added logic
+                # to automate the decision about whether to enable
+                # libunwind based on whether TSAN is enabled, but that
+                # logic is already complex, and it feels better to
+                # make it explicit that using TSAN means you won't get
+                # the benefits of libunwind. Fixing this is:
+                env.FatalError("Cannot use libunwind with TSAN, please add --use-libunwind=off to your compile flags")
+
             # die_after_fork=0 is a temporary setting to allow tests to continue while we figure out why
             # we're running afoul of it. If we remove it here, it also needs to be removed from the test
             # variant in etc/evergreen.yml
@@ -2983,7 +2997,15 @@ def doConfigure(myenv):
             # lld has problems with separate debug info on some platforms. See:
             # - https://bugzilla.mozilla.org/show_bug.cgi?id=1485556
             # - https://bugzilla.mozilla.org/show_bug.cgi?id=1485556
-            if get_option('separate-debug') == 'off':
+            #
+            # lld also apparently has problems with symbol resolution
+            # in some esoteric configurations that apply for us when
+            # using --link-model=dynamic mode, so disable lld there
+            # too. See:
+            # - https://bugs.llvm.org/show_bug.cgi?id=46676
+            #
+            # We should revisit all of these issues the next time we upgrade our clang minimum.
+            if get_option('separate-debug') == 'off' and get_option('link-model') != 'dynamic':
                 if not AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=lld'):
                     AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
             else:
@@ -3816,9 +3838,10 @@ def doConfigure(myenv):
 env = doConfigure( env )
 env["NINJA_SYNTAX"] = "#site_scons/third_party/ninja_syntax.py"
 
+
 # Now that we are done with configure checks, enable ccache and
-# icecream, if available. Per the rules declared in the icecream tool,
-# load the ccache tool first.
+# icecream if requested. If *both* icecream and ccache are requested,
+# ccache must be loaded first.
 env.Tool('ccache')
 
 if env.ToolchainIs("clang"):
@@ -3827,6 +3850,7 @@ elif env.ToolchainIs("gcc"):
     env["ICECC_COMPILER_TYPE"] = "gcc"
 
 env.Tool('icecream')
+
 
 # Defaults for SCons provided flags. SetOption only sets the option to our value
 # if the user did not provide it. So for any flag here if it's explicitly passed
@@ -3886,13 +3910,13 @@ if get_option('ninja') != 'disabled':
     else:
         ninja_builder = Tool("ninja_next")
         ninja_builder.generate(env)
-        
+
         ninjaConf = Configure(env, help=False, custom_tests = {
             'CheckNinjaCompdbExpand': env.CheckNinjaCompdbExpand,
         })
         env['NINJA_COMPDB_EXPAND'] = ninjaConf.CheckNinjaCompdbExpand()
         ninjaConf.Finish()
-        
+
 
     # idlc.py has the ability to print it's implicit dependencies
     # while generating, Ninja can consume these prints using the
@@ -3936,7 +3960,7 @@ if get_option('ninja') != 'disabled':
 
     def ninja_test_list_builder(env, node):
         test_files = [test_file.path for test_file in env["MONGO_TEST_REGISTRY"][node.path]]
-        files = "\\n".join(test_files)
+        files = ' '.join(test_files)
         return {
             "outputs": [node.get_path()],
             "rule": "TEST_LIST",
@@ -3946,13 +3970,15 @@ if get_option('ninja') != 'disabled':
             }
         }
 
+    if env["PLATFORM"] == "win32":
+        cmd = 'cmd.exe /c del "$out" && for %a in ($files) do (echo %a >> "$out")'
+    else:
+        cmd = 'rm -f "$out"; for i in $files; do echo "$$i" >> "$out"; done;'
+
     env.NinjaRule(
         rule="TEST_LIST",
         description="Compiling test list: $out",
-        command="{prefix}echo {flags} '$files' > '$out'".format(
-            prefix="cmd.exe /c " if env["PLATFORM"] == "win32" else "",
-            flags="-n" if env["PLATFORM"] != "win32" else "",
-        ),
+        command=cmd,
     )
     env.NinjaRegisterFunctionHandler("test_list_builder_action", ninja_test_list_builder)
 

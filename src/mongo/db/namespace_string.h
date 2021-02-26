@@ -106,6 +106,9 @@ public:
     // Namespace for storing the persisted state of migration coordinators.
     static const NamespaceString kMigrationCoordinatorsNamespace;
 
+    // Namespace for storing the persisted state of tenant migration donors.
+    static const NamespaceString kMigrationDonorsNamespace;
+
     // Namespace for replica set configuration settings.
     static const NamespaceString kSystemReplSetNamespace;
 
@@ -117,6 +120,9 @@ public:
 
     // Namespace for balancer settings and default read and write concerns.
     static const NamespaceString kConfigSettingsNamespace;
+
+    // Namespace for vector clock state.
+    static const NamespaceString kVectorClockNamespace;
 
     /**
      * Constructs an empty NamespaceString.

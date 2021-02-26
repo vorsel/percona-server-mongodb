@@ -13,6 +13,7 @@ let st = new ShardingTest({
 });
 
 const dbName = "testdb";
+const otherDbName = "otherdb";
 
 function verifyDocuments(db, count) {
     assert.eq(count, db.unshardedFoo.count());
@@ -21,19 +22,27 @@ function verifyDocuments(db, count) {
 function createCollections() {
     assert.commandWorked(st.getDB(dbName).runCommand({dropDatabase: 1}));
     let db = st.getDB(dbName);
+    let otherDb = st.getDB(otherDbName);
 
-    const unshardedFooIndexes = [{key: {a: 1}, name: 'fooIndex'}];
-    const shardedBarIndexes = [{key: {a: 1}, name: 'barIndex'}];
+    const unshardedFooIndexes = [
+        {key: {a: 1}, name: 'fooIndex_a'},
+        {key: {c: 1}, name: 'fooTTL_c', expireAfterSeconds: 1800}
+    ];
+    const shardedBarIndexes = [
+        {key: {a: 1}, name: 'barIndex_a'},
+        {key: {c: 1}, name: 'barTTL_c', expireAfterSeconds: 1800}
+    ];
 
     assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
     assert.commandWorked(st.s.adminCommand({movePrimary: dbName, to: st.shard0.shardName}));
 
     assert.commandWorked(db.createCollection('unshardedFoo'));
     assert.commandWorked(db.createCollection('shardedBar'));
+    assert.commandWorked(otherDb.createCollection('unshardedOtherFoo'));
 
     for (let i = 0; i < 3; i++) {
-        assert.commandWorked(db.unshardedFoo.insert({a: i}));
-        assert.commandWorked(db.shardedBar.insert({a: i}));
+        assert.commandWorked(db.unshardedFoo.insert({_id: i, a: i, b: i, c: i}));
+        assert.commandWorked(db.shardedBar.insert({_id: i, a: i, b: i, c: i}));
     }
 
     assert.commandWorked(
@@ -42,11 +51,112 @@ function createCollections() {
 
     assert.commandWorked(db.adminCommand({enableSharding: dbName}));
     assert.commandWorked(db.adminCommand({shardCollection: dbName + '.shardedBar', key: {_id: 1}}));
+
+    assert.commandWorked(db.createView('unshardedFooView', 'unshardedFoo', [{$match: {}}]));
+    assert.commandWorked(db.createView('shardedBarView', 'shardedBar', [{$match: {}}]));
 }
 
-// start move primary and hang during cloneCatalog
-// failViaMongos indicates if mongos can get an up to date routing info
-function testMovePrimary(failpoint, fromShard, toShard, coll, shouldFail) {
+function mapFunc() {
+    emit(this.a, 1);
+}
+function reduceFunc(key, values) {
+    return Array.sum(values);
+}
+
+function buildCommands(collName, shouldFail) {
+    const commands = [
+        {command: {insert: collName, documents: [{a: 10}]}, shouldFail: shouldFail},
+        {
+            command: {update: collName, updates: [{q: {a: 1}, u: {$set: {a: 11}}}]},
+            shouldFail: shouldFail
+        },
+        {
+            command: {findAndModify: collName, query: {_id: 2}, update: {$set: {a: 11}}},
+            shouldFail: shouldFail
+        },
+        {command: {delete: collName, deletes: [{q: {_id: 0}, limit: 1}]}, shouldFail: shouldFail},
+        {
+            command: {
+                aggregate: collName,
+                cursor: {},
+                pipeline: [
+                    {$match: {_id: 0}},
+                    {
+                        $merge: {
+                            into: {db: dbName, coll: "testMergeColl"},
+                            on: "_id",
+                            whenMatched: "replace",
+                            whenNotMatched: "insert"
+                        }
+                    }
+                ]
+            },
+            shouldFail: true
+        },
+        {
+            command: {
+                aggregate: collName,
+                cursor: {},
+                pipeline: [
+                    {$match: {_id: 0}},
+                    {
+                        $merge: {
+                            into: {db: otherDbName, coll: "testMergeColl"},
+                            on: "_id",
+                            whenMatched: "replace",
+                            whenNotMatched: "insert"
+                        }
+                    }
+                ]
+            },
+            shouldFail: false
+        },
+        {
+            command:
+                {aggregate: collName, cursor: {}, pipeline: [{$match: {}}, {$out: "testOutColl"}]},
+            shouldFail: true
+        },
+        {
+            command: {
+                mapReduce: collName,
+                map: mapFunc,
+                reduce: reduceFunc,
+                out: {merge: "testOutMR", db: dbName}
+            },
+            shouldFail: true
+        },
+        {
+            command: {
+                mapReduce: collName,
+                map: mapFunc,
+                reduce: reduceFunc,
+                out: {merge: "testOutMR", db: otherDbName}
+            },
+            shouldFail: false
+        },
+        {command: {create: "testCollection"}, shouldFail: true},
+        {
+            command: {createIndexes: collName, indexes: [{key: {b: 1}, name: collName + "Idx_b"}]},
+            shouldFail: shouldFail
+        },
+        {
+            command: {collMod: collName, index: {keyPattern: {c: 1}, expireAfterSeconds: 3600}},
+            shouldFail: shouldFail
+        },
+        {command: {convertToCapped: "unshardedFoo", size: 1000000}, shouldFail: true}
+    ];
+    return commands;
+}
+
+function buildDDLCommands(collName) {
+    const commands = [{
+        command: {renameCollection: dbName + "." + collName, to: dbName + ".testCollection"},
+        alwaysFail: true
+    }];
+    return commands;
+}
+
+function testMovePrimary(failpoint, fromShard, toShard, db, shouldFail, sharded) {
     let codeToRunInParallelShell = '{ db.getSiblingDB("admin").runCommand({movePrimary: "' +
         dbName + '", to: "' + toShard.name + '"}); }';
 
@@ -59,27 +169,64 @@ function testMovePrimary(failpoint, fromShard, toShard, coll, shouldFail) {
     clearRawMongoProgramOutput();
 
     // Test DML
-    jsTestLog("Before insert");
-    if (shouldFail) {
-        assert.commandFailedWithCode(coll.insert({a: 10}), ErrorCodes.MovePrimaryInProgress);
+
+    let collName;
+    let cmdShouldFail = !sharded;
+    if (sharded) {
+        collName = "shardedBar";
     } else {
-        assert.commandWorked(coll.insert({a: 10}));
+        collName = "unshardedFoo";
     }
 
-    jsTestLog("Before update");
-    if (shouldFail) {
-        assert.commandFailedWithCode(coll.update({a: 1}, {$set: {a: 10}}),
-                                     ErrorCodes.MovePrimaryInProgress);
+    buildCommands(collName, cmdShouldFail).forEach(commandObj => {
+        if (shouldFail && commandObj.shouldFail) {
+            jsTestLog("running command: " + tojson(commandObj.command) +
+                      ",\nshoudFail: " + shouldFail);
+            assert.commandFailedWithCode(db.runCommand(commandObj.command),
+                                         ErrorCodes.MovePrimaryInProgress);
+        } else if (!shouldFail && !commandObj.shouldFail) {
+            jsTestLog("running command: " + tojson(commandObj.command) +
+                      ",\nshoudFail: " + shouldFail);
+            assert.commandWorked(db.runCommand(commandObj.command));
+        }
+    });
+
+    assert.commandWorked(fromShard.adminCommand({configureFailPoint: failpoint, mode: 'off'}));
+
+    awaitShell();
+}
+
+function testMovePrimaryDDL(failpoint, fromShard, toShard, db, shouldFail, sharded) {
+    let codeToRunInParallelShell = '{ db.getSiblingDB("admin").runCommand({movePrimary: "' +
+        dbName + '", to: "' + toShard.name + '"}); }';
+
+    assert.commandWorked(fromShard.adminCommand({configureFailPoint: failpoint, mode: 'alwaysOn'}));
+
+    let awaitShell = startParallelShell(codeToRunInParallelShell, st.s.port);
+
+    jsTestLog("Waiting for failpoint " + failpoint);
+    waitForFailpoint("Hit " + failpoint, 1);
+    clearRawMongoProgramOutput();
+
+    let collName;
+    if (sharded) {
+        collName = "shardedBar";
     } else {
-        assert.commandWorked(coll.update({a: 10}, {$set: {a: 11}}));
+        collName = "unshardedFoo";
     }
 
-    jsTestLog("Before remove");
-    if (shouldFail) {
-        assert.commandFailedWithCode(coll.remove({a: 1}), ErrorCodes.MovePrimaryInProgress);
-    } else {
-        assert.commandWorked(coll.remove({a: 11}));
-    }
+    buildDDLCommands(collName).forEach(commandObj => {
+        if (shouldFail) {
+            jsTestLog("running command: " + tojson(commandObj.command) +
+                      ",\nshoudFail: " + shouldFail);
+            assert.commandFailedWithCode(db.runCommand(commandObj.command),
+                                         ErrorCodes.MovePrimaryInProgress);
+        } else if (!commandObj.alwaysFail) {
+            jsTestLog("running command: " + tojson(commandObj.command) +
+                      ",\nshoudFail: " + shouldFail);
+            assert.commandWorked(db.runCommand(commandObj.command));
+        }
+    });
 
     assert.commandWorked(fromShard.adminCommand({configureFailPoint: failpoint, mode: 'off'}));
 
@@ -89,37 +236,28 @@ function testMovePrimary(failpoint, fromShard, toShard, coll, shouldFail) {
 createCollections();
 let fromShard = st.getPrimaryShard(dbName);
 let toShard = st.getOther(fromShard);
-testMovePrimary('hangInCloneStage', fromShard, toShard, fromShard.getDB(dbName).shardedBar, false);
 
-fromShard = st.getPrimaryShard(dbName);
-toShard = st.getOther(fromShard);
-testMovePrimary('hangInCloneStage', fromShard, toShard, fromShard.getDB(dbName).unshardedFoo, true);
+testMovePrimary('hangInCloneStage', fromShard, toShard, st.s.getDB(dbName), true, false);
 verifyDocuments(toShard.getDB(dbName), 3);
 verifyDocuments(fromShard.getDB(dbName), 0);
 
 createCollections();
 fromShard = st.getPrimaryShard(dbName);
 toShard = st.getOther(fromShard);
-testMovePrimary('hangInCloneStage', fromShard, toShard, st.s.getDB(dbName).shardedBar, false);
 
-fromShard = st.getPrimaryShard(dbName);
-toShard = st.getOther(fromShard);
-testMovePrimary('hangInCloneStage', fromShard, toShard, st.s.getDB(dbName).unshardedFoo, true);
+testMovePrimary('hangInCloneStage', fromShard, toShard, st.s.getDB(dbName), false, true);
 verifyDocuments(toShard.getDB(dbName), 3);
 verifyDocuments(fromShard.getDB(dbName), 0);
 
 createCollections();
 fromShard = st.getPrimaryShard(dbName);
 toShard = st.getOther(fromShard);
-testMovePrimary(
-    'hangInCleanStaleDataStage', fromShard, toShard, st.s.getDB(dbName).shardedBar, false);
+testMovePrimaryDDL('hangInCloneStage', fromShard, toShard, st.s.getDB("admin"), false, true);
 
+createCollections();
 fromShard = st.getPrimaryShard(dbName);
 toShard = st.getOther(fromShard);
-testMovePrimary(
-    'hangInCleanStaleDataStage', fromShard, toShard, st.s.getDB(dbName).unshardedFoo, false);
-verifyDocuments(toShard.getDB(dbName), 3);
-verifyDocuments(fromShard.getDB(dbName), 0);
+testMovePrimary('hangInCleanStaleDataStage', fromShard, toShard, st.s.getDB(dbName), false, false);
 
 st.stop();
 })();

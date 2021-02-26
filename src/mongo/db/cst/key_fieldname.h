@@ -33,11 +33,16 @@
 
 #include "mongo/util/printable_enum.h"
 
-#define KEYFIELDNAMES(ENUMIFY) \
-    ENUMIFY(arrayMarker)       \
-    ENUMIFY(atan2)             \
-    ENUMIFY(id)                \
-    ENUMIFY(project)
+#define KEYFIELDNAMES(ENUMIFY)   \
+    ENUMIFY(atan2)               \
+    ENUMIFY(id)                  \
+    ENUMIFY(project)             \
+    ENUMIFY(inhibitOptimization) \
+    ENUMIFY(unionWith)           \
+    ENUMIFY(collArg)             \
+    ENUMIFY(pipelineArg)         \
+    ENUMIFY(skip)                \
+    ENUMIFY(limit)
 
 MAKE_PRINTABLE_ENUM(KeyFieldname, KEYFIELDNAMES);
 MAKE_PRINTABLE_ENUM_STRING_ARRAY(key_fieldname, KeyFieldname, KEYFIELDNAMES);

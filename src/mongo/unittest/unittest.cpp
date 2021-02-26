@@ -40,6 +40,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <pcrecpp.h>
 
 #include "mongo/logger/console_appender.h"
 #include "mongo/logger/log_manager.h"
@@ -79,6 +80,10 @@ auto& suitesMap() {
 }
 
 }  // namespace
+
+bool searchRegex(const std::string& pattern, const std::string& string) {
+    return pcrecpp::RE(pattern).PartialMatch(string);
+}
 
 class Result {
 public:
@@ -155,9 +160,10 @@ namespace {
 
 // Attempting to read the featureCompatibilityVersion parameter before it is explicitly initialized
 // with a meaningful value will trigger failures as of SERVER-32630.
+// (Generic FCV reference): This FCV reference should exist across LTS binary versions.
 void setUpFCV() {
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46);
+        ServerGlobalParams::FeatureCompatibility::kLatest);
 }
 void tearDownFCV() {
     serverGlobalParams.featureCompatibility.reset();

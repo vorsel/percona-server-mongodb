@@ -87,7 +87,12 @@ class UUID {
     friend class repl::InitialSyncIdDocument;
     friend class ResumeTokenInternal;
     friend class ShardCollectionTypeBase;
+    friend class TenantMigrationDonorDocument;
+    friend class TenantMigrationRecipientDocument;
     friend class VoteCommitIndexBuild;
+    friend class DonorStartMigration;
+    friend class DonorWaitForMigrationToCommit;
+    friend class DonorForgetMigration;
 
 public:
     /**

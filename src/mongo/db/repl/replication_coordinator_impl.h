@@ -47,6 +47,7 @@
 #include "mongo/db/repl/sync_source_resolver.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/update_position_args.h"
+#include "mongo/db/repl/vote_requester.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/random.h"
@@ -82,7 +83,6 @@ class ReplSetConfig;
 class SyncSourceFeedback;
 class StorageInterface;
 class TopologyCoordinator;
-class VoteRequester;
 
 class ReplicationCoordinatorImpl : public ReplicationCoordinator {
     ReplicationCoordinatorImpl(const ReplicationCoordinatorImpl&) = delete;
@@ -174,7 +174,7 @@ public:
     virtual void setMyLastDurableOpTimeAndWallTime(const OpTimeAndWallTime& opTimeAndWallTime);
 
     virtual void setMyLastAppliedOpTimeAndWallTimeForward(
-        const OpTimeAndWallTime& opTimeAndWallTime, DataConsistency consistency);
+        const OpTimeAndWallTime& opTimeAndWallTime);
     virtual void setMyLastDurableOpTimeAndWallTimeForward(
         const OpTimeAndWallTime& opTimeAndWallTime);
 
@@ -281,13 +281,13 @@ public:
 
     virtual void blacklistSyncSource(const HostAndPort& host, Date_t until) override;
 
-    virtual void resetLastOpTimesFromOplog(OperationContext* opCtx,
-                                           DataConsistency consistency) override;
+    virtual void resetLastOpTimesFromOplog(OperationContext* opCtx) override;
 
-    virtual bool shouldChangeSyncSource(const HostAndPort& currentSource,
-                                        const rpc::ReplSetMetadata& replMetadata,
-                                        const rpc::OplogQueryMetadata& oqMetadata,
-                                        const OpTime& lastOpTimeFetched) override;
+    virtual ChangeSyncSourceAction shouldChangeSyncSource(const HostAndPort& currentSource,
+                                                          const rpc::ReplSetMetadata& replMetadata,
+                                                          const rpc::OplogQueryMetadata& oqMetadata,
+                                                          const OpTime& previousOpTimeFetched,
+                                                          const OpTime& lastOpTimeFetched) override;
 
     virtual OpTime getLastCommittedOpTime() const override;
     virtual OpTimeAndWallTime getLastCommittedOpTimeAndWallTime() const override;
@@ -445,12 +445,6 @@ public:
     /**
      * Simple test wrappers that expose private methods.
      */
-    boost::optional<OpTimeAndWallTime> chooseStableOpTimeFromCandidates_forTest(
-        const std::set<OpTimeAndWallTime>& candidates,
-        const OpTimeAndWallTime& maximumStableOpTime);
-    void cleanupStableOpTimeCandidates_forTest(std::set<OpTimeAndWallTime>* candidates,
-                                               OpTimeAndWallTime stableOpTime);
-    std::set<OpTimeAndWallTime> getStableOpTimeCandidates_forTest();
     void handleHeartbeatResponse_forTest(BSONObj response,
                                          int targetIndex,
                                          Milliseconds ping = Milliseconds(100));
@@ -465,13 +459,13 @@ public:
         long long term, TopologyCoordinator::UpdateTermResult* updateResult);
 
     /**
-     * If called after _startElectSelfV1_inlock(), blocks until all asynchronous
+     * If called after ElectionState::start(), blocks until all asynchronous
      * activities associated with election complete.
      */
     void waitForElectionFinish_forTest();
 
     /**
-     * If called after _startElectSelfV1_inlock(), blocks until all asynchronous
+     * If called after ElectionState::start(), blocks until all asynchronous
      * activities associated with election dry run complete, including writing
      * last vote and scheduling the real election.
      */
@@ -482,6 +476,12 @@ public:
      * won't fully complete before this method is called, or this method may never return.
      */
     void waitForStepDownAttempt_forTest();
+
+    /**
+     * Cancels all future processing work of the VoteRequester and sets the election state to
+     * kCanceled.
+     */
+    void cancelElection_forTest();
 
 private:
     using CallbackFn = executor::TaskExecutor::CallbackFn;
@@ -494,9 +494,6 @@ private:
         const executor::TaskExecutor::CallbackFn& work)>;
 
     using SharedPromiseOfIsMasterResponse = SharedPromise<std::shared_ptr<const IsMasterResponse>>;
-
-    class LoseElectionGuardV1;
-    class LoseElectionDryRunGuardV1;
 
     /**
      * Configuration states for a replica set node.
@@ -727,6 +724,112 @@ private:
         long _numCatchUpOps = 0;
     };
 
+    class ElectionState {
+    public:
+        ElectionState(ReplicationCoordinatorImpl* repl)
+            : _repl(repl),
+              _topCoord(repl->_topCoord.get()),
+              _replExecutor(repl->_replExecutor.get()) {}
+
+        /**
+         * Begins an attempt to elect this node.
+         * Called after an incoming heartbeat changes this node's view of the set such that it
+         * believes it can be elected PRIMARY.
+         * For proper concurrency, start methods must be called while holding _mutex.
+         *
+         * For V1 (raft) style elections the election path is:
+         *      _processDryRunResult() (may skip)
+         *      _startRealElection()
+         *      _writeLastVoteForMyElection()
+         *      _requestVotesForRealElection()
+         *      _onVoteRequestComplete()
+         */
+        void start(WithLock lk, StartElectionReasonEnum reason);
+
+        // Returns the election finished event.
+        executor::TaskExecutor::EventHandle getElectionFinishedEvent(WithLock);
+
+        // Returns the election dry run finished event.
+        executor::TaskExecutor::EventHandle getElectionDryRunFinishedEvent(WithLock);
+
+        // Notifies the VoteRequester to cancel further processing. Sets the election state to
+        // canceled.
+        void cancel(WithLock lk);
+
+    private:
+        class LoseElectionGuardV1;
+        class LoseElectionDryRunGuardV1;
+
+        /**
+         * Returns the election result from the VoteRequester.
+         */
+        VoteRequester::Result _getElectionResult(WithLock) const;
+
+        /**
+         * Starts the VoteRequester and requests votes from known members of the replica set.
+         */
+        StatusWith<executor::TaskExecutor::EventHandle> _startVoteRequester(
+            WithLock, long long term, bool dryRun, OpTime lastAppliedOpTime, int primaryIndex);
+
+        /**
+         * Starts VoteRequester to run the real election when last vote write has completed.
+         */
+        void _requestVotesForRealElection(WithLock lk,
+                                          long long newTerm,
+                                          StartElectionReasonEnum reason);
+
+        /**
+         * Callback called when the dryRun VoteRequester has completed; checks the results and
+         * decides whether to conduct a proper election.
+         * "originalTerm" was the term during which the dry run began, if the term has since
+         * changed, do not run for election.
+         */
+        void _processDryRunResult(long long originalTerm, StartElectionReasonEnum reason);
+
+        /**
+         * Begins executing a real election. This is called either a successful dry run, or when the
+         * dry run was skipped (which may be specified for a ReplSetStepUp).
+         */
+        void _startRealElection(WithLock lk,
+                                long long originalTerm,
+                                StartElectionReasonEnum reason);
+
+        /**
+         * Writes the last vote in persistent storage after completing dry run successfully.
+         * This job will be scheduled to run in DB worker threads.
+         */
+        void _writeLastVoteForMyElection(LastVote lastVote,
+                                         const executor::TaskExecutor::CallbackArgs& cbData,
+                                         StartElectionReasonEnum reason);
+
+        /**
+         * Callback called when the VoteRequester has completed; checks the results and
+         * decides whether to change state to primary and alert other nodes of our primary-ness.
+         * "originalTerm" was the term during which the election began, if the term has since
+         * changed, do not step up as primary.
+         */
+        void _onVoteRequestComplete(long long originalTerm, StartElectionReasonEnum reason);
+
+        // Not owned.
+        ReplicationCoordinatorImpl* _repl;
+        // The VoteRequester used to start and gather results from the election voting process.
+        std::unique_ptr<VoteRequester> _voteRequester;
+        // Flag that indicates whether the election has been canceled.
+        bool _isCanceled = false;
+        // Event that the election code will signal when the in-progress election completes.
+        executor::TaskExecutor::EventHandle _electionFinishedEvent;
+
+        // Event that the election code will signal when the in-progress election dry run completes,
+        // which includes writing the last vote and scheduling the real election.
+        executor::TaskExecutor::EventHandle _electionDryRunFinishedEvent;
+
+        // Pointer to the TopologyCoordinator owned by ReplicationCoordinator.
+        TopologyCoordinator* _topCoord;
+
+        // Pointer to the executor owned by ReplicationCoordinator.
+        executor::TaskExecutor* _replExecutor;
+    };
+
     // Inner class to manage the concurrency of _canAcceptNonLocalWrites and _canServeNonLocalReads.
     class ReadWriteAbility {
     public:
@@ -910,8 +1013,7 @@ private:
      */
     void _setMyLastAppliedOpTimeAndWallTime(WithLock lk,
                                             const OpTimeAndWallTime& opTime,
-                                            bool isRollbackAllowed,
-                                            DataConsistency consistency);
+                                            bool isRollbackAllowed);
     void _setMyLastDurableOpTimeAndWallTime(WithLock lk,
                                             const OpTimeAndWallTime& opTimeAndWallTime,
                                             bool isRollbackAllowed);
@@ -1078,57 +1180,6 @@ private:
     void _onFollowerModeStateChange();
 
     /**
-     * Begins an attempt to elect this node.
-     * Called after an incoming heartbeat changes this node's view of the set such that it
-     * believes it can be elected PRIMARY.
-     * For proper concurrency, start methods must be called while holding _mutex.
-     *
-     * For V1 (raft) style elections the election path is:
-     *      _startElectSelfIfEligibleV1()
-     *      _processDryRunResult() (may skip)
-     *      _startRealElection_inlock()
-     *      _writeLastVoteForMyElection()
-     *      _startVoteRequester_inlock()
-     *      _onVoteRequestComplete()
-     */
-    void _startElectSelfV1_inlock(StartElectionReasonEnum reason);
-
-    /**
-     * Callback called when the dryRun VoteRequester has completed; checks the results and
-     * decides whether to conduct a proper election.
-     * "originalTerm" was the term during which the dry run began, if the term has since
-     * changed, do not run for election.
-     */
-    void _processDryRunResult(long long originalTerm, StartElectionReasonEnum reason);
-
-    /**
-     * Begins executing a real election. This is called either a successful dry run, or when the
-     * dry run was skipped (which may be specified for a ReplSetStepUp).
-     */
-    void _startRealElection_inlock(long long originalTerm, StartElectionReasonEnum reason);
-
-    /**
-     * Writes the last vote in persistent storage after completing dry run successfully.
-     * This job will be scheduled to run in DB worker threads.
-     */
-    void _writeLastVoteForMyElection(LastVote lastVote,
-                                     const executor::TaskExecutor::CallbackArgs& cbData,
-                                     StartElectionReasonEnum reason);
-
-    /**
-     * Starts VoteRequester to run the real election when last vote write has completed.
-     */
-    void _startVoteRequester_inlock(long long newTerm, StartElectionReasonEnum reason);
-
-    /**
-     * Callback called when the VoteRequester has completed; checks the results and
-     * decides whether to change state to primary and alert other nodes of our primary-ness.
-     * "originalTerm" was the term during which the election began, if the term has since
-     * changed, do not step up as primary.
-     */
-    void _onVoteRequestComplete(long long originalTerm, StartElectionReasonEnum reason);
-
-    /**
      * Removes 'host' from the sync source blacklist. If 'host' isn't found, it's simply
      * ignored and no error is thrown.
      *
@@ -1287,34 +1338,12 @@ private:
     bool _updateCommittedSnapshot(WithLock lk, const OpTimeAndWallTime& newCommittedSnapshot);
 
     /**
-     * A helper method that returns the current stable optime based on the current commit point and
-     * set of stable optime candidates.
+     * A helper method that returns the current stable optime based on the current commit point.
      */
-    boost::optional<OpTimeAndWallTime> _recalculateStableOpTime(WithLock lk);
+    OpTime _recalculateStableOpTime(WithLock lk);
 
     /**
-     * Calculates the 'stable' replication optime given a set of optime candidates and a maximum
-     * stable optime. The stable optime is the greatest optime in 'candidates' that is also less
-     * than or equal to 'maximumStableOpTime' and other criteria.
-     *
-     * Returns boost::none if there is no satisfactory candidate.
-     */
-    boost::optional<OpTimeAndWallTime> _chooseStableOpTimeFromCandidates(
-        WithLock lk,
-        const std::set<OpTimeAndWallTime>& candidates,
-        OpTimeAndWallTime maximumStableOpTime);
-
-    /**
-     * Removes any optimes from the optime set 'candidates' that are less than
-     * 'stableOpTime'.
-     */
-    void _cleanupStableOpTimeCandidates(std::set<OpTimeAndWallTime>* candidates,
-                                        OpTimeAndWallTime stableOpTime);
-
-    /**
-     * Calculates and sets the value of the 'stable' replication optime for the storage engine.  See
-     * ReplicationCoordinatorImpl::_chooseStableOpTimeFromCandidates for a definition of 'stable',
-     * in this context.
+     * Calculates and sets the value of the 'stable' replication optime for the storage engine.
      */
     void _setStableTimestampForStorage(WithLock lk);
 
@@ -1401,7 +1430,7 @@ private:
      * canceled election completes. If there is no running election, returns an invalid event
      * handle.
      */
-    executor::TaskExecutor::EventHandle _cancelElectionIfNeeded_inlock();
+    executor::TaskExecutor::EventHandle _cancelElectionIfNeeded(WithLock);
 
     /**
      * Waits until the lastApplied opTime is at least the 'targetOpTime'.
@@ -1550,15 +1579,6 @@ private:
     // This member's index position in the current config.
     int _selfIndex;  // (M)
 
-    std::unique_ptr<VoteRequester> _voteRequester;  // (M)
-
-    // Event that the election code will signal when the in-progress election completes.
-    executor::TaskExecutor::EventHandle _electionFinishedEvent;  // (M)
-
-    // Event that the election code will signal when the in-progress election dry run completes,
-    // which includes writing the last vote and scheduling the real election.
-    executor::TaskExecutor::EventHandle _electionDryRunFinishedEvent;  // (M)
-
     // Whether we slept last time we attempted an election but possibly tied with other nodes.
     bool _sleptLastElection;  // (M)
 
@@ -1579,12 +1599,6 @@ private:
     // reads, if there is one.
     // When engaged, this must be <= _lastCommittedOpTime.
     boost::optional<OpTimeAndWallTime> _currentCommittedSnapshot;  // (M)
-
-    // A set of optimes that are used for computing the replication system's current 'stable'
-    // optime. Every time a node's applied optime is updated, it will be added to this set.
-    // Optimes that are older than the current stable optime should get removed from this set.
-    // This set should also be cleared if a rollback occurs.
-    std::set<OpTimeAndWallTime> _stableOpTimeCandidates;  // (M)
 
     // A flag that enables/disables advancement of the stable timestamp for storage.
     bool _shouldSetStableTimestamp = true;  // (M)
@@ -1637,6 +1651,10 @@ private:
     // The catchup state including all catchup logic. The presence of a non-null pointer indicates
     // that the node is currently in catchup mode.
     std::unique_ptr<CatchupState> _catchupState;  // (X)
+
+    // The election state that includes logic to start and return information from the election
+    // voting process.
+    std::unique_ptr<ElectionState> _electionState;  // (M)
 
     // Atomic-synchronized copy of Topology Coordinator's _term, for use by the public getTerm()
     // function.

@@ -41,6 +41,7 @@
 #include "mongo/util/net/socket_utils.h"
 #ifdef MONGO_CONFIG_SSL
 #include "mongo/util/net/ssl_manager.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
 #endif
 
@@ -108,6 +109,9 @@ public:
 
         _local = HostAndPort(_localAddr.toString(true));
         _remote = HostAndPort(_remoteAddr.toString(true));
+#ifdef MONGO_CONFIG_SSL
+        _sslManager = tl->getSSLManager();
+#endif
     } catch (const DBException&) {
         throw;
     } catch (const asio::system_error& error) {
@@ -239,6 +243,19 @@ public:
 
         return false;
     }
+
+#ifdef MONGO_CONFIG_SSL
+    const SSLConfiguration* getSSLConfiguration() const override {
+        if (_sslManager) {
+            return &_sslManager->getSSLConfiguration();
+        }
+        return nullptr;
+    }
+
+    const std::shared_ptr<SSLManagerInterface> getSSLManager() const override {
+        return _sslManager;
+    }
+#endif
 
 protected:
     friend class TransportLayerASIO;
@@ -782,6 +799,7 @@ private:
 #ifdef MONGO_CONFIG_SSL
     boost::optional<asio::ssl::stream<decltype(_socket)>> _sslSocket;
     bool _ranHandshake = false;
+    std::shared_ptr<SSLManagerInterface> _sslManager;
 #endif
 
     TransportLayerASIO* const _tl;

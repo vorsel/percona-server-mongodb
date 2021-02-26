@@ -137,8 +137,9 @@ ShardingMongodTestFixture::ShardingMongodTestFixture() {
 
     // Set the highest FCV because otherwise it defaults to the lower FCV. This way we default to
     // testing this release's code, not backwards compatibility code.
+    // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46);
+        ServerGlobalParams::FeatureCompatibility::kLatest);
 }
 
 ShardingMongodTestFixture::~ShardingMongodTestFixture() = default;
@@ -255,7 +256,8 @@ Status ShardingMongodTestFixture::initializeGlobalShardingStateForMongodForTest(
 
     auto const grid = Grid::get(operationContext());
     grid->init(makeShardingCatalogClient(std::move(distLockManagerPtr)),
-               std::make_unique<CatalogCache>(CatalogCacheLoader::get(getServiceContext())),
+               std::make_unique<CatalogCache>(CatalogCacheLoader::get(getServiceContext()),
+                                              catalogCacheExecutor()),
                makeShardRegistry(configConnStr),
                makeClusterCursorManager(),
                makeBalancerConfiguration(),

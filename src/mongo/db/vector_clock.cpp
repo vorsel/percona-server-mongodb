@@ -32,9 +32,12 @@
 #include "mongo/db/vector_clock.h"
 
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/client/query.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/logical_clock_gen.h"
 #include "mongo/db/logical_time_validator.h"
+#include "mongo/db/vector_clock_document_gen.h"
+#include "mongo/util/static_immortal.h"
 
 namespace mongo {
 
@@ -159,8 +162,7 @@ public:
              Component component) const override {
         const auto& fcv = serverGlobalParams.featureCompatibility;
         if (fcv.isVersionInitialized() &&
-            fcv.getVersion() ==
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46) {
+            fcv.getVersion() == ServerGlobalParams::FeatureCompatibility::Version::kVersion451) {
             return ActualFormat::out(service, opCtx, permitRefresh, out, time, component);
         }
         return false;
@@ -402,6 +404,11 @@ void VectorClock::advanceTime_forTest(Component component, LogicalTime newTime) 
     LogicalTimeArray newTimeArray;
     newTimeArray[component] = newTime;
     _advanceTime(std::move(newTimeArray));
+}
+
+const Query& VectorClock::stateQuery() {
+    static StaticImmortal q{QUERY(VectorClockDocument::k_idFieldName << kDocIdKey)};
+    return *q;
 }
 
 }  // namespace mongo

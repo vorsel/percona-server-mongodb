@@ -55,6 +55,7 @@
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_parameters_gen.h"
+#include "mongo/util/net/ssl_peer_info.h"
 
 using asio::ssl::apple::CFUniquePtr;
 
@@ -1293,8 +1294,8 @@ SSLManagerApple::SSLManagerApple(const SSLParams& params, bool isServer)
             uassertStatusOK(
                 _sslConfiguration.setServerSubjectName(uassertStatusOK(certificateGetSubject(
                     _serverCtx.certs.get(), &_sslConfiguration.serverCertificateExpirationDate))));
-            static auto task =
-                CertificateExpirationMonitor(_sslConfiguration.serverCertificateExpirationDate);
+            CertificateExpirationMonitor::updateExpirationDeadline(
+                _sslConfiguration.serverCertificateExpirationDate);
         }
     }
 
@@ -1739,6 +1740,7 @@ SSLInformationToLog SSLManagerApple::getSSLInformationToLog() const {
 bool isSSLServer = false;
 
 extern SSLManagerInterface* theSSLManager;
+extern SSLManagerCoordinator* theSSLManagerCoordinator;
 
 std::unique_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
@@ -1751,7 +1753,7 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("EndStartupOptionHandling"))
         nullptr, mongodbRolesOID.identifier.c_str(), ::kCFStringEncodingUTF8);
 
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
-        theSSLManager = new SSLManagerApple(sslGlobalParams, isSSLServer);
+        theSSLManagerCoordinator = new SSLManagerCoordinator();
     }
     return Status::OK();
 }

@@ -214,7 +214,7 @@ void _logOpsInner(OperationContext* opCtx,
                   OpTime finalOpTime,
                   Date_t wallTime) {
     auto replCoord = ReplicationCoordinator::get(opCtx);
-    if (nss.size() && replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet &&
+    if (replCoord->getReplicationMode() == ReplicationCoordinator::modeReplSet &&
         !replCoord->canAcceptWritesFor(opCtx, nss)) {
         str::stream ss;
         ss << "logOp() but can't accept write to collection " << nss;
@@ -252,8 +252,7 @@ void _logOpsInner(OperationContext* opCtx,
             }
 
             // Optimes on the primary should always represent consistent database states.
-            replCoord->setMyLastAppliedOpTimeAndWallTimeForward(
-                {finalOpTime, wallTime}, ReplicationCoordinator::DataConsistency::Consistent);
+            replCoord->setMyLastAppliedOpTimeAndWallTimeForward({finalOpTime, wallTime});
 
             // We set the last op on the client to 'finalOpTime', because that contains the
             // timestamp of the operation that the client actually performed.
@@ -1220,7 +1219,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             auto request = UpdateRequest();
             request.setNamespaceString(requestNss);
             request.setQuery(updateCriteria);
-            request.setUpdateModification(o);
+            request.setUpdateModification(write_ops::UpdateModification::parseFromOplogEntry(o));
             request.setUpsert(upsert);
             request.setFromOplogApplication(true);
 

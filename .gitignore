@@ -192,3 +192,6 @@ python2-venv
 
 # Generated resmoke configuration file
 resmoke.ini
+
+# UndoDB Recordings
+*.undo

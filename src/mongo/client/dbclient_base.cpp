@@ -51,7 +51,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/killcursors_request.h"
+#include "mongo/db/query/kill_cursors_gen.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/remote_command_request.h"
 #include "mongo/executor/remote_command_response.h"
@@ -461,8 +461,9 @@ void DBClientBase::_auth(const BSONObj& params) {
     // We will only have a client name if SSL is enabled
     std::string clientName = "";
 #ifdef MONGO_CONFIG_SSL
-    if (getSSLManager() != nullptr) {
-        clientName = getSSLManager()->getSSLConfiguration().clientSubjectName.toString();
+    auto sslConfiguration = getSSLConfiguration();
+    if (sslConfiguration) {
+        clientName = sslConfiguration->clientSubjectName.toString();
     }
 #endif
 
@@ -475,7 +476,7 @@ void DBClientBase::_auth(const BSONObj& params) {
         .get();
 }
 
-Status DBClientBase::authenticateInternalUser() {
+Status DBClientBase::authenticateInternalUser(auth::StepDownBehavior stepDownBehavior) {
     ScopedMetadataWriterRemover remover{this};
     if (!auth::isInternalAuthSet()) {
         if (!serverGlobalParams.quiet.load()) {
@@ -488,14 +489,15 @@ Status DBClientBase::authenticateInternalUser() {
     // We will only have a client name if SSL is enabled
     std::string clientName = "";
 #ifdef MONGO_CONFIG_SSL
-    if (getSSLManager() != nullptr) {
-        clientName = getSSLManager()->getSSLConfiguration().clientSubjectName.toString();
+    auto sslConfiguration = getSSLConfiguration();
+    if (sslConfiguration) {
+        clientName = sslConfiguration->clientSubjectName.toString();
     }
 #endif
 
-    auto status =
-        auth::authenticateInternalClient(clientName, boost::none, _makeAuthRunCommandHook())
-            .getNoThrow();
+    auto status = auth::authenticateInternalClient(
+                      clientName, boost::none, stepDownBehavior, _makeAuthRunCommandHook())
+                      .getNoThrow();
     if (status.isOK()) {
         return status;
     }
@@ -906,7 +908,7 @@ void DBClientBase::update(const string& ns,
 
 void DBClientBase::killCursor(const NamespaceString& ns, long long cursorId) {
     runFireAndForgetCommand(
-        OpMsgRequest::fromDBAndBody(ns.db(), KillCursorsRequest(ns, {cursorId}).toBSON()));
+        OpMsgRequest::fromDBAndBody(ns.db(), KillCursorsRequest(ns, {cursorId}).toBSON(BSONObj{})));
 }
 
 namespace {

@@ -68,6 +68,8 @@
 namespace mongo {
 
 using logv2::LogComponent;
+const std::set<std::string> kNoApiVersions = {};
+const std::set<std::string> kApiVersions1 = {"1"};
 
 namespace {
 
@@ -127,12 +129,6 @@ const StringMap<int> txnCmdWhitelist = {{"abortTransaction", 1},
                                         {"killCursors", 1},
                                         {"prepareTransaction", 1},
                                         {"update", 1}};
-
-// The commands that can be run on the 'admin' database in multi-document transactions.
-const StringMap<int> txnAdminCommands = {{"abortTransaction", 1},
-                                         {"commitTransaction", 1},
-                                         {"coordinateCommitTransaction", 1},
-                                         {"prepareTransaction", 1}};
 
 auto getCommandInvocationHooksHandle =
     ServiceContext::declareDecoration<std::shared_ptr<CommandInvocationHooks>>();
@@ -491,9 +487,7 @@ void CommandHelpers::canUseTransactions(const NamespaceString& nss,
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot run command against the '" << dbName
                           << "' database in a transaction.",
-            dbName != NamespaceString::kLocalDb &&
-                (dbName != NamespaceString::kAdminDb ||
-                 txnAdminCommands.find(cmdName) != txnAdminCommands.cend()));
+            dbName != NamespaceString::kLocalDb);
 
     uassert(ErrorCodes::OperationNotSupportedInTransaction,
             str::stream() << "Cannot run command against the '" << nss

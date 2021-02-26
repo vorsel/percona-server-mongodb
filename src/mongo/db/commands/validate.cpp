@@ -189,13 +189,19 @@ public:
                 return CollectionValidation::ValidateMode::kForegroundFull;
             return CollectionValidation::ValidateMode::kForeground;
         }();
+
+        // External users cannot run validate with repair as there is no way yet for users to invoke
+        // it. It is only to be used by startup repair.
+        auto repairMode = CollectionValidation::RepairMode::kNone;
         ValidateResults validateResults;
-        Status status = CollectionValidation::validate(opCtx, nss, mode, &validateResults, &result);
+        Status status =
+            CollectionValidation::validate(opCtx, nss, mode, repairMode, &validateResults, &result);
         if (!status.isOK()) {
             return CommandHelpers::appendCommandStatusNoThrow(result, status);
         }
 
         result.appendBool("valid", validateResults.valid);
+        result.appendBool("repaired", validateResults.repaired);
         if (validateResults.readTimestamp) {
             result.append("readTimestamp", validateResults.readTimestamp.get());
         }
@@ -203,6 +209,18 @@ public:
         result.append("errors", validateResults.errors);
         result.append("extraIndexEntries", validateResults.extraIndexEntries);
         result.append("missingIndexEntries", validateResults.missingIndexEntries);
+
+        // Need to convert RecordId to int64_t to append to BSONObjBuilder
+        BSONArrayBuilder builder;
+        for (RecordId corruptRecord : validateResults.corruptRecords) {
+            builder.append(corruptRecord.repr());
+        }
+        result.append("corruptRecords", builder.done());
+
+        if (validateResults.repaired) {
+            result.appendNumber("numRemovedCorruptRecords",
+                                validateResults.numRemovedCorruptRecords);
+        }
 
         if (!validateResults.valid) {
             result.append("advice",

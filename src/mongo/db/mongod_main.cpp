@@ -112,7 +112,6 @@
 #include "mongo/db/pipeline/process_interface/replica_set_node_process_interface.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/read_write_concern_defaults_cache_lookup_mongod.h"
-#include "mongo/db/repair_database_and_check_version.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_settings.h"
@@ -143,6 +142,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_entry_point_mongod.h"
 #include "mongo/db/session_killer.h"
+#include "mongo/db/startup_recovery.h"
 #include "mongo/db/startup_warnings_mongod.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/backup_cursor_hooks.h"
@@ -448,17 +448,8 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
 
     auto startupOpCtx = serviceContext->makeOperationContext(&cc());
 
-    bool canCallFCVSetIfCleanStartup =
-        !storageGlobalParams.readOnly && (storageGlobalParams.engine != "devnull");
-    if (canCallFCVSetIfCleanStartup && !replSettings.usingReplSets()) {
-        Lock::GlobalWrite lk(startupOpCtx.get());
-        FeatureCompatibilityVersion::setIfCleanStartup(startupOpCtx.get(),
-                                                       repl::StorageInterface::get(serviceContext));
-    }
-
-    bool nonLocalDatabases;
     try {
-        nonLocalDatabases = repairDatabasesAndCheckVersion(startupOpCtx.get());
+        startup_recovery::repairAndRecoverDatabases(startupOpCtx.get());
     } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
         LOGV2_FATAL_OPTIONS(
             20573,
@@ -469,6 +460,10 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
         exitCleanly(EXIT_NEED_DOWNGRADE);
     }
 
+    // Ensure FCV document exists and is initialized in-memory. Fatally asserts if there is an
+    // error.
+    FeatureCompatibilityVersion::fassertInitializedAfterStartup(startupOpCtx.get());
+
     // This flag is used during storage engine initialization to perform behavior that is specific
     // to recovering from an unclean shutdown. It is also used to determine whether temporary files
     // should be removed. The last of these uses is done by repairDatabasesAndCheckVersion() above,
@@ -476,23 +471,6 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     // outside of startup do not perform behavior that is specific to starting up after an unclean
     // shutdown.
     startingAfterUncleanShutdown(serviceContext) = false;
-
-    auto replProcess = repl::ReplicationProcess::get(serviceContext);
-    invariant(replProcess);
-    const bool initialSyncFlag =
-        replProcess->getConsistencyMarkers()->getInitialSyncFlag(startupOpCtx.get());
-
-    // Assert that the in-memory featureCompatibilityVersion parameter has been explicitly set. If
-    // we are part of a replica set and are started up with no data files, we do not set the
-    // featureCompatibilityVersion until a primary is chosen. For this case, we expect the in-memory
-    // featureCompatibilityVersion parameter to still be uninitialized until after startup. If the
-    // initial sync flag is set and we are part of a replica set, we expect the version to be
-    // initialized as part of initial sync after startup.
-    const bool initializeFCVAtInitialSync = replSettings.usingReplSets() && initialSyncFlag;
-    if (canCallFCVSetIfCleanStartup && (!replSettings.usingReplSets() || nonLocalDatabases) &&
-        !initializeFCVAtInitialSync) {
-        invariant(serverGlobalParams.featureCompatibility.isVersionInitialized());
-    }
 
     if (gFlowControlEnabled.load()) {
         LOGV2(20536, "Flow Control is enabled on this deployment");
@@ -1102,7 +1080,7 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
 
     // TODO SERVER-49138: Remove this FCV check once we branch for 4.8.
     if (serverGlobalParams.featureCompatibility.isVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46)) {
+            ServerGlobalParams::FeatureCompatibility::Version::kVersion451)) {
         if (auto replCoord = repl::ReplicationCoordinator::get(serviceContext);
             replCoord && replCoord->enterQuiesceModeIfSecondary(shutdownTimeout)) {
             ServiceContext::UniqueOperationContext uniqueOpCtx;

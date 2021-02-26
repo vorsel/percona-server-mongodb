@@ -36,6 +36,7 @@
 #include <ostream>
 
 #include "mongo/db/client.h"
+#include "mongo/db/commands/feature_compatibility_version_document_gen.h"
 #include "mongo/db/commands/feature_compatibility_version_parser.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
 #include "mongo/db/json.h"
@@ -139,8 +140,7 @@ public:
      * clear/reset state
      */
     void reset() {
-        _setMyLastOptime = [this](const OpTimeAndWallTime& opTimeAndWallTime,
-                                  ReplicationCoordinator::DataConsistency consistency) {
+        _setMyLastOptime = [this](const OpTimeAndWallTime& opTimeAndWallTime) {
             _myLastOpTime = opTimeAndWallTime.opTime;
             _myLastWallTime = opTimeAndWallTime.wallTime;
         };
@@ -159,12 +159,13 @@ public:
     void blacklistSyncSource(const HostAndPort& host, Date_t until) override {
         _syncSourceSelector->blacklistSyncSource(host, until);
     }
-    bool shouldChangeSyncSource(const HostAndPort& currentSource,
-                                const rpc::ReplSetMetadata& replMetadata,
-                                const rpc::OplogQueryMetadata& oqMetadata,
-                                const OpTime& lastOpTimeFetched) override {
+    ChangeSyncSourceAction shouldChangeSyncSource(const HostAndPort& currentSource,
+                                                  const rpc::ReplSetMetadata& replMetadata,
+                                                  const rpc::OplogQueryMetadata& oqMetadata,
+                                                  const OpTime& previousOpTimeFetched,
+                                                  const OpTime& lastOpTimeFetched) override {
         return _syncSourceSelector->shouldChangeSyncSource(
-            currentSource, replMetadata, oqMetadata, lastOpTimeFetched);
+            currentSource, replMetadata, oqMetadata, previousOpTimeFetched, lastOpTimeFetched);
     }
 
     void scheduleNetworkResponse(std::string cmdName, const BSONObj& obj) {
@@ -380,9 +381,8 @@ protected:
         InitialSyncerOptions options;
         options.initialSyncRetryWait = Milliseconds(1);
         options.getMyLastOptime = [this]() { return _myLastOpTime; };
-        options.setMyLastOptime = [this](const OpTimeAndWallTime& opTimeAndWallTime,
-                                         ReplicationCoordinator::DataConsistency consistency) {
-            _setMyLastOptime(opTimeAndWallTime, consistency);
+        options.setMyLastOptime = [this](const OpTimeAndWallTime& opTimeAndWallTime) {
+            _setMyLastOptime(opTimeAndWallTime);
         };
         options.resetOptimes = [this]() { _myLastOpTime = OpTime(); };
         options.syncSourceSelector = this;
@@ -675,9 +675,9 @@ void assertFCVRequest(RemoteCommandRequest request) {
 }
 
 void InitialSyncerTest::processSuccessfulFCVFetcherResponseLastStable() {
-    auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "version"
-                            << FeatureCompatibilityVersionParser::kVersion44)};
-    processSuccessfulFCVFetcherResponse(docs);
+    FeatureCompatibilityVersionDocument fcvDoc;
+    fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
+    processSuccessfulFCVFetcherResponse({fcvDoc.toBSON()});
 }
 
 void InitialSyncerTest::processSuccessfulFCVFetcherResponse(std::vector<BSONObj> docs) {
@@ -693,8 +693,7 @@ void InitialSyncerTest::processSuccessfulFCVFetcherResponse(std::vector<BSONObj>
 TEST_F(InitialSyncerTest, InvalidConstruction) {
     InitialSyncerOptions options;
     options.getMyLastOptime = []() { return OpTime(); };
-    options.setMyLastOptime = [](const OpTimeAndWallTime&,
-                                 ReplicationCoordinator::DataConsistency consistency) {};
+    options.setMyLastOptime = [](const OpTimeAndWallTime&) {};
     options.resetOptimes = []() {};
     options.syncSourceSelector = this;
     auto callback = [](const StatusWith<OpTimeAndWallTime>&) {};
@@ -929,11 +928,10 @@ TEST_F(InitialSyncerTest, InitialSyncerResetsOptimesOnNewAttempt) {
 
     _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort());
 
-    // Set the last optime to an arbitrary nonzero value. The value of the 'consistency' argument
-    // doesn't matter. Also set last wall time to an arbitrary non-minimum value.
+    // Set the last optime to an arbitrary nonzero value. Also set last wall time to an arbitrary
+    // non-minimum value.
     auto origOptime = OpTime(Timestamp(1000, 1), 1);
-    _setMyLastOptime({origOptime, Date_t::max()},
-                     ReplicationCoordinator::DataConsistency::Inconsistent);
+    _setMyLastOptime({origOptime, Date_t::max()});
 
     // Start initial sync.
     const std::uint32_t initialSyncMaxAttempts = 1U;
@@ -1894,8 +1892,9 @@ TEST_F(InitialSyncerTest,
 
 TEST_F(InitialSyncerTest,
        InitialSyncerReturnsTooManyMatchingDocumentsWhenFCVFetcherReturnsMultipleDocuments) {
-    auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "version"
-                            << FeatureCompatibilityVersionParser::kVersion44),
+    FeatureCompatibilityVersionDocument fcvDoc;
+    fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
+    auto docs = {fcvDoc.toBSON(),
                  BSON("_id"
                       << "other")};
     runInitialSyncWithBadFCVResponse(docs, ErrorCodes::TooManyMatchingDocuments);
@@ -1903,24 +1902,25 @@ TEST_F(InitialSyncerTest,
 
 TEST_F(InitialSyncerTest,
        InitialSyncerReturnsIncompatibleServerVersionWhenFCVFetcherReturnsUpgradeTargetVersion) {
-    auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "version"
-                            << FeatureCompatibilityVersionParser::kVersion44 << "targetVersion"
-                            << FeatureCompatibilityVersionParser::kVersion46)};
-    runInitialSyncWithBadFCVResponse(docs, ErrorCodes::IncompatibleServerVersion);
+    FeatureCompatibilityVersionDocument fcvDoc;
+    fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
+    fcvDoc.setTargetVersion(ServerGlobalParams::FeatureCompatibility::kLatest);
+    runInitialSyncWithBadFCVResponse({fcvDoc.toBSON()}, ErrorCodes::IncompatibleServerVersion);
 }
 
 TEST_F(InitialSyncerTest,
        InitialSyncerReturnsIncompatibleServerVersionWhenFCVFetcherReturnsDowngradeTargetVersion) {
-    auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "version"
-                            << FeatureCompatibilityVersionParser::kVersion44 << "targetVersion"
-                            << FeatureCompatibilityVersionParser::kVersion44)};
-    runInitialSyncWithBadFCVResponse(docs, ErrorCodes::IncompatibleServerVersion);
+    FeatureCompatibilityVersionDocument fcvDoc;
+    fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
+    fcvDoc.setTargetVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
+    fcvDoc.setPreviousVersion(ServerGlobalParams::FeatureCompatibility::kLatest);
+    runInitialSyncWithBadFCVResponse({fcvDoc.toBSON()}, ErrorCodes::IncompatibleServerVersion);
 }
 
-TEST_F(InitialSyncerTest, InitialSyncerReturnsBadValueWhenFCVFetcherReturnsNoVersion) {
+TEST_F(InitialSyncerTest, InitialSyncerReturnsParseErrorWhenFCVFetcherReturnsNoVersion) {
     auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "targetVersion"
                             << FeatureCompatibilityVersionParser::kVersion44)};
-    runInitialSyncWithBadFCVResponse(docs, ErrorCodes::BadValue);
+    runInitialSyncWithBadFCVResponse(docs, ((ErrorCodes::Error)40414));
 }
 
 TEST_F(InitialSyncerTest, InitialSyncerSucceedsWhenFCVFetcherReturnsOldVersion) {
@@ -1950,9 +1950,9 @@ TEST_F(InitialSyncerTest, InitialSyncerSucceedsWhenFCVFetcherReturnsOldVersion) 
         // Oplog entry associated with the beginApplyingTimestamp.
         processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
 
-        auto docs = {BSON("_id" << FeatureCompatibilityVersionParser::kParameterName << "version"
-                                << FeatureCompatibilityVersionParser::kVersion44)};
-        processSuccessfulFCVFetcherResponse(docs);
+        FeatureCompatibilityVersionDocument fcvDoc;
+        fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
+        processSuccessfulFCVFetcherResponse({fcvDoc.toBSON()});
     }
 
     // We shut it down so we do not have to finish initial sync. If the fCV fetcher got an error,

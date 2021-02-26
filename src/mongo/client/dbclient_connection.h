@@ -39,6 +39,7 @@
 #include "mongo/client/mongo_uri.h"
 #include "mongo/client/query.h"
 #include "mongo/client/read_preference.h"
+#include "mongo/config.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/write_concern_options.h"
@@ -300,11 +301,16 @@ public:
         return _isMongos;
     }
 
-    Status authenticateInternalUser() override;
+    Status authenticateInternalUser(
+        auth::StepDownBehavior stepDownBehavior = auth::StepDownBehavior::kKillConnection) override;
 
     bool authenticatedDuringConnect() const override {
         return _authenticatedDuringConnect;
     }
+
+#ifdef MONGO_CONFIG_SSL
+    const SSLConfiguration* getSSLConfiguration() override;
+#endif
 
 protected:
     int _minWireVersion{0};
@@ -338,6 +344,9 @@ protected:
     void _checkConnection();
 
     bool _internalAuthOnReconnect = false;
+
+    auth::StepDownBehavior _internalAuthStepDownBehavior = auth::StepDownBehavior::kKillConnection;
+
     std::map<std::string, BSONObj> authCache;
 
     static AtomicWord<int> _numConnections;

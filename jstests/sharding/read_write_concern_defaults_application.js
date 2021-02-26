@@ -291,6 +291,9 @@ let testCases = {
         checkReadConcern: true,
         checkWriteConcern: false,
     },
+    donorForgetMigration: {skip: "does not accept read or write concern"},
+    donorStartMigration: {skip: "does not accept read or write concern"},
+    donorWaitForMigrationToCommit: {skip: "does not accept read or write concern"},
     driverOIDTest: {skip: "internal command"},
     drop: {
         setUp: function(conn) {
@@ -588,6 +591,7 @@ let testCases = {
         useLogs: true,
     },
     rolesInfo: {skip: "does not accept read or write concern"},
+    rotateCertificates: {skip: "does not accept read or write concern"},
     saslContinue: {skip: "does not accept read or write concern"},
     saslStart: {skip: "does not accept read or write concern"},
     sbe: {skip: "internal command"},
@@ -656,7 +660,7 @@ let testCases = {
     whatsmyuri: {skip: "internal command"},
 };
 
-commandsRemovedFromMongodIn46.forEach(function(cmd) {
+commandsRemovedFromMongodSinceLastLTS.forEach(function(cmd) {
     testCases[cmd] = {skip: "must define test coverage for 4.4 backwards compatibility"};
 });
 

@@ -51,6 +51,7 @@
 #include "mongo/db/op_observer_util.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/repl/migrating_tenant_donor_util.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -192,6 +193,9 @@ OpTimeBundle replLogUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& 
     oplogEntry.setFromMigrateIfTrue(args.updateArgs.fromMigrate);
     // oplogLink could have been changed to include pre/postImageOpTime by the previous no-op write.
     repl::appendOplogEntryChainInfo(opCtx, &oplogEntry, &oplogLink, args.updateArgs.stmtId);
+    if (args.updateArgs.oplogSlot) {
+        oplogEntry.setOpTime(*args.updateArgs.oplogSlot);
+    }
     opTimes.writeOpTime = logOperation(opCtx, &oplogEntry);
     opTimes.wallClockTime = oplogEntry.getWallClockTime();
     return opTimes;
@@ -569,6 +573,9 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
     } else if (args.nss == NamespaceString::kConfigSettingsNamespace) {
         ReadWriteConcernDefaults::get(opCtx).observeDirectWriteToConfigSettings(
             opCtx, args.updateArgs.updatedDoc["_id"], args.updateArgs.updatedDoc);
+    } else if (args.nss == NamespaceString::kMigrationDonorsNamespace) {
+        migrating_tenant_donor_util::onTenantMigrationDonorStateTransition(
+            opCtx, args.updateArgs.updatedDoc);
     }
 }
 
@@ -771,6 +778,22 @@ repl::OpTime OpObserverImpl::onDropCollection(OperationContext* opCtx,
     if (collectionName.coll() == DurableViewCatalog::viewsCollectionName()) {
         DurableViewCatalog::onSystemViewsCollectionDrop(opCtx, collectionName);
     } else if (collectionName == NamespaceString::kSessionTransactionsTableNamespace) {
+        // Disallow this drop if there are currently prepared transactions.
+        const auto sessionCatalog = SessionCatalog::get(opCtx);
+        SessionKiller::Matcher matcherAllSessions(
+            KillAllSessionsByPatternSet{makeKillAllSessionsByPattern(opCtx)});
+        bool noPreparedTxns = true;
+        sessionCatalog->scanSessions(matcherAllSessions, [&](const ObservableSession& session) {
+            auto txnParticipant = TransactionParticipant::get(session);
+            if (txnParticipant.transactionIsPrepared()) {
+                noPreparedTxns = false;
+            }
+        });
+        uassert(4852500,
+                "Unable to drop transactions table (config.transactions) while prepared "
+                "transactions are present.",
+                noPreparedTxns);
+
         MongoDSessionCatalog::invalidateAllSessions(opCtx);
     } else if (collectionName == NamespaceString::kConfigSettingsNamespace) {
         ReadWriteConcernDefaults::get(opCtx).invalidate();

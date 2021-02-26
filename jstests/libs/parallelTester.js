@@ -195,6 +195,10 @@ if (typeof _threadInject != "undefined") {
             // Assumes that other tests are not creating cursors.
             "kill_cursors.js",
 
+            // These tests check global command counters.
+            "find_and_modify_metrics.js",
+            "update_metrics.js",
+
             // Views tests
             "views/invalid_system_views.js",      // Puts invalid view definitions in system.views.
             "views/views_all_commands.js",        // Drops test DB.
@@ -213,6 +217,7 @@ if (typeof _threadInject != "undefined") {
         if (db.getMongo().readMode() === "legacy") {
             var requires_find_command = [
                 "apply_ops_system_dot_views.js",
+                "explode_for_sort_collation.js",
                 "update_pipeline_shell_helpers.js",
                 "update_with_pipeline.js",
                 "views/dbref_projection.js",

@@ -44,6 +44,7 @@
 #include "mongo/util/decorable.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/net/ssl/apple.hpp"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/out_of_line_executor.h"
 #include "mongo/util/time_support.h"
@@ -115,26 +116,6 @@ struct OpenSSLDeleter {
 class SSLConnectionInterface {
 public:
     virtual ~SSLConnectionInterface();
-};
-
-class SSLConfiguration {
-public:
-    bool isClusterMember(StringData subjectName) const;
-    bool isClusterMember(SSLX509Name subjectName) const;
-    void getServerStatusBSON(BSONObjBuilder*) const;
-    Status setServerSubjectName(SSLX509Name name);
-
-    const SSLX509Name& serverSubjectName() const {
-        return _serverSubjectName;
-    }
-
-    SSLX509Name clientSubjectName;
-    Date_t serverCertificateExpirationDate;
-    bool hasCA = false;
-
-private:
-    SSLX509Name _serverSubjectName;
-    std::vector<SSLX509Name::Entry> _canonicalServerSubjectName;
 };
 
 // These represent the ASN.1 type bytes for strings used in an X509 DirectoryString
@@ -303,8 +284,33 @@ public:
     virtual SSLInformationToLog getSSLInformationToLog() const = 0;
 };
 
-// Access SSL functions through this instance.
-SSLManagerInterface* getSSLManager();
+/**
+ * Manages changes in the SSL configuration, such as certificate rotation, and updates a manager
+ * appropriately.
+ */
+class SSLManagerCoordinator {
+public:
+    SSLManagerCoordinator();
+
+    /**
+     * Get the global SSLManagerCoordinator instance.
+     */
+    static SSLManagerCoordinator* get();
+
+    /**
+     * Access the current SSLManager safely.
+     */
+    std::shared_ptr<SSLManagerInterface> getSSLManager();
+
+    /**
+     * Perform certificate rotation safely.
+     */
+    void rotate();
+
+private:
+    Mutex _lock = MONGO_MAKE_LATCH("SSLManagerCoordinator::_lock");
+    synchronized_value<std::shared_ptr<SSLManagerInterface>> _manager;
+};
 
 extern bool isSSLServer;
 

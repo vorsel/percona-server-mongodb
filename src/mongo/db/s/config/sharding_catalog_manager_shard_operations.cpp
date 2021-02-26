@@ -338,15 +338,18 @@ StatusWith<ShardType> ShardingCatalogManager::_validateHostAsShard(
                                                 << "field when attempting to add "
                                                 << connectionString.toString() << " as a shard");
     }
+    // (Generic FCV reference): This FCV check should exist across LTS binary versions.
     if (serverGlobalParams.featureCompatibility.getVersion() >
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44) {
-        // If the cluster's FCV is 4.6, or upgrading to / downgrading from, the node being added
-        // must be a v4.6 binary.
+        ServerGlobalParams::FeatureCompatibility::kLastLTS) {
+        // If the cluster's FCV is kLatest, or upgrading to / downgrading from, the node being added
+        // must be a version kLatest binary.
         invariant(maxWireVersion == WireVersion::LATEST_WIRE_VERSION);
     } else {
-        // If the cluster's FCV is 4.4, the node being added must be a v4.4 or v4.6 binary.
+        // If the cluster's FCV is kLastLTS, the node being added must be a version kLastLTS or
+        // version kLatest binary.
+        // (Generic FCV reference): This FCV check should exist across LTS binary versions.
         invariant(serverGlobalParams.featureCompatibility.getVersion() ==
-                  ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44);
+                  ServerGlobalParams::FeatureCompatibility::kLastLTS);
         invariant(maxWireVersion >= WireVersion::LATEST_WIRE_VERSION - 1);
     }
 
@@ -651,10 +654,10 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
 
         BSONObj setFCVCmd;
         switch (serverGlobalParams.featureCompatibility.getVersion()) {
-            case ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46:
-            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo46:
+            case ServerGlobalParams::FeatureCompatibility::kLatest:
+            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To451:
                 setFCVCmd = BSON(FeatureCompatibilityVersionCommandParser::kCommandName
-                                 << FeatureCompatibilityVersionParser::kVersion46
+                                 << FeatureCompatibilityVersionParser::kVersion451
                                  << WriteConcernOptions::kWriteConcernField
                                  << opCtx->getWriteConcern().toBSON());
                 break;

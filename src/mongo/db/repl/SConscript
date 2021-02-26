@@ -689,8 +689,8 @@ env.Library(
         '$BUILD_DIR/mongo/rpc/metadata',
         '$BUILD_DIR/mongo/transport/transport_layer_common',
         '$BUILD_DIR/mongo/util/fail_point',
-        'initial_syncer',
         'data_replicator_external_state_initial_sync',
+        'initial_syncer',
         'repl_coordinator_interface',
         'repl_settings',
         'replica_set_messages',
@@ -698,6 +698,7 @@ env.Library(
         'replication_process',
         'reporter',
         'scatter_gather',
+        'tenant_migration_cloners',
         'topology_coordinator',
     ],
     LIBDEPS_PRIVATE=[
@@ -740,6 +741,7 @@ env.Library(
 env.Library(
     target='repl_coordinator_interface',
     source=[
+        'always_allow_non_local_writes.cpp',
         'repl_client_info.cpp',
         'replication_coordinator.cpp',
         'replication_coordinator_noop.cpp',
@@ -966,16 +968,16 @@ env.Library(
     target='initial_sync_cloners',
     source=[
         'all_database_cloner.cpp',
-        'base_cloner.cpp',
         'collection_cloner.cpp',
         'database_cloner.cpp',
-        env.Idlc('database_cloner.idl')[0]
     ],
     LIBDEPS = [
-        'task_runner',
+        'base_cloner',
+        'database_cloner_common',
         'initial_sync_shared_data',
         'member_data',
         'replication_consistency_markers_impl',
+        'task_runner',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/clientdriver_network',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
@@ -984,12 +986,27 @@ env.Library(
     LIBDEPS_PRIVATE=[
         'repl_server_parameters',
         'replication_auth',
-        '$BUILD_DIR/mongo/idl/idl_parser',
-        '$BUILD_DIR/mongo/db/catalog/collection_options',
         '$BUILD_DIR/mongo/db/commands/list_collections_filter',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/index_build_entry_helpers',
         '$BUILD_DIR/mongo/util/progress_meter',
+    ]
+)
+
+env.Library(
+    target='tenant_migration_cloners',
+    source=[
+        'tenant_collection_cloner.cpp',
+        'tenant_database_cloner.cpp',
+    ],
+    LIBDEPS = [
+        'base_cloner',
+        'database_cloner_common',
+        'initial_sync_shared_data',
+        '$BUILD_DIR/mongo/base',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/commands/list_collections_filter',
     ]
 )
 
@@ -1084,6 +1101,38 @@ env.Library(
 )
 
 env.Library(
+    target='base_cloner',
+    source=[
+        'base_cloner.cpp',
+    ],
+    LIBDEPS=[
+        'initial_sync_shared_data',
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/client/clientdriver_network',
+        '$BUILD_DIR/mongo/util/fail_point',
+    ],
+    LIBDEPS_PRIVATE=[
+        'repl_server_parameters',
+        'replication_consistency_markers_impl',
+    ]
+)
+
+env.Library(
+    target='database_cloner_common',
+    source=[
+        'database_cloner_common.cpp',
+        env.Idlc('database_cloner.idl')[0],
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/catalog/collection_options',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ]
+)
+
+env.Library(
     target='initial_syncer',
     source=[
         'initial_syncer.cpp',
@@ -1164,15 +1213,25 @@ env.Library(
 )
 
 env.Library(
-    target='migrating_tenant_access_blocker',
+    target='migrating_tenant',
     source=[
         'migrating_tenant_access_blocker.cpp',
+        'migrating_tenant_access_blocker_by_prefix.cpp',
+        'migrating_tenant_access_blocker_server_status_section.cpp',
+        'migrating_tenant_donor_util.cpp',
+        env.Idlc('migrate_tenant_state_machine.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/catalog_raii',
+        '$BUILD_DIR/mongo/db/commands/server_status',
+        '$BUILD_DIR/mongo/db/dbhelpers',
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/executor/network_interface_factory',
+        '$BUILD_DIR/mongo/executor/thread_pool_task_executor',
+        'local_oplog_info',
         'optime',
-        'repl_coordinator_impl'
+        'repl_coordinator_interface',
     ],
 )
 
@@ -1209,11 +1268,12 @@ env.Library(
         '$BUILD_DIR/mongo/util/fail_point',
         'bgsync',
         'drop_pending_collection_reaper',
-        'migrating_tenant_access_blocker',
+        'migrating_tenant',
         'oplog_application',
         'oplog_buffer_collection',
         'oplog_interface_remote',
         'optime',
+        'primary_only_service',
         'repl_coordinator_interface',
         'repl_settings',
         'replication_consistency_markers_impl',
@@ -1272,6 +1332,7 @@ env.CppUnitTest(
         'oplog_fetcher_test.cpp',
         'oplog_test.cpp',
         'optime_extract_test.cpp',
+        'primary_only_service_test.cpp',
         'read_concern_args_test.cpp',
         'repl_set_config_checks_test.cpp',
         'repl_set_config_test.cpp',
@@ -1317,6 +1378,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/db/stats/counters',
+        '$BUILD_DIR/mongo/db/storage/ephemeral_for_test/storage_ephemeral_for_test_core',
         '$BUILD_DIR/mongo/db/transaction',
         '$BUILD_DIR/mongo/dbtests/mocklib',
         '$BUILD_DIR/mongo/executor/network_interface_factory',
@@ -1349,6 +1411,7 @@ env.CppUnitTest(
         'oplog_interface_mock',
         'oplog_interface_remote',
         'optime',
+        'primary_only_service',
         'repl_coordinator_impl',
         'repl_server_parameters',
         'replica_set_messages',
@@ -1502,5 +1565,23 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/rw_concern_d',
+    ],
+)
+
+env.Library(
+    target='primary_only_service',
+    source=[
+        'primary_only_service.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/executor/task_executor_interface',
+        'replica_set_aware_service',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/dbdirectclient',
+        '$BUILD_DIR/mongo/executor/scoped_task_executor',
+        '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
+        'wait_for_majority_service',
     ],
 )

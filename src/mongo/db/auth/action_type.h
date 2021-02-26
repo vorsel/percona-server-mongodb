@@ -156,6 +156,7 @@ namespace mongo {
     X(revokePrivilegesFromRole) /* ID only */                                         \
     X(revokeRolesFromRole)      /* ID only */                                         \
     X(revokeRolesFromUser)      /* ID only */                                         \
+    X(rotateCertificates)                                                             \
     X(runAsLessPrivilegedUser)                                                        \
     X(serverStatus)                                                                   \
     X(setAuthenticationRestriction)                                                   \

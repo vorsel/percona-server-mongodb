@@ -49,6 +49,8 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
@@ -64,6 +66,37 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(hangAfterDatabaseLock);
 MONGO_FAIL_POINT_DEFINE(assertAfterIndexUpdate);
+
+void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const& nss) {
+    Lock::DBLock dblock(opCtx, nss.db(), MODE_IS);
+    auto dss = DatabaseShardingState::get(opCtx, nss.db().toString());
+    if (!dss) {
+        return;
+    }
+
+    auto dssLock = DatabaseShardingState::DSSLock::lockShared(opCtx, dss);
+    try {
+        const auto collDesc =
+            CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx);
+        if (!collDesc.isSharded()) {
+            auto mpsm = dss->getMovePrimarySourceManager(dssLock);
+
+            if (mpsm) {
+                LOGV2(
+                    4945200, "assertMovePrimaryInProgress", "movePrimaryNss"_attr = nss.toString());
+
+                uasserted(ErrorCodes::MovePrimaryInProgress,
+                          "movePrimary is in progress for namespace " + nss.toString());
+            }
+        }
+    } catch (const DBException& ex) {
+        if (ex.toStatus() != ErrorCodes::MovePrimaryInProgress) {
+            LOGV2(4945201, "Error when getting colleciton description", "what"_attr = ex.what());
+            return;
+        }
+        throw;
+    }
+}
 
 struct CollModRequest {
     const IndexDescriptor* idx = nullptr;
@@ -203,14 +236,14 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
             // Save this to a variable to avoid reading the atomic variable multiple times.
             const auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
 
-            // If the feature compatibility version is not 4.6, and we are validating features as
-            // master, ban the use of new agg features introduced in 4.6 to prevent them from being
-            // persisted in the catalog.
+            // If the feature compatibility version is not kLatest, and we are validating features
+            // as master, ban the use of new agg features introduced in kLatest to prevent them from
+            // being persisted in the catalog.
             boost::optional<ServerGlobalParams::FeatureCompatibility::Version>
                 maxFeatureCompatibilityVersion;
+            // (Generic FCV reference): This FCV check should exist across LTS binary versions.
             if (serverGlobalParams.validateFeaturesAsMaster.load() &&
-                currentFCV !=
-                    ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46) {
+                currentFCV != ServerGlobalParams::FeatureCompatibility::kLatest) {
                 maxFeatureCompatibilityVersion = currentFCV;
             }
             cmr.collValidator = coll->parseValidator(opCtx,
@@ -337,6 +370,7 @@ Status _collModInternal(OperationContext* opCtx,
     // This can kill all cursors so don't allow running it while a background operation is in
     // progress.
     if (coll) {
+        assertMovePrimaryInProgress(opCtx, nss);
         IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(coll->uuid());
     }
 

@@ -42,6 +42,7 @@
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/client/replica_set_monitor.h"
+#include "mongo/config.h"
 #include "mongo/db/auth/sasl_command_constants.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/jsobj.h"
@@ -482,15 +483,16 @@ Status DBClientReplicaSet::_runAuthLoop(Authenticate authCb) {
     }
 }
 
-Status DBClientReplicaSet::authenticateInternalUser() {
+Status DBClientReplicaSet::authenticateInternalUser(auth::StepDownBehavior stepDownBehavior) {
     if (!auth::isInternalAuthSet()) {
         return {ErrorCodes::AuthenticationFailed,
                 "No authentication parameters set for internal user"};
     }
 
     _internalAuthRequested = true;
-    return _runAuthLoop(
-        [&](DBClientConnection* conn) { uassertStatusOK(conn->authenticateInternalUser()); });
+    return _runAuthLoop([stepDownBehavior](DBClientConnection* conn) {
+        uassertStatusOK(conn->authenticateInternalUser(stepDownBehavior));
+    });
 }
 
 void DBClientReplicaSet::_auth(const BSONObj& params) {
@@ -1207,5 +1209,11 @@ void DBClientReplicaSet::resetSlaveOkConn() {
 
     _lastSlaveOkHost = HostAndPort();
 }
+
+#ifdef MONGO_CONFIG_SSL
+const SSLConfiguration* DBClientReplicaSet::getSSLConfiguration() {
+    return checkMaster()->getSSLConfiguration();
+}
+#endif
 
 }  // namespace mongo

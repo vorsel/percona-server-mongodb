@@ -60,7 +60,7 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/query/killcursors_request.h"
+#include "mongo/db/query/kill_cursors_gen.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/remote_command_request.h"
@@ -77,6 +77,7 @@
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/net/ssl_options.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/password_digest.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/version.h"
@@ -257,12 +258,13 @@ void DBClientConnection::_auth(const BSONObj& params) {
     DBClientBase::_auth(params);
 }
 
-Status DBClientConnection::authenticateInternalUser() {
+Status DBClientConnection::authenticateInternalUser(auth::StepDownBehavior stepDownBehavior) {
     if (autoReconnect) {
         _internalAuthOnReconnect = true;
+        _internalAuthStepDownBehavior = stepDownBehavior;
     }
 
-    return DBClientBase::authenticateInternalUser();
+    return DBClientBase::authenticateInternalUser(stepDownBehavior);
 }
 
 bool DBClientConnection::connect(const HostAndPort& server,
@@ -586,7 +588,7 @@ void DBClientConnection::_checkConnection() {
                 "Reconnected",
                 "connString"_attr = toString());
     if (_internalAuthOnReconnect) {
-        uassertStatusOK(authenticateInternalUser());
+        uassertStatusOK(authenticateInternalUser(_internalAuthStepDownBehavior));
     } else {
         for (const auto& kv : authCache) {
             try {
@@ -821,6 +823,12 @@ void DBClientConnection::handleNotMasterResponse(const BSONObj& replyBody,
 
     _markFailed(kSetFlag);
 }
+
+#ifdef MONGO_CONFIG_SSL
+const SSLConfiguration* DBClientConnection::getSSLConfiguration() {
+    return _session->getSSLConfiguration();
+}
+#endif
 
 AtomicWord<int> DBClientConnection::_numConnections;
 

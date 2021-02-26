@@ -206,8 +206,8 @@ void ReplicationCoordinatorNoOp::setMyHeartbeatMessage(const std::string&) {
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::setMyLastAppliedOpTimeAndWallTimeForward(const OpTimeAndWallTime&,
-                                                                          DataConsistency) {
+void ReplicationCoordinatorNoOp::setMyLastAppliedOpTimeAndWallTimeForward(
+    const OpTimeAndWallTime&) {
     MONGO_UNREACHABLE;
 }
 
@@ -393,14 +393,16 @@ void ReplicationCoordinatorNoOp::blacklistSyncSource(const HostAndPort&, Date_t)
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::resetLastOpTimesFromOplog(OperationContext*, DataConsistency) {
+void ReplicationCoordinatorNoOp::resetLastOpTimesFromOplog(OperationContext*) {
     MONGO_UNREACHABLE;
 }
 
-bool ReplicationCoordinatorNoOp::shouldChangeSyncSource(const HostAndPort&,
-                                                        const rpc::ReplSetMetadata&,
-                                                        const rpc::OplogQueryMetadata&,
-                                                        const OpTime&) {
+ChangeSyncSourceAction ReplicationCoordinatorNoOp::shouldChangeSyncSource(
+    const HostAndPort&,
+    const rpc::ReplSetMetadata&,
+    const rpc::OplogQueryMetadata&,
+    const OpTime&,
+    const OpTime&) {
     MONGO_UNREACHABLE;
 }
 

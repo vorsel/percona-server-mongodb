@@ -51,6 +51,7 @@
 #include "mongo/logv2/log.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
@@ -62,6 +63,7 @@
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/ssl_options.h"
 #include "mongo/util/net/ssl_parameters_gen.h"
+#include "mongo/util/net/ssl_peer_info.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/periodic_runner.h"
 #include "mongo/util/read_through_cache.h"
@@ -83,6 +85,15 @@
 #include <openssl/x509v3.h>
 #ifdef MONGO_CONFIG_HAVE_SSL_EC_KEY_NEW
 #include <openssl/ec.h>
+#endif
+
+#if OPENSSL_VERSION_NUMBER < 0x1010100FL
+int SSL_CTX_set_ciphersuites(SSL_CTX*, const char*) {
+    uasserted(
+        4877400,
+        "Setting OpenSSL cipher suites is not allowed for OpenSSL versions older than 1.1.1.");
+    return 0;
+}
 #endif
 
 namespace mongo {
@@ -733,9 +744,9 @@ Future<UniqueOCSPResponse> retrieveOCSPResponse(const std::string& host,
  * and returns a set of Certificate IDs that are there in the response and a date object
  * which represents the time when the Response needs to be refreshed.
  */
-StatusWith<std::pair<OCSPCertIDSet, Date_t>> iterateResponse(OCSP_BASICRESP* basicResp,
-                                                             STACK_OF(X509) * intermediateCerts) {
-    Date_t earliestNextUpdate = Date_t::max();
+StatusWith<std::pair<OCSPCertIDSet, boost::optional<Date_t>>> iterateResponse(
+    OCSP_BASICRESP* basicResp, STACK_OF(X509) * intermediateCerts) {
+    boost::optional<Date_t> earliestNextUpdate = boost::none;
 
     OCSPCertIDSet certIdsInResponse;
 
@@ -765,8 +776,12 @@ StatusWith<std::pair<OCSPCertIDSet, Date_t>> iterateResponse(OCSP_BASICRESP* bas
                                  << "Unexpected OCSP Certificate Status. Reason: " << status);
         }
 
-        Date_t nextUpdateDate(convertASN1ToMillis(static_cast<ASN1_TIME*>(nextupd)));
-        earliestNextUpdate = std::min(earliestNextUpdate, nextUpdateDate);
+        if (nextupd) {
+            Date_t nextUpdateDate(convertASN1ToMillis(static_cast<ASN1_TIME*>(nextupd)));
+            earliestNextUpdate = earliestNextUpdate
+                ? boost::optional<Date_t>(std::min(earliestNextUpdate.get(), nextUpdateDate))
+                : boost::optional<Date_t>(nextUpdateDate);
+        }
     }
 
     if (earliestNextUpdate < Date_t::now()) {
@@ -781,7 +796,7 @@ StatusWith<std::pair<OCSPCertIDSet, Date_t>> iterateResponse(OCSP_BASICRESP* bas
  * the IDs of the certificates that the OCSP Response contains. The Date_t object is the
  * earliest expiration date on the OCSPResponse.
  */
-StatusWith<std::pair<OCSPCertIDSet, Date_t>> parseAndValidateOCSPResponse(
+StatusWith<std::pair<OCSPCertIDSet, boost::optional<Date_t>>> parseAndValidateOCSPResponse(
     SSL_CTX* context, OCSP_RESPONSE* response, STACK_OF(X509) * intermediateCerts) {
     // Read the overall status of the OCSP response
     int responseStatus = OCSP_response_status(response);
@@ -878,7 +893,7 @@ Future<OCSPFetchResponse> dispatchRequests(SSL_CTX* context,
                     // If not, we pass down a bogus response, and let the caller deal with it down
                     // there.
                     boost::optional<Date_t> nextUpdate = swCertIDSetAndDuration.isOK()
-                        ? boost::optional<Date_t>(swCertIDSetAndDuration.getValue().second)
+                        ? swCertIDSetAndDuration.getValue().second
                         : boost::none;
 
                     if (state->finishLine.arriveStrongly()) {
@@ -1000,6 +1015,16 @@ ServiceContext::ConstructorActionRegisterer OCSPCacheRegisterer("CreateOCSPCache
 
 using OCSPCacheVal = OCSPCache::ValueHandle;
 
+struct OCSPStaplingContext {
+    OCSPStaplingContext(UniqueOCSPResponse response, Date_t nextUpdate)
+        : sharedResponseForServer(std::move(response)), sharedResponseNextUpdate(nextUpdate) {}
+
+    OCSPStaplingContext() = default;
+
+    std::shared_ptr<OCSP_RESPONSE> sharedResponseForServer;
+    Date_t sharedResponseNextUpdate;
+};
+
 class SSLManagerOpenSSL : public SSLManagerInterface {
 public:
     explicit SSLManagerOpenSSL(const SSLParams& params, bool isServer);
@@ -1046,6 +1071,18 @@ public:
 
     SSLInformationToLog getSSLInformationToLog() const final;
 
+    Mutex* getSharedResponseMutex() {
+        return &_sharedResponseMutex;
+    }
+
+    const std::shared_ptr<OCSPStaplingContext> getOcspStaplingContext(WithLock) {
+        return _ocspStaplingContext;
+    }
+
+    void setOcspStaplingContext(WithLock, std::shared_ptr<OCSPStaplingContext> newContext) {
+        _ocspStaplingContext = newContext;
+    }
+
 private:
     const int _rolesNid = OBJ_create(mongodbRolesOID.identifier.c_str(),
                                      mongodbRolesOID.shortDescription.c_str(),
@@ -1058,6 +1095,9 @@ private:
     bool _allowInvalidHostnames;
     bool _suppressNoCertificateWarning;
     SSLConfiguration _sslConfiguration;
+
+    Mutex _sharedResponseMutex = MONGO_MAKE_LATCH("OCSPStaplingJobRunner::_sharedResponseMutex");
+    std::shared_ptr<OCSPStaplingContext> _ocspStaplingContext;
 
     Mutex _staplingMutex = MONGO_MAKE_LATCH("OCSPStaplingJobRunner::_mutex");
     PeriodicRunner::JobAnchor _ocspStaplingAnchor;
@@ -1192,12 +1232,12 @@ private:
 // Global variable indicating if this is a server or a client instance
 bool isSSLServer = false;
 
-extern SSLManagerInterface* theSSLManager;
+extern SSLManagerCoordinator* theSSLManagerCoordinator;
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("SetupOpenSSL", "EndStartupOptionHandling"))
 (InitializerContext*) {
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
-        theSSLManager = new SSLManagerOpenSSL(sslGlobalParams, isSSLServer);
+        theSSLManagerCoordinator = new SSLManagerCoordinator();
     }
     return Status::OK();
 }
@@ -1306,8 +1346,7 @@ SSLConnectionOpenSSL::SSLConnectionOpenSSL(SSL_CTX* context,
     : socket(sock) {
     ssl = SSL_new(context);
 
-    std::string sslErr =
-        nullptr != getSSLManager() ? getSSLManager()->getSSLErrorMessage(ERR_get_error()) : "";
+    std::string sslErr = SSLManagerInterface::getSSLErrorMessage(ERR_get_error());
     massert(15861, "Error creating new SSL object " + sslErr, ssl);
 
     BIO_new_bio_pair(&internalBIO, BUFFER_SIZE, &networkBIO, BUFFER_SIZE);
@@ -1380,8 +1419,8 @@ SSLManagerOpenSSL::SSLManagerOpenSSL(const SSLParams& params, bool isServer)
 
         uassertStatusOK(_sslConfiguration.setServerSubjectName(std::move(serverSubjectName)));
 
-        static CertificateExpirationMonitor task =
-            CertificateExpirationMonitor(_sslConfiguration.serverCertificateExpirationDate);
+        CertificateExpirationMonitor::updateExpirationDeadline(
+            _sslConfiguration.serverCertificateExpirationDate);
     }
 }
 
@@ -1448,26 +1487,13 @@ int SSLManagerOpenSSL::SSL_shutdown(SSLConnectionInterface* connInterface) {
     return status;
 }
 
-struct OCSPStaplingContext {
-    OCSPStaplingContext(UniqueOCSPResponse response, Date_t nextUpdate)
-        : sharedResponseForServer(std::move(response)), sharedResponseNextUpdate(nextUpdate) {}
-
-    OCSPStaplingContext() = default;
-
-    std::shared_ptr<OCSP_RESPONSE> sharedResponseForServer;
-    Date_t sharedResponseNextUpdate;
-};
-
-mongo::Mutex sharedResponseMutex;
-std::shared_ptr<OCSPStaplingContext> ocspStaplingContext;
-
 int ocspServerCallback(SSL* ssl, void* arg) {
     {
         std::shared_ptr<OCSPStaplingContext> context;
-
         {
-            stdx::lock_guard<mongo::Mutex> guard(sharedResponseMutex);
-            context = ocspStaplingContext;
+            stdx::lock_guard<mongo::Mutex> guard(
+                *(static_cast<SSLManagerOpenSSL*>(arg)->getSharedResponseMutex()));
+            context = static_cast<SSLManagerOpenSSL*>(arg)->getOcspStaplingContext(guard);
         }
 
         if (!context || !context->sharedResponseForServer) {
@@ -1760,16 +1786,27 @@ Status SSLManagerOpenSSL::stapleOCSPResponse(SSL_CTX* context) {
         return dispatchRequests(
                    context, std::move(intermediateCerts), ocspContext, OCSPPurpose::kStaple)
             .onCompletion([](StatusWith<OCSPFetchResponse> swResponse) -> Milliseconds {
+                std::shared_ptr<SSLManagerInterface> sslManager =
+                    theSSLManagerCoordinator->getSSLManager();
+                std::shared_ptr<SSLManagerOpenSSL> theSSLManagerCast =
+                    std::static_pointer_cast<SSLManagerOpenSSL>(sslManager);
+
+                Mutex* sharedResponseMutex = theSSLManagerCast->getSharedResponseMutex();
+
+                stdx::lock_guard<mongo::Mutex> guard(*sharedResponseMutex);
+
+                std::shared_ptr<OCSPStaplingContext> ocspStaplingContext =
+                    theSSLManagerCast->getOcspStaplingContext(guard);
+
                 if (!swResponse.isOK()) {
                     LOGV2_WARNING(23233, "Could not staple OCSP response to outgoing certificate.");
-
-                    stdx::lock_guard<mongo::Mutex> guard(sharedResponseMutex);
 
                     if (ocspStaplingContext && ocspStaplingContext->sharedResponseForServer &&
                         ocspStaplingContext->sharedResponseNextUpdate <
                             (Date_t::now() + kOCSPUnknownStatusRefreshRate)) {
 
-                        ocspStaplingContext = std::make_shared<OCSPStaplingContext>();
+                        theSSLManagerCast->setOcspStaplingContext(
+                            guard, std::make_shared<OCSPStaplingContext>());
 
                         LOGV2_WARNING(
                             4633601,
@@ -1779,12 +1816,11 @@ Status SSLManagerOpenSSL::stapleOCSPResponse(SSL_CTX* context) {
                     return kOCSPUnknownStatusRefreshRate;
                 }
 
-                stdx::lock_guard<mongo::Mutex> guard(sharedResponseMutex);
-
-                ocspStaplingContext = std::make_shared<OCSPStaplingContext>(
-                    std::move(swResponse.getValue().response),
-                    swResponse.getValue().nextStapleRefresh());
-
+                theSSLManagerCast->setOcspStaplingContext(
+                    guard,
+                    std::make_shared<OCSPStaplingContext>(
+                        std::move(swResponse.getValue().response),
+                        swResponse.getValue().nextStapleRefresh()));
                 return swResponse.getValue().fetchNewResponseDuration();
             });
     };
@@ -1801,8 +1837,8 @@ Status SSLManagerOpenSSL::stapleOCSPResponse(SSL_CTX* context) {
             Milliseconds duration;
             if (swDurationInitial.isOK()) {
                 // if the validation refresh period was set manually, use it
-                if (kOCSPValidationRefreshPeriodSecs != -1) {
-                    duration = Seconds(kOCSPValidationRefreshPeriodSecs);
+                if (kOCSPStaplingRefreshPeriodSecs != -1) {
+                    duration = Seconds(kOCSPStaplingRefreshPeriodSecs);
                 } else {
                     duration = swDurationInitial.getValue();
                 }
@@ -1822,9 +1858,9 @@ Status SSLManagerOpenSSL::stapleOCSPResponse(SSL_CTX* context) {
                                 return;
                             } else {
                                 // if the validation refresh period was set manually, use it
-                                if (kOCSPValidationRefreshPeriodSecs != -1) {
+                                if (kOCSPStaplingRefreshPeriodSecs != -1) {
                                     this->_ocspStaplingAnchor.setPeriod(
-                                        Seconds(kOCSPValidationRefreshPeriodSecs));
+                                        Seconds(kOCSPStaplingRefreshPeriodSecs));
                                 } else {
                                     this->_ocspStaplingAnchor.setPeriod(swDuration.getValue());
                                 }
@@ -1837,7 +1873,7 @@ Status SSLManagerOpenSSL::stapleOCSPResponse(SSL_CTX* context) {
         });
 
     SSL_CTX_set_tlsext_status_cb(context, ocspServerCallback);
-    SSL_CTX_set_tlsext_status_arg(context, nullptr);
+    SSL_CTX_set_tlsext_status_arg(context, static_cast<void*>(this));
 
     return Status::OK();
 }
@@ -1880,6 +1916,18 @@ Status SSLManagerOpenSSL::initSSLContext(SSL_CTX* context,
                       str::stream() << "Can not set supported cipher suites with config string \""
                                     << params.sslCipherConfig
                                     << "\": " << getSSLErrorMessage(ERR_get_error()));
+    }
+
+    if (!params.sslCipherSuiteConfig.empty()) {
+        // OpenSSL versions older than version 1.1.1 are not allowed to configure their cipher
+        // suites using the sslCipherSuiteConfig flag.
+        if (0 == ::SSL_CTX_set_ciphersuites(context, params.sslCipherSuiteConfig.c_str())) {
+            return Status(ErrorCodes::InvalidSSLConfiguration,
+                          str::stream()
+                              << "Can not set supported cipher suites with config string \""
+                              << params.sslCipherSuiteConfig
+                              << "\": " << getSSLErrorMessage(ERR_get_error()));
+        }
     }
 
     // We use the address of the context as the session id context.

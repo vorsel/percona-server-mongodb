@@ -570,10 +570,13 @@ protected:
 
 struct ValidateResults {
     bool valid = true;
+    bool repaired = false;
     boost::optional<Timestamp> readTimestamp = boost::none;
     std::vector<std::string> errors;
     std::vector<std::string> warnings;
     std::vector<BSONObj> extraIndexEntries;
     std::vector<BSONObj> missingIndexEntries;
+    std::vector<RecordId> corruptRecords;
+    long long numRemovedCorruptRecords = 0;
 };
 }  // namespace mongo

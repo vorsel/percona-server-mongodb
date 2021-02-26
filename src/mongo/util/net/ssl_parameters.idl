@@ -72,12 +72,13 @@ server_parameters:
     cpp_varname: "tlsOCSPCacheSize"
     validator:
       gt: 0
-  ocspValidationRefreshPeriodSecs:
+  ocspStaplingRefreshPeriodSecs:
     description: "Interval at which the OCSP response will be refreshed"
     set_at: startup
     cpp_vartype: int
+    deprecated_name: ocspValidationRefreshPeriodSecs
     default: -1
-    cpp_varname: "kOCSPValidationRefreshPeriodSecs"
+    cpp_varname: "kOCSPStaplingRefreshPeriodSecs"
     validator:
       gte: 1
   tlsOCSPVerifyTimeoutSecs:
@@ -108,6 +109,11 @@ server_parameters:
     cpp_varname: "sslGlobalParams.sslCipherConfig"
     validator:
       callback: "validateOpensslCipherConfig"
+
+  opensslCipherSuiteConfig:
+    description: "Cipher configuration string for OpenSSL based connections that use TLS 1.3 or newer ONLY"
+    set_at: startup
+    cpp_varname: "sslGlobalParams.sslCipherSuiteConfig"
 
   disableNonTLSConnectionLogging:
     deprecated_name: "disableNonSSLConnectionLogging"

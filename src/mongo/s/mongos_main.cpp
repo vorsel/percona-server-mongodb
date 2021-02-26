@@ -67,7 +67,6 @@
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/read_write_concern_defaults_cache_lookup_mongos.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/service_liaison_mongos.h"
@@ -94,6 +93,7 @@
 #include "mongo/s/mongos_topology_coordinator.h"
 #include "mongo/s/query/cluster_cursor_cleanup_job.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
+#include "mongo/s/read_write_concern_defaults_cache_lookup_mongos.h"
 #include "mongo/s/service_entry_point_mongos.h"
 #include "mongo/s/session_catalog_router.h"
 #include "mongo/s/sessions_collection_sharded.h"
@@ -293,7 +293,7 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
         //
         // TODO SERVER-49138: Remove this FCV check once we branch for 4.8.
         if (serverGlobalParams.featureCompatibility.isVersion(
-                ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46);
+                ServerGlobalParams::FeatureCompatibility::Version::kVersion451);
             auto mongosTopCoord = MongosTopologyCoordinator::get(opCtx)) {
             mongosTopCoord->enterQuiesceModeAndWait(opCtx, quiesceTime);
         }
@@ -421,10 +421,12 @@ Status initializeSharding(OperationContext* opCtx) {
     auto shardFactory =
         std::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
 
+    auto catalogCacheExecutor = CatalogCache::makeDefaultThreadPool();
     CatalogCacheLoader::set(opCtx->getServiceContext(),
-                            std::make_unique<ConfigServerCatalogCacheLoader>());
+                            std::make_unique<ConfigServerCatalogCacheLoader>(catalogCacheExecutor));
 
-    auto catalogCache = std::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx));
+    auto catalogCache =
+        std::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx), catalogCacheExecutor);
 
     // List of hooks which will be called by the ShardRegistry when it discovers a shard has been
     // removed.
@@ -916,9 +918,10 @@ MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 // featureCompatibilityVersion is lower.
 MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersionLatest,
                                      ("EndStartupOptionStorage"))
+// (Generic FCV reference): This FCV reference should exist across LTS binary versions.
 (InitializerContext* context) {
     serverGlobalParams.featureCompatibility.setVersion(
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo46);
+        ServerGlobalParams::FeatureCompatibility::kLatest);
     return Status::OK();
 }
 
