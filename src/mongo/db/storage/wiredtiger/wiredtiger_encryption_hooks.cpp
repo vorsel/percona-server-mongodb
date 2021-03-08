@@ -117,6 +117,10 @@ Status WiredTigerEncryptionHooks::endNonBlockingBackup() {
     return _encryptionKeyDB->endNonBlockingBackup();
 }
 
+StatusWith<std::vector<std::string>> WiredTigerEncryptionHooks::extendBackupCursor() {
+    return _encryptionKeyDB->extendBackupCursor();
+}
+
 const unsigned char* WiredTigerEncryptionHooks::dbKey(boost::optional<std::string> dbName,
                                                       unsigned char* buf) {
     if (!dbName) {
