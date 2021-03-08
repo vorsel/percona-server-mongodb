@@ -120,6 +120,10 @@ Status WiredTigerEncryptionHooks::endNonBlockingBackup() {
     return _encryptionKeyDB->endNonBlockingBackup();
 }
 
+StatusWith<std::vector<std::string>> WiredTigerEncryptionHooks::extendBackupCursor() {
+    return _encryptionKeyDB->extendBackupCursor();
+}
+
 
 WiredTigerEncryptionHooksCBC::WiredTigerEncryptionHooksCBC(EncryptionKeyDB* encryptionKeyDB)
     : WiredTigerEncryptionHooks(encryptionKeyDB) {
