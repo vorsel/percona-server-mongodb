@@ -435,7 +435,9 @@ mode_t getUmaskOverride() {
 }
 
 // We need to set our umask before opening any log files.
-MONGO_INITIALIZER_GENERAL(MungeUmask, ("EndStartupOptionHandling"), ("ServerLogRedirection"))
+MONGO_INITIALIZER_GENERAL(MungeUmask,
+                          ("EndStartupOptionHandling"),
+                          ("ServerLogRedirection", "AuditOptionsPath_Validate"))
 (InitializerContext*) {
     if (!honorSystemUmask) {
         // POSIX does not provide a mechanism for reading the current umask
