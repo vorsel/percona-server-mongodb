@@ -113,7 +113,7 @@ Conflicts: Percona-Server-MongoDB-tools Percona-Server-MongoDB-32-tools Percona-
 
 export CC=${CC:-gcc}
 export CXX=${CXX:-g++}
-export PSM_TARGETS="mongod mongos mongo perconadecrypt mongobridge"
+export PSM_TARGETS="install-mongod install-mongos install-mongo install-perconadecrypt install-mongobridge"
 export INSTALLDIR=$RPM_BUILD_DIR/install
 export INSTALLDIR_AWS=$RPM_BUILD_DIR/install_aws
 export AWS_LIBS="/usr/local"
@@ -206,11 +206,11 @@ install -m 644 %{SOURCE3} %{buildroot}/%{_sysconfdir}/sysconfig/mongod
 install -m 755 %{SOURCE4} %{buildroot}/%{_bindir}/
 install -m 755 %{SOURCE7} %{buildroot}/%{_bindir}/
 #
-install -m 755 mongo %{buildroot}/%{_bindir}/
-install -m 755 mongod %{buildroot}/%{_bindir}/
-install -m 755 mongos %{buildroot}/%{_bindir}/
-install -m 755 perconadecrypt %{buildroot}/%{_bindir}/
-install -m 755 mongobridge %{buildroot}/%{_bindir}/
+install -m 755 build/install/bin/mongo %{buildroot}/%{_bindir}/mongo
+install -m 755 build/install/bin/mongod %{buildroot}/%{_bindir}/mongod
+install -m 755 build/install/bin/mongos %{buildroot}/%{_bindir}/mongos
+install -m 755 build/install/bin/perconadecrypt %{buildroot}/%{_bindir}/
+install -m 755 build/install/bin/mongobridge %{buildroot}/%{_bindir}/mongobridge
 
 install -m 755 $RPM_BUILD_DIR/%{src_dir}/bin/* %{buildroot}/%{_bindir}/
 
