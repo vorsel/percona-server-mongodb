@@ -61,6 +61,13 @@ struct StorageGlobalParams;
 class StorageEngine : public percona::EngineExtension {
 public:
     /**
+     * This is the minimum valid timestamp; it can be used for reads that need to see all
+     * untimestamped data but no timestamped data. We cannot use 0 here because 0 means see all
+     * timestamped data.
+     */
+    static const uint64_t kMinimumTimestamp = 1;
+
+    /**
      * When the storage engine needs to know how much oplog to preserve for the sake of active
      * transactions, it executes a callback that returns either the oldest active transaction
      * timestamp, or boost::none if there is no active transaction, or an error if it fails.
@@ -486,6 +493,11 @@ public:
     virtual void setStableTimestamp(Timestamp stableTimestamp, bool force = false) {}
 
     /**
+     * Returns the stable timestamp.
+     */
+    virtual Timestamp getStableTimestamp() const = 0;
+
+    /**
      * Tells the storage engine the timestamp of the data at startup. This is necessary because
      * timestamps are not persisted in the storage layer.
      */
@@ -513,6 +525,12 @@ public:
      * through. Additionally, all future writes must be newer or equal to this value.
      */
     virtual void setOldestTimestamp(Timestamp timestamp) {}
+
+    /**
+     * Gets the oldest timestamp for which the storage engine must maintain snapshot history
+     * through.
+     */
+    virtual Timestamp getOldestTimestamp() const = 0;
 
     /**
      * Sets a callback which returns the timestamp of the oldest oplog entry involved in an
