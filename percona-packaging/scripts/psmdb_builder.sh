@@ -332,7 +332,7 @@ install_deps() {
         yum -y install percona-devtoolset-gcc-c++ percona-devtoolset-libstdc++-devel percona-devtoolset-valgrind-devel
         yum -y install python27 python27-devel rpmlint libcurl-devel e2fsprogs-devel expat-devel lz4-devel git cmake3
         yum -y install openldap-devel krb5-devel
-        wget https://bootstrap.pypa.io/2.7/get-pip.py
+        wget https://bootstrap.pypa.io/pip/2.7/get-pip.py
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
         ln -s /usr/bin/python2.7 /usr/bin/python2
@@ -343,7 +343,7 @@ install_deps() {
         #yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel
         yum -y install rpm-build git python python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel which
         yum -y install openldap-devel krb5-devel
-        wget https://bootstrap.pypa.io/2.7/get-pip.py
+        wget https://bootstrap.pypa.io/pip/2.7/get-pip.py
         python get-pip.py
       else
         yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
@@ -408,7 +408,7 @@ EOL
       apt-get -y install libext2fs-dev || apt-get -y install e2fslibs-dev
       install_golang
       install_gcc_54_deb
-      wget https://bootstrap.pypa.io/2.7/get-pip.py
+      wget https://bootstrap.pypa.io/pip/2.7/get-pip.py
       if [ x"${DEBIAN}" = "xfocal" ]; then
           ln -s /usr/bin/python2 /usr/bin/python
       fi
