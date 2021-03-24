@@ -333,7 +333,7 @@ install_deps() {
       if [ x"$RHEL" = x6 ]; then
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel libpcap-devel scons make rpm-build rpmbuild percona-devtoolset-gcc percona-devtoolset-binutils percona-devtoolset-gcc-c++ percona-devtoolset-libstdc++-devel percona-devtoolset-valgrind-devel python27 python27-devel libcurl-devel e2fsprogs-devel expat-devel lz4-devel git cmake3
         yum -y install openldap-devel krb5-devel
-        wget https://bootstrap.pypa.io/2.7/get-pip.py
+        wget https://bootstrap.pypa.io/pip/2.7/get-pip.py
         python2.7 get-pip.py
         rm -rf /usr/bin/python2
         ln -s /usr/bin/python2.7 /usr/bin/python2
@@ -398,7 +398,7 @@ EOL
       apt-get -y install libext2fs-dev || apt-get -y install e2fslibs-dev
       install_golang
       install_gcc_54_deb
-      wget https://bootstrap.pypa.io/2.7/get-pip.py
+      wget https://bootstrap.pypa.io/pip/2.7/get-pip.py
       if [ x"${DEBIAN}" = "xfocal" ]; then
         ln -s /usr/bin/python2 /usr/bin/python
       fi
