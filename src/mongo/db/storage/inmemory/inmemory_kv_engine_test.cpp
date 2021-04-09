@@ -48,26 +48,16 @@ namespace {
 
 class InMemoryKVHarnessHelper : public KVHarnessHelper {
 public:
-    InMemoryKVHarnessHelper() : _dbpath("inmem-kv-harness") {
-        const bool readOnly = false;
-        if (!hasGlobalServiceContext())
-            setGlobalServiceContext(ServiceContext::make());
-        _engine.reset(new WiredTigerKVEngine(
-            kInMemoryEngineName, _dbpath.path(), _cs.get(),
-            "in_memory=true,"
-            "log=(enabled=false),"
-            "file_manager=(close_idle_time=0),"
-            "checkpoint=(wait=0,log_size=0)",
-            100, 0, false, true, false, readOnly));
+    InMemoryKVHarnessHelper(ServiceContext* svcCtx)
+        : _dbpath("inmem-kv-harness"), _engine(makeEngine()) {
         repl::ReplicationCoordinator::set(
-            getGlobalServiceContext(),
-            std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
-                getGlobalServiceContext(), repl::ReplSettings())));
+            svcCtx,
+            std::make_unique<repl::ReplicationCoordinatorMock>(svcCtx, repl::ReplSettings()));
         _engine->notifyStartupComplete();
     }
 
     virtual ~InMemoryKVHarnessHelper() {
-        _engine.reset(NULL);
+        _engine.reset(nullptr);
     }
 
     virtual KVEngine* restartEngine() {
@@ -81,13 +71,31 @@ public:
     }
 
 private:
+    WiredTigerKVEngine* makeEngine() {
+        const bool readOnly = false;
+        auto engine = new WiredTigerKVEngine(kInMemoryEngineName,
+                                             _dbpath.path(),
+                                             _cs.get(),
+                                             "in_memory=true,"
+                                             "log=(enabled=false),"
+                                             "file_manager=(close_idle_time=0),"
+                                             "checkpoint=(wait=0,log_size=0)",
+                                             100,
+                                             0,
+                                             false,
+                                             true,
+                                             false,
+                                             readOnly);
+        return engine;
+    }
+
     const std::unique_ptr<ClockSource> _cs = std::make_unique<ClockSourceMock>();
     unittest::TempDir _dbpath;
     std::unique_ptr<WiredTigerKVEngine> _engine;
 };
 
-std::unique_ptr<KVHarnessHelper> makeHelper() {
-    return std::make_unique<InMemoryKVHarnessHelper>();
+std::unique_ptr<KVHarnessHelper> makeHelper(ServiceContext* svcCtx) {
+    return std::make_unique<InMemoryKVHarnessHelper>(svcCtx);
 }
 
 MONGO_INITIALIZER(RegisterKVHarnessFactory)(InitializerContext*) {
