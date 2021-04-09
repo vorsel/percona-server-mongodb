@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2020 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -118,8 +118,8 @@ class test_hs09(wttest.WiredTigerTestCase):
         self.check_ckpt_hs(value2, value1, 2, 3)
 
     def test_prepared_updates_not_written_to_hs(self):
-        # Prepare reads currently not supported with columnar store.
-        # Remove this once prepare reads is supported in WT-6061.
+        # FIXME-WT-6061: Prepare reads currently not supported with columnar store.
+        # Remove this once prepare reads is supported.
         if self.key_format == 'r':
             return
 

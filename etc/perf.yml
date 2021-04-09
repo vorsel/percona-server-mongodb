@@ -23,7 +23,7 @@ variables:
   # _skip_compile: &_compile
   #     []
   # _skip_expansions: &_expansion_updates
-  #   - key: mongodb_binary_archive
+  #   - key: mdb_binary_for_server
   #     value: https://mciuploads.s3.amazonaws.com/perf/5f6ca2392fbabe40badf39c4/c39af144b2370be0537410d9bc79be66a1a5f3c7/linux/mongodb-5f6ca2392fbabe40badf39c4.tar.gz
   ###
 
@@ -84,7 +84,6 @@ modules:
   repo: git@github.com:10gen/linkbench2.git
   prefix: ../../src
   branch: master
-  ref: 63207190657737b32eb0e81c5b81ad1b8bad0e5a
 - name: mongo-perf
   repo: git@github.com:mongodb/mongo-perf.git
   prefix: ../../src
@@ -165,10 +164,6 @@ functions:
       type: test
       params:
         script: ./src/dsi/run-dsi determine_failure -m TEST
-    - command: json.send
-      params:
-        name: "perf"
-        file: "./build/LegacyPerfJson/perf.json"
     - command: shell.exec
       type: test
       params:
@@ -176,6 +171,10 @@ functions:
           ./src/dsi/run-dsi analysis
           # detect outliers needs to run, so defer the post_run_check exit status to later
           echo $? > post_run_check.status
+    - command: json.send
+      params:
+        name: "perf"
+        file: "./build/LegacyPerfJson/perf.json"
     - command: shell.exec
       params:
         script: |
@@ -195,23 +194,6 @@ functions:
           set -o verbose
           source ./signal_processing_venv/bin/activate
           detect-changes --config .signal-processing.yml --mongo-repo=./src/mongo
-    - command: shell.exec
-      params:
-        script: |
-          set -o verbose
-          source ./signal_processing_venv/bin/activate
-          detect-outliers --config .signal-processing.yml
-    - command: shell.exec
-      type: setup
-      params:
-        script: |
-          set -o verbose
-          filename=rejects.json
-          if [ -s "$filename" ]; then
-            echo "Rejecting task due to the following outliers:"
-            cat "$filename"
-            exit ${detected_outlier_exit_code|0}
-          fi
     - command: shell.exec
       type: test
       params:

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2020 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -352,7 +352,6 @@ class WiredTigerTestCase(unittest.TestCase):
             print("Failed wiredtiger_open: dir '%s', config '%s'" % \
                 (home, conn_param))
             raise e
-        self.pr(repr(conn))
         return conn
 
     # Replacement for wiredtiger.wiredtiger_open that returns

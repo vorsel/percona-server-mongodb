@@ -3,6 +3,7 @@ ACM
 APIs
 ActiveState
 Adler's
+ASAN
 Atomicity
 BLOBs
 BLRrVv
@@ -18,7 +19,10 @@ Christoph
 Collet's
 Coverity
 Coverity's
+CPPSuite
+CSuite
 CURSTD
+Cyclomatic
 DB's
 DBTs
 DHANDLE
@@ -72,6 +76,7 @@ LRU
 LRrVv
 LSB
 LSM
+LSNs
 LZ
 Lameter
 LevelDB
@@ -83,6 +88,7 @@ Mewhort
 MongoDB
 MongoDB's
 Multithreaded
+MSAN
 NOTFOUND
 NSEC
 NUMA
@@ -106,8 +112,10 @@ Seward's
 SiH
 TSC
 TXT
+UBSAN
 UNC
 URIs
+Valgrind
 WILLNEED
 WiredTiger
 WiredTiger's
@@ -115,9 +123,11 @@ WiredTigerCheckpoint
 WiredTigerException
 WiredTigerLog
 WiredTigerPanicException
+WiredTigerPreplog
 WiredTigerRollbackException
 WiredTigerStat
 WiredTigerTestCase
+WiredTigerTmplog
 XRay
 Yann
 Za
@@ -172,6 +182,7 @@ checkpointed
 checksum
 checksums
 ckp
+ckpt
 clickable
 colgroup
 colgroups
@@ -189,14 +200,17 @@ copydoc
 cov
 cp
 cpp
+cppsuite
 cpu
 crashless
 crc
+csuite
 curfile
 cursortype
 curtable
 customerABC
 cv
+cyclomatic
 dN
 dNLen
 dNOff
@@ -294,6 +308,7 @@ fuzzutil
 fvisibility
 fxray
 gcc
+gcov
 gdbm
 ge
 getKey
@@ -405,8 +420,8 @@ multiversion
 mutex
 mutexes
 mutexing
+mux
 mvcc
-mx
 mygcc
 mytable
 namespace
@@ -455,6 +470,8 @@ plantuml
 png
 posix
 pre
+prealloc
+prepended
 prepends
 prev
 primary's
@@ -621,3 +638,4 @@ yieldcpu
 zlib
 zseries
 zstd
+loc

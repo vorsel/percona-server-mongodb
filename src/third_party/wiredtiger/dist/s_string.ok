@@ -15,6 +15,7 @@ ARG
 ARGS
 ASAN
 ASM
+AUS
 Addr
 Ailamaki
 Alakuijala
@@ -107,6 +108,7 @@ DeadStores
 Decrement
 Decrypt
 DeleteFileW
+Destructor
 Dh
 EACCES
 EAGAIN
@@ -157,6 +159,7 @@ FreeBSD's
 FreeLibrary
 Fsync
 Fuerst
+GBR
 GCC
 GIDs
 GLIBC
@@ -169,6 +172,7 @@ GetFileSizeEx
 GetLastError
 GetModuleHandleExW
 GetProcAddress
+Getters
 Google
 HFS
 HHHH
@@ -286,6 +290,7 @@ NOVALUE
 NOWAIT
 NUL
 NUM
+NZD
 NetBSD
 NoAddr
 Noll
@@ -339,6 +344,7 @@ RNG
 RPC
 RTS
 RUNDIR
+RUS
 RWLOCK
 RXB
 Radu
@@ -503,6 +509,7 @@ aspell
 assertfmt
 async
 atomicity
+auth
 autocommit
 autoconf
 automake
@@ -563,11 +570,13 @@ calloc
 cas
 catfmt
 cb
+cbt
 ccc
 ccr
 cd
 ce
 ceh
+celsius
 centric
 cfg
 cfko
@@ -692,6 +701,7 @@ desc
 designator
 dest
 destSize
+destructor
 dev
 dh
 dhandle
@@ -758,6 +768,7 @@ existp
 extern
 extlist
 fadvise
+fahrenheit
 fallocate
 fallthrough
 fblocks
@@ -844,6 +855,7 @@ goutf
 gt
 handleops
 handlep
+hardcoded
 hashval
 havesize
 hdr
@@ -882,6 +894,7 @@ indx
 infeasible
 inflateInit
 infmt
+informations
 init
 initCStream
 initializers
@@ -938,6 +951,7 @@ keycmp
 keyid
 keylen
 keyv
+kmsid
 kv
 kvraw
 kvs
@@ -967,6 +981,7 @@ llll
 llu
 llvm
 loadtext
+loc
 localTime
 localkey
 localtime
@@ -1011,6 +1026,7 @@ maxCLevel
 maxcpu
 maxdbs
 maxdiff
+mb
 mbll
 mbss
 mem
@@ -1049,6 +1065,7 @@ mutexes
 mux
 mytable
 mytxn
+nTemp
 namespace
 namespaces
 nbits
@@ -1267,6 +1284,7 @@ spinlocks
 sprintf
 src
 srch
+ss
 ssize
 startup
 statlog
@@ -1311,6 +1329,7 @@ sx
 sy
 sys
 syscall
+syscrypto
 sysinfo
 sz
 t's
@@ -1411,6 +1430,7 @@ usercfg
 usr
 utf
 util
+utils
 uu
 vN
 vW

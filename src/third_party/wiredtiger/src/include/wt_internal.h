@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2020 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -89,6 +89,8 @@ struct __wt_bm;
 typedef struct __wt_bm WT_BM;
 struct __wt_btree;
 typedef struct __wt_btree WT_BTREE;
+struct __wt_bucket_storage;
+typedef struct __wt_bucket_storage WT_BUCKET_STORAGE;
 struct __wt_cache;
 typedef struct __wt_cache WT_CACHE;
 struct __wt_cache_pool;
@@ -255,6 +257,8 @@ struct __wt_named_encryptor;
 typedef struct __wt_named_encryptor WT_NAMED_ENCRYPTOR;
 struct __wt_named_extractor;
 typedef struct __wt_named_extractor WT_NAMED_EXTRACTOR;
+struct __wt_named_storage_source;
+typedef struct __wt_named_storage_source WT_NAMED_STORAGE_SOURCE;
 struct __wt_optrack_header;
 typedef struct __wt_optrack_header WT_OPTRACK_HEADER;
 struct __wt_optrack_record;
@@ -317,6 +321,8 @@ struct __wt_thread_group;
 typedef struct __wt_thread_group WT_THREAD_GROUP;
 struct __wt_tiered;
 typedef struct __wt_tiered WT_TIERED;
+struct __wt_tiered_manager;
+typedef struct __wt_tiered_manager WT_TIERED_MANAGER;
 struct __wt_time_aggregate;
 typedef struct __wt_time_aggregate WT_TIME_AGGREGATE;
 struct __wt_time_window;

@@ -136,6 +136,9 @@ public:
         MONGO_UNREACHABLE;
     }
     void setStableTimestamp(Timestamp stableTimestamp, bool force = false) final {}
+    Timestamp getStableTimestamp() const final {
+        return Timestamp();
+    }
     void setInitialDataTimestamp(Timestamp timestamp) final {}
     Timestamp getInitialDataTimestamp() {
         return Timestamp();
@@ -151,9 +154,6 @@ public:
         return false;
     }
     void setCachePressureForTest(int pressure) final {}
-    void triggerJournalFlush() const final {}
-    void waitForJournalFlush(OperationContext* opCtx) const final {}
-    void interruptJournalFlusherForReplStateChange() const final {}
     StatusWith<StorageEngine::ReconcileResult> reconcileCatalogAndIdents(
         OperationContext* opCtx) final {
         return ReconcileResult{};

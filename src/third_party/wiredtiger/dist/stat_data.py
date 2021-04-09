@@ -104,6 +104,10 @@ class SessionOpStat(Stat):
     prefix = 'session'
     def __init__(self, name, desc, flags=''):
         Stat.__init__(self, name, SessionOpStat.prefix, desc, flags)
+class StorageStat(Stat):
+    prefix = 'session'
+    def __init__(self, name, desc, flags=''):
+        Stat.__init__(self, name, SessionOpStat.prefix, desc, flags)
 class ThreadStat(Stat):
     prefix = 'thread-state'
     def __init__(self, name, desc, flags=''):
@@ -299,9 +303,7 @@ connection_stats = [
     CursorStat('cursor_modify_bytes', 'cursor modify key and value bytes affected', 'size'),
     CursorStat('cursor_modify_bytes_touch', 'cursor modify value bytes modified', 'size'),
     CursorStat('cursor_next', 'cursor next calls'),
-    CursorStat('cursor_next_hs_tombstone_rts', 'cursor next calls that skip due to a globally visible history store tombstone in rollback to stable'),
     CursorStat('cursor_prev', 'cursor prev calls'),
-    CursorStat('cursor_prev_hs_tombstone_rts', 'cursor prev calls that skip due to a globally visible history store tombstone in rollback to stable'),
     CursorStat('cursor_remove', 'cursor remove calls'),
     CursorStat('cursor_remove_bytes', 'cursor remove key bytes removed', 'size'),
     CursorStat('cursor_reopen', 'cursors reused from cache'),
@@ -334,6 +336,7 @@ connection_stats = [
     DhandleStat('dh_sweep_close', 'connection sweep dhandles closed'),
     DhandleStat('dh_sweep_ref', 'connection sweep candidate became referenced'),
     DhandleStat('dh_sweep_remove', 'connection sweep dhandles removed from hash list'),
+    DhandleStat('dh_sweep_skip_ckpt', 'connection sweeps skipped due to checkpoint gathering handles'),
     DhandleStat('dh_sweep_tod', 'connection sweep time-of-death sets'),
     DhandleStat('dh_sweeps', 'connection sweeps'),
 
@@ -462,6 +465,8 @@ connection_stats = [
     # Reconciliation statistics
     ##########################################
     RecStat('rec_maximum_seconds', 'maximum seconds spent in a reconciliation call', 'no_clear,no_scale,size'),
+    RecStat('rec_overflow_key_internal', 'internal-page overflow keys'),
+    RecStat('rec_overflow_key_leaf', 'leaf-page overflow keys'),
     RecStat('rec_pages_with_prepare', 'page reconciliation calls that resulted in values with prepared transaction metadata'),
     RecStat('rec_pages_with_ts', 'page reconciliation calls that resulted in values with timestamps'),
     RecStat('rec_pages_with_txn', 'page reconciliation calls that resulted in values with transaction ids'),
@@ -493,6 +498,11 @@ connection_stats = [
     SessionOpStat('session_table_truncate_success', 'table truncate successful calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_verify_fail', 'table verify failed calls', 'no_clear,no_scale'),
     SessionOpStat('session_table_verify_success', 'table verify successful calls', 'no_clear,no_scale'),
+
+    ##########################################
+    # Tiered storage statistics
+    ##########################################
+    StorageStat('flush_tier', 'flush_tier operation calls'),
 
     ##########################################
     # Thread Count statistics
@@ -530,11 +540,6 @@ connection_stats = [
     TxnStat('txn_checkpoint_time_recent', 'transaction checkpoint most recent time (msecs)', 'no_clear,no_scale'),
     TxnStat('txn_checkpoint_time_total', 'transaction checkpoint total time (msecs)', 'no_clear,no_scale'),
     TxnStat('txn_commit', 'transactions committed'),
-    TxnStat('txn_durable_queue_empty', 'durable timestamp queue insert to empty'),
-    TxnStat('txn_durable_queue_head', 'durable timestamp queue inserts to head'),
-    TxnStat('txn_durable_queue_inserts', 'durable timestamp queue inserts total'),
-    TxnStat('txn_durable_queue_len', 'durable timestamp queue length'),
-    TxnStat('txn_durable_queue_walked', 'durable timestamp queue entries walked'),
     TxnStat('txn_fail_cache', 'transaction failures due to history store'),
     TxnStat('txn_pinned_checkpoint_range', 'transaction range of IDs currently pinned by a checkpoint', 'no_clear,no_scale'),
     TxnStat('txn_pinned_range', 'transaction range of IDs currently pinned', 'no_clear,no_scale'),
@@ -548,11 +553,6 @@ connection_stats = [
     TxnStat('txn_prepare_rollback', 'prepared transactions rolled back'),
     TxnStat('txn_prepared_updates_count', 'Number of prepared updates'),
     TxnStat('txn_query_ts', 'query timestamp calls'),
-    TxnStat('txn_read_queue_empty', 'read timestamp queue insert to empty'),
-    TxnStat('txn_read_queue_head', 'read timestamp queue inserts to head'),
-    TxnStat('txn_read_queue_inserts', 'read timestamp queue inserts total'),
-    TxnStat('txn_read_queue_len', 'read timestamp queue length'),
-    TxnStat('txn_read_queue_walked', 'read timestamp queue entries walked'),
     TxnStat('txn_rollback', 'transactions rolled back'),
     TxnStat('txn_rts', 'rollback to stable calls'),
     TxnStat('txn_rts_pages_visited', 'rollback to stable pages visited'),
@@ -567,6 +567,7 @@ connection_stats = [
     TxnStat('txn_set_ts_stable_upd', 'set timestamp stable updates'),
     TxnStat('txn_sync', 'transaction sync calls'),
     TxnStat('txn_timestamp_oldest_active_read', 'transaction read timestamp of the oldest active reader', 'no_clear,no_scale'),
+    TxnStat('txn_walk_sessions', 'transaction walk of concurrent sessions'),
 
     ##########################################
     # Yield statistics
@@ -854,6 +855,12 @@ conn_dsrc_stats = [
     RecStat('rec_time_window_stop_txn', 'records written including a stop transaction ID'),
 
     ##########################################
+    # Tiered storage statistics
+    ##########################################
+    StorageStat('tiered_object_size', 'tiered storage object size', 'no_clear,no_scale,size'),
+    StorageStat('tiered_retention', 'tiered storage local retention time (secs)', 'no_clear,no_scale,size'),
+
+    ##########################################
     # Transaction statistics
     ##########################################
     TxnStat('txn_checkpoint_obsolete_applied', 'transaction checkpoints due to obsolete pages'),
@@ -861,7 +868,8 @@ conn_dsrc_stats = [
     TxnStat('txn_rts_hs_removed', 'rollback to stable updates removed from history store'),
     TxnStat('txn_rts_hs_restore_updates', 'rollback to stable restored updates from history store'),
     TxnStat('txn_rts_hs_restore_tombstones', 'rollback to stable restored tombstones from history store'),
-    TxnStat('txn_rts_hs_stop_older_than_newer_start', 'rollback to stable hs records with stop timestamps older than newer records'),
+    TxnStat('txn_rts_hs_stop_older_than_newer_start', 'rollback to stable history store records with stop timestamps older than newer records'),
+    TxnStat('txn_rts_inconsistent_ckpt', 'rollback to stable inconsistent checkpoint'),
     TxnStat('txn_rts_keys_removed', 'rollback to stable keys removed'),
     TxnStat('txn_rts_keys_restored', 'rollback to stable keys restored'),
     TxnStat('txn_rts_sweep_hs_keys', 'rollback to stable sweeping history store keys'),

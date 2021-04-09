@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Public Domain 2014-2020 MongoDB, Inc.
+# Public Domain 2014-present MongoDB, Inc.
 # Public Domain 2008-2014 WiredTiger, Inc.
 #
 # This is free and unencumbered software released into the public domain.
@@ -649,7 +649,7 @@ for arg in sys.argv[1:]:
             print(pysrc)
         else:
             (outfd, tmpfile) = tempfile.mkstemp(suffix='.py')
-            os.write(outfd, pysrc)
+            os.write(outfd, pysrc.encode())
             os.close(outfd)
             # We make a copy of the configuration file in the home
             # directory after the run, because the wiredtiger_open

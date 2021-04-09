@@ -56,6 +56,7 @@
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -277,14 +278,17 @@ void ReplicationCoordinatorImpl::_handleHeartbeatResponse(
 
     if (action.getAction() == HeartbeatResponseAction::NoAction && hbStatusResponse.isOK() &&
         hbStatusResponse.getValue().hasState() &&
-        hbStatusResponse.getValue().getState() != MemberState::RS_PRIMARY &&
-        action.getAdvancedOpTimeOrUpdatedConfig()) {
-        // If a member's opTime has moved forward or config is newer, try to update the
-        // lastCommitted. Even if we've only updated the config, this is still safe.
-        _updateLastCommittedOpTimeAndWallTime(lk);
-
-        // Wake up replication waiters on optime changes or updated configs.
-        _wakeReadyWaiters(lk);
+        hbStatusResponse.getValue().getState() != MemberState::RS_PRIMARY) {
+        if (action.getAdvancedOpTimeOrUpdatedConfig()) {
+            // If a member's opTime has moved forward or config is newer, try to update the
+            // lastCommitted. Even if we've only updated the config, this is still safe.
+            _updateLastCommittedOpTimeAndWallTime(lk);
+            // Wake up replication waiters on optime changes or updated configs.
+            _wakeReadyWaiters(lk);
+        } else if (action.getBecameElectable() && _topCoord->isSteppingDown()) {
+            // Try to wake up the stepDown waiter when a new node becomes electable.
+            _wakeReadyWaiters(lk);
+        }
     }
 
     // Abort catchup if we have caught up to the latest known optime after heartbeat refreshing.
@@ -623,7 +627,7 @@ void ReplicationCoordinatorImpl::_heartbeatReconfigStore(
         auto status = _externalState->storeLocalConfigDocument(
             opCtx.get(), newConfig.toBSON(), false /* writeOplog */);
         // Wait for durability of the new config document.
-        opCtx->recoveryUnit()->waitUntilDurable(opCtx.get());
+        JournalFlusher::get(opCtx.get())->waitForJournalFlush();
 
         bool isFirstConfig;
         {

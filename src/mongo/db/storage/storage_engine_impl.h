@@ -132,6 +132,8 @@ public:
 
     virtual void setStableTimestamp(Timestamp stableTimestamp, bool force = false) override;
 
+    virtual Timestamp getStableTimestamp() const override;
+
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
     virtual Timestamp getInitialDataTimestamp() override;
@@ -176,12 +178,6 @@ public:
     void clearDropPendingState() final;
 
     bool supportsTwoPhaseIndexBuild() const final;
-
-    void triggerJournalFlush() const final;
-
-    void waitForJournalFlush(OperationContext* opCtx) const final;
-
-    void interruptJournalFlusherForReplStateChange() const final;
 
     SnapshotManager* getSnapshotManager() const final;
 

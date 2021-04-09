@@ -489,6 +489,11 @@ public:
     virtual void setStableTimestamp(Timestamp stableTimestamp, bool force = false) = 0;
 
     /**
+     * Returns the stable timestamp.
+     */
+    virtual Timestamp getStableTimestamp() const = 0;
+
+    /**
      * Tells the storage engine the timestamp of the data at startup. This is necessary because
      * timestamps are not persisted in the storage layer.
      */
@@ -545,26 +550,6 @@ public:
      * evalutates to 'pressure'.
      */
     virtual void setCachePressureForTest(int pressure) = 0;
-
-    /**
-     * Prompts an immediate journal flush.
-     */
-    virtual void triggerJournalFlush() const = 0;
-
-    /**
-     * Initiates if needed and waits for a complete round of journal flushing to execute.
-     *
-     * Can throw ShutdownInProgress if the storage engine is being closed.
-     */
-    virtual void waitForJournalFlush(OperationContext* opCtx) const = 0;
-
-    /**
-     * Ensures interruption of the JournalFlusher if it is or will be acquiring a lock.
-     *
-     * TODO: this function will be moved above the Storage Engine layer along with the
-     * JournalFlusher in SERVER-45847.
-     */
-    virtual void interruptJournalFlusherForReplStateChange() const = 0;
 
     struct IndexIdentifier {
         const RecordId catalogId;

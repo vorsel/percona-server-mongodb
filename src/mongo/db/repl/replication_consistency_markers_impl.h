@@ -120,12 +120,17 @@ private:
         OperationContext* opCtx) const;
 
     /**
+     * Updates the oplogTruncateAfterPoint with 'timestamp'. Callers should use this codepath when
+     * expecting write interruption errors.
+     */
+    Status _setOplogTruncateAfterPoint(OperationContext* opCtx, const Timestamp& timestamp);
+
+    /**
      * Upserts the OplogTruncateAfterPoint document according to the provided update spec. The
      * collection must already exist. See `createInternalCollections`.
-     *
-     * This fasserts on failure.
      */
-    void _upsertOplogTruncateAfterPointDocument(OperationContext* opCtx, const BSONObj& updateSpec);
+    Status _upsertOplogTruncateAfterPointDocument(OperationContext* opCtx,
+                                                  const BSONObj& updateSpec);
 
     StorageInterface* _storageInterface;
     const NamespaceString _minValidNss;
@@ -146,6 +151,20 @@ private:
     // time in case of multiple callers to refreshOplogTruncateAfterPointIfPrimary.
     mutable Mutex _refreshOplogTruncateAfterPointMutex =
         MONGO_MAKE_LATCH("ReplicationConsistencyMarkers::_refreshOplogTruncateAfterPointMutex");
+
+    // In-memory cache of the of the oplog entry LTE to the oplogTruncateAfterPoint timestamp.
+    // Eventually matches the oplogTruncateAfterPoint timestamp when parallel writes finish. Avoids
+    // repeatedly writing the same oplogTruncateAfterPoint timestamp to disk, which creates noise in
+    // a silent system. Only set in state PRIMARY.
+    //
+    // Reset whenever setOplogTruncateAfterPoint() manually resets the truncate point: this could
+    // push the durable truncate point forwards or backwards in time, reflecting changes in the
+    // oplog. The truncate point is manually set in non-PRIMARY states.
+    //
+    // Note: these values lack their own specific concurrency control, instead depending on the
+    // serialization that exists in setting the oplog truncate after point.
+    boost::optional<Timestamp> _lastNoHolesOplogTimestamp;
+    boost::optional<OpTimeAndWallTime> _lastNoHolesOplogOpTimeAndWallTime;
 };
 
 }  // namespace repl

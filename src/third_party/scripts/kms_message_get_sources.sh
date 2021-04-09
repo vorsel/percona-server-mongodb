@@ -17,8 +17,7 @@ if grep -q Microsoft /proc/version; then
     GIT_EXE=git.exe
 fi
 
-NAME=libmongocrypt
-REVISION=59c8c17bbdfa1cf0fdec60cfdde73a437a868221
+REVISION=1.2.0
 
 if grep -q Microsoft /proc/version; then
     SRC_ROOT=$(wslpath -u $(powershell.exe -Command "Get-ChildItem Env:TEMP | Get-Content | Write-Host"))

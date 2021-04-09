@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2020 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -77,10 +77,8 @@ __sweep_expire_one(WT_SESSION_IMPL *session)
      */
     WT_RET(__wt_try_writelock(session, &dhandle->rwlock));
 
-    /* Only sweep clean trees where all updates are visible. */
-    if (btree != NULL &&
-      (btree->modified ||
-        !__wt_txn_visible_all(session, btree->rec_max_txn, btree->rec_max_timestamp)))
+    /* Only sweep clean trees. */
+    if (btree != NULL && btree->modified)
         goto err;
 
     /*
@@ -295,10 +293,18 @@ __sweep_server(void *arg)
 
         /*
          * See if it is time to sweep the data handles. Those are swept less frequently than the
-         * history store table by default and the frequency is controlled by a user setting.
+         * history store table by default and the frequency is controlled by a user setting. We want
+         * to avoid sweeping while checkpoint is gathering handles. Both need to lock the dhandle
+         * list and sweep acquiring that lock can interfere with checkpoint and cause it to take
+         * longer. Sweep is an operation that typically has long intervals so skipping some for
+         * checkpoint should have little impact.
          */
         if (!cv_signalled && (now - last < sweep_interval))
             continue;
+        if (F_ISSET(conn, WT_CONN_CKPT_GATHER)) {
+            WT_STAT_CONN_INCR(session, dh_sweep_skip_ckpt);
+            continue;
+        }
         WT_STAT_CONN_INCR(session, dh_sweeps);
         /*
          * Mark handles with a time of death, and report whether any handles are marked dead. If

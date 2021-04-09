@@ -45,6 +45,7 @@
 #include "mongo/db/repl/insert_group.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/stats/timer_stats.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/basic.h"
 #include "mongo/util/fail_point.h"
@@ -393,7 +394,7 @@ void ApplyBatchFinalizerForJournal::_run() {
         }
 
         auto opCtx = cc().makeOperationContext();
-        opCtx->recoveryUnit()->waitUntilDurable(opCtx.get());
+        JournalFlusher::get(opCtx.get())->waitForJournalFlush();
         _recordDurable(latestOpTimeAndWallTime);
     }
 }
@@ -733,14 +734,6 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
             }
         }
     }
-
-    // Tell the storage engine to flush the journal now that a replication batch has completed. This
-    // means that all the writes associated with the oplog entries in the batch are finished and no
-    // new writes with timestamps associated with those oplog entries will show up in the future. We
-    // want to flush the journal as soon as possible in order to free ops waiting with 'j' write
-    // concern.
-    const auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    storageEngine->triggerJournalFlush();
 
     // Use this fail point to hold the PBWM lock and prevent the batch from completing.
     if (MONGO_unlikely(pauseBatchApplicationBeforeCompletion.shouldFail())) {

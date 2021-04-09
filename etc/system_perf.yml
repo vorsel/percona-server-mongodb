@@ -90,7 +90,6 @@ modules:
   repo: git@github.com:10gen/linkbench2.git
   prefix: ../../src
   branch: master
-  ref: 63207190657737b32eb0e81c5b81ad1b8bad0e5a
 - name: mongo-perf
   repo: git@github.com:mongodb/mongo-perf.git
   prefix: ../../src
@@ -179,10 +178,6 @@ functions:
       type: test
       params:
         script: ./src/dsi/run-dsi determine_failure -m TEST
-    - command: json.send
-      params:
-        name: "perf"
-        file: "./build/LegacyPerfJson/perf.json"
     - command: shell.exec
       type: test
       params:
@@ -190,6 +185,10 @@ functions:
           ./src/dsi/run-dsi analysis
           # detect outliers needs to run, so defer the post_run_check exit status to later
           echo $? > post_run_check.status
+    - command: json.send
+      params:
+        name: "perf"
+        file: "./build/LegacyPerfJson/perf.json"
     - command: shell.exec
       params:
         script: |
@@ -209,23 +208,6 @@ functions:
           set -o verbose
           source ./signal_processing_venv/bin/activate
           detect-changes --config .signal-processing.yml --mongo-repo=./src/mongo
-    - command: shell.exec
-      params:
-        script: |
-          set -o verbose
-          source ./signal_processing_venv/bin/activate
-          detect-outliers --config .signal-processing.yml
-    - command: shell.exec
-      type: setup
-      params:
-        script: |
-          set -o verbose
-          filename=rejects.json
-          if [ -s "$filename" ]; then
-            echo "Rejecting task due to the following outliers:"
-            cat "$filename"
-            exit ${detected_outlier_exit_code|0}
-          fi
     - command: shell.exec
       type: test
       params:
@@ -418,7 +400,7 @@ tasks:
         file: ./expansions.yml
     - command: shell.exec
       params:
-        script: ./src/genny/scripts/genny_auto_tasks.sh all_tasks
+        script: ./src/dsi/run-dsi schedule_tasks --tasks all_tasks
     - command: generate.tasks
       params:
         files:
@@ -434,7 +416,7 @@ tasks:
         file: ./expansions.yml
     - command: shell.exec
       params:
-        script: ./src/genny/scripts/genny_auto_tasks.sh variant_tasks
+        script: ./src/dsi/run-dsi schedule_tasks --tasks variant_tasks
     - command: generate.tasks
       params:
         files:
@@ -450,7 +432,7 @@ tasks:
         file: ./expansions.yml
     - command: shell.exec
       params:
-        script: ./src/genny/scripts/genny_auto_tasks.sh patch_tasks
+        script: ./src/dsi/run-dsi schedule_tasks --tasks patch_tasks
     - command: generate.tasks
       params:
         files:
@@ -1233,6 +1215,23 @@ buildvariants:
     - name: genny_patch_tasks
     - name: genny_auto_tasks
 
+- name: linux-shard-single
+  display_name: Linux Shard Single
+  batchtime: 5760  # 4 days
+  modules: *modules
+  expansions:
+    mongodb_setup: shard-single
+    infrastructure_provisioning: shard-single
+    platform: linux
+    project_dir: *project_dir
+    authentication: enabled
+    storageEngine: wiredTiger
+  run_on:
+      - "rhel70-perf-shard-lite"
+  depends_on: *_compile_amazon2
+  tasks:
+    - name: genny_patch_tasks
+    - name: genny_auto_tasks
 
 - name: linux-3-node-replSet
   display_name: Linux 3-Node ReplSet
@@ -1424,7 +1423,7 @@ buildvariants:
     mongodb_setup: initialsync-logkeeper
     infrastructure_provisioning: initialsync-logkeeper
     # EBS logkeeper snapshot with FCV set to 4.4
-    snapshotId: snap-0b0b8b2ad16e8f14e
+    snapshotId: snap-0390038d5022d13fd
     platform: linux
     authentication: disabled
     storageEngine: wiredTiger

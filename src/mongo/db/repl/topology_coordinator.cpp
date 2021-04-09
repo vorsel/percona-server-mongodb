@@ -903,8 +903,11 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
             nextAction = HeartbeatResponseAction::makeReconfigAction();
             nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
 
-            // TODO(SERVER-48178) Only continue processing heartbeat in primary state to avoid
-            // concurrent reconfig and rollback.
+            // Only continue processing heartbeat in primary state. In other states it is not
+            // safe to continue processing heartbeat and should start reconfig right away.
+            // e.g. if this node was removed from replSet, _selfIndex is -1, and a following
+            // check on _selfIndex will keep retrying heartbeat to fetch new config, preventing
+            // the new config to be installed.
             if (_role != Role::kLeader) {
                 return nextAction;
             }
@@ -968,6 +971,7 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
     MemberData& hbData = _memberData.at(memberIndex);
     const MemberConfig member = _rsConfig.getMemberAt(memberIndex);
     bool advancedOpTimeOrUpdatedConfig = false;
+    bool becameElectable = false;
     if (!hbResponse.isOK()) {
         if (isUnauthorized) {
             hbData.setAuthIssue(now);
@@ -994,7 +998,9 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
                     "setUpValues: heartbeat response good",
                     "memberId"_attr = member.getId());
         pingsInConfig++;
+        auto wasUnelectable = hbData.isUnelectable();
         advancedOpTimeOrUpdatedConfig = hbData.setUpValues(now, std::move(hbr));
+        becameElectable = wasUnelectable && !hbData.isUnelectable();
     }
 
     _updatePrimaryFromHBDataV1(now);
@@ -1008,6 +1014,7 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
 
     nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
     nextAction.setAdvancedOpTimeOrUpdatedConfig(advancedOpTimeOrUpdatedConfig);
+    nextAction.setBecameElectable(becameElectable);
     return nextAction;
 }
 

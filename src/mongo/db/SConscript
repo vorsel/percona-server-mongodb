@@ -474,6 +474,7 @@ env.Library(
         'default_baton.cpp',
         'operation_context.cpp',
         'operation_context_group.cpp',
+        'operation_id.cpp',
         'operation_key_manager.cpp',
         'service_context.cpp',
         'server_recovery.cpp',
@@ -1027,6 +1028,7 @@ env.Library(
         "commands/server_status_core",
         "s/sharding_api_d",
         "shared_request_handling",
+        "$BUILD_DIR/mongo/db/storage/storage_control",
     ],
 )
 
@@ -1702,6 +1704,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         'op_observer',
+        '$BUILD_DIR/mongo/util/clock_source_mock',
     ],
 )
 
@@ -1720,6 +1723,7 @@ env.Library(
         'index/index_access_methods',
         'index_builds_coordinator_mongod',
         'service_context_d',
+        'storage/storage_control',
         'storage/devnull/storage_devnull',
         'storage/ephemeral_for_test/storage_ephemeral_for_test',
         'storage/storage_options',
@@ -1890,6 +1894,7 @@ envWithAsio.CppUnitTest(
         'op_observer_impl_test.cpp',
         'op_observer_registry_test.cpp',
         'operation_context_test.cpp',
+        'operation_id_test.cpp',
         'operation_time_tracker_test.cpp',
         'range_arithmetic_test.cpp',
         'read_write_concern_defaults_test.cpp',

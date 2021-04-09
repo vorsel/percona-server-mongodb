@@ -91,6 +91,7 @@
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
@@ -2099,6 +2100,10 @@ std::shared_ptr<IsMasterResponse> ReplicationCoordinatorImpl::_makeIsMasterRespo
         response->setIsSecondary(true);
     }
 
+    if (_waitingForRSTLAtStepDown) {
+        response->setIsMaster(false);
+    }
+
     if (_inShutdown) {
         response->setIsMaster(false);
         response->setIsSecondary(false);
@@ -2488,6 +2493,19 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
             "not primary so can't step down",
             getMemberState().primary());
 
+    // This makes us tell the 'hello' command we can't accept writes (though in fact we can,
+    // it is not valid to disable writes until we actually acquire the RSTL).
+    {
+        stdx::lock_guard lk(_mutex);
+        _waitingForRSTLAtStepDown++;
+        _fulfillTopologyChangePromise(lk);
+    }
+    auto clearStepDownFlag = makeGuard([&] {
+        stdx::lock_guard lk(_mutex);
+        _waitingForRSTLAtStepDown--;
+        _fulfillTopologyChangePromise(lk);
+    });
+
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &stepdownHangBeforeRSTLEnqueue, opCtx, "stepdownHangBeforeRSTLEnqueue");
 
@@ -2516,6 +2534,11 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     auto action = _updateMemberStateFromTopologyCoordinator(lk);
     invariant(action == PostMemberStateUpdateAction::kActionNone);
     invariant(!_readWriteAbility->canAcceptNonLocalWrites(lk));
+
+    // We truly cannot accept writes now, and we've updated the topology version to say so, so
+    // no need for this flag any more, nor to increment the topology version again.
+    _waitingForRSTLAtStepDown--;
+    clearStepDownFlag.dismiss();
 
     auto updateMemberState = [&] {
         invariant(lk.owns_lock());
@@ -2843,10 +2866,15 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
         if (isPrimaryOrSecondary) {
             return Status::OK();
         }
-        return Status(ErrorCodes::NotPrimaryOrSecondary,
-                      "not master or secondary; cannot currently read from this replSet member");
+        const auto msg = client->supportsHello()
+            ? "not primary or secondary; cannot currently read from this replSet member"_sd
+            : "not master or secondary; cannot currently read from this replSet member"_sd;
+        return Status(ErrorCodes::NotPrimaryOrSecondary, msg);
     }
-    return Status(ErrorCodes::NotPrimaryNoSecondaryOk, "not master and slaveOk=false");
+
+    const auto msg = client->supportsHello() ? "not primary and secondaryOk=false"_sd
+                                             : "not master and slaveOk=false"_sd;
+    return Status(ErrorCodes::NotPrimaryNoSecondaryOk, msg);
 }
 
 bool ReplicationCoordinatorImpl::isInPrimaryOrSecondaryState(OperationContext* opCtx) const {
@@ -3359,7 +3387,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
         }
     }
     // Wait for durability of the new config document.
-    opCtx->recoveryUnit()->waitUntilDurable(opCtx);
+    JournalFlusher::get(opCtx)->waitForJournalFlush();
 
     configStateGuard.dismiss();
     _finishReplSetReconfig(opCtx, newConfig, force, myIndex);
@@ -3779,9 +3807,11 @@ ReplicationCoordinatorImpl::PostMemberStateUpdateAction
 ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock lk) {
     // We want to respond to any waiting isMasters even if our current and target state are the
     // same as it is possible writes have been disabled during a stepDown but the primary has yet
-    // to transition to SECONDARY state.
+    // to transition to SECONDARY state.  We do not do so when _waitingForRSTLAtStepDown is true
+    // because in that case we have already said we cannot accept writes in the hello response
+    // and explictly incremented the toplogy version.
     ON_BLOCK_EXIT([&] {
-        if (_rsConfig.isInitialized()) {
+        if (_rsConfig.isInitialized() && !_waitingForRSTLAtStepDown) {
             _fulfillTopologyChangePromise(lk);
         }
     });

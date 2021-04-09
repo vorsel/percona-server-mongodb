@@ -807,6 +807,10 @@ void StorageEngineImpl::setStableTimestamp(Timestamp stableTimestamp, bool force
     _engine->setStableTimestamp(stableTimestamp, force);
 }
 
+Timestamp StorageEngineImpl::getStableTimestamp() const {
+    return _engine->getStableTimestamp();
+}
+
 void StorageEngineImpl::setInitialDataTimestamp(Timestamp initialDataTimestamp) {
     _engine->setInitialDataTimestamp(initialDataTimestamp);
 }
@@ -920,18 +924,6 @@ bool StorageEngineImpl::supportsTwoPhaseIndexBuild() const {
     }
 
     return true;
-}
-
-void StorageEngineImpl::triggerJournalFlush() const {
-    return _engine->triggerJournalFlush();
-}
-
-void StorageEngineImpl::waitForJournalFlush(OperationContext* opCtx) const {
-    return _engine->waitForJournalFlush(opCtx);
-}
-
-void StorageEngineImpl::interruptJournalFlusherForReplStateChange() const {
-    return _engine->interruptJournalFlusherForReplStateChange();
 }
 
 Timestamp StorageEngineImpl::getAllDurableTimestamp() const {
