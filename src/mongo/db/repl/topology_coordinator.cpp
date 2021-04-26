@@ -1123,11 +1123,11 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
         nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
         return nextAction;
     }
-    // If we're not in the config, we don't need to respond to heartbeats.
+    // This server is not in the config, either because it was removed or a DNS error finding self.
     if (_selfIndex == -1) {
-        LOG(1) << "Could not find ourself in current config so ignoring heartbeat from " << target
-               << " -- current config: " << _rsConfig.toBSON();
-        HeartbeatResponseAction nextAction = HeartbeatResponseAction::makeNoAction();
+        LOG(1) << "Could not find self in current config, retrying DNS resolution of members "
+               << target << " -- current config: " << _rsConfig.toBSON();
+        HeartbeatResponseAction nextAction = HeartbeatResponseAction::makeRetryReconfigAction();
         nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
         return nextAction;
     }
@@ -1146,6 +1146,7 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
     MemberData& hbData = _memberData.at(memberIndex);
     const MemberConfig member = _rsConfig.getMemberAt(memberIndex);
     bool advancedOpTime = false;
+    bool becameElectable = false;
     if (!hbResponse.isOK()) {
         if (isUnauthorized) {
             hbData.setAuthIssue(now);
@@ -1163,7 +1164,9 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
         ReplSetHeartbeatResponse hbr = std::move(hbResponse.getValue());
         LOG(3) << "setUpValues: heartbeat response good for member _id:" << member.getId()
                << ", msg:  " << hbr.getHbMsg();
+        auto wasUnelectable = hbData.isUnelectable();
         advancedOpTime = hbData.setUpValues(now, std::move(hbr));
+        becameElectable = wasUnelectable && !hbData.isUnelectable();
     }
 
     HeartbeatResponseAction nextAction;
@@ -1175,6 +1178,7 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
 
     nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
     nextAction.setAdvancedOpTime(advancedOpTime);
+    nextAction.setBecameElectable(becameElectable);
     return nextAction;
 }
 

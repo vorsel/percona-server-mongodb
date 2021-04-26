@@ -417,7 +417,7 @@ function RollbackTest(name = "RollbackTest", replSet) {
             assert.commandWorked(curSecondary.adminCommand({serverStatus: 1}))
                 .storageEngine.supportsCommittedReads;
         const isInMemoryStorageEngine = jsTest.options().storageEngine === "inMemory";
-        if (!isMajorityReadConcernEnabledOnRollbackNode && isInMemoryStorageEngine) {
+        if (!isMajorityReadConcernEnabledOnRollbackNode || isInMemoryStorageEngine) {
             this.awaitPrimaryAppliedSurpassesRollbackApplied();
         }
 
@@ -529,6 +529,8 @@ function RollbackTest(name = "RollbackTest", replSet) {
 
         curSecondary = rst.getSecondary();
         assert.neq(curPrimary, curSecondary);
+
+        waitForState(curSecondary, ReplSetTest.State.SECONDARY);
     };
 
     /**
