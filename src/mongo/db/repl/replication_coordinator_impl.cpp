@@ -83,6 +83,7 @@
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/vote_requester.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/db/write_concern_options.h"
@@ -2050,6 +2051,11 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &stepdownHangBeforeRSTLEnqueue, opCtx, "stepdownHangBeforeRSTLEnqueue");
 
+    // To prevent a deadlock between session checkout and RSTL lock taking, disallow new sessions
+    // from being checked out. Existing sessions currently checked out will be killed by the
+    // killOpThread.
+    ScopedBlockSessionCheckouts blockSessions(opCtx);
+
     // Using 'force' sets the default for the wait time to zero, which means the stepdown will
     // fail if it does not acquire the lock immediately. In such a scenario, we use the
     // stepDownUntil deadline instead.
@@ -2359,10 +2365,15 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
         if (isPrimaryOrSecondary) {
             return Status::OK();
         }
-        return Status(ErrorCodes::NotPrimaryOrSecondary,
-                      "not master or secondary; cannot currently read from this replSet member");
+        const auto msg = client->supportsHello()
+            ? "not primary or secondary; cannot currently read from this replSet member"_sd
+            : "not master or secondary; cannot currently read from this replSet member"_sd;
+        return Status(ErrorCodes::NotPrimaryOrSecondary, msg);
     }
-    return Status(ErrorCodes::NotPrimaryNoSecondaryOk, "not master and slaveOk=false");
+
+    const auto msg = client->supportsHello() ? "not primary and secondaryOk=false"_sd
+                                             : "not master and slaveOk=false"_sd;
+    return Status(ErrorCodes::NotPrimaryNoSecondaryOk, msg);
 }
 
 bool ReplicationCoordinatorImpl::isInPrimaryOrSecondaryState(OperationContext* opCtx) const {
@@ -2746,6 +2757,11 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
     if (isForceReconfig && _shouldStepDownOnReconfig(lk, newConfig, myIndex)) {
         _topCoord->prepareForUnconditionalStepDown();
         lk.unlock();
+
+        // To prevent a deadlock between session checkout and RSTL lock taking, disallow new
+        // sessions from being checked out. Existing sessions currently checked out will be killed
+        // by the killOpThread.
+        ScopedBlockSessionCheckouts blockSessions(opCtx);
 
         // Primary node won't be electable or removed after the configuration change.
         // So, finish the reconfig under RSTL, so that the step down occurs safely.
