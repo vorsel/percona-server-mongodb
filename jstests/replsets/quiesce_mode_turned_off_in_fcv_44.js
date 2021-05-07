@@ -1,7 +1,7 @@
 /*
  * Tests that a node does not enter quiesce mode during shutdown if we are in FCV 4.4.
  *
- * TODO SERVER-49138: Remove this test once we branch for 4.8.
+ * TODO SERVER-49138: Remove this test when 5.0 becomes last-lts.
  *
  * @tags: [multiversion_incompatible]
  */
@@ -17,7 +17,7 @@ rst.initiateWithHighElectionTimeout();
 const primary = rst.getPrimary();
 
 // Set FCV to 4.4 to test that quiesce mode is ignored.
-assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
+assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
 assert.commandWorked(primary.adminCommand({clearLog: "global"}));
 
 // Shutdown the node.

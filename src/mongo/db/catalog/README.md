@@ -1,5 +1,25 @@
 # Execution Internals
-_intro to execution goes here_
+The storage execution layer provides an interface for higher level MongoDB components, including
+query, replication and sharding, to all storage engines compatible with MongoDB. It maintains a
+catalog, in-memory and on-disk, of collections and indexes. It also implements an additional (to
+whatever a storage engine implements) concurrency control layer to safely modify the catalog while
+sustaining correct and consistent collection and index data formatting.
+
+Execution facilitates reads and writes to the storage engine with various persistence guarantees,
+builds indexes, supports replication rollback, manages oplog visibility, repairs data corruption
+and inconsistencies, and much more.
+
+The main code highlights are: the storage integration layer found in the [**storage/**][] directory;
+the lock manager and lock helpers found in the [**concurrency/**][] directory; the catalog found in
+the [**catalog/**][] directory; the index build code found in many directories; the various types of
+index implementations found in the [**index/**][] directory; and the sorter found in the
+[**sorter/**][] directory.
+
+[**storage/**]: https://github.com/mongodb/mongo/tree/master/src/mongo/db/storage
+[**concurrency/**]: https://github.com/mongodb/mongo/tree/master/src/mongo/db/concurrency
+[**catalog/**]: https://github.com/mongodb/mongo/tree/master/src/mongo/db/catalog
+[**index/**]: https://github.com/mongodb/mongo/tree/master/src/mongo/db/index
+[**sorter/**]: https://github.com/mongodb/mongo/tree/master/src/mongo/db/sorter
 
 # The Catalog
 
@@ -9,7 +29,7 @@ _intro to execution goes here_
 include discussion of RecordStore interface
 
 ### Index Catalog
-include discussion of SortedDataInferface interface
+include discussion of SortedDataInterface interface
 
 ### Versioning
 in memory versioning (or lack thereof) is separate from on disk
@@ -106,15 +126,71 @@ Maybe include a discussion of how MongoDB read concerns translate into particula
 ## MongoDB Point-in-Time Read
 
 # Read Operations
-How does a read work?
 
-## Collection Read
-how it works, what tables
+All read operations on collections and indexes are required to take collection locks. Storage
+engines that provide document-level concurrency require all operations to hold at least a collection
+IS lock. With the WiredTiger storage engine, the MongoDB integration layer implicitly starts a
+storage transaction on the first attempt to read from a collection or index. Unless a read operation
+is part of a larger write operation, the transaction is rolled-back automatically when the last
+GlobalLock is released, explicitly during query yielding, or from a call to abandonSnapshot();
 
-## Index Read
-_could pull out index reads and writes into its own section, if preferable_
+See
+[WiredTigerCursor](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/storage/wiredtiger/wiredtiger_cursor.cpp#L48),
+[WiredTigerRecoveryUnit::getSession](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.cpp#L303-L305),
+[GlobalLock dtor](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/concurrency/d_concurrency.h#L228-L239),
+[PlanYieldPolicy::_yieldAllLocks](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/query/plan_yield_policy.cpp#L182),
+[RecoveryUnit::abandonSnapshot](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/storage/recovery_unit.h#L217).
 
-how it works, goes from index table to collection table -- two lookups
+## Collection Reads
+
+Collection reads act directly on a
+[RecordStore](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/storage/record_store.h#L202)
+or
+[RecordCursor](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/storage/record_store.h#L102).
+The Collection object also provides [higher-level
+accessors](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/catalog/collection.h#L279)
+to the RecordStore.
+
+## Index Reads
+
+Index reads act directly on a
+[SortedDataInterface::Cursor](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/storage/sorted_data_interface.h#L214).
+Most readers create cursors rather than interacting with indexes through the
+[IndexAccessMethod](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/index/index_access_method.h#L142).
+
+## AutoGetCollectionForRead 
+
+The
+[AutoGetCollectionForRead](https://github.com/mongodb/mongo/blob/58283ca178782c4d1c4a4d2acd4313f6f6f86fd5/src/mongo/db/db_raii.cpp#L89)
+(AGCFR) RAII type is used by most client read operations. In addition to acquiring all necessary
+locks in the hierarchy, it ensures that operations reading at points in time are respecting the
+visibility rules of collection data and metadata.
+
+AGCFR ensures that operations reading at a timestamp do not read at times later than metadata
+changes on the collection (see
+[here](https://github.com/mongodb/mongo/blob/58283ca178782c4d1c4a4d2acd4313f6f6f86fd5/src/mongo/db/db_raii.cpp#L158)).
+
+## Secondary Reads
+
+The oplog applier applies entries out-of-order to provide parallelism for data replication. This
+exposes readers with no set read timestamp to the possibility of seeing inconsistent states of data.
+To solve this problem, the oplog applier takes the ParallelBatchWriterMode (PBWM) lock in X mode,
+and readers using no read timestamp are expected to take the PBWM lock in IS mode to avoid observing
+inconsistent data mid-batch.
+
+Reads on secondaries are able to opt-out of taking the PBWM lock and read at replication's
+[lastApplied](../repl/README.md#replication-timestamp-glossary) optime instead (see
+[SERVER-34192](https://jira.mongodb.org/browse/SERVER-34192)). LastApplied is used because on
+secondaries it is only updated after each oplog batch, which is a known consistent state of data.
+This allows operations to avoid taking the PBWM lock, and thus not conflict with oplog application.
+
+AGCFR provides the mechanism for secondary reads. This is implemented by [opting-out of the
+ParallelBatchWriterMode
+lock](https://github.com/mongodb/mongo/blob/58283ca178782c4d1c4a4d2acd4313f6f6f86fd5/src/mongo/db/db_raii.cpp#L98)
+and switching the ReadSource of [eligible
+readers](https://github.com/mongodb/mongo/blob/58283ca178782c4d1c4a4d2acd4313f6f6f86fd5/src/mongo/db/storage/snapshot_helper.cpp#L106)
+to read at
+[kLastApplied](https://github.com/mongodb/mongo/blob/58283ca178782c4d1c4a4d2acd4313f6f6f86fd5/src/mongo/db/storage/recovery_unit.h#L411).
 
 # Write Operations
 an overview of how writes (insert, update, delete) are processed
@@ -127,52 +203,126 @@ how index tables also get updated when a write happens, (numIndexes + 1) writes 
 ## Vectored Insert
 
 # Concurrency Control
-We have the catalog described above; now how do we protect it?
+
+Theoretically, one could design a database that used only mutexes to maintain database consistency
+while supporting multiple simultaneous operations; however, this solution would result in pretty bad
+performance and would a be strain on the operating system. Therefore, databases typically use a more
+complex method of coordinating operations. This design consists of Resources (lockable entities),
+some of which may be organized in a Hierarchy, and Locks (requests for access to a resource). A Lock
+Manager is responsible for keeping track of Resources and Locks, and for managing each Resource's
+Lock Queue.  The Lock Manager identifies Resources with a ResourceId.
+
+## Resource Hierarchy
+
+In MongoDB, Resources are arranged in a hierarchy, in order to provide an ordering to prevent
+deadlocks when locking multiple Resources, and also as an implementation of Intent Locking (an
+optimization for locking higher level resources). The hierarchy of ResourceTypes is as follows:
+
+1. Global (three - see below) 
+1. Database (one per database on the server)
+1. Collection (one per collection on the server)
+
+Each resource must be locked in order from the top. Therefore, if a Collection resource is desired
+to be locked, one must first lock the one Global resource, and then lock the Database resource that
+is the parent of the Collection. Finally, the Collection resource is locked.
+
+In addition to these ResourceTypes, there also exists ResourceMutex, which is independent of this
+hierarchy.  One can use ResourceMutex instead of a regular mutex if one desires the features of the
+lock manager, such as fair queuing and the ability to have multiple simultaneous lock holders.
 
 ## Lock Modes
 
-## Lock Granularity
-Different storage engines can support different levels of granularity.
+The lock manager keeps track of each Resource's _granted locks_ and a queue of _waiting locks_.
+Rather than the binary "locked-or-not" modes of a mutex, a MongoDB lock can have one of several
+_modes_. Modes have different _compatibilities_ with other locks for the same resource. Locks with
+compatible modes can be simultaneously granted to the same resource, while locks with modes that are
+incompatible with any currently granted lock on a resource must wait in the waiting queue for that
+resource until the conflicting granted locks are unlocked.  The different types of modes are:
+1. X (exclusive): Used to perform writes and reads on the resource.
+2. S (shared): Used to perform only reads on the resource (thus, it is okay to Share with other
+   compatible locks).
+3. IX (intent-exclusive): Used to indicate that an X lock is taken at a level in the hierarchy below
+   this resource.  This lock mode is used to block X or S locks on this resource.
+4. IS (intent-shared): Used to indicate that an S lock is taken at a level in the hierarchy below
+   this resource. This lock mode is used to block X locks on this resource.
 
-### Lock Acquisition Order
-discuss lock acquisition order
+## Lock Compatibility Matrix
 
-mention risk of deadlocks motivation
+This matrix answers the question, given a granted lock on a resource with the mode given, is a
+requested lock on that same resource with the given mode compatible?
+
+| Requested Mode |||                  Granted Mode               |||
+|:---------------|:---------:|:-------:|:-------:|:------:|:------:|
+|                | MODE_NONE | MODE_IS | MODE_IX | MODE_S | MODE_X |
+| MODE_IS        |     Y     |    Y    |    Y    |    Y   |   N    |
+| MODE_IX        |     Y     |    Y    |    Y    |    N   |   N    |
+| MODE_S         |     Y     |    Y    |    N    |    Y   |   N    |
+| MODE_X         |     Y     |    N    |    N    |    N   |   N    |
+
+Typically, locks are granted in the order they are queued, but some LockRequest behaviors can be
+specially selected to break this rule. One behavior is _enqueueAtFront_, which allows important lock
+acquisitions to cut to the front of the line, in order to expedite them. Currently, all mode X and S
+locks for the three Global Resources (Global, RSTL, and PBWM) automatically use this option.
+Another behavior is _compatibleFirst_, which allows compatible lock requests to cut ahead of others
+waiting in the queue and be granted immediately; note that this mode might starve queued lock
+requests indefinitely.
 
 ### Replication State Transition Lock (RSTL)
 
+The Replication State Transition Lock is of ResourceType Global, so it must be locked prior to
+locking any Database level resource. This lock is used to synchronize replica state transitions
+(typically transitions between PRIMARY, SECONDARY, and ROLLBACK states).
+More information on the RSTL is contained in the [Replication Architecture Guide](https://github.com/mongodb/mongo/blob/b4db8c01a13fd70997a05857be17548b0adec020/src/mongo/db/repl/README.md#replication-state-transition-lock)
+
 ### Parallel Batch Writer Mode Lock (PBWM)
+
+The Parallel Batch Writer Mode lock is of ResourceType Global, so it must be locked prior to locking
+any Database level resource. This lock is used to synchronize secondary oplog application with other
+readers, so that they do not observe inconsistent snapshots of the data. Typically this is only an
+issue with readers that read with no timestamp, readers at explicit timestamps can acquire this lock
+in a compatible mode with the oplog applier and thus are not blocked when the oplog applier is
+running.
+More information on the PBWM lock is contained in the [Replication Architecture Guide.](https://github.com/mongodb/mongo/blob/b4db8c01a13fd70997a05857be17548b0adec020/src/mongo/db/repl/README.md#parallel-batch-writer-mode)
 
 ### Global Lock
 
+The resource known as the Global Lock is of ResourceType Global.  It is currently used to
+synchronize shutdown, so that all operations are finished with the storage engine before closing it.
+Certain types of global storage engine operations, such as recoverToStableTimestamp(), also require
+this lock to be held in exclusive mode.
+
 ### Database Lock
+
+Any resource of ResourceType Database protects certain database-wide operations such as database
+drop.  These operations are being phased out, in the hopes that we can eliminate this ResourceType
+completely.
 
 ### Collection Lock
 
+Any resource of ResourceType Collection protects certain collection-wide operations, and in some
+cases also protects the in-memory catalog structure consistency in the face of concurrent readers
+and writers of the catalog. Acquiring this resource with an intent lock is an indication that the
+operation is doing explicit reads (IS) or writes (IX) at the document level.  There is no Document
+ResourceType, as locking at this level is done in the storage engine itself for efficiency reasons.
+
 ### Document Level Concurrency Control
-Explain WT's optimistic concurrency control, and why we do not need document locks in the MongoDB layer.
 
-### Mutexes
-
-### FCV Lock
+Each storage engine is responsible for locking at the document level.  The WiredTiger storage engine
+uses MVCC (multiversion concurrency control) along with optimistic locking in order to provide
+concurrency guarantees.
 
 ## Two-Phase Locking
-We use this for transactions? Explain.
 
-## Replica Set Transaction Locking
-TBD: title of this section -- there is some confusion over what terminology will be best understood
-Stashing and unstashing locks for replica set level transactions across multiple statements.
-Read's IS locks are converted to IX locks in replica set transactions.
+The lock manager automatically provides _two-phase locking_ for a given storage transaction.
+Two-phase locking consists of an Expanding phase where locks are acquired but not released, and a
+subsequent Shrinking phase where locks are released but not acquired.  By adhering to this protocol,
+a transaction will be guaranteed to be serializable with other concurrent transactions. The
+WriteUnitOfWork class manages two-phase locking in MongoDB. This results in the somewhat unexpected
+behavior of the RAII locking types acquiring locks on resources upon their construction but not
+unlocking the lock upon their destruction when going out of scope. Instead, the responsibility of
+unlocking the locks is transferred to the WriteUnitOfWork destructor.  Note this is only true for
+transactions that do writes, and therefore only for code that uses WriteUnitOfWork.
 
-## Locking Best Practices
-
-### Network Calls
-i.e., never hold a lock across a network call unless absolutely necessary
-
-### Long Running I/O
-i.e., don't hold a lock across journal flushing
-
-### FCV Lock Usage
 
 # Indexes
 
@@ -238,7 +388,7 @@ have the following procedure:
 ## Hybrid Index Builds
 
 Hybrid index builds refer to the default procedure introduced in 4.2 that produces efficient index
-data structures without blocking reads or writes for extended periods of time. This is acheived by
+data structures without blocking reads or writes for extended periods of time. This is achieved by
 performing a full collection scan and bulk-loading keys (described above) while concurrently
 intercepting new writes into a temporary storage engine table.
 
@@ -344,7 +494,7 @@ data on a collection and performed the first drain of side-writes. Voting is imp
 `voteCommitIndexBuild` command, and is persisted as a write to the replicated
 `config.system.indexBuilds` collection.
 
-While waiting for a commit decision, primaries and secondaries continue receiving and applying new
+While waiting for a commit decision, primaries and secondaries continue recieving and applying new
 side writes. When a quorum is reached, the current primary, under a collection X lock, will check
 all index constraints. If there are errors, it will replicate an `abortIndexBuild` oplog entry. If
 the index build is successful, it will replicate a `commitIndexBuild` oplog entry.
@@ -544,7 +694,7 @@ MongoDB repair attempts to address the following forms of corruption:
    configuration](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/repair_database_and_check_version.cpp#L460-L485)
    if data has been or could have been modified. This [prevents a repaired node from
    joining](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/repl/replication_coordinator_impl.cpp#L486-L494)
-   and threatening the consisency of its replica set.
+   and threatening the consistency of its replica set.
 
 Additionally:
 * When repair starts, it creates a temporary file, `_repair_incomplete` that is only removed when
@@ -585,7 +735,7 @@ rebuilt](https://github.com/mongodb/mongo/blob/e485c1a8011d85682cb8dafa87ab92b9c
 running with enableMajorityReadConcern=false.
 
 The second step of recovering the catalog is [reconciling unfinished index builds](https://github.com/mongodb/mongo/blob/e485c1a8011d85682cb8dafa87ab92b9c23daa66/src/mongo/db/storage/storage_engine_impl.cpp#L427-L432
-"Github"). In 4.6 the story will simplify, but right now there are a few outcomes:
+"Github"). In 4.7+ the story will simplify, but right now there are a few outcomes:
 * An [unfinished FCV 4.2- background index build on the primary](https://github.com/mongodb/mongo/blob/e485c1a8011d85682cb8dafa87ab92b9c23daa66/src/mongo/db/storage/storage_engine_impl.cpp#L527-L542 "Github") will be discarded (no oplog entry
   was ever written saying the index exists).
 * An [unfinished FCV 4.2- background index build on a secondary](https://github.com/mongodb/mongo/blob/e485c1a8011d85682cb8dafa87ab92b9c23daa66/src/mongo/db/storage/storage_engine_impl.cpp#L513-L525 "Github") will be rebuilt in the foreground
@@ -709,7 +859,88 @@ _Code spelunking starting points:_
 * [_Whether WT journals a collection_](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/storage/wiredtiger/wiredtiger_util.cpp#L560-L580)
 
 # Flow Control
-What it does (motivation). How does it do it? Ticketing.
+
+The Flow Control mechanism aims to keep replica set majority committed lag less than or equal to a
+configured maximum. The default value for this maximum lag is 10 seconds. The Flow Control mechanism
+starts throttling writes on the primary once the majority committed replication lag reaches a
+threshold percentage of the configured maximum. The mechanism uses a "ticket admission"-based
+approach to throttle writes. With this mechanism, in a given period of 1 second, a fixed number of
+"flow control tickets" is available. Operations must acquire a flow control ticket in order to
+acquire a global IX lock to execute a write. Acquisition attempts that occur after this fixed number
+has been granted will stall until the next 1 second period. Certain system operations circumvent the
+ticket admission mechanism and are allowed to proceed even when there are no tickets available.
+
+To address the possibility of this Flow Control mechanism causing indefinite stalls in
+Primary-Secondary-Arbiter replica sets in which a majority cannot be established, the mechanism only
+executes when read concern majority is enabled. Additionally, the mechanism can be disabled by an
+admin.
+
+Flow Control is configurable via several server parameters. Additionally, currentOp, serverStatus,
+database profiling, and slow op log lines include Flow Control information.
+
+## Ticket admission mechanism
+
+The ticket admission Flow Control mechanism allows a specified number of global IX lock acquisitions
+every second. Most global IX lock acquisitions (except for those that explicitly circumvent Flow
+Control) must first acquire a "Flow Control ticket" before acquiring a ticket for the lock. When
+there are no more flow control tickets available in a one second period, remaining attempts to
+acquire flow control tickets stall until the next period, when the available flow control tickets
+are replenished. It should be noted that there is no "pool" of flow control tickets that threads
+give and take from; an independent mechanism refreshes the ticket counts every second.
+
+When the Flow Control mechanism refreshes available tickets, it calculates how many tickets it
+should allow in order to address the majority committed lag.
+
+The Flow Control mechanism determines how many tickets to replenish every period based on:
+1. The current majority committed replication lag with respect to the configured target maximum
+   replication lag
+1. How many operations the secondary sustaining the commit point has applied in the last period
+1. How many IX locks per operation were acquired in the last period
+
+## Configurable constants
+
+Criterion #2 determines a "base" number of tickets to be used in the calculation. When the current
+majority committed lag is greater than or equal to a certain configurable threshold percentage of
+the target maximum, the Flow Control mechanism scales down this "base" number based on the
+discrepancy between the two lag values. For some configurable constant 0 < k < 1, it calculates the
+following:
+
+`base * k ^ ((lag - threshold)/threshold) * fudge factor`
+
+The fudge factor is also configurable and should be close to 1. Its purpose is to assign slightly
+lower than the "base" number of tickets when the current lag is close to the threshold.  Criterion
+#3 is then multiplied by the result of the above calculation to translate a count of operations into
+a count of lock acquisitions.
+
+When the majority committed lag is less than the threshold percentage of the target maximum, the
+number of tickets assigned in the previous period is used as the "base" of the calculation. This
+number is added to a configurable constant (the ticket "adder" constant), and the sum is multiplied
+by another configurable constant (the ticket "multiplier" constant). This product is the new number
+of tickets to be assigned in the next period.
+
+When the Flow Control mechanism is disabled, the ticket refresher mechanism always allows one
+billion flow control ticket acquisitions per second. The Flow Control mechanism can be disabled
+explicitly via a server parameter and implicitly via setting enableMajorityReadConcern to
+false. Additionally, the mechanism is disabled on nodes that cannot accept writes.
+
+Criteria #2 and #3 are determined using a sampling mechanism that periodically stores the necessary
+data as primaries process writes. The sampling mechanism executes regardless of whether Flow Control
+is enabled.
+
+## Oscillations
+
+There are known scenarios in which the Flow Control mechanism causes write throughput to
+oscillate. There is no known work that can be done to eliminate oscillations entirely for this
+mechanism without hindering other aspects of the mechanism. Work was done (see SERVER-39867) to
+dampen the oscillations at the expense of throughput.
+
+## Throttling internal operations
+
+The Flow Control mechanism throttles all IX lock acquisitions regardless of whether they are from
+client or system operations unless they are part of an operation that is explicitly excluded from
+Flow Control. Writes that occur as part of replica set elections in particular are excluded. See
+SERVER-39868 for more details.
+
 
 # Collection Validation
 

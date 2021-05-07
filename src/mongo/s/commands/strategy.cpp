@@ -123,7 +123,8 @@ void appendRequiredFieldsToResponse(OperationContext* opCtx, BSONObjBuilder* res
     // The appended operationTime must always be <= the appended $clusterTime, so in case we need to
     // use $clusterTime as the operationTime below, take a $clusterTime value which is guaranteed to
     // be <= the value output by gossipOut().
-    auto clusterTime = VectorClock::get(opCtx)->getTime()[VectorClock::Component::ClusterTime];
+    const auto currentTime = VectorClock::get(opCtx)->getTime();
+    const auto clusterTime = currentTime.clusterTime();
 
     bool clusterTimeWasOutput = VectorClock::get(opCtx)->gossipOut(opCtx, responseBuilder);
 
@@ -347,14 +348,13 @@ void runCommand(OperationContext* opCtx,
     // Fill out all currentOp details.
     CurOp::get(opCtx)->setGenericOpRequestDetails(opCtx, nss, command, request.body, opType);
 
-    auto const apiParamsFromClient = initializeAPIParameters(request.body);
+    auto const apiParamsFromClient = initializeAPIParameters(request.body, command);
     APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
 
     auto osi = initializeOperationSessionInfo(opCtx,
                                               request.body,
                                               command->requiresAuth(),
                                               command->attachLogicalSessionsToOpCtx(),
-                                              true,
                                               true);
 
     // TODO SERVER-28756: Change allowTransactionsOnConfigDatabase to true once we fix the bug

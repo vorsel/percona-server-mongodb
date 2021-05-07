@@ -33,7 +33,7 @@
 
 load('jstests/libs/profiler.js');
 load("jstests/libs/logv2_helpers.js");
-load('jstests/sharding/libs/last_stable_mongod_commands.js');
+load('jstests/sharding/libs/last_lts_mongod_commands.js');
 
 let db = "test";
 let coll = "foo";
@@ -96,6 +96,7 @@ let testCases = {
     _configsvrRemoveShard: {skip: "internal command"},
     _configsvrRemoveShardFromZone: {skip: "internal command"},
     _configsvrRenameCollection: {skip: "internal command"},
+    _configsvrReshardCollection: {skip: "internal command"},
     _configsvrShardCollection: {skip: "internal command"},
     _configsvrUpdateZoneKeyRange: {skip: "internal command"},
     _flushDatabaseCacheUpdates: {skip: "internal command"},
@@ -116,6 +117,7 @@ let testCases = {
     _shardsvrRenameCollection: {skip: "internal command"},
     _shardsvrShardCollection: {skip: "internal command"},
     _transferMods: {skip: "internal command"},
+    _vectorClockPersist: {skip: "internal command"},
     abortTransaction: {
         setUp: function(conn) {
             assert.commandWorked(conn.getDB(db).runCommand({create: coll, writeConcern: {w: 1}}));
@@ -502,6 +504,7 @@ let testCases = {
     profile: {skip: "does not accept read or write concern"},
     reIndex: {skip: "does not accept read or write concern"},
     reapLogicalSessionCacheNow: {skip: "does not accept read or write concern"},
+    recipientSyncData: {skip: "does not accept read or write concern"},
     refineCollectionShardKey: {skip: "does not accept read or write concern"},
     refreshLogicalSessionCacheNow: {skip: "does not accept read or write concern"},
     refreshSessions: {skip: "does not accept read or write concern"},
@@ -615,6 +618,7 @@ let testCases = {
     startRecordingTraffic: {skip: "does not accept read or write concern"},
     startSession: {skip: "does not accept read or write concern"},
     stopRecordingTraffic: {skip: "does not accept read or write concern"},
+    testDeprecation: {skip: "does not accept read or write concern"},
     top: {skip: "does not accept read or write concern"},
     unsetSharding: {skip: "internal command"},
     update: {

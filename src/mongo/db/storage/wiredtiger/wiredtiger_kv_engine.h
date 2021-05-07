@@ -109,8 +109,6 @@ public:
     void setRecordStoreExtraOptions(const std::string& options);
     void setSortedDataInterfaceExtraOptions(const std::string& options);
 
-    bool supportsDocLocking() const override;
-
     bool supportsDirectoryPerDB() const override;
 
     /**
@@ -337,8 +335,6 @@ public:
     Timestamp getStableTimestamp() const override;
     Timestamp getOldestTimestamp() const override;
     Timestamp getCheckpointTimestamp() const override;
-
-    Timestamp getInitialDataTimestamp() const;
 
     /**
      * Returns the data file path associated with an ident on disk. Returns boost::none if the data

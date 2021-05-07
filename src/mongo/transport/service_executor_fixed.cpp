@@ -34,6 +34,8 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/logv2/log.h"
 #include "mongo/transport/service_executor_gen.h"
+#include "mongo/transport/session.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo {
@@ -109,7 +111,7 @@ Status ServiceExecutorFixed::shutdown(Milliseconds timeout) {
     return waitForShutdown();
 }
 
-Status ServiceExecutorFixed::schedule(Task task, ScheduleFlags flags) {
+Status ServiceExecutorFixed::scheduleTask(Task task, ScheduleFlags flags) {
     if (!_canScheduleWork.load()) {
         return Status(ErrorCodes::ShutdownInProgress, "Executor is not running");
     }
@@ -149,9 +151,20 @@ Status ServiceExecutorFixed::schedule(Task task, ScheduleFlags flags) {
     return Status::OK();
 }
 
+void ServiceExecutorFixed::runOnDataAvailable(Session* session,
+                                              OutOfLineExecutor::Task onCompletionCallback) {
+    invariant(session);
+    session->waitForData().thenRunOn(shared_from_this()).getAsync(std::move(onCompletionCallback));
+}
+
 void ServiceExecutorFixed::appendStats(BSONObjBuilder* bob) const {
     *bob << kExecutorLabel << kExecutorName << kThreadsRunning
          << static_cast<int>(_numRunningExecutorThreads.load());
+}
+
+int ServiceExecutorFixed::getRecursionDepthForExecutorThread() const {
+    invariant(_executorContext);
+    return _executorContext->getRecursionDepth();
 }
 
 }  // namespace transport

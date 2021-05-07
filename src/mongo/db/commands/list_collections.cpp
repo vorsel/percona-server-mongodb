@@ -212,6 +212,9 @@ BSONObj buildCollectionBson(OperationContext* opCtx,
 
 class CmdListCollections : public BasicCommand {
 public:
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kOptIn;
     }
@@ -267,10 +270,7 @@ public:
                 uasserted(ErrorCodes::BadValue, "\"filter\" must be an object");
             }
 
-            StatusWithMatchExpression statusWithMatcher =
-                MatchExpressionParser::parse(filterElt.Obj(), std::move(expCtx));
-            uassertStatusOK(statusWithMatcher.getStatus());
-            matcher = std::move(statusWithMatcher.getValue());
+            matcher = uassertStatusOK(MatchExpressionParser::parse(filterElt.Obj(), expCtx));
         }
 
         const long long defaultBatchSize = std::numeric_limits<long long>::max();
@@ -402,6 +402,7 @@ public:
             {std::move(exec),
              cursorNss,
              AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+             APIParameters::get(opCtx),
              opCtx->getWriteConcern(),
              repl::ReadConcernArgs::get(opCtx),
              jsobj,

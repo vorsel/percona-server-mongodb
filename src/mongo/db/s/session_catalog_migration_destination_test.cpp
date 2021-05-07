@@ -91,22 +91,23 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 boost::optional<StmtId> stmtId,
                                 boost::optional<repl::OpTime> preImageOpTime = boost::none,
                                 boost::optional<repl::OpTime> postImageOpTime = boost::none) {
-    return repl::OplogEntry(opTime,            // optime
-                            0,                 // hash
-                            opType,            // opType
-                            kNs,               // namespace
-                            boost::none,       // uuid
-                            boost::none,       // fromMigrate
-                            0,                 // version
-                            object,            // o
-                            object2,           // o2
-                            sessionInfo,       // sessionInfo
-                            boost::none,       // isUpsert
-                            wallClockTime,     // wall clock time
-                            stmtId,            // statement id
-                            boost::none,       // optime of previous write within same transaction
-                            preImageOpTime,    // pre-image optime
-                            postImageOpTime);  // post-image optime
+    return repl::OplogEntry(opTime,           // optime
+                            0,                // hash
+                            opType,           // opType
+                            kNs,              // namespace
+                            boost::none,      // uuid
+                            boost::none,      // fromMigrate
+                            0,                // version
+                            object,           // o
+                            object2,          // o2
+                            sessionInfo,      // sessionInfo
+                            boost::none,      // isUpsert
+                            wallClockTime,    // wall clock time
+                            stmtId,           // statement id
+                            boost::none,      // optime of previous write within same transaction
+                            preImageOpTime,   // pre-image optime
+                            postImageOpTime,  // post-image optime
+                            boost::none);     // ShardId of resharding recipient
 }
 
 repl::OplogEntry extractInnerOplog(const repl::OplogEntry& oplog) {
@@ -241,11 +242,7 @@ public:
             Client::initThread("test-insert-thread");
             auto innerOpCtx = Client::getCurrent()->makeOperationContext();
 
-            // The ephemeral for test storage engine doesn't support document-level locking, so
-            // requests with txnNumbers aren't allowed. To get around this, we have to manually set
-            // up the session state and perform the insert.
-            initializeOperationSessionInfo(
-                innerOpCtx.get(), insertBuilder.obj(), true, true, true, true);
+            initializeOperationSessionInfo(innerOpCtx.get(), insertBuilder.obj(), true, true, true);
             MongoDOperationContextSession sessionTxnState(innerOpCtx.get());
             auto txnParticipant = TransactionParticipant::get(innerOpCtx.get());
             txnParticipant.beginOrContinue(

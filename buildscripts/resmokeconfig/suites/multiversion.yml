@@ -3,7 +3,8 @@ test_kind: js_test
 selector:
   roots:
   - jstests/multiVersion/**/*.js
-  - src/mongo/db/modules/*/jstests/hot_backups/*last_stable*.js
+  - src/mongo/db/modules/*/jstests/hot_backups/*last_lts*.js
+  - src/mongo/db/modules/*/jstests/hot_backups/*last_cont*.js
   exclude_files:
   # Do not execute files with helper functions.
   - jstests/multiVersion/libs/*.js
@@ -17,9 +18,6 @@ selector:
   # TODO SERVER-42919: recent work on the ReplicaSetMonitor means that mongoS no longer crashes when
   # it attempts to connect to an upgraded mongoD. Un-blacklist when SERVER-42919 fixes this issue.
   - jstests/multiVersion/genericSetFCVUsage/crash_mongos_against_upgraded_cluster.js
-
-  # TODO: SERVER-48192
-  - jstests/multiVersion/pending_chunk.js
 
   # TODO: SERVER-48192
   - jstests/multiVersion/migrations_with_mixed_fcv.js

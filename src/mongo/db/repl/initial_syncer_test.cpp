@@ -67,6 +67,7 @@
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/platform/mutex.h"
+#include "mongo/util/clock_source_mock.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/fail_point.h"
@@ -228,10 +229,10 @@ public:
 
     /**
      * Schedules and processes a successful response to the network request sent by InitialSyncer's
-     * feature compatibility version fetcher. Always includes a valid fCV=last-stable document in
+     * feature compatibility version fetcher. Always includes a valid fCV=last-lts document in
      * the response.
      */
-    void processSuccessfulFCVFetcherResponseLastStable();
+    void processSuccessfulFCVFetcherResponseLastLTS();
 
     void finishProcessingNetworkResponse() {
         getNet()->runReadyNetworkOperations();
@@ -340,10 +341,8 @@ protected:
         };
 
         auto* service = getGlobalServiceContext();
-        service->setFastClockSource(
-            std::make_unique<executor::NetworkInterfaceMockClockSource>(getNet()));
-        service->setPreciseClockSource(
-            std::make_unique<executor::NetworkInterfaceMockClockSource>(getNet()));
+        service->setFastClockSource(std::make_unique<ClockSourceMock>());
+        service->setPreciseClockSource(std::make_unique<ClockSourceMock>());
         ThreadPool::Options dbThreadPoolOptions;
         dbThreadPoolOptions.poolName = "dbthread";
         dbThreadPoolOptions.minThreads = 1U;
@@ -644,7 +643,8 @@ OplogEntry makeOplogEntry(int t,
                       boost::none,                 // statement id
                       boost::none,   // optime of previous write within same transaction
                       boost::none,   // pre-image optime
-                      boost::none);  // post-image optime
+                      boost::none,   // post-image optime
+                      boost::none);  // ShardId of resharding recipient
 }
 
 BSONObj makeOplogEntryObj(int t,
@@ -674,7 +674,7 @@ void assertFCVRequest(RemoteCommandRequest request) {
                       request.cmdObj.getObjectField("filter"));
 }
 
-void InitialSyncerTest::processSuccessfulFCVFetcherResponseLastStable() {
+void InitialSyncerTest::processSuccessfulFCVFetcherResponseLastLTS() {
     FeatureCompatibilityVersionDocument fcvDoc;
     fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
     processSuccessfulFCVFetcherResponse({fcvDoc.toBSON()});
@@ -1686,7 +1686,7 @@ TEST_F(InitialSyncerTest,
         processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
 
         // Feature Compatibility Version.
-        processSuccessfulFCVFetcherResponseLastStable();
+        processSuccessfulFCVFetcherResponseLastLTS();
     }
 
     initialSyncer->join();
@@ -1847,7 +1847,7 @@ TEST_F(InitialSyncerTest, InitialSyncerResendsFindCommandIfFCVFetcherReturnsRetr
     ASSERT_TRUE(initialSyncer->isActive());
 
     // FCV second attempt.
-    processSuccessfulFCVFetcherResponseLastStable();
+    processSuccessfulFCVFetcherResponseLastLTS();
 }
 
 void InitialSyncerTest::runInitialSyncWithBadFCVResponse(std::vector<BSONObj> docs,
@@ -2003,7 +2003,7 @@ TEST_F(InitialSyncerTest,
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate response to OplogFetcher so it has enough operations to reach end timestamp.
             getOplogFetcher()->receiveBatch(1LL, {makeOplogEntryObj(1), lastOp.toBSON()});
@@ -2064,7 +2064,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughOplogFetcherCallbackError) {
         net->runReadyNetworkOperations();
 
         // Feature Compatibility Version.
-        processSuccessfulFCVFetcherResponseLastStable();
+        processSuccessfulFCVFetcherResponseLastLTS();
 
         // Simulate an error response to the OplogFetcher.
         getOplogFetcher()->simulateResponseError(
@@ -2118,7 +2118,7 @@ TEST_F(InitialSyncerTest,
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate cursor closing on sync source.
             getOplogFetcher()->receiveBatch(0LL, {makeOplogEntryObj(1)});
@@ -2179,7 +2179,7 @@ TEST_F(
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate cursor closing on sync source.
             getOplogFetcher()->receiveBatch(0LL,
@@ -2238,7 +2238,7 @@ TEST_F(
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate cursor closing on sync source.
             getOplogFetcher()->receiveBatch(0LL,
@@ -2290,7 +2290,7 @@ TEST_F(InitialSyncerTest,
         processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
 
         // Feature Compatibility Version.
-        processSuccessfulFCVFetcherResponseLastStable();
+        processSuccessfulFCVFetcherResponseLastLTS();
     }
 
     initialSyncer->join();
@@ -2325,7 +2325,7 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsBothOplogFetcherAndAllDatabaseClon
         processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
 
         // Feature Compatibility Version.
-        processSuccessfulFCVFetcherResponseLastStable();
+        processSuccessfulFCVFetcherResponseLastLTS();
     }
 
     ASSERT_OK(initialSyncer->shutdown());
@@ -2384,7 +2384,7 @@ TEST_F(InitialSyncerTest,
         processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
 
         // Feature Compatibility Version.
-        processSuccessfulFCVFetcherResponseLastStable();
+        processSuccessfulFCVFetcherResponseLastLTS();
     }
 
     initialSyncer->join();
@@ -2424,7 +2424,7 @@ TEST_F(InitialSyncerTest,
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -2485,7 +2485,7 @@ TEST_F(InitialSyncerTest, InitialSyncerRetriesLastOplogEntryFetcherNetworkError)
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -2567,7 +2567,7 @@ TEST_F(InitialSyncerTest,
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -2640,7 +2640,7 @@ TEST_F(InitialSyncerTest,
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -2691,7 +2691,7 @@ TEST_F(InitialSyncerTest,
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -2752,7 +2752,7 @@ TEST_F(
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -2804,7 +2804,7 @@ TEST_F(InitialSyncerTest,
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -2871,7 +2871,7 @@ TEST_F(
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -2941,7 +2941,7 @@ TEST_F(
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -3011,7 +3011,7 @@ TEST_F(
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -3063,7 +3063,7 @@ TEST_F(
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -3124,7 +3124,7 @@ TEST_F(InitialSyncerTest, InitialSyncerHandlesNetworkErrorsFromRollbackCheckerAf
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -3193,7 +3193,7 @@ TEST_F(InitialSyncerTest,
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -3259,7 +3259,7 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsLastRollbackCheckerOnShutdown) {
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -3317,7 +3317,7 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsLastRollbackCheckerOnOplogFetcherC
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -3379,7 +3379,7 @@ TEST_F(InitialSyncerTest,
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -3474,7 +3474,7 @@ TEST_F(InitialSyncerTest, LastOpTimeShouldBeSetEvenIfNoOperationsAreAppliedAfter
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -3532,7 +3532,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetNextApplierBatchScheduleE
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // The cloners start right after the FCV is received. The oplog entry fetcher associated
@@ -3593,7 +3593,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughSecondGetNextApplierBatchSch
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Before processing scheduled last oplog entry fetcher response, set flag in
@@ -3650,7 +3650,7 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsGetNextApplierBatchOnShutdown) {
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -3709,7 +3709,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughGetNextApplierBatchInLockErr
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate an OplogFetcher batch with bad oplog entries that will be added to the oplog
             // buffer and processed by _getNextApplierBatch_inlock().
@@ -3778,7 +3778,7 @@ TEST_F(
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate an OplogFetcher batch with bad oplog entries that will be added to the oplog
             // buffer and processed by _getNextApplierBatch_inlock().
@@ -3840,7 +3840,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughMultiApplierScheduleError) {
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -3907,7 +3907,7 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughMultiApplierCallbackError) {
                                                  kListDatabasesFailPointData);
 
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate an OplogFetcher batch that has enough operations to trigger MultiApplier.
             getOplogFetcher()->receiveBatch(1LL, {makeOplogEntryObj(1), makeOplogEntryObj(2)});
@@ -3960,7 +3960,7 @@ TEST_F(InitialSyncerTest, InitialSyncerCancelsGetNextApplierBatchCallbackOnOplog
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -4016,7 +4016,7 @@ OplogEntry InitialSyncerTest::doInitialSyncWithOneBatch() {
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate an OplogFetcher batch that has enough operations to reach end timestamp.
             getOplogFetcher()->receiveBatch(1LL, {makeOplogEntryObj(1), lastOp.toBSON()});
@@ -4142,7 +4142,7 @@ TEST_F(InitialSyncerTest,
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate an OplogFetcher batch that has enough operations to reach end timestamp.
             getOplogFetcher()->receiveBatch(
@@ -4222,7 +4222,7 @@ TEST_F(InitialSyncerTest, OplogOutOfOrderOnOplogFetchFinish) {
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate a batch to the OplogFetcher.
             getOplogFetcher()->receiveBatch(1LL, {makeOplogEntryObj(1)});
@@ -4285,7 +4285,7 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
             processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
 
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
 
             // Deliver cancellation to OplogFetcher
             net->runReadyNetworkOperations();
@@ -4348,7 +4348,7 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
             processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
 
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         LOGV2(24170, "Done playing first successful response");
@@ -4593,7 +4593,7 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgressForNetwork
             FailPointEnableBlock clonerFailpoint("hangAfterClonerStage",
                                                  kListDatabasesFailPointData);
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
         }
 
         // Oplog entry associated with the stopTimestamp.
@@ -4762,7 +4762,7 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressOmitsClonerStatsIfClonerStatsExc
                     .data);
 
             // Feature Compatibility Version.
-            processSuccessfulFCVFetcherResponseLastStable();
+            processSuccessfulFCVFetcherResponseLastLTS();
 
             // Simulate a batch to OplogFetcher.
             getOplogFetcher()->receiveBatch(1LL, {makeOplogEntryObj(1)});

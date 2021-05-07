@@ -158,7 +158,6 @@
 #include "mongo/db/system_index.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/ttl.h"
-#include "mongo/db/unclean_shutdown.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -187,6 +186,7 @@
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/latch_analyzer.h"
 #include "mongo/util/net/ocsp/ocsp_manager.h"
+#include "mongo/util/net/private/ssl_expiration.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
 #include "mongo/util/ntservice.h"
@@ -272,19 +272,18 @@ void logStartup(OperationContext* opCtx) {
     wunit.commit();
 }
 
-void initWireSpec() {
-    WireSpec& spec = WireSpec::instance();
-
+MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionHandling"))(InitializerContext*) {
     // The featureCompatibilityVersion behavior defaults to the downgrade behavior while the
     // in-memory version is unset.
-
+    WireSpec::Specification spec;
     spec.incomingInternalClient.minWireVersion = RELEASE_2_4_AND_BEFORE;
     spec.incomingInternalClient.maxWireVersion = LATEST_WIRE_VERSION;
-
     spec.outgoing.minWireVersion = RELEASE_2_4_AND_BEFORE;
     spec.outgoing.maxWireVersion = LATEST_WIRE_VERSION;
-
     spec.isInternalClient = true;
+
+    WireSpec::instance().initialize(std::move(spec));
+    return Status::OK();
 }
 
 void initializeCommandHooks(ServiceContext* serviceContext) {
@@ -304,8 +303,6 @@ MONGO_FAIL_POINT_DEFINE(shutdownAtStartup);
 
 ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     Client::initThread("initandlisten");
-
-    initWireSpec();
 
     serviceContext->setFastClockSource(FastClockSourceFactory::create(Milliseconds(10)));
 
@@ -346,6 +343,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     serviceContext->setPeriodicRunner(std::move(runner));
 
     OCSPManager::get()->startThreadPool();
+    CertificateExpirationMonitor::get()->start(serviceContext);
 
     if (!storageGlobalParams.repair) {
         auto tl =
@@ -365,7 +363,8 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
                      std::make_unique<FlowControl>(
                          serviceContext, repl::ReplicationCoordinator::get(serviceContext)));
 
-    initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
+    auto lastStorageEngineShutdownState =
+        initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
     StorageControl::startStorageControls(serviceContext);
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
@@ -438,7 +437,8 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
 
     // When starting up after an unclean shutdown, we do not attempt to use any of the temporary
     // files left from the previous run. Thus, we remove them in this case.
-    if (!storageGlobalParams.readOnly && startingAfterUncleanShutdown(serviceContext)) {
+    if (!storageGlobalParams.readOnly &&
+        LastStorageEngineShutdownState::kUnclean == lastStorageEngineShutdownState) {
         boost::filesystem::remove_all(storageGlobalParams.dbpath + "/_tmp/");
     }
 
@@ -449,7 +449,8 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     auto startupOpCtx = serviceContext->makeOperationContext(&cc());
 
     try {
-        startup_recovery::repairAndRecoverDatabases(startupOpCtx.get());
+        startup_recovery::repairAndRecoverDatabases(startupOpCtx.get(),
+                                                    lastStorageEngineShutdownState);
     } catch (const ExceptionFor<ErrorCodes::MustDowngrade>& error) {
         LOGV2_FATAL_OPTIONS(
             20573,
@@ -463,14 +464,6 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     // Ensure FCV document exists and is initialized in-memory. Fatally asserts if there is an
     // error.
     FeatureCompatibilityVersion::fassertInitializedAfterStartup(startupOpCtx.get());
-
-    // This flag is used during storage engine initialization to perform behavior that is specific
-    // to recovering from an unclean shutdown. It is also used to determine whether temporary files
-    // should be removed. The last of these uses is done by repairDatabasesAndCheckVersion() above,
-    // so we reset the flag to false here. We reset the flag so that other users of these functions
-    // outside of startup do not perform behavior that is specific to starting up after an unclean
-    // shutdown.
-    startingAfterUncleanShutdown(serviceContext) = false;
 
     if (gFlowControlEnabled.load()) {
         LOGV2(20536, "Flow Control is enabled on this deployment");
@@ -1078,9 +1071,12 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
                 (opCtx->getServiceContext()->getPreciseClockSource()->now() - stepDownStartTime));
     }
 
-    // TODO SERVER-49138: Remove this FCV check once we branch for 4.8.
-    if (serverGlobalParams.featureCompatibility.isVersion(
-            ServerGlobalParams::FeatureCompatibility::Version::kVersion451)) {
+    // TODO SERVER-49138: Remove this FCV check when 5.0 becomes last-lts.
+    // We must FCV gate the Quiesce mode feature so that a 4.7+ node entering Quiesce mode in a
+    // mixed 4.4/4.7+ replica set does not delay a 4.4 node from finding a valid sync source.
+    if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+            ServerGlobalParams::FeatureCompatibility::Version::kVersion47)) {
         if (auto replCoord = repl::ReplicationCoordinator::get(serviceContext);
             replCoord && replCoord->enterQuiesceModeIfSecondary(shutdownTimeout)) {
             ServiceContext::UniqueOperationContext uniqueOpCtx;

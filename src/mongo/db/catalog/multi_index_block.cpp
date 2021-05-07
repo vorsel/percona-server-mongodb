@@ -51,6 +51,7 @@
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/tenant_migration_conflict_info.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/logv2/log.h"
@@ -151,13 +152,15 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
                                                        const BSONObj& spec,
                                                        OnInitFn onInit) {
     const auto indexes = std::vector<BSONObj>(1, spec);
-    return init(opCtx, collection, indexes, onInit);
+    return init(opCtx, collection, indexes, onInit, boost::none);
 }
 
-StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
-                                                       Collection* collection,
-                                                       const std::vector<BSONObj>& indexSpecs,
-                                                       OnInitFn onInit) {
+StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(
+    OperationContext* opCtx,
+    Collection* collection,
+    const std::vector<BSONObj>& indexSpecs,
+    OnInitFn onInit,
+    const boost::optional<ResumeIndexInfo>& resumeInfo) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(collection->ns(), MODE_X),
               str::stream() << "Collection " << collection->ns() << " with UUID "
                             << collection->uuid() << " is holding the incorrect lock");
@@ -168,6 +171,10 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
     WriteUnitOfWork wunit(opCtx);
 
     invariant(_indexes.empty());
+
+    if (resumeInfo) {
+        _phase = resumeInfo->getPhase();
+    }
 
     // Guarantees that exceptions cannot be returned from index builder initialization except for
     // WriteConflictExceptions, which should be dealt with by the caller.
@@ -208,7 +215,7 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
         for (size_t i = 0; i < indexSpecs.size(); i++) {
             BSONObj info = indexSpecs[i];
             StatusWith<BSONObj> statusWithInfo =
-                collection->getIndexCatalog()->prepareSpecForCreate(opCtx, info);
+                collection->getIndexCatalog()->prepareSpecForCreate(opCtx, info, resumeInfo);
             Status status = statusWithInfo.getStatus();
             if (!status.isOK()) {
                 // If we were given two identical indexes to build, we will run into an error trying
@@ -231,9 +238,22 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
             IndexToBuild index;
             index.block = std::make_unique<IndexBuildBlock>(
                 collection->getIndexCatalog(), collection->ns(), info, _method, _buildUUID);
-            status = index.block->init(opCtx, collection);
-            if (!status.isOK())
-                return status;
+            if (resumeInfo) {
+                auto resumeInfoIndexes = resumeInfo->getIndexes();
+                // Find the resume information that corresponds to this spec.
+                auto indexResumeInfo =
+                    std::find_if(resumeInfoIndexes.begin(),
+                                 resumeInfoIndexes.end(),
+                                 [&info](const IndexSorterInfo& indexInfo) {
+                                     return info.woCompare(indexInfo.getSpec()) == 0;
+                                 });
+
+                index.block->initForResume(opCtx, collection, *indexResumeInfo);
+            } else {
+                status = index.block->init(opCtx, collection);
+                if (!status.isOK())
+                    return status;
+            }
 
             auto indexCleanupGuard = makeGuard([opCtx, &index] {
                 index.block->finalizeTemporaryTables(
@@ -270,8 +290,10 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
 
             index.filterExpression = index.block->getEntry()->getFilterExpression();
 
-            // TODO SERVER-14888 Suppress this in cases we don't want to audit.
-            audit::logCreateIndex(opCtx->getClient(), &info, descriptor->indexName(), ns);
+            if (!resumeInfo) {
+                // TODO SERVER-14888 Suppress this in cases we don't want to audit.
+                audit::logCreateIndex(opCtx->getClient(), &info, descriptor->indexName(), ns);
+            }
 
             indexCleanupGuard.dismiss();
             _indexes.push_back(std::move(index));
@@ -283,6 +305,10 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
         }
 
         opCtx->recoveryUnit()->onCommit([ns, this](auto commitTs) {
+            if (!_buildUUID) {
+                return;
+            }
+
             LOGV2(20346,
                   "Index build initialized: {buildUUID}: {nss} ({collection_uuid}): indexes: "
                   "{indexes_size}",
@@ -295,8 +321,11 @@ StatusWith<std::vector<BSONObj>> MultiIndexBlock::init(OperationContext* opCtx,
 
         wunit.commit();
         return indexInfoObjs;
-        // Avoid converting WCE to Status
     } catch (const WriteConflictException&) {
+        // Avoid converting WCE to Status.
+        throw;
+    } catch (const TenantMigrationConflictException&) {
+        // Avoid converting TenantMigrationConflictException to Status.
         throw;
     } catch (...) {
         auto status = exceptionToStatus();
@@ -397,8 +426,9 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(OperationContext* opCtx,
     opCtx->recoveryUnit()->setReadOnce(readOnce);
 
     try {
-        invariant(_phase == Phase::kInitialized, _phaseToString(_phase));
-        _phase = Phase::kCollectionScan;
+        invariant(_phase == IndexBuildPhaseEnum::kInitialized,
+                  IndexBuildPhase_serializer(_phase).toString());
+        _phase = IndexBuildPhaseEnum::kCollectionScan;
 
         BSONObj objToIndex;
         RecordId loc;
@@ -433,7 +463,7 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(OperationContext* opCtx,
             n++;
         }
     } catch (...) {
-        _phase = Phase::kInitialized;
+        _phase = IndexBuildPhaseEnum::kInitialized;
         return exceptionToStatus();
     }
 
@@ -522,9 +552,10 @@ Status MultiIndexBlock::dumpInsertsFromBulk(OperationContext* opCtx,
     // insertDocumentsInCollection() to scan and insert the contents of the collection.
     // Therefore, it is possible for the phase of this MultiIndexBlock to be kInitialized
     // rather than kCollection when this function is called.
-    invariant(_phase == Phase::kCollectionScan || _phase == Phase::kInitialized,
-              _phaseToString(_phase));
-    _phase = Phase::kBulkLoad;
+    invariant(_phase == IndexBuildPhaseEnum::kCollectionScan ||
+                  _phase == IndexBuildPhaseEnum::kInitialized,
+              IndexBuildPhase_serializer(_phase).toString());
+    _phase = IndexBuildPhaseEnum::kBulkLoad;
 
     for (size_t i = 0; i < _indexes.size(); i++) {
         // When dupRecords is passed, 'dupsAllowed' should be passed to reflect whether or not the
@@ -577,8 +608,10 @@ Status MultiIndexBlock::drainBackgroundWrites(
     // Background writes are drained three times (once without blocking writes and twice blocking
     // writes), so we may either be coming from the bulk load phase or be already in the drain
     // writes phase.
-    invariant(_phase == Phase::kBulkLoad || _phase == Phase::kDrainWrites, _phaseToString(_phase));
-    _phase = Phase::kDrainWrites;
+    invariant(_phase == IndexBuildPhaseEnum::kBulkLoad ||
+                  _phase == IndexBuildPhaseEnum::kDrainWrites,
+              IndexBuildPhase_serializer(_phase).toString());
+    _phase = IndexBuildPhaseEnum::kDrainWrites;
 
     const Collection* coll =
         CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, _collectionUUID.get());
@@ -779,18 +812,23 @@ void MultiIndexBlock::_writeStateToDisk(OperationContext* opCtx) const {
 BSONObj MultiIndexBlock::_constructStateObject() const {
     BSONObjBuilder builder;
     _buildUUID->appendToBuilder(&builder, "_id");
-    builder.append("phase", _phaseToString(_phase));
+    builder.append("phase", IndexBuildPhase_serializer(_phase));
+
+    if (_collectionUUID) {
+        _collectionUUID->appendToBuilder(&builder, "collectionUUID");
+    }
 
     // We can be interrupted by shutdown before inserting the first document from the collection
     // scan, in which case there is no _lastRecordIdInserted.
-    if (_phase == Phase::kCollectionScan && _lastRecordIdInserted)
+    if (_phase == IndexBuildPhaseEnum::kCollectionScan && _lastRecordIdInserted)
         builder.append("collectionScanPosition", _lastRecordIdInserted->repr());
 
     BSONArrayBuilder indexesArray(builder.subarrayStart("indexes"));
     for (const auto& index : _indexes) {
         BSONObjBuilder indexInfo(indexesArray.subobjStart());
 
-        if (_phase == Phase::kCollectionScan || _phase == Phase::kBulkLoad) {
+        if (_phase == IndexBuildPhaseEnum::kCollectionScan ||
+            _phase == IndexBuildPhaseEnum::kBulkLoad) {
             auto state = index.bulk->getSorterState();
 
             indexInfo.append("tempDir", state.tempDir);
@@ -814,11 +852,15 @@ BSONObj MultiIndexBlock::_constructStateObject() const {
 
         if (auto duplicateKeyTrackerTableIdent =
                 indexBuildInterceptor->getDuplicateKeyTrackerTableIdent())
-            indexInfo.append("dupKeyTempTable", *duplicateKeyTrackerTableIdent);
+            indexInfo.append("duplicateKeyTrackerTable", *duplicateKeyTrackerTableIdent);
 
         if (auto skippedRecordTrackerTableIdent =
                 indexBuildInterceptor->getSkippedRecordTracker()->getTableIdent())
             indexInfo.append("skippedRecordTrackerTable", *skippedRecordTrackerTableIdent);
+
+        // TODO SERVER-49450: Consider only writing out the index name or key and getting the rest
+        // of the spec from the durable catalog on startup.
+        indexInfo.append("spec", index.block->getSpec());
 
         indexInfo.done();
 
@@ -829,19 +871,4 @@ BSONObj MultiIndexBlock::_constructStateObject() const {
 
     return builder.obj();
 }
-
-std::string MultiIndexBlock::_phaseToString(Phase phase) const {
-    switch (phase) {
-        case Phase::kInitialized:
-            return "initialized";
-        case Phase::kCollectionScan:
-            return "collection scan";
-        case Phase::kBulkLoad:
-            return "bulk load";
-        case Phase::kDrainWrites:
-            return "drain writes";
-    }
-    MONGO_UNREACHABLE;
-}
-
 }  // namespace mongo

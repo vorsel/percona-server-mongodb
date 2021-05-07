@@ -148,10 +148,6 @@ OpTime ReplicationCoordinatorEmbedded::getCurrentCommittedSnapshotOpTime() const
     UASSERT_NOT_IMPLEMENTED;
 }
 
-OpTimeAndWallTime ReplicationCoordinatorEmbedded::getCurrentCommittedSnapshotOpTimeAndWallTime()
-    const {
-    UASSERT_NOT_IMPLEMENTED;
-}
 void ReplicationCoordinatorEmbedded::appendDiagnosticBSON(mongo::BSONObjBuilder*) {
     UASSERT_NOT_IMPLEMENTED;
 }
@@ -198,10 +194,6 @@ ReplicationCoordinator::ApplierState ReplicationCoordinatorEmbedded::getApplierS
 }
 
 void ReplicationCoordinatorEmbedded::signalDrainComplete(OperationContext*, long long) {
-    UASSERT_NOT_IMPLEMENTED;
-}
-
-Status ReplicationCoordinatorEmbedded::waitForDrainFinish(Milliseconds) {
     UASSERT_NOT_IMPLEMENTED;
 }
 

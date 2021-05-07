@@ -112,51 +112,170 @@ struct MatchExpressionVisitorContext {
     sbe::value::SlotId inputVar;
 };
 
+std::unique_ptr<sbe::PlanStage> makeLimitCoScanTree(long long limit = 1) {
+    return sbe::makeS<sbe::LimitSkipStage>(sbe::makeS<sbe::CoScanStage>(), limit, boost::none);
+}
+
+std::unique_ptr<sbe::EExpression> makeFillEmptyFalse(std::unique_ptr<sbe::EExpression> e) {
+    using namespace std::literals;
+    return sbe::makeE<sbe::EFunction>(
+        "fillEmpty"sv,
+        sbe::makeEs(std::move(e), sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean, 0)));
+}
+
+/**
+ * Helper to check if the current comparison expression is a branch of a logical $and expression.
+ * If it is but is not the last one, inject a filter stage to bail out early from the $and predicate
+ * without the need to evaluate all branches. If this is the last branch of the $and expression, or
+ * if it's not within a logical expression at all, just keep the predicate var on the top on the
+ * stack and let the parent expression process it.
+ */
+void checkForShortCircuitFromLogicalAnd(MatchExpressionVisitorContext* context) {
+    if (!context->nestedLogicalExprs.empty() && context->nestedLogicalExprs.top().second > 1 &&
+        context->nestedLogicalExprs.top().first->matchType() == MatchExpression::AND) {
+        context->inputStage = sbe::makeS<sbe::FilterStage<false>>(
+            std::move(context->inputStage),
+            sbe::makeE<sbe::EVariable>(context->predicateVars.top()));
+        context->predicateVars.pop();
+    }
+}
+
+enum class LeafArrayTraversalMode {
+    kArrayAndItsElements = 0,  // Visit both the array's elements _and_ the array itself
+    kArrayElementsOnly = 1,    // Visit the array's elements but don't visit the array itself
+};
+
 /**
  * A helper function to generate a path traversal plan stage at the given nested 'level' of the
  * traversal path. For example, for a dotted path expression {'a.b': 2}, the traversal sub-tree will
  * look like this:
  *
  *     traverse
- *          traversePredicateVar // the global traversal result
- *          elemPredicateVar1 // the result coming from the 'in' branch
+ *          outputVar1 // the traversal result
+ *          innerVar1 // the result coming from the 'in' branch
  *          fieldVar1 // field 'a' projected in the 'from' branch, this is the field we will be
  *                    // traversing
- *          {traversePredicateVar || elemPredicateVar1} // the folding expression - combining
- *                                                      // results for each element
- *          {traversePredicateVar} // final (early out) expression - when we hit the 'true' value,
- *                                 // we don't have to traverse the whole array
+ *          {outputVar1 || innerVar1} // the folding expression - combining
+ *                                    // results for each element
+ *          {outputVar1} // final (early out) expression - when we hit the 'true' value,
+ *                       // we don't have to traverse the whole array
  *      in
- *          project [elemPredicateVar1 = traversePredicateVar]
+ *          project [innerVar1 =                               // if getField(fieldVar1,'b') returns
+ *                    fillEmpty(outputVar2, false) ||          // an array, compare the array itself
+ *                    (fillEmpty(isArray(fieldVar), false) &&  // to 2 as well
+ *                     fillEmpty(fieldVar2==2, false))]
  *          traverse // nested traversal
- *              traversePredicateVar // the global traversal result
- *              elemPredicateVar2 // the result coming from the 'in' branch
+ *              outputVar2 // the traversal result
+ *              innerVar2 // the result coming from the 'in' branch
  *              fieldVar2 // field 'b' projected in the 'from' branch, this is the field we will be
  *                        // traversing
- *              {traversePredicateVar || elemPredicateVar2} // the folding expression
- *              {traversePredicateVar} // final (early out) expression
+ *              {outputVar2 || innerVar2} // the folding expression
+ *              {outputVar2} // final (early out) expression
  *          in
- *              project [elemPredicateVar2 = fieldVar2==2] // compare the field 'b' to 2 and store
- *                                                         // the bool result in elemPredicateVar2
+ *              project [innerVar2 =                        // compare the field 'b' to 2 and store
+ *                         fillEmpty(fieldVar2==2, false)]  // the bool result in innerVar2
  *              limit 1
  *              coscan
  *          from
- *              project [fieldVar2=getField(fieldVar1, 'b')] // project field 'b' from the document
- *                                                           // bound to 'fieldVar1', which is
- *                                                           // field 'a'
+ *              project [fieldVar2 = getField(fieldVar1, 'b')] // project field 'b' from the
+ *                                                             // document  bound to 'fieldVar1',
+ *                                                             // which is field 'a'
  *              limit 1
  *              coscan
  *      from
- *         project [fieldVar1=getField(inputVar, 'a')] // project field 'a' from the document bound
- *                                                     // to 'inputVar'
+ *         project [fieldVar1 = getField(inputVar, 'a')] // project field 'a' from the document
+ *                                                       // bound to 'inputVar'
  *         <inputStage>  // e.g., COLLSCAN
  */
-std::unique_ptr<sbe::PlanStage> generateTraverseHelper(MatchExpressionVisitorContext* context,
-                                                       std::unique_ptr<sbe::PlanStage> inputStage,
-                                                       sbe::value::SlotId inputVar,
-                                                       const PathMatchExpression* expr,
-                                                       MakePredicateEExprFn makeEExprCallback,
-                                                       size_t level) {
+std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> generateTraverseHelper(
+    std::unique_ptr<sbe::PlanStage> inputStage,
+    sbe::value::SlotId inputVar,
+    const FieldPath& fp,
+    size_t level,
+    sbe::value::SlotIdGenerator* slotIdGenerator,
+    const MakePredicateEExprFn& makePredicate,
+    LeafArrayTraversalMode mode) {
+    using namespace std::literals;
+
+    invariant(level < fp.getPathLength());
+
+    // Generate the projection stage to read a sub-field at the current nested level and bind it
+    // to 'fieldVar'.
+    std::string_view fieldName{fp.getFieldName(level).rawData(), fp.getFieldName(level).size()};
+    auto fieldVar{slotIdGenerator->generate()};
+    auto fromBranch = sbe::makeProjectStage(
+        std::move(inputStage),
+        fieldVar,
+        sbe::makeE<sbe::EFunction>("getField"sv,
+                                   sbe::makeEs(sbe::makeE<sbe::EVariable>(inputVar),
+                                               sbe::makeE<sbe::EConstant>(fieldName))));
+
+    // Generate the 'in' branch for the TraverseStage that we're about to construct.
+    auto [innerVar, innerBranch] = (level == fp.getPathLength() - 1u)
+        // Base case: Genereate a ProjectStage to evaluate the predicate.
+        ? [&]() {
+              auto innerVar{slotIdGenerator->generate()};
+              return std::make_pair(
+                  innerVar,
+                  sbe::makeProjectStage(makeLimitCoScanTree(), innerVar, makePredicate(fieldVar)));
+          }()
+        // Recursive case.
+        : generateTraverseHelper(
+              makeLimitCoScanTree(), fieldVar, fp, level + 1, slotIdGenerator, makePredicate, mode);
+
+    // Generate the traverse stage for the current nested level.
+    auto outputVar{slotIdGenerator->generate()};
+    auto outputStage = sbe::makeS<sbe::TraverseStage>(
+        std::move(fromBranch),
+        std::move(innerBranch),
+        fieldVar,
+        outputVar,
+        innerVar,
+        sbe::makeSV(),
+        sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::logicOr,
+                                     sbe::makeE<sbe::EVariable>(outputVar),
+                                     sbe::makeE<sbe::EVariable>(innerVar)),
+        sbe::makeE<sbe::EVariable>(outputVar),
+        1);
+
+    // For the last level, if `mode` == kArrayAndItsElements and getField() returns an array we
+    // need to apply the predicate both to the elements of the array _and_ to the array itself.
+    // By itself, TraverseStage only applies the predicate to the elements of the array. Thus,
+    // for the last level, we add a ProjectStage so that we also apply the predicate to the array
+    // itself. (For cases where getField() doesn't return an array, this additional ProjectStage
+    // is effectively a no-op.)
+    if (mode == LeafArrayTraversalMode::kArrayAndItsElements && level == fp.getPathLength() - 1u) {
+        auto traverseVar = outputVar;
+        auto traverseStage = std::move(outputStage);
+        outputVar = slotIdGenerator->generate();
+        outputStage = sbe::makeProjectStage(
+            std::move(traverseStage),
+            outputVar,
+            sbe::makeE<sbe::EPrimBinary>(
+                sbe::EPrimBinary::logicOr,
+                makeFillEmptyFalse(sbe::makeE<sbe::EVariable>(traverseVar)),
+                sbe::makeE<sbe::EPrimBinary>(
+                    sbe::EPrimBinary::logicAnd,
+                    makeFillEmptyFalse(sbe::makeE<sbe::EFunction>(
+                        "isArray", sbe::makeEs(sbe::makeE<sbe::EVariable>(fieldVar)))),
+                    makePredicate(fieldVar))));
+    }
+
+    return {outputVar, std::move(outputStage)};
+}
+
+/*
+ * A helper function for 'generateTraverseForArraySize' similar to the 'generateTraverseHelper'. The
+ * function extends the traverse sub-tree generation by retuning a special leaf-level traverse stage
+ * that uses a fold expression to add counts of elements in the array, as well as performs an extra
+ * check that the leaf-level traversal is being done on a valid array.
+ */
+std::unique_ptr<sbe::PlanStage> generateTraverseForArraySizeHelper(
+    MatchExpressionVisitorContext* context,
+    std::unique_ptr<sbe::PlanStage> inputStage,
+    sbe::value::SlotId inputVar,
+    const SizeMatchExpression* expr,
+    size_t level) {
     using namespace std::literals;
 
     FieldPath path{expr->path()};
@@ -183,19 +302,64 @@ std::unique_ptr<sbe::PlanStage> generateTraverseHelper(MatchExpressionVisitorCon
 
     std::unique_ptr<sbe::PlanStage> innerBranch;
     if (level == path.getPathLength() - 1u) {
+        // Before generating a final leaf traverse stage, check that the thing we are about to
+        // traverse is indeed an array.
+        inputStage = sbe::makeS<sbe::FilterStage<false>>(
+            std::move(inputStage),
+            sbe::makeE<sbe::EFunction>("isArray",
+                                       sbe::makeEs(sbe::makeE<sbe::EVariable>(fieldVar))));
+
+        // Project '1' for each element in the array, then sum up using a fold expression.
         innerBranch = sbe::makeProjectStage(
             sbe::makeS<sbe::LimitSkipStage>(sbe::makeS<sbe::CoScanStage>(), 1, boost::none),
             elemPredicateVar,
-            makeEExprCallback(fieldVar));
+            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 1));
+
+        // The final traverse stage for the leaf level with a fold expression that sums up
+        // values in slot fieldVar, resulting in the count of elements in the array.
+        auto leafLevelTraverseStage = sbe::makeS<sbe::TraverseStage>(
+            std::move(inputStage),
+            std::move(innerBranch),
+            fieldVar,
+            traversePredicateVar,
+            elemPredicateVar,
+            sbe::makeSV(),
+            sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::add,
+                                         sbe::makeE<sbe::EVariable>(traversePredicateVar),
+                                         sbe::makeE<sbe::EVariable>(elemPredicateVar)),
+            nullptr,
+            1);
+
+        auto finalArrayTraverseVar{context->slotIdGenerator->generate()};
+        // Final project stage to filter based on the user provided value. If the traversal result
+        // was not evaluated to Nothing, then compare to the user provided value. If the traversal
+        // final result did evaluate to Nothing, the only way the fold expression result would be
+        // Nothing is if the array was empty, so replace Nothing with 0 and compare to the user
+        // provided value.
+        auto finalProjectStage = sbe::makeProjectStage(
+            std::move(leafLevelTraverseStage),
+            finalArrayTraverseVar,
+            sbe::makeE<sbe::EPrimBinary>(
+                sbe::EPrimBinary::eq,
+                sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, expr->getData()),
+                sbe::makeE<sbe::EIf>(
+                    sbe::makeE<sbe::EFunction>(
+                        "exists", sbe::makeEs(sbe::makeE<sbe::EVariable>(traversePredicateVar))),
+                    sbe::makeE<sbe::EVariable>(traversePredicateVar),
+                    sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 0))));
+
+        context->predicateVars.pop();
+        context->predicateVars.push(finalArrayTraverseVar);
+
+        return finalProjectStage;
     } else {
         // Generate nested traversal.
         innerBranch = sbe::makeProjectStage(
-            generateTraverseHelper(
+            generateTraverseForArraySizeHelper(
                 context,
                 sbe::makeS<sbe::LimitSkipStage>(sbe::makeS<sbe::CoScanStage>(), 1, boost::none),
                 fieldVar,
                 expr,
-                makeEExprCallback,
                 level + 1),
             elemPredicateVar,
             sbe::makeE<sbe::EVariable>(traversePredicateVar));
@@ -224,27 +388,36 @@ std::unique_ptr<sbe::PlanStage> generateTraverseHelper(MatchExpressionVisitorCon
  */
 void generateTraverse(MatchExpressionVisitorContext* context,
                       const PathMatchExpression* expr,
-                      MakePredicateEExprFn makeEExprCallback) {
-    context->predicateVars.push(context->slotIdGenerator->generate());
-    context->inputStage = generateTraverseHelper(context,
-                                                 std::move(context->inputStage),
-                                                 context->inputVar,
-                                                 expr,
-                                                 std::move(makeEExprCallback),
-                                                 0);
+                      MakePredicateEExprFn makePredicate) {
+    FieldPath fp{expr->path()};
 
-    // If this comparison expression is a branch of a logical $and expression, but not the last
-    // one, inject a filter stage to bail out early from the $and predicate without the need to
-    // evaluate all branches. If this is the last branch of the $and expression, or if it's not
-    // within a logical expression at all, just keep the predicate var on the top on the stack
-    // and let the parent expression process it.
-    if (!context->nestedLogicalExprs.empty() && context->nestedLogicalExprs.top().second > 1 &&
-        context->nestedLogicalExprs.top().first->matchType() == MatchExpression::AND) {
-        context->inputStage = sbe::makeS<sbe::FilterStage<false>>(
-            std::move(context->inputStage),
-            sbe::makeE<sbe::EVariable>(context->predicateVars.top()));
-        context->predicateVars.pop();
-    }
+    auto [slot, stage] = generateTraverseHelper(std::move(context->inputStage),
+                                                context->inputVar,
+                                                fp,
+                                                0,
+                                                context->slotIdGenerator,
+                                                makePredicate,
+                                                LeafArrayTraversalMode::kArrayAndItsElements);
+
+    context->predicateVars.push(slot);
+    context->inputStage = std::move(stage);
+
+    // Check if can bail out early from the $and predicate if this expression is part of branch.
+    checkForShortCircuitFromLogicalAnd(context);
+}
+
+/**
+ * Generates a path traversal SBE plan stage sub-tree for matching arrays with '$size'. Applies
+ * an extra project on top of the sub-tree to filter based on user provided value.
+ */
+void generateTraverseForArraySize(MatchExpressionVisitorContext* context,
+                                  const SizeMatchExpression* expr) {
+    context->predicateVars.push(context->slotIdGenerator->generate());
+    context->inputStage = generateTraverseForArraySizeHelper(
+        context, std::move(context->inputStage), context->inputVar, expr, 0);
+
+    // Check if can bail out early from the $and predicate if this expression is part of branch.
+    checkForShortCircuitFromLogicalAnd(context);
 }
 
 /**
@@ -262,8 +435,8 @@ void generateTraverseForComparisonPredicate(MatchExpressionVisitorContext* conte
         // SBE EConstant assumes ownership of the value so we have to make a copy here.
         auto [tag, val] = sbe::value::copyValue(tagView, valView);
 
-        return sbe::makeE<sbe::EPrimBinary>(
-            binaryOp, sbe::makeE<sbe::EVariable>(inputSlot), sbe::makeE<sbe::EConstant>(tag, val));
+        return makeFillEmptyFalse(sbe::makeE<sbe::EPrimBinary>(
+            binaryOp, sbe::makeE<sbe::EVariable>(inputSlot), sbe::makeE<sbe::EConstant>(tag, val)));
     };
     generateTraverse(context, expr, std::move(makeEExprFn));
 }
@@ -449,9 +622,7 @@ public:
     }
     void visit(const LTEMatchExpression* expr) final {}
     void visit(const LTMatchExpression* expr) final {}
-    void visit(const ModMatchExpression* expr) final {
-        unsupportedExpression(expr);
-    }
+    void visit(const ModMatchExpression* expr) final {}
     void visit(const NorMatchExpression* expr) final {
         unsupportedExpression(expr);
     }
@@ -462,9 +633,7 @@ public:
         _context->nestedLogicalExprs.push({expr, expr->numChildren()});
     }
     void visit(const RegexMatchExpression* expr) final {}
-    void visit(const SizeMatchExpression* expr) final {
-        unsupportedExpression(expr);
-    }
+    void visit(const SizeMatchExpression* expr) final {}
     void visit(const TextMatchExpression* expr) final {
         unsupportedExpression(expr);
     }
@@ -474,9 +643,7 @@ public:
     void visit(const TwoDPtInAnnulusExpression* expr) final {
         unsupportedExpression(expr);
     }
-    void visit(const TypeMatchExpression* expr) final {
-        unsupportedExpression(expr);
-    }
+    void visit(const TypeMatchExpression* expr) final {}
     void visit(const WhereMatchExpression* expr) final {
         unsupportedExpression(expr);
     }
@@ -554,7 +721,24 @@ public:
     void visit(const LTMatchExpression* expr) final {
         generateTraverseForComparisonPredicate(_context, expr, sbe::EPrimBinary::less);
     }
-    void visit(const ModMatchExpression* expr) final {}
+    void visit(const ModMatchExpression* expr) final {
+        // The mod function returns the result of the mod operation between the operand and given
+        // divisor, so construct an expression to then compare the result of the operation to the
+        // given remainder.
+        auto makeEExprFn = [expr](sbe::value::SlotId inputSlot) {
+            return makeFillEmptyFalse(sbe::makeE<sbe::EPrimBinary>(
+                sbe::EPrimBinary::eq,
+                sbe::makeE<sbe::EFunction>(
+                    "mod",
+                    sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot),
+                                sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
+                                                           expr->getDivisor()))),
+                sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
+                                           expr->getRemainder())));
+        };
+
+        generateTraverse(_context, expr, std::move(makeEExprFn));
+    }
     void visit(const NorMatchExpression* expr) final {}
     void visit(const NotMatchExpression* expr) final {}
     void visit(const OrMatchExpression* expr) final {
@@ -580,25 +764,31 @@ public:
             // TODO: In the future, this needs to account for the fact that the regex match
             // expression matches strings, but also matches stored regexes. For example,
             // {$match: {a: /foo/}} matches the document {a: /foo/} in addition to {a: "foobar"}.
-            return sbe::makeE<sbe::EPrimBinary>(
-                sbe::EPrimBinary::logicAnd,
-                sbe::makeE<sbe::EFunction>("isString",
-                                           sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot))),
-                sbe::makeE<sbe::EFunction>(
-                    "regexMatch",
-                    sbe::makeEs(
-                        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::pcreRegex, ownedRegexVal),
-                        sbe::makeE<sbe::EVariable>(inputSlot))));
+            return makeFillEmptyFalse(sbe::makeE<sbe::EFunction>(
+                "regexMatch",
+                sbe::makeEs(
+                    sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::pcreRegex, ownedRegexVal),
+                    sbe::makeE<sbe::EVariable>(inputSlot))));
         };
 
         generateTraverse(_context, expr, std::move(makeEExprFn));
     }
 
-    void visit(const SizeMatchExpression* expr) final {}
+    void visit(const SizeMatchExpression* expr) final {
+        generateTraverseForArraySize(_context, expr);
+    }
+
     void visit(const TextMatchExpression* expr) final {}
     void visit(const TextNoOpMatchExpression* expr) final {}
     void visit(const TwoDPtInAnnulusExpression* expr) final {}
-    void visit(const TypeMatchExpression* expr) final {}
+    void visit(const TypeMatchExpression* expr) final {
+        auto makeEExprFn = [expr](sbe::value::SlotId inputSlot) {
+            const MatcherTypeSet& ts = expr->typeSet();
+            return sbe::makeE<sbe::ETypeMatch>(sbe::makeE<sbe::EVariable>(inputSlot),
+                                               ts.getBSONTypeMask());
+        };
+        generateTraverse(_context, expr, std::move(makeEExprFn));
+    }
     void visit(const WhereMatchExpression* expr) final {}
     void visit(const WhereNoOpMatchExpression* expr) final {}
 

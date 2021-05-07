@@ -37,10 +37,12 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/transport/mock_session.h"
 #include "mongo/transport/service_executor_fixed.h"
 #include "mongo/transport/service_executor_gen.h"
 #include "mongo/transport/service_executor_synchronous.h"
 #include "mongo/transport/transport_layer.h"
+#include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
@@ -146,7 +148,7 @@ void scheduleBasicTask(ServiceExecutor* exec, bool expectSuccess) {
     auto barrier = std::make_shared<unittest::Barrier>(2);
     auto task = [barrier] { barrier->countDownAndWait(); };
 
-    auto status = exec->schedule(std::move(task), ServiceExecutor::kEmptyFlags);
+    auto status = exec->scheduleTask(std::move(task), ServiceExecutor::kEmptyFlags);
     if (expectSuccess) {
         ASSERT_OK(status);
         barrier->countDownAndWait();
@@ -170,74 +172,76 @@ class ServiceExecutorFixedFixture : public unittest::Test {
 public:
     static constexpr auto kNumExecutorThreads = 2;
 
-    void setUp() override {
-        ThreadPool::Options options;
-        options.minThreads = options.maxThreads = kNumExecutorThreads;
-        options.poolName = "Test";
-        _executor = std::make_shared<ServiceExecutorFixed>(std::move(options));
-    }
+    class ServiceExecutorHandle {
+    public:
+        static constexpr int kNone = 0b00;
+        static constexpr int kStartExecutor = 0b01;
+        static constexpr int kSkipShutdown = 0b10;
 
-    void tearDown() override {
-        if (_skipShutdown)
-            return;
-        ASSERT_OK(_executor->shutdown(kShutdownTime));
-    }
+        ServiceExecutorHandle() = delete;
+        ServiceExecutorHandle(const ServiceExecutorHandle&) = delete;
+        ServiceExecutorHandle(ServiceExecutorHandle&&) = delete;
 
-    void skipShutdown(bool skip) {
-        _skipShutdown = skip;
-    }
+        explicit ServiceExecutorHandle(int flags = kNone) : _skipShutdown(flags & kSkipShutdown) {
+            ThreadPool::Options options;
+            options.minThreads = options.maxThreads = kNumExecutorThreads;
+            options.poolName = "Test";
+            _executor = std::make_shared<ServiceExecutorFixed>(std::move(options));
 
-    auto getServiceExecutor() const {
-        return _executor;
-    }
+            if (flags & kStartExecutor) {
+                ASSERT_OK(_executor->start());
+            }
+        }
 
-    auto startAndGetServiceExecutor() {
-        ASSERT_OK(_executor->start());
-        return getServiceExecutor();
-    }
+        ~ServiceExecutorHandle() {
+            if (_skipShutdown) {
+                LOGV2(4987901, "Skipped shutting down the executor");
+            } else {
+                invariant(_executor->shutdown(kShutdownTime));
+            }
+        }
 
-    auto makeRecursionGuard() {
-        _recursionDepth.fetchAndAdd(1);
-        return makeGuard([this] { _recursionDepth.fetchAndSubtract(1); });
-    }
+        std::shared_ptr<ServiceExecutorFixed> operator->() noexcept {
+            return _executor;
+        }
 
-    auto getRecursionDepth() const {
-        return _recursionDepth.load();
-    }
+        std::shared_ptr<ServiceExecutorFixed> operator*() noexcept {
+            return _executor;
+        }
 
-private:
-    AtomicWord<int> _recursionDepth{0};
-    bool _skipShutdown = false;
-    std::shared_ptr<ServiceExecutorFixed> _executor;
+    private:
+        const bool _skipShutdown;
+        std::shared_ptr<ServiceExecutorFixed> _executor;
+    };
 };
 
 TEST_F(ServiceExecutorFixedFixture, ScheduleFailsBeforeStartup) {
-    auto executor = getServiceExecutor();
-    ASSERT_NOT_OK(executor->schedule([] {}, ServiceExecutor::kEmptyFlags));
+    ServiceExecutorHandle executorHandle(ServiceExecutorHandle::kSkipShutdown);
+    ASSERT_NOT_OK(executorHandle->scheduleTask([] {}, ServiceExecutor::kEmptyFlags));
 }
 
 DEATH_TEST_F(ServiceExecutorFixedFixture, DestructorFailsBeforeShutdown, "invariant") {
-    startAndGetServiceExecutor();
-    skipShutdown(true);
+    ServiceExecutorHandle executorHandle(ServiceExecutorHandle::kStartExecutor |
+                                         ServiceExecutorHandle::kSkipShutdown);
 }
 
 TEST_F(ServiceExecutorFixedFixture, BasicTaskRuns) {
-    auto executor = startAndGetServiceExecutor();
+    ServiceExecutorHandle executorHandle(ServiceExecutorHandle::kStartExecutor);
     auto barrier = std::make_shared<unittest::Barrier>(2);
-    ASSERT_OK(executor->schedule([barrier]() mutable { barrier->countDownAndWait(); },
-                                 ServiceExecutor::kEmptyFlags));
+    ASSERT_OK(executorHandle->scheduleTask([barrier]() mutable { barrier->countDownAndWait(); },
+                                           ServiceExecutor::kEmptyFlags));
     barrier->countDownAndWait();
 }
 
 TEST_F(ServiceExecutorFixedFixture, RecursiveTask) {
-    auto executor = startAndGetServiceExecutor();
+    ServiceExecutorHandle executorHandle(ServiceExecutorHandle::kStartExecutor);
     auto barrier = std::make_shared<unittest::Barrier>(2);
 
     std::function<void()> recursiveTask;
-    recursiveTask = [&, barrier] {
-        auto recursionGuard = makeRecursionGuard();
-        if (getRecursionDepth() < fixedServiceExecutorRecursionLimit.load()) {
-            ASSERT_OK(executor->schedule(recursiveTask, ServiceExecutor::kMayRecurse));
+    recursiveTask = [&, barrier, executor = *executorHandle] {
+        if (executor->getRecursionDepthForExecutorThread() <
+            fixedServiceExecutorRecursionLimit.load()) {
+            ASSERT_OK(executor->scheduleTask(recursiveTask, ServiceExecutor::kMayRecurse));
         } else {
             // This test never returns unless the service executor can satisfy the recursion depth.
             barrier->countDownAndWait();
@@ -245,12 +249,12 @@ TEST_F(ServiceExecutorFixedFixture, RecursiveTask) {
     };
 
     // Schedule recursive task and wait for the recursion to stop
-    ASSERT_OK(executor->schedule(recursiveTask, ServiceExecutor::kMayRecurse));
+    ASSERT_OK(executorHandle->scheduleTask(recursiveTask, ServiceExecutor::kMayRecurse));
     barrier->countDownAndWait();
 }
 
 TEST_F(ServiceExecutorFixedFixture, FlattenRecursiveScheduledTasks) {
-    auto executor = startAndGetServiceExecutor();
+    ServiceExecutorHandle executorHandle(ServiceExecutorHandle::kStartExecutor);
     auto barrier = std::make_shared<unittest::Barrier>(2);
     AtomicWord<int> tasksToSchedule{fixedServiceExecutorRecursionLimit.load() * 3};
 
@@ -258,11 +262,10 @@ TEST_F(ServiceExecutorFixedFixture, FlattenRecursiveScheduledTasks) {
     // "tasksToSchedule" tasks to the service executor, and each scheduled task verifies that the
     // recursion depth remains zero during its execution.
     std::function<void()> recursiveTask;
-    recursiveTask = [&, barrier] {
-        auto recursionGuard = makeRecursionGuard();
-        ASSERT_EQ(getRecursionDepth(), 1);
+    recursiveTask = [&, barrier, executor = *executorHandle] {
+        ASSERT_EQ(executor->getRecursionDepthForExecutorThread(), 1);
         if (tasksToSchedule.fetchAndSubtract(1) > 0) {
-            ASSERT_OK(executor->schedule(recursiveTask, ServiceExecutor::kEmptyFlags));
+            ASSERT_OK(executor->scheduleTask(recursiveTask, ServiceExecutor::kEmptyFlags));
         } else {
             // Once there are no more tasks to schedule, notify the main thread to proceed.
             barrier->countDownAndWait();
@@ -270,64 +273,62 @@ TEST_F(ServiceExecutorFixedFixture, FlattenRecursiveScheduledTasks) {
     };
 
     // Schedule the recursive task and wait for the execution to finish.
-    ASSERT_OK(executor->schedule(recursiveTask, ServiceExecutor::kMayYieldBeforeSchedule));
+    ASSERT_OK(
+        executorHandle->scheduleTask(recursiveTask, ServiceExecutor::kMayYieldBeforeSchedule));
     barrier->countDownAndWait();
 }
 
 TEST_F(ServiceExecutorFixedFixture, ShutdownTimeLimit) {
-    auto executor = startAndGetServiceExecutor();
+    ServiceExecutorHandle executorHandle(ServiceExecutorHandle::kStartExecutor);
     auto invoked = std::make_shared<SharedPromise<void>>();
     auto mayReturn = std::make_shared<SharedPromise<void>>();
 
-    ASSERT_OK(executor->schedule(
-        [executor, invoked, mayReturn]() mutable {
+    ASSERT_OK(executorHandle->scheduleTask(
+        [executor = *executorHandle, invoked, mayReturn]() mutable {
             invoked->emplaceValue();
             mayReturn->getFuture().get();
         },
         ServiceExecutor::kEmptyFlags));
 
     invoked->getFuture().get();
-    ASSERT_NOT_OK(executor->shutdown(kShutdownTime));
+    ASSERT_NOT_OK(executorHandle->shutdown(kShutdownTime));
 
     // Ensure the service executor is stopped before leaving the test.
     mayReturn->emplaceValue();
 }
 
 TEST_F(ServiceExecutorFixedFixture, Stats) {
-    auto executor = startAndGetServiceExecutor();
-    auto barrier = std::make_shared<unittest::Barrier>(kNumExecutorThreads + 1);
-    stdx::condition_variable cond;
+    ServiceExecutorHandle executorHandle(ServiceExecutorHandle::kStartExecutor);
+    auto rendezvousBarrier = std::make_shared<unittest::Barrier>(kNumExecutorThreads + 1);
+    auto returnBarrier = std::make_shared<unittest::Barrier>(kNumExecutorThreads + 1);
 
-    auto task = [barrier, &cond]() mutable {
-        cond.notify_one();
-        barrier->countDownAndWait();
+    auto task = [rendezvousBarrier, returnBarrier]() mutable {
+        rendezvousBarrier->countDownAndWait();
+        // Executor threads wait here for the main thread to test "executor->appendStats()".
+        returnBarrier->countDownAndWait();
     };
 
     for (auto i = 0; i < kNumExecutorThreads; i++) {
-        ASSERT_OK(executor->schedule(task, ServiceExecutor::kEmptyFlags));
+        ASSERT_OK(executorHandle->scheduleTask(task, ServiceExecutor::kEmptyFlags));
     }
 
     // The main thread waits for the executor threads to bump up "threadsRunning" while picking up a
-    // task to execute. Once all executor threads are running, the main thread will unblock them
-    // through the barrier.
-    auto mutex = MONGO_MAKE_LATCH();
-    stdx::unique_lock<Latch> lk(mutex);
-    cond.wait(lk, [&executor]() {
-        BSONObjBuilder bob;
-        executor->appendStats(&bob);
-        auto obj = bob.obj();
-        ASSERT(obj.hasField("threadsRunning"));
-        auto threadsRunning = obj.getIntField("threadsRunning");
-        LOGV2_DEBUG(
-            4910503, 1, "Checked number of executor threads", "threads"_attr = threadsRunning);
-        return threadsRunning == static_cast<int>(ServiceExecutorFixedFixture::kNumExecutorThreads);
-    });
+    // task to execute. Once all executor threads are running (rendezvous) and the main thread is
+    // done testing the stats, the main thread will unblock them through "returnBarrier".
+    rendezvousBarrier->countDownAndWait();
 
-    barrier->countDownAndWait();
+    BSONObjBuilder bob;
+    executorHandle->appendStats(&bob);
+    auto obj = bob.obj();
+    ASSERT(obj.hasField("threadsRunning"));
+    auto threadsRunning = obj.getIntField("threadsRunning");
+    ASSERT_EQ(threadsRunning, static_cast<int>(ServiceExecutorFixedFixture::kNumExecutorThreads));
+
+    returnBarrier->countDownAndWait();
 }
 
 TEST_F(ServiceExecutorFixedFixture, ScheduleFailsAfterShutdown) {
-    auto executor = startAndGetServiceExecutor();
+    ServiceExecutorHandle executorHandle(ServiceExecutorHandle::kStartExecutor);
     std::unique_ptr<stdx::thread> schedulerThread;
 
     {
@@ -335,15 +336,37 @@ TEST_F(ServiceExecutorFixedFixture, ScheduleFailsAfterShutdown) {
         // underlying thread-pool. Then shutdown the service executor and unblock the scheduler
         // thread. This order of events must cause "schedule()" to return a non-okay status.
         FailPointEnableBlock failpoint("hangBeforeSchedulingServiceExecutorFixedTask");
-        schedulerThread = std::make_unique<stdx::thread>([executor] {
+        schedulerThread = std::make_unique<stdx::thread>([executor = *executorHandle] {
             ASSERT_NOT_OK(
-                executor->schedule([] { MONGO_UNREACHABLE; }, ServiceExecutor::kEmptyFlags));
+                executor->scheduleTask([] { MONGO_UNREACHABLE; }, ServiceExecutor::kEmptyFlags));
         });
         failpoint->waitForTimesEntered(1);
-        ASSERT_OK(executor->shutdown(kShutdownTime));
+        ASSERT_OK(executorHandle->shutdown(kShutdownTime));
     }
 
     schedulerThread->join();
+}
+
+TEST_F(ServiceExecutorFixedFixture, RunTaskAfterWaitingForData) {
+    auto tl = std::make_unique<TransportLayerMock>();
+    auto session = tl->createSession();
+
+    ServiceExecutorHandle executorHandle(ServiceExecutorHandle::kStartExecutor);
+
+    const auto mainThreadId = stdx::this_thread::get_id();
+    AtomicWord<bool> ranOnDataAvailable{false};
+    auto barrier = std::make_shared<unittest::Barrier>(2);
+    executorHandle->runOnDataAvailable(
+        session.get(), [&ranOnDataAvailable, mainThreadId, barrier](Status) mutable -> void {
+            ranOnDataAvailable.store(true);
+            ASSERT(stdx::this_thread::get_id() != mainThreadId);
+            barrier->countDownAndWait();
+        });
+
+    ASSERT(!ranOnDataAvailable.load());
+    reinterpret_cast<MockSession*>(session.get())->signalAvailableData();
+    barrier->countDownAndWait();
+    ASSERT(ranOnDataAvailable.load());
 }
 
 }  // namespace

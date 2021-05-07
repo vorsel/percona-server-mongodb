@@ -570,6 +570,10 @@ public:
         if (item == RadixStore::end())
             return std::make_pair(item, false);
 
+        // Setting the same value is a no-op
+        if (item->second == value.second)
+            return std::make_pair(item, false);
+
         return _upsertWithCopyOnSharedNodes(key, std::move(value));
     }
 
@@ -957,9 +961,8 @@ private:
             _metrics.subtractMemory(sizeof(Head) - sizeof(Node));
         }
 
-        Head(Head&& other) : Node(std::move(other)) {
-            // TODO SERVER-49100: Move other fields in Head class.
-        }
+        Head(Head&& other)
+            : Node(std::move(other)), _count(other._count), _dataSize(other._dataSize) {}
 
         bool hasPreviousVersion() const {
             return _hasPreviousVersion;
@@ -1566,8 +1569,18 @@ private:
                 // If all three are unique and leaf nodes with different data, then it is a merge
                 // conflict.
                 if (node->isLeaf() && baseNode->isLeaf() && otherNode->isLeaf()) {
-                    if (node->_data != baseNode->_data || baseNode->_data != otherNode->_data)
+                    bool dataChanged = node->_data != baseNode->_data;
+                    bool otherDataChanged = baseNode->_data != otherNode->_data;
+                    if (dataChanged && otherDataChanged) {
+                        // All three nodes have different data, that is a merge conflict
                         throw merge_conflict_exception();
+                    }
+                    if (otherDataChanged) {
+                        // Only other changed the data. Take that node
+                        current = _makeBranchUnique(context);
+                        _rebuildContext(context, trieKeyIndex);
+                        current->_children[key] = other->_children[key];
+                    }
                     continue;
                 }
 

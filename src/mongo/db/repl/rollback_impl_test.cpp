@@ -528,7 +528,11 @@ TEST_F(RollbackImplTest, RollbackKillsNecessaryOperations) {
 
     // Run rollback in a separate thread so the locking threads can check for interrupt.
     Status status(ErrorCodes::InternalError, "Not set");
-    stdx::thread rollbackThread([&] { status = _rollback->runRollback(_opCtx.get()); });
+    stdx::thread rollbackThread([&] {
+        ThreadClient tc(getGlobalServiceContext());
+        auto opCtx = tc.get()->makeOperationContext();
+        status = _rollback->runRollback(opCtx.get());
+    });
 
     while (!(writeOpCtx->isKillPending() && readOpCtx->isKillPending())) {
         // Do nothing.
@@ -1444,7 +1448,8 @@ RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
                                          boost::none,                // statementId
                                          OpTime(),                   // prevWriteOpTimeInTransaction
                                          boost::none,                // preImageOpTime
-                                         boost::none);               // postImageOpTime
+                                         boost::none,                // postImageOpTime
+                                         boost::none);  // ShardId of resharding recipient
     ASSERT_OK(_insertOplogEntry(partialApplyOpsOplogEntry.toBSON()));
     ops.push_back(std::make_pair(partialApplyOpsOplogEntry.toBSON(), insertOp2.second));
 
@@ -1475,7 +1480,8 @@ RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
                                         boost::none,                // statementId
                                         partialApplyOpsOpTime,      // prevWriteOpTimeInTransaction
                                         boost::none,                // preImageOpTime
-                                        boost::none);               // postImageOpTime
+                                        boost::none,                // postImageOpTime
+                                        boost::none);  // ShardId of resharding recipient
     ASSERT_OK(_insertOplogEntry(commitApplyOpsOplogEntry.toBSON()));
     ops.push_back(std::make_pair(commitApplyOpsOplogEntry.toBSON(), insertOp3.second));
 

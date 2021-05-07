@@ -160,9 +160,9 @@ public:
              BSONObjBuilder* out,
              LogicalTime time,
              Component component) const override {
-        const auto& fcv = serverGlobalParams.featureCompatibility;
-        if (fcv.isVersionInitialized() &&
-            fcv.getVersion() == ServerGlobalParams::FeatureCompatibility::Version::kVersion451) {
+        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+            serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+                ServerGlobalParams::FeatureCompatibility::Version::kVersion47)) {
             return ActualFormat::out(service, opCtx, permitRefresh, out, time, component);
         }
         return false;
@@ -400,7 +400,7 @@ void VectorClock::resetVectorClock_forTest() {
     _isEnabled = true;
 }
 
-void VectorClock::advanceTime_forTest(Component component, LogicalTime newTime) {
+void VectorClock::_advanceTime_forTest(Component component, LogicalTime newTime) {
     LogicalTimeArray newTimeArray;
     newTimeArray[component] = newTime;
     _advanceTime(std::move(newTimeArray));

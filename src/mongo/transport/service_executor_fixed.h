@@ -56,13 +56,22 @@ public:
 
     Status start() override;
     Status shutdown(Milliseconds timeout) override;
-    Status schedule(Task task, ScheduleFlags flags) override;
+    Status scheduleTask(Task task, ScheduleFlags flags) override;
+
+    void runOnDataAvailable(Session* session,
+                            OutOfLineExecutor::Task onCompletionCallback) override;
 
     Mode transportMode() const override {
         return Mode::kSynchronous;
     }
 
     void appendStats(BSONObjBuilder* bob) const override;
+
+    /**
+     * Returns the recursion depth of the active executor thread.
+     * It is forbidden to invoke this method outside scheduled tasks.
+     */
+    int getRecursionDepthForExecutorThread() const;
 
 private:
     // Maintains the execution state (e.g., recursion depth) for executor threads

@@ -258,6 +258,8 @@ std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::buildSort(const QuerySolu
                                       std::move(values),
                                       sn->limit ? sn->limit
                                                 : std::numeric_limits<std::size_t>::max(),
+                                      internalQueryMaxBlockingSortMemoryUsageBytes.load(),
+                                      _cq.getExpCtx()->allowDiskUse,
                                       _data.trialRunProgressTracker.get());
 }
 
@@ -303,8 +305,12 @@ std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::buildProjectionDefault(
     auto pn = static_cast<const ProjectionNodeDefault*>(root);
     auto inputStage = build(pn->children[0]);
     invariant(_data.resultSlot);
-    auto [slot, stage] = generateProjection(
-        &pn->proj, std::move(inputStage), &_slotIdGenerator, &_frameIdGenerator, *_data.resultSlot);
+    auto [slot, stage] = generateProjection(_opCtx,
+                                            &pn->proj,
+                                            std::move(inputStage),
+                                            &_slotIdGenerator,
+                                            &_frameIdGenerator,
+                                            *_data.resultSlot);
     _data.resultSlot = slot;
     return std::move(stage);
 }

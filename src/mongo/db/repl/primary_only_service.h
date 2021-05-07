@@ -41,9 +41,7 @@
 #include "mongo/executor/scoped_task_executor.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/mutex.h"
-#include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/future.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -86,42 +84,26 @@ public:
      */
     class Instance {
     public:
-        struct RunOnceResult {
-            enum State {
-                kKeepRunning,
-                kFinished,
-            };
-            // If set to kFinished signals that the task this Instance represents is complete, and
-            // both the in-memory Instance object and the on-disk state document can be cleaned up.
-            State state = kKeepRunning;
-
-            // If set, signals that the next call to 'runOnce' on this instance shouldn't occur
-            // until this optime is majority committed.
-            boost::optional<OpTime> optime;
-
-            static RunOnceResult kComplete() {
-                return RunOnceResult{kFinished, boost::none};
-            }
-
-            static RunOnceResult kKeepGoing(OpTime ot) {
-                return RunOnceResult{kKeepRunning, std::move(ot)};
-            }
-
-        private:
-            RunOnceResult(State st, boost::optional<OpTime> ot)
-                : state(std::move(st)), optime(std::move(ot)) {}
-        };
-
         virtual ~Instance() = default;
 
         /**
-         * This is the main function that PrimaryOnlyService implementations will need to implement,
-         * and is where the bulk of the work those services perform is executed. The
-         * PrimaryOnlyService machinery will call this function repeatedly until the RunOnceResult
-         * returned has 'complete' set to true, at which point the state document will be deleted
-         * and the Instance destroyed.
+         * Schedules work to call this instance's 'run' method against the provided
+         * ScopedTaskExecutor. Also includes checking to ensure that run is only ever scheduled
+         * once.
          */
-        virtual SemiFuture<RunOnceResult> runOnce(OperationContext* opCtx) = 0;
+        void scheduleRun(std::shared_ptr<executor::ScopedTaskExecutor> executor);
+
+    protected:
+        /**
+         * This is the main function that PrimaryOnlyService implementations will need to implement,
+         * and is where the bulk of the work those services perform is scheduled. All work run for
+         * this Instance should be scheduled on 'executor'. Instances are responsible for inserting,
+         * updating, and deleting their state documents as needed.
+         */
+        virtual void run(std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept = 0;
+
+    private:
+        bool _running = false;
     };
 
     /**
@@ -136,17 +118,27 @@ public:
         virtual ~TypedInstance() = default;
 
         /**
-         * Same functionality as PrimaryOnlyService::lookupInstanceBase, but returns a pointer of
+         * Same functionality as PrimaryOnlyService::lookupInstance, but returns a pointer of
          * the proper derived class for the Instance.
          */
         static boost::optional<std::shared_ptr<InstanceType>> lookup(PrimaryOnlyService* service,
                                                                      const InstanceID& id) {
-            auto instance = service->lookupInstanceBase(id);
+            auto instance = service->lookupInstance(id);
             if (!instance) {
                 return boost::none;
             }
 
             return checked_pointer_cast<InstanceType>(instance.get());
+        }
+
+        /**
+         * Same functionality as PrimaryOnlyService::getOrCreateInstance, but returns a pointer of
+         * the proper derived class for the Instance.
+         */
+        static std::shared_ptr<InstanceType> getOrCreate(PrimaryOnlyService* service,
+                                                         BSONObj initialState) {
+            auto instance = service->getOrCreateInstance(std::move(initialState));
+            return checked_pointer_cast<InstanceType>(instance);
         }
     };
 
@@ -165,6 +157,17 @@ public:
     virtual NamespaceString getStateDocumentsNS() const = 0;
 
     /**
+     * Constructs and starts up _executor.
+     */
+    void startup(OperationContext* opCtx);
+
+    /**
+     * Releases all running Instances, then shuts down and joins _executor, ensuring that
+     * there are no remaining tasks running.
+     */
+    void shutdown();
+
+    /**
      * Called on transition to primary. Resumes any running Instances of this service
      * based on their persisted state documents. Also joins() any outstanding jobs from the previous
      * term, thereby ensuring that two Instance objects with the same InstanceID cannot coexist.
@@ -179,26 +182,7 @@ public:
      */
     void onStepDown();
 
-    /**
-     * Releases all running Instances, then shuts down and joins _executor, ensuring that there are
-     * no remaining tasks running.
-     */
-    void shutdown();
-
-    /**
-     * Writes the given 'initialState' object to the service's state document collection and then
-     * schedules work to construct an in-memory instance object and start it running, as soon as the
-     * write of the state object is majority committed.  This is the main way that consumers can
-     * start up new PrimaryOnlyService tasks.
-     */
-    SemiFuture<InstanceID> startNewInstance(OperationContext* opCtx, BSONObj initialState);
-
 protected:
-    /**
-     * Returns a ScopedTaskExecutor used to run instances of this service.
-     */
-    virtual std::unique_ptr<executor::ScopedTaskExecutor> getTaskExecutor() = 0;
-
     /**
      * Constructs a new Instance object with the given initial state.
      */
@@ -206,26 +190,37 @@ protected:
 
     /**
      * Given an InstanceId returns the corresponding running Instance object, or boost::none if
-     * there is none. Note that 'lookupInstanceBase' will not find a newly added Instance until the
-     * Future returned by the call to 'startNewInstance' that added it resolves.
+     * there is none.
      */
-    boost::optional<std::shared_ptr<Instance>> lookupInstanceBase(const InstanceID& id);
+    boost::optional<std::shared_ptr<Instance>> lookupInstance(const InstanceID& id);
+
+    /**
+     * Extracts an InstanceID from the _id field of the given 'initialState' object. If an Instance
+     * with the extracted InstanceID already exists in _intances, returns it.  If not, constructs a
+     * new Instance (by calling constructInstance()), registers it in _instances, and returns it.
+     * It is illegal to call this more than once with 'initialState' documents that have the same
+     * _id but are otherwise not completely identical.
+     * Throws NotMaster if the node is not currently primary.
+     */
+    std::shared_ptr<Instance> getOrCreateInstance(BSONObj initialState);
 
 private:
     ServiceContext* const _serviceContext;
 
     Mutex _mutex = MONGO_MAKE_LATCH("PrimaryOnlyService::_mutex");
 
-    // A ScopedTaskExecutor that is used to schedule calls to runOnce against Instance objects.
-    // PrimaryOnlyService implementations are responsible for creating a TaskExecutor configured
-    // with the desired options.  The size of the thread pool within the TaskExecutor limits the
-    // number of Instances of this PrimaryOnlyService that can be actively running on a thread
-    // simultaneously (though it does not limit the number of Instance objects that can
-    // simultaneously exist).
-    // This ScopedTaskExecutor wraps the TaskExecutor owned by the PrimaryOnlyService
-    // implementation, and is created at stepUp and destroyed at stepDown so that all outstanding
-    // tasks get interrupted.
-    std::unique_ptr<executor::ScopedTaskExecutor> _executor;
+    // A ScopedTaskExecutor that is used to perform all work run on behalf of an Instance.
+    // This ScopedTaskExecutor wraps _executor and is created at stepUp and destroyed at
+    // stepDown so that all outstanding tasks get interrupted.
+    std::shared_ptr<executor::ScopedTaskExecutor> _scopedExecutor;
+
+    // The concrete TaskExecutor backing _scopedExecutor. While _scopedExecutor is created and
+    // destroyed with each stepUp/stepDown, _executor persists for the lifetime of the process. We
+    // want _executor to survive failover to prevent us from having to reallocate lots of
+    // thread and connection resources on every stepUp. Service instances should never have access
+    // to _executor directly, they should only ever use _scopedExecutor so that they get the
+    // guarantee that all outstanding tasks are interrupted at stepDown.
+    std::shared_ptr<executor::TaskExecutor> _executor;
 
     enum class State {
         kRunning,
@@ -233,13 +228,14 @@ private:
         kShutdown,
     };
 
-    State _state = State::kRunning;
+    State _state = State::kPaused;
 
     // The term that this service is running under.
     long long _term = OpTime::kUninitializedTerm;
 
     // Map of running instances, keyed by InstanceID.
-    SimpleBSONObjUnorderedMap<std::shared_ptr<Instance>> _instances;
+    using InstanceMap = SimpleBSONObjUnorderedMap<std::shared_ptr<Instance>>;
+    InstanceMap _instances;
 };
 
 /**
@@ -274,8 +270,9 @@ public:
      */
     void shutdown();
 
+    void onStartup(OperationContext*) final;
     void onStepUpBegin(OperationContext*, long long term) final {}
-    void onBecomeArbiter() final{};
+    void onBecomeArbiter() final {}
     void onStepUpComplete(OperationContext*, long long term) final;
     void onStepDown() final;
 

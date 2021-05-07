@@ -751,6 +751,11 @@ TEST_F(RadixStoreTest, UpdateTest) {
     ASSERT_TRUE(it2 == thisStore.end());
 }
 
+TEST_F(RadixStoreTest, UpdateExistingSameDataTest) {
+    thisStore.insert({"a", "a"});
+    ASSERT_FALSE(thisStore.update({"a", "a"}).second);
+}
+
 TEST_F(RadixStoreTest, DuplicateKeyTest) {
     std::string msg1 = "Hello, world!";
     std::string msg2 = msg1 + "!!";
@@ -1424,6 +1429,24 @@ TEST_F(RadixStoreTest, MergeInsertions) {
     }
 
     ASSERT_EQ(itemsVisited, 4);
+}
+
+TEST_F(RadixStoreTest, MergeAllDifferentLeafOnlyOtherChanged) {
+    baseStore.insert({"aa", "a"});
+
+    otherStore = baseStore;
+    otherStore.update({"aa", "b"});
+
+    thisStore = baseStore;
+    // Force 'aa' to get a new node but still be a leaf
+    thisStore.insert({"aaa", "a"});
+    thisStore.erase("aaa");
+
+    // This should not be a merge conflict, only other actually changed 'aa'
+    thisStore.merge3(baseStore, otherStore);
+
+    expected.insert({"aa", "b"});
+    ASSERT_TRUE(thisStore == expected);
 }
 
 TEST_F(RadixStoreTest, MergeConflictingPathCompressedKeys) {

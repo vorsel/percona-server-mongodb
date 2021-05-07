@@ -35,6 +35,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/rpc/message.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
 #include "mongo/util/polymorphic_scoped.h"
 
 namespace mongo {
@@ -48,7 +49,7 @@ extern FailPoint skipCheckingForNotMasterInCommandDispatch;
 
 /**
  * Helpers for writing ServiceEntryPointImpl implementations from a reusable core.
- * Implementations are ServiceEntryPointMongo and ServiceEntryPointEmbedded, which share
+ * Implementations are ServiceEntryPointMongod and ServiceEntryPointEmbedded, which share
  * most of their code, but vary in small details captured by the Hooks customization
  * interface.
  */
@@ -98,7 +99,9 @@ struct ServiceEntryPointCommon {
                                          BSONObjBuilder* metadataBob) const = 0;
     };
 
-    static DbResponse handleRequest(OperationContext* opCtx, const Message& m, const Hooks& hooks);
+    static Future<DbResponse> handleRequest(OperationContext* opCtx,
+                                            const Message& m,
+                                            const Hooks& hooks) noexcept;
 
     /**
      * Produce a new object based on cmdObj, but with redactions applied as specified by

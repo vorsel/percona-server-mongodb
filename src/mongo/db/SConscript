@@ -72,6 +72,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/index_names',
+        '$BUILD_DIR/mongo/db/repl/tenant_migration_conflict_info',
         '$BUILD_DIR/mongo/db/write_concern_options',
         'shutdown_in_progress_quiesce_info',
     ]
@@ -363,7 +364,6 @@ env.Library(
         "$BUILD_DIR/mongo/util/net/ssl_manager",
         "$BUILD_DIR/mongo/util/net/ssl_parameters_auth",
         "auth/authorization_manager_global",
-        "serverinit",
     ],
 )
 
@@ -484,7 +484,6 @@ env.Library(
         'operation_key_manager.cpp',
         'service_context.cpp',
         'server_recovery.cpp',
-        'unclean_shutdown.cpp',
         'repl_set_member_in_standalone_mode.cpp',
     ],
     LIBDEPS=[
@@ -842,7 +841,7 @@ env.Library(
         'views/views_mongod',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
-        "$BUILD_DIR/mongo/db/repl/migrating_tenant",
+        "$BUILD_DIR/mongo/db/repl/tenant_migration_donor",
         '$BUILD_DIR/mongo/s/coreshard',
         "$BUILD_DIR/mongo/s/grid",
     ],
@@ -873,6 +872,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/command_can_run_here',
         '$BUILD_DIR/mongo/db/curop_metrics',
         '$BUILD_DIR/mongo/db/ops/write_ops_exec',
+        '$BUILD_DIR/mongo/db/repl/tenant_migration_donor',
         '$BUILD_DIR/mongo/db/rw_concern_d',
         '$BUILD_DIR/mongo/db/s/sharding_api_d',
         '$BUILD_DIR/mongo/db/stats/counters',
@@ -883,6 +883,17 @@ env.Library(
         'commands/server_status_core',
         'repl/replica_set_messages',
     ],
+)
+
+env.Library(
+    target='resumable_index_builds_idl',
+    source=[
+        env.Idlc('resumable_index_builds.idl')[0],
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ]
 )
 
 env.Library(
@@ -898,6 +909,7 @@ env.Library(
         'curop',
         'db_raii',
         'index_build_entry_helpers',
+        'resumable_index_builds_idl',
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
         '$BUILD_DIR/mongo/db/catalog/index_build_entry_idl',
         "$BUILD_DIR/mongo/executor/task_executor_interface",
@@ -1108,7 +1120,6 @@ env.Library(
         'exec/and_hash.cpp',
         'exec/and_sorted.cpp',
         'exec/cached_plan.cpp',
-        'exec/change_stream_proxy.cpp',
         'exec/collection_scan.cpp',
         'exec/count.cpp',
         'exec/count_scan.cpp',
@@ -1127,7 +1138,6 @@ env.Library(
         'exec/multi_plan.cpp',
         'exec/near.cpp',
         'exec/or.cpp',
-        'exec/pipeline_proxy.cpp',
         'exec/plan_cache_util.cpp',
         'exec/plan_stage.cpp',
         'exec/projection.cpp',
@@ -1157,6 +1167,7 @@ env.Library(
         'pipeline/document_source_cursor.cpp',
         'pipeline/document_source_geo_near_cursor.cpp',
         'pipeline/pipeline_d.cpp',
+        'pipeline/plan_executor_pipeline.cpp',
         'query/classic_stage_builder.cpp',
         'query/explain.cpp',
         'query/find.cpp',
@@ -1222,6 +1233,7 @@ env.Library(
         'query/query_planner',
         'repl/repl_coordinator_interface',
         's/sharding_api_d',
+        'shared_request_handling',
         'stats/serveronly_stats',
         'storage/oplog_hack',
         'storage/snapshot_helper',
@@ -1653,6 +1665,7 @@ env.Library(
 env.Library(
     target='vector_clock_mongod',
     source=[
+        'vector_clock_persist_command.cpp',
         'vector_clock_mongod.cpp',
     ],
     LIBDEPS=[
@@ -1663,6 +1676,8 @@ env.Library(
         'rw_concern_d',
         'repl/replica_set_aware_service',
         'server_options_core',
+        '$BUILD_DIR/mongo/db/s/sharding_api_d',
+        '$BUILD_DIR/mongo/s/grid',
     ],
 )
 
@@ -1724,6 +1739,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         'op_observer',
+        '$BUILD_DIR/mongo/util/clock_source_mock',
     ],
 )
 
@@ -2058,7 +2074,6 @@ env.Library(
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
         '$BUILD_DIR/mongo/s/grid',
         '$BUILD_DIR/mongo/s/sessions_collection_sharded',
-        '$BUILD_DIR/mongo/s/sessions_collection_sharded',
         '$BUILD_DIR/mongo/scripting/scripting',
         '$BUILD_DIR/mongo/transport/service_entry_point',
         '$BUILD_DIR/mongo/transport/transport_layer_manager',
@@ -2319,11 +2334,10 @@ asioEnv.CppIntegrationTest(
         'exhaust_cursor_currentop_integration_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/executor/network_interface_fixture',
-        '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
         '$BUILD_DIR/mongo/client/clientdriver_network',
-        '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
+        '$BUILD_DIR/mongo/executor/network_interface_fixture',
         '$BUILD_DIR/mongo/rpc/protocol',
+        '$BUILD_DIR/mongo/transport/transport_layer_egress_init',
         '$BUILD_DIR/mongo/util/version_impl',
     ],
 )

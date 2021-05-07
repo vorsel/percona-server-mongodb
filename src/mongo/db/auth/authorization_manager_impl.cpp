@@ -661,7 +661,7 @@ void AuthorizationManagerImpl::invalidateUsersFromDB(OperationContext* opCtx, St
     LOGV2_DEBUG(20236, 2, "Invalidating all users from database", "database"_attr = dbname);
     _updateCacheGeneration();
     _authSchemaVersionCache.invalidateAll();
-    _userCache.invalidateIf(
+    _userCache.invalidateKeyIf(
         [&](const UserRequest& userRequest) { return userRequest.name.getDB() == dbname; });
 }
 
@@ -713,16 +713,19 @@ AuthorizationManagerImpl::AuthSchemaVersionCache::AuthSchemaVersionCache(
     ServiceContext* service,
     ThreadPoolInterface& threadPool,
     AuthzManagerExternalState* externalState)
-    : ReadThroughCache(
-          _mutex,
-          service,
-          threadPool,
-          [this](OperationContext* opCtx, int unusedKey) { return _lookup(opCtx, unusedKey); },
-          1 /* cacheSize */),
+    : ReadThroughCache(_mutex,
+                       service,
+                       threadPool,
+                       [this](OperationContext* opCtx, int key, const ValueHandle& cachedValue) {
+                           return _lookup(opCtx, key, cachedValue);
+                       },
+                       1 /* cacheSize */),
       _externalState(externalState) {}
 
 AuthorizationManagerImpl::AuthSchemaVersionCache::LookupResult
-AuthorizationManagerImpl::AuthSchemaVersionCache::_lookup(OperationContext* opCtx, int unusedKey) {
+AuthorizationManagerImpl::AuthSchemaVersionCache::_lookup(OperationContext* opCtx,
+                                                          int unusedKey,
+                                                          const ValueHandle& unusedCachedValue) {
     invariant(unusedKey == 0);
 
     int authzVersion;
@@ -740,8 +743,8 @@ AuthorizationManagerImpl::UserCacheImpl::UserCacheImpl(
     : UserCache(_mutex,
                 service,
                 threadPool,
-                [this](OperationContext* opCtx, const UserRequest& userReq) {
-                    return _lookup(opCtx, userReq);
+                [this](OperationContext* opCtx, const UserRequest& userReq, UserHandle cachedUser) {
+                    return _lookup(opCtx, userReq, cachedUser);
                 },
                 cacheSize),
       _authSchemaVersionCache(authSchemaVersionCache),
@@ -749,7 +752,8 @@ AuthorizationManagerImpl::UserCacheImpl::UserCacheImpl(
 
 AuthorizationManagerImpl::UserCacheImpl::LookupResult
 AuthorizationManagerImpl::UserCacheImpl::_lookup(OperationContext* opCtx,
-                                                 const UserRequest& userReq) {
+                                                 const UserRequest& userReq,
+                                                 const UserHandle& unusedCachedUser) {
     LOGV2_DEBUG(20238, 1, "Getting user record", "user"_attr = userReq.name);
 
     // Number of times to retry a user document that fetches due to transient AuthSchemaIncompatible

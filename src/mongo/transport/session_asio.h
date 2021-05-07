@@ -110,7 +110,7 @@ public:
         _local = HostAndPort(_localAddr.toString(true));
         _remote = HostAndPort(_remoteAddr.toString(true));
 #ifdef MONGO_CONFIG_SSL
-        _sslManager = tl->getSSLManager();
+        _sslContext = *tl->_sslContext;
 #endif
     } catch (const DBException&) {
         throw;
@@ -165,6 +165,14 @@ public:
     Future<Message> asyncSourceMessage(const BatonHandle& baton = nullptr) override {
         ensureAsync();
         return sourceMessageImpl(baton);
+    }
+
+    Future<void> waitForData() override {
+#ifdef MONGO_CONFIG_SSL
+        if (_sslSocket)
+            return asio::async_read(*_sslSocket, asio::null_buffers(), UseFuture{}).ignoreValue();
+#endif
+        return asio::async_read(_socket, asio::null_buffers(), UseFuture{}).ignoreValue();
     }
 
     Status sinkMessage(Message message) override {
@@ -246,14 +254,14 @@ public:
 
 #ifdef MONGO_CONFIG_SSL
     const SSLConfiguration* getSSLConfiguration() const override {
-        if (_sslManager) {
-            return &_sslManager->getSSLConfiguration();
+        if (_sslContext->manager) {
+            return &_sslContext->manager->getSSLConfiguration();
         }
         return nullptr;
     }
 
     const std::shared_ptr<SSLManagerInterface> getSSLManager() const override {
-        return _sslManager;
+        return _sslContext->manager;
     }
 #endif
 
@@ -267,13 +275,12 @@ protected:
     Future<void> handshakeSSLForEgressWithLock(stdx::unique_lock<Latch> lk,
                                                const HostAndPort& target,
                                                const ReactorHandle& reactor) {
-        if (!_tl->_egressSSLContext) {
+        if (!_sslContext->egress) {
             return Future<void>::makeReady(Status(ErrorCodes::SSLHandshakeFailed,
                                                   "SSL requested but SSL support is disabled"));
         }
 
-        _sslSocket.emplace(
-            std::move(_socket), *_tl->_egressSSLContext, removeFQDNRoot(target.host()));
+        _sslSocket.emplace(std::move(_socket), *_sslContext->egress, removeFQDNRoot(target.host()));
         lk.unlock();
 
         auto doHandshake = [&] {
@@ -677,7 +684,7 @@ private:
         // protocol message needs to be 0 or -1. Otherwise the connection is either sending
         // garbage or a TLS Hello packet which will be caught by the TLS handshake.
         if (responseTo != 0 && responseTo != -1) {
-            if (!_tl->_ingressSSLContext) {
+            if (!_sslContext->ingress) {
                 return Future<bool>::makeReady(
                     Status(ErrorCodes::SSLHandshakeFailed,
                            "SSL handshake received but server is started without SSL support"));
@@ -694,7 +701,7 @@ private:
                     });
             }
 
-            _sslSocket.emplace(std::move(_socket), *_tl->_ingressSSLContext, "");
+            _sslSocket.emplace(std::move(_socket), *_sslContext->ingress, "");
             auto doHandshake = [&] {
                 if (_blockingMode == Sync) {
                     std::error_code ec;
@@ -706,6 +713,15 @@ private:
                 }
             };
             return doHandshake().then([this](size_t size) {
+                if (_sslSocket->get_sni()) {
+                    auto sniName = _sslSocket->get_sni().get();
+                    LOGV2_DEBUG(4908000,
+                                2,
+                                "Client connected with SNI extension",
+                                "sniName"_attr = sniName);
+                } else {
+                    LOGV2_DEBUG(4908001, 2, "Client connected without SNI extension");
+                }
                 if (SSLPeerInfo::forSession(shared_from_this()).subjectName.empty()) {
                     return getSSLManager()
                         ->parseAndValidatePeerCertificate(_sslSocket->native_handle(),
@@ -799,7 +815,7 @@ private:
 #ifdef MONGO_CONFIG_SSL
     boost::optional<asio::ssl::stream<decltype(_socket)>> _sslSocket;
     bool _ranHandshake = false;
-    std::shared_ptr<SSLManagerInterface> _sslManager;
+    std::shared_ptr<TransportLayerASIO::SSLConnectionContext> _sslContext;
 #endif
 
     TransportLayerASIO* const _tl;

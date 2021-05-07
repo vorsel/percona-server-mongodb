@@ -65,14 +65,15 @@ public:
 
     std::string toString() const;
 
+    Timestamp getOperationTime_forTest();
+
 protected:
     ClonerStages getStages() final;
 
     bool isMyFailPoint(const BSONObj& data) const final;
 
 private:
-    // TODO(SERVER-48816): implement unit tests
-    // friend class TenantDatabaseclonerTest;
+    friend class TenantDatabaseClonerTest;
 
     class TenantDatabaseClonerStage : public ClonerStage<TenantDatabaseCloner> {
     public:
@@ -121,6 +122,9 @@ private:
     std::unique_ptr<TenantCollectionCloner> _currentCollectionCloner;         // (MX)
 
     TenantDatabaseClonerStage _listCollectionsStage;  // (R)
+
+    // The operationTime returned with the listCollections result.
+    Timestamp _operationTime;  // (X)
 
     Stats _stats;  // (MX)
 };

@@ -220,6 +220,7 @@ void setUpOperationContextStateForGetMore(OperationContext* opCtx,
                                           bool disableAwaitDataFailpointActive) {
     applyCursorReadConcern(opCtx, cursor.getReadConcernArgs());
     opCtx->setWriteConcern(cursor.getWriteConcernOptions());
+    APIParameters::get(opCtx) = cursor.getAPIParameters();
     setUpOperationDeadline(opCtx, cursor, request, disableAwaitDataFailpointActive);
 
     // If the originating command had a 'comment' field, we extract it and set it on opCtx. Note
@@ -240,6 +241,12 @@ void setUpOperationContextStateForGetMore(OperationContext* opCtx,
 class GetMoreCmd final : public Command {
 public:
     GetMoreCmd() : Command("getMore") {}
+
+    // Do not currently use apiVersions because clients are prohibited from calling
+    // getMore with apiVersion.
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
 
     std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
                                              const OpMsgRequest& opMsgRequest) override {
@@ -333,7 +340,7 @@ public:
                               "getMore command executor error: {error}, stats: {stats}",
                               "getMore command executor error",
                               "error"_attr = exception.toStatus(),
-                              "stats"_attr = redact(Explain::getWinningPlanStats(exec)));
+                              "stats"_attr = redact(exec->getStats()));
 
                 exception.addContext("Executor error during getMore");
                 throw;
@@ -508,7 +515,7 @@ public:
             exec->reattachToOperationContext(opCtx);
             exec->restoreState();
 
-            auto planSummary = Explain::getPlanSummary(exec);
+            auto planSummary = exec->getPlanSummary();
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
                 curOp->setPlanSummary_inlock(planSummary);
@@ -553,7 +560,7 @@ public:
             // obtain these values we need to take a diff of the pre-execution and post-execution
             // metrics, as they accumulate over the course of a cursor's lifetime.
             PlanSummaryStats preExecutionStats;
-            Explain::getSummaryStats(*exec, &preExecutionStats);
+            exec->getSummaryStats(&preExecutionStats);
 
             // Mark this as an AwaitData operation if appropriate.
             if (cursorPin->isAwaitData() && !disableAwaitDataFailpointActive) {
@@ -600,7 +607,7 @@ public:
                                                         &numResults);
 
             PlanSummaryStats postExecutionStats;
-            Explain::getSummaryStats(*exec, &postExecutionStats);
+            exec->getSummaryStats(&postExecutionStats);
             postExecutionStats.totalKeysExamined -= preExecutionStats.totalKeysExamined;
             postExecutionStats.totalDocsExamined -= preExecutionStats.totalDocsExamined;
             curOp->debug().setPlanSummaryMetrics(postExecutionStats);
@@ -613,9 +620,7 @@ public:
             if (cursorPin->getExecutor()->lockPolicy() !=
                     PlanExecutor::LockPolicy::kLocksInternally &&
                 curOp->shouldDBProfile()) {
-                BSONObjBuilder execStatsBob;
-                Explain::getWinningPlanStats(exec, &execStatsBob);
-                curOp->debug().execStats = execStatsBob.obj();
+                curOp->debug().execStats = exec->getStats();
             }
 
             if (shouldSaveCursor) {

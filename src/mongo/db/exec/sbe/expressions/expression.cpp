@@ -31,6 +31,7 @@
 
 #include "mongo/db/exec/sbe/expressions/expression.h"
 
+#include <iomanip>
 #include <sstream>
 
 #include "mongo/db/exec/sbe/stages/spool.h"
@@ -345,6 +346,9 @@ struct BuiltinFn {
  * The map of recognized builtin functions.
  */
 static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
+    {"dateParts", BuiltinFn{[](size_t n) { return n == 9; }, vm::Builtin::dateParts, false}},
+    {"datePartsWeekYear",
+     BuiltinFn{[](size_t n) { return n == 9; }, vm::Builtin::datePartsWeekYear, false}},
     {"split", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::split, false}},
     {"regexMatch", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::regexMatch, false}},
     {"dropFields", BuiltinFn{[](size_t n) { return n > 0; }, vm::Builtin::dropFields, false}},
@@ -354,6 +358,8 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"abs", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::abs, false}},
     {"addToArray", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::addToArray, true}},
     {"addToSet", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::addToSet, true}},
+    {"doubleDoubleSum",
+     BuiltinFn{[](size_t n) { return n > 0; }, vm::Builtin::doubleDoubleSum, true}},
 };
 
 /**
@@ -392,6 +398,7 @@ static stdx::unordered_map<std::string, InstrFn> kInstrFunctions = {
     {"max", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendMax, true}},
     {"first", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendFirst, true}},
     {"last", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendLast, true}},
+    {"mod", InstrFn{[](size_t n) { return n == 2; }, &vm::CodeFragment::appendMod, false}},
 };
 }  // namespace
 
@@ -600,6 +607,85 @@ std::vector<DebugPrinter::Block> EFail::debugPrint() const {
     ret.emplace_back(DebugPrinter::Block(std::to_string(_code)));
     ret.emplace_back(DebugPrinter::Block(",`"));
     ret.emplace_back(DebugPrinter::Block(_message));
+
+    ret.emplace_back("`)");
+
+    return ret;
+}
+
+std::unique_ptr<EExpression> ENumericConvert::clone() const {
+    return std::make_unique<ENumericConvert>(_nodes[0]->clone(), _target);
+}
+
+std::unique_ptr<vm::CodeFragment> ENumericConvert::compile(CompileCtx& ctx) const {
+    auto code = std::make_unique<vm::CodeFragment>();
+
+    auto operand = _nodes[0]->compile(ctx);
+    code->append(std::move(operand));
+    code->appendNumericConvert(_target);
+
+    return code;
+}
+
+std::vector<DebugPrinter::Block> ENumericConvert::debugPrint() const {
+    std::vector<DebugPrinter::Block> ret;
+
+    DebugPrinter::addKeyword(ret, "convert");
+
+    ret.emplace_back("(");
+
+    DebugPrinter::addBlocks(ret, _nodes[0]->debugPrint());
+
+    ret.emplace_back(DebugPrinter::Block("`,"));
+
+    switch (_target) {
+        case value::TypeTags::NumberInt32:
+            ret.emplace_back("int32");
+            break;
+        case value::TypeTags::NumberInt64:
+            ret.emplace_back("int64");
+            break;
+        case value::TypeTags::NumberDouble:
+            ret.emplace_back("double");
+            break;
+        case value::TypeTags::NumberDecimal:
+            ret.emplace_back("decimal");
+            break;
+        default:
+            MONGO_UNREACHABLE;
+            break;
+    }
+
+    ret.emplace_back("`)");
+    return ret;
+}
+
+std::unique_ptr<EExpression> ETypeMatch::clone() const {
+    return std::make_unique<ETypeMatch>(_nodes[0]->clone(), _typeMask);
+}
+
+std::unique_ptr<vm::CodeFragment> ETypeMatch::compile(CompileCtx& ctx) const {
+    auto code = std::make_unique<vm::CodeFragment>();
+
+    auto variable = _nodes[0]->compile(ctx);
+    code->append(std::move(variable));
+    code->appendTypeMatch(_typeMask);
+
+    return code;
+}
+
+std::vector<DebugPrinter::Block> ETypeMatch::debugPrint() const {
+    std::vector<DebugPrinter::Block> ret;
+
+    DebugPrinter::addKeyword(ret, "typeMatch");
+
+    ret.emplace_back("(`");
+
+    DebugPrinter::addBlocks(ret, _nodes[0]->debugPrint());
+    ret.emplace_back(DebugPrinter::Block("`,"));
+    std::stringstream ss;
+    ss << "0x" << std::setfill('0') << std::uppercase << std::setw(8) << std::hex << _typeMask;
+    ret.emplace_back(ss.str());
 
     ret.emplace_back("`)");
 

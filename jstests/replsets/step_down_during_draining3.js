@@ -71,19 +71,11 @@ assert.soon(
     1000);
 
 reconnect(secondary);
-replSet.stepUpNoAwaitReplication(secondary);
+replSet.stepUp(secondary, {awaitReplicationBeforeStepUp: false, awaitWritablePrimary: false});
 
 // Secondary doesn't allow writes yet.
 var res = secondary.getDB("admin").runCommand({"isMaster": 1});
 assert(!res.ismaster);
-
-assert.commandFailedWithCode(
-    secondary.adminCommand({
-        replSetTest: 1,
-        waitForDrainFinish: 5000,
-    }),
-    ErrorCodes.ExceededTimeLimit,
-    'replSetTest waitForDrainFinish should time out when draining is not allowed to complete');
 
 assert.commandWorked(secondary.adminCommand({replSetStepDown: 60, force: true}));
 

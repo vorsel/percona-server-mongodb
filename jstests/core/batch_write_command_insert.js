@@ -50,7 +50,7 @@ function countEventually(collection, n) {
 
 //
 // NO DOCS, illegal command
-coll.remove({});
+coll.drop();
 request = {
     insert: coll.getName()
 };
@@ -59,7 +59,7 @@ assert(resultNOK(result), tojson(result));
 
 //
 // Single document insert, no write concern specified
-coll.remove({});
+coll.drop();
 request = {
     insert: coll.getName(),
     documents: [{a: 1}]
@@ -71,7 +71,7 @@ assert.eq(coll.count(), 1);
 
 //
 // Single document insert, w:1 write concern specified, ordered:true
-coll.remove({});
+coll.drop();
 request = {
     insert: coll.getName(),
     documents: [{a: 1}],
@@ -85,7 +85,7 @@ assert.eq(coll.count(), 1);
 
 //
 // Single document insert, w:1 write concern specified, ordered:false
-coll.remove({});
+coll.drop();
 request = {
     insert: coll.getName(),
     documents: [{a: 1}],
@@ -98,24 +98,8 @@ assert.eq(1, result.n);
 assert.eq(coll.count(), 1);
 
 //
-// Document with illegal key should fail
-coll.remove({});
-request = {
-    insert: coll.getName(),
-    documents: [{$set: {a: 1}}],
-    writeConcern: {w: 1},
-    ordered: false
-};
-result = coll.runCommand(request);
-assert(result.ok, tojson(result));
-assert(result.writeErrors != null);
-assert.eq(1, result.writeErrors.length);
-assert.eq(0, result.n);
-assert.eq(coll.count(), 0);
-
-//
 // Document with valid nested key should insert (op log format)
-coll.remove({});
+coll.drop();
 request = {
     insert: coll.getName(),
     documents: [{o: {$set: {a: 1}}}],
@@ -129,7 +113,7 @@ assert.eq(coll.count(), 1);
 
 //
 // Large batch under the size threshold should insert successfully
-coll.remove({});
+coll.drop();
 batch = [];
 for (var i = 0; i < maxWriteBatchSize; ++i) {
     batch.push({});
@@ -147,7 +131,7 @@ assert.eq(coll.count(), batch.length);
 
 //
 // Large batch above the size threshold should fail to insert
-coll.remove({});
+coll.drop();
 batch = [];
 for (var i = 0; i < maxWriteBatchSize + 1; ++i) {
     batch.push({});
@@ -164,7 +148,7 @@ assert.eq(coll.count(), 0);
 
 //
 // Batch of size zero should fail to insert
-coll.remove({});
+coll.drop();
 request = {
     insert: coll.getName(),
     documents: []
@@ -175,12 +159,11 @@ assert(resultNOK(result), tojson(result));
 //
 //
 // Unique index tests
-coll.remove({});
-coll.ensureIndex({a: 1}, {unique: true});
 
 //
 // Should fail single insert due to duplicate key
-coll.remove({});
+coll.drop();
+coll.ensureIndex({a: 1}, {unique: true});
 coll.insert({a: 1});
 request = {
     insert: coll.getName(),
@@ -194,7 +177,8 @@ assert.eq(coll.count(), 1);
 
 //
 // Fail with duplicate key error on multiple document inserts, ordered false
-coll.remove({});
+coll.drop();
+coll.ensureIndex({a: 1}, {unique: true});
 request = {
     insert: coll.getName(),
     documents: [{a: 1}, {a: 1}, {a: 1}],
@@ -219,7 +203,8 @@ assert.eq(coll.count(), 1);
 
 //
 // Fail with duplicate key error on multiple document inserts, ordered true
-coll.remove({});
+coll.drop();
+coll.ensureIndex({a: 1}, {unique: true});
 request = {
     insert: coll.getName(),
     documents: [{a: 1}, {a: 1}, {a: 1}],
@@ -239,7 +224,8 @@ assert.eq(coll.count(), 1);
 
 //
 // Ensure _id is the first field in all documents
-coll.remove({});
+coll.drop();
+coll.ensureIndex({a: 1}, {unique: true});
 request = {
     insert: coll.getName(),
     documents: [{a: 1}, {a: 2, _id: 2}]

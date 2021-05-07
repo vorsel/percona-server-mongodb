@@ -37,6 +37,7 @@
 #include "mongo/transport/transport_mode.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/functional.h"
+#include "mongo/util/out_of_line_executor.h"
 
 namespace mongo {
 // This needs to be forward declared here because the service_context.h is a circular dependency.
@@ -44,10 +45,12 @@ class ServiceContext;
 
 namespace transport {
 
+class Session;
+
 /*
  * This is the interface for all ServiceExecutors.
  */
-class ServiceExecutor {
+class ServiceExecutor : public OutOfLineExecutor {
 public:
     virtual ~ServiceExecutor() = default;
     using Task = unique_function<void()>;
@@ -81,7 +84,25 @@ public:
      * If defer is true, then the executor may defer execution of this Task until an available
      * thread is available.
      */
-    virtual Status schedule(Task task, ScheduleFlags flags) = 0;
+    virtual Status scheduleTask(Task task, ScheduleFlags flags) = 0;
+
+    /*
+     * Provides an executor-friendly wrapper for "scheduleTask". Internally, it wraps instance of
+     * "OutOfLineExecutor::Task" inside "ServiceExecutor::Task" objects, which are then scheduled
+     * for execution on the service executor. May throw if "scheduleTask" returns a non-okay status.
+     */
+    void schedule(OutOfLineExecutor::Task func) override {
+        internalAssert(scheduleTask([task = std::move(func)]() mutable { task(Status::OK()); },
+                                    ScheduleFlags::kEmptyFlags));
+    }
+
+    /*
+     * Awaits the availability of incoming data for the specified session. On success, it will
+     * schedule the callback on current executor. Otherwise, it will invoke the callback with a
+     * non-okay status on the caller thread.
+     */
+    virtual void runOnDataAvailable(Session* session,
+                                    OutOfLineExecutor::Task onCompletionCallback) = 0;
 
     /*
      * Stops and joins the ServiceExecutor. Any outstanding tasks will not be executed, and any

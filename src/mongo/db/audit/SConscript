@@ -14,7 +14,7 @@ env.Library(
         env.Idlc("audit_parameters.idl")[0],
         env.Idlc("audit_options.idl")[0],
     ],
-    LIBDEPS=[
+    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/matcher/expressions',
         '$BUILD_DIR/mongo/db/pipeline/expression_context',
@@ -24,4 +24,7 @@ env.Library(
     LIBDEPS_DEPENDENTS=[
         '$BUILD_DIR/mongo/db/commands',
     ],
+    LIBDEPS_TAGS=[
+        'lint-allow-nonprivate-on-deps-dependents',
+    ]
 )

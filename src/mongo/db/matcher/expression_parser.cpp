@@ -66,6 +66,7 @@
 #include "mongo/db/matcher/schema/expression_internal_schema_xor.h"
 #include "mongo/db/matcher/schema/json_schema_parser.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/query/dbref.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/util/str.h"
 #include "mongo/util/string_map.h"
@@ -214,15 +215,15 @@ bool isDBRefDocument(const BSONObj& obj, bool allowIncompleteDBRef) {
         auto element = i.next();
         auto fieldName = element.fieldNameStringData();
         // $ref
-        if (!hasRef && "$ref"_sd == fieldName) {
+        if (!hasRef && dbref::kRefFieldName == fieldName) {
             hasRef = true;
         }
         // $id
-        else if (!hasID && "$id"_sd == fieldName) {
+        else if (!hasID && dbref::kIdFieldName == fieldName) {
             hasID = true;
         }
         // $db
-        else if (!hasDB && "$db"_sd == fieldName) {
+        else if (!hasDB && dbref::kDbFieldName == fieldName) {
             hasDB = true;
         }
     }
@@ -271,7 +272,7 @@ StatusWithMatchExpression parse(const BSONObj& obj,
                                 const ExtensionsCallback* extensionsCallback,
                                 MatchExpressionParser::AllowedFeatureSet allowedFeatures,
                                 DocumentParseLevel currentLevel) {
-    auto root = std::make_unique<AndMatchExpression>();
+    auto root = std::make_unique<AndMatchExpression>(createAnnotation(expCtx, "$and", BSONObj()));
 
     const DocumentParseLevel nextLevel = (currentLevel == DocumentParseLevel::kPredicateTopLevel)
         ? DocumentParseLevel::kUserDocumentTopLevel
@@ -1136,7 +1137,8 @@ StatusWithMatchExpression parseTreeTopLevel(
         return {Status(ErrorCodes::BadValue, str::stream() << T::kName << " must be an array")};
     }
 
-    auto temp = std::make_unique<T>();
+    auto temp = std::make_unique<T>(
+        createAnnotation(expCtx, elem.fieldNameStringData().toString(), BSONObj()));
 
     auto arr = elem.Obj();
     if (arr.isEmpty()) {
@@ -1367,14 +1369,20 @@ StatusWithMatchExpression parseNot(StringData name,
         return {ErrorCodes::BadValue, "$not cannot be empty"};
     }
 
-    auto theAnd = std::make_unique<AndMatchExpression>();
+    auto theAnd = std::make_unique<AndMatchExpression>(createAnnotation(expCtx, "$and", BSONObj()));
     auto parseStatus = parseSub(
         name, notObject, theAnd.get(), expCtx, extensionsCallback, allowedFeatures, currentLevel);
     if (!parseStatus.isOK()) {
         return parseStatus;
     }
 
-    return {std::make_unique<NotMatchExpression>(theAnd.release())};
+    // If the and has one child, it can be ignored when generating a document validation error.
+    if (theAnd->numChildren() == 1 && theAnd->getErrorAnnotation()) {
+        theAnd->setErrorAnnotation(createAnnotation(expCtx, AnnotationMode::kIgnoreButDescend));
+    }
+
+    return {std::make_unique<NotMatchExpression>(theAnd.release(),
+                                                 createAnnotation(expCtx, "$not", BSONObj()))};
 }
 
 StatusWithMatchExpression parseInternalSchemaBinDataSubType(StringData name, BSONElement e) {

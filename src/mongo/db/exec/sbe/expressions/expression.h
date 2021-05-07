@@ -351,5 +351,58 @@ private:
     ErrorCodes::Error _code;
     std::string _message;
 };
+
+/**
+ * This is a numeric conversion expression. It supports both narrowing and widening conversion under
+ * no loss of precision. If a given conversion loses precision the expression results in Nothing.
+ * ENumericConvert can be instantiated for the following source to target tags,
+ *
+ *  NumberInt32 -> NumberInt64, NumberInt32 -> NumberDouble, NumberInt32 -> NumberDecimal
+ *  NumberInt64 -> NumberInt32, NumberInt64 -> NumberDouble, NumberInt64 -> NumberDecimal
+ *  NumberDouble -> NumberInt32, NumberDouble -> NumberInt64, NumberDouble -> NumberDecimal
+ *  NumberDecimal -> NumberInt32, NumberDecimal -> NumberInt64, NumberDecimal -> NumberDouble
+ */
+class ENumericConvert final : public EExpression {
+public:
+    ENumericConvert(std::unique_ptr<EExpression> source, value::TypeTags target) : _target(target) {
+        _nodes.emplace_back(std::move(source));
+        validateNodes();
+        invariant(
+            target == value::TypeTags::NumberInt32 || target == value::TypeTags::NumberInt64 ||
+            target == value::TypeTags::NumberDouble || target == value::TypeTags::NumberDecimal);
+    }
+
+    std::unique_ptr<EExpression> clone() const override;
+
+    std::unique_ptr<vm::CodeFragment> compile(CompileCtx& ctx) const override;
+
+    std::vector<DebugPrinter::Block> debugPrint() const override;
+
+private:
+    value::TypeTags _target;
+};
+
+/**
+ * This is a type match expression. It checks if a variable's BSONType is present within a given
+ * set of BSONTypes encoded as a bitmask (_typeMask). If the variable's BSONType is in the set,
+ * this expression returns true, otherwise it returns false.
+ */
+class ETypeMatch final : public EExpression {
+public:
+    ETypeMatch(std::unique_ptr<EExpression> variable, uint32_t typeMask) : _typeMask(typeMask) {
+        _nodes.emplace_back(std::move(variable));
+        validateNodes();
+    }
+
+    std::unique_ptr<EExpression> clone() const override;
+
+    std::unique_ptr<vm::CodeFragment> compile(CompileCtx& ctx) const override;
+
+    std::vector<DebugPrinter::Block> debugPrint() const override;
+
+private:
+    uint32_t _typeMask;
+};
+
 }  // namespace sbe
 }  // namespace mongo

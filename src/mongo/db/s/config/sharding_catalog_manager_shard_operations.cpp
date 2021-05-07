@@ -339,8 +339,8 @@ StatusWith<ShardType> ShardingCatalogManager::_validateHostAsShard(
                                                 << connectionString.toString() << " as a shard");
     }
     // (Generic FCV reference): This FCV check should exist across LTS binary versions.
-    if (serverGlobalParams.featureCompatibility.getVersion() >
-        ServerGlobalParams::FeatureCompatibility::kLastLTS) {
+    if (serverGlobalParams.featureCompatibility.isGreaterThan(
+            ServerGlobalParams::FeatureCompatibility::kLastLTS)) {
         // If the cluster's FCV is kLatest, or upgrading to / downgrading from, the node being added
         // must be a version kLatest binary.
         invariant(maxWireVersion == WireVersion::LATEST_WIRE_VERSION);
@@ -655,9 +655,9 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
         BSONObj setFCVCmd;
         switch (serverGlobalParams.featureCompatibility.getVersion()) {
             case ServerGlobalParams::FeatureCompatibility::kLatest:
-            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To451:
+            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To47:
                 setFCVCmd = BSON(FeatureCompatibilityVersionCommandParser::kCommandName
-                                 << FeatureCompatibilityVersionParser::kVersion451
+                                 << FeatureCompatibilityVersionParser::kVersion47
                                  << WriteConcernOptions::kWriteConcernField
                                  << opCtx->getWriteConcern().toBSON());
                 break;
@@ -679,8 +679,7 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
         }
 
         // Tick clusterTime to get a new topologyTime for this mutation of the topology.
-        auto newTopologyTime =
-            VectorClockMutable::get(opCtx)->tick(VectorClock::Component::ClusterTime, 1);
+        auto newTopologyTime = VectorClockMutable::get(opCtx)->tickClusterTime(1);
 
         shardType.setTopologyTime(newTopologyTime.asTimestamp());
 
@@ -920,8 +919,7 @@ RemoveShardProgress ShardingCatalogManager::removeShard(OperationContext* opCtx,
     std::string controlShardName = controlShardStatus.getValue().getName();
 
     // Tick clusterTime to get a new topologyTime for this mutation of the topology.
-    auto newTopologyTime =
-        VectorClockMutable::get(opCtx)->tick(VectorClock::Component::ClusterTime, 1);
+    auto newTopologyTime = VectorClockMutable::get(opCtx)->tickClusterTime(1);
 
     // Use applyOps to both remove the shard's document and update topologyTime on another document.
     auto command =

@@ -629,7 +629,7 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
 
     LOGV2_DEBUG(21168,
                 2,
-                "Resetting feature compatibility version to last-stable. If the sync source is in "
+                "Resetting feature compatibility version to last-lts. If the sync source is in "
                 "latest feature compatibility version, we will find out when we clone the "
                 "server configuration collection (admin.system.version)");
     serverGlobalParams.featureCompatibility.reset();
@@ -1087,8 +1087,7 @@ void InitialSyncer::_fcvFetcherCallback(const StatusWith<Fetcher::QueryResponse>
 
     // Changing the featureCompatibilityVersion during initial sync is unsafe.
     // (Generic FCV reference): This FCV check should exist across LTS binary versions.
-    if (version > ServerGlobalParams::FeatureCompatibility::kLastLTS &&
-        version < ServerGlobalParams::FeatureCompatibility::kLatest) {
+    if (serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading(version)) {
         onCompletionGuard->setResultAndCancelRemainingWork_inlock(
             lock,
             Status(ErrorCodes::IncompatibleServerVersion,

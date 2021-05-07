@@ -194,8 +194,7 @@ Status buildMissingIdIndex(OperationContext* opCtx, Collection* collection) {
 auto downgradeError =
     Status{ErrorCodes::MustDowngrade,
            str::stream() << "UPGRADE PROBLEM: The data files need to be fully upgraded to version "
-                            "4.4 before attempting "
-                            "an upgrade to 4.5.1; see "
+                            "4.4 before attempting a binary upgrade; see "
                          << feature_compatibility_version_documentation::kUpgradeLink
                          << " for more details."};
 
@@ -332,9 +331,19 @@ void assertCappedOplog(OperationContext* opCtx, Database* db) {
     }
 }
 
-void reconcileCatalogAndRebuildUnfinishedIndexes(OperationContext* opCtx,
-                                                 StorageEngine* storageEngine) {
-    auto reconcileResult = fassert(40593, storageEngine->reconcileCatalogAndIdents(opCtx));
+void reconcileCatalogAndRebuildUnfinishedIndexes(
+    OperationContext* opCtx,
+    StorageEngine* storageEngine,
+    LastStorageEngineShutdownState lastStorageEngineShutdownState) {
+
+    // When starting up after an unclean shutdown, we do not attempt to recover any state from the
+    // internal idents. Thus, we drop them in this case.
+    auto reconcilePolicy =
+        LastStorageEngineShutdownState::kUnclean == lastStorageEngineShutdownState
+        ? StorageEngine::InternalIdentReconcilePolicy::kDrop
+        : StorageEngine::InternalIdentReconcilePolicy::kRetain;
+    auto reconcileResult =
+        fassert(40593, storageEngine->reconcileCatalogAndIdents(opCtx, reconcilePolicy));
 
     // Determine which indexes need to be rebuilt. rebuildIndexesOnCollection() requires that all
     // indexes on that collection are done at once, so we use a map to group them together.
@@ -390,7 +399,7 @@ void reconcileCatalogAndRebuildUnfinishedIndexes(OperationContext* opCtx,
     // not build any indexes to completion, but rather start the background thread to build the
     // index, and wait for a replicated commit or abort oplog entry.
     IndexBuildsCoordinator::get(opCtx)->restartIndexBuildsForRecovery(
-        opCtx, reconcileResult.indexBuildsToRestart);
+        opCtx, reconcileResult.indexBuildsToRestart, reconcileResult.indexBuildsToResume);
 }
 
 /**
@@ -511,7 +520,9 @@ void startupRecoveryReadOnly(OperationContext* opCtx, StorageEngine* storageEngi
 }
 
 // Perform routine startup recovery procedure.
-void startupRecovery(OperationContext* opCtx, StorageEngine* storageEngine) {
+void startupRecovery(OperationContext* opCtx,
+                     StorageEngine* storageEngine,
+                     LastStorageEngineShutdownState lastStorageEngineShutdownState) {
     invariant(!storageGlobalParams.readOnly && !storageGlobalParams.repair);
 
     // Determine whether this is a replica set node running in standalone mode. This must be set
@@ -523,7 +534,8 @@ void startupRecovery(OperationContext* opCtx, StorageEngine* storageEngine) {
 
     // Drops abandoned idents. Rebuilds unfinished indexes and restarts incomplete two-phase
     // index builds.
-    reconcileCatalogAndRebuildUnfinishedIndexes(opCtx, storageEngine);
+    reconcileCatalogAndRebuildUnfinishedIndexes(
+        opCtx, storageEngine, lastStorageEngineShutdownState);
 
     const auto& replSettings = repl::ReplicationCoordinator::get(opCtx)->getSettings();
 
@@ -563,7 +575,8 @@ namespace startup_recovery {
  * Recovers or repairs all databases from a previous shutdown. May throw a MustDowngrade error
  * if data files are incompatible with the current binary version.
  */
-void repairAndRecoverDatabases(OperationContext* opCtx) {
+void repairAndRecoverDatabases(OperationContext* opCtx,
+                               LastStorageEngineShutdownState lastStorageEngineShutdownState) {
     auto const storageEngine = opCtx->getServiceContext()->getStorageEngine();
     Lock::GlobalWrite lk(opCtx);
 
@@ -579,7 +592,7 @@ void repairAndRecoverDatabases(OperationContext* opCtx) {
     } else if (storageGlobalParams.readOnly) {
         startupRecoveryReadOnly(opCtx, storageEngine);
     } else {
-        startupRecovery(opCtx, storageEngine);
+        startupRecovery(opCtx, storageEngine, lastStorageEngineShutdownState);
     }
 
     assertFilesCompatible(opCtx, storageEngine);

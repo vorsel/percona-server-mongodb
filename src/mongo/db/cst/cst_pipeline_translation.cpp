@@ -30,18 +30,27 @@
 
 #include <algorithm>
 #include <boost/intrusive_ptr.hpp>
+#include <boost/optional.hpp>
 #include <iterator>
 
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/db/cst/c_node.h"
 #include "mongo/db/cst/cst_pipeline_translation.h"
 #include "mongo/db/cst/key_fieldname.h"
 #include "mongo/db/cst/key_value.h"
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/exec/inclusion_projection_executor.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_limit.h"
+#include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_project.h"
+#include "mongo/db/pipeline/document_source_sample.h"
 #include "mongo/db/pipeline/document_source_skip.h"
+#include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/pipeline/expression_trigonometric.h"
 #include "mongo/db/query/projection.h"
 #include "mongo/db/query/projection_ast.h"
 #include "mongo/db/query/projection_parser.h"
@@ -50,13 +59,295 @@
 
 namespace mongo::cst_pipeline_translation {
 namespace {
+Value translateLiteralToValue(const CNode& cst);
+Value translateLiteralLeaf(const CNode& cst);
+
 /**
- * Walk a projection CNode and produce a ProjectionASTNode.
+ * Walk a literal array payload and produce a Value. This function is neccesary because Aggregation
+ * Expression literals are required to be collapsed into Values inside ExpressionConst but
+ * uncollapsed otherwise.
+ */
+auto translateLiteralArrayToValue(const CNode::ArrayChildren& array) {
+    auto values = std::vector<Value>{};
+    static_cast<void>(
+        std::transform(array.begin(), array.end(), std::back_inserter(values), [&](auto&& elem) {
+            return translateLiteralToValue(elem);
+        }));
+    return Value{std::move(values)};
+}
+
+/**
+ * Walk a literal object payload and produce a Value. This function is neccesary because Aggregation
+ * Expression literals are required to be collapsed into Values inside ExpressionConst but
+ * uncollapsed otherwise.
+ */
+auto translateLiteralObjectToValue(const CNode::ObjectChildren& object) {
+    auto fields = std::vector<std::pair<StringData, Value>>{};
+    static_cast<void>(
+        std::transform(object.begin(), object.end(), std::back_inserter(fields), [&](auto&& field) {
+            return std::pair{StringData{stdx::get<UserFieldname>(field.first)},
+                             translateLiteralToValue(field.second)};
+        }));
+    return Value{Document{std::move(fields)}};
+}
+
+/**
+ * Walk a purely literal CNode and produce a Value. This function is neccesary because Aggregation
+ * Expression literals are required to be collapsed into Values inside ExpressionConst but
+ * uncollapsed otherwise.
+ */
+Value translateLiteralToValue(const CNode& cst) {
+    return stdx::visit(
+        visit_helper::Overloaded{
+            [](const CNode::ArrayChildren& array) { return translateLiteralArrayToValue(array); },
+            [](const CNode::ObjectChildren& object) {
+                return translateLiteralObjectToValue(object);
+            },
+            [&](auto&& payload) { return translateLiteralLeaf(cst); }},
+        cst.payload);
+}
+
+/**
+ * Walk a literal array payload and produce an ExpressionArray.
+ */
+auto translateLiteralArray(const CNode::ArrayChildren& array,
+                           const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    auto expressions = std::vector<boost::intrusive_ptr<Expression>>{};
+    static_cast<void>(std::transform(
+        array.begin(), array.end(), std::back_inserter(expressions), [&](auto&& elem) {
+            return translateExpression(elem, expCtx);
+        }));
+    return ExpressionArray::create(expCtx.get(), std::move(expressions));
+}
+
+/**
+ * Walk a literal object payload and produce an ExpressionObject.
+ */
+auto translateLiteralObject(const CNode::ObjectChildren& object,
+                            const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    auto fields = std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>>>{};
+    static_cast<void>(
+        std::transform(object.begin(), object.end(), std::back_inserter(fields), [&](auto&& field) {
+            return std::pair{std::string{stdx::get<UserFieldname>(field.first)},
+                             translateExpression(field.second, expCtx)};
+        }));
+    return ExpressionObject::create(expCtx.get(), std::move(fields));
+}
+
+/**
+ * Walk an agg function/operator object payload and produce an ExpressionVector.
+ */
+auto transformInputExpression(const CNode::ObjectChildren& object,
+                              const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    auto expressions = std::vector<boost::intrusive_ptr<Expression>>{};
+    stdx::visit(
+        visit_helper::Overloaded{
+            [&](const CNode::ArrayChildren& array) {
+                static_cast<void>(std::transform(
+                    array.begin(), array.end(), std::back_inserter(expressions), [&](auto&& elem) {
+                        return translateExpression(elem, expCtx);
+                    }));
+            },
+            [&](const CNode::ObjectChildren& object) {
+                static_cast<void>(std::transform(
+                    object.begin(),
+                    object.end(),
+                    std::back_inserter(expressions),
+                    [&](auto&& elem) { return translateExpression(elem.second, expCtx); }));
+            },
+            // Everything else is a literal.
+            [&](auto&&) { expressions.push_back(translateExpression(object[0].second, expCtx)); }},
+        object[0].second.payload);
+    return expressions;
+}
+
+/**
+ * Check that the order of arguments is what we expect in an input expression.
+ */
+bool verifyFieldnames(const std::vector<CNode::Fieldname>& expected,
+                      const std::vector<std::pair<CNode::Fieldname, CNode>>& actual) {
+    if (expected.size() != actual.size())
+        return false;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (expected[i] != actual[i].first)
+            return false;
+    }
+    return true;
+}
+
+/**
+ * Walk an agg function/operator object payload and produce an Expression.
+ */
+boost::intrusive_ptr<Expression> translateFunctionObject(
+    const CNode::ObjectChildren& object, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    // Constants require using Value instead of Expression to build the tree in agg.
+    if (stdx::get<KeyFieldname>(object[0].first) == KeyFieldname::constExpr ||
+        stdx::get<KeyFieldname>(object[0].first) == KeyFieldname::literal)
+        return make_intrusive<ExpressionConstant>(expCtx.get(),
+                                                  translateLiteralToValue(object[0].second));
+    auto expressions = transformInputExpression(object, expCtx);
+    switch (stdx::get<KeyFieldname>(object[0].first)) {
+        case KeyFieldname::add:
+            return make_intrusive<ExpressionAdd>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::atan2:
+            return make_intrusive<ExpressionArcTangent2>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::andExpr:
+            return make_intrusive<ExpressionAnd>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::orExpr:
+            return make_intrusive<ExpressionOr>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::notExpr:
+            return make_intrusive<ExpressionNot>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::cmp:
+            return make_intrusive<ExpressionCompare>(
+                expCtx.get(), ExpressionCompare::CMP, std::move(expressions));
+        case KeyFieldname::eq:
+            return make_intrusive<ExpressionCompare>(
+                expCtx.get(), ExpressionCompare::EQ, std::move(expressions));
+        case KeyFieldname::gt:
+            return make_intrusive<ExpressionCompare>(
+                expCtx.get(), ExpressionCompare::GT, std::move(expressions));
+        case KeyFieldname::gte:
+            return make_intrusive<ExpressionCompare>(
+                expCtx.get(), ExpressionCompare::GTE, std::move(expressions));
+        case KeyFieldname::lt:
+            return make_intrusive<ExpressionCompare>(
+                expCtx.get(), ExpressionCompare::LT, std::move(expressions));
+        case KeyFieldname::lte:
+            return make_intrusive<ExpressionCompare>(
+                expCtx.get(), ExpressionCompare::LTE, std::move(expressions));
+        case KeyFieldname::ne:
+            return make_intrusive<ExpressionCompare>(
+                expCtx.get(), ExpressionCompare::NE, std::move(expressions));
+        case KeyFieldname::convert:
+            dassert(verifyFieldnames({KeyFieldname::inputArg,
+                                      KeyFieldname::toArg,
+                                      KeyFieldname::onErrorArg,
+                                      KeyFieldname::onNullArg},
+                                     object[0].second.objectChildren()));
+            return make_intrusive<ExpressionConvert>(expCtx.get(),
+                                                     std::move(expressions[0]),
+                                                     std::move(expressions[1]),
+                                                     std::move(expressions[2]),
+                                                     std::move(expressions[3]));
+        case KeyFieldname::toBool:
+            return ExpressionConvert::create(
+                expCtx.get(), std::move(expressions[0]), BSONType::Bool);
+        case KeyFieldname::toDate:
+            return ExpressionConvert::create(
+                expCtx.get(), std::move(expressions[0]), BSONType::Date);
+        case KeyFieldname::toDecimal:
+            return ExpressionConvert::create(
+                expCtx.get(), std::move(expressions[0]), BSONType::NumberDecimal);
+        case KeyFieldname::toDouble:
+            return ExpressionConvert::create(
+                expCtx.get(), std::move(expressions[0]), BSONType::NumberDouble);
+        case KeyFieldname::toInt:
+            return ExpressionConvert::create(
+                expCtx.get(), std::move(expressions[0]), BSONType::NumberInt);
+        case KeyFieldname::toLong:
+            return ExpressionConvert::create(
+                expCtx.get(), std::move(expressions[0]), BSONType::NumberLong);
+        case KeyFieldname::toObjectId:
+            return ExpressionConvert::create(
+                expCtx.get(), std::move(expressions[0]), BSONType::jstOID);
+        case KeyFieldname::toString:
+            return ExpressionConvert::create(
+                expCtx.get(), std::move(expressions[0]), BSONType::String);
+        case KeyFieldname::type:
+            return make_intrusive<ExpressionType>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::abs:
+            return make_intrusive<ExpressionAbs>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::ceil:
+            return make_intrusive<ExpressionCeil>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::divide:
+            return make_intrusive<ExpressionDivide>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::exponent:
+            return make_intrusive<ExpressionExp>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::floor:
+            return make_intrusive<ExpressionFloor>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::ln:
+            return make_intrusive<ExpressionLn>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::log:
+            return make_intrusive<ExpressionLog>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::logten:
+            return make_intrusive<ExpressionLog10>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::mod:
+            return make_intrusive<ExpressionMod>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::multiply:
+            return make_intrusive<ExpressionMultiply>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::pow:
+            return make_intrusive<ExpressionPow>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::round:
+            return make_intrusive<ExpressionRound>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::sqrt:
+            return make_intrusive<ExpressionSqrt>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::subtract:
+            return make_intrusive<ExpressionSubtract>(expCtx.get(), std::move(expressions));
+        case KeyFieldname::trunc:
+            return make_intrusive<ExpressionTrunc>(expCtx.get(), std::move(expressions));
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+/**
+ * Walk a literal leaf CNode and produce an agg Value.
+ */
+Value translateLiteralLeaf(const CNode& cst) {
+    return stdx::visit(
+        visit_helper::Overloaded{
+            // These are illegal since they're non-leaf.
+            [](const CNode::ArrayChildren&) -> Value { MONGO_UNREACHABLE; },
+            [](const CNode::ObjectChildren&) -> Value { MONGO_UNREACHABLE; },
+            // These are illegal since they're non-literal.
+            [](const KeyValue&) -> Value { MONGO_UNREACHABLE; },
+            [](const NonZeroKey&) -> Value { MONGO_UNREACHABLE; },
+            // These payloads require a special translation to DocumentValue parlance.
+            [](const UserUndefined&) { return Value{BSONUndefined}; },
+            [](const UserNull&) { return Value{BSONNULL}; },
+            [](const UserMinKey&) { return Value{MINKEY}; },
+            [](const UserMaxKey&) { return Value{MAXKEY}; },
+            // The rest convert directly.
+            [](auto&& payload) { return Value{payload}; }},
+        cst.payload);
+}
+
+/**
+ * Walk a projection CNode and produce a ProjectionASTNode. Also returns whether this was an
+ * inclusion (or expressive projection) or an exclusion projection.
  */
 auto translateProjection(const CNode& cst, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
     using namespace projection_ast;
-    // TODO SERVER-48834: Support more than inclusion projection.
-    return std::make_unique<BooleanConstantASTNode>(true);
+    // Returns whether a KeyValue indicates inclusion or exclusion.
+    auto isInclusionKeyValue = [](auto&& keyValue) {
+        switch (stdx::get<KeyValue>(keyValue)) {
+            case KeyValue::trueKey:
+                return true;
+            case KeyValue::intZeroKey:
+            case KeyValue::longZeroKey:
+            case KeyValue::doubleZeroKey:
+            case KeyValue::decimalZeroKey:
+            case KeyValue::falseKey:
+                return false;
+            default:
+                MONGO_UNREACHABLE;
+        }
+    };
+
+    if (stdx::holds_alternative<NonZeroKey>(cst.payload) ||
+        (stdx::holds_alternative<KeyValue>(cst.payload) && isInclusionKeyValue(cst.payload)))
+        // This is an inclusion Key.
+        return std::pair{std::unique_ptr<ASTNode>{std::make_unique<BooleanConstantASTNode>(true)},
+                         true};
+    else if (stdx::holds_alternative<KeyValue>(cst.payload) && !isInclusionKeyValue(cst.payload))
+        // This is an exclusion Key.
+        return std::pair{std::unique_ptr<ASTNode>{std::make_unique<BooleanConstantASTNode>(false)},
+                         false};
+    else
+        // This is an arbitrary expression to produce a computed field (this counts as inclusion).
+        return std::pair{std::unique_ptr<ASTNode>{
+                             std::make_unique<ExpressionASTNode>(translateExpression(cst, expCtx))},
+                         true};
 }
 
 /**
@@ -66,21 +357,56 @@ auto translateProject(const CNode& cst, const boost::intrusive_ptr<ExpressionCon
     using namespace projection_ast;
     auto root = ProjectionPathASTNode{};
     bool sawId = false;
+    bool removeId = false;
+    boost::optional<bool> inclusion;
 
     for (auto&& [name, child] : cst.objectChildren()) {
-        if (stdx::get<UserFieldname>(name) == UserFieldname{"_id"})
+        // Turn the CNode into a projection AST node.
+        auto&& [projection, wasInclusion] = translateProjection(child, expCtx);
+        // If we see a key fieldname, make sure it's _id.
+        if (auto keyFieldname = stdx::get_if<KeyFieldname>(&name);
+            keyFieldname && *keyFieldname == KeyFieldname::id) {
+            // Keep track of whether we've ever seen _id at all.
             sawId = true;
-        addNodeAtPath(&root, stdx::get<UserFieldname>(name), translateProjection(child, expCtx));
+            // Keep track of whether we will need to remove the _id field to get around an exclusion
+            // projection bug in the case where it was manually included.
+            removeId = wasInclusion;
+            // Add node to the projection AST.
+            addNodeAtPath(&root, "_id", std::move(projection));
+        } else {
+            // This conditional changes the status of 'inclusion' to indicate whether we're in an
+            // inclusion or exclusion projection.
+            // TODO SERVER-48810: Improve error message with BSON locations.
+            inclusion = !inclusion ? wasInclusion
+                                   : *inclusion == wasInclusion ? wasInclusion : []() -> bool {
+                uasserted(4933100,
+                          "$project must include only exclusion "
+                          "projection or only inclusion projection");
+            }();
+            // Add node to the projection AST.
+            addNodeAtPath(&root, stdx::get<UserFieldname>(name), std::move(projection));
+        }
     }
 
-    if (!sawId)
-        addNodeAtPath(&root, "_id", std::make_unique<BooleanConstantASTNode>(true));
-
-    return DocumentSourceProject::create(
-        // TODO SERVER-48834: Support more than inclusion projection.
-        Projection{root, ProjectType::kInclusion},
-        expCtx,
-        "$project");
+    // If we saw any non-_id exclusions, this is an exclusion projection.
+    if (inclusion && !*inclusion) {
+        // If we saw an inclusion _id for an exclusion projection, we must manually remove it or
+        // projection AST will turn it into an _id exclusion due to a bug.
+        // TODO Fix the bug or organize this code to circumvent projection AST.
+        if (removeId)
+            static_cast<void>(root.removeChild("_id"));
+        return DocumentSourceProject::create(
+            Projection{root, ProjectType::kExclusion}, expCtx, "$project");
+        // If we saw any non-_id inclusions or computed fields, this is an inclusion projectioion.
+        // Also if inclusion was not determinted, it is the default.
+    } else {
+        // If we didn't see _id we need to add it in manually for inclusion or projection AST
+        // will incorrectly assume we want it gone.
+        if (!sawId)
+            addNodeAtPath(&root, "_id", std::make_unique<BooleanConstantASTNode>(true));
+        return DocumentSourceProject::create(
+            Projection{root, ProjectType::kInclusion}, expCtx, "$project");
+    }
 }
 
 /**
@@ -117,6 +443,23 @@ auto translateLimit(const CNode& cst, const boost::intrusive_ptr<ExpressionConte
 }
 
 /**
+ * Unwrap a sample stage CNode and produce a DocumentSourceMatch.
+ */
+auto translateSample(const CNode& cst, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return DocumentSourceSample::create(expCtx, translateNumToLong(cst.objectChildren()[0].second));
+}
+
+/**
+ * Unwrap a match stage CNode and produce a DocumentSourceSample.
+ */
+auto translateMatch(const CNode& cst, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    // TODO SERVER-48790, Implement CST to MatchExpression/Query command translation.
+    // And add corresponding tests in cst_pipeline_translation_test.cpp.
+    auto placeholder = fromjson("{}");
+    return DocumentSourceMatch::create(placeholder, expCtx);
+}
+
+/**
  * Walk an aggregation pipeline stage object CNode and produce a DocumentSource.
  */
 boost::intrusive_ptr<DocumentSource> translateSource(
@@ -124,16 +467,56 @@ boost::intrusive_ptr<DocumentSource> translateSource(
     switch (cst.firstKeyFieldname()) {
         case KeyFieldname::project:
             return translateProject(cst.objectChildren()[0].second, expCtx);
+        case KeyFieldname::match:
+            return translateMatch(cst.objectChildren()[0].second, expCtx);
         case KeyFieldname::skip:
             return translateSkip(cst.objectChildren()[0].second, expCtx);
         case KeyFieldname::limit:
             return translateLimit(cst.objectChildren()[0].second, expCtx);
+        case KeyFieldname::sample:
+            return translateSample(cst.objectChildren()[0].second, expCtx);
         default:
             MONGO_UNREACHABLE;
     }
 }
 
 }  // namespace
+
+/**
+ * Walk an expression CNode and produce an agg Expression.
+ */
+boost::intrusive_ptr<Expression> translateExpression(
+    const CNode& cst, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    return stdx::visit(
+        visit_helper::Overloaded{
+            // When we're not inside an agg operator/function, this is a non-leaf literal.
+            [&](const CNode::ArrayChildren& array) -> boost::intrusive_ptr<Expression> {
+                return translateLiteralArray(array, expCtx);
+            },
+            // This is either a literal object or an agg operator/function.
+            [&](const CNode::ObjectChildren& object) -> boost::intrusive_ptr<Expression> {
+                if (!object.empty() && stdx::holds_alternative<KeyFieldname>(object[0].first))
+                    return translateFunctionObject(object, expCtx);
+                else
+                    return translateLiteralObject(object, expCtx);
+            },
+            // If a key occurs outside a particular agg operator/function, it was misplaced.
+            [](const KeyValue& keyValue) -> boost::intrusive_ptr<Expression> {
+                switch (keyValue) {
+                    // An absentKey denotes a missing optional argument to an Expression.
+                    case KeyValue::absentKey:
+                        return nullptr;
+                    default:
+                        MONGO_UNREACHABLE;
+                }
+            },
+            [](const NonZeroKey&) -> boost::intrusive_ptr<Expression> { MONGO_UNREACHABLE; },
+            // Everything else is a literal leaf.
+            [&](auto &&) -> boost::intrusive_ptr<Expression> {
+                return ExpressionConstant::create(expCtx.get(), translateLiteralLeaf(cst));
+            }},
+        cst.payload);
+}
 
 /**
  * Walk a pipeline array CNode and produce a Pipeline.

@@ -1775,7 +1775,7 @@ std::string TopologyCoordinator::_getReplSetStatusString() {
     // Construct a ReplSetStatusArgs using default parameters. Missing parameters will not be
     // included in the status string.
     ReplSetStatusArgs rsStatusArgs{
-        Date_t::now(), 0U, OpTimeAndWallTime(), BSONObj(), BSONObj(), BSONObj(), boost::none};
+        Date_t::now(), 0U, OpTime(), BSONObj(), BSONObj(), BSONObj(), boost::none};
     BSONObjBuilder builder;
     Status result(ErrorCodes::InternalError, "didn't set status in prepareStatusResponse");
     prepareStatusResponse(rsStatusArgs, &builder, &result);
@@ -1972,10 +1972,8 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
 
     optimes.appendDate("lastCommittedWallTime", _lastCommittedOpTimeAndWallTime.wallTime);
 
-    if (!rsStatusArgs.readConcernMajorityOpTime.opTime.isNull()) {
-        rsStatusArgs.readConcernMajorityOpTime.opTime.append(&optimes, "readConcernMajorityOpTime");
-        optimes.appendDate("readConcernMajorityWallTime",
-                           rsStatusArgs.readConcernMajorityOpTime.wallTime);
+    if (!rsStatusArgs.readConcernMajorityOpTime.isNull()) {
+        rsStatusArgs.readConcernMajorityOpTime.append(&optimes, "readConcernMajorityOpTime");
     }
 
     appendOpTime(&optimes, "appliedOpTime", lastOpApplied);
@@ -2886,24 +2884,22 @@ bool TopologyCoordinator::canCompleteTransitionToPrimary(long long termWhenDrain
     }
     // Allow completing the transition to primary even when in the middle of a stepdown attempt,
     // in case the stepdown attempt fails.
-    if (_leaderMode != LeaderMode::kLeaderElect && _leaderMode != LeaderMode::kAttemptingStepDown) {
+    if (_leaderMode != LeaderMode::kLeaderElect && _leaderMode != LeaderMode::kAttemptingStepDown &&
+        _leaderMode != LeaderMode::kSteppingDown) {
         return false;
     }
 
     return true;
 }
 
-Status TopologyCoordinator::completeTransitionToPrimary(const OpTime& firstOpTimeOfTerm) {
-    if (!canCompleteTransitionToPrimary(firstOpTimeOfTerm.getTerm())) {
-        return Status(ErrorCodes::PrimarySteppedDown,
-                      "By the time this node was ready to complete its transition to PRIMARY it "
-                      "was no longer eligible to do so");
-    }
+void TopologyCoordinator::completeTransitionToPrimary(const OpTime& firstOpTimeOfTerm) {
+    invariant(canCompleteTransitionToPrimary(firstOpTimeOfTerm.getTerm()));
+
     if (_leaderMode == LeaderMode::kLeaderElect) {
         _setLeaderMode(LeaderMode::kMaster);
     }
+
     _firstOpTimeOfMyTerm = firstOpTimeOfTerm;
-    return Status::OK();
 }
 
 void TopologyCoordinator::adjustMaintenanceCountBy(int inc) {

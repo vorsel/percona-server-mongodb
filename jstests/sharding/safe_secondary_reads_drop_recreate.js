@@ -20,7 +20,7 @@
 "use strict";
 
 load('jstests/libs/profiler.js');
-load('jstests/sharding/libs/last_stable_mongos_commands.js');
+load('jstests/sharding/libs/last_lts_mongos_commands.js');
 
 let db = "test";
 let coll = "foo";
@@ -53,6 +53,7 @@ let testCases = {
     _configsvrMoveChunk: {skip: "primary only"},
     _configsvrMovePrimary: {skip: "primary only"},
     _configsvrRemoveShardFromZone: {skip: "primary only"},
+    _configsvrReshardCollection: {skip: "primary only"},
     _configsvrShardCollection: {skip: "primary only"},
     _configsvrUpdateZoneKeyRange: {skip: "primary only"},
     _flushRoutingTableCacheUpdates: {skip: "does not return user data"},
@@ -296,6 +297,7 @@ let testCases = {
     startRecordingTraffic: {skip: "does not return user data"},
     startSession: {skip: "does not return user data"},
     stopRecordingTraffic: {skip: "does not return user data"},
+    testDeprecation: {skip: "does not return user data"},
     top: {skip: "does not return user data"},
     unsetSharding: {skip: "does not return user data"},
     update: {skip: "primary only"},

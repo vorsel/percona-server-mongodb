@@ -53,7 +53,7 @@
 #endif
 #endif
 
-#line 52 "src/mongo/db/cst/pipeline_grammar.yy"
+#line 58 "src/mongo/db/cst/pipeline_grammar.yy"
 namespace mongo {
 #line 59 "src/mongo/db/cst/location_gen.h"
 
@@ -260,7 +260,7 @@ std::basic_ostream<YYChar>& operator<<(std::basic_ostream<YYChar>& ostr, const l
     return ostr;
 }
 
-#line 52 "src/mongo/db/cst/pipeline_grammar.yy"
+#line 58 "src/mongo/db/cst/pipeline_grammar.yy"
 }  // namespace mongo
 #line 333 "src/mongo/db/cst/location_gen.h"
 

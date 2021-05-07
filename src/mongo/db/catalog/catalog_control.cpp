@@ -110,10 +110,17 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
     // Load the catalog in the storage engine.
     LOGV2(20273, "openCatalog: loading storage engine catalog");
     auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    storageEngine->loadCatalog(opCtx);
+    // Ignore orphaned idents because this function is used during rollback and not at
+    // startup recovery, when we may try to recover orphaned idents.
+    auto loadingFromUncleanShutdown = false;
+    storageEngine->loadCatalog(opCtx, loadingFromUncleanShutdown);
 
     LOGV2(20274, "openCatalog: reconciling catalog and idents");
-    auto reconcileResult = fassert(40688, storageEngine->reconcileCatalogAndIdents(opCtx));
+    // Retain unknown internal idents because this function is used during rollback and not at
+    // startup recovery, when we may drop unknown internal idents.
+    auto internalIdentReconcilePolicy = StorageEngine::InternalIdentReconcilePolicy::kRetain;
+    auto reconcileResult = fassert(
+        40688, storageEngine->reconcileCatalogAndIdents(opCtx, internalIdentReconcilePolicy));
 
     // Determine which indexes need to be rebuilt. rebuildIndexesOnCollection() requires that all
     // indexes on that collection are done at once, so we use a map to group them together.
@@ -163,12 +170,12 @@ void openCatalog(OperationContext* opCtx, const MinVisibleTimestampMap& minVisib
         fassert(40690, rebuildIndexesOnCollection(opCtx, collection, indexSpecs, RepairData::kNo));
     }
 
-    // Once all unfinished index builds have been dropped and the catalog has been reloaded, restart
-    // any unfinished index builds. This will not restart any index builds to completion, but rather
-    // start the background thread, build the index, and wait for a replicated commit or abort oplog
-    // entry.
+    // Once all unfinished index builds have been dropped and the catalog has been reloaded, resume
+    // or restart any unfinished index builds. This will not resume/restart any index builds to
+    // completion, but rather start the background thread, build the index, and wait for a
+    // replicated commit or abort oplog entry.
     IndexBuildsCoordinator::get(opCtx)->restartIndexBuildsForRecovery(
-        opCtx, reconcileResult.indexBuildsToRestart);
+        opCtx, reconcileResult.indexBuildsToRestart, reconcileResult.indexBuildsToResume);
 
     // Open all databases and repopulate the CollectionCatalog.
     LOGV2(20276, "openCatalog: reopening all databases");

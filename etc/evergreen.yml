@@ -1766,6 +1766,9 @@ functions:
     - *update_task_timeout
     - command: expansions.update
       params:
+        env:
+          CEDAR_USER: ${cedar_user}
+          CEDAR_API_KEY: ${cedar_api_key}
         updates:
         - key: aws_key_remote
           value: ${mongodatafiles_aws_key}
@@ -3055,9 +3058,9 @@ functions:
   "gather failed unittests": &gather_failed_unittests
     command: shell.exec
     params:
+      shell: bash
       working_dir: "src"
       script: |
-
         set -eou pipefail
 
         # Only run on unit test tasks so we don't target mongod binaries from cores.
@@ -3514,7 +3517,7 @@ tasks:
   commands:
     - func: "scons compile"
       vars:
-        targets: install-all
+        targets: install-all-meta
         compiling_for_test: true
         task_compile_flags: >-
           --detect-odr-violations
@@ -3549,8 +3552,16 @@ tasks:
         script: |
           set -o errexit
           set -o verbose
+          # TODO SERVER-49884 Remove this when we no longer check in generated Bison.
+          BISON_GENERATED_PATTERN=pipeline_parser_gen\.cpp
           # This could probably be accelerated with gnu parallel
-          /opt/mongodbtoolchain/v3/bin/clang-tidy -p ./compile_commands.json --checks="-*,bugprone-unused-raii" -warnings-as-errors="*" $(jq -r '.[] | .file' compile_commands.json | grep src/mongo)
+          /opt/mongodbtoolchain/v3/bin/clang-tidy \
+            -p ./compile_commands.json \
+            --checks="-*,bugprone-unused-raii,bugprone-use-after-move" \
+            -warnings-as-errors="*" \
+            $(jq -r '.[] | .file' compile_commands.json | \
+            grep src/mongo | \
+            grep -v $BISON_GENERATED_PATTERN)
 
 ## unittests - run unittests ##
 - name: unittests
@@ -3677,44 +3688,6 @@ tasks:
           mkdir -p $BUILD_PREFIX/share/doc/mongo-c-driver
           cp COPYING $BUILD_PREFIX/share/doc/mongo-c-driver
           cp THIRD_PARTY_NOTICES $BUILD_PREFIX/share/doc/mongo-c-driver
-          if [ -d $BUILD_PREFIX/Frameworks ]; then
-
-              # We need to account for the fact that on the Darwin
-              # mobile platforms, things shouldn't go to the Resources
-              # directory but on macOS they should. If the Resources
-              # directory is there (it should be for the plist file),
-              # then use it, otherwise just use the framework root.
-              if [ -e $BUILD_PREFIX/Frameworks/mongoc.framework/Resources ]; then
-                  cp COPYING $BUILD_PREFIX/Frameworks/mongoc.framework/Resources
-                  cp THIRD_PARTY_NOTICES $BUILD_PREFIX/Frameworks/mongoc.framework/Resources
-                  plutil -insert MinimumOSVersion -string ${cdriver_cmake_osx_deployment_target} $BUILD_PREFIX/Frameworks/mongoc.framework/Resources/Info.plist
-              else
-                  cp COPYING $BUILD_PREFIX/Frameworks/mongoc.framework
-                  cp THIRD_PARTY_NOTICES $BUILD_PREFIX/Frameworks/mongoc.framework
-                  plutil -insert MinimumOSVersion -string ${cdriver_cmake_osx_deployment_target} $BUILD_PREFIX/Frameworks/mongoc.framework/Info.plist
-              fi
-
-              if [ -e $BUILD_PREFIX/Frameworks/bson.framework/Resources ]; then
-                  cp COPYING $BUILD_PREFIX/Frameworks/bson.framework/Resources
-                  cp THIRD_PARTY_NOTICES $BUILD_PREFIX/Frameworks/bson.framework/Resources
-                  plutil -insert MinimumOSVersion -string ${cdriver_cmake_osx_deployment_target} $BUILD_PREFIX/Frameworks/bson.framework/Resources/Info.plist
-              else
-                  cp COPYING $BUILD_PREFIX/Frameworks/bson.framework
-                  cp THIRD_PARTY_NOTICES $BUILD_PREFIX/Frameworks/bson.framework
-                  plutil -insert MinimumOSVersion -string ${cdriver_cmake_osx_deployment_target} $BUILD_PREFIX/Frameworks/bson.framework/Info.plist
-              fi
-
-          fi
-
-          # CMake doesn't seem to do the dSYM for us for the framework
-          if [ -e $BUILD_PREFIX/Frameworks ]; then
-              pushd $BUILD_PREFIX/Frameworks
-              xcrun dsymutil -num-threads=1 -o bson.framework.dSYM bson.framework/bson
-              xcrun strip -Sx bson.framework/bson
-              xcrun dsymutil -num-threads=1 -o mongoc.framework.dSYM mongoc.framework/mongoc
-              xcrun strip -Sx mongoc.framework/mongoc
-              popd
-          fi
 
           mv $BUILD_PREFIX $FINAL_PREFIX
 
@@ -6772,7 +6745,7 @@ tasks:
       resmoke_args: --storageEngine=wiredTiger
       fallback_num_sub_suites: 31
 
-- name: sharding_last_stable_mongos_and_mixed_shards_gen
+- name: sharding_last_lts_mongos_and_mixed_shards_gen
   tags: ["sharding", "common", "multiversion"]
   commands:
   - func: "generate resmoke tasks"
@@ -7122,7 +7095,7 @@ tasks:
 
 - <<: *task_template
   name: ocsp
-  tags: ["ssl", "ocsp"]
+  tags: ["ssl", "encrypt", "ocsp"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -9418,6 +9391,7 @@ buildvariants:
   run_on:
   - windows-64-vs2019-small
   expansions:
+    burn_in_tests_build_variant: enterprise-windows
     exe: ".exe"
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug msi archive-mh archive-mh-debug
     content_type: application/zip
@@ -9796,17 +9770,16 @@ buildvariants:
       --lto
       --variables-files=etc/scons/xcode_macosx.vars
       -j$(sysctl -n hw.logicalcpu)
-      FRAMEWORKPATH='$BUILD_ROOT/mongo-embedded-sdk-$MONGO_VERSION/Frameworks'
+      LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
     cdriver_cmake_osx_deployment_target: "10.12"
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)"
         -DCMAKE_OSX_ARCHITECTURES=x86_64
-        -DENABLE_APPLE_FRAMEWORK=ON
-        -DCMAKE_INSTALL_BINDIR=Frameworks
         -DENABLE_SSL=DARWIN
         -DENABLE_ZLIB=BUNDLED
         -DCMAKE_C_FLAGS="-Wunguarded-availability"
+        -DCMAKE_INSTALL_RPATH=@loader_path/../lib
     disable_unit_tests: true
   tasks:
   - name: embedded_sdk_build_and_test
@@ -10249,6 +10222,7 @@ buildvariants:
     scons_cache_scope: shared
     large_distro_name: rhel62-large
   tasks:
+  - name: burn_in_tests_gen
   - name: compile_TG
     distros:
     - rhel62-large
@@ -10918,7 +10892,7 @@ buildvariants:
   - name: compile_TG
     distros:
     - rhel70
-  - name: ssl_gen
+  - name: .ssl
   - name: jsCore
   - name: external_auth
 
@@ -11886,10 +11860,12 @@ buildvariants:
     # We also relax oplog constraints so that applying oplog entries after a rollbackViaRefetch works correctly.
     # TODO (SERVER-47022): Re-enable oplog constraint enforcement once we set the application mode
     # correctly after rollbackViaRefetch.
+    # TODO (SERVER-47509): Re-enable index build commit-quorum when resmoke handles multiple
+    # mongodSetParameters.
     test_flags: >-
       --storageEngine=ephemeralForTest
-      --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_wiredtiger,uses_transactions,requires_document_locking,uses_speculative_majority,requires_snapshot_read,requires_majority_read_concern,uses_change_streams,requires_sharding,incompatible_with_eft
-      --mongodSetParameters="{oplogApplicationEnforcesSteadyStateConstraints: false}"
+      --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_wiredtiger,uses_transactions,uses_speculative_majority,requires_snapshot_read,requires_majority_read_concern,uses_change_streams,requires_sharding,incompatible_with_eft
+      --mongodSetParameters="{oplogApplicationEnforcesSteadyStateConstraints: false, enableIndexBuildCommitQuorum: false}"
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     multiversion_platform: rhel62
     multiversion_edition: targeted
@@ -12007,6 +11983,8 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
+    # If you add anything to san_options, make sure the appropriate changes are
+    # also made to SConstruct.
     san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=address --ssl --enable-free-mon=on -j$(grep -c ^processor /proc/cpuinfo)
     multiversion_platform: ubuntu1804
@@ -12101,6 +12079,8 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for UBSAN.
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
+    # If you add anything to san_options, make sure the appropriate changes are
+    # also made to SConstruct.
     san_options: UBSAN_OPTIONS="print_stacktrace=1"
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --sanitize=undefined --ssl --enable-free-mon=on -j$(grep -c ^processor /proc/cpuinfo)
     multiversion_platform: ubuntu1804
@@ -12154,7 +12134,7 @@ buildvariants:
   - name: server_selection_json_test_TG
 
 - name: ubuntu1804-debug-aubsan-lite
-  display_name: "! {A,UB}SAN Enterprise Ubuntu 18.04 DEBUG"
+  display_name: "! Shared Library {A,UB}SAN Enterprise Ubuntu 18.04 DEBUG"
   batchtime: 240 # 4 hours
   modules:
   - enterprise
@@ -12167,13 +12147,15 @@ buildvariants:
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
     san_options: UBSAN_OPTIONS="print_stacktrace=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
-    compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo)
+    compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl -j$(grep -c ^processor /proc/cpuinfo) --link-model=dynamic
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
+    scons_cache_mode: all
     max_sub_suites: 100
+    num_scons_link_jobs_available: 0.99
   tasks:
-  - name: compile_all_run_unittests_TG
+  - name: compile_all_run_unittests_parallel_TG
   - name: jsCore
   - name: jsCore_txns
   # Note: {A,UB}SAN has a runtime component that is not fed into Jepsen.
@@ -12195,6 +12177,8 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
+    # If you add anything to san_options, make sure the appropriate changes are
+    # also made to SConstruct.
     san_options: UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS=detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1
     compile_flags: LINKFLAGS=-nostdlib++ LIBS=stdc++ --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address,fuzzer --ssl -j$(grep -c ^processor /proc/cpuinfo)
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
@@ -12217,6 +12201,8 @@ buildvariants:
     # We need llvm-symbolizer in the PATH for ASAN for clang-3.7 or later.
     variant_path_suffix: /opt/mongodbtoolchain/v3/bin
     lang_environment: LANG=C
+    # If you add anything to san_options, make sure the appropriate changes are
+    # also made to SConstruct.
     san_options: TSAN_OPTIONS="die_after_fork=0:suppressions=etc/tsan.suppressions:halt_on_error=1"
     # TODO: Remove some of the excluded tags when the ephemeralForTest storage engine is
     # further along in development: https://jira.mongodb.org/browse/SERVER-48325

@@ -83,6 +83,7 @@ ClientCursor::ClientCursor(ClientCursorParams params,
       _authenticatedUsers(std::move(params.authenticatedUsers)),
       _lsid(operationUsingCursor->getLogicalSessionId()),
       _txnNumber(operationUsingCursor->getTxnNumber()),
+      _apiParameters(std::move(params.apiParameters)),
       _writeConcernOptions(std::move(params.writeConcernOptions)),
       _readConcernArgs(std::move(params.readConcernArgs)),
       _originatingCommand(params.originatingCommandObj),
@@ -92,7 +93,7 @@ ClientCursor::ClientCursor(ClientCursorParams params,
       _operationUsingCursor(operationUsingCursor),
       _lastUseDate(now),
       _createdDate(now),
-      _planSummary(Explain::getPlanSummary(_exec.get())),
+      _planSummary(_exec->getPlanSummary()),
       _opKey(operationUsingCursor->getOperationKey()) {
     invariant(_exec);
     invariant(_operationUsingCursor);

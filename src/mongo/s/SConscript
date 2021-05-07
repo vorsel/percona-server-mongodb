@@ -179,7 +179,10 @@ env.Library(
         env.Idlc('request_types/shard_collection.idl')[0],
         env.Idlc('request_types/refine_collection_shard_key.idl')[0],
         env.Idlc('request_types/reshard_collection.idl')[0],
+        env.Idlc('resharded_chunk.idl')[0],
         env.Idlc('request_types/wait_for_fail_point.idl')[0],
+        env.Idlc('resharding/common_types.idl')[0],
+        env.Idlc('resharding/type_collection_fields.idl')[0],
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/connection_string',
@@ -195,6 +198,7 @@ env.Library(
     target='sharding_test_fixture_common',
     source=[
         'sharding_test_fixture_common.cpp',
+        'catalog_cache_loader_mock.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/remote_command_targeter_mock',
@@ -563,6 +567,7 @@ env.CppUnitTest(
         'append_raw_responses_test.cpp',
         'balancer_configuration_test.cpp',
         'build_versioned_requests_for_targeted_shards_test.cpp',
+        'catalog_cache_test.cpp',
         'catalog_cache_refresh_test.cpp',
         'catalog/type_changelog_test.cpp',
         'catalog/type_chunk_test.cpp',
@@ -581,7 +586,6 @@ env.CppUnitTest(
         'chunk_test.cpp',
         'chunk_version_test.cpp',
         'chunk_writes_tracker_test.cpp',
-        'client/shard_registry_data_test.cpp',
         'client/shard_remote_test.cpp',
         'cluster_identity_loader_test.cpp',
         'cluster_last_error_info_test.cpp',

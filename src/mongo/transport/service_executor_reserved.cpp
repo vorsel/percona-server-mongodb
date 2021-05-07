@@ -35,8 +35,8 @@
 
 #include "mongo/logv2/log.h"
 #include "mongo/stdx/thread.h"
-#include "mongo/transport/service_entry_point_utils.h"
 #include "mongo/transport/service_executor_gen.h"
+#include "mongo/transport/service_executor_utils.h"
 #include "mongo/util/processinfo.h"
 
 namespace mongo {
@@ -165,7 +165,7 @@ Status ServiceExecutorReserved::shutdown(Milliseconds timeout) {
                  "reserved executor couldn't shutdown all worker threads within time limit.");
 }
 
-Status ServiceExecutorReserved::schedule(Task task, ScheduleFlags flags) {
+Status ServiceExecutorReserved::scheduleTask(Task task, ScheduleFlags flags) {
     if (!_stillRunning.load()) {
         return Status{ErrorCodes::ShutdownInProgress, "Executor is not running"};
     }
@@ -198,6 +198,11 @@ void ServiceExecutorReserved::appendStats(BSONObjBuilder* bob) const {
          << static_cast<int>(_numRunningWorkerThreads.loadRelaxed()) << kReadyThreads
          << static_cast<int>(_numReadyThreads) << kStartingThreads
          << static_cast<int>(_numStartingThreads);
+}
+
+void ServiceExecutorReserved::runOnDataAvailable(Session* session,
+                                                 OutOfLineExecutor::Task onCompletionCallback) {
+    scheduleCallbackOnDataAvailable(session, std::move(onCompletionCallback), this);
 }
 
 }  // namespace transport

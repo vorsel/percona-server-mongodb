@@ -132,7 +132,7 @@ protected:
         getTopoCoord().setCurrentPrimary_forTest(_selfIndex, electionTimestamp);
         OpTime dummyOpTime(Timestamp(1, 1), getTopoCoord().getTerm());
         setMyOpTime(dummyOpTime);
-        ASSERT_OK(getTopoCoord().completeTransitionToPrimary(dummyOpTime));
+        getTopoCoord().completeTransitionToPrimary(dummyOpTime);
     }
 
     void setMyOpTime(const OpTime& opTime, Date_t wallTime = Date_t()) {
@@ -1825,7 +1825,6 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
     OpTime lastCommittedOpTime(Timestamp(5, 1), 20);
     Date_t lastCommittedWallTime = Date_t() + Seconds(lastCommittedOpTime.getSecs());
     OpTime readConcernMajorityOpTime(Timestamp(4, 1), 20);
-    Date_t readConcernMajorityWallTime = Date_t() + Seconds(readConcernMajorityOpTime.getSecs());
 
     Timestamp lastStableRecoveryTimestamp(2, 2);
     Timestamp lastStableCheckpointTimestampDeprecated(2, 2);
@@ -1885,7 +1884,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
         TopologyCoordinator::ReplSetStatusArgs{
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-            {readConcernMajorityOpTime, readConcernMajorityWallTime},
+            readConcernMajorityOpTime,
             initialSyncStatus,
             electionCandidateMetrics,
             electionParticipantMetrics,
@@ -1906,7 +1905,6 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
         const auto optimes = rsStatus["optimes"].Obj();
         ASSERT_BSONOBJ_EQ(readConcernMajorityOpTime.toBSON(),
                           optimes["readConcernMajorityOpTime"].Obj());
-        ASSERT_EQUALS(readConcernMajorityWallTime, optimes["readConcernMajorityWallTime"].Date());
         ASSERT_BSONOBJ_EQ(oplogProgress.toBSON(), optimes["appliedOpTime"].Obj());
         ASSERT_EQUALS(appliedWallTime, optimes["lastAppliedWallTime"].Date());
         ASSERT_BSONOBJ_EQ((oplogDurable).toBSON(), optimes["durableOpTime"].Obj());
@@ -2005,7 +2003,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatus) {
         TopologyCoordinator::ReplSetStatusArgs{
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-            {readConcernMajorityOpTime, readConcernMajorityWallTime},
+            readConcernMajorityOpTime,
             initialSyncStatus,
             BSONObj()},
         &statusBuilder2,
@@ -2027,7 +2025,6 @@ TEST_F(TopoCoordTest, ReplSetGetStatusWriteMajorityDifferentFromMajorityVoteCoun
     Seconds uptimeSecs(10);
     Date_t curTime = heartbeatTime + uptimeSecs;
     OpTime readConcernMajorityOpTime(Timestamp(4, 1), 20);
-    Date_t readConcernMajorityWallTime = Date_t() + Seconds(readConcernMajorityOpTime.getSecs());
     BSONObj initialSyncStatus = BSON("failedInitialSyncAttempts" << 1);
     std::string setName = "mySet";
 
@@ -2051,7 +2048,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatusWriteMajorityDifferentFromMajorityVoteCoun
         TopologyCoordinator::ReplSetStatusArgs{
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-            {readConcernMajorityOpTime, readConcernMajorityWallTime},
+            readConcernMajorityOpTime,
             initialSyncStatus},
         &statusBuilder,
         &resultStatus);
@@ -2085,7 +2082,7 @@ TEST_F(TopoCoordTest, ReplSetGetStatusVotingMembersCountAndWritableVotingMembers
     BSONObjBuilder statusBuilder;
     Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
     getTopoCoord().prepareStatusResponse(
-        TopologyCoordinator::ReplSetStatusArgs{Date_t(), 10, OpTimeAndWallTime(), BSONObj()},
+        TopologyCoordinator::ReplSetStatusArgs{Date_t(), 10, OpTime(), BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_OK(resultStatus);
@@ -2121,7 +2118,7 @@ TEST_F(TopoCoordTest, NodeReturnsInvalidReplicaSetConfigInResponseToGetStatusWhe
         TopologyCoordinator::ReplSetStatusArgs{
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-            OpTimeAndWallTime(),
+            OpTime(),
             BSONObj()},
         &statusBuilder,
         &resultStatus);
@@ -5494,7 +5491,7 @@ TEST_F(TopoCoordTest,
             TopologyCoordinator::ReplSetStatusArgs{
                 curTime,
                 static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-                OpTimeAndWallTime(),
+                OpTime(),
                 BSONObj()},
             &statusBuilder,
             &resultStatus);
@@ -5562,7 +5559,7 @@ TEST_F(TopoCoordTest,
             TopologyCoordinator::ReplSetStatusArgs{
                 curTime,
                 static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-                OpTimeAndWallTime(),
+                OpTime(),
                 BSONObj()},
             &statusBuilder,
             &resultStatus);
@@ -5644,7 +5641,7 @@ TEST_F(TopoCoordTest, replSetGetStatusForThreeMemberedReplicaSet) {
         TopologyCoordinator::ReplSetStatusArgs{
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-            OpTimeAndWallTime(),
+            OpTime(),
             BSONObj()},
         &statusBuilder,
         &resultStatus);
@@ -5702,7 +5699,7 @@ TEST_F(TopoCoordTest, StatusResponseAlwaysIncludesStringStatusFieldsForNonMember
         TopologyCoordinator::ReplSetStatusArgs{
             curTime,
             static_cast<unsigned>(durationCount<Seconds>(uptimeSecs)),
-            OpTimeAndWallTime(),
+            OpTime(),
             BSONObj()},
         &statusBuilder,
         &resultStatus);
@@ -6913,7 +6910,7 @@ TEST_F(HeartbeatResponseTestV1, NodeDoesNotStepDownSelfWhenRemoteNodeWasElectedL
     ASSERT_NO_ACTION(nextAction.getAction());
 }
 
-TEST_F(HeartbeatResponseTestV1, NodeWillNotTransitionToPrimaryAfterHearingAboutNewerTerm) {
+TEST_F(HeartbeatResponseTestV1, NodeWillCompleteTransitionToPrimaryAfterHearingAboutNewerTerm) {
     auto initialTerm = getTopoCoord().getTerm();
     OpTime firstOpTimeOfTerm(Timestamp(1, 1), initialTerm);
 
@@ -6922,17 +6919,14 @@ TEST_F(HeartbeatResponseTestV1, NodeWillNotTransitionToPrimaryAfterHearingAboutN
                                              firstOpTimeOfTerm.getTimestamp());
     getTopoCoord().setCurrentPrimary_forTest(getSelfIndex());
 
-    // At first transition to primary is OK
-    ASSERT(getTopoCoord().canCompleteTransitionToPrimary(initialTerm));
+    // Verify that transition to primary is OK.
+    ASSERT_TRUE(getTopoCoord().canCompleteTransitionToPrimary(initialTerm));
 
     // Now mark ourselves as mid-stepdown, as if we had heard about a new term.
     getTopoCoord().prepareForUnconditionalStepDown();
 
-    ASSERT_FALSE(getTopoCoord().canCompleteTransitionToPrimary(initialTerm));
-
-    // Check that transitioning to primary fails now that the term has been updated.
-    ASSERT_EQUALS(ErrorCodes::PrimarySteppedDown,
-                  getTopoCoord().completeTransitionToPrimary(firstOpTimeOfTerm));
+    // Verify that the transition to primary can still complete.
+    ASSERT_TRUE(getTopoCoord().canCompleteTransitionToPrimary(initialTerm));
 }
 
 TEST_F(HeartbeatResponseTestV1,
@@ -7161,7 +7155,7 @@ public:
         Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
         getTopoCoord().prepareStatusResponse(
             TopologyCoordinator::ReplSetStatusArgs{
-                _firstRequestDate + Milliseconds(4000), 10, OpTimeAndWallTime(), BSONObj()},
+                _firstRequestDate + Milliseconds(4000), 10, OpTime(), BSONObj()},
             &statusBuilder,
             &resultStatus);
         ASSERT_OK(resultStatus);
@@ -7239,7 +7233,7 @@ public:
         Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
         getTopoCoord().prepareStatusResponse(
             TopologyCoordinator::ReplSetStatusArgs{
-                firstRequestDate() + Seconds(4), 10, OpTimeAndWallTime(), BSONObj()},
+                firstRequestDate() + Seconds(4), 10, OpTime(), BSONObj()},
             &statusBuilder,
             &resultStatus);
         ASSERT_OK(resultStatus);
@@ -7282,7 +7276,7 @@ TEST_F(HeartbeatResponseTestTwoRetriesV1, NodeDoesNotRetryHeartbeatsAfterFailing
     Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
     getTopoCoord().prepareStatusResponse(
         TopologyCoordinator::ReplSetStatusArgs{
-            firstRequestDate() + Milliseconds(4900), 10, OpTimeAndWallTime(), BSONObj()},
+            firstRequestDate() + Milliseconds(4900), 10, OpTime(), BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_OK(resultStatus);
@@ -7334,7 +7328,7 @@ TEST_F(HeartbeatResponseTestTwoRetriesV1, HeartbeatThreeNonconsecutiveFailures) 
     Status resultStatus(ErrorCodes::InternalError, "prepareStatusResponse didn't set result");
     getTopoCoord().prepareStatusResponse(
         TopologyCoordinator::ReplSetStatusArgs{
-            firstRequestDate() + Milliseconds(7000), 600, OpTimeAndWallTime(), BSONObj()},
+            firstRequestDate() + Milliseconds(7000), 600, OpTime(), BSONObj()},
         &statusBuilder,
         &resultStatus);
     ASSERT_OK(resultStatus);

@@ -202,7 +202,8 @@ void CollectionShardingRuntime::setFilteringMetadata(OperationContext* opCtx,
     }
 }
 
-void CollectionShardingRuntime::clearFilteringMetadata() {
+void CollectionShardingRuntime::clearFilteringMetadata(OperationContext* opCtx) {
+    const auto csrLock = CSRLock::lockExclusive(opCtx, this);
     stdx::lock_guard lk(_metadataManagerLock);
     if (!isNamespaceAlwaysUnsharded(_nss)) {
         LOGV2_DEBUG(4798530,
@@ -213,18 +214,6 @@ void CollectionShardingRuntime::clearFilteringMetadata() {
         _metadataType = MetadataType::kUnknown;
         _metadataManager.reset();
     }
-}
-
-SharedSemiFuture<void> CollectionShardingRuntime::beginReceive(ChunkRange const& range) {
-    stdx::lock_guard lk(_metadataManagerLock);
-    invariant(_metadataType == MetadataType::kSharded);
-    return _metadataManager->beginReceive(range);
-}
-
-void CollectionShardingRuntime::forgetReceive(const ChunkRange& range) {
-    stdx::lock_guard lk(_metadataManagerLock);
-    invariant(_metadataType == MetadataType::kSharded);
-    _metadataManager->forgetReceive(range);
 }
 
 SharedSemiFuture<void> CollectionShardingRuntime::cleanUpRange(ChunkRange const& range,
@@ -288,12 +277,6 @@ Status CollectionShardingRuntime::waitForClean(OperationContext* opCtx,
     }
 
     MONGO_UNREACHABLE;
-}
-
-boost::optional<ChunkRange> CollectionShardingRuntime::getNextOrphanRange(BSONObj const& from) {
-    stdx::lock_guard lk(_metadataManagerLock);
-    invariant(_metadataType == MetadataType::kSharded);
-    return _metadataManager->getNextOrphanRange(from);
 }
 
 std::shared_ptr<ScopedCollectionDescription::Impl>
@@ -390,16 +373,6 @@ void CollectionShardingRuntime::appendShardVersion(BSONObjBuilder* builder) {
     if (optCollDescr) {
         builder->appendTimestamp(_nss.ns(), optCollDescr->getShardVersion().toLong());
     }
-}
-
-void CollectionShardingRuntime::appendPendingReceiveChunks(BSONArrayBuilder* builder) {
-    _metadataManager->toBSONPending(*builder);
-}
-
-void CollectionShardingRuntime::clearReceivingChunks() {
-    stdx::lock_guard lk(_metadataManagerLock);
-    invariant(_metadataType == MetadataType::kSharded);
-    _metadataManager->clearReceivingChunks();
 }
 
 size_t CollectionShardingRuntime::numberOfRangesScheduledForDeletion() const {

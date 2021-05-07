@@ -45,7 +45,6 @@ std::pair<value::TypeTags, value::Value> genericNumericCompare(value::TypeTags l
                                                                value::TypeTags rhsTag,
                                                                value::Value rhsValue,
                                                                Op op) {
-
     if (value::isNumber(lhsTag) && value::isNumber(rhsTag)) {
         switch (getWidestNumericalType(lhsTag, rhsTag)) {
             case value::TypeTags::NumberInt32: {
@@ -90,6 +89,13 @@ std::pair<value::TypeTags, value::Value> genericNumericCompare(value::TypeTags l
         // This is where Mongo differs from SQL.
         auto result = op(0, 0);
         return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+    } else if ((value::isArray(lhsTag) && value::isArray(rhsTag)) ||
+               (value::isObject(lhsTag) && value::isObject(rhsTag))) {
+        auto [tag, val] = value::compareValue(lhsTag, lhsValue, rhsTag, rhsValue);
+        if (tag == value::TypeTags::NumberInt32) {
+            auto result = op(value::bitcastTo<int32_t>(val), 0);
+            return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+        }
     }
 
     return {value::TypeTags::Nothing, 0};
@@ -108,7 +114,10 @@ struct Instruction {
         sub,
         mul,
         div,
+        idiv,
+        mod,
         negate,
+        numConvert,
 
         logicNot,
 
@@ -138,6 +147,7 @@ struct Instruction {
         isArray,
         isString,
         isNumber,
+        typeMatch,
 
         function,
 
@@ -160,13 +170,16 @@ static_assert(sizeof(Instruction) == sizeof(uint8_t));
 enum class Builtin : uint8_t {
     split,
     regexMatch,
+    dateParts,
+    datePartsWeekYear,
     dropFields,
     newObj,
-    ksToString,  // KeyString to string
-    newKs,       // new KeyString
-    abs,         // absolute value
-    addToArray,  // agg function to append to an array
-    addToSet,    // agg function to append to a set
+    ksToString,       // KeyString to string
+    newKs,            // new KeyString
+    abs,              // absolute value
+    addToArray,       // agg function to append to an array
+    addToSet,         // agg function to append to a set
+    doubleDoubleSum,  // special double summation
 };
 
 class CodeFragment {
@@ -195,6 +208,8 @@ public:
     void appendSub();
     void appendMul();
     void appendDiv();
+    void appendIDiv();
+    void appendMod();
     void appendNegate();
     void appendNot();
     void appendLess() {
@@ -233,6 +248,7 @@ public:
     void appendIsArray();
     void appendIsString();
     void appendIsNumber();
+    void appendTypeMatch(uint32_t typeMask);
     void appendFunction(Builtin f, uint8_t arity);
     void appendJump(int jumpOffset);
     void appendJumpTrue(int jumpOffset);
@@ -240,6 +256,7 @@ public:
     void appendFail() {
         appendSimpleInstruction(Instruction::fail);
     }
+    void appendNumericConvert(value::TypeTags targetTag);
 
 private:
     void appendSimpleInstruction(Instruction::Tags tag);
@@ -299,10 +316,21 @@ private:
                                                                value::Value lhsValue,
                                                                value::TypeTags rhsTag,
                                                                value::Value rhsValue);
+    std::tuple<bool, value::TypeTags, value::Value> genericIDiv(value::TypeTags lhsTag,
+                                                                value::Value lhsValue,
+                                                                value::TypeTags rhsTag,
+                                                                value::Value rhsValue);
+    std::tuple<bool, value::TypeTags, value::Value> genericMod(value::TypeTags lhsTag,
+                                                               value::Value lhsValue,
+                                                               value::TypeTags rhsTag,
+                                                               value::Value rhsValue);
     std::tuple<bool, value::TypeTags, value::Value> genericAbs(value::TypeTags operandTag,
                                                                value::Value operandValue);
     std::tuple<bool, value::TypeTags, value::Value> genericNot(value::TypeTags tag,
                                                                value::Value value);
+    std::tuple<bool, value::TypeTags, value::Value> genericNumConvert(value::TypeTags lhsTag,
+                                                                      value::Value lhsValue,
+                                                                      value::TypeTags rhsTag);
     template <typename Op>
     std::pair<value::TypeTags, value::Value> genericCompare(value::TypeTags lhsTag,
                                                             value::Value lhsValue,
@@ -358,6 +386,8 @@ private:
                                                             value::Value fieldValue);
 
     std::tuple<bool, value::TypeTags, value::Value> builtinSplit(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDate(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDateWeekYear(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinRegexMatch(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDropFields(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinNewObj(uint8_t arity);
@@ -366,6 +396,7 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinAbs(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinAddToArray(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinAddToSet(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDoubleDoubleSum(uint8_t arity);
 
     std::tuple<bool, value::TypeTags, value::Value> dispatchBuiltin(Builtin f, uint8_t arity);
 

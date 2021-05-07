@@ -115,6 +115,7 @@
 #include "mongo/util/fast_clock_source_factory.h"
 #include "mongo/util/latch_analyzer.h"
 #include "mongo/util/net/ocsp/ocsp_manager.h"
+#include "mongo/util/net/private/ssl_expiration.h"
 #include "mongo/util/net/socket_exception.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/net/ssl_manager.h"
@@ -291,9 +292,10 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
         // At this point, we will start responding to any isMaster request with ShutdownInProgress
         // so that clients can re-route their operations.
         //
-        // TODO SERVER-49138: Remove this FCV check once we branch for 4.8.
-        if (serverGlobalParams.featureCompatibility.isVersion(
-                ServerGlobalParams::FeatureCompatibility::Version::kVersion451);
+        // TODO SERVER-49138: Remove this FCV check when 5.0 becomes last-lts.
+        if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+                    ServerGlobalParams::FeatureCompatibility::Version::kVersion47);
             auto mongosTopCoord = MongosTopologyCoordinator::get(opCtx)) {
             mongosTopCoord->enterQuiesceModeAndWait(opCtx, quiesceTime);
         }
@@ -421,12 +423,11 @@ Status initializeSharding(OperationContext* opCtx) {
     auto shardFactory =
         std::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
 
-    auto catalogCacheExecutor = CatalogCache::makeDefaultThreadPool();
     CatalogCacheLoader::set(opCtx->getServiceContext(),
-                            std::make_unique<ConfigServerCatalogCacheLoader>(catalogCacheExecutor));
+                            std::make_unique<ConfigServerCatalogCacheLoader>());
 
     auto catalogCache =
-        std::make_unique<CatalogCache>(CatalogCacheLoader::get(opCtx), catalogCacheExecutor);
+        std::make_unique<CatalogCache>(opCtx->getServiceContext(), CatalogCacheLoader::get(opCtx));
 
     // List of hooks which will be called by the ShardRegistry when it discovers a shard has been
     // removed.
@@ -492,15 +493,16 @@ Status initializeSharding(OperationContext* opCtx) {
     return Status::OK();
 }
 
-void initWireSpec() {
-    WireSpec& spec = WireSpec::instance();
-
+MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionHandling"))(InitializerContext*) {
     // Since the upgrade order calls for upgrading mongos last, it only needs to talk the latest
     // wire version. This ensures that users will get errors if they upgrade in the wrong order.
+    WireSpec::Specification spec;
     spec.outgoing.minWireVersion = LATEST_WIRE_VERSION;
     spec.outgoing.maxWireVersion = LATEST_WIRE_VERSION;
-
     spec.isInternalClient = true;
+
+    WireSpec::instance().initialize(std::move(spec));
+    return Status::OK();
 }
 
 class ShardingReplicaSetChangeListener final
@@ -665,8 +667,6 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
 
     logShardingVersionInfo(nullptr);
 
-    initWireSpec();
-
     // Set up the periodic runner for background job execution
     {
         auto runner = makePeriodicRunner(serviceContext);
@@ -674,6 +674,7 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     }
 
     OCSPManager::get()->startThreadPool();
+    CertificateExpirationMonitor::get()->start(serviceContext);
 
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongos>(serviceContext));
 

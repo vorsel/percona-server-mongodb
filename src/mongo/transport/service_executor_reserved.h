@@ -56,11 +56,14 @@ public:
 
     Status start() override;
     Status shutdown(Milliseconds timeout) override;
-    Status schedule(Task task, ScheduleFlags flags) override;
+    Status scheduleTask(Task task, ScheduleFlags flags) override;
 
     Mode transportMode() const override {
         return Mode::kSynchronous;
     }
+
+    void runOnDataAvailable(Session* session,
+                            OutOfLineExecutor::Task onCompletionCallback) override;
 
     void appendStats(BSONObjBuilder* bob) const override;
 

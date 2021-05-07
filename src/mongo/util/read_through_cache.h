@@ -97,6 +97,17 @@ protected:
     Mutex _cancelTokenMutex = MONGO_MAKE_LATCH("ReadThroughCacheBase::_cancelTokenMutex");
 };
 
+template <typename Result, typename Key, typename Value, typename Time>
+struct ReadThroughCacheLookup {
+    using Fn = unique_function<Result(
+        OperationContext*, const Key&, const Value& cachedValue, const Time& timeInStore)>;
+};
+
+template <typename Result, typename Key, typename Value>
+struct ReadThroughCacheLookup<Result, Key, Value, CacheNotCausallyConsistent> {
+    using Fn = unique_function<Result(OperationContext*, const Key&, const Value& cachedValue)>;
+};
+
 /**
  * Implements an (optionally) causally consistent read-through cache from Key to Value, built on top
  * of InvalidatingLRUCache.
@@ -206,7 +217,8 @@ public:
         // contains the time that the store returned for the 'value'.
         Time t;
     };
-    using LookupFn = unique_function<LookupResult(OperationContext*, const Key&)>;
+
+    using LookupFn = typename ReadThroughCacheLookup<LookupResult, Key, ValueHandle, Time>::Fn;
 
     // Exposed publicly so it can be unit-tested indepedently of the usages in this class. Must not
     // be used independently.
@@ -247,8 +259,11 @@ public:
             return it->second->addWaiter(ul);
 
         // Schedule an asynchronous lookup for the key
+        auto [cachedValue, timeInStore] = _cache.getCachedValueAndTimeInStore(key);
         auto [it, emplaced] = _inProgressLookups.emplace(
-            key, std::make_unique<InProgressLookup>(*this, key, _cache.getTimeInStore(key)));
+            key,
+            std::make_unique<InProgressLookup>(
+                *this, key, ValueHandle(std::move(cachedValue)), std::move(timeInStore)));
         invariant(emplaced);
         auto& inProgressLookup = *it->second;
         auto sharedFutureToReturn = inProgressLookup.addWaiter(ul);
@@ -316,8 +331,11 @@ public:
         _cache.invalidate(key);
     }
 
+    /**
+     * Invalidates all cached entries and in progress lookups with keys that matches the preidcate.
+     */
     template <typename Pred>
-    void invalidateIf(const Pred& predicate) {
+    void invalidateKeyIf(const Pred& predicate) {
         stdx::lock_guard lg(_mutex);
         for (auto& entry : _inProgressLookups) {
             if (predicate(entry.first))
@@ -326,8 +344,18 @@ public:
         _cache.invalidateIf([&](const Key& key, const StoredValue*) { return predicate(key); });
     }
 
+    /**
+     * Invalidates all cached entries with stored values that matches the preidcate.
+     */
+    template <typename Pred>
+    void invalidateCachedValueIf(const Pred& predicate) {
+        stdx::lock_guard lg(_mutex);
+        _cache.invalidateIf(
+            [&](const Key&, const StoredValue* value) { return predicate(value->value); });
+    }
+
     void invalidateAll() {
-        invalidateIf([](const Key&) { return true; });
+        invalidateKeyIf([](const Key&) { return true; });
     }
 
     /**
@@ -498,8 +526,11 @@ private:
 template <typename Key, typename Value, typename Time>
 class ReadThroughCache<Key, Value, Time>::InProgressLookup {
 public:
-    InProgressLookup(ReadThroughCache& cache, Key key, Time minTimeInStore)
-        : _cache(cache), _key(std::move(key)), _minTimeInStore(std::move(minTimeInStore)) {}
+    InProgressLookup(ReadThroughCache& cache, Key key, ValueHandle cachedValue, Time minTimeInStore)
+        : _cache(cache),
+          _key(std::move(key)),
+          _cachedValue(std::move(cachedValue)),
+          _minTimeInStore(std::move(minTimeInStore)) {}
 
     Future<LookupResult> asyncLookupRound() {
         auto [promise, future] = makePromiseFuture<LookupResult>();
@@ -510,7 +541,11 @@ public:
             OperationContext * opCtx, const Status& status) mutable noexcept {
             promise.setWith([&] {
                 uassertStatusOK(status);
-                return _cache._lookupFn(opCtx, _key);
+                if constexpr (std::is_same_v<Time, CacheNotCausallyConsistent>) {
+                    return _cache._lookupFn(opCtx, _key, _cachedValue);
+                } else {
+                    return _cache._lookupFn(opCtx, _key, _cachedValue, _minTimeInStore);
+                }
             });
         }));
 
@@ -580,6 +615,7 @@ private:
     bool _valid{false};
     boost::optional<CancelToken> _cancelToken;
 
+    ValueHandle _cachedValue;
     Time _minTimeInStore;
 
     using TimeAndPromiseMap = std::map<Time, std::unique_ptr<SharedPromise<ValueHandle>>>;

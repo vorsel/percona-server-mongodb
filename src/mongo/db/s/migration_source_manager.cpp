@@ -76,7 +76,6 @@ const auto msmForCsr = CollectionShardingRuntime::declareDecoration<MigrationSou
 // Wait at most this much time for the recipient to catch up sufficiently so critical section can be
 // entered
 const Hours kMaxWaitToEnterCriticalSectionTimeout(6);
-const char kMigratedChunkVersionField[] = "migratedChunkVersion";
 const char kWriteConcernField[] = "writeConcern";
 const WriteConcernOptions kMajorityWriteConcern(WriteConcernOptions::kMajority,
                                                 WriteConcernOptions::SyncMode::UNSET,
@@ -451,10 +450,7 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig() {
         {
             UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
             AutoGetCollection autoColl(_opCtx, getNss(), MODE_IX);
-            auto* const csr = CollectionShardingRuntime::get(_opCtx, getNss());
-            auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
-
-            CollectionShardingRuntime::get(_opCtx, getNss())->clearFilteringMetadata();
+            CollectionShardingRuntime::get(_opCtx, getNss())->clearFilteringMetadata(_opCtx);
         }
         scopedGuard.dismiss();
         _cleanup(false);
@@ -489,10 +485,7 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig() {
         {
             UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
             AutoGetCollection autoColl(_opCtx, getNss(), MODE_IX);
-            auto* const csr = CollectionShardingRuntime::get(_opCtx, getNss());
-            auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
-
-            CollectionShardingRuntime::get(_opCtx, getNss())->clearFilteringMetadata();
+            CollectionShardingRuntime::get(_opCtx, getNss())->clearFilteringMetadata(_opCtx);
         }
         scopedGuard.dismiss();
         _cleanup(false);

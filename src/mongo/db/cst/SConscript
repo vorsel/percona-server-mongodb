@@ -23,6 +23,7 @@ env.CppUnitTest(
     target='cst_test',
     source=[
         'bson_lexer_test.cpp',
+        'cst_expression_test.cpp',
         'cst_test.cpp',
     ],
     LIBDEPS=[
@@ -34,6 +35,7 @@ env.CppUnitTest(
     target='cst_pipeline_translation_test',
     source=[
         'cst_pipeline_translation_test.cpp',
+        'cst_literals_test.cpp',
     ],
     LIBDEPS=[
         'cst',

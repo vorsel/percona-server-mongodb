@@ -167,8 +167,6 @@ public:
 
     void signalDrainComplete(OperationContext*, long long) override;
 
-    Status waitForDrainFinish(Milliseconds) override;
-
     void signalUpstreamUpdater() override;
 
     StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const override;
@@ -248,8 +246,6 @@ public:
     Status updateTerm(OperationContext*, long long) override;
 
     repl::OpTime getCurrentCommittedSnapshotOpTime() const override;
-
-    repl::OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const override;
 
     void waitUntilSnapshotCommitted(OperationContext*, const Timestamp&) override;
 

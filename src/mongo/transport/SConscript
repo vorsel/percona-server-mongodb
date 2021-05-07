@@ -8,13 +8,13 @@ env.Library(
     target='transport_layer_common',
     source=[
         'ismaster_metrics.cpp',
-        'service_entry_point_utils.cpp',
         'session.cpp',
         'transport_layer.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/db/wire_version',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
     ],
 )
@@ -89,6 +89,7 @@ tlEnv.Library(
         'service_executor_fixed.cpp',
         'service_executor_reserved.cpp',
         'service_executor_synchronous.cpp',
+        'service_executor_utils.cpp',
         env.Idlc('service_executor.idl')[0],
     ],
     LIBDEPS=[
@@ -188,7 +189,6 @@ tlEnv.CppUnitTest(
         '$BUILD_DIR/mongo/rpc/rpc',
         '$BUILD_DIR/mongo/unittest/unittest',
         '$BUILD_DIR/mongo/util/clock_source_mock',
-        '$BUILD_DIR/mongo/util/net/socket',
         '$BUILD_DIR/third_party/shim_asio',
         'message_compressor',
         'message_compressor_options_server',

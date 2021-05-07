@@ -542,8 +542,8 @@ void DBClientBase::logout(const string& dbname, BSONObj& info) {
 bool DBClientBase::isMaster(bool& isMaster, BSONObj* info) {
     BSONObjBuilder bob;
     bob.append("ismaster", 1);
-    if (WireSpec::instance().isInternalClient) {
-        WireSpec::appendInternalClientWireVersion(WireSpec::instance().outgoing, &bob);
+    if (auto wireSpec = WireSpec::instance().get(); wireSpec->isInternalClient) {
+        WireSpec::appendInternalClientWireVersion(wireSpec->outgoing, &bob);
     }
 
     BSONObj o;
@@ -1121,5 +1121,12 @@ string nsGetCollection(const string& ns) {
     return ns.substr(pos + 1);
 }
 
+Timestamp DBClientBase::getOperationTime() {
+    return _lastOperationTime;
+}
+
+void DBClientBase::setOperationTime(Timestamp operationTime) {
+    _lastOperationTime = operationTime;
+}
 
 }  // namespace mongo

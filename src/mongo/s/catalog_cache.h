@@ -42,6 +42,7 @@
 #include "mongo/util/concurrency/notification.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/with_lock.h"
+#include "mongo/util/read_through_cache.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -129,8 +130,8 @@ class CatalogCache {
     CatalogCache& operator=(const CatalogCache&) = delete;
 
 public:
-    CatalogCache(CatalogCacheLoader& cacheLoader, std::shared_ptr<ThreadPool> executor);
-    ~CatalogCache();
+    CatalogCache(ServiceContext* service, CatalogCacheLoader& cacheLoader);
+    ~CatalogCache() = default;
 
     /**
      * Blocking method that ensures the specified database is in the cache, loading it if necessary,
@@ -255,12 +256,6 @@ public:
                            const ShardId& shardId) const;
 
     /**
-     * Non-blocking method, which indiscriminately causes the database entry for the specified
-     * database to be refreshed the next time getDatabase is called.
-     */
-    void invalidateDatabaseEntry(const StringData dbName);
-
-    /**
      * Non-blocking method, which invalidates the shard for the routing table for the specified
      * namespace. If that shard is targetted in the future, getCollectionRoutingInfo will wait on a
      * refresh.
@@ -303,13 +298,6 @@ public:
      */
     void checkAndRecordOperationBlockedByRefresh(OperationContext* opCtx, mongo::LogicalOp opType);
 
-    /**
-     * Returns a ThreadPool with default options to be used for CatalogCache.
-     *
-     * The returned ThreadPool is already started up.
-     */
-    static std::shared_ptr<ThreadPool> makeDefaultThreadPool();
-
 private:
     // Make the cache entries friends so they can access the private classes below
     friend class CachedDatabaseInfo;
@@ -340,29 +328,18 @@ private:
         std::shared_ptr<RoutingTableHistory> routingInfo;
     };
 
-    /**
-     * Cache entry describing a database.
-     */
-    struct DatabaseInfoEntry {
-        // Specifies whether this cache entry needs a refresh (in which case 'dbt' will either be
-        // unset if the cache entry has never been loaded, or should not be relied on).
-        bool needsRefresh{true};
+    class DatabaseCache : public ReadThroughCache<std::string, DatabaseType> {
+    public:
+        DatabaseCache(ServiceContext* service,
+                      ThreadPoolInterface& threadPool,
+                      CatalogCacheLoader& catalogCacheLoader);
 
-        // Contains a notification to be waited on for the refresh to complete (only available if
-        // needsRefresh is true)
-        std::shared_ptr<Notification<Status>> refreshCompletionNotification;
+    private:
+        LookupResult _lookupDatabase(OperationContext* opCtx, const std::string& dbName);
 
-        // Contains the cached info about the database (only available if needsRefresh is false)
-        boost::optional<DatabaseType> dbt;
+        CatalogCacheLoader& _catalogCacheLoader;
+        Mutex _mutex = MONGO_MAKE_LATCH("DatabaseCache::_mutex");
     };
-
-    /**
-     * Non-blocking call which schedules an asynchronous refresh for the specified database. The
-     * database entry must be in the 'needsRefresh' state.
-     */
-    void _scheduleDatabaseRefresh(WithLock,
-                                  StringData dbName,
-                                  std::shared_ptr<DatabaseInfoEntry> dbEntry);
 
     /**
      * Non-blocking call which schedules an asynchronous refresh for the specified namespace. The
@@ -498,15 +475,13 @@ private:
 
     std::shared_ptr<ThreadPool> _executor;
 
-    using DatabaseInfoMap = StringMap<std::shared_ptr<DatabaseInfoEntry>>;
     using CollectionInfoMap = StringMap<std::shared_ptr<CollectionRoutingInfoEntry>>;
     using CollectionsByDbMap = StringMap<CollectionInfoMap>;
 
-    // Mutex to serialize access to the structures below
-    mutable Mutex _mutex = MONGO_MAKE_LATCH("CatalogCache::_mutex");
+    DatabaseCache _databaseCache;
 
-    // Map from DB name to the info for that database
-    DatabaseInfoMap _databases;
+    // Mutex to serialize access to the collection cache
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("CatalogCache::_mutex");
     // Map from full collection name to the routing info for that collection, grouped by database
     CollectionsByDbMap _collectionsByDb;
 };

@@ -93,6 +93,10 @@ class CmdListIndexes : public BasicCommand {
 public:
     CmdListIndexes() : BasicCommand("listIndexes") {}
 
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
+    }
+
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kOptIn;
     }
@@ -214,6 +218,7 @@ public:
             {std::move(exec),
              nss,
              AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+             APIParameters::get(opCtx),
              opCtx->getWriteConcern(),
              repl::ReadConcernArgs::get(opCtx),
              cmdObj,

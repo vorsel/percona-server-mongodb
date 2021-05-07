@@ -1,6 +1,6 @@
 /**
- * Verifies that a change stream which is resumed on a downgraded last-stable binary does not crash
- * the server, even when reading oplog entries which the last-stable binary may not understand.
+ * Verifies that a change stream which is resumed on a downgraded binary does not crash
+ * the server, even when reading oplog entries which the downgraded binary may not understand.
  *
  * @tags: [uses_change_streams, requires_replication]
  */
@@ -170,8 +170,8 @@ function writeOplogEntriesAndCreateResumePointsOnLatestVersion() {
     let testStartTime = createSentinelEntryAndGetTimeStamp(testNum);
     const outputChangeStreams = [];
     for (let testCase of testCases) {
-        jsTestLog(
-            `Opening a change stream for '${testCase.testName}' at startTime: ${testStartTime}`);
+        jsTestLog(`Opening a change stream for '${testCase.testName}' at startTime: ${
+            tojson(testStartTime)}`);
 
         // Capture the 'resumeToken' when the sentinel entry is found. We use the token to resume
         // the stream rather than the 'testStartTime' because resuming from a token adds more stages
@@ -220,7 +220,7 @@ function writeOplogEntriesAndCreateResumePointsOnLatestVersion() {
  * should be an array and each entry should have fields 'watch', 'resumeToken' and
  * 'endSentinelEntry'.
  */
-function resumeStreamsOnLastStableVersion(changeStreams) {
+function resumeStreamsOnDowngradedVersion(changeStreams) {
     for (let changeStream of changeStreams) {
         jsTestLog("Validating change stream for " + tojson(changeStream));
         const csCursor = changeStream.watch({resumeAfter: changeStream.resumeToken});
@@ -252,17 +252,30 @@ function resumeStreamsOnLastStableVersion(changeStreams) {
 // cluster has been downgraded.
 const changeStreamsToBeValidated = writeOplogEntriesAndCreateResumePointsOnLatestVersion();
 
-// Downgrade the entire cluster to 'last-stable' binVersion.
-assert.commandWorked(
-    st.s.getDB(dbName).adminCommand({setFeatureCompatibilityVersion: lastStableFCV}));
-st.upgradeCluster("last-stable");
+function runTests(downgradeVersion) {
+    jsTestLog("Running test with 'downgradeVersion': " + downgradeVersion);
+    const downgradeFCV = downgradeVersion === "last-lts" ? lastLTSFCV : lastContinuousFCV;
+    // Downgrade the entire cluster to the 'downgradeVersion' binVersion.
+    assert.commandWorked(
+        st.s.getDB(dbName).adminCommand({setFeatureCompatibilityVersion: downgradeFCV}));
+    st.upgradeCluster(downgradeVersion);
 
-// Refresh our reference to the sharded collection post-downgrade.
-shardedColl = st.s.getDB(dbName)[collName];
+    // Refresh our reference to the sharded collection post-downgrade.
+    shardedColl = st.s.getDB(dbName)[collName];
 
-// Resume all the change streams that were created on latest version and validate that the change
-// stream doesn't crash the server after downgrade.
-resumeStreamsOnLastStableVersion(changeStreamsToBeValidated);
+    // Resume all the change streams that were created on latest version and validate that the
+    // change stream doesn't crash the server after downgrade.
+    resumeStreamsOnDowngradedVersion(changeStreamsToBeValidated);
+}
 
+// Test resuming change streams after downgrading the cluster to 'last-continuous'.
+runTests('last-continuous');
+
+// Upgrade the entire cluster back to the latest version.
+st.upgradeCluster('latest', {waitUntilStable: true});
+assert.commandWorked(st.s.getDB(dbName).adminCommand({setFeatureCompatibilityVersion: latestFCV}));
+
+// Test resuming change streams after downgrading the cluster to 'last-lts'.
+runTests('last-lts');
 st.stop();
 }());

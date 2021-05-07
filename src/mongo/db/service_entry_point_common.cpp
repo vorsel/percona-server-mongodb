@@ -70,6 +70,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/tenant_migration_donor_util.h"
 #include "mongo/db/run_op_kill_cursors.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
@@ -514,6 +515,17 @@ void _abortUnpreparedOrStashPreparedTransaction(
 }
 }  // namespace
 
+void invokeWithNoSession(OperationContext* opCtx,
+                         const OpMsgRequest& request,
+                         CommandInvocation* invocation,
+                         rpc::ReplyBuilderInterface* replyBuilder) {
+    tenant_migration_donor::checkIfCanReadOrBlock(opCtx, request.getDatabase());
+    tenant_migration_donor::migrationConflictRetry(
+        opCtx,
+        [&] { CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder); },
+        replyBuilder);
+}
+
 void invokeWithSessionCheckedOut(OperationContext* opCtx,
                                  const OpMsgRequest& request,
                                  CommandInvocation* invocation,
@@ -615,8 +627,13 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
         }
     }
 
+    tenant_migration_donor::checkIfCanReadOrBlock(opCtx, request.getDatabase());
+
     try {
-        CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder);
+        tenant_migration_donor::migrationConflictRetry(
+            opCtx,
+            [&] { CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder); },
+            replyBuilder);
     } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>&) {
         // Exceptions are used to resolve views in a sharded cluster, so they should be handled
         // specially to avoid unnecessary aborts.
@@ -802,7 +819,7 @@ bool runCommandImpl(OperationContext* opCtx,
                 invokeWithSessionCheckedOut(
                     opCtx, request, invocation, sessionOptions, replyBuilder);
             } else {
-                CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder);
+                invokeWithNoSession(opCtx, request, invocation, replyBuilder);
             }
         } catch (const DBException& ex) {
             // Do no-op write before returning NoSuchTransaction if command has writeConcern.
@@ -833,7 +850,7 @@ bool runCommandImpl(OperationContext* opCtx,
         if (shouldCheckOutSession) {
             invokeWithSessionCheckedOut(opCtx, request, invocation, sessionOptions, replyBuilder);
         } else {
-            CommandHelpers::runCommandInvocation(opCtx, request, invocation, replyBuilder);
+            invokeWithNoSession(opCtx, request, invocation, replyBuilder);
         }
     }
 
@@ -857,6 +874,7 @@ bool runCommandImpl(OperationContext* opCtx,
     });
 
     behaviors.waitForLinearizableReadConcern(opCtx);
+    tenant_migration_donor::checkIfLinearizableReadWasAllowedOrThrow(opCtx, request.getDatabase());
 
     // Wait for data to satisfy the read concern level, if necessary.
     behaviors.waitForSpeculativeMajorityReadConcern(opCtx);
@@ -933,7 +951,7 @@ void execCommandDatabase(OperationContext* opCtx,
 
         auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
 
-        auto const apiParamsFromClient = initializeAPIParameters(request.body);
+        auto const apiParamsFromClient = initializeAPIParameters(request.body, command);
         APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
 
         sessionOptions = initializeOperationSessionInfo(
@@ -941,8 +959,7 @@ void execCommandDatabase(OperationContext* opCtx,
             request.body,
             command->requiresAuth(),
             command->attachLogicalSessionsToOpCtx(),
-            replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet,
-            opCtx->getServiceContext()->getStorageEngine()->supportsDocLocking());
+            replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet);
 
         CommandHelpers::evaluateFailCommandFailPoint(opCtx, invocation.get());
 
@@ -1633,9 +1650,9 @@ BSONObj ServiceEntryPointCommon::getRedactedCopyForLogging(const Command* comman
     return bob.obj();
 }
 
-DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
-                                                  const Message& m,
-                                                  const Hooks& behaviors) {
+Future<DbResponse> ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
+                                                          const Message& m,
+                                                          const Hooks& behaviors) noexcept try {
     // before we lock...
     NetworkOp op = m.operation();
     bool isCommand = false;
@@ -1778,7 +1795,10 @@ DbResponse ServiceEntryPointCommon::handleRequest(OperationContext* opCtx,
     }
 
     recordCurOpMetrics(opCtx);
-    return dbresponse;
+    return Future<DbResponse>::makeReady(std::move(dbresponse));
+} catch (const DBException& e) {
+    LOGV2_ERROR(4879802, "Failed to handle request", "error"_attr = redact(e));
+    return e.toStatus();
 }
 
 ServiceEntryPointCommon::Hooks::~Hooks() = default;

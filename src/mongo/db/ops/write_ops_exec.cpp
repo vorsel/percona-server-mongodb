@@ -295,18 +295,16 @@ void insertDocuments(OperationContext* opCtx,
     // to be written. Multidocument transactions should not generate opTimes because they are
     // generated at the time of commit.
     auto batchSize = std::distance(begin, end);
-    if (supportsDocLocking()) {
-        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        auto inTransaction = opCtx->inMultiDocumentTransaction();
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    auto inTransaction = opCtx->inMultiDocumentTransaction();
 
-        if (!inTransaction && !replCoord->isOplogDisabledFor(opCtx, collection->ns())) {
-            // Populate 'slots' with new optimes for each insert.
-            // This also notifies the storage engine of each new timestamp.
-            auto oplogSlots = repl::getNextOpTimes(opCtx, batchSize);
-            auto slot = oplogSlots.begin();
-            for (auto it = begin; it != end; it++) {
-                it->oplogSlot = *slot++;
-            }
+    if (!inTransaction && !replCoord->isOplogDisabledFor(opCtx, collection->ns())) {
+        // Populate 'slots' with new optimes for each insert.
+        // This also notifies the storage engine of each new timestamp.
+        auto oplogSlots = repl::getNextOpTimes(opCtx, batchSize);
+        auto slot = oplogSlots.begin();
+        for (auto it = begin; it != end; it++) {
+            it->oplogSlot = *slot++;
         }
     }
 
@@ -671,21 +669,19 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+        CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanSummary());
     }
 
     exec->executePlan();
 
     PlanSummaryStats summary;
-    Explain::getSummaryStats(*exec, &summary);
+    exec->getSummaryStats(&summary);
     if (auto coll = collection->getCollection()) {
         CollectionQueryInfo::get(coll).notifyOfQuery(opCtx, coll, summary);
     }
 
     if (curOp.shouldDBProfile()) {
-        BSONObjBuilder execStatsBob;
-        Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-        curOp.debug().execStats = execStatsBob.obj();
+        curOp.debug().execStats = exec->getStats();
     }
 
     const UpdateStats* updateStats = UpdateStage::getUpdateStats(exec.get());
@@ -911,7 +907,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        CurOp::get(opCtx)->setPlanSummary_inlock(Explain::getPlanSummary(exec.get()));
+        CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanSummary());
     }
 
     exec->executePlan();
@@ -919,16 +915,14 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
     curOp.debug().additiveMetrics.ndeleted = n;
 
     PlanSummaryStats summary;
-    Explain::getSummaryStats(*exec, &summary);
+    exec->getSummaryStats(&summary);
     if (auto coll = collection.getCollection()) {
         CollectionQueryInfo::get(coll).notifyOfQuery(opCtx, coll, summary);
     }
     curOp.debug().setPlanSummaryMetrics(summary);
 
     if (curOp.shouldDBProfile()) {
-        BSONObjBuilder execStatsBob;
-        Explain::getWinningPlanStats(exec.get(), &execStatsBob);
-        curOp.debug().execStats = execStatsBob.obj();
+        curOp.debug().execStats = exec->getStats();
     }
 
     LastError::get(opCtx->getClient()).recordDelete(n);

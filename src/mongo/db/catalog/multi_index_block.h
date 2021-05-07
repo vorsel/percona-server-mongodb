@@ -46,6 +46,7 @@
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/resumable_index_builds_gen.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/fail_point.h"
 
@@ -108,14 +109,20 @@ public:
      * Requires holding an exclusive lock on the collection.
      */
     using OnInitFn = std::function<Status(std::vector<BSONObj>& specs)>;
-    StatusWith<std::vector<BSONObj>> init(OperationContext* opCtx,
-                                          Collection* collection,
-                                          const std::vector<BSONObj>& specs,
-                                          OnInitFn onInit);
+    StatusWith<std::vector<BSONObj>> init(
+        OperationContext* opCtx,
+        Collection* collection,
+        const std::vector<BSONObj>& specs,
+        OnInitFn onInit,
+        const boost::optional<ResumeIndexInfo>& resumeInfo = boost::none);
     StatusWith<std::vector<BSONObj>> init(OperationContext* opCtx,
                                           Collection* collection,
                                           const BSONObj& spec,
                                           OnInitFn onInit);
+    StatusWith<std::vector<BSONObj>> initForResume(OperationContext* opCtx,
+                                                   Collection* collection,
+                                                   const std::vector<BSONObj>& specs,
+                                                   const ResumeIndexInfo& resumeInfo);
 
     /**
      * Not all index initializations need an OnInitFn, in particular index builds that do not need
@@ -297,8 +304,6 @@ private:
         InsertDeleteOptions options;
     };
 
-    enum class Phase { kInitialized, kCollectionScan, kBulkLoad, kDrainWrites };
-
     void _abortWithoutCleanup(OperationContext* opCtx, bool shutdown);
 
     bool _shouldWriteStateToDisk(OperationContext* opCtx, bool shutdown) const;
@@ -307,7 +312,6 @@ private:
 
     BSONObj _constructStateObject() const;
 
-    std::string _phaseToString(Phase phase) const;
 
     // Is set during init() and ensures subsequent function calls act on the same Collection.
     boost::optional<UUID> _collectionUUID;
@@ -331,6 +335,6 @@ private:
     boost::optional<RecordId> _lastRecordIdInserted;
 
     // The current phase of the index build.
-    Phase _phase = Phase::kInitialized;
+    IndexBuildPhaseEnum _phase = IndexBuildPhaseEnum::kInitialized;
 };
 }  // namespace mongo

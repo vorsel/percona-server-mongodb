@@ -45,9 +45,6 @@ public:
     std::vector<std::string> listDatabases() const final {
         return {};
     }
-    bool supportsDocLocking() const final {
-        return false;
-    }
     bool supportsCappedCollections() const final {
         return true;
     }
@@ -60,7 +57,7 @@ public:
     bool isEphemeral() const final {
         return true;
     }
-    void loadCatalog(OperationContext* opCtx) final {}
+    void loadCatalog(OperationContext* opCtx, bool loadingFromUncleanShutdown) final {}
     void closeCatalog(OperationContext* opCtx) final {}
     Status closeDatabase(OperationContext* opCtx, StringData db) final {
         return Status::OK();
@@ -94,6 +91,10 @@ public:
         return Status::OK();
     }
     std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(OperationContext* opCtx) final {
+        return {};
+    }
+    std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreFromExistingIdent(
+        OperationContext* opCtx, StringData ident) final {
         return {};
     }
     void cleanShutdown() final {}
@@ -143,7 +144,7 @@ public:
         OldestActiveTransactionTimestampCallback callback) final {}
 
     StatusWith<StorageEngine::ReconcileResult> reconcileCatalogAndIdents(
-        OperationContext* opCtx) final {
+        OperationContext* opCtx, InternalIdentReconcilePolicy internalIdentReconcilePolicy) final {
         return ReconcileResult{};
     }
     Timestamp getAllDurableTimestamp() const final {

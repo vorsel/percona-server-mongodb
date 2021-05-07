@@ -578,15 +578,6 @@ public:
     virtual void signalDrainComplete(OperationContext* opCtx, long long termWhenBufferIsEmpty) = 0;
 
     /**
-     * Waits duration of 'timeout' for applier to finish draining its buffer of operations.
-     * Returns OK if we are not in drain mode.
-     * Returns ErrorCodes::ExceededTimeLimit if we timed out waiting for the applier to drain its
-     * buffer.
-     * Returns ErrorCodes::BadValue if timeout is negative.
-     */
-    virtual Status waitForDrainFinish(Milliseconds timeout) = 0;
-
-    /**
      * Signals the sync source feedback thread to wake up and send a handshake and
      * replSetUpdatePosition command to our sync source.
      */
@@ -858,11 +849,6 @@ public:
      * Gets the latest OpTime of the currentCommittedSnapshot.
      */
     virtual OpTime getCurrentCommittedSnapshotOpTime() const = 0;
-
-    /**
-     * Gets the latest OpTime of the currentCommittedSnapshot and its corresponding wall clock time.
-     */
-    virtual OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const = 0;
 
     /**
      * Appends diagnostics about the replication subsystem.

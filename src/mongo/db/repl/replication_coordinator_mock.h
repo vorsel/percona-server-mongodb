@@ -181,8 +181,6 @@ public:
 
     virtual void signalDrainComplete(OperationContext*, long long);
 
-    virtual Status waitForDrainFinish(Milliseconds timeout) override;
-
     virtual void signalUpstreamUpdater();
 
     virtual StatusWith<BSONObj> prepareReplSetUpdatePositionCommand() const override;
@@ -281,8 +279,6 @@ public:
     virtual void dropAllSnapshots() override;
 
     virtual OpTime getCurrentCommittedSnapshotOpTime() const override;
-
-    virtual OpTimeAndWallTime getCurrentCommittedSnapshotOpTimeAndWallTime() const override;
 
     virtual void waitUntilSnapshotCommitted(OperationContext* opCtx,
                                             const Timestamp& untilSnapshot) override;

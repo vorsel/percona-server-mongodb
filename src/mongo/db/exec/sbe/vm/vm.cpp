@@ -35,8 +35,10 @@
 
 #include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/storage/key_string.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/summation.h"
 
 MONGO_FAIL_POINT_DEFINE(failOnPoisonedFieldLookup);
 
@@ -60,7 +62,10 @@ int Instruction::stackOffset[Instruction::Tags::lastInstruction] = {
     -1,  // sub
     -1,  // mul
     -1,  // div
+    -1,  // idiv
+    -1,  // mod
     0,   // negate
+    0,   // numConvert
 
     0,  // logicNot
 
@@ -88,6 +93,7 @@ int Instruction::stackOffset[Instruction::Tags::lastInstruction] = {
     0,  // isArray
     0,  // isString
     0,  // isNumber
+    0,  // typeMatch
 
     0,  // function is special, the stack offset is encoded in the instruction itself
 
@@ -200,6 +206,17 @@ void CodeFragment::appendAdd() {
     appendSimpleInstruction(Instruction::add);
 }
 
+void CodeFragment::appendNumericConvert(value::TypeTags targetTag) {
+    Instruction i;
+    i.tag = Instruction::numConvert;
+    adjustStackSimple(i);
+
+    auto offset = allocateSpace(sizeof(Instruction) + sizeof(targetTag));
+
+    offset += value::writeToMemory(offset, i);
+    offset += value::writeToMemory(offset, targetTag);
+}
+
 void CodeFragment::appendSub() {
     appendSimpleInstruction(Instruction::sub);
 }
@@ -210,6 +227,14 @@ void CodeFragment::appendMul() {
 
 void CodeFragment::appendDiv() {
     appendSimpleInstruction(Instruction::div);
+}
+
+void CodeFragment::appendIDiv() {
+    appendSimpleInstruction(Instruction::idiv);
+}
+
+void CodeFragment::appendMod() {
+    appendSimpleInstruction(Instruction::mod);
 }
 
 void CodeFragment::appendNegate() {
@@ -276,6 +301,17 @@ void CodeFragment::appendIsString() {
 
 void CodeFragment::appendIsNumber() {
     appendSimpleInstruction(Instruction::isNumber);
+}
+
+void CodeFragment::appendTypeMatch(uint32_t typeMask) {
+    Instruction i;
+    i.tag = Instruction::typeMatch;
+    adjustStackSimple(i);
+
+    auto offset = allocateSpace(sizeof(Instruction) + sizeof(typeMask));
+
+    offset += value::writeToMemory(offset, i);
+    offset += value::writeToMemory(offset, typeMask);
 }
 
 void CodeFragment::appendFunction(Builtin f, uint8_t arity) {
@@ -765,15 +801,231 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinRegexMatch(uint
     auto stringView = value::getStringView(typeTagInputStr, valueInputStr);
     pcrecpp::StringPiece pcreStringView{stringView.data(), static_cast<int>(stringView.size())};
 
-    auto pcreRegex = value::getPrceRegexView(valuePcreRegex);
+    auto pcreRegex = value::getPcreRegexView(valuePcreRegex);
     auto regexMatchResult = pcreRegex->PartialMatch(pcreStringView);
 
     return {false, value::TypeTags::Boolean, regexMatchResult};
 }
 
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDoubleDoubleSum(uint8_t arity) {
+    invariant(arity > 0);
+
+    value::TypeTags resultTag = value::TypeTags::NumberInt32;
+    bool haveDate = false;
+
+    // Sweep across all tags and pick the result type.
+    for (size_t idx = 0; idx < arity; ++idx) {
+        auto [own, tag, val] = getFromStack(idx);
+        if (tag == value::TypeTags::Date) {
+            if (haveDate) {
+                uassert(4848404, "only one date allowed in an $add expression", !haveDate);
+            }
+            // Date is a simple 64 bit integer.
+            haveDate = true;
+            tag = value::TypeTags::NumberInt64;
+        }
+        if (value::isNumber(tag)) {
+            resultTag = value::getWidestNumericalType(resultTag, tag);
+        } else if (tag == value::TypeTags::Nothing || tag == value::TypeTags::Null) {
+            // What to do about null and nothing?
+            return {false, value::TypeTags::Nothing, 0};
+        } else {
+            // What to do about non-numeric types like arrays and objects?
+            return {false, value::TypeTags::Nothing, 0};
+        }
+    }
+
+    if (resultTag == value::TypeTags::NumberDecimal) {
+        Decimal128 sum;
+        for (size_t idx = 0; idx < arity; ++idx) {
+            auto [own, tag, val] = getFromStack(idx);
+            if (tag == value::TypeTags::Date) {
+                sum.add(Decimal128(value::bitcastTo<int64_t>(val)));
+            } else {
+                sum.add(value::numericCast<Decimal128>(tag, val));
+            }
+        }
+        if (haveDate) {
+            return {false, value::TypeTags::Date, value::bitcastFrom(sum.toLong())};
+        } else {
+            auto [tag, val] = value::makeCopyDecimal(sum);
+            return {true, tag, val};
+        }
+    } else {
+        DoubleDoubleSummation sum;
+        for (size_t idx = 0; idx < arity; ++idx) {
+            auto [own, tag, val] = getFromStack(idx);
+            if (tag == value::TypeTags::NumberInt32) {
+                sum.addInt(value::numericCast<int32_t>(tag, val));
+            } else if (tag == value::TypeTags::NumberInt64 || tag == value::TypeTags::Date) {
+                sum.addLong(value::numericCast<int64_t>(tag, val));
+            } else if (tag == value::TypeTags::NumberDouble) {
+                sum.addDouble(value::numericCast<double>(tag, val));
+            } else if (tag == value::TypeTags::Date) {
+                sum.addLong(value::bitcastTo<int64_t>(val));
+            }
+        }
+        if (haveDate) {
+            uassert(ErrorCodes::Overflow, "date overflow in $add", sum.fitsLong());
+            return {false, value::TypeTags::Date, value::bitcastFrom(sum.getLong())};
+        } else {
+            switch (resultTag) {
+                case value::TypeTags::NumberInt32: {
+                    auto result = sum.getLong();
+                    if (sum.fitsLong() && result >= std::numeric_limits<int32_t>::min() &&
+                        result <= std::numeric_limits<int32_t>::max()) {
+                        return {false, value::TypeTags::NumberInt32, value::bitcastFrom(result)};
+                    }
+                    // Fall through to the larger type.
+                }
+                case value::TypeTags::NumberInt64: {
+                    if (sum.fitsLong()) {
+                        return {
+                            false, value::TypeTags::NumberInt64, value::bitcastFrom(sum.getLong())};
+                    }
+                    // Fall through to the larger type.
+                }
+                case value::TypeTags::NumberDouble: {
+                    return {
+                        false, value::TypeTags::NumberDouble, value::bitcastFrom(sum.getDouble())};
+                }
+                default:
+                    MONGO_UNREACHABLE;
+            }
+        }
+    }
+    return {false, value::TypeTags::Nothing, 0};
+}
+
+/**
+ * A helper for the bultinDate method. The formal parameters yearOrWeekYear and monthOrWeek carry
+ * values depending on wether the date is a year-month-day or ISOWeekYear.
+ */
+using DateFn = std::function<Date_t(
+    TimeZone, long long, long long, long long, long long, long long, long long, long long)>;
+std::tuple<bool, value::TypeTags, value::Value> builtinDateHelper(
+    DateFn computeDateFn,
+    std::tuple<bool, value::TypeTags, value::Value> tzdb,
+    std::tuple<bool, value::TypeTags, value::Value> yearOrWeekYear,
+    std::tuple<bool, value::TypeTags, value::Value> monthOrWeek,
+    std::tuple<bool, value::TypeTags, value::Value> day,
+    std::tuple<bool, value::TypeTags, value::Value> hour,
+    std::tuple<bool, value::TypeTags, value::Value> minute,
+    std::tuple<bool, value::TypeTags, value::Value> second,
+    std::tuple<bool, value::TypeTags, value::Value> millisecond,
+    std::tuple<bool, value::TypeTags, value::Value> timezone) {
+
+    auto [ownedTzdb, typeTagTzdb, valueTzdb] = tzdb;
+    auto [ownedYearOrWeekYear, typeTagYearOrWeekYear, valueYearOrWeekYear] = yearOrWeekYear;
+    auto [ownedMonthOrWeek, typeTagMonthOrWeek, valueMonthOrWeek] = monthOrWeek;
+    auto [ownedDay, typeTagDay, valueDay] = day;
+    auto [ownedHr, typeTagHr, valueHr] = hour;
+    auto [ownedMin, typeTagMin, valueMin] = minute;
+    auto [ownedSec, typeTagSec, valueSec] = second;
+    auto [ownedMillis, typeTagMillis, valueMillis] = millisecond;
+    auto [ownedTz, typeTagTz, valueTz] = timezone;
+
+    if (typeTagTzdb != value::TypeTags::timeZoneDB || !value::isNumber(typeTagYearOrWeekYear) ||
+        !value::isNumber(typeTagMonthOrWeek) || !value::isNumber(typeTagDay) ||
+        !value::isNumber(typeTagHr) || !value::isNumber(typeTagMin) ||
+        !value::isNumber(typeTagSec) || !value::isNumber(typeTagMillis) ||
+        !value::isString(typeTagTz)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+
+    auto timeZoneDB = value::getTimeZoneDBView(valueTzdb);
+    invariant(timeZoneDB);
+
+    auto tzString = value::getStringView(typeTagTz, valueTz);
+    const auto tz = tzString == ""
+        ? timeZoneDB->utcZone()
+        : timeZoneDB->getTimeZone(StringData{tzString.data(), tzString.size()});
+
+    auto date =
+        computeDateFn(tz,
+                      value::numericCast<int64_t>(typeTagYearOrWeekYear, valueYearOrWeekYear),
+                      value::numericCast<int64_t>(typeTagMonthOrWeek, valueMonthOrWeek),
+                      value::numericCast<int64_t>(typeTagDay, valueDay),
+                      value::numericCast<int64_t>(typeTagHr, valueHr),
+                      value::numericCast<int64_t>(typeTagMin, valueMin),
+                      value::numericCast<int64_t>(typeTagSec, valueSec),
+                      value::numericCast<int64_t>(typeTagMillis, valueMillis));
+    return {false, value::TypeTags::Date, date.asInt64()};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDate(uint8_t arity) {
+    auto timeZoneDBTuple = getFromStack(0);
+    auto yearTuple = getFromStack(1);
+    auto monthTuple = getFromStack(2);
+    auto dayTuple = getFromStack(3);
+    auto hourTuple = getFromStack(4);
+    auto minuteTuple = getFromStack(5);
+    auto secondTuple = getFromStack(6);
+    auto millisTuple = getFromStack(7);
+    auto timezoneTuple = getFromStack(8);
+
+    return builtinDateHelper(
+        [](TimeZone tz,
+           long long year,
+           long long month,
+           long long day,
+           long long hour,
+           long long min,
+           long long sec,
+           long long millis) -> Date_t {
+            return tz.createFromDateParts(year, month, day, hour, min, sec, millis);
+        },
+        timeZoneDBTuple,
+        yearTuple,
+        monthTuple,
+        dayTuple,
+        hourTuple,
+        minuteTuple,
+        secondTuple,
+        millisTuple,
+        timezoneTuple);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDateWeekYear(uint8_t arity) {
+    auto timeZoneDBTuple = getFromStack(0);
+    auto yearTuple = getFromStack(1);
+    auto weekTuple = getFromStack(2);
+    auto dayTuple = getFromStack(3);
+    auto hourTuple = getFromStack(4);
+    auto minuteTuple = getFromStack(5);
+    auto secondTuple = getFromStack(6);
+    auto millisTuple = getFromStack(7);
+    auto timezoneTuple = getFromStack(8);
+
+    return builtinDateHelper(
+        [](TimeZone tz,
+           long long year,
+           long long month,
+           long long day,
+           long long hour,
+           long long min,
+           long long sec,
+           long long millis) -> Date_t {
+            return tz.createFromIso8601DateParts(year, month, day, hour, min, sec, millis);
+        },
+        timeZoneDBTuple,
+        yearTuple,
+        weekTuple,
+        dayTuple,
+        hourTuple,
+        minuteTuple,
+        secondTuple,
+        millisTuple,
+        timezoneTuple);
+}
+
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builtin f,
                                                                           uint8_t arity) {
     switch (f) {
+        case Builtin::dateParts:
+            return builtinDate(arity);
+        case Builtin::datePartsWeekYear:
+            return builtinDateWeekYear(arity);
         case Builtin::split:
             return builtinSplit(arity);
         case Builtin::regexMatch:
@@ -792,6 +1044,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builti
             return builtinAddToArray(arity);
         case Builtin::addToSet:
             return builtinAddToSet(arity);
+        case Builtin::doubleDoubleSum:
+            return builtinDoubleDoubleSum(arity);
     }
 
     MONGO_UNREACHABLE;
@@ -942,6 +1196,40 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(CodeFragment* c
                     }
                     break;
                 }
+                case Instruction::idiv: {
+                    auto [rhsOwned, rhsTag, rhsVal] = getFromStack(0);
+                    popStack();
+                    auto [lhsOwned, lhsTag, lhsVal] = getFromStack(0);
+
+                    auto [owned, tag, val] = genericIDiv(lhsTag, lhsVal, rhsTag, rhsVal);
+
+                    topStack(owned, tag, val);
+
+                    if (rhsOwned) {
+                        value::releaseValue(rhsTag, rhsVal);
+                    }
+                    if (lhsOwned) {
+                        value::releaseValue(lhsTag, lhsVal);
+                    }
+                    break;
+                }
+                case Instruction::mod: {
+                    auto [rhsOwned, rhsTag, rhsVal] = getFromStack(0);
+                    popStack();
+                    auto [lhsOwned, lhsTag, lhsVal] = getFromStack(0);
+
+                    auto [owned, tag, val] = genericMod(lhsTag, lhsVal, rhsTag, rhsVal);
+
+                    topStack(owned, tag, val);
+
+                    if (rhsOwned) {
+                        value::releaseValue(rhsTag, rhsVal);
+                    }
+                    if (lhsOwned) {
+                        value::releaseValue(lhsTag, lhsVal);
+                    }
+                    break;
+                }
                 case Instruction::negate: {
                     auto [owned, tag, val] = getFromStack(0);
 
@@ -952,6 +1240,22 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(CodeFragment* c
 
                     if (owned) {
                         value::releaseValue(resultTag, resultVal);
+                    }
+
+                    break;
+                }
+                case Instruction::numConvert: {
+                    auto tag = value::readFromMemory<value::TypeTags>(pcPointer);
+                    pcPointer += sizeof(tag);
+
+                    auto [owned, lhsTag, lhsVal] = getFromStack(0);
+
+                    auto [rhsOwned, rhsTag, rhsVal] = genericNumConvert(lhsTag, lhsVal, tag);
+
+                    topStack(rhsOwned, rhsTag, rhsVal);
+
+                    if (owned) {
+                        value::releaseValue(lhsTag, lhsVal);
                     }
 
                     break;
@@ -1273,6 +1577,22 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(CodeFragment* c
 
                     if (tag != value::TypeTags::Nothing) {
                         topStack(false, value::TypeTags::Boolean, value::isNumber(tag));
+                    }
+
+                    if (owned) {
+                        value::releaseValue(tag, val);
+                    }
+                    break;
+                }
+                case Instruction::typeMatch: {
+                    auto typeMask = value::readFromMemory<uint32_t>(pcPointer);
+                    pcPointer += sizeof(typeMask);
+
+                    auto [owned, tag, val] = getFromStack(0);
+
+                    if (tag != value::TypeTags::Nothing) {
+                        bool matches = static_cast<bool>(getBSONTypeMask(tag) & typeMask);
+                        topStack(false, value::TypeTags::Boolean, matches);
                     }
 
                     if (owned) {

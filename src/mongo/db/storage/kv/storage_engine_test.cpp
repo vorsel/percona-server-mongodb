@@ -48,7 +48,6 @@
 #include "mongo/db/storage/storage_engine_impl.h"
 #include "mongo/db/storage/storage_engine_test_fixture.h"
 #include "mongo/db/storage/storage_repair_observer.h"
-#include "mongo/db/unclean_shutdown.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/periodic_runner_factory.h"
@@ -93,6 +92,7 @@ TEST_F(StorageEngineTest, ReconcileIdentsTest) {
     reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
     ASSERT_EQUALS(1UL, reconcileResult.indexesToRebuild.size());
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 
     StorageEngine::IndexIdentifier& toRebuild = reconcileResult.indexesToRebuild[0];
     ASSERT_EQUALS("db.coll1", toRebuild.nss.ns());
@@ -123,8 +123,8 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphansAfterUncleanShutdown) {
     {
         Lock::GlobalWrite writeLock(opCtx.get(), Date_t::max(), Lock::InterruptBehavior::kThrow);
         _storageEngine->closeCatalog(opCtx.get());
-        startingAfterUncleanShutdown(getGlobalServiceContext()) = true;
-        _storageEngine->loadCatalog(opCtx.get());
+        auto loadingFromUncleanShutdown = true;
+        _storageEngine->loadCatalog(opCtx.get(), loadingFromUncleanShutdown);
     }
 
     ASSERT(!identExists(opCtx.get(), swCollInfo.getValue().ident));
@@ -143,11 +143,10 @@ TEST_F(StorageEngineTest, ReconcileDropsTemporary) {
     ASSERT(identExists(opCtx.get(), ident));
 
     // Reconcile will only drop temporary idents when starting up after an unclean shutdown.
-    startingAfterUncleanShutdown(opCtx->getServiceContext()) = true;
-
-    auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
+    auto reconcileResult = unittest::assertGet(reconcileAfterUncleanShutdown(opCtx.get()));
     ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 
     // The storage engine is responsible for dropping its temporary idents.
     ASSERT(!identExists(opCtx.get(), ident));
@@ -170,9 +169,14 @@ TEST_F(StorageEngineTest, ReconcileKeepsTemporary) {
     ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
 
-    // The storage engine does not drop its temporary idents outside of starting up after an
-    // unclean shutdown.
-    ASSERT(identExists(opCtx.get(), ident));
+    // TODO SERVER-49847: Clean up when the feature is turned on by default.
+    if (_storageEngine->supportsResumableIndexBuilds()) {
+        // The storage engine does not drop its temporary idents outside of starting up after an
+        // unclean shutdown.
+        ASSERT(identExists(opCtx.get(), ident));
+    } else {
+        ASSERT_FALSE(identExists(opCtx.get(), ident));
+    }
 
     rs->finalizeTemporaryTable(opCtx.get(), TemporaryRecordStore::FinalizationAction::kDelete);
 }
@@ -231,8 +235,9 @@ TEST_F(StorageEngineTest, ReconcileUnfinishedIndex) {
     // not require it to be rebuilt.
     ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
 
-    // There are no two-phase builds to restart.
+    // There are no two-phase builds to resume or restart.
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 }
 
 TEST_F(StorageEngineTest, ReconcileUnfinishedBackgroundSecondaryIndex) {
@@ -272,8 +277,9 @@ TEST_F(StorageEngineTest, ReconcileUnfinishedBackgroundSecondaryIndex) {
     ASSERT_EQUALS(ns.ns(), toRebuild.nss.ns());
     ASSERT_EQUALS(indexName, toRebuild.indexName);
 
-    // There are no two-phase builds to restart.
+    // There are no two-phase builds to restart or resume.
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 }
 
 TEST_F(StorageEngineTest, ReconcileTwoPhaseIndexBuilds) {
@@ -332,6 +338,9 @@ TEST_F(StorageEngineTest, ReconcileTwoPhaseIndexBuilds) {
     ASSERT_EQ(2UL, specs.size());
     ASSERT_EQ(indexA, specs[0]["name"].str());
     ASSERT_EQ(indexB, specs[1]["name"].str());
+
+    // There should be no index builds to resume.
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 }
 
 TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphans) {
@@ -349,7 +358,8 @@ TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphans) {
     {
         Lock::GlobalWrite writeLock(opCtx.get(), Date_t::max(), Lock::InterruptBehavior::kThrow);
         _storageEngine->closeCatalog(opCtx.get());
-        _storageEngine->loadCatalog(opCtx.get());
+        auto loadingFromUncleanShutdown = false;
+        _storageEngine->loadCatalog(opCtx.get(), loadingFromUncleanShutdown);
     }
 
     ASSERT(identExists(opCtx.get(), swCollInfo.getValue().ident));
@@ -373,6 +383,7 @@ TEST_F(StorageEngineRepairTest, ReconcileSucceeds) {
     auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
     ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
     ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToRestart.size());
+    ASSERT_EQUALS(0UL, reconcileResult.indexBuildsToResume.size());
 
     ASSERT(!identExists(opCtx.get(), swCollInfo.getValue().ident));
     ASSERT(collectionExists(opCtx.get(), collNs));
@@ -401,7 +412,8 @@ TEST_F(StorageEngineRepairTest, LoadCatalogRecoversOrphansInCatalog) {
     ASSERT(!collectionExists(opCtx.get(), collNs));
 
     // When in a repair context, loadCatalog() recreates catalog entries for orphaned idents.
-    _storageEngine->loadCatalog(opCtx.get());
+    auto loadingFromUncleanShutdown = false;
+    _storageEngine->loadCatalog(opCtx.get(), loadingFromUncleanShutdown);
     auto identNs = swCollInfo.getValue().ident;
     std::replace(identNs.begin(), identNs.end(), '-', '_');
     NamespaceString orphanNs = NamespaceString("local.orphan." + identNs);
@@ -434,7 +446,8 @@ TEST_F(StorageEngineTest, LoadCatalogDropsOrphans) {
 
     // When in a normal startup context, loadCatalog() does not recreate catalog entries for
     // orphaned idents.
-    _storageEngine->loadCatalog(opCtx.get());
+    auto loadingFromUncleanShutdown = false;
+    _storageEngine->loadCatalog(opCtx.get(), loadingFromUncleanShutdown);
     // reconcileCatalogAndIdents() drops orphaned idents.
     auto reconcileResult = unittest::assertGet(reconcile(opCtx.get()));
     ASSERT_EQUALS(0UL, reconcileResult.indexesToRebuild.size());
@@ -485,8 +498,10 @@ public:
      * Create an instance of the KV Storage Engine so that we have a timestamp monitor operating.
      */
     TimestampKVEngineTest() {
-        StorageEngineOptions options{
-            /*directoryPerDB=*/false, /*directoryForIndexes=*/false, /*forRepair=*/false};
+        StorageEngineOptions options{/*directoryPerDB=*/false,
+                                     /*directoryForIndexes=*/false,
+                                     /*forRepair=*/false,
+                                     /*lockFileCreatedByUncleanShutdown=*/false};
         _storageEngine =
             std::make_unique<StorageEngineImpl>(std::make_unique<TimestampMockKVEngine>(), options);
         _storageEngine->finishInit();

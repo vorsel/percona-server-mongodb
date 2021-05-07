@@ -164,8 +164,8 @@ bool WiredTigerFileVersion::shouldDowngrade(bool readOnly,
             _startupVersion == StartupVersion::IS_42;
     }
 
-    if (serverGlobalParams.featureCompatibility.getVersion() !=
-        ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44) {
+    if (serverGlobalParams.featureCompatibility.isGreaterThan(
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44)) {
         // Only consider downgrading when FCV is set to kFullyDowngraded.
         // (This FCV gate must remain across binary version releases.)
         return false;
@@ -962,6 +962,21 @@ void WiredTigerKVEngine::appendGlobalStats(BSONObjBuilder& b) {
     bb.done();
 }
 
+/**
+ * Table of MongoDB<->WiredTiger<->Log version numbers:
+ *
+ * |                MongoDB | WiredTiger | Log |
+ * |------------------------+------------+-----|
+ * |                 3.0.15 |      2.5.3 |   1 |
+ * |                 3.2.20 |      2.9.2 |   1 |
+ * |                 3.4.15 |      2.9.2 |   1 |
+ * |                  3.6.4 |      3.0.1 |   2 |
+ * |                 4.0.16 |      3.1.1 |   3 |
+ * |                  4.2.1 |      3.2.2 |   3 |
+ * |                  4.2.6 |      3.3.0 |   3 |
+ * | 4.2.6 (blessed by 4.4) |      3.3.0 |   4 |
+ * |                  4.4.0 |     10.0.0 |   5 |
+ */
 void WiredTigerKVEngine::_openWiredTiger(const std::string& path, const std::string& wtOpenConfig) {
     // MongoDB 4.4 will always run in compatibility version 10.0.
     std::string configStr = wtOpenConfig + ",compatibility=(require_min=\"10.0.0\")";
@@ -2786,10 +2801,6 @@ void WiredTigerKVEngine::dropSomeQueuedIdents() {
     }
 }
 
-bool WiredTigerKVEngine::supportsDocLocking() const {
-    return true;
-}
-
 bool WiredTigerKVEngine::supportsDirectoryPerDB() const {
     return true;
 }
@@ -3308,10 +3319,6 @@ Timestamp WiredTigerKVEngine::getOldestTimestamp() const {
 
 Timestamp WiredTigerKVEngine::getCheckpointTimestamp() const {
     return Timestamp(_getCheckpointTimestamp());
-}
-
-Timestamp WiredTigerKVEngine::getInitialDataTimestamp() const {
-    return Timestamp(_initialDataTimestamp.load());
 }
 
 std::uint64_t WiredTigerKVEngine::_getCheckpointTimestamp() const {

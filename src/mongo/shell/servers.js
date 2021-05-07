@@ -4,6 +4,8 @@ var MongoRunner, _startMongod, startMongoProgram, runMongoProgram, startMongoPro
 (function() {
 "use strict";
 
+const SIGTERM = 15;
+
 var shellVersion = version;
 
 // Record the exit codes of mongod and mongos processes that crashed during startup keyed by
@@ -208,7 +210,9 @@ MongoRunner.binVersionSubs = [
     new MongoRunner.VersionSub(extractMajorVersionFromVersionString(shellVersion()),
                                shellVersion()),
     // To-be-updated when we branch for the next release.
-    new MongoRunner.VersionSub("last-stable", "4.4")
+    new MongoRunner.VersionSub("last-continuous", "4.4"),
+    // To be updated when we branch for the next LTS release.
+    new MongoRunner.VersionSub("last-lts", "4.4")
 ];
 
 MongoRunner.getBinVersionFor = function(version) {
@@ -1026,14 +1030,15 @@ var stopMongoProgram = function(conn, signal, opts, waitpid) {
     opts = opts || {};
     waitpid = (waitpid === undefined) ? true : waitpid;
 
-    if (signal !== MongoRunner.EXIT_CLEAN && typeof TestData !== 'undefined') {
-        TestData.allowUncleanShutdowns = true;
+    // If we are executing an unclean shutdown, we want to avoid checking collection counts during
+    // validation, since the counts may be inaccurate.
+    if (signal !== SIGTERM && typeof TestData !== 'undefined') {
+        TestData.skipEnforceFastCountOnValidate = true;
     }
 
-    var allowedExitCode = MongoRunner.EXIT_CLEAN;
-
-    if (opts.allowedExitCode) {
-        allowedExitCode = opts.allowedExitCode;
+    const allowedExitCode = opts.allowedExitCode ? opts.allowedExitCode : MongoRunner.EXIT_CLEAN;
+    if (!waitpid && allowedExitCode !== MongoRunner.EXIT_CLEAN) {
+        throw new Error('Must wait for process to exit if it is expected to exit uncleanly');
     }
 
     var port = parseInt(conn.port);
