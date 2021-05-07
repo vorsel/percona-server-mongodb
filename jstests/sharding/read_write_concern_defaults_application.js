@@ -26,6 +26,7 @@
  *   requires_majority_read_concern,
  *   requires_profiling,
  *   uses_transactions,
+ *   requires_fcv_47
  * ]
  */
 (function() {
@@ -101,6 +102,7 @@ let testCases = {
     _configsvrUpdateZoneKeyRange: {skip: "internal command"},
     _flushDatabaseCacheUpdates: {skip: "internal command"},
     _flushRoutingTableCacheUpdates: {skip: "internal command"},
+    _flushRoutingTableCacheUpdatesWithWriteConcern: {skip: "internal command"},
     _getNextSessionMods: {skip: "internal command"},
     _getUserCacheGeneration: {skip: "internal command"},
     _hashBSONElement: {skip: "internal command"},
@@ -457,6 +459,7 @@ let testCases = {
         useLogs: true,
     },
     handshake: {skip: "does not accept read or write concern"},
+    hello: {skip: "does not accept read or write concern"},
     hostInfo: {skip: "does not accept read or write concern"},
     httpClientRequest: {skip: "does not accept read or write concern"},
     insert: {
@@ -469,7 +472,6 @@ let testCases = {
     },
     internalRenameIfOptionsAndIndexesMatch: {skip: "internal command"},
     invalidateUserCache: {skip: "does not accept read or write concern"},
-    isMaster: {skip: "does not accept read or write concern"},
     isdbgrid: {skip: "does not accept read or write concern"},
     killAllSessions: {skip: "does not accept read or write concern"},
     killAllSessionsByPattern: {skip: "does not accept read or write concern"},

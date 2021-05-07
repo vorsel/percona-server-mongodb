@@ -436,9 +436,11 @@ Status AbstractIndexAccessMethod::compact(OperationContext* opCtx) {
 
 class AbstractIndexAccessMethod::BulkBuilderImpl : public IndexAccessMethod::BulkBuilder {
 public:
-    BulkBuilderImpl(IndexCatalogEntry* indexCatalogEntry,
-                    const IndexDescriptor* descriptor,
-                    size_t maxMemoryUsageBytes);
+    BulkBuilderImpl(IndexCatalogEntry* indexCatalogEntry, size_t maxMemoryUsageBytes);
+
+    BulkBuilderImpl(IndexCatalogEntry* index,
+                    size_t maxMemoryUsageBytes,
+                    const IndexSorterInfo& sorterInfo);
 
     Status insert(OperationContext* opCtx,
                   const BSONObj& obj,
@@ -457,15 +459,17 @@ public:
 
     int64_t getKeysInserted() const final;
 
-    Sorter::State getSorterState() const final;
+    Sorter::PersistedState getPersistedSorterState() const final;
 
     void persistDataForShutdown() final;
 
 private:
     void _addMultikeyMetadataKeysIntoSorter();
 
-    std::unique_ptr<Sorter> _sorter;
+    Sorter::Settings _makeSorterSettings() const;
+
     IndexCatalogEntry* _indexCatalogEntry;
+    std::unique_ptr<Sorter> _sorter;
     int64_t _keysInserted = 0;
 
     // Set to true if any document added to the BulkBuilder causes the index to become multikey.
@@ -482,23 +486,35 @@ private:
 };
 
 std::unique_ptr<IndexAccessMethod::BulkBuilder> AbstractIndexAccessMethod::initiateBulk(
-    size_t maxMemoryUsageBytes) {
-    return std::make_unique<BulkBuilderImpl>(_indexCatalogEntry, _descriptor, maxMemoryUsageBytes);
+    size_t maxMemoryUsageBytes, const boost::optional<IndexSorterInfo>& sorterInfo) {
+    return sorterInfo
+        ? std::make_unique<BulkBuilderImpl>(_indexCatalogEntry, maxMemoryUsageBytes, *sorterInfo)
+        : std::make_unique<BulkBuilderImpl>(_indexCatalogEntry, maxMemoryUsageBytes);
 }
 
 AbstractIndexAccessMethod::BulkBuilderImpl::BulkBuilderImpl(IndexCatalogEntry* index,
-                                                            const IndexDescriptor* descriptor,
                                                             size_t maxMemoryUsageBytes)
-    : _sorter(Sorter::make(
-          SortOptions()
-              .TempDir(storageGlobalParams.dbpath + "/_tmp")
-              .ExtSortAllowed()
-              .MaxMemoryUsageBytes(maxMemoryUsageBytes),
-          BtreeExternalSortComparison(),
-          std::pair<KeyString::Value::SorterDeserializeSettings,
-                    mongo::NullValue::SorterDeserializeSettings>(
-              {index->accessMethod()->getSortedDataInterface()->getKeyStringVersion()}, {}))),
-      _indexCatalogEntry(index) {}
+    : _indexCatalogEntry(index),
+      _sorter(Sorter::make(SortOptions()
+                               .TempDir(storageGlobalParams.dbpath + "/_tmp")
+                               .ExtSortAllowed()
+                               .MaxMemoryUsageBytes(maxMemoryUsageBytes),
+                           BtreeExternalSortComparison(),
+                           _makeSorterSettings())) {}
+
+AbstractIndexAccessMethod::BulkBuilderImpl::BulkBuilderImpl(IndexCatalogEntry* index,
+                                                            size_t maxMemoryUsageBytes,
+                                                            const IndexSorterInfo& sorterInfo)
+    : _indexCatalogEntry(index),
+      _sorter(Sorter::makeFromExistingRanges(sorterInfo.getFileName()->toString(),
+                                             *sorterInfo.getRanges(),
+                                             SortOptions()
+                                                 .TempDir(sorterInfo.getTempDir()->toString())
+                                                 .ExtSortAllowed()
+                                                 .MaxMemoryUsageBytes(maxMemoryUsageBytes),
+                                             BtreeExternalSortComparison(),
+                                             _makeSorterSettings())),
+      _keysInserted(*sorterInfo.getNumKeys()) {}
 
 Status AbstractIndexAccessMethod::BulkBuilderImpl::insert(OperationContext* opCtx,
                                                           const BSONObj& obj,
@@ -581,9 +597,9 @@ int64_t AbstractIndexAccessMethod::BulkBuilderImpl::getKeysInserted() const {
     return _keysInserted;
 }
 
-AbstractIndexAccessMethod::BulkBuilder::Sorter::State
-AbstractIndexAccessMethod::BulkBuilderImpl::getSorterState() const {
-    return _sorter->getState();
+AbstractIndexAccessMethod::BulkBuilder::Sorter::PersistedState
+AbstractIndexAccessMethod::BulkBuilderImpl::getPersistedSorterState() const {
+    return _sorter->getPersistedState();
 }
 
 void AbstractIndexAccessMethod::BulkBuilderImpl::persistDataForShutdown() {
@@ -598,11 +614,18 @@ void AbstractIndexAccessMethod::BulkBuilderImpl::_addMultikeyMetadataKeysIntoSor
     }
 }
 
+AbstractIndexAccessMethod::BulkBuilderImpl::Sorter::Settings
+AbstractIndexAccessMethod::BulkBuilderImpl::_makeSorterSettings() const {
+    return std::pair<KeyString::Value::SorterDeserializeSettings,
+                     mongo::NullValue::SorterDeserializeSettings>(
+        {_indexCatalogEntry->accessMethod()->getSortedDataInterface()->getKeyStringVersion()}, {});
+}
+
 Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
                                              BulkBuilder* bulk,
                                              bool dupsAllowed,
-                                             KeyHandlerFn&& onDuplicateKey,
-                                             set<RecordId>* dupRecords) {
+                                             const KeyHandlerFn& onDuplicateKeyInserted,
+                                             const RecordIdHandlerFn& onDuplicateRecord) {
     Timer timer;
 
     std::unique_ptr<BulkBuilder::Sorter::Iterator> it(bulk->done());
@@ -623,13 +646,11 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
     for (int64_t i = 0; it->more(); i++) {
         opCtx->checkForInterrupt();
 
-        WriteUnitOfWork wunit(opCtx);
-
         // Get the next datum and add it to the builder.
         BulkBuilder::Sorter::Data data = it->next();
 
-        // Assert that keys are retrieved from the sorter in non-decreasing order, but only in
-        // debug builds since this check can be expensive.
+        // Assert that keys are retrieved from the sorter in non-decreasing order, but only in debug
+        // builds since this check can be expensive.
         int cmpData;
         if (kDebugBuild || _descriptor->unique()) {
             cmpData = data.first.compareWithoutRecordId(previousKey);
@@ -644,38 +665,29 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
         }
 
         // Before attempting to insert, perform a duplicate key check.
-        bool isDup = false;
-        if (_descriptor->unique()) {
-            isDup = cmpData == 0;
-            if (isDup && !dupsAllowed) {
-                if (dupRecords) {
-                    RecordId recordId = KeyString::decodeRecordIdAtEnd(data.first.getBuffer(),
-                                                                       data.first.getSize());
-                    dupRecords->insert(recordId);
-                    continue;
-                }
-                auto dupKey =
-                    KeyString::toBson(data.first, getSortedDataInterface()->getOrdering());
-                return buildDupKeyErrorStatus(dupKey.getOwned(),
-                                              _indexCatalogEntry->getNSSFromCatalog(opCtx),
-                                              _descriptor->indexName(),
-                                              _descriptor->keyPattern(),
-                                              _descriptor->collation());
+        bool isDup = (_descriptor->unique()) ? (cmpData == 0) : false;
+        if (isDup && !dupsAllowed) {
+            Status status = _handleDuplicateKey(opCtx, data.first, onDuplicateRecord);
+            if (!status.isOK()) {
+                return status;
             }
+            continue;
         }
 
         hangIndexBuildDuringBulkLoadPhase.executeIf(
-            [i](const BSONObj& data) {
+            [opCtx, i](const BSONObj& data) {
                 LOGV2(4924400,
                       "Hanging index build during bulk load phase due to "
                       "'hangIndexBuildDuringBulkLoadPhase' failpoint",
                       "iteration"_attr = i);
 
-                hangIndexBuildDuringBulkLoadPhase.pauseWhileSet();
+                hangIndexBuildDuringBulkLoadPhase.pauseWhileSet(opCtx);
             },
             [i](const BSONObj& data) { return i == data["iteration"].numberLong(); });
 
+        WriteUnitOfWork wunit(opCtx);
         Status status = builder->addKey(data.first);
+        wunit.commit();
 
         if (!status.isOK()) {
             // Duplicates are checked before inserting.
@@ -686,14 +698,13 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
         previousKey = data.first;
 
         if (isDup) {
-            status = onDuplicateKey(data.first);
+            status = onDuplicateKeyInserted(data.first);
             if (!status.isOK())
                 return status;
         }
 
         // If we're here either it's a dup and we're cool with it or the addKey went just fine.
         pm.hit();
-        wunit.commit();
     }
 
     pm.finished();
@@ -804,6 +815,10 @@ SortedDataInterface* AbstractIndexAccessMethod::getSortedDataInterface() const {
     return _newInterface.get();
 }
 
+std::shared_ptr<Ident> AbstractIndexAccessMethod::getSharedIdent() const {
+    return _newInterface;
+}
+
 /**
  * Generates a new file name on each call using a static, atomic and monotonically increasing
  * number.
@@ -818,6 +833,21 @@ std::string nextFileName() {
     return "extsort-index." + std::to_string(indexAccessMethodFileCounter.fetchAndAdd(1));
 }
 
+Status AbstractIndexAccessMethod::_handleDuplicateKey(OperationContext* opCtx,
+                                                      const KeyString::Value& dataKey,
+                                                      const RecordIdHandlerFn& onDuplicateRecord) {
+    RecordId recordId = KeyString::decodeRecordIdAtEnd(dataKey.getBuffer(), dataKey.getSize());
+    if (onDuplicateRecord) {
+        return onDuplicateRecord(recordId);
+    }
+
+    BSONObj dupKey = KeyString::toBson(dataKey, getSortedDataInterface()->getOrdering());
+    return buildDupKeyErrorStatus(dupKey.getOwned(),
+                                  _indexCatalogEntry->getNSSFromCatalog(opCtx),
+                                  _descriptor->indexName(),
+                                  _descriptor->keyPattern(),
+                                  _descriptor->collation());
+}
 }  // namespace mongo
 
 #include "mongo/db/sorter/sorter.cpp"

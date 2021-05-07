@@ -1469,7 +1469,7 @@ rs.help = function() {
     print();
     print("\trs.printReplicationInfo()                  check oplog size and time range");
     print(
-        "\trs.printSlaveReplicationInfo()             check replica set members and replication lag");
+        "\trs.printSecondaryReplicationInfo()             check replica set members and replication lag");
     print("\tdb.isMaster()                              check who is primary");
     print();
     print("\treconfiguration helpers disconnect from the database so the shell will display");
@@ -1488,7 +1488,12 @@ rs.initiate = function(c) {
     return db._adminCommand({replSetInitiate: c});
 };
 rs.printSlaveReplicationInfo = function() {
-    return db.printSlaveReplicationInfo();
+    print(
+        "WARNING: printSlaveReplicationInfo is deprecated and may be removed in the next major release. Please use printSecondaryReplicationInfo instead.");
+    return db.printSecondaryReplicationInfo();
+};
+rs.printSecondaryReplicationInfo = function() {
+    return db.printSecondaryReplicationInfo();
 };
 rs.printReplicationInfo = function() {
     return db.printReplicationInfo();
@@ -1532,7 +1537,7 @@ rs.add = function(hostport, arb) {
     assert.soon(function() {
         var cfg = hostport;
 
-        var local = db.getSisterDB("local");
+        var local = db.getSiblingDB("local");
         assert(local.system.replset.count() <= 1,
                "error: local.system.replset has unexpected contents");
         var c = local.system.replset.findOne();
@@ -1608,13 +1613,13 @@ rs.conf = function() {
     if (resp.ok && !(resp.errmsg) && resp.config)
         return resp.config;
     else if (resp.errmsg && resp.errmsg.startsWith("no such cmd"))
-        return db.getSisterDB("local").system.replset.findOne();
+        return db.getSiblingDB("local").system.replset.findOne();
     throw new Error("Could not retrieve replica set config: " + tojson(resp));
 };
 rs.config = rs.conf;
 
 rs.remove = function(hn) {
-    var local = db.getSisterDB("local");
+    var local = db.getSiblingDB("local");
     assert(local.system.replset.count() <= 1,
            "error: local.system.replset has unexpected contents");
     var c = local.system.replset.findOne();
@@ -1657,7 +1662,7 @@ rs.debug.nullLastOpWritten = function(primary, secondary) {
 };
 
 rs.debug.getLastOpWritten = function(server) {
-    var s = db.getSisterDB("local");
+    var s = db.getSiblingDB("local");
     if (server) {
         s = connect(server + "/local");
     }

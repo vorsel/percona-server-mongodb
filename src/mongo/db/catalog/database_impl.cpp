@@ -73,6 +73,7 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_options.h"
+#include "mongo/db/storage/storage_util.h"
 #include "mongo/db/system_index.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
@@ -492,7 +493,8 @@ Status DatabaseImpl::_finishDropCollection(OperationContext* opCtx,
           "namespace"_attr = nss,
           "uuid"_attr = uuid);
 
-    auto status = DurableCatalog::get(opCtx)->dropCollection(opCtx, collection->getCatalogId());
+    auto status = catalog::dropCollection(
+        opCtx, collection->ns(), collection->getCatalogId(), collection->getSharedIdent());
     if (!status.isOK())
         return status;
 
@@ -678,7 +680,7 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
         uassertStatusOK(storageEngine->getCatalog()->createCollection(
             opCtx, nss, optionsWithUUID, true /*allocateDefaultSpace*/));
     auto catalogId = catalogIdRecordStorePair.first;
-    std::unique_ptr<Collection> ownedCollection =
+    std::shared_ptr<Collection> ownedCollection =
         Collection::Factory::get(opCtx)->make(opCtx,
                                               nss,
                                               catalogId,

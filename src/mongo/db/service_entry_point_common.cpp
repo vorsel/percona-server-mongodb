@@ -77,6 +77,7 @@
 #include "mongo/db/s/transaction_coordinator_factory.h"
 #include "mongo/db/service_entry_point_common.h"
 #include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/stats/api_version_metrics.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/stats/top.h"
@@ -932,9 +933,20 @@ void execCommandDatabase(OperationContext* opCtx,
         (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
 
     try {
+        auto const apiParamsFromClient = initializeAPIParameters(request.body, command);
+        Client* client = opCtx->getClient();
+
         {
-            stdx::lock_guard<Client> lk(*opCtx->getClient());
+            stdx::lock_guard<Client> lk(*client);
             CurOp::get(opCtx)->setCommand_inlock(command);
+            APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
+        }
+
+        auto& apiParams = APIParameters::get(opCtx);
+        auto& apiVersionMetrics = ApplicationApiVersionMetrics::get(opCtx->getServiceContext());
+        const auto& clientMetadata = ClientMetadataIsMasterState::get(client).getClientMetadata();
+        if (clientMetadata) {
+            apiVersionMetrics.update(clientMetadata.get(), apiParams);
         }
 
         sleepMillisAfterCommandExecutionBegins.execute([&](const BSONObj& data) {
@@ -950,9 +962,6 @@ void execCommandDatabase(OperationContext* opCtx,
         rpc::TrackingMetadata::get(opCtx).initWithOperName(command->getName());
 
         auto const replCoord = repl::ReplicationCoordinator::get(opCtx);
-
-        auto const apiParamsFromClient = initializeAPIParameters(request.body, command);
-        APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
 
         sessionOptions = initializeOperationSessionInfo(
             opCtx,
@@ -1362,7 +1371,7 @@ DbResponse receivedCommands(OperationContext* opCtx,
 
             const auto session = opCtx->getClient()->session();
             if (session) {
-                if (!opCtx->isExhaust() || c->getName() != "isMaster"_sd) {
+                if (!opCtx->isExhaust() || c->getName() != "hello"_sd) {
                     InExhaustIsMaster::get(session.get())->setInExhaustIsMaster(false);
                 }
             }
@@ -1703,8 +1712,7 @@ Future<DbResponse> ServiceEntryPointCommon::handleRequest(OperationContext* opCt
     if (op == dbMsg || (op == dbQuery && isCommand)) {
         dbresponse = receivedCommands(opCtx, m, behaviors);
         // IsMaster should take kMaxAwaitTimeMs at most, log if it takes twice that.
-        if (auto command = currentOp.getCommand();
-            command && (command->getName() == "ismaster" || command->getName() == "isMaster")) {
+        if (auto command = currentOp.getCommand(); command && (command->getName() == "hello")) {
             slowMsOverride =
                 2 * durationCount<Milliseconds>(SingleServerIsMasterMonitor::kMaxAwaitTime);
         }

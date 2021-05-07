@@ -38,7 +38,7 @@ namespace mongo {
 /**
  * This class comprises a mock Collection for use by CollectionCatalog unit tests.
  */
-class CollectionMock : public Collection {
+class CollectionMock final : public Collection {
 public:
     CollectionMock(const NamespaceString& ns)
         : CollectionMock(ns, std::unique_ptr<IndexCatalog>()) {}
@@ -83,6 +83,9 @@ public:
         std::abort();
     }
     RecordStore* getRecordStore() {
+        std::abort();
+    }
+    std::shared_ptr<Ident> getSharedIdent() const {
         std::abort();
     }
 
@@ -226,6 +229,9 @@ public:
     CappedCallback* getCappedCallback() {
         std::abort();
     }
+    const CappedCallback* getCappedCallback() const {
+        std::abort();
+    }
 
     std::shared_ptr<CappedInsertNotifier> getCappedInsertNotifier() const {
         std::abort();
@@ -251,7 +257,7 @@ public:
         std::abort();
     }
 
-    boost::optional<Timestamp> getMinimumVisibleSnapshot() {
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() const {
         std::abort();
     }
 
@@ -271,13 +277,16 @@ public:
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
         OperationContext* opCtx,
         PlanYieldPolicy::YieldPolicy yieldPolicy,
-        ScanDirection scanDirection) {
+        ScanDirection scanDirection,
+        boost::optional<RecordId> resumeAfterRecordId) const {
         std::abort();
     }
 
     void establishOplogCollectionForLogging(OperationContext* opCtx) {
         std::abort();
     }
+
+    void onDeregisterFromCatalog() {}
 
     UUID uuid() const {
         return _uuid;

@@ -140,6 +140,9 @@ public:
     }
     void setOldestTimestampFromStable() final {}
     void setOldestTimestamp(Timestamp timestamp) final {}
+    Timestamp getOldestTimestamp() const final {
+        return {};
+    };
     void setOldestActiveTransactionTimestampCallback(
         OldestActiveTransactionTimestampCallback callback) final {}
 
@@ -162,6 +165,9 @@ public:
     std::set<std::string> getDropPendingIdents() const final {
         return {};
     }
+    void addDropPendingIdent(const Timestamp& dropTimestamp,
+                             const NamespaceString& nss,
+                             std::shared_ptr<Ident> ident) final {}
     Status currentFilesCompatible(OperationContext* opCtx) const final {
         return Status::OK();
     }

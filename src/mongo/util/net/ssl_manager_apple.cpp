@@ -1266,7 +1266,7 @@ public:
                                                         const HostAndPort& hostForLogging,
                                                         const ExecutorPtr& reactor) final;
 
-    Status stapleOCSPResponse(asio::ssl::apple::Context* context) final;
+    Status stapleOCSPResponse(asio::ssl::apple::Context* context, bool asyncOCSPStaple) final;
 
     const SSLConfiguration& getSSLConfiguration() const final {
         return _sslConfiguration;
@@ -1277,6 +1277,8 @@ public:
     int SSL_shutdown(SSLConnectionInterface* conn) final;
 
     SSLInformationToLog getSSLInformationToLog() const final;
+
+    void stopJobs() final;
 
 private:
     bool _weakValidation;
@@ -1485,9 +1487,12 @@ StatusWith<TLSVersion> mapTLSVersion(SSLContextRef ssl) {
     }
 }
 
-Status SSLManagerApple::stapleOCSPResponse(asio::ssl::apple::Context* context) {
+Status SSLManagerApple::stapleOCSPResponse(asio::ssl::apple::Context* context,
+                                           bool asyncOCSPStaple) {
     return Status::OK();
 }
+
+void SSLManagerApple::stopJobs() {}
 
 Future<SSLPeerInfo> SSLManagerApple::parseAndValidatePeerCertificate(
     ::SSLContextRef ssl,
@@ -1813,9 +1818,9 @@ bool isSSLServer = false;
 extern SSLManagerInterface* theSSLManager;
 extern SSLManagerCoordinator* theSSLManagerCoordinator;
 
-std::unique_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
+std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
-    return std::make_unique<SSLManagerApple>(params, isServer);
+    return std::make_shared<SSLManagerApple>(params, isServer);
 }
 
 MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManager, ("EndStartupOptionHandling"))

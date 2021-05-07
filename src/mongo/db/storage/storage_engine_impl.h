@@ -132,6 +132,8 @@ public:
 
     virtual void setOldestTimestamp(Timestamp newOldestTimestamp) override;
 
+    virtual Timestamp getOldestTimestamp() const override;
+
     virtual void setOldestActiveTransactionTimestampCallback(
         StorageEngine::OldestActiveTransactionTimestampCallback) override;
 
@@ -312,7 +314,7 @@ public:
 
     void addDropPendingIdent(const Timestamp& dropTimestamp,
                              const NamespaceString& nss,
-                             StringData ident) override;
+                             std::shared_ptr<Ident> ident) override;
 
     DurableCatalog* getCatalog() override {
         return _catalog.get();
@@ -340,7 +342,7 @@ public:
     }
 
     std::set<std::string> getDropPendingIdents() const override {
-        return _dropPendingIdentReaper.getAllIdents();
+        return _dropPendingIdentReaper.getAllIdentNames();
     }
 
     Status currentFilesCompatible(OperationContext* opCtx) const override {

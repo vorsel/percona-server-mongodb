@@ -41,7 +41,7 @@ namespace mongo::sbe {
 namespace {
 std::string valueDebugString(std::pair<value::TypeTags, value::Value> value) {
     std::stringstream stream;
-    value::printValue(stream, value.first, value.second);
+    stream << std::make_pair(value.first, value.second);
     return stream.str();
 };
 }  // namespace
@@ -115,7 +115,7 @@ TEST(SBEKeyStringTest, Basic) {
 
     // Set up an SBE expression that will compare one element in the 'testValues' BSON object with
     // one of the KeyString components.
-    CompileCtx ctx;
+    CompileCtx ctx{std::make_unique<RuntimeEnvironment>()};
     CoScanStage emptyStage;
     ctx.root = &emptyStage;
 
@@ -195,7 +195,7 @@ TEST(SBEKeyStringTest, KeyComponentInclusion) {
     readKeyStringValueIntoAccessors(
         keyString, KeyString::ALL_ASCENDING, &builder, &accessors, indexKeysToInclude);
 
-    ASSERT(std::make_pair(value::TypeTags::NumberInt64, value::bitcastFrom(12345)) ==
+    ASSERT(std::make_pair(value::TypeTags::NumberInt64, value::bitcastFrom(int64_t{12345})) ==
            accessors[0].getViewOfValue())
         << "Incorrect value from accessor: " << valueDebugString(accessors[0].getViewOfValue());
 

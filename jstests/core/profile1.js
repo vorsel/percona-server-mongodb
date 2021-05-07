@@ -6,6 +6,7 @@
 //   requires_collstats,
 //   requires_non_retryable_commands,
 //   requires_profiling,
+//   sbe_incompatible,
 // ]
 
 (function() {
@@ -32,7 +33,7 @@ function resetProfile(level, slowms) {
 
 // special db so that it can be run in parallel tests
 var stddb = db;
-db = db.getSisterDB("profile1");
+db = db.getSiblingDB("profile1");
 var username = "jstests_profile1_user";
 
 db.dropUser(username);

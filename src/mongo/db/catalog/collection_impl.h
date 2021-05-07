@@ -52,7 +52,7 @@ public:
 
     class FactoryImpl : public Factory {
     public:
-        std::unique_ptr<Collection> make(OperationContext* opCtx,
+        std::shared_ptr<Collection> make(OperationContext* opCtx,
                                          const NamespaceString& nss,
                                          RecordId catalogId,
                                          CollectionUUID uuid,
@@ -94,6 +94,10 @@ public:
 
     RecordStore* getRecordStore() final {
         return _recordStore.get();
+    }
+
+    std::shared_ptr<Ident> getSharedIdent() const final {
+        return _recordStore;
     }
 
     const BSONObj getValidatorDoc() const final {
@@ -284,6 +288,7 @@ public:
     bool isCapped() const final;
 
     CappedCallback* getCappedCallback() final;
+    const CappedCallback* getCappedCallback() const final;
 
     /**
      * Get a pointer to a capped insert notifier object. The caller can wait on this object
@@ -323,7 +328,7 @@ public:
      * If return value is not boost::none, reads with majority read concern using an older snapshot
      * must error.
      */
-    boost::optional<Timestamp> getMinimumVisibleSnapshot() final {
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() const final {
         return _minVisibleSnapshot;
     }
 
@@ -333,12 +338,12 @@ public:
      */
     void setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) final;
 
-    bool haveCappedWaiters() final;
+    bool haveCappedWaiters() const final;
 
     /**
      * Notify (capped collection) waiters of data changes, like an insert.
      */
-    void notifyCappedWaitersIfNeeded() final;
+    void notifyCappedWaitersIfNeeded() const final;
 
     /**
      * Get a pointer to the collection's default collator. The pointer must not be used after this
@@ -352,11 +357,13 @@ public:
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
         OperationContext* opCtx,
         PlanYieldPolicy::YieldPolicy yieldPolicy,
-        ScanDirection scanDirection) final;
+        ScanDirection scanDirection,
+        boost::optional<RecordId> resumeAfterRecordId) const final;
 
     void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) final;
 
     void establishOplogCollectionForLogging(OperationContext* opCtx) final;
+    void onDeregisterFromCatalog() final;
 
 private:
     /**
@@ -390,7 +397,7 @@ private:
     bool _committed = true;
 
     // The RecordStore may be null during a repair operation.
-    std::unique_ptr<RecordStore> _recordStore;  // owned
+    std::shared_ptr<RecordStore> _recordStore;  // shared across all Collection instances.
     const bool _needCappedLock;
     std::unique_ptr<IndexCatalog> _indexCatalog;
 

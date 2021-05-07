@@ -114,6 +114,7 @@
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/stacktrace.h"
 #include "mongo/util/testing_proctor.h"
 #include "mongo/util/time_support.h"
 
@@ -2612,13 +2613,20 @@ Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* op
     return wtRCToStatus(WiredTigerIndex::Create(opCtx, _uri(ident), config));
 }
 
+Status WiredTigerKVEngine::dropGroupedSortedDataInterface(OperationContext* opCtx,
+                                                          StringData ident) {
+    return wtRCToStatus(WiredTigerIndex::Drop(opCtx, _uri(ident)));
+}
+
 std::unique_ptr<SortedDataInterface> WiredTigerKVEngine::getGroupedSortedDataInterface(
     OperationContext* opCtx, StringData ident, const IndexDescriptor* desc, KVPrefix prefix) {
     if (desc->unique()) {
-        return std::make_unique<WiredTigerIndexUnique>(opCtx, _uri(ident), desc, prefix, _readOnly);
+        return std::make_unique<WiredTigerIndexUnique>(
+            opCtx, _uri(ident), ident, desc, prefix, _readOnly);
     }
 
-    return std::make_unique<WiredTigerIndexStandard>(opCtx, _uri(ident), desc, prefix, _readOnly);
+    return std::make_unique<WiredTigerIndexStandard>(
+        opCtx, _uri(ident), ident, desc, prefix, _readOnly);
 }
 
 std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
@@ -2651,10 +2659,8 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     params.isCapped = false;
     params.isEphemeral = _ephemeral;
     params.cappedCallback = nullptr;
-    // Temporary collections do not need to persist size information to the size storer.
-    params.sizeStorer = nullptr;
-    // Temporary collections do not need to reconcile collection size/counts.
-    params.tracksSizeAdjustments = false;
+    params.sizeStorer = _sizeStorer.get();
+    params.tracksSizeAdjustments = true;
     params.isReadOnly = false;
 
     params.cappedMaxSize = -1;
@@ -3295,17 +3301,21 @@ bool WiredTigerKVEngine::supportsOplogStones() const {
 void WiredTigerKVEngine::startOplogManager(OperationContext* opCtx,
                                            WiredTigerRecordStore* oplogRecordStore) {
     stdx::lock_guard<Latch> lock(_oplogManagerMutex);
-    if (_oplogManagerCount == 0)
-        _oplogManager->startVisibilityThread(opCtx, oplogRecordStore);
-    _oplogManagerCount++;
+    // Halt visibility thread if running on previous record store
+    if (_oplogRecordStore) {
+        _oplogManager->haltVisibilityThread();
+    }
+
+    _oplogManager->startVisibilityThread(opCtx, oplogRecordStore);
+    _oplogRecordStore = oplogRecordStore;
 }
 
-void WiredTigerKVEngine::haltOplogManager() {
+void WiredTigerKVEngine::haltOplogManager(WiredTigerRecordStore* oplogRecordStore) {
     stdx::unique_lock<Latch> lock(_oplogManagerMutex);
-    invariant(_oplogManagerCount > 0);
-    _oplogManagerCount--;
-    if (_oplogManagerCount == 0) {
+    // Halt visibility thread if the request match current
+    if (_oplogRecordStore == oplogRecordStore) {
         _oplogManager->haltVisibilityThread();
+        _oplogRecordStore = nullptr;
     }
 }
 

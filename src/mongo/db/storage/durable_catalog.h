@@ -143,6 +143,8 @@ public:
                                     bool stayTemp) = 0;
 
     /**
+     * Deletes the persisted collection catalog entry identified by 'catalogId'.
+     *
      * Expects (invariants) that all of the index catalog entries have been removed already via
      * removeIndex.
      */
@@ -200,9 +202,11 @@ public:
                                  StringData validationLevel,
                                  StringData validationAction) = 0;
 
-    virtual Status removeIndex(OperationContext* opCtx,
-                               RecordId catalogId,
-                               StringData indexName) = 0;
+    /**
+     * Removes the index 'indexName' from the persisted collection catalog entry identified by
+     * 'catalogId'.
+     */
+    virtual void removeIndex(OperationContext* opCtx, RecordId catalogId, StringData indexName) = 0;
 
     /**
      * Updates the persisted catalog entry for 'ns' with the new index and creates the index on
@@ -215,6 +219,15 @@ public:
                                         const IndexDescriptor* spec,
                                         boost::optional<UUID> buildUUID,
                                         bool isBackgroundSecondaryBuild) = 0;
+
+    /**
+     * Drops the provided ident and recreates it as empty for use in resuming an index build.
+     */
+    virtual Status dropAndRecreateIndexIdentForResume(OperationContext* opCtx,
+                                                      RecordId catalogId,
+                                                      const IndexDescriptor* spec,
+                                                      StringData ident,
+                                                      KVPrefix prefix) = 0;
 
     /**
      * Returns a UUID if the index is being built with the two-phase index build procedure.

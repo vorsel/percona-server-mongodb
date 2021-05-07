@@ -72,6 +72,7 @@
 #include "mongo/db/storage/execution_context.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/storage_engine_init.h"
+#include "mongo/db/storage/storage_util.h"
 #include "mongo/db/ttl_collection_cache.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
@@ -1084,20 +1085,23 @@ Status IndexCatalogImpl::dropIndexEntry(OperationContext* opCtx, IndexCatalogEnt
 void IndexCatalogImpl::deleteIndexFromDisk(OperationContext* opCtx, const string& indexName) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_collection->ns(), MODE_X));
 
-    Status status =
-        DurableCatalog::get(opCtx)->removeIndex(opCtx, _collection->getCatalogId(), indexName);
-    if (status.code() == ErrorCodes::NamespaceNotFound) {
-        /*
-         * This is ok, as we may be partially through index creation.
-         */
-    } else if (!status.isOK()) {
-        LOGV2_WARNING(20364,
-                      "couldn't drop index {index} on collection: {namespace} because of {error}",
-                      "Couldn't drop index",
-                      "index"_attr = indexName,
-                      "namespace"_attr = _collection->ns(),
-                      "error"_attr = redact(status));
-    }
+    // The index catalog entry may not exist in the catalog depending on how far an index build may
+    // have gotten before needing to abort. If the catalog entry cannot be found, then there are no
+    // concurrent operations still using the index.
+    auto ident = [&]() -> std::shared_ptr<Ident> {
+        auto indexDesc = findIndexByName(opCtx, indexName, true /* includeUnfinishedIndexes */);
+        if (!indexDesc) {
+            return nullptr;
+        }
+        return getEntry(indexDesc)->accessMethod()->getSharedIdent();
+    }();
+
+    catalog::removeIndex(opCtx,
+                         indexName,
+                         _collection->getCatalogId(),
+                         _collection->uuid(),
+                         _collection->ns(),
+                         ident);
 }
 
 void IndexCatalogImpl::setMultikeyPaths(OperationContext* const opCtx,
@@ -1470,8 +1474,8 @@ Status IndexCatalogImpl::_updateRecord(OperationContext* const opCtx,
 
     iam->prepareUpdate(opCtx, index, oldDoc, newDoc, recordId, options, &updateTicket);
 
-    int64_t keysInserted;
-    int64_t keysDeleted;
+    int64_t keysInserted = 0;
+    int64_t keysDeleted = 0;
 
     auto status = Status::OK();
     if (index->isHybridBuilding() || !index->isReady(opCtx)) {

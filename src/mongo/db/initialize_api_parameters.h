@@ -36,8 +36,10 @@
 namespace mongo {
 
 /**
- * Parses a command's API Version parameters from a request and stores the apiVersion, apiStrict,
- * and apiDeprecationErrors fields.
+ * See VERSIONED_API_README.md for an overview of the Versioned API.
+ *
+ * This function parses a command's API Version parameters from a request and stores the apiVersion,
+ * apiStrict, and apiDeprecationErrors fields.
  */
 const APIParametersFromClient initializeAPIParameters(const BSONObj& requestBody, Command* command);
 
@@ -76,10 +78,19 @@ public:
         _apiDeprecationErrors = apiDeprecationErrors;
     }
 
+    const bool getParamsPassed() const {
+        return _paramsPassed;
+    }
+
+    void setParamsPassed(bool noParamsPassed) {
+        _paramsPassed = noParamsPassed;
+    }
+
 private:
     StringData _apiVersion;
     bool _apiStrict;
     bool _apiDeprecationErrors;
+    bool _paramsPassed;
 };
 
 }  // namespace mongo

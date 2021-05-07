@@ -194,7 +194,6 @@
 #include "mongo/util/periodic_runner.h"
 #include "mongo/util/periodic_runner_factory.h"
 #include "mongo/util/quick_exit.h"
-#include "mongo/util/ramlog.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/sequence_util.h"
 #include "mongo/util/signal_handlers.h"
@@ -221,6 +220,7 @@ namespace {
 
 MONGO_FAIL_POINT_DEFINE(hangDuringQuiesceMode);
 MONGO_FAIL_POINT_DEFINE(pauseWhileKillingOperationsAtShutdown);
+MONGO_FAIL_POINT_DEFINE(hangBeforeShutdown);
 
 const NamespaceString startupLogCollectionName("local.startup_log");
 
@@ -342,8 +342,10 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     auto runner = makePeriodicRunner(serviceContext);
     serviceContext->setPeriodicRunner(std::move(runner));
 
-    OCSPManager::get()->startThreadPool();
+#ifdef MONGO_CONFIG_SSL
+    OCSPManager::start(serviceContext);
     CertificateExpirationMonitor::get()->start(serviceContext);
+#endif
 
     if (!storageGlobalParams.repair) {
         auto tl =
@@ -599,7 +601,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
         uassert(ErrorCodes::BadValue,
                 str::stream() << "Cannot use queryableBackupMode in a replica set",
                 !replCoord->isReplEnabled());
-        replCoord->startup(startupOpCtx.get());
+        replCoord->startup(startupOpCtx.get(), lastStorageEngineShutdownState);
     }
 
     if (!storageGlobalParams.readOnly) {
@@ -650,7 +652,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
             ReplicaSetNodeProcessInterface::getReplicaSetNodeExecutor(serviceContext)->startup();
         }
 
-        replCoord->startup(startupOpCtx.get());
+        replCoord->startup(startupOpCtx.get(), lastStorageEngineShutdownState);
         if (getReplSetMemberInStandaloneMode(serviceContext)) {
             LOGV2_WARNING_OPTIONS(
                 20547,
@@ -723,16 +725,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     // operation context anymore
     startupOpCtx.reset();
 
-    auto start = serviceContext->getServiceExecutor()->start();
-    if (!start.isOK()) {
-        LOGV2_ERROR(20570,
-                    "Error starting service executor: {error}",
-                    "Error starting service executor",
-                    "error"_attr = start);
-        return EXIT_NET_ERROR;
-    }
-
-    start = serviceContext->getServiceEntryPoint()->start();
+    auto start = serviceContext->getServiceEntryPoint()->start();
     if (!start.isOK()) {
         LOGV2_ERROR(20571,
                     "Error starting service entry point: {error}",
@@ -1043,6 +1036,11 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         shutdownTimeout = Milliseconds(repl::shutdownTimeoutMillisForSignaledShutdown.load());
     }
 
+    if (MONGO_unlikely(hangBeforeShutdown.shouldFail())) {
+        LOGV2(4944800, "Hanging before shutdown due to hangBeforeShutdown failpoint");
+        hangBeforeShutdown.pauseWhileSet();
+    }
+
     // If we don't have shutdownArgs, we're shutting down from a signal, or other clean shutdown
     // path.
     //
@@ -1257,11 +1255,6 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         CatalogCacheLoader::get(serviceContext).shutDown();
     }
 
-#if __has_feature(address_sanitizer)
-    // When running under address sanitizer, we get false positive leaks due to disorder around
-    // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
-    // harder to dry up the server from active connections before going on to really shut down.
-
     // Shutdown the Service Entry Point and its sessions and give it a grace period to complete.
     if (auto sep = serviceContext->getServiceEntryPoint()) {
         LOGV2_OPTIONS(4784923, {LogComponent::kCommand}, "Shutting down the ServiceEntryPoint");
@@ -1271,19 +1264,6 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
                           "Service entry point did not shutdown within the time limit");
         }
     }
-
-    // Shutdown and wait for the service executor to exit
-    if (auto svcExec = serviceContext->getServiceExecutor()) {
-        LOGV2_OPTIONS(4784924, {LogComponent::kExecutor}, "Shutting down the service executor");
-        Status status = svcExec->shutdown(Seconds(10));
-        if (!status.isOK()) {
-            LOGV2_OPTIONS(20564,
-                          {LogComponent::kNetwork},
-                          "Service executor did not shutdown within the time limit",
-                          "error"_attr = status);
-        }
-    }
-#endif
 
     LOGV2(4784925, "Shutting down free monitoring");
     stopFreeMonitoring();
@@ -1328,6 +1308,9 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
 #ifndef MONGO_CONFIG_USE_RAW_LATCHES
     LatchAnalyzer::get(serviceContext).dump();
 #endif
+
+    FlowControl::shutdown(serviceContext);
+    OCSPManager::shutdown(serviceContext);
 }
 
 }  // namespace

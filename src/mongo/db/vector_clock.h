@@ -31,17 +31,13 @@
 
 #include <array>
 
-#include "mongo/client/query.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/transport/session.h"
 
-
 namespace mongo {
-
-class VectorClockMutable;
 
 /**
  * The VectorClock service provides a collection of cluster-wide logical clocks (including the
@@ -82,6 +78,9 @@ protected:
 public:
     class VectorTime {
     public:
+        explicit VectorTime(LogicalTimeArray time) : _time(std::move(time)) {}
+        VectorTime() = default;
+
         LogicalTime clusterTime() const& {
             return _time[Component::ClusterTime];
         }
@@ -105,9 +104,7 @@ public:
     private:
         friend class VectorClock;
 
-        explicit VectorTime(LogicalTimeArray time) : _time(time) {}
-
-        const LogicalTimeArray _time;
+        LogicalTimeArray _time;
     };
 
     static constexpr char kClusterTimeFieldName[] = "$clusterTime";
@@ -118,6 +115,7 @@ public:
     // implementation.
     static VectorClock* get(ServiceContext* service);
     static VectorClock* get(OperationContext* ctx);
+
     static void registerVectorClockOnServiceContext(ServiceContext* service,
                                                     VectorClock* vectorClock);
 
@@ -134,6 +132,7 @@ public:
     bool gossipOut(OperationContext* opCtx,
                    BSONObjBuilder* outMessage,
                    const transport::Session::TagMask defaultClientSessionTags = 0) const;
+
     /**
      * Read the necessary fields from inMessage in order to update the current time, based on this
      * message received from another node, taking into account if the gossiping is from an internal
@@ -149,21 +148,9 @@ public:
      */
     bool isEnabled() const;
 
-    /*
-     * Methods to save/recover the the vector clock to/from persistent storage. Subclasses are
-     * eventually expected to override these methods to provide persistence mechanisms. Default
-     * implementations do nothing.
-     */
-    virtual SharedSemiFuture<void> persist(OperationContext* opCtx) {
-        return SharedSemiFuture<void>();
-    }
-    virtual SharedSemiFuture<void> recover(OperationContext* opCtx) {
-        return SharedSemiFuture<void>();
-    }
-    virtual void waitForInMemoryVectorClockToBePersisted(OperationContext* opCtx) {}
-    virtual void waitForVectorClockToBeRecovered(OperationContext* opCtx) {}
-
-    void resetVectorClock_forTest();
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+    // The group of methods below is only used for unit-testing
+    ///////////////////////////////////////////////////////////////////////////////////////////////
 
     void advanceClusterTime_forTest(LogicalTime newTime) {
         _advanceTime_forTest(Component::ClusterTime, newTime);
@@ -177,17 +164,12 @@ public:
         _advanceTime_forTest(Component::TopologyTime, newTime);
     }
 
-    // Query to use when reading/writing the vector clock state document.
-    static const Query& stateQuery();
-
-    // The _id value of the vector clock singleton document.
-    static constexpr StringData kDocIdKey = "vectorClockState"_sd;
+    void resetVectorClock_forTest();
 
 protected:
     class ComponentFormat {
-
     public:
-        ComponentFormat(std::string fieldName) : _fieldName(fieldName) {}
+        ComponentFormat(std::string fieldName) : _fieldName(std::move(fieldName)) {}
         virtual ~ComponentFormat() = default;
 
         // Returns true if the time was output, false otherwise.
@@ -208,8 +190,6 @@ protected:
 
     VectorClock();
     virtual ~VectorClock();
-
-    void _advanceTime_forTest(Component component, LogicalTime newTime);
 
     /**
      * The maximum permissible value for each part of a LogicalTime's Timestamp (ie. "secs" and
@@ -239,7 +219,6 @@ protected:
      * Used to ensure that gossiped or ticked times never overflow the maximum possible LogicalTime.
      */
     static bool _lessThanOrEqualToMaxPossibleTime(LogicalTime time, uint64_t nTicks);
-
 
     /**
      * Adds the necessary fields to outMessage to gossip the given time to a node internal to the
@@ -316,17 +295,26 @@ protected:
      */
     void _advanceTime(LogicalTimeArray&& newTime);
 
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+    // The group of methods below is only used for unit-testing
+    ///////////////////////////////////////////////////////////////////////////////////////////////
+
+    void _advanceTime_forTest(Component component, LogicalTime newTime);
+
+    // Initialised only once, when the specific vector clock instance gets instantiated on the
+    // service context
     ServiceContext* _service{nullptr};
 
-    // The mutex protects _vectorTime and _isEnabled.
+    // Protects the fields below
     //
     // Note that ConfigTime is advanced under the ReplicationCoordinator mutex, so to avoid
     // potential deadlocks the ReplicationCoordator mutex should never be acquired whilst the
     // VectorClock mutex is held.
     mutable Mutex _mutex = MONGO_MAKE_LATCH("VectorClock::_mutex");
 
-    LogicalTimeArray _vectorTime;
     bool _isEnabled{true};
+
+    LogicalTimeArray _vectorTime;
 
 private:
     class PlainComponentFormat;

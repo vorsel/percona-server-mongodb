@@ -362,11 +362,6 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
             CatalogCacheLoader::get(serviceContext).shutDown();
         }
 
-#if __has_feature(address_sanitizer)
-        // When running under address sanitizer, we get false positive leaks due to disorder around
-        // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
-        // harder to dry up the server from active connections before going on to really shut down.
-
         // Shutdown the Service Entry Point and its sessions and give it a grace period to complete.
         if (auto sep = serviceContext->getServiceEntryPoint()) {
             if (!sep->shutdown(Seconds(10))) {
@@ -375,18 +370,6 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
                               "Service entry point did not shutdown within the time limit");
             }
         }
-
-        // Shutdown and wait for the service executor to exit
-        if (auto svcExec = serviceContext->getServiceExecutor()) {
-            Status status = svcExec->shutdown(Seconds(5));
-            if (!status.isOK()) {
-                LOGV2_OPTIONS(22845,
-                              {LogComponent::kNetwork},
-                              "Service executor did not shutdown within the time limit",
-                              "error"_attr = status);
-            }
-        }
-#endif
 
         // Shutdown Full-Time Data Capture
         stopMongoSFTDC();
@@ -397,6 +380,8 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
 #ifndef MONGO_CONFIG_USE_RAW_LATCHES
     LatchAnalyzer::get(serviceContext).dump();
 #endif
+
+    OCSPManager::shutdown(serviceContext);
 }
 
 Status initializeSharding(OperationContext* opCtx) {
@@ -673,8 +658,10 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
         serviceContext->setPeriodicRunner(std::move(runner));
     }
 
-    OCSPManager::get()->startThreadPool();
+#ifdef MONGO_CONFIG_SSL
+    OCSPManager::start(serviceContext);
     CertificateExpirationMonitor::get()->start(serviceContext);
+#endif
 
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongos>(serviceContext));
 
@@ -783,9 +770,7 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
 
     clusterCursorCleanupJob.go();
 
-    UserCacheInvalidator cacheInvalidatorThread(AuthorizationManager::get(serviceContext));
-    cacheInvalidatorThread.initialize(opCtx);
-    cacheInvalidatorThread.go();
+    UserCacheInvalidator::start(serviceContext, opCtx);
 
 #ifdef PERCONA_AUDIT_ENABLED
     // start audit log flusher thread only if destination is file
@@ -804,15 +789,6 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
         std::make_unique<LogicalSessionCacheImpl>(std::make_unique<ServiceLiaisonMongos>(),
                                                   std::make_unique<SessionsCollectionSharded>(),
                                                   RouterSessionCatalog::reapSessionsOlderThan));
-
-    status = serviceContext->getServiceExecutor()->start();
-    if (!status.isOK()) {
-        LOGV2_ERROR(22859,
-                    "Error starting service executor: {error}",
-                    "Error starting service executor",
-                    "error"_attr = redact(status));
-        return EXIT_NET_ERROR;
-    }
 
     status = serviceContext->getServiceEntryPoint()->start();
     if (!status.isOK()) {

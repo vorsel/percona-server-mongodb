@@ -365,7 +365,7 @@ CurOp::CurOp(OperationContext* opCtx, CurOpStack* stack) : _stack(stack) {
 
 CurOp::~CurOp() {
     if (parent() != nullptr)
-        parent()->yielded(_numYields);
+        parent()->yielded(_numYields.load());
     invariant(this == _stack->pop());
 }
 
@@ -708,7 +708,7 @@ void CurOp::reportState(OperationContext* opCtx, BSONObjBuilder* builder, bool t
         builder->append("writeConflicts", n);
     }
 
-    builder->append("numYields", _numYields);
+    builder->append("numYields", _numYields.load());
 
     if (_debug.dataThroughputLastSecond) {
         builder->append("dataThroughputLastSecond", *_debug.dataThroughputLastSecond);

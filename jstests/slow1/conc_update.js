@@ -1,6 +1,3 @@
-// SERVER-36709: Disabled for ephemeralForTest due to excessive memory usage
-// @tags: [incompatible_with_eft]
-
 (function() {
 "use strict";
 
@@ -24,7 +21,7 @@ db.conc.ensureIndex({x: 1});
 var c1 = db.conc.count({x: {$lt: NRECORDS}});
 
 const updater = startParallelShell(
-    "db = db.getSisterDB('concurrency');\
+    "db = db.getSiblingDB('concurrency');\
                                   db.concflag.insert({ inprog: true });\
                                   sleep(20);\
                                   assert.commandWorked(db.conc.update({}, \

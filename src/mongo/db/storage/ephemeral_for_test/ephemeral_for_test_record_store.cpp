@@ -51,7 +51,7 @@ namespace mongo {
 namespace ephemeral_for_test {
 namespace {
 Ordering allAscending = Ordering::make(BSONObj());
-auto const version = KeyString::Version::V1;
+auto const version = KeyString::Version::kLatestVersion;
 BSONObj const sample = BSON(""
                             << "s"
                             << "" << (int64_t)0);
@@ -78,12 +78,11 @@ RecordStore::RecordStore(StringData ns,
                          int64_t cappedMaxDocs,
                          CappedCallback* cappedCallback,
                          VisibilityManager* visibilityManager)
-    : mongo::RecordStore(ns),
+    : mongo::RecordStore(ns, ident),
       _isCapped(isCapped),
       _cappedMaxSize(cappedMaxSize),
       _cappedMaxDocs(cappedMaxDocs),
-      _identStr(ident.rawData(), ident.size()),
-      _ident(_identStr.data(), _identStr.size()),
+      _ident(getIdent().data(), getIdent().size()),
       _prefix(createKey(_ident, std::numeric_limits<int64_t>::min())),
       _postfix(createKey(_ident, std::numeric_limits<int64_t>::max())),
       _cappedCallback(cappedCallback),
@@ -100,10 +99,6 @@ RecordStore::RecordStore(StringData ns,
 
 const char* RecordStore::name() const {
     return kEngineName;
-}
-
-const std::string& RecordStore::getIdent() const {
-    return _identStr;
 }
 
 long long RecordStore::dataSize(OperationContext* opCtx) const {

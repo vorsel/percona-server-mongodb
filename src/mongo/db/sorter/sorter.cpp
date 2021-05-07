@@ -80,6 +80,13 @@ uint32_t addDataToChecksum(const void* startOfData, size_t sizeOfData, uint32_t 
     return newChecksum;
 }
 
+void checkNoExternalSortOnMongos(const SortOptions& opts) {
+    // This should be checked by consumers, but if it isn't try to fail early.
+    uassert(16947,
+            "Attempting to use external sort from mongos. This is not allowed.",
+            !(isMongos() && opts.extSortAllowed));
+}
+
 }  // namespace
 
 namespace sorter {
@@ -129,26 +136,30 @@ public:
     InMemIterator() {}
 
     /// Only a single value
-    InMemIterator(const Data& singleValue) : _data(1, singleValue) {}
+    InMemIterator(const Data& singleValue)
+        : _data(std::make_shared<std::deque<Data>>(1, singleValue)) {}
 
     /// Any number of values
     template <typename Container>
-    InMemIterator(const Container& input) : _data(input.begin(), input.end()) {}
+    InMemIterator(const Container& input)
+        : _data(std::make_shared<std::deque<Data>>(input.begin(), input.end())) {}
+
+    InMemIterator(std::shared_ptr<std::deque<Data>> input) : _data(input) {}
 
     void openSource() {}
     void closeSource() {}
 
     bool more() {
-        return !_data.empty();
+        return _data && !_data->empty();
     }
     Data next() {
-        Data out = std::move(_data.front());
-        _data.pop_front();
+        Data out = std::move(_data->front());
+        _data->pop_front();
         return out;
     }
 
 private:
-    std::deque<Data> _data;
+    std::shared_ptr<std::deque<Data>> _data;
 };
 
 /**
@@ -246,7 +257,7 @@ public:
         return Data(std::move(first), std::move(second));
     }
 
-    SorterRangeInfo getRangeInfo() const {
+    SorterRange getRange() const {
         return {_fileStartOffset, _fileEndOffset, _originalChecksum};
     }
 
@@ -528,12 +539,34 @@ public:
     NoLimitSorter(const SortOptions& opts,
                   const Comparator& comp,
                   const Settings& settings = Settings())
-        : _comp(comp), _settings(settings), _opts(opts), _memUsed(0) {
-        verify(_opts.limit == 0);
-        if (_opts.extSortAllowed) {
-            this->_tempDir = _opts.tempDir;
-            this->_fileName = _opts.tempDir + "/" + nextFileName();
-        }
+        : Sorter<Key, Value>(opts), _comp(comp), _settings(settings) {
+        invariant(opts.limit == 0);
+    }
+
+    NoLimitSorter(const std::string& fileName,
+                  const std::vector<SorterRange> ranges,
+                  const SortOptions& opts,
+                  const Comparator& comp,
+                  const Settings& settings = Settings())
+        : Sorter<Key, Value>(opts, fileName),
+          _comp(comp),
+          _settings(settings),
+          _nextSortedFileWriterOffset(!ranges.empty() ? ranges.back().getEndOffset() : 0) {
+        invariant(opts.extSortAllowed);
+
+        this->_usedDisk = true;
+
+        std::transform(ranges.begin(),
+                       ranges.end(),
+                       std::back_inserter(this->_iters),
+                       [this](const SorterRange& range) {
+                           return std::make_shared<sorter::FileIterator<Key, Value>>(
+                               this->_fileName,
+                               range.getStartOffset(),
+                               range.getEndOffset(),
+                               this->_settings,
+                               range.getChecksum());
+                       });
     }
 
     ~NoLimitSorter() {
@@ -547,12 +580,24 @@ public:
     void add(const Key& key, const Value& val) {
         invariant(!_done);
 
-        _data.emplace_back(key.getOwned(), val.getOwned());
+        _data->emplace_back(key.getOwned(), val.getOwned());
 
         _memUsed += key.memUsageForSorter();
         _memUsed += val.memUsageForSorter();
 
-        if (_memUsed > _opts.maxMemoryUsageBytes)
+        if (_memUsed > this->_opts.maxMemoryUsageBytes)
+            spill();
+    }
+
+    void emplace(Key&& key, Value&& val) override {
+        invariant(!_done);
+
+        _memUsed += key.memUsageForSorter();
+        _memUsed += val.memUsageForSorter();
+
+        _data->emplace_back(std::move(key), std::move(val));
+
+        if (_memUsed > this->_opts.maxMemoryUsageBytes)
             spill();
     }
 
@@ -565,7 +610,7 @@ public:
         }
 
         spill();
-        Iterator* mergeIt = Iterator::merge(this->_iters, this->_fileName, _opts, _comp);
+        Iterator* mergeIt = Iterator::merge(this->_iters, this->_fileName, this->_opts, _comp);
         _done = true;
         return mergeIt;
     }
@@ -585,7 +630,7 @@ private:
 
     void sort() {
         STLComparator less(_comp);
-        std::stable_sort(_data.begin(), _data.end(), less);
+        std::stable_sort(_data->begin(), _data->end(), less);
 
         // Does 2x more compares than stable_sort
         // TODO test on windows
@@ -596,25 +641,26 @@ private:
         invariant(!_done);
 
         this->_usedDisk = true;
-        if (_data.empty())
+        if (_data->empty())
             return;
 
-        if (!_opts.extSortAllowed) {
+        if (!this->_opts.extSortAllowed) {
             // This error message only applies to sorts from user queries made through the find or
             // aggregation commands. Other clients, such as bulk index builds, should suppress this
             // error, either by allowing external sorting or by catching and throwing a more
             // appropriate error.
             uasserted(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
-                      str::stream() << "Sort exceeded memory limit of " << _opts.maxMemoryUsageBytes
-                                    << " bytes, but did not opt in to external sorting.");
+                      str::stream()
+                          << "Sort exceeded memory limit of " << this->_opts.maxMemoryUsageBytes
+                          << " bytes, but did not opt in to external sorting.");
         }
 
         sort();
 
         SortedFileWriter<Key, Value> writer(
-            _opts, this->_fileName, _nextSortedFileWriterOffset, _settings);
-        for (; !_data.empty(); _data.pop_front()) {
-            writer.addAlreadySorted(_data.front().first, _data.front().second);
+            this->_opts, this->_fileName, _nextSortedFileWriterOffset, _settings);
+        for (; !_data->empty(); _data->pop_front()) {
+            writer.addAlreadySorted(_data->front().first, _data->front().second);
         }
         Iterator* iteratorPtr = writer.done();
         _nextSortedFileWriterOffset = writer.getFileEndOffset();
@@ -626,11 +672,12 @@ private:
 
     const Comparator _comp;
     const Settings _settings;
-    SortOptions _opts;
     std::streampos _nextSortedFileWriterOffset = 0;
     bool _done = false;
-    size_t _memUsed;
-    std::deque<Data> _data;  // Data that has not been spilled.
+    size_t _memUsed = 0;
+
+    // Data that has not been spilled.
+    std::shared_ptr<std::deque<Data>> _data = std::make_shared<std::deque<Data>>();
 };
 
 template <typename Key, typename Value, typename Comparator>
@@ -690,20 +737,15 @@ public:
     TopKSorter(const SortOptions& opts,
                const Comparator& comp,
                const Settings& settings = Settings())
-        : _comp(comp),
+        : Sorter<Key, Value>(opts),
+          _comp(comp),
           _settings(settings),
-          _opts(opts),
           _memUsed(0),
           _haveCutoff(false),
           _worstCount(0),
           _medianCount(0) {
         // This also *works* with limit==1 but LimitOneSorter should be used instead
-        verify(_opts.limit > 1);
-
-        if (_opts.extSortAllowed) {
-            this->_tempDir = _opts.tempDir;
-            this->_fileName = _opts.tempDir + "/" + nextFileName();
-        }
+        invariant(opts.limit > 1);
 
         // Preallocate a fixed sized vector of the required size if we don't expect it to have a
         // major impact on our memory budget. This is the common case with small limits.
@@ -728,7 +770,7 @@ public:
         STLComparator less(_comp);
         Data contender(key, val);
 
-        if (_data.size() < _opts.limit) {
+        if (_data.size() < this->_opts.limit) {
             if (_haveCutoff && !less(contender, _cutoff))
                 return;
 
@@ -737,16 +779,16 @@ public:
             _memUsed += key.memUsageForSorter();
             _memUsed += val.memUsageForSorter();
 
-            if (_data.size() == _opts.limit)
+            if (_data.size() == this->_opts.limit)
                 std::make_heap(_data.begin(), _data.end(), less);
 
-            if (_memUsed > _opts.maxMemoryUsageBytes)
+            if (_memUsed > this->_opts.maxMemoryUsageBytes)
                 spill();
 
             return;
         }
 
-        verify(_data.size() == _opts.limit);
+        invariant(_data.size() == this->_opts.limit);
 
         if (!less(contender, _data.front()))
             return;  // not good enough
@@ -763,7 +805,7 @@ public:
         _data.back() = {contender.first.getOwned(), contender.second.getOwned()};
         std::push_heap(_data.begin(), _data.end(), less);
 
-        if (_memUsed > _opts.maxMemoryUsageBytes)
+        if (_memUsed > this->_opts.maxMemoryUsageBytes)
             spill();
     }
 
@@ -774,7 +816,7 @@ public:
         }
 
         spill();
-        Iterator* iterator = Iterator::merge(this->_iters, this->_fileName, _opts, _comp);
+        Iterator* iterator = Iterator::merge(this->_iters, this->_fileName, this->_opts, _comp);
         _done = true;
         return iterator;
     }
@@ -795,7 +837,7 @@ private:
     void sort() {
         STLComparator less(_comp);
 
-        if (_data.size() == _opts.limit) {
+        if (_data.size() == this->_opts.limit) {
             std::sort_heap(_data.begin(), _data.end(), less);
         } else {
             std::stable_sort(_data.begin(), _data.end(), less);
@@ -864,14 +906,14 @@ private:
 
 
         // Promote _worstSeen or _lastMedian to _cutoff and reset counters if should.
-        if (_worstCount >= _opts.limit) {
+        if (_worstCount >= this->_opts.limit) {
             if (!_haveCutoff || less(_worstSeen, _cutoff)) {
                 _cutoff = _worstSeen;
                 _haveCutoff = true;
             }
             _worstCount = 0;
         }
-        if (_medianCount >= _opts.limit) {
+        if (_medianCount >= this->_opts.limit) {
             if (!_haveCutoff || less(_lastMedian, _cutoff)) {
                 _cutoff = _lastMedian;
                 _haveCutoff = true;
@@ -887,13 +929,13 @@ private:
         if (_data.empty())
             return;
 
-        if (!_opts.extSortAllowed) {
+        if (!this->_opts.extSortAllowed) {
             // This error message only applies to sorts from user queries made through the find or
             // aggregation commands. Other clients should suppress this error, either by allowing
             // external sorting or by catching and throwing a more appropriate error.
             uasserted(ErrorCodes::QueryExceededMemoryLimitNoDiskUseAllowed,
                       str::stream()
-                          << "Sort exceeded memory limit of " << _opts.maxMemoryUsageBytes
+                          << "Sort exceeded memory limit of " << this->_opts.maxMemoryUsageBytes
                           << " bytes, but did not opt in to external sorting. Aborting operation."
                           << " Pass allowDiskUse:true to opt in.");
         }
@@ -905,7 +947,7 @@ private:
         updateCutoff();
 
         SortedFileWriter<Key, Value> writer(
-            _opts, this->_fileName, _nextSortedFileWriterOffset, _settings);
+            this->_opts, this->_fileName, _nextSortedFileWriterOffset, _settings);
         for (size_t i = 0; i < _data.size(); i++) {
             writer.addAlreadySorted(_data[i].first, _data[i].second);
         }
@@ -922,7 +964,6 @@ private:
 
     const Comparator _comp;
     const Settings _settings;
-    SortOptions _opts;
     std::streampos _nextSortedFileWriterOffset = 0;
     bool _done = false;
     size_t _memUsed;
@@ -942,12 +983,16 @@ private:
 }  // namespace sorter
 
 template <typename Key, typename Value>
-std::vector<SorterRangeInfo> Sorter<Key, Value>::_getRangeInfos() const {
-    std::vector<SorterRangeInfo> ranges;
+Sorter<Key, Value>::Sorter(const SortOptions& opts)
+    : Sorter(opts, opts.extSortAllowed ? opts.tempDir + "/" + nextFileName() : "") {}
+
+template <typename Key, typename Value>
+std::vector<SorterRange> Sorter<Key, Value>::_getRanges() const {
+    std::vector<SorterRange> ranges;
     ranges.reserve(_iters.size());
 
     std::transform(_iters.begin(), _iters.end(), std::back_inserter(ranges), [](const auto it) {
-        return it->getRangeInfo();
+        return it->getRange();
     });
 
     return ranges;
@@ -1105,10 +1150,7 @@ template <typename Comparator>
 Sorter<Key, Value>* Sorter<Key, Value>::make(const SortOptions& opts,
                                              const Comparator& comp,
                                              const Settings& settings) {
-    // This should be checked by consumers, but if it isn't try to fail early.
-    uassert(16947,
-            "Attempting to use external sort from mongos. This is not allowed.",
-            !(isMongos() && opts.extSortAllowed));
+    checkNoExternalSortOnMongos(opts);
 
     uassert(17149,
             "Attempting to use external sort without setting SortOptions::tempDir",
@@ -1121,5 +1163,24 @@ Sorter<Key, Value>* Sorter<Key, Value>::make(const SortOptions& opts,
         default:
             return new sorter::TopKSorter<Key, Value, Comparator>(opts, comp, settings);
     }
+}
+
+template <typename Key, typename Value>
+template <typename Comparator>
+Sorter<Key, Value>* Sorter<Key, Value>::makeFromExistingRanges(
+    const std::string& fileName,
+    const std::vector<SorterRange> ranges,
+    const SortOptions& opts,
+    const Comparator& comp,
+    const Settings& settings) {
+    checkNoExternalSortOnMongos(opts);
+
+    invariant(opts.limit == 0,
+              str::stream() << "Creating a Sorter from existing ranges is only availble with the "
+                               "NoLimitSorter (limit 0), but got limit "
+                            << opts.limit);
+
+    return new sorter::NoLimitSorter<Key, Value, Comparator>(
+        fileName, ranges, opts, comp, settings);
 }
 }  // namespace mongo

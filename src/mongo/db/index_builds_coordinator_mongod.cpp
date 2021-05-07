@@ -58,6 +58,7 @@ namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(hangBeforeInitializingIndexBuild);
+MONGO_FAIL_POINT_DEFINE(hangIndexBuildAfterSignalPrimaryForCommitReadiness);
 
 const StringData kMaxNumActiveUserIndexBuildsServerParameterName = "maxNumActiveUserIndexBuilds"_sd;
 
@@ -635,6 +636,11 @@ void IndexBuildsCoordinatorMongod::_signalPrimaryForCommitReadiness(
             break;
         }
     }
+
+    if (MONGO_unlikely(hangIndexBuildAfterSignalPrimaryForCommitReadiness.shouldFail())) {
+        LOGV2(4841707, "Hanging index build after signaling the primary for commit readiness");
+        hangIndexBuildAfterSignalPrimaryForCommitReadiness.pauseWhileSet(opCtx);
+    }
     return;
 }
 
@@ -781,7 +787,7 @@ Status IndexBuildsCoordinatorMongod::setCommitQuorum(OperationContext* opCtx,
     }
 
     AutoGetCollectionForRead autoColl(opCtx, nss);
-    Collection* collection = autoColl.getCollection();
+    const Collection* collection = autoColl.getCollection();
     if (!collection) {
         return Status(ErrorCodes::NamespaceNotFound,
                       str::stream() << "Collection '" << nss << "' was not found.");

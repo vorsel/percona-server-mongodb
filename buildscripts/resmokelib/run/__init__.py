@@ -673,7 +673,7 @@ class RunPlugin(PluginInterface):
                             help="The path to the mongod executable for resmoke.py to use.")
 
         parser.add_argument(
-            "--mongodSetParameters", dest="mongod_set_parameters",
+            "--mongodSetParameters", dest="mongod_set_parameters", action="append",
             metavar="{key1: value1, key2: value2, ..., keyN: valueN}",
             help=("Passes one or more --setParameter options to all mongod processes"
                   " started by resmoke.py. The argument is specified as bracketed YAML -"
@@ -683,7 +683,7 @@ class RunPlugin(PluginInterface):
                             help="The path to the mongos executable for resmoke.py to use.")
 
         parser.add_argument(
-            "--mongosSetParameters", dest="mongos_set_parameters",
+            "--mongosSetParameters", dest="mongos_set_parameters", action="append",
             metavar="{key1: value1, key2: value2, ..., keyN: valueN}",
             help=("Passes one or more --setParameter options to all mongos processes"
                   " started by resmoke.py. The argument is specified as bracketed YAML -"
@@ -859,7 +859,21 @@ class RunPlugin(PluginInterface):
                   " located in the resmokeconfig/suites/ directory, then the basename"
                   " without the .yml extension can be specified, e.g. 'console'."))
 
-        # Used for testing resmoke. Do not set this.
+        # Used for testing resmoke.
+        #
+        # `is_inner_level`:
+        #     Marks the resmoke process as a child of a parent resmoke process, meaning that"
+        #     it was started by a shell process which itself was started by a top-level"
+        #     resmoke process. This is used to ensure the hang-analyzer is called properly."
+        #
+        # `test_archival`:
+        #     Allows unit testing of resmoke's archival feature where we write out the names
+        #     of the files to be archived, instead of doing the actual archival, which can
+        #     be time and resource intensive.
+        #
+        # `test_analysis`:
+        #     When specified, the hang-analyzer writes out the pids it will analyze without
+        #     actually running analysis, which can be time and resource intensive.
         internal_options.add_argument("--internalParam", action="append", dest="internal_params",
                                       help=argparse.SUPPRESS)
 

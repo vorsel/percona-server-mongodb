@@ -464,6 +464,26 @@ tasks:
     - func: "run test"
     - func: "analyze"
 
+- name: linkbench_non_retryable_writes_stepdowns
+  priority: 5
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "linkbench_non_retryable_writes_stepdowns"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
+- name: linkbench_non_retryable_writes_rolling_restarts
+  priority: 5
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "linkbench_non_retryable_writes_rolling_restarts"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
 - name: linkbench2
   priority: 5
   exec_timeout_secs: 43200 # 12 hours
@@ -551,6 +571,30 @@ tasks:
     - func: "prepare environment"
       vars:
         test: "ycsb_rolling_restarts"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+      vars:
+        script_flags: --ycsb-throughput-analysis reports
+
+- name: industry_benchmarks_non_retryable_writes_stepdowns
+  priority: 5
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "ycsb_non_retryable_writes_stepdowns"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+      vars:
+        script_flags: --ycsb-throughput-analysis reports
+
+- name: industry_benchmarks_non_retryable_writes_rolling_restarts
+  priority: 5
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "ycsb_non_retryable_writes_rolling_restarts"
     - func: "deploy cluster"
     - func: "run test"
     - func: "analyze"
@@ -773,6 +817,16 @@ tasks:
     - func: "prepare environment"
       vars:
         test: "move_chunk_waiting"
+    - func: "deploy cluster"
+    - func: "run test"
+    - func: "analyze"
+
+- name: move_chunk_large_chunk_map_workloads
+  priority: 5
+  commands:
+    - func: "prepare environment"
+      vars:
+        test: "move_chunk_large_chunk_map"
     - func: "deploy cluster"
     - func: "run test"
     - func: "analyze"
@@ -1041,7 +1095,7 @@ buildvariants:
     - mongo-tools
     - enterprise
     - genny
-  batchtime: 1440 # 24 hours
+  batchtime: 2880 # 48 hours
   expansions: &compile-expansions
     platform: linux
     project_dir: &project_dir dsi
@@ -1080,7 +1134,7 @@ buildvariants:
   modules:
   - mongo-tools
   - enterprise
-  batchtime: 1440 # 24 hours
+  batchtime: 2880 # 48 hours
   expansions:
     <<: *compile-expansions
     compile_flags: >-
@@ -1214,7 +1268,7 @@ buildvariants:
 
 - name: linux-1-node-replSet-fle
   display_name: Linux 1-Node ReplSet FLE
-  batchtime: 2880  # 48 hours
+  batchtime: 5760  # 4 days
   modules: *modules
   expansions:
     setup: single-replica-fle
@@ -1239,7 +1293,7 @@ buildvariants:
 
 - name: linux-1-node-replSet-cwrwc
   display_name: Linux 1-Node ReplSet CWRWC
-  batchtime: 2880  # 48 hours
+  batchtime: 5760  # 4 days
   modules: *modules
   expansions:
     setup: single-replica-cwrwc
@@ -1263,7 +1317,7 @@ buildvariants:
 
 - name: linux-1-node-replSet-ese-cbc
   display_name: Linux 1-Node ReplSet ESE CBC
-  batchtime: 2880  # 48 hours
+  batchtime: 5760  # 4 days
   modules: *modules
   expansions:
     setup: single-replica-ese-cbc
@@ -1288,7 +1342,7 @@ buildvariants:
 
 - name: linux-1-node-replSet-ese-gcm
   display_name: Linux 1-Node ReplSet ESE GCM
-  batchtime: 2880  # 48 hours
+  batchtime: 5760  # 4 days
   modules: *modules
   expansions:
     setup: single-replica-ese-gcm
@@ -1337,7 +1391,7 @@ buildvariants:
 
 - name: linux-3-node-1dayhistory-15gbwtcache
   display_name: Linux 3-Node ReplSet 1 Day History 15 GB WiredTiger Cache
-  batchtime: 2880  # 48 hours
+  batchtime: 5760  # 4 days
   modules: *modules
   expansions:
     setup: replica-1dayhistory-15gbwtcache
@@ -1396,7 +1450,7 @@ buildvariants:
 
 - name: linux-shard-lite
   display_name: Linux Shard Lite Cluster
-  batchtime: 2880  # 48 hours
+  batchtime: 5760  # 4 days
   modules: *modules
   expansions:
     setup: shard-lite
@@ -1427,6 +1481,7 @@ buildvariants:
     - name: mixed_workloads
     - name: mongos_workloads
     - name: mongos_large_catalog_workloads
+    - name: move_chunk_large_chunk_map_workloads
     - name: move_chunk_workloads
     - name: move_chunk_waiting_workloads
     - name: retryable_writes_workloads
@@ -1569,7 +1624,7 @@ buildvariants:
 
 - name: linux-3-node-replSet-maintenance-events
   display_name: Linux 3-Node ReplSet (Maintenance Events)
-  batchtime: 2880  # 48 hours
+  batchtime: 5760  # 4 days
   modules: *modules
   expansions:
     setup: replica-maintenance-events
@@ -1587,9 +1642,13 @@ buildvariants:
         variant: compile-amazon2
   tasks:
     - name: industry_benchmarks_stepdowns
-    - name: linkbench_stepdowns
     - name: industry_benchmarks_rolling_restarts
+    - name: industry_benchmarks_non_retryable_writes_stepdowns
+    - name: industry_benchmarks_non_retryable_writes_rolling_restarts
+    - name: linkbench_stepdowns
     - name: linkbench_rolling_restarts
+    - name: linkbench_non_retryable_writes_stepdowns
+    - name: linkbench_non_retryable_writes_rolling_restarts
 
 - name: linux-3-node-replSet-initialsync
   display_name: Linux 3-Node ReplSet Initial Sync
@@ -1693,7 +1752,7 @@ buildvariants:
 #######################################
 - name: atlas-like-M60
   display_name: M60-Like 3-Node ReplSet
-  batchtime: 2880  # 48 hours
+  batchtime: 5760  # 4 days
   modules: *modules
   expansions:
     setup: atlas-like-replica

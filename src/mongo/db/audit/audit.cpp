@@ -58,22 +58,21 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/bson/bson_field.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/audit/audit_parameters_gen.h"
-#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/logger/auditlog.h"
-#include "mongo/logger/logger.h"
 #include "mongo/logv2/log.h"
+#include "mongo/logv2/log_util.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit_code.h"
 #include "mongo/util/net/sock.h"
 #include "mongo/util/string_map.h"
-#include "mongo/util/time_support.h"
 
 #include "audit_options.h"
 
@@ -106,7 +105,7 @@ namespace audit {
     };
 
     // Writable interface for audit events
-    class WritableAuditLog : public logger::AuditLog {
+    class WritableAuditLog : public logv2::AuditLog {
     public:
         WritableAuditLog(const BSONObj &filter)
             : _matcher(filter.getOwned(), new ExpressionContext(nullptr, nullptr, NamespaceString())) {
@@ -118,9 +117,10 @@ namespace audit {
                 appendMatched(obj, affects_durable_state);
             }
         }
-        virtual void rotate() override {
+        virtual Status rotate(bool rename, StringData renameSuffix) override {
             // No need to override this method if there is nothing to rotate
             // like it is for 'console' and 'syslog' destinations
+            return Status::OK();
         }
 
         virtual void flush() {
@@ -198,28 +198,32 @@ namespace audit {
             invariant(_membuf.write(adapter->data(), adapter->size()));
         }
 
-        virtual void rotate() override {
+        virtual Status rotate(bool rename, StringData renameSuffix) override {
             stdx::lock_guard<SimpleMutex> lck(_mutex);
 
             // Close the current file.
             _file.reset();
 
-            // Rename the current file
-            // Note: we append a timestamp to the file name.
-            std::stringstream ss;
-            ss << _fileName << "." << terseCurrentTime(false);
-            std::string s = ss.str();
-            int r = std::rename(_fileName.c_str(), s.c_str());
-            if (r != 0) {
-                LOGV2_ERROR(29016,
-                            "Could not rotate audit log, but continuing normally "
-                            "(error desc: {err_desc})",
-                            "err_desc"_attr = errnoWithDescription());
+            if (rename) {
+                // Rename the current file
+                // Note: we append a timestamp to the file name.
+                std::stringstream ss;
+                ss << _fileName << "." << renameSuffix;
+                std::string s = ss.str();
+                int r = std::rename(_fileName.c_str(), s.c_str());
+                if (r != 0) {
+                    LOGV2_ERROR(29016,
+                                "Could not rotate audit log, but continuing normally "
+                                "(error desc: {err_desc})",
+                                "err_desc"_attr = errnoWithDescription());
+                }
             }
 
             // Open a new file, with the same name as the original.
             _file.reset(new Sink);
             _file->open(_fileName.c_str());
+
+            return Status::OK();
         }
 
         virtual void flush() override {
@@ -451,10 +455,6 @@ namespace audit {
     static std::shared_ptr<WritableAuditLog> _auditLog;
 
     static void _setGlobalAuditLog(WritableAuditLog *log) {
-        // Sets the audit log in the general logging framework which
-        // will rotate() the audit log when the server log rotates.
-        setAuditLog(log);
-
         // Must be the last line because this function is also used
         // for cleanup (log can be nullptr)
         // Otherwise race condition exists during cleanup.
@@ -493,6 +493,14 @@ namespace audit {
     MONGO_INITIALIZER_WITH_PREREQUISITES(AuditInit,
                                          ("default", "PathlessOperatorMap", "MatchExpressionParser"))
         (InitializerContext *context) {
+        // Sets the audit log in the general logging framework which
+        // will rotate() the audit log when the server log rotates.
+        logv2::addLogRotator([](bool renameFiles, StringData suffix) {
+                if (_auditLog) {
+                    return _auditLog->rotate(renameFiles, suffix);
+                }
+                return Status::OK();
+        });
         return initialize();
     }
 

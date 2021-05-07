@@ -2,10 +2,11 @@
 //   assumes_superuser_permissions,
 //   creates_and_authenticates_user,
 //   requires_profiling,
+//   sbe_incompatible,
 // ]
 // special db so that it can be run in parallel tests
 var stddb = db;
-var db = db.getSisterDB("profile3");
+var db = db.getSiblingDB("profile3");
 
 db.dropAllUsers();
 t = db.profile3;

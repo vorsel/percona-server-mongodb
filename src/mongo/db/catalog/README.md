@@ -23,22 +23,18 @@ index implementations found in the [**index/**][] directory; and the sorter foun
 
 # The Catalog
 
-## In-Memory Catalog
-
-### Collection Catalog
-include discussion of RecordStore interface
-
-### Index Catalog
-include discussion of SortedDataInterface interface
-
-### Versioning
-in memory versioning (or lack thereof) is separate from on disk
-
-#### The Minimum Visible Snapshot
+The catalog is where MongoDB stores information about the collections and indexes for a MongoDB
+node. In some contexts we refer to this as metadata and to operations changing this metadata as
+[DDL](#glossary) (Data Definition Language) operations. The catalog is persisted as a table with
+BSON documents that each describe properties of a collection and its indexes. An in-memory catalog
+caches the most recent catalog information for more efficient access.
 
 ## Durable Catalog
-Discuss what the catalog looks like on disk -- e.g. just another WT data table we structure
-specially
+
+The durable catalog is persisted as a table with the `_mdb_catalog` [ident](#glossary). Each entry
+in this table is indexed with a 64-bit `RecordId`, referred to as the catalog ID, and contains a
+BSON document that describes the properties of a collection and its indexes. The `DurableCatalog`
+class allows read and write access to the durable data.
 
 **Example**: an entry in the durable catalog for a collection `test.employees` with an in-progress
 index build on `{lastName: 1}`:
@@ -67,19 +63,66 @@ index build on `{lastName: 1}`:
   'ns': 'test.employees'}
 ```
 
+## Collection Catalog
+The `CollectionCatalog` class holds in-memory state about all collections in all databases and is a
+cache of the [durable catalog](#durable-catalog) state. It provides the following functionality:
+ * Register new `Collection` objects, taking ownership of them.
+ * Lookup `Collection` objects by their `UUID` or `NamespaceString`.
+ * Iterate over `Collection` objects in a database in `UUID` order.
+ * Deregister individual dropped `Collection` objects, releasing ownership.
+ * Allow closing/reopening the catalog while still providing limited `UUID` to `NamespaceString`
+   lookup to support rollback to a point in time.
 
-### Catalog Data Formats
-What do the catalog documents look like? Are there catalog concepts constructed only in-memory and not on disk?
+All catalog access is internally synchronized, and use of iterators after catalog changes generally
+results in automatic repositioning.
 
-#### Collection Data Format
+### Collection objects
+Objects of the `Collection` class provide access to a collection's main properties across some range
+of time between [DDL](#glossary) operations that may change these properties. Such operations may
+change the collection name for example, resulting in a new `Collection` object. It is possible for
+operations that read at different points in time to use different `Collection` objects.
 
-#### Index Data Format
+Notable properties of `Collection` objects are:
+ * catalog ID - to look up or change information from the DurableCatalog.
+ * UUID - Identifier that remains for the lifetime of the underlying MongoDb collection, even across
+   DDL operations such as renames, and is consistent between different nodes and shards in a
+   cluster.
+ * NamespaceString - The current name associated with the collection.
+ * Collation and validation properties.
+ * Decorations that are either `Collection` instance specific or shared between all `Collection`
+   objects over the lifetime of the collection.
+ * minimum visible snapshot - The minimum point-in-time snapshot at which the information the
+   `Collection` object is valid.
 
-### Versioning
-e.g. data changes in tables are versioned, dropping/creating tables is not versioned
+In addition `Collection` objects have shared ownership of:
+ * An [`IndexCatalog`](#index-catalog) - an in-memory structure representing the `md.indexes` data
+   from the durable catalog.
+ * A `RecordStore` - an interface to access and manipulate the documents in the collection as stored
+   by the storage engine.
 
-## Catalog Changes
-How are updates to the catalog done in-memory and on disk?
+Finally, there are two kinds of decorations on `Collection` objects. The `Collection` object derives
+from `Decorable` and can have `Decoration`s that keep non-durable state that is discarded when DDL
+operations occur. This is used for query information. Additionally, there are
+`SharedCollectionDecorations` for storing index usage statistics and query settings that are shared
+between `Collection` instances across DDL operations.
+
+### Index Catalog
+
+Each `Collection` object owns an `IndexCatalog` object, which in turn has shared ownership of
+`IndexCatalogEntry` objects that each again own an `IndexDescriptor` containing an in-memory
+presentation of the data stored in the [durable catalog](#durable-catalog).
+
+## Catalog Changes, versioning and the Minimum Visible Snapshot
+Every catalog change has a corresponding write with a commit time. When registered `OpObserver`
+objects observe catalog changes, they set the minimum visible snapshot of the `Collection` or
+`IndexCatalogEntry` object to the commit timestamp. Readers use this timestamp to determine whether
+the information cached in the `Collection` and `IndexCatalog` is valid for the point in time at
+which they read.
+
+Operations that use collection locks (in any [lockmode](#lock-modes)) can rely on the catalog
+information of the collection not changing. However, when unlocking and then relocking, not only
+should operations recheck catalog information to ensure it is still valid, they should also make
+sure to abandon the storage snapshot, so it is consistent with the in memory catalog.
 
 ## Two-Phase Collection and Index Drop
 
@@ -116,14 +159,54 @@ _Code spelunking starting points:_
   timestamp_](https://github.com/mongodb/mongo/blob/r4.5.0/src/mongo/db/storage/storage_engine_impl.cpp#L932-L949)
 
 # Storage Transactions
-Clarify transaction refers to storage engine transactions, not repl or sharding, throughout this document.
 
-Include a discussion on how RecoveryUnit implements isolation and transactional behaviors, including ‘read source’ and how those implement read concern levels.
-Maybe include a discussion of how MongoDB read concerns translate into particular read sources and data views.
+Through the pluggable storage engine API, MongoDB executes reads and writes on its storage engine
+with [snapshot isolation](#glossary).  The structure used to achieve this is the [RecoveryUnit
+class](../storage/recovery_unit.h).
 
-## WiredTiger Snapshot
+## RecoveryUnit
 
-## MongoDB Point-in-Time Read
+Each pluggable storage engine for MongoDB must implement `RecoveryUnit` as one of the base classes
+for the storage engine API.  Typically, storage engines satisfy the `RecoveryUnit` requirements with
+some form of [snapshot isolation](#glossary) with [transactions](#glossary). Such transactions are
+called storage transactions elsewhere in this document, to differentiate them from the higher-level
+_multi-document transactions_ accessible to users of MongoDB.  The RecoveryUnit controls what
+[snapshot](#glossary) a storage engine transaction uses for its reads.  In MongoDB, a snapshot is defined by a
+_timestamp_. A snapshot consists of all data committed with a timestamp less than or equal to the
+snapshot's timestamp.  No uncommitted data is visible in a snapshot, and data changes in storage
+transactions that commit after a snapshot is created, regardless of their timestamps, are also not
+visible.  Generally, one uses a `RecoveryUnit` to perform transactional reads and writes by first
+configuring the `RecoveryUnit` with the desired
+[ReadSource](https://github.com/mongodb/mongo/blob/b2c1fa4f121fdb6cdffa924b802271d68c3367a3/src/mongo/db/storage/recovery_unit.h#L391-L421)
+and then performing the reads and writes using operations on `RecordStore` or `SortedDataInterface`,
+and finally calling `commit()` on the `WriteUnitOfWork` (if performing writes).
+
+## WriteUnitOfWork
+
+A `WriteUnitOfWork` is the mechanism to control how writes are transactionally performed on the
+storage engine.  All the writes (and reads) performed within its scope are part of the same storage
+transaction.  After all writes have been staged, one must call `commit()` in order to atomically
+commit the transaction to the storage engine.  It is illegal to perform writes outside the scope of
+a WriteUnitOfWork since there would be no way to commit them.  If the `WriteUnitOfWork` falls out of
+scope before `commit()` is called, the storage transaction is rolled back and all the staged writes
+are lost.  Reads can be performed outside of a `WriteUnitOfWork` block; storage transactions outside
+of a `WriteUnitOfWork` are always rolled back, since there are no writes to commit.
+
+## Lazy initialization of storage transactions
+
+Note that storage transactions on WiredTiger are not started at the beginning of a `WriteUnitOfWork`
+block.  Instead, the transaction is started implicitly with the first read or write operation.  To
+explicitly start a transaction, one can use `RecoveryUnit::preallocateSnapshot()`.
+
+## Changes
+
+One can register a `Change` on a `RecoveryUnit` while in a `WriteUnitOfWork`.  This allows extra
+actions to be performed based on whether a `WriteUnitOfWork` commits or rolls back.  These actions
+will typically update in-memory state to match what was written in the storage transaction, in a
+transactional way.  Note that `Change`s are not executed until the destruction of the
+`WriteUnitOfWork`, which can be long after the storage engine committed.  Two-phase locking ensures
+that all locks are held while a Change's `commit()` or `rollback()` function runs.
+
 
 # Read Operations
 
@@ -193,14 +276,51 @@ to read at
 [kLastApplied](https://github.com/mongodb/mongo/blob/58283ca178782c4d1c4a4d2acd4313f6f6f86fd5/src/mongo/db/storage/recovery_unit.h#L411).
 
 # Write Operations
-an overview of how writes (insert, update, delete) are processed
 
-## Index Writes
-_could pull out index reads and writes into its own section, if preferable_
+Operations that write to collections and indexes must take collection locks. Storage engines require
+all operations to hold at least a collection IX lock to provide document-level concurrency.
+Operations must perform writes in the scope of a WriteUnitOfWork.
 
-how index tables also get updated when a write happens, (numIndexes + 1) writes total
+## WriteUnitOfWork
 
-## Vectored Insert
+All reads and writes in the scope of a WriteUnitOfWork (WUOW) operate on the same storage engine
+snapshot, and all writes in the scope of a WUOW are transactional; they are either all committed or
+all rolled-back. The WUOW commits writes that took place in its scope by a call to commit(). It
+rolls-back writes when it goes out of scope and its destructor is called before a call to commit().
+
+Writers may conflict with each other when more than one operation stages an uncommitted write to the
+same document concurrently. To force one or more of the writers to retry, the storage engine may
+throw a WriteConflictException at any point, up to and including the the call to commit(). This is
+referred to as optimistic concurrency control because it allows uncontended writes to commit
+quickly. Because of this behavior, most WUOWs are enclosed in a writeConflictRetry loop that retries
+the write transaction until it succeeds, accompanied by a bounded exponential back-off.
+
+See
+[WriteUnitOfWork](https://github.com/mongodb/mongo/blob/r4.4.0/src/mongo/db/storage/write_unit_of_work.h)
+and
+[writeConflictRetry](https://github.com/mongodb/mongo/blob/r4.4.0/src/mongo/db/concurrency/write_conflict_exception.h).
+
+## Collection and Index Writes
+
+Collection write operations (inserts, updates, and deletes) perform storage engine writes to both
+the collection's RecordStore and relevant index's SortedDataInterface in the same storage transaction, or
+WUOW. This ensures that completed, not-building indexes are always consistent with collection data.
+
+## Vectored Inserts
+
+To support efficient bulk inserts, we provide an internal API on collections, insertDocuments, that
+supports 'vectored' inserts. Writers that wish to insert a vector of many documents will
+bulk-allocate OpTimes for each document into a vector and pass both to insertDocument. In a single
+WriteUnitOfWork, for every document, a commit timestamp is set with the OpTime, and the document is
+inserted. The storage engine allows each document to appear committed at a different timestamp, even
+though all writes took place in a single storage transaction.
+
+See
+[insertDocuments](https://github.com/mongodb/mongo/blob/r4.4.0/src/mongo/db/ops/write_ops_exec.cpp#L315)
+and
+[WiredTigerRecordStore::insertRecords](https://github.com/mongodb/mongo/blob/r4.4.0/src/mongo/db/storage/wiredtiger/wiredtiger_record_store.cpp#L1494).
+
+
 
 # Concurrency Control
 
@@ -762,19 +882,168 @@ that checkpoint's timestamp is known as the
 ## Table Ident Resolution
 
 # File-System Backups
+Backups represent a full copy of the data files at a point-in-time. These copies of the data files
+can be used to recover data from a consistent state at an earlier time. This technique is commonly
+used after a disaster ensued in the database.
+
+The data storage requirements for backups can be large as they correlate to the size of the
+database. This can be alleviated by using a technique called incremental backups. Incremental
+backups only back up the data that has changed since the last backup.
+
+MongoDB instances used in production should have a strategy in place for capturing and restoring
+backups in the case of data loss events.
+
+[Documentation for further reading.](https://docs.mongodb.com/manual/core/backups/)
 
 ## How To Take a Backup
 
-## How To Use Backed Up Datafiles
-describe the different ways backed up datafiles can be used
+### Open a Backup Cursor
+To open a backup cursor, the aggregate command with the `$backupCursor` pipeline must be used.
 
-explain how datafiles persist a machine’s identity which must be manipulated for some kinds of restores
+`let cursor = db.runCommand({aggregate: 1, pipeline: [{$backupCursor: {}}], cursor: {}})`
 
-## Replica Set Backup
+The cursor will implicitly be created as a tailable cursor. A tailable cursor remains open after the
+client exhausts the results in the cursor.
 
-## Sharding Backup
+For a sharded cluster, a backup cursor will need to be open on one member of each shard and one
+member of the config server replica set.
 
-## Queryable Backup (Read-Only)
+### Consume the Results
+When iterating through the contents of the backup cursor, there are a couple of things to be aware
+of.
+
+* The metadata document
+  * This is always the first document in the response. It has one key, `metadata` and its value is a
+    sub-document.
+    * `backupId` is the UUID of the backup, this is unused for replica sets.
+    * `dbpath` is the directory mongod is running against. This is always reported as an absolute
+      path.
+    * `oplogStart` and `oplogEnd` are both guaranteed to be in the oplog on the copied data files.
+      There exist documents earlier than the `oplogStart` and documents later than the `oplogEnd`,
+      the values are conservative in that respect.
+    * `checkpointTimestamp` is the state of the data if brought up in standalone mode. The data can
+      be "played forward" to any time later than the `checkpointTimestamp`. Opening backup cursors
+      against a standalone and replica set nodes in initial sync should not report a
+      `checkpointTimestamp`.
+    * The value used for the `disableIncrementalBackup` option, which turns off the storage of
+      incremental history.
+    * The value used for the `incrementalBackup` option, which is used to determine whether to take
+      an incremental backup.
+    * The value used for the `blockSize` option, which allows the granularity to be specified when
+      tracking a range of files to be included in a backup. 
+    * The value used for the `thisBackupName` option, which tags the backup being taken with that
+      name.
+    * The value used for the `srcBackupName` option, which is the backup name that is used as the
+      base for the incremental backup being taken.
+
+* The file document
+  * The other variety of documents represent the files to be copied as part of the backup.
+  * For non-incremental backups, the documents returned have the following format.
+    * `filename`: The absolute path of the filename.
+    * `fileSize`: The size of the file at `filename`.
+  * For incremental backups, the documents returned can have one of two formats returned.
+    * If a file remained unchanged in the incremental backup, then it will return the document in
+      the same format as non-incremental backups.
+    * Otherwise, if an incremental backup of a file is taken, the following format is returned.
+      * `filename`: The absolute path of the filename.
+      * `fileSize`: The size of the file at `filename`.
+      * `offset`: The offset at `filename` where the bytes should start being copied from.
+      * `length`: The number of bytes to copy starting at `offset` in `filename`. The client is
+        responsible for coping with EOF (end of file) errors. They are expected and benign.
+
+### Copy Files While Sending Heartbeats
+To prevent MongoDB from releasing the backup cursor's resources while copying files and start
+overwriting data that was previously reserved for the backup, a `getMore` request must be sent at
+least once every 10 minutes. Sending a `getMore` request is how this algorithm does heartbeats. 
+While copying files, WiredTiger still accepts writes and persists data while a backup cursor is 
+open. This means the files being copied can be getting changed while the copy is happening. Thus,
+the first important property of backup cursors is that WiredTiger will never change the bytes in a
+file that is important to the backup. The second property is the number of bytes to copy can be
+determined right after the backup cursor is opened.
+
+A valid heartbeat will respond with `{ok: 1}`.
+A heartbeat after storage has released resources responds with `{ok: 0}` and a
+`CursorNotFound` error.
+
+### Determine the Backup/Restore Point in Time (Sharded Cluster Only)
+Once all backup cursors have been opened, set the `backupPointInTime` to be the max of all
+`checkpointTimestamps`.
+
+`backupPointInTime = restorePointInTime = max(checkpointTimestamp0, ..., checkpointTimestampN)`
+
+### Extending the Backup Cursor on Each Node (Sharded Cluster Only)
+To extend the backup cursor, the aggregate command with the `$backupCursorExtend` pipeline must be
+used.
+
+`let cursor = db.runCommand({aggregate: 1, pipeline:  [{$backupCursorExtend: {backupId:<backupId>, timestamp: <backupPointInTime>}}], cursor: {}})`
+
+The backupId was returned in the `metadata` document from the `$backupCursor` command. The cursor
+will be created as a non-tailable cursor. The command may not return immediately because it may wait
+for the node to have the full oplog history up to the backup point in time.
+
+### Consume and Copy the Results in the Extended Backup Cursor (Sharded Cluster Only)
+All the documents represent the additional journal files to be copied as part of the backup. The
+`filename` is always reported as an absolute path. Additionally, the `fileSize` of the `filename` is
+provided too.
+
+### Close the Backup Cursor
+After all files have been copied, the backup process must send the `killCursors` command and
+receive a successful response. A successful response will include the `cursorId` that was sent as
+part of the request in the response's `cursorsKilled` array. If the `cursorId` is found in any
+other field, the `killCursors` request was not successful.
+
+## How To Use Backed Up Data Files
+
+### Replica Set Backup
+There are two approaches that can be taken when restoring the data files for a replica set node.
+
+* Initial Sync via Restore
+
+  When using backed-up data to seed an initial sync (whether for a new node, or an existing node),
+  there should not be a need to throw away any writes. The most recent version of the data is
+  suitable.
+
+  It's sufficient to copy the backed up files into place and start a mongod instance on them.
+
+  If the node is already part of a replica set, no further commands are necessary. Otherwise, all
+  that's left is to add the node to the replica set config.
+
+* Cloning Data into a New Replica Set
+
+  When using backed-up data to startup a new replica set, there's more flexibility in choosing the
+  restore point as there are still writes that need to be replayed from the oplog. The oplog can be
+  truncated after a certain point by setting the `db.replset.oplogTruncateAfterPoint` document to
+  the desired point in time.
+
+  The nodes will first need to be started up in standalone mode to perform their recoveries. Any
+  previous replica set configuration should be replaced with the new one. Afterwards, all the nodes
+  will need to be restarted with the `--replSet` option.
+
+### Sharding Backup
+
+Larger data sets that use sharding to distribute the data across multiple machines require a more
+complex backup and restore technique. The technique for backing up a sharded cluster was described
+[above](#open-a-backup-cursor).
+
+With the backed-up data from a sharded cluster backup, we can obtain a completely consistent point
+in time across the entire cluster.
+
+Standalone mongod instances will be needed on the data files of each node. The previous replica set
+configuration and other non-oplog replication related collections will need to be removed. The
+previous shards configuration will need to be replaced with the new shards configuration document on
+the config server's data files. Additionally the `shardIdentity` document needs to be updated and
+the cache collections in the config databases must be dropped.
+
+[Additional documentation on sharded cluster backup and restore.](https://docs.mongodb.com/manual/administration/backup-sharded-clusters/)
+
+### Queryable Backup (Read-Only)
+This is a feature provided by Ops Manager in which Ops Manager quickly and securely makes a given
+snapshot accessible over a MongoDB connection string.
+
+Queryable backups start-up quickly regardless of the snapshot's total data size. They are uniquely
+useful for restoring a small subset of data, such as a document that was accidentally deleted or
+reading out a single collection. Queryable backups allow access to the snapshot for read-only
+operations.
 
 # Checkpoints
 
@@ -802,7 +1071,7 @@ the data files.
 
 To avoid taking unnecessary checkpoints on an idle server, WiredTiger will only take checkpoints for
 the following scenarios:
-* When the [stable timestamp](../repl/README.md#replication-timestamp-glossary) is greater than or 
+* When the [stable timestamp](../repl/README.md#replication-timestamp-glossary) is greater than or
   equal to the [initial data timestamp](../repl/README.md#replication-timestamp-glossary), we take a
   stable checkpoint, which is a durable view of the data at a particular timestamp. This is for
   steady-state replication.
@@ -1012,7 +1281,7 @@ Additionally, users can specify that they'd like to perform a `full` validation.
   on the `RecordStore` and `SortedDataInterface` of each index in the `ValidateState` object.
     + We choose a read timestamp (`ReadSource`) based on the validation mode and node configuration:
       |                |  Standalone  | Replica Set  |
-      |----------------|:------------:|--------------|
+      | -------------- | :----------: | ------------ |
       | **Foreground** | kNoTimestamp | kNoTimestamp |
       | **Background** | kNoTimestamp | kNoOverlap   |
 * Traverses the `RecordStore` using the `ValidateAdaptor` object.
@@ -1098,7 +1367,7 @@ consistency problem if secondary replica set members querying the oplog of their
 unknowingly read past these holes and miss the data therein.
 
 | Op       | Action             | Result                                       |
-|----------|--------------------|----------------------------------------------|
+| -------- | ------------------ | -------------------------------------------- |
 | Writer A | open transaction   | assigned commit timestamp T5                 |
 | Writer B | open transaction   | assigned commit timestamp T6                 |
 | Writer B | commit transation  | T1,T2,T3,T4,T6 are visible to new readers    |
@@ -1171,18 +1440,37 @@ representation, from lower memory addresses to higher addresses, is the same as 
 for that type. For example, ASCII strings are binary comparable, but double precision floating point
 numbers and little-endian integers are not.
 
+**DDL**: Acronym for Data Description Language or Data Definition Language used generally in the
+context of relational databases. DDL operations in the MongoDB context include index and collection
+creation or drop, as well as `collMod` operations.
+
 **ident**: An ident is a unique identifier given to a storage engine resource. Collections and
 indexes map application-layer names to storage engine idents. In WiredTiger, idents are implemented
 as tables. For example, collection idents have the form: `collection-<counter>-<random number>`.
 
-**oplog hole**: an uncommitted oplog write that can exist with out-of-order writes when a later
+**oplog hole**: An uncommitted oplog write that can exist with out-of-order writes when a later
 timestamped write happens to commit first. Oplog holes can exist in-memory and persisted on disk.
 
-**oplogReadTimestamp**: the timestamp used for WT forward cursor oplog reads in order to avoid
+**oplogReadTimestamp**: The timestamp used for WT forward cursor oplog reads in order to avoid
 advancing past oplog holes. Tracks in-memory oplog holes.
 
-**oplogTruncateAfterPoint**: the timestamp after which oplog entries will be truncated during
+**oplogTruncateAfterPoint**: The timestamp after which oplog entries will be truncated during
 startup recovery after an unclean shutdown. Tracks persisted oplog holes.
+
+**snapshot**: A snapshot consists of a consistent view of data in the database.  In MongoDB, a
+snapshot consists of all data committed with a timestamp less than or equal to the snapshot's
+timestamp.
+
+**snapshot isolation**: A guarantee that all reads in a transaction see the same consistent snapshot
+of the database, and that all writes in a transaction had no conflicts with other concurrent writes,
+if the transaction commits.
+
+**storage transaction**: A concept provided by a pluggable storage engine through which changes to
+data in the database can be performed.  In order to satisfy the MongoDB pluggable storage engine
+requirements for atomicity, consistency, isolation, and durability, storage engines typically use
+some form of transaction. In contrast, a multi-document transaction in MongoDB is a user-facing
+feature providing similar guarantees across many nodes in a sharded cluster; a storage transaction
+only provides guarantees within one node.
 
 [`BSONObj::woCompare`]: https://github.com/mongodb/mongo/blob/v4.4/src/mongo/bson/bsonobj.h#L460
 [`BSONElement::compareElements`]: https://github.com/mongodb/mongo/blob/v4.4/src/mongo/bson/bsonelement.cpp#L285

@@ -203,7 +203,10 @@ void _gatherIndexEntryErrors(OperationContext* opCtx,
     {
         ValidateResults tempValidateResults;
         BSONObjBuilder tempBuilder;
-        indexValidator->traverseRecordStore(opCtx, &tempValidateResults, &tempBuilder);
+        ValidateResultsMap tempIndexResultsMap;
+
+        indexValidator->traverseRecordStore(
+            opCtx, &tempValidateResults, &tempBuilder, &tempIndexResultsMap);
     }
 
     LOGV2_OPTIONS(
@@ -225,7 +228,17 @@ void _gatherIndexEntryErrors(OperationContext* opCtx,
         indexValidator->traverseIndex(opCtx,
                                       index.get(),
                                       /*numTraversedKeys=*/nullptr,
-                                      /*ValidateResults=*/nullptr);
+                                      result);
+    }
+
+    if (result->numRemovedExtraIndexEntries > 0) {
+        result->warnings.push_back(str::stream()
+                                   << "Removed " << result->numRemovedExtraIndexEntries
+                                   << " extra index entries.");
+    }
+
+    if (validateState->shouldRunRepair()) {
+        indexConsistency->repairMissingIndexEntries(opCtx, result);
     }
 
     LOGV2_OPTIONS(20301, {LogComponent::kIndex}, "Finished traversing through all the indexes");
@@ -490,12 +503,12 @@ Status validate(OperationContext* opCtx,
                       "uuid"_attr = uuidString);
 
         IndexConsistency indexConsistency(opCtx, &validateState);
-        ValidateAdaptor indexValidator(&indexConsistency, &validateState, &indexNsResultsMap);
+        ValidateAdaptor indexValidator(&indexConsistency, &validateState);
 
         // In traverseRecordStore(), the index validator keeps track the records in the record
         // store so that _validateIndexes() can confirm that the index entries match the records in
         // the collection.
-        indexValidator.traverseRecordStore(opCtx, results, output);
+        indexValidator.traverseRecordStore(opCtx, results, output, &indexNsResultsMap);
 
         // Pause collection validation while a lock is held and between collection and index data
         // validation.

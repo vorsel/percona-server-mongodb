@@ -145,15 +145,14 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
     onShardVersionMismatch(_opCtx, getNss(), boost::none);
 
     // Snapshot the committed metadata from the time the migration starts
-    const auto collectionMetadataAndUUID = [&] {
+    const auto [collectionMetadata, collectionUUID] = [&] {
         UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
         AutoGetCollection autoColl(_opCtx, getNss(), MODE_IS);
         uassert(ErrorCodes::InvalidOptions,
                 "cannot move chunks for a collection that doesn't exist",
                 autoColl.getCollection());
 
-        boost::optional<UUID> collectionUUID;
-        collectionUUID = autoColl.getCollection()->uuid();
+        UUID collectionUUID = autoColl.getCollection()->uuid();
 
         auto optMetadata =
             CollectionShardingRuntime::get(_opCtx, getNss())->getCurrentMetadataIfKnown();
@@ -168,8 +167,6 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
 
         return std::make_tuple(std::move(metadata), std::move(collectionUUID));
     }();
-
-    const auto& collectionMetadata = std::get<0>(collectionMetadataAndUUID);
 
     const auto collectionVersion = collectionMetadata.getCollVersion();
     const auto shardVersion = collectionMetadata.getShardVersion();
@@ -195,11 +192,12 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
                                str::stream() << "Unable to move chunk with arguments '"
                                              << redact(_args.toString()));
 
+    _collectionEpoch = collectionVersion.epoch();
+    _collectionUUID = collectionUUID;
+
     _chunkVersion = collectionMetadata.getChunkManager()
                         ->findIntersectingChunkWithSimpleCollation(_args.getMinKey())
                         .getLastmod();
-    _collectionEpoch = collectionVersion.epoch();
-    _collectionUuid = std::get<1>(collectionMetadataAndUUID);
 }
 
 MigrationSourceManager::~MigrationSourceManager() {
@@ -246,7 +244,7 @@ Status MigrationSourceManager::startClone() {
         AutoGetCollection autoColl(_opCtx,
                                    getNss(),
                                    replEnabled ? MODE_IX : MODE_X,
-                                   AutoGetCollection::ViewMode::kViewsForbidden,
+                                   AutoGetCollectionViewMode::kViewsForbidden,
                                    _opCtx->getServiceContext()->getPreciseClockSource()->now() +
                                        Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
 
@@ -259,7 +257,7 @@ Status MigrationSourceManager::startClone() {
             _args.getFromShardId(),
             _args.getToShardId(),
             getNss(),
-            _collectionUuid.get(),
+            *_collectionUUID,
             ChunkRange(_args.getMinKey(), _args.getMaxKey()),
             _chunkVersion,
             _args.getWaitForDelete());
@@ -516,12 +514,6 @@ Status MigrationSourceManager::commitChunkMetadataOnConfig() {
     // scheduling orphan cleanup.
     _cleanup(true);
 
-    LOGV2_DEBUG_OPTIONS(4817403,
-                        2,
-                        {logv2::LogComponent::kShardMigrationPerf},
-                        "Finished critical section",
-                        "migrationId"_attr = _coordinator->getMigrationId());
-
     ShardingLogging::get(_opCtx)->logChange(
         _opCtx,
         "moveChunk.commit",
@@ -617,10 +609,10 @@ CollectionMetadata MigrationSourceManager::_getCurrentMetadataAndCheckEpoch() {
     uassert(ErrorCodes::ConflictingOperationInProgress,
             str::stream() << "The collection's epoch has changed since the migration began. "
                              "Expected collection epoch: "
-                          << _collectionEpoch.toString() << ", but found: "
+                          << _collectionEpoch->toString() << ", but found: "
                           << (metadata.isSharded() ? metadata.getCollVersion().epoch().toString()
                                                    : "unsharded collection"),
-            metadata.isSharded() && metadata.getCollVersion().epoch() == _collectionEpoch);
+            metadata.isSharded() && metadata.getCollVersion().epoch() == *_collectionEpoch);
 
     return metadata;
 }
@@ -648,8 +640,15 @@ void MigrationSourceManager::_notifyChangeStreamsOnRecipientFirstChunk(
     writeConflictRetry(
         _opCtx, "migrateChunkToNewShard", NamespaceString::kRsOplogNamespace.ns(), [&] {
             WriteUnitOfWork uow(_opCtx);
-            serviceContext->getOpObserver()->onInternalOpMessage(
-                _opCtx, getNss(), _collectionUuid, BSON("msg" << dbgMessage), o2Message);
+            serviceContext->getOpObserver()->onInternalOpMessage(_opCtx,
+                                                                 getNss(),
+                                                                 *_collectionUUID,
+                                                                 BSON("msg" << dbgMessage),
+                                                                 o2Message,
+                                                                 boost::none,
+                                                                 boost::none,
+                                                                 boost::none,
+                                                                 boost::none);
             uow.commit();
         });
 }
@@ -679,6 +678,14 @@ void MigrationSourceManager::_cleanup(bool completeMigration) {
         _critSec.reset();
         return std::move(_cloneDriver);
     }();
+
+    if (_state == kCriticalSection || _state == kCloneCompleted || _state == kCommittingOnConfig) {
+        LOGV2_DEBUG_OPTIONS(4817403,
+                            2,
+                            {logv2::LogComponent::kShardMigrationPerf},
+                            "Finished critical section",
+                            "migrationId"_attr = _coordinator->getMigrationId());
+    }
 
     // The cleanup operations below are potentially blocking or acquire other locks, so perform them
     // outside of the collection X lock

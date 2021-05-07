@@ -54,11 +54,12 @@ TEST(CstTest, BuildsAndPrints) {
     }
     {
         const auto cst = CNode{CNode::ObjectChildren{
-            {KeyFieldname::project,
+            {KeyFieldname::projectInclusion,
              CNode{CNode::ObjectChildren{{UserFieldname{"a"}, CNode{KeyValue::trueKey}},
                                          {KeyFieldname::id, CNode{KeyValue::falseKey}}}}}}};
         ASSERT_BSONOBJ_EQ(
-            fromjson("{project : {a: \"<KeyValue trueKey>\", id: \"<KeyValue falseKey>\"}}"),
+            fromjson(
+                "{projectInclusion : {a: \"<KeyValue trueKey>\", id: \"<KeyValue falseKey>\"}}"),
             cst.toBson());
     }
 }
@@ -71,34 +72,6 @@ TEST(CstGrammarTest, EmptyPipeline) {
     ASSERT_EQ(0, parseTree.parse());
     ASSERT_TRUE(stdx::get_if<CNode::ArrayChildren>(&output.payload));
     ASSERT_EQ(0, stdx::get_if<CNode::ArrayChildren>(&output.payload)->size());
-}
-
-TEST(CstGrammarTest, InvalidPipelineSpec) {
-    {
-        CNode output;
-        auto input = fromjson("{pipeline: [{}]}");
-        BSONLexer lexer(input["pipeline"].Array(), PipelineParserGen::token::START_PIPELINE);
-        auto parseTree = PipelineParserGen(lexer, &output);
-        ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
-    }
-    {
-        CNode output;
-        auto input = fromjson("{pipeline: [{$unknownStage: {}}]}");
-        BSONLexer lexer(input["pipeline"].Array(), PipelineParserGen::token::START_PIPELINE);
-        auto parseTree = PipelineParserGen(lexer, &output);
-        ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
-    }
-    {
-        ASSERT_THROWS_CODE(
-            [] {
-                CNode output;
-                auto input = fromjson("{pipeline: 'not an array'}");
-                BSONLexer lexer(input["pipeline"].Array(),
-                                PipelineParserGen::token::START_PIPELINE);
-            }(),
-            AssertionException,
-            13111);
-    }
 }
 
 TEST(CstGrammarTest, ParsesInternalInhibitOptimization) {
@@ -269,9 +242,10 @@ TEST(CstGrammarTest, ParsesProject) {
         ASSERT_EQ(0, parseTree.parse());
         auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
         ASSERT_EQ(1, stages.size());
-        ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+        ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
         ASSERT_EQ(stages[0].toBson().toString(),
-                  "{ project: { a: \"<NonZeroKey of type double 1.000000>\", b: \"<NonZeroKey of "
+                  "{ projectInclusion: { a: \"<NonZeroKey of type double 1.000000>\", b: "
+                  "\"<NonZeroKey of "
                   "type int 1>\", id: \"<NonZeroKey of type long 1>\" } }");
     }
     {
@@ -283,10 +257,11 @@ TEST(CstGrammarTest, ParsesProject) {
         ASSERT_EQ(0, parseTree.parse());
         auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
         ASSERT_EQ(1, stages.size());
-        ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
-        ASSERT_EQ(stages[0].toBson().toString(),
-                  "{ project: { a: \"<KeyValue doubleZeroKey>\", b: \"<KeyValue intZeroKey>\", "
-                  "c: \"<KeyValue longZeroKey>\" } }");
+        ASSERT(KeyFieldname::projectExclusion == stages[0].firstKeyFieldname());
+        ASSERT_EQ(
+            stages[0].toBson().toString(),
+            "{ projectExclusion: { a: \"<KeyValue doubleZeroKey>\", b: \"<KeyValue intZeroKey>\", "
+            "c: \"<KeyValue longZeroKey>\" } }");
     }
     {
         CNode output;
@@ -299,12 +274,42 @@ TEST(CstGrammarTest, ParsesProject) {
         ASSERT_EQ(0, parseTree.parse());
         auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
         ASSERT_EQ(1, stages.size());
-        ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+        ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
         ASSERT_EQ(stages[0].toBson().toString(),
-                  "{ project: { id: \"<NonZeroKey of type double 9.100000>\", a: { add: [ "
-                  "\"<UserInt 4>\", \"<UserInt 5>\", { add: [ \"<UserInt 6>\", \"<UserInt 7>\", "
-                  "\"<UserInt 8>\" ] } ] }, b: { atan2: [ \"<UserDouble 1.000000>\", { add: [ "
-                  "\"<UserInt 2>\", \"<UserInt -3>\" ] } ] } } }");
+                  "{ projectInclusion: { id: \"<NonZeroKey of type double 9.100000>\", a: { add: [ "
+                  "{ add: [ "
+                  "\"<UserInt 8>\", \"<UserInt 7>\", \"<UserInt 6>\" ] }, \"<UserInt 5>\", "
+                  "\"<UserInt 4>\" ] }, b: { atan2: [ \"<UserDouble 1.000000>\", { add: [ "
+                  "\"<UserInt -3>\", \"<UserInt 2>\" ] } ] } } }");
+    }
+    {
+        CNode output;
+        auto input = fromjson("{pipeline: [{$project: {a: {$add: [6]}}}]}");
+        BSONLexer lexer(input["pipeline"].Array(), PipelineParserGen::token::START_PIPELINE);
+        auto parseTree = PipelineParserGen(lexer, &output);
+        ASSERT_EQ(0, parseTree.parse());
+        auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
+        ASSERT_EQ(1, stages.size());
+        ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
+        ASSERT_EQ(stages[0].toBson().toString(),
+                  "{ projectInclusion: { a: { add: [ \"<UserInt 6>\" ] } } }");
+    }
+}
+
+TEST(CstGrammarTest, FailsToParseMixedProject) {
+    {
+        CNode output;
+        auto input = fromjson("{pipeline: [{$project: {a: 1, b: 0.0}}]}");
+        BSONLexer lexer(input["pipeline"].Array(), PipelineParserGen::token::START_PIPELINE);
+        auto parseTree = PipelineParserGen(lexer, &output);
+        ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
+    }
+    {
+        CNode output;
+        auto input = fromjson("{pipeline: [{$project: {a: 0, b: {$add: [5, 67]}}}]}");
+        BSONLexer lexer(input["pipeline"].Array(), PipelineParserGen::token::START_PIPELINE);
+        auto parseTree = PipelineParserGen(lexer, &output);
+        ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
     }
 }
 
@@ -638,8 +643,9 @@ TEST(CstGrammarTest, ParsesValidNumberAbs) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
-    ASSERT_EQ(stages[0].toBson().toString(), "{ project: { val: { abs: \"<UserInt 1>\" } } }");
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
+    ASSERT_EQ(stages[0].toBson().toString(),
+              "{ projectInclusion: { val: { abs: \"<UserInt 1>\" } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidCeil) {
@@ -650,9 +656,9 @@ TEST(CstGrammarTest, ParsesValidCeil) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { ceil: \"<UserDouble 1.500000>\" } } }");
+              "{ projectInclusion: { val: { ceil: \"<UserDouble 1.500000>\" } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidDivide) {
@@ -663,9 +669,9 @@ TEST(CstGrammarTest, ParsesValidDivide) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { divide: [ \"<UserInt 10>\", \"<UserInt 5>\" ] } } }");
+              "{ projectInclusion: { val: { divide: [ \"<UserInt 10>\", \"<UserInt 5>\" ] } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidExp) {
@@ -676,9 +682,9 @@ TEST(CstGrammarTest, ParsesValidExp) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { exponent: \"<UserDouble 1.500000>\" } } }");
+              "{ projectInclusion: { val: { exponent: \"<UserDouble 1.500000>\" } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidFloor) {
@@ -689,9 +695,9 @@ TEST(CstGrammarTest, ParsesValidFloor) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { floor: \"<UserDouble 1.500000>\" } } }");
+              "{ projectInclusion: { val: { floor: \"<UserDouble 1.500000>\" } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidLn) {
@@ -702,9 +708,9 @@ TEST(CstGrammarTest, ParsesValidLn) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { ln: [ \"<UserInt 10>\", \"<UserInt 37>\" ] } } }");
+              "{ projectInclusion: { val: { ln: [ \"<UserInt 10>\", \"<UserInt 37>\" ] } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidLog) {
@@ -715,9 +721,9 @@ TEST(CstGrammarTest, ParsesValidLog) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { log: [ \"<UserInt 10>\", \"<UserInt 5>\" ] } } }");
+              "{ projectInclusion: { val: { log: [ \"<UserInt 10>\", \"<UserInt 5>\" ] } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidLog10) {
@@ -728,9 +734,9 @@ TEST(CstGrammarTest, ParsesValidLog10) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { logten: \"<UserDouble 1.500000>\" } } }");
+              "{ projectInclusion: { val: { logten: \"<UserDouble 1.500000>\" } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidMod) {
@@ -741,9 +747,9 @@ TEST(CstGrammarTest, ParsesValidMod) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { mod: [ \"<UserInt 10>\", \"<UserInt 5>\" ] } } }");
+              "{ projectInclusion: { val: { mod: [ \"<UserInt 10>\", \"<UserInt 5>\" ] } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidMultiply) {
@@ -754,9 +760,9 @@ TEST(CstGrammarTest, ParsesValidMultiply) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { multiply: [ \"<UserInt 10>\", \"<UserInt 5>\" ] } } }");
+              "{ projectInclusion: { val: { multiply: [ \"<UserInt 10>\", \"<UserInt 5>\" ] } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidPow) {
@@ -767,9 +773,9 @@ TEST(CstGrammarTest, ParsesValidPow) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { pow: [ \"<UserInt 10>\", \"<UserInt 5>\" ] } } }");
+              "{ projectInclusion: { val: { pow: [ \"<UserInt 10>\", \"<UserInt 5>\" ] } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidRound) {
@@ -780,9 +786,10 @@ TEST(CstGrammarTest, ParsesValidRound) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
-    ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { round: [ \"<UserDouble 1.234000>\", \"<UserInt 2>\" ] } } }");
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
+    ASSERT_EQ(
+        stages[0].toBson().toString(),
+        "{ projectInclusion: { val: { round: [ \"<UserDouble 1.234000>\", \"<UserInt 2>\" ] } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidSqrt) {
@@ -793,8 +800,9 @@ TEST(CstGrammarTest, ParsesValidSqrt) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
-    ASSERT_EQ(stages[0].toBson().toString(), "{ project: { val: { sqrt: \"<UserInt 25>\" } } }");
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
+    ASSERT_EQ(stages[0].toBson().toString(),
+              "{ projectInclusion: { val: { sqrt: \"<UserInt 25>\" } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidSubtract) {
@@ -805,9 +813,9 @@ TEST(CstGrammarTest, ParsesValidSubtract) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { subtract: [ \"<UserInt 10>\", \"<UserInt 5>\" ] } } }");
+              "{ projectInclusion: { val: { subtract: [ \"<UserInt 10>\", \"<UserInt 5>\" ] } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidTrunc) {
@@ -818,9 +826,10 @@ TEST(CstGrammarTest, ParsesValidTrunc) {
     ASSERT_EQ(0, parseTree.parse());
     auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
     ASSERT_EQ(1, stages.size());
-    ASSERT(KeyFieldname::project == stages[0].firstKeyFieldname());
-    ASSERT_EQ(stages[0].toBson().toString(),
-              "{ project: { val: { trunc: [ \"<UserDouble 1.234000>\", \"<UserInt 2>\" ] } } }");
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
+    ASSERT_EQ(
+        stages[0].toBson().toString(),
+        "{ projectInclusion: { val: { trunc: [ \"<UserDouble 1.234000>\", \"<UserInt 2>\" ] } } }");
 }
 
 TEST(CstGrammarTest, ParsesEmptyMatchInFind) {

@@ -9,7 +9,8 @@ env.Library(
     source=[
         'field_checker.cpp',
         'log_builder.cpp',
-        'path_support.cpp'
+        'path_support.cpp',
+        'storage_validation.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -36,7 +37,6 @@ env.Library(
         'push_node.cpp',
         'rename_node.cpp',
         'set_node.cpp',
-        'storage_validation.cpp',
         'unset_node.cpp',
         'update_array_node.cpp',
         'update_internal_node.cpp',
@@ -48,21 +48,21 @@ env.Library(
         '$BUILD_DIR/mongo/db/update_index_data',
         '$BUILD_DIR/mongo/db/vector_clock_mutable',
         'update_common',
+        'update_document_diff',
     ],
 )
 
 env.Library(
     target='update',
     source=[
-        'document_diff_applier.cpp',
-        'document_diff_calculator.cpp',
-        'document_diff_serialization.cpp',
+        'delta_executor.cpp',
         'object_replace_executor.cpp',
         'pipeline_executor.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/pipeline/pipeline',
-        'update_nodes'
+        'update_nodes',
+        'update_document_diff',
     ],
 )
 
@@ -81,6 +81,30 @@ env.Library(
     ],
 )
 
+env.Library(
+    target='update_test_helpers',
+    source=[
+        'document_diff_test_helpers.cpp',
+    ],
+    LIBDEPS=[
+        'update',
+    ],
+)
+
+env.Library(
+    target='update_document_diff',
+    source=[
+        'document_diff_calculator.cpp',
+        'document_diff_applier.cpp',
+        'document_diff_serialization.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/db/update_index_data',
+    ],
+)
+
 env.CppUnitTest(
     target='db_update_test',
     source=[
@@ -89,6 +113,7 @@ env.CppUnitTest(
         'bit_node_test.cpp',
         'compare_node_test.cpp',
         'current_date_node_test.cpp',
+        'delta_executor_test.cpp',
         'document_diff_calculator_test.cpp',
         'document_diff_serialization_test.cpp',
         'document_diff_applier_test.cpp',
@@ -125,5 +150,6 @@ env.CppUnitTest(
         'update',
         'update_common',
         'update_driver',
+        'update_test_helpers',
     ],
 )

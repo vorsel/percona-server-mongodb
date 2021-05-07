@@ -15,6 +15,7 @@
  *                 *when the the collection has been dropped and recreated as empty.*
  * - behavior: Must be "unshardedOnly", or "versioned". Determines what system profiler checks are
  * performed.
+ * @tags: [requires_fcv_47]
  */
 (function() {
 "use strict";
@@ -57,6 +58,7 @@ let testCases = {
     _configsvrShardCollection: {skip: "primary only"},
     _configsvrUpdateZoneKeyRange: {skip: "primary only"},
     _flushRoutingTableCacheUpdates: {skip: "does not return user data"},
+    _flushRoutingTableCacheUpdatesWithWriteConcern: {skip: "does not return user data"},
     _getUserCacheGeneration: {skip: "does not return user data"},
     _hashBSONElement: {skip: "does not return user data"},
     _isSelf: {skip: "does not return user data"},
@@ -190,11 +192,11 @@ let testCases = {
     grantRolesToRole: {skip: "primary only"},
     grantRolesToUser: {skip: "primary only"},
     handshake: {skip: "does not return user data"},
+    hello: {skip: "does not return user data"},
     hostInfo: {skip: "does not return user data"},
     insert: {skip: "primary only"},
     invalidateUserCache: {skip: "does not return user data"},
     isdbgrid: {skip: "does not return user data"},
-    isMaster: {skip: "does not return user data"},
     killAllSessions: {skip: "does not return user data"},
     killAllSessionsByPattern: {skip: "does not return user data"},
     killCursors: {skip: "does not return user data"},

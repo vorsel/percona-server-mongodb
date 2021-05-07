@@ -72,9 +72,10 @@ public:
     static std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> collectionScan(
         OperationContext* opCtx,
         StringData ns,
-        Collection* collection,
+        const Collection* collection,
         PlanYieldPolicy::YieldPolicy yieldPolicy,
-        const Direction direction = FORWARD);
+        const Direction direction = FORWARD,
+        boost::optional<RecordId> resumeAfterRecordId = boost::none);
 
     /**
      * Returns a FETCH => DELETE plan.
@@ -135,7 +136,8 @@ private:
         const boost::intrusive_ptr<ExpressionContext>& expCtx,
         WorkingSet* ws,
         const Collection* collection,
-        Direction direction);
+        Direction direction,
+        boost::optional<RecordId> resumeAfterRecordId = boost::none);
 
     /**
      * Returns a plan stage that is either an index scan or an index scan with a fetch stage.

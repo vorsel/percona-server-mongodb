@@ -443,6 +443,15 @@ public:
     virtual void clearDropPendingState() = 0;
 
     /**
+     * Adds 'ident' to a list of indexes/collections whose data will be dropped when:
+     * - the dropTimestamp' is sufficiently old to ensure no future data accesses
+     * - and no holders of 'ident' remain (the index/collection is no longer in active use)
+     */
+    virtual void addDropPendingIdent(const Timestamp& dropTimestamp,
+                                     const NamespaceString& nss,
+                                     std::shared_ptr<Ident> ident) = 0;
+
+    /**
      * Recovers the storage engine state to the last stable timestamp. "Stable" in this case
      * refers to a timestamp that is guaranteed to never be rolled back. The stable timestamp
      * used should be one provided by StorageEngine::setStableTimestamp().
@@ -514,6 +523,12 @@ public:
      * through. Additionally, all future writes must be newer or equal to this value.
      */
     virtual void setOldestTimestamp(Timestamp timestamp) = 0;
+
+    /**
+     * Gets the oldest timestamp for which the storage engine must maintain snapshot history
+     * through.
+     */
+    virtual Timestamp getOldestTimestamp() const = 0;
 
     /**
      * Sets a callback which returns the timestamp of the oldest oplog entry involved in an

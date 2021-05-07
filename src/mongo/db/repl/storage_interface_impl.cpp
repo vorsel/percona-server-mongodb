@@ -303,9 +303,10 @@ namespace {
  * Returns NamespaceNotFound if the database or collection does not exist.
  */
 template <typename AutoGetCollectionType>
-StatusWith<Collection*> getCollection(const AutoGetCollectionType& autoGetCollection,
-                                      const NamespaceStringOrUUID& nsOrUUID,
-                                      const std::string& message) {
+StatusWith<decltype(std::declval<AutoGetCollectionType>().getCollection())> getCollection(
+    const AutoGetCollectionType& autoGetCollection,
+    const NamespaceStringOrUUID& nsOrUUID,
+    const std::string& message) {
     if (!autoGetCollection.getDb()) {
         StringData dbName = nsOrUUID.nss() ? nsOrUUID.nss()->db() : nsOrUUID.dbname();
         return {ErrorCodes::NamespaceNotFound,
@@ -488,6 +489,30 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
         }
         wuow.commit();
 
+        return Status::OK();
+    });
+}
+
+Status StorageInterfaceImpl::createIndexesOnEmptyCollection(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const std::vector<BSONObj>& secondaryIndexSpecs) {
+    return writeConflictRetry(opCtx, "createIndexesOnEmptyCollection", nss.ns(), [&] {
+        AutoGetCollection autoColl(opCtx, nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
+        WriteUnitOfWork wunit(opCtx);
+
+        for (auto&& spec : secondaryIndexSpecs) {
+            // Will error if collection is not empty.
+            auto secIndexSW =
+                autoColl.getCollection()->getIndexCatalog()->createIndexOnEmptyCollection(opCtx,
+                                                                                          spec);
+            auto status = secIndexSW.getStatus();
+            if (!status.isOK()) {
+                return status;
+            }
+        }
+
+        wunit.commit();
         return Status::OK();
     });
 }

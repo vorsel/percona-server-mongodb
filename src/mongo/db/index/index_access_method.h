@@ -66,6 +66,7 @@ class IndexAccessMethod {
 
 public:
     using KeyHandlerFn = std::function<Status(const KeyString::Value&)>;
+    using RecordIdHandlerFn = std::function<Status(const RecordId&)>;
 
     IndexAccessMethod() = default;
     virtual ~IndexAccessMethod() = default;
@@ -234,9 +235,10 @@ public:
         virtual int64_t getKeysInserted() const = 0;
 
         /**
-         * Returns the current state of this BulkBuilder's underlying Sorter.
+         * Returns the current state of this BulkBuilder's underlying Sorter that has been already
+         * persisted to disk.
          */
-        virtual Sorter::State getSorterState() const = 0;
+        virtual Sorter::PersistedState getPersistedSorterState() const = 0;
 
         /**
          * Persists on disk the keys that have been inserted using this BulkBuilder.
@@ -249,12 +251,16 @@ public:
      * You work on the returned BulkBuilder and then call commitBulk.
      * This can return NULL, meaning bulk mode is not available.
      *
-     * It is only legal to initiate bulk when the index is new and empty.
+     * It is only legal to initiate bulk when the index is new and empty, or when resuming an index
+     * build.
      *
      * maxMemoryUsageBytes: amount of memory consumed before the external sorter starts spilling to
      *                      disk
+     * sorterInfo: the information to use to resume the index build, or boost::none if starting a
+     * new index build.
      */
-    virtual std::unique_ptr<BulkBuilder> initiateBulk(size_t maxMemoryUsageBytes) = 0;
+    virtual std::unique_ptr<BulkBuilder> initiateBulk(
+        size_t maxMemoryUsageBytes, const boost::optional<IndexSorterInfo>& sorterInfo) = 0;
 
     /**
      * Call this when you are ready to finish your bulk work.
@@ -263,14 +269,16 @@ public:
      * @param mayInterrupt - Is this commit interruptible (will cancel)
      * @param dupsAllowed - If false and 'dupRecords' is not null, append with the RecordIds of
      *                      the uninserted duplicates.
-     * @param onDuplicateKey - Will be called for each duplicate key inserted into the index.
-     * @param dupRecords - If not null, is filled with the RecordIds of uninserted duplicate keys.
+     * @param onDuplicateKeyInserted - Will be called for each duplicate key inserted into the
+     * index.
+     * @param onDuplicateRecord - If not nullptr, will be called for each RecordId of uninserted
+     * duplicate keys.
      */
     virtual Status commitBulk(OperationContext* opCtx,
                               BulkBuilder* bulk,
                               bool dupsAllowed,
-                              KeyHandlerFn&& onDuplicateKey,
-                              std::set<RecordId>* dupRecords) = 0;
+                              const KeyHandlerFn& onDuplicateKeyInserted,
+                              const RecordIdHandlerFn& onDuplicateRecord) = 0;
 
     /**
      * Specifies whether getKeys should relax the index constraints or not, in order of most
@@ -338,6 +346,11 @@ public:
      * documents into an index, except for testing purposes.
      */
     virtual SortedDataInterface* getSortedDataInterface() const = 0;
+
+    /**
+     * Fetches the Ident for this index.
+     */
+    virtual std::shared_ptr<Ident> getSharedIdent() const = 0;
 };
 
 /**
@@ -489,13 +502,14 @@ public:
                             Collection* collection,
                             MultikeyPaths paths) final;
 
-    std::unique_ptr<BulkBuilder> initiateBulk(size_t maxMemoryUsageBytes) final;
+    std::unique_ptr<BulkBuilder> initiateBulk(
+        size_t maxMemoryUsageBytes, const boost::optional<IndexSorterInfo>& sorterInfo) final;
 
     Status commitBulk(OperationContext* opCtx,
                       BulkBuilder* bulk,
                       bool dupsAllowed,
-                      KeyHandlerFn&& onDuplicateKey,
-                      std::set<RecordId>* dupRecords) final;
+                      const KeyHandlerFn& onDuplicateKeyInserted,
+                      const RecordIdHandlerFn& onDuplicateRecord) final;
 
     void getKeys(SharedBufferFragmentBuilder& pooledBufferBuilder,
                  const BSONObj& obj,
@@ -512,6 +526,8 @@ public:
                                    const MultikeyPaths& multikeyPaths) const override;
 
     SortedDataInterface* getSortedDataInterface() const override final;
+
+    std::shared_ptr<Ident> getSharedIdent() const override final;
 
 protected:
     /**
@@ -551,8 +567,16 @@ private:
                       const KeyString::Value& keyString,
                       const RecordId& loc,
                       bool dupsAllowed);
+    /**
+     * While inserting keys into index (from external sorter), if a duplicate key is detected
+     * (when duplicates are not allowed), 'onDuplicateRecord' will be called if passed, otherwise a
+     * DuplicateKey error will be returned.
+     */
+    Status _handleDuplicateKey(OperationContext* opCtx,
+                               const KeyString::Value& dataKey,
+                               const RecordIdHandlerFn& onDuplicateRecord);
 
-    const std::unique_ptr<SortedDataInterface> _newInterface;
+    const std::shared_ptr<SortedDataInterface> _newInterface;
 };
 
 }  // namespace mongo

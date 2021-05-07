@@ -73,13 +73,6 @@ modifiertable::ModifierType validateMod(BSONElement mod) {
                           << " not {" << mod << "}",
             mod.type() == BSONType::Object);
 
-    uassert(ErrorCodes::FailedToParse,
-            str::stream() << "'" << mod.fieldName()
-                          << "' is empty. You must specify a field like so: "
-                             "{"
-                          << mod.fieldName() << ": {<field>: ...}}",
-            !mod.embeddedObject().isEmpty());
-
     return modType;
 }
 
@@ -257,7 +250,9 @@ Status UpdateDriver::update(OperationContext* opCtx,
                             FieldRefSetWithStorage* modifiedPaths) {
     // TODO: assert that update() is called at most once in a !_multi case.
 
-    _affectIndices = (_updateType != UpdateType::kOperator && _indexedFields != nullptr);
+    _affectIndices =
+        (_updateType == UpdateType::kReplacement || _updateType == UpdateType::kPipeline) &&
+        (_indexedFields != nullptr);
 
     _logDoc.reset();
 
@@ -312,10 +307,7 @@ void UpdateDriver::setCollator(const CollatorInterface* collator) {
 
 bool UpdateDriver::isDocReplacement(const write_ops::UpdateModification& updateMod) {
     return (updateMod.type() == write_ops::UpdateModification::Type::kClassic &&
-            (modifiertable::getType(
-                 updateMod.getUpdateClassic().firstElementFieldNameStringData()) ==
-                 modifiertable::MOD_UNKNOWN &&
-             updateMod.getUpdateClassic().firstElementFieldNameStringData() != "$v"_sd)) ||
+            *updateMod.getUpdateClassic().firstElementFieldName() != '$') ||
         updateMod.type() == write_ops::UpdateModification::Type::kPipeline;
 }
 

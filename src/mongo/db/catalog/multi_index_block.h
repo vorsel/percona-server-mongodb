@@ -149,7 +149,10 @@ public:
      *
      * Should not be called inside of a WriteUnitOfWork.
      */
-    Status insertAllDocumentsInCollection(OperationContext* opCtx, Collection* collection);
+    Status insertAllDocumentsInCollection(
+        OperationContext* opCtx,
+        Collection* collection,
+        boost::optional<RecordId> resumeAfterRecordId = boost::none);
 
     /**
      * Call this after init() for each document in the collection.
@@ -168,16 +171,14 @@ public:
      *
      * Do not call if you called insertAllDocumentsInCollection();
      *
-     * If 'dupRecords' is passed as non-NULL and duplicates are not allowed for the index, violators
-     * of uniqueness constraints will be added to the set. Records added to this set are not
-     * indexed, so callers MUST either fail this index build or delete the documents from the
-     * collection.
+     * If 'onDuplicateRecord' is passed as non-NULL and duplicates are not allowed for the index,
+     * violators of uniqueness constraints will be handled by 'onDuplicateRecord'.
      *
      * Should not be called inside of a WriteUnitOfWork.
      */
     Status dumpInsertsFromBulk(OperationContext* opCtx);
-    Status dumpInsertsFromBulk(OperationContext* opCtx, std::set<RecordId>* const dupRecords);
-
+    Status dumpInsertsFromBulk(OperationContext* opCtx,
+                               const IndexAccessMethod::RecordIdHandlerFn& onDuplicateRecord);
     /**
      * For background indexes using an IndexBuildInterceptor to capture inserts during a build,
      * drain these writes into the index. If intent locks are held on the collection, more writes
@@ -270,9 +271,12 @@ public:
      * not perform any storage engine writes. May delete internal tables, but this is not
      * transactional.
      *
+     * If the indexes being built were resumable, returns the information to resume them.
+     * Otherwise, returns boost::none.
+     *
      * This should only be used during rollback.
      */
-    void abortWithoutCleanupForRollback(OperationContext* opCtx);
+    boost::optional<ResumeIndexInfo> abortWithoutCleanupForRollback(OperationContext* opCtx);
 
     /**
      * May be called at any time after construction but before a successful commit(). Suppresses
@@ -304,9 +308,15 @@ private:
         InsertDeleteOptions options;
     };
 
-    void _abortWithoutCleanup(OperationContext* opCtx, bool shutdown);
+    /**
+     * This function should be used for shutdown and rollback. When called for shutdown, writes the
+     * resumable index build state to disk if resuamble index builds are supported. When called for
+     * rollback, returns the information to resume the index build if resuamble index builds are
+     * supported.
+     */
+    boost::optional<ResumeIndexInfo> _abortWithoutCleanup(OperationContext* opCtx, bool shutdown);
 
-    bool _shouldWriteStateToDisk(OperationContext* opCtx, bool shutdown) const;
+    bool _isResumable(OperationContext* opCtx) const;
 
     void _writeStateToDisk(OperationContext* opCtx) const;
 

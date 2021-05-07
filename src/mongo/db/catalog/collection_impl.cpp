@@ -103,6 +103,9 @@ MONGO_FAIL_POINT_DEFINE(failAfterBulkLoadDocInsert);
 // will not (and cannot) be enforced but it will be persisted.
 MONGO_FAIL_POINT_DEFINE(allowSettingMalformedCollectionValidators);
 
+// This fail point introduces corruption to documents during insert.
+MONGO_FAIL_POINT_DEFINE(corruptDocumentOnInsert);
+
 /**
  * Checks the 'failCollectionInserts' fail point at the beginning of an insert operation to see if
  * the insert should fail. Returns Status::OK if The function should proceed with the insertion.
@@ -203,6 +206,12 @@ Status checkValidatorCanBeUsedOnNs(const BSONObj& validator,
     if (validator.isEmpty())
         return Status::OK();
 
+    if (nss.isTemporaryReshardingCollection()) {
+        // In resharding, if the user's original collection has a validator, then the temporary
+        // resharding collection is created with it as well.
+        return Status::OK();
+    }
+
     if (nss.isSystem() && !nss.isDropPendingNamespace()) {
         return {ErrorCodes::InvalidOptions,
                 str::stream() << "Document validators not allowed on system collection " << nss
@@ -259,19 +268,21 @@ CollectionImpl::~CollectionImpl() {
         _recordStore->setCappedCallback(nullptr);
         _cappedNotifier->kill();
     }
+}
 
+void CollectionImpl::onDeregisterFromCatalog() {
     if (ns().isOplog()) {
         repl::clearLocalOplogPtr();
     }
 }
 
-std::unique_ptr<Collection> CollectionImpl::FactoryImpl::make(
+std::shared_ptr<Collection> CollectionImpl::FactoryImpl::make(
     OperationContext* opCtx,
     const NamespaceString& nss,
     RecordId catalogId,
     CollectionUUID uuid,
     std::unique_ptr<RecordStore> rs) const {
-    return std::make_unique<CollectionImpl>(opCtx, nss, catalogId, uuid, std::move(rs));
+    return std::make_shared<CollectionImpl>(opCtx, nss, catalogId, uuid, std::move(rs));
 }
 
 SharedCollectionDecorations* CollectionImpl::getSharedDecorations() const {
@@ -378,6 +389,13 @@ Status CollectionImpl::checkValidation(OperationContext* opCtx, const BSONObj& d
 
     if (documentValidationDisabled(opCtx))
         return Status::OK();
+
+    if (ns().isTemporaryReshardingCollection()) {
+        // In resharding, the donor shard primary is responsible for performing document validation
+        // and the recipient should not perform validation on documents inserted into the temporary
+        // resharding collection.
+        return Status::OK();
+    }
 
     if (validatorMatchExpr->matchesBSON(document))
         return Status::OK();
@@ -631,7 +649,15 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
     timestamps.reserve(count);
 
     for (auto it = begin; it != end; it++) {
-        records.emplace_back(Record{RecordId(), RecordData(it->doc.objdata(), it->doc.objsize())});
+        const auto& doc = it->doc;
+
+        if (MONGO_unlikely(corruptDocumentOnInsert.shouldFail())) {
+            // Insert a truncated record that is half the expected size of the source document.
+            records.emplace_back(Record{RecordId(), RecordData(doc.objdata(), doc.objsize() / 2)});
+            timestamps.emplace_back(it->oplogSlot.getTimestamp());
+            continue;
+        }
+        records.emplace_back(Record{RecordId(), RecordData(doc.objdata(), doc.objsize())});
         timestamps.emplace_back(it->oplogSlot.getTimestamp());
     }
     Status status = _recordStore->insertRecords(opCtx, &records, timestamps);
@@ -665,13 +691,13 @@ void CollectionImpl::setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapsh
     }
 }
 
-bool CollectionImpl::haveCappedWaiters() {
+bool CollectionImpl::haveCappedWaiters() const {
     // Waiters keep a shared_ptr to '_cappedNotifier', so there are waiters if this CollectionImpl's
     // shared_ptr is not unique (use_count > 1).
     return _cappedNotifier.use_count() > 1;
 }
 
-void CollectionImpl::notifyCappedWaitersIfNeeded() {
+void CollectionImpl::notifyCappedWaitersIfNeeded() const {
     // If there is a notifier object and another thread is waiting on it, then we notify
     // waiters of this document insert.
     if (haveCappedWaiters())
@@ -878,6 +904,10 @@ bool CollectionImpl::isCapped() const {
 }
 
 CappedCallback* CollectionImpl::getCappedCallback() {
+    return this;
+}
+
+const CappedCallback* CollectionImpl::getCappedCallback() const {
     return this;
 }
 
@@ -1189,10 +1219,12 @@ StatusWith<std::vector<BSONObj>> CollectionImpl::addCollationDefaultsToIndexSpec
 std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> CollectionImpl::makePlanExecutor(
     OperationContext* opCtx,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
-    ScanDirection scanDirection) {
+    ScanDirection scanDirection,
+    boost::optional<RecordId> resumeAfterRecordId) const {
     auto isForward = scanDirection == ScanDirection::kForward;
     auto direction = isForward ? InternalPlanner::FORWARD : InternalPlanner::BACKWARD;
-    return InternalPlanner::collectionScan(opCtx, _ns.ns(), this, yieldPolicy, direction);
+    return InternalPlanner::collectionScan(
+        opCtx, _ns.ns(), this, yieldPolicy, direction, resumeAfterRecordId);
 }
 
 void CollectionImpl::setNs(NamespaceString nss) {

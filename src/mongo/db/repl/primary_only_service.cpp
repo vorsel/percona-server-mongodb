@@ -42,6 +42,7 @@
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
+#include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/service_context.h"
 #include "mongo/executor/network_connection_hook.h"
@@ -56,7 +57,8 @@
 namespace mongo {
 namespace repl {
 
-MONGO_FAIL_POINT_DEFINE(PrimaryOnlyServiceHangBeforeCreatingInstance);
+MONGO_FAIL_POINT_DEFINE(PrimaryOnlyServiceHangBeforeRebuildingInstances);
+MONGO_FAIL_POINT_DEFINE(PrimaryOnlyServiceFailRebuildingInstances);
 
 namespace {
 const auto _registryDecoration = ServiceContext::declareDecoration<PrimaryOnlyServiceRegistry>();
@@ -67,27 +69,6 @@ const auto _registryRegisterer =
 
 const Status kExecutorShutdownStatus(ErrorCodes::InterruptedDueToReplStateChange,
                                      "PrimaryOnlyService executor shut down due to stepDown");
-
-// Throws on error.
-void insertDocument(OperationContext* opCtx,
-                    const NamespaceString& collectionName,
-                    const BSONObj& document) {
-    DBDirectClient client(opCtx);
-
-    BSONObj res;
-    client.runCommand(collectionName.db().toString(),
-                      [&] {
-                          write_ops::Insert insertOp(collectionName);
-                          insertOp.setDocuments({document});
-                          return insertOp.toBSON({});
-                      }(),
-                      res);
-
-    BatchedCommandResponse response;
-    std::string errmsg;
-    invariant(response.parseBSON(res, &errmsg));
-    uassertStatusOK(response.toStatus());
-}
 }  // namespace
 
 PrimaryOnlyServiceRegistry* PrimaryOnlyServiceRegistry::get(ServiceContext* serviceContext) {
@@ -116,9 +97,14 @@ void PrimaryOnlyServiceRegistry::onStartup(OperationContext* opCtx) {
     }
 }
 
-void PrimaryOnlyServiceRegistry::onStepUpComplete(OperationContext*, long long term) {
+void PrimaryOnlyServiceRegistry::onStepUpComplete(OperationContext* opCtx, long long term) {
+    const auto stepUpOpTime = ReplicationCoordinator::get(opCtx)->getMyLastAppliedOpTime();
+    invariant(term == stepUpOpTime.getTerm(),
+              str::stream() << "Term from last optime (" << stepUpOpTime.getTerm()
+                            << ") doesn't match the term we're stepping up in (" << term << ")");
+
     for (auto& service : _services) {
-        service.second->onStepUp(term);
+        service.second->onStepUp(stepUpOpTime);
     }
 }
 
@@ -138,7 +124,10 @@ PrimaryOnlyService::PrimaryOnlyService(ServiceContext* serviceContext)
     : _serviceContext(serviceContext) {}
 
 void PrimaryOnlyService::startup(OperationContext* opCtx) {
-    ThreadPool::Options threadPoolOptions;
+    // Initialize the thread pool options with the service-specific limits on pool size.
+    ThreadPool::Options threadPoolOptions(getThreadPoolLimits());
+
+    // Now add the options that are fixed for all PrimaryOnlyServices.
     threadPoolOptions.threadNamePrefix = getServiceName() + "-";
     threadPoolOptions.poolName = getServiceName() + "ThreadPool";
     threadPoolOptions.onCreateThread = [](const std::string& threadName) {
@@ -154,17 +143,18 @@ void PrimaryOnlyService::startup(OperationContext* opCtx) {
     _executor->startup();
 }
 
-void PrimaryOnlyService::onStepUp(long long term) {
+void PrimaryOnlyService::onStepUp(const OpTime& stepUpOpTime) {
     InstanceMap savedInstances;
     auto newThenOldScopedExecutor =
         std::make_shared<executor::ScopedTaskExecutor>(_executor, kExecutorShutdownStatus);
     {
         stdx::lock_guard lk(_mutex);
 
-        invariant(term > _term,
-                  str::stream() << "term " << term << " is not greater than " << _term);
-        _term = term;
-        _state = State::kRunning;
+        auto newTerm = stepUpOpTime.getTerm();
+        invariant(newTerm > _term,
+                  str::stream() << "term " << newTerm << " is not greater than " << _term);
+        _term = newTerm;
+        _state = State::kRebuilding;
 
         // Install a new executor, while moving the old one into 'newThenOldScopedExecutor' so it
         // can be accessed outside of _mutex.
@@ -180,6 +170,16 @@ void PrimaryOnlyService::onStepUp(long long term) {
         // Shutdown happens in onStepDown of previous term, so we only need to join() here.
         (*newThenOldScopedExecutor)->join();
     }
+
+    // Now wait for the first write of the new term to be majority committed, so that we know all
+    // previous writes to state documents are also committed, and then schedule work to rebuild
+    // Instances from their persisted state documents.
+    stdx::lock_guard lk(_mutex);
+    WaitForMajorityService::get(_serviceContext)
+        .waitUntilMajority(stepUpOpTime)
+        .thenRunOn(**_scopedExecutor)
+        .then([this] { _rebuildInstances(); })
+        .getAsync([](auto&&) {});  // Ignore the result Future
 }
 
 void PrimaryOnlyService::onStepDown() {
@@ -189,6 +189,7 @@ void PrimaryOnlyService::onStepDown() {
         (*_scopedExecutor)->shutdown();
     }
     _state = State::kPaused;
+    _rebuildStatus = Status::OK();
 }
 
 void PrimaryOnlyService::shutdown() {
@@ -225,7 +226,13 @@ std::shared_ptr<PrimaryOnlyService::Instance> PrimaryOnlyService::getOrCreateIns
             !idElem.eoo());
     InstanceID instanceID = idElem.wrap();
 
-    stdx::lock_guard lk(_mutex);
+    stdx::unique_lock lk(_mutex);
+    while (_state == State::kRebuilding) {
+        _rebuildCV.wait(lk);
+    }
+    if (_state == State::kRebuildFailed) {
+        uassertStatusOK(_rebuildStatus);
+    }
     uassert(
         ErrorCodes::NotMaster,
         str::stream() << "Not Primary when trying to create a new instance of PrimaryOnlyService "
@@ -236,8 +243,8 @@ std::shared_ptr<PrimaryOnlyService::Instance> PrimaryOnlyService::getOrCreateIns
     if (it != _instances.end()) {
         return it->second;
     }
-    auto [it2, inserted] =
-        _instances.emplace(instanceID.getOwned(), constructInstance(std::move(initialState)));
+    auto [it2, inserted] = _instances.emplace(std::move(instanceID).getOwned(),
+                                              constructInstance(std::move(initialState)));
     invariant(inserted);
 
     // Kick off async work to run the instance
@@ -248,7 +255,19 @@ std::shared_ptr<PrimaryOnlyService::Instance> PrimaryOnlyService::getOrCreateIns
 
 boost::optional<std::shared_ptr<PrimaryOnlyService::Instance>> PrimaryOnlyService::lookupInstance(
     const InstanceID& id) {
-    stdx::lock_guard lk(_mutex);
+    stdx::unique_lock lk(_mutex);
+    while (_state == State::kRebuilding) {
+        _rebuildCV.wait(lk);
+    }
+    if (_state == State::kShutdown || _state == State::kPaused) {
+        invariant(_instances.empty());
+        return boost::none;
+    }
+    if (_state == State::kRebuildFailed) {
+        uassertStatusOK(_rebuildStatus);
+    }
+    invariant(_state == State::kRunning);
+
 
     auto it = _instances.find(id);
     if (it == _instances.end()) {
@@ -256,6 +275,69 @@ boost::optional<std::shared_ptr<PrimaryOnlyService::Instance>> PrimaryOnlyServic
     }
 
     return it->second;
+}
+
+void PrimaryOnlyService::_rebuildInstances() noexcept {
+    std::vector<BSONObj> stateDocuments;
+    {
+        auto opCtx = cc().makeOperationContext();
+        DBDirectClient client(opCtx.get());
+        try {
+            if (MONGO_unlikely(PrimaryOnlyServiceFailRebuildingInstances.shouldFail())) {
+                uassertStatusOK(
+                    Status(ErrorCodes::InternalError, "Querying state documents failed"));
+            }
+
+            auto cursor = client.query(getStateDocumentsNS(), Query());
+            while (cursor->more()) {
+                stateDocuments.push_back(cursor->nextSafe().getOwned());
+            }
+        } catch (const DBException& e) {
+            LOGV2_ERROR(4923601,
+                        "Failed to start PrimaryOnlyService {service} because the query on {ns} "
+                        "for state documents failed due to {error}",
+                        "ns"_attr = getStateDocumentsNS(),
+                        "service"_attr = getServiceName(),
+                        "error"_attr = e);
+
+            Status status = e.toStatus();
+            status.addContext(str::stream()
+                              << "Failed to start PrimaryOnlyService \"" << getServiceName()
+                              << "\" because the query for state documents on ns \""
+                              << getStateDocumentsNS() << "\" failed");
+
+            stdx::lock_guard lk(_mutex);
+            _state = State::kRebuildFailed;
+            _rebuildStatus = std::move(status);
+            _rebuildCV.notify_all();
+            return;
+        }
+    }
+
+    if (MONGO_unlikely(PrimaryOnlyServiceHangBeforeRebuildingInstances.shouldFail())) {
+        PrimaryOnlyServiceHangBeforeRebuildingInstances.pauseWhileSet();
+    }
+
+    stdx::lock_guard lk(_mutex);
+    if (_state != State::kRebuilding) {
+        // Node stepped down before finishing rebuilding service from previous stepUp.
+        _rebuildCV.notify_all();
+        return;
+    }
+    invariant(_instances.empty());
+
+    for (auto&& doc : stateDocuments) {
+        auto idElem = doc["_id"];
+        fassert(4923602, !idElem.eoo());
+        auto instanceID = idElem.wrap().getOwned();
+        auto instance = constructInstance(std::move(doc));
+
+        auto [_, inserted] = _instances.emplace(instanceID, instance);
+        invariant(inserted);
+        instance->scheduleRun(_scopedExecutor);
+    }
+    _state = State::kRunning;
+    _rebuildCV.notify_all();
 }
 
 void PrimaryOnlyService::Instance::scheduleRun(

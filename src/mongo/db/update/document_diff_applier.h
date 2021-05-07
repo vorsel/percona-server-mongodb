@@ -31,12 +31,20 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/update/document_diff_serialization.h"
+#include "mongo/db/update_index_data.h"
 
 namespace mongo {
 namespace doc_diff {
+
+struct ApplyDiffOutput {
+    BSONObj postImage;
+    bool indexesAffected;
+};
+
 /**
- * Applies the diff to 'pre' and returns the post image. Throws if the diff is invalid.
+ * Applies the diff to 'pre' and returns the post image. Throws if the diff is invalid. The
+ * indexData' parameter is optional, if provided computes whether the indexes are affected.
  */
-BSONObj applyDiff(const BSONObj& pre, const Diff& diff);
+ApplyDiffOutput applyDiff(const BSONObj& pre, const Diff& diff, const UpdateIndexData* indexData);
 }  // namespace doc_diff
 }  // namespace mongo

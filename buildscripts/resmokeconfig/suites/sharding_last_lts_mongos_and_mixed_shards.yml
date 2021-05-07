@@ -7,8 +7,7 @@ selector:
   - jstests/sharding/query/*.js
   exclude_with_any_tags:
   - multiversion_incompatible
-  - requires_fcv_46
-  - need_fixing_for_46
+  - requires_fcv_47
   exclude_files:
   # Requires fix to SERVER-31689
   - jstests/sharding/query/aggregation_currentop.js
@@ -21,15 +20,6 @@ selector:
   - jstests/sharding/query/merge_stale_on_fields.js
   - jstests/sharding/refresh_sessions.js
   - jstests/sharding/query/lookup.js
-  # Enable when 4.4 becomes last-lts
-  - jstests/sharding/query/out_fails_to_replace_sharded_collection.js
-  - jstests/sharding/merge_from_stale_mongos.js
-  - jstests/sharding/migration_coordinator_basic.js
-  - jstests/sharding/migration_coordinator_killop_in_critical_section.js
-  - jstests/sharding/migration_coordinator_shutdown_in_critical_section.js
-  - jstests/sharding/test_stacked_migration_cleanup.js
-  - jstests/sharding/kill_pinned_cursor.js
-  - jstests/sharding/killop.js
   # Enable when 5.0 becomes last-lts
   - jstests/sharding/mongos_dataSize.js
   # Enable when SERVER-44733 is backported
@@ -38,8 +28,6 @@ selector:
   - jstests/sharding/retryable_write_error_labels.js
   # Enable when SERVER-43310 is backported
   - jstests/sharding/cluster_create_indexes_always_routes_through_primary.js
-  # TODO SERVER-46040: Enable when SERVER-46040 is backported
-  - jstests/sharding/drop_indexes_with_stale_config_error.js
   # Enable when SERVER-43614 is backported.
   - jstests/sharding/query/unionWith_current_op.js
   - jstests/sharding/verify_sessions_expiration_sharded.js

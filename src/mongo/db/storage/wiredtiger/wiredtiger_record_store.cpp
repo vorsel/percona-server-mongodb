@@ -457,13 +457,15 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesByScanning(OperationCon
         int64_t newCurrentBytes = _currentBytes.addAndFetch(record->data.size());
         if (newCurrentBytes >= _minBytesPerStone) {
             BSONObj obj = record->data.toBson();
-            Date_t wallTime = obj["wall"].Date();
+            auto wallTime = obj.hasField("wall") ? obj["wall"].Date() : obj["ts"].timestampTime();
 
-            LOGV2_DEBUG(
-                22385, 1, "Marking oplog entry as a potential future oplog truncation point.");
-            OplogStones::Stone stone(
+            LOGV2_DEBUG(22385,
+                        1,
+                        "Marking oplog entry as a potential future oplog truncation point",
+                        "wall"_attr = wallTime);
+
+            _stones.emplace_back(
                 _currentRecords.swap(0), _currentBytes.swap(0), record->id, wallTime);
-            _stones.push_back(stone);
         }
 
         numRecords++;
@@ -554,8 +556,8 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationCon
         }
 
         BSONObj obj = record->data.toBson();
-        Date_t wall = obj["wall"].Date();
-        oplogEstimates.push_back(RecordIdAndWall{record->id, wall});
+        oplogEstimates.emplace_back(
+            record->id, obj.hasField("wall") ? obj["wall"].Date() : obj["ts"].timestampTime());
 
         const auto now = Date_t::now();
         if (samplingLogIntervalSeconds > 0 &&
@@ -577,17 +579,17 @@ void WiredTigerRecordStore::OplogStones::_calculateStonesBySampling(OperationCon
         // Use every (kRandomSamplesPerStone)th sample, starting with the
         // (kRandomSamplesPerStone - 1)th, as the last record for each stone.
         // If parsing "wall" fails, we crash to allow user to fix their oplog.
-        int sampleIndex = kRandomSamplesPerStone * i - 1;
-        RecordIdAndWall rIdAndWall = oplogEstimates[sampleIndex];
+        const auto& [id, wallTime] = oplogEstimates[kRandomSamplesPerStone * i - 1];
+
         LOGV2_DEBUG(22394,
                     1,
                     "Marking oplog entry as a potential future oplog truncation point. wall: "
                     "{wall}, ts: {ts}",
-                    "wall"_attr = rIdAndWall.wall,
-                    "ts"_attr = rIdAndWall.id);
-        OplogStones::Stone stone(
-            estRecordsPerStone, estBytesPerStone, rIdAndWall.id, rIdAndWall.wall);
-        _stones.push_back(stone);
+                    "Marking oplog entry as a potential future oplog truncation point",
+                    "wall"_attr = wallTime,
+                    "ts"_attr = id);
+
+        _stones.emplace_back(estRecordsPerStone, estBytesPerStone, id, wallTime);
     }
 
     // Account for the partially filled chunk.
@@ -797,9 +799,8 @@ StatusWith<std::string> WiredTigerRecordStore::generateCreateString(
 WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
                                              OperationContext* ctx,
                                              Params params)
-    : RecordStore(params.ns),
+    : RecordStore(params.ns, params.ident),
       _uri(WiredTigerKVEngine::kTableUriPrefix + params.ident),
-      _ident(params.ident),
       _tableId(WiredTigerSession::genTableId()),
       _engineName(params.engineName),
       _isCapped(params.isCapped),
@@ -821,7 +822,7 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
       _sizeStorer(params.sizeStorer),
       _tracksSizeAdjustments(params.tracksSizeAdjustments),
       _kvEngine(kvEngine) {
-    invariant(_ident.size() > 0);
+    invariant(getIdent().size() > 0);
 
     Status versionStatus = WiredTigerUtil::checkApplicationMetadataFormatVersion(
                                ctx, _uri, kMinimumRecordStoreVersion, kMaximumRecordStoreVersion)
@@ -853,13 +854,12 @@ WiredTigerRecordStore::WiredTigerRecordStore(WiredTigerKVEngine* kvEngine,
         // The oplog always needs to be marked for size adjustment since it is journaled and also
         // may change during replication recovery (if truncated).
         sizeRecoveryState(getGlobalServiceContext())
-            .markCollectionAsAlwaysNeedsSizeAdjustment(_ident);
+            .markCollectionAsAlwaysNeedsSizeAdjustment(getIdent());
     }
 
     // If no SizeStorer is in use, start counting at zero. In practice, this will only ever be the
-    // the case for temporary RecordStores (those not associated with any collection) and in unit
-    // tests. Persistent size information is not required in either case. If a RecordStore needs
-    // persistent size information, we require it to use a SizeStorer.
+    // the case in unit tests. Persistent size information is not required in this case. If a
+    // RecordStore needs persistent size information, we require it to use a SizeStorer.
     _sizeInfo = _sizeStorer ? _sizeStorer->load(_uri)
                             : std::make_shared<WiredTigerSizeStorer::SizeInfo>(0, 0);
 }
@@ -885,7 +885,7 @@ WiredTigerRecordStore::~WiredTigerRecordStore() {
 
     if (_isOplog) {
         // Delete oplog visibility manager on KV engine.
-        _kvEngine->haltOplogManager();
+        _kvEngine->haltOplogManager(this);
     }
 }
 
@@ -909,9 +909,9 @@ void WiredTigerRecordStore::checkSize(OperationContext* opCtx) {
                            "record store as needing size adjustment during recovery. ns: "
                            "{isTemp_temp_ns}, ident: {ident}",
                            "isTemp_temp_ns"_attr = (isTemp() ? "(temp)" : ns()),
-                           "ident"_attr = _ident);
+                           "ident"_attr = getIdent());
         sizeRecoveryState(getGlobalServiceContext())
-            .markCollectionAsAlwaysNeedsSizeAdjustment(_ident);
+            .markCollectionAsAlwaysNeedsSizeAdjustment(getIdent());
         _sizeInfo->dataSize.store(0);
         _sizeInfo->numRecords.store(0);
     }
@@ -1099,7 +1099,7 @@ int64_t WiredTigerRecordStore::_cappedDeleteAsNeeded(OperationContext* opCtx,
     // replication recovery. If we don't mark the collection for size adjustment then we will not
     // perform the capped deletions as expected. In that case, the collection is guaranteed to be
     // empty at the stable timestamp and thus guaranteed to be marked for size adjustment.
-    if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(_ident)) {
+    if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(getIdent())) {
         return 0;
     }
 
@@ -1883,7 +1883,8 @@ void WiredTigerRecordStore::updateStatsAfterRepair(OperationContext* opCtx,
                                                    long long numRecords,
                                                    long long dataSize) {
     // We're correcting the size as of now, future writes should be tracked.
-    sizeRecoveryState(getGlobalServiceContext()).markCollectionAsAlwaysNeedsSizeAdjustment(_ident);
+    sizeRecoveryState(getGlobalServiceContext())
+        .markCollectionAsAlwaysNeedsSizeAdjustment(getIdent());
 
     _sizeInfo->numRecords.store(numRecords);
     _sizeInfo->dataSize.store(dataSize);
@@ -1953,7 +1954,7 @@ void WiredTigerRecordStore::_changeNumRecords(OperationContext* opCtx, int64_t d
         return;
     }
 
-    if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(_ident)) {
+    if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(getIdent())) {
         return;
     }
 
@@ -1980,7 +1981,7 @@ void WiredTigerRecordStore::_increaseDataSize(OperationContext* opCtx, int64_t a
         return;
     }
 
-    if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(_ident)) {
+    if (!sizeRecoveryState(getGlobalServiceContext()).collectionNeedsSizeAdjustment(getIdent())) {
         return;
     }
 

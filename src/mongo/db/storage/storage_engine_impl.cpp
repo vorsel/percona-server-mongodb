@@ -46,10 +46,12 @@
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/temporary_kv_record_store.h"
 #include "mongo/db/storage/storage_repair_observer.h"
+#include "mongo/db/storage/storage_util.h"
 #include "mongo/db/storage/two_phase_index_build_knobs_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
@@ -60,6 +62,8 @@ namespace mongo {
 
 using std::string;
 using std::vector;
+
+MONGO_FAIL_POINT_DEFINE(failToParseResumeIndexInfo);
 
 namespace {
 const std::string catalogInfo = "_mdb_catalog";
@@ -290,7 +294,7 @@ void StorageEngineImpl::_initCollection(OperationContext* opCtx,
     auto collection = collectionFactory->make(opCtx, nss, catalogId, uuid, std::move(rs));
 
     auto& collectionCatalog = CollectionCatalog::get(getGlobalServiceContext());
-    collectionCatalog.registerCollection(uuid, &collection);
+    collectionCatalog.registerCollection(uuid, std::move(collection));
 }
 
 void StorageEngineImpl::closeCatalog(OperationContext* opCtx) {
@@ -372,6 +376,11 @@ bool StorageEngineImpl::_handleInternalIdents(
         if (doc.hasField("phase")) {
             ResumeIndexInfo resumeInfo;
             try {
+                if (MONGO_unlikely(failToParseResumeIndexInfo.shouldFail())) {
+                    uasserted(ErrorCodes::FailPointEnabled,
+                              "failToParseResumeIndexInfo fail point is enabled");
+                }
+
                 resumeInfo = ResumeIndexInfo::parse(IDLParserErrorContext("ResumeIndexInfo"), doc);
             } catch (const DBException& e) {
                 LOGV2(4916300, "Failed to parse resumable index info", "error"_attr = e.toStatus());
@@ -443,7 +452,7 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
     }
     std::set<std::string> internalIdentsToDrop;
 
-    auto dropPendingIdents = _dropPendingIdentReaper.getAllIdents();
+    auto dropPendingIdents = _dropPendingIdentReaper.getAllIdentNames();
 
     // Drop all idents in the storage engine that are not known to the catalog. This can happen in
     // the case of a collection or index creation being rolled back.
@@ -745,8 +754,6 @@ Status StorageEngineImpl::_dropCollectionsNoTimestamp(OperationContext* opCtx,
     Status firstError = Status::OK();
     WriteUnitOfWork untimestampedDropWuow(opCtx);
     for (auto& nss : toDrop) {
-        auto durableCatalog = getCatalog();
-        invariant(durableCatalog);
         auto coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
 
         // No need to remove the indexes from the IndexCatalog because eliminating the Collection
@@ -755,14 +762,16 @@ Status StorageEngineImpl::_dropCollectionsNoTimestamp(OperationContext* opCtx,
             coll->getIndexCatalog()->getIndexIterator(opCtx, true /* includeUnfinishedIndexes */);
         while (ii->more()) {
             const IndexCatalogEntry* ice = ii->next();
-            Status status = durableCatalog->removeIndex(
-                opCtx, coll->getCatalogId(), ice->descriptor()->indexName());
-            if (!status.isOK() && firstError.isOK()) {
-                firstError = status;
-            }
+            catalog::removeIndex(opCtx,
+                                 ice->descriptor()->indexName(),
+                                 coll->getCatalogId(),
+                                 coll->uuid(),
+                                 coll->ns(),
+                                 ice->accessMethod()->getSharedIdent());
         }
 
-        Status result = durableCatalog->dropCollection(opCtx, coll->getCatalogId());
+        Status result = catalog::dropCollection(
+            opCtx, coll->ns(), coll->getCatalogId(), coll->getSharedIdent());
         if (!result.isOK() && firstError.isOK()) {
             firstError = result;
         }
@@ -901,6 +910,10 @@ void StorageEngineImpl::setOldestTimestamp(Timestamp newOldestTimestamp) {
     _engine->setOldestTimestamp(newOldestTimestamp, force);
 }
 
+Timestamp StorageEngineImpl::getOldestTimestamp() const {
+    return _engine->getOldestTimestamp();
+};
+
 void StorageEngineImpl::setOldestActiveTransactionTimestampCallback(
     StorageEngine::OldestActiveTransactionTimestampCallback callback) {
     _engine->setOldestActiveTransactionTimestampCallback(callback);
@@ -1016,7 +1029,7 @@ void StorageEngineImpl::_dumpCatalog(OperationContext* opCtx) {
 
 void StorageEngineImpl::addDropPendingIdent(const Timestamp& dropTimestamp,
                                             const NamespaceString& nss,
-                                            StringData ident) {
+                                            std::shared_ptr<Ident> ident) {
     _dropPendingIdentReaper.addDropPendingIdent(dropTimestamp, nss, ident);
 }
 

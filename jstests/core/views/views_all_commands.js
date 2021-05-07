@@ -3,9 +3,11 @@
 //   does_not_support_stepdowns,
 //   requires_emptycapped,
 //   requires_fastcount,
+//   requires_fcv_47,
 //   requires_getmore,
 //   requires_non_retryable_commands,
 //   requires_non_retryable_writes,
+//   sbe_incompatible,
 //   uses_map_reduce_with_temp_collections,
 // ]
 
@@ -101,6 +103,7 @@ let viewsCommandTests = {
     _configsvrUpdateZoneKeyRange: {skip: isAnInternalCommand},
     _flushDatabaseCacheUpdates: {skip: isUnrelated},
     _flushRoutingTableCacheUpdates: {skip: isUnrelated},
+    _flushRoutingTableCacheUpdatesWithWriteConcern: {skip: isUnrelated},
     _getNextSessionMods: {skip: isAnInternalCommand},
     _getUserCacheGeneration: {skip: isAnInternalCommand},
     _hashBSONElement: {skip: isAnInternalCommand},
@@ -333,13 +336,13 @@ let viewsCommandTests = {
     grantRolesToRole: {skip: isUnrelated},
     grantRolesToUser: {skip: isUnrelated},
     handshake: {skip: isUnrelated},
+    hello: {skip: isUnrelated},
     hostInfo: {skip: isUnrelated},
     httpClientRequest: {skip: isAnInternalCommand},
     insert: {command: {insert: "view", documents: [{x: 1}]}, expectFailure: true},
     internalRenameIfOptionsAndIndexesMatch: {skip: isAnInternalCommand},
     invalidateUserCache: {skip: isUnrelated},
     isdbgrid: {skip: isUnrelated},
-    isMaster: {skip: isUnrelated},
     killCursors: {
         setup: function(conn) {
             assert.commandWorked(conn.collection.remove({}));

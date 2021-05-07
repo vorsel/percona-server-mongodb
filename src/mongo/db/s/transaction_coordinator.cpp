@@ -133,6 +133,10 @@ TransactionCoordinator::TransactionCoordinator(OperationContext* operationContex
     // either with success or error and the scheduled deadline task above has been joined.
     std::move(kickOffCommitPF.future)
         .then([this] {
+            return VectorClockMutable::get(_serviceContext)->waitForDurableTopologyTime();
+        })
+        .thenRunOn(Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor())
+        .then([this] {
             // Persist the participants, unless they have been made durable already (which would
             // only be the case if this coordinator was created as part of step-up recovery).
             //  Input: _participants

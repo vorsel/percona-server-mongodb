@@ -70,20 +70,14 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                                        const RecordId& recordId,
                                        const RecordData& record,
                                        size_t* dataSize,
-                                       ValidateResults* results) {
-    BSONObj recordBson;
-    try {
-        recordBson = record.toBson();
-    } catch (...) {
-        return exceptionToStatus();
-    }
-
-    const Status status = validateBSON(recordBson.objdata(), recordBson.objsize());
-    if (status.isOK()) {
-        *dataSize = recordBson.objsize();
-    } else {
+                                       ValidateResults* results,
+                                       ValidateResultsMap* indexNsResultsMap) {
+    const Status status = validateBSON(record.data(), record.size());
+    if (!status.isOK())
         return status;
-    }
+
+    BSONObj recordBson = record.toBson();
+    *dataSize = recordBson.objsize();
 
     if (MONGO_unlikely(_validateState->extraLoggingForTest())) {
         LOGV2(4666601, "[validate]", "recordId"_attr = recordId, "recordData"_attr = recordBson);
@@ -138,7 +132,7 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                                                           << " set to multikey.");
                 results->repaired = true;
             } else {
-                ValidateResults& curRecordResults = (*_indexNsResultsMap)[descriptor->indexName()];
+                ValidateResults& curRecordResults = (*indexNsResultsMap)[descriptor->indexName()];
                 std::string msg = str::stream() << "Index " << descriptor->indexName()
                                                 << " is not multikey but has more than one"
                                                 << " key in document " << recordId;
@@ -173,7 +167,7 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                         << "Index " << descriptor->indexName()
                         << " multikey paths do not cover a document. RecordId: " << recordId;
                     ValidateResults& curRecordResults =
-                        (*_indexNsResultsMap)[descriptor->indexName()];
+                        (*indexNsResultsMap)[descriptor->indexName()];
                     curRecordResults.errors.push_back(msg);
                     curRecordResults.valid = false;
                 }
@@ -305,7 +299,8 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
             continue;
         }
 
-        _indexConsistency->addIndexKey(indexEntry->keyString, &indexInfo, indexEntry->loc);
+        _indexConsistency->addIndexKey(
+            opCtx, indexEntry->keyString, &indexInfo, indexEntry->loc, results);
         _progress->hit();
         numKeys++;
         isFirstEntry = false;
@@ -332,7 +327,8 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
 
 void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
                                           ValidateResults* results,
-                                          BSONObjBuilder* output) {
+                                          BSONObjBuilder* output,
+                                          ValidateResultsMap* indexNsResultsMap) {
     _numRecords = 0;  // need to reset it because this function can be called more than once.
     long long dataSizeTotal = 0;
     long long interruptIntervalNumBytes = 0;
@@ -370,7 +366,8 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         interruptIntervalNumBytes += dataSize;
         dataSizeTotal += dataSize;
         size_t validatedSize = 0;
-        Status status = validateRecord(opCtx, record->id, record->data, &validatedSize, results);
+        Status status = validateRecord(
+            opCtx, record->id, record->data, &validatedSize, results, indexNsResultsMap);
 
         // Checks to ensure isInRecordIdOrder() is being used properly.
         if (prevRecordId.isValid()) {

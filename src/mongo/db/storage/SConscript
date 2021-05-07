@@ -189,8 +189,8 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context'
     ],
     LIBDEPS_DEPENDENTS=[
-        '$BUILD_DIR/mongo/mongod_initializers',
-        '$BUILD_DIR/mongo/mongos_initializers',
+        '$BUILD_DIR/mongo/db/mongod_initializers',
+        '$BUILD_DIR/mongo/s/mongos_initializers',
     ],
     LIBDEPS_TAGS=[
         'lint-allow-nonprivate-on-deps-dependents',
@@ -207,7 +207,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
     ],
     LIBDEPS_DEPENDENTS=[
-        '$BUILD_DIR/mongo/mongod_initializers',
+        '$BUILD_DIR/mongo/db/mongod_initializers',
     ],
     LIBDEPS_TAGS=[
         'lint-allow-nonprivate-on-deps-dependents',
@@ -488,7 +488,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/index_names',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/storage/bson_collection_catalog_entry',
-        '$BUILD_DIR/mongo/db/storage/kv/kv_drop_pending_ident_reaper',
         '$BUILD_DIR/mongo/db/storage/kv/kv_prefix',
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
     ],
@@ -498,6 +497,18 @@ env.Library(
         '$BUILD_DIR/mongo/db/server_options_core',
     ],
 )
+
+env.Library(
+    target='storage_util',
+    source=[
+        'storage_util.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        'durable_catalog_impl',
+        'kv/kv_drop_pending_ident_reaper',
+    ],
+)
+
 env.Library(
     target='two_phase_index_build_knobs_idl',
     source=[
@@ -527,6 +538,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/collection_catalog_helper',
         '$BUILD_DIR/mongo/db/resumable_index_builds_idl',
         '$BUILD_DIR/mongo/db/vector_clock',
+        'storage_util',
         'two_phase_index_build_knobs_idl',
     ],
 )

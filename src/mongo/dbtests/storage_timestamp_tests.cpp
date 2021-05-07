@@ -303,7 +303,7 @@ public:
         abortOnExit.dismiss();
     }
 
-    std::int32_t itCount(Collection* coll) {
+    std::int32_t itCount(const Collection* coll) {
         std::uint64_t ret = 0;
         auto cursor = coll->getRecordStore()->getCursor(_opCtx);
         while (cursor->next() != boost::none) {
@@ -313,7 +313,7 @@ public:
         return ret;
     }
 
-    BSONObj findOne(Collection* coll) {
+    BSONObj findOne(const Collection* coll) {
         auto optRecord = coll->getRecordStore()->getCursor(_opCtx)->next();
         if (optRecord == boost::none) {
             // Print a stack trace to help disambiguate which `findOne` failed.
@@ -402,7 +402,7 @@ public:
             << ". Expected: " << expectedDoc.toBSON() << ". Found: " << doc.toBSON();
     }
 
-    void assertDocumentAtTimestamp(Collection* coll,
+    void assertDocumentAtTimestamp(const Collection* coll,
                                    const Timestamp& ts,
                                    const BSONObj& expectedDoc) {
         OneOffRead oor(_opCtx, ts);
@@ -418,7 +418,7 @@ public:
         }
     }
 
-    void assertFilteredDocumentAtTimestamp(Collection* coll,
+    void assertFilteredDocumentAtTimestamp(const Collection* coll,
                                            const BSONObj& query,
                                            const Timestamp& ts,
                                            boost::optional<const BSONObj&> expectedDoc) {
@@ -2181,6 +2181,11 @@ public:
             // Save the pre-state idents so we can capture the specific ident related to index
             // creation.
             origIdents = durableCatalog->getAllIdents(_opCtx);
+
+            // Ensure we have a committed snapshot to avoid ReadConcernMajorityNotAvailableYet
+            // error at the beginning of the the collection scan phase.
+            auto snapshotManager = storageEngine->getSnapshotManager();
+            snapshotManager->setCommittedSnapshot(insertTimestamp.asTimestamp());
         }
 
         DBDirectClient client(_opCtx);
@@ -2284,6 +2289,11 @@ public:
                                            presentTerm));
             wuow.commit();
             ASSERT_EQ(1, itCount(autoColl.getCollection()));
+
+            // Ensure we have a committed snapshot to avoid ReadConcernMajorityNotAvailableYet
+            // error at the beginning of the the collection scan phase.
+            auto snapshotManager = storageEngine->getSnapshotManager();
+            snapshotManager->setCommittedSnapshot(insertTimestamp.asTimestamp());
         }
 
         DBDirectClient client(_opCtx);
@@ -2413,6 +2423,11 @@ public:
             // Save the pre-state idents so we can capture the specific ident related to index
             // creation.
             origIdents = durableCatalog->getAllIdents(_opCtx);
+
+            // Ensure we have a committed snapshot to avoid ReadConcernMajorityNotAvailableYet
+            // error at the beginning of the the collection scan phase.
+            auto snapshotManager = storageEngine->getSnapshotManager();
+            snapshotManager->setCommittedSnapshot(insertTimestamp2.asTimestamp());
         }
 
         {
@@ -2947,6 +2962,20 @@ public:
 class TimestampIndexOplogApplicationOnPrimary : public StorageTimestampTest {
 public:
     void run() {
+        // Index builds expect a non-empty oplog and a valid committed snapshot.
+        {
+            Lock::GlobalLock lk(_opCtx, MODE_IX);
+            WriteUnitOfWork wuow(_opCtx);
+            auto service = _opCtx->getServiceContext();
+            service->getOpObserver()->onOpMessage(_opCtx, BSONObj());
+            wuow.commit();
+
+            auto snapshotManager = service->getStorageEngine()->getSnapshotManager();
+            auto lastAppliedOpTime =
+                repl::ReplicationCoordinator::get(service)->getMyLastAppliedOpTime();
+            snapshotManager->setCommittedSnapshot(lastAppliedOpTime.getTimestamp());
+        }
+
         // In order for oplog application to assign timestamps, we must be in non-replicated mode
         // and disable document validation.
         repl::UnreplicatedWritesBlock uwb(_opCtx);

@@ -285,7 +285,7 @@ public:
                                                         const HostAndPort& hostForLogging,
                                                         const ExecutorPtr& reactor) final;
 
-    Status stapleOCSPResponse(SCHANNEL_CRED* cred) final;
+    Status stapleOCSPResponse(SCHANNEL_CRED* cred, bool asyncOCSPStaple) final;
 
     const SSLConfiguration& getSSLConfiguration() const final {
         return _sslConfiguration;
@@ -298,6 +298,8 @@ public:
     int SSL_shutdown(SSLConnectionInterface* conn) final;
 
     SSLInformationToLog getSSLInformationToLog() const final;
+
+    void stopJobs() final;
 
 private:
     Status _loadCertificates(const SSLParams& params);
@@ -390,9 +392,9 @@ SSLConnectionWindows::~SSLConnectionWindows() {}
 // Global variable indicating if this is a server or a client instance
 bool isSSLServer = false;
 
-std::unique_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
+std::shared_ptr<SSLManagerInterface> SSLManagerInterface::create(const SSLParams& params,
                                                                  bool isServer) {
-    return std::make_unique<SSLManagerWindows>(params, isServer);
+    return std::make_shared<SSLManagerWindows>(params, isServer);
 }
 
 namespace {
@@ -1943,9 +1945,11 @@ StatusWith<TLSVersion> mapTLSVersion(PCtxtHandle ssl) {
     }
 }
 
-Status SSLManagerWindows::stapleOCSPResponse(SCHANNEL_CRED* cred) {
+Status SSLManagerWindows::stapleOCSPResponse(SCHANNEL_CRED* cred, bool asyncOCSPStaple) {
     return Status::OK();
 }
+
+void SSLManagerWindows::stopJobs() {}
 
 Future<SSLPeerInfo> SSLManagerWindows::parseAndValidatePeerCertificate(
     PCtxtHandle ssl,

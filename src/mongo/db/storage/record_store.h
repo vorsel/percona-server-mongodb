@@ -36,6 +36,7 @@
 #include "mongo/db/exec/collection_scan_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/ident.h"
 #include "mongo/db/storage/record_data.h"
 
 namespace mongo {
@@ -199,12 +200,12 @@ public:
  * This class must be thread-safe. In addition, for storage engines implementing the KVEngine some
  * methods must be thread safe, see DurableCatalog.
  */
-class RecordStore {
+class RecordStore : public Ident {
     RecordStore(const RecordStore&) = delete;
     RecordStore& operator=(const RecordStore&) = delete;
 
 public:
-    RecordStore(StringData ns) : _ns(ns.toString()) {}
+    RecordStore(StringData ns, StringData identName) : Ident(identName), _ns(ns.toString()) {}
 
     virtual ~RecordStore() {}
 
@@ -224,8 +225,6 @@ public:
     bool isTemp() const {
         return ns().size() == 0;
     }
-
-    virtual const std::string& getIdent() const = 0;
 
     /**
      * The dataSize is an approximation of the sum of the sizes (in bytes) of the
@@ -577,5 +576,35 @@ struct ValidateResults {
     std::vector<BSONObj> missingIndexEntries;
     std::vector<RecordId> corruptRecords;
     long long numRemovedCorruptRecords = 0;
+    long long numRemovedExtraIndexEntries = 0;
+    long long numInsertedMissingIndexEntries = 0;
+
+    // Takes a bool that indicates the context of the caller and a BSONObjBuilder to append with
+    // validate results.
+    void appendToResultObj(BSONObjBuilder& resultObj, bool debugging) const {
+        resultObj.appendBool("valid", valid);
+        resultObj.appendBool("repaired", repaired);
+        if (readTimestamp) {
+            resultObj.append("readTimestamp", readTimestamp.get());
+        }
+        resultObj.append("warnings", warnings);
+        resultObj.append("errors", errors);
+        resultObj.append("extraIndexEntries", extraIndexEntries);
+        resultObj.append("missingIndexEntries", missingIndexEntries);
+
+        // Need to convert RecordId to int64_t to append to BSONObjBuilder
+        BSONArrayBuilder builder;
+        for (RecordId corruptRecord : corruptRecords) {
+            builder.append(corruptRecord.repr());
+        }
+        resultObj.append("corruptRecords", builder.done());
+
+        if (repaired || debugging) {
+            resultObj.appendNumber("numRemovedCorruptRecords", numRemovedCorruptRecords);
+            resultObj.appendNumber("numRemovedExtraIndexEntries", numRemovedExtraIndexEntries);
+            resultObj.appendNumber("numInsertedMissingIndexEntries",
+                                   numInsertedMissingIndexEntries);
+        }
+    }
 };
 }  // namespace mongo

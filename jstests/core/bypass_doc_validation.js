@@ -1,10 +1,11 @@
 // @tags: [
 //   does_not_support_stepdowns,
 //   requires_fastcount,
+//   requires_fcv_47,
 //   requires_non_retryable_commands,
+//   sbe_incompatible,
 //   uses_$out,
 //   uses_map_reduce_with_temp_collections,
-//   requires_fcv_46,
 // ]
 
 /**
@@ -107,7 +108,7 @@ function runBypassDocumentValidationTest(validator) {
 
     // Test the mapReduce command if it is reading from a different database and collection without
     // validation.
-    const otherDb = myDb.getSisterDB("mr_second_input_db");
+    const otherDb = myDb.getSiblingDB("mr_second_input_db");
     const otherDbColl = otherDb.mr_second_input_coll;
     assert.commandWorked(otherDbColl.insert({val: 1}));
     outputColl.drop();

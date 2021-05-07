@@ -347,30 +347,6 @@ std::shared_ptr<SSLManagerInterface> SSLManagerCoordinator::getSSLManager() {
     return *_manager;
 }
 
-void SSLManagerCoordinator::rotate() {
-// Note: This isn't Windows-specific code, but other platforms may need more work
-#if defined(_WIN32) || defined(__APPLE__)
-    stdx::lock_guard lockGuard(_lock);
-    std::shared_ptr<SSLManagerInterface> manager =
-        SSLManagerInterface::create(sslGlobalParams, isSSLServer);
-
-    int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
-    if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509 ||
-        clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendX509) {
-        auth::setInternalUserAuthParams(
-            BSON(saslCommandMechanismFieldName
-                 << "MONGODB-X509" << saslCommandUserDBFieldName << "$external"
-                 << saslCommandUserFieldName
-                 << manager->getSSLConfiguration().clientSubjectName.toString()));
-    }
-
-    auto tl = getGlobalServiceContext()->getTransportLayer();
-    invariant(tl != nullptr);
-    uassertStatusOK(tl->rotateCertificates(manager));
-    _manager = manager;
-#endif
-}
-
 void logCert(const CertInformationToLog& cert, StringData certType, const int logNum) {
     LOGV2(logNum,
           "Certificate information",
@@ -402,6 +378,35 @@ void logSSLInfo(const SSLInformationToLog& info) {
     if (info.crl.has_value()) {
         logCRL(info.crl.get(), 4913012);
     }
+}
+
+void SSLManagerCoordinator::rotate() {
+    stdx::lock_guard lockGuard(_lock);
+
+    std::shared_ptr<SSLManagerInterface> manager =
+        SSLManagerInterface::create(sslGlobalParams, isSSLServer);
+
+    int clusterAuthMode = serverGlobalParams.clusterAuthMode.load();
+    if (clusterAuthMode == ServerGlobalParams::ClusterAuthMode_x509 ||
+        clusterAuthMode == ServerGlobalParams::ClusterAuthMode_sendX509) {
+        auth::setInternalUserAuthParams(
+            BSON(saslCommandMechanismFieldName
+                 << "MONGODB-X509" << saslCommandUserDBFieldName << "$external"
+                 << saslCommandUserFieldName
+                 << manager->getSSLConfiguration().clientSubjectName.toString()));
+    }
+
+    auto tl = getGlobalServiceContext()->getTransportLayer();
+    invariant(tl != nullptr);
+    uassertStatusOK(tl->rotateCertificates(manager, false));
+
+    std::shared_ptr<SSLManagerInterface> originalManager = *_manager;
+    _manager = manager;
+
+    LOGV2(4913400, "Successfully rotated X509 certificates.");
+    logSSLInfo(_manager->get()->getSSLInformationToLog());
+
+    originalManager->stopJobs();
 }
 
 SSLManagerCoordinator::SSLManagerCoordinator()
@@ -621,7 +626,7 @@ TLSVersionCounts& TLSVersionCounts::get(ServiceContext* serviceContext) {
     return getTLSVersionCounts(serviceContext);
 }
 
-MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager", "GlobalLogManager"))
+MONGO_INITIALIZER_WITH_PREREQUISITES(SSLManagerLogger, ("SSLManager"))
 (InitializerContext*) {
     if (!isSSLServer || (sslGlobalParams.sslMode.load() != SSLParams::SSLMode_disabled)) {
         const auto& config = SSLManagerCoordinator::get()->getSSLManager()->getSSLConfiguration();

@@ -27,7 +27,7 @@ a notice will be included in
 | [benchmark]                | Apache-2.0        | 1.5.1            | 1.5.0             |                      |                                 |
 | [Boost]                    | BSL-1.0           | 1.73.0           | 1.70.0            |                      |                ✗                |
 | [fmt]                      | BSD-2-Clause      | 6.2.1            | 6.1.1             |                      |                ✗                |
-| [GPerfTools]               | BSD-3-Clause      | 2.7.90           | 2.7               |                      |                ✗                |
+| [GPerfTools]               | BSD-3-Clause      | 2.8              | 2.8               |                      |                ✗                |
 | [ICU4]                     | ICU               | 67.1             | 57.1              |          ✗           |                ✗                |
 | [Intel Decimal FP Library] | BSD-3-Clause      | 2.0 Update 2     | 2.0 Update 1      |                      |                ✗                |
 | [JSON-Schema-Test-Suite]   | MIT               |                  | 728066f9c5        |                      |                                 |
@@ -70,6 +70,7 @@ a notice will be included in
 [MurmurHash3]: https://github.com/aappleby/smhasher/blob/master/src/MurmurHash3.cpp
 [ocspbuilder]: https://github.com/wbond/ocspbuilder
 [ocspresponder]: https://github.com/threema-ch/ocspresponder
+[peglib]: https://github.com/yhirose/cpp-peglib
 [Pcre]: http://www.pcre.org/
 [S2]: https://github.com/google/s2geometry
 [SafeInt]: https://github.com/dcleblanc/SafeInt

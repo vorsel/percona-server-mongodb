@@ -60,13 +60,13 @@
 
 // Track locations of symbols.
 %locations
-%define api.location.file "location_gen.h"
+%define api.location.type {mongo::BSONLocation}
+%define parse.error verbose
 
 // Header only.
 %code requires {
+    #include "mongo/db/cst/bson_location.h"
     #include "mongo/db/cst/c_node.h"
-    #include "mongo/db/cst/key_fieldname.h"
-    #include "mongo/stdx/variant.h"
 
     // Forward declare any parameters needed for lexing/parsing.
     namespace mongo {
@@ -82,19 +82,23 @@
 // Cpp only.
 %code { 
     #include "mongo/db/cst/bson_lexer.h"
+    #include "mongo/db/cst/c_node_validation.h"
+    #include "mongo/db/cst/key_fieldname.h"
     #include "mongo/platform/decimal128.h"
+    #include "mongo/stdx/variant.h"
 
     namespace mongo {
         // Mandatory error function.
-        void PipelineParserGen::error (const PipelineParserGen::location_type& loc, 
+        void PipelineParserGen::error (const PipelineParserGen::location_type& loc,
                                        const std::string& msg) {
-            uasserted(ErrorCodes::FailedToParse, str::stream() << msg <<
-                    " at location " <<
-                    loc.begin.line << ":" << loc.begin.column <<
-                    " of input BSON. Lexer produced token of type " <<
-                    lexer[loc.begin.column].type_get() << "." );
+            uasserted(ErrorCodes::FailedToParse, str::stream() << msg << " at element " << loc);
         }
     }  // namespace mongo
+
+    // Default location for actions, called each time a rule is matched but before the action is 
+    // run. Also called when bison encounters a syntax ambiguity, which should not be relevant for
+    // mongo.
+    #define YYLLOC_DEFAULT(newPos, rhsPositions, nRhs)
 }
 
 // Parsing parameters, funneled through yyparse() to yylex().
@@ -106,106 +110,127 @@
 // Token definitions.
 //
 
+// If adding to this list, keep in alphabetical order since some rules expect a strict sorted order
+// of tokens based on their enum value. The appended strings are used to generate user-friendly 
+// error messages.
 %token 
-    START_OBJECT
-    END_OBJECT
-    START_ARRAY
-    END_ARRAY
-
+    ABS
+    ADD
+    AND
+    ARG_CHARS "chars argument"
+    ARG_COLL "coll argument"
+    ARG_DATE "date argument"
+    ARG_DATE_STRING "dateString argument"
+    ARG_FIND "find argument"
+    ARG_FORMAT "format argument"
+    ARG_INPUT "input argument"
+    ARG_ON_ERROR "onError argument"
+    ARG_ON_NULL "onNull argument"
+    ARG_OPTIONS "options argument"
+    ARG_PIPELINE "pipeline argument"
+    ARG_REGEX "regex argument"
+    ARG_REPLACEMENT "replacement argument"
+    ARG_SIZE "size argument"
+    ARG_TIMEZONE "timezone argument"
+    ARG_TO "to argument"
+    ATAN2
+    BOOL_FALSE "false"
+    BOOL_TRUE "true"
+    CEIL
+    CMP
+    CONCAT
+    CONST_EXPR
+    CONVERT
+    DATE_FROM_STRING
+    DATE_TO_STRING
+    DECIMAL_ZERO "zero (decimal)"
+    DIVIDE
+    DOUBLE_ZERO "zero (double)"
+    END_ARRAY "end of array"
+    END_OBJECT "end of object"
+    EQ
+    EXPONENT
+    FLOOR
+    GT
+    GTE
     ID
-
-    // Special literals
-    INT_ZERO
-    LONG_ZERO
-    DOUBLE_ZERO
-    DECIMAL_ZERO
-    BOOL_TRUE
-    BOOL_FALSE
-
-    // Reserve pipeline stage names.
+    INDEX_OF_BYTES
+    INDEX_OF_CP
+    INT_ZERO "zero (int)"
+    LITERAL
+    LN
+    LOG
+    LOGTEN
+    LONG_ZERO "zero (long)"
+    LT
+    LTE
+    LTRIM
+    MOD
+    MULTIPLY
+    NE
+    NOT
+    OR
+    POW
+    REGEX_FIND
+    REGEX_FIND_ALL
+    REGEX_MATCH
+    REPLACE_ALL
+    REPLACE_ONE
+    ROUND
+    RTRIM
+    SPLIT
+    SQRT
     STAGE_INHIBIT_OPTIMIZATION
     STAGE_LIMIT
     STAGE_PROJECT
     STAGE_SAMPLE
     STAGE_SKIP
     STAGE_UNION_WITH
-
-    // $unionWith arguments.
-    COLL_ARG
-    PIPELINE_ARG
-
-    // $sample arguments.
-    SIZE_ARG
-
-    // Expressions
-    ADD
-    ATAN2
-    AND
-    CONST_EXPR
-    LITERAL
-    OR
-    NOT
-    CMP
-    EQ
-    GT
-    GTE
-    LT
-    LTE
-    NE
-    CONVERT
+    START_ARRAY "array"
+    START_OBJECT "object"
+    STR_CASE_CMP
+    STR_LEN_BYTES
+    STR_LEN_CP
+    SUBSTR
+    SUBSTR_BYTES
+    SUBSTR_CP
+    SUBTRACT
     TO_BOOL
     TO_DATE
     TO_DECIMAL
     TO_DOUBLE
     TO_INT
     TO_LONG
+    TO_LOWER
     TO_OBJECT_ID
     TO_STRING
-    TYPE
-    ABS
-    CEIL
-    DIVIDE
-    EXPONENT
-    FLOOR
-    LN
-    LOG
-    LOGTEN
-    MOD
-    MULTIPLY
-    POW
-    ROUND
-    SQRT
-    SUBTRACT
+    TO_UPPER
+    TRIM
     TRUNC
-
-    // $convert arguments.
-    INPUT_ARG
-    TO_ARG
-    ON_ERROR_ARG
-    ON_NULL_ARG
+    TYPE
 
     END_OF_FILE 0 "EOF"
 ;
 
-%token <std::string> FIELDNAME
-%token <std::string> STRING
-%token <BSONBinData> BINARY
-%token <UserUndefined> UNDEFINED
-%token <OID> OBJECT_ID
-%token <Date_t> DATE_LITERAL
-%token <UserNull> JSNULL
-%token <BSONRegEx> REGEX
-%token <BSONDBRef> DB_POINTER
-%token <BSONCode> JAVASCRIPT
-%token <BSONSymbol> SYMBOL
-%token <BSONCodeWScope> JAVASCRIPT_W_SCOPE
-%token <int> INT_NON_ZERO
-%token <Timestamp> TIMESTAMP
-%token <long long> LONG_NON_ZERO
-%token <double> DOUBLE_NON_ZERO
-%token <Decimal128> DECIMAL_NON_ZERO
-%token <UserMinKey> MIN_KEY
-%token <UserMaxKey> MAX_KEY
+%token <std::string> FIELDNAME "fieldname"
+%token <std::string> STRING "string"
+%token <BSONBinData> BINARY "BinData"
+%token <UserUndefined> UNDEFINED "undefined"
+%token <OID> OBJECT_ID "ObjectID"
+%token <Date_t> DATE_LITERAL "Date"
+%token <UserNull> JSNULL "null"
+%token <BSONRegEx> REGEX "regex"
+%token <BSONDBRef> DB_POINTER "dbPointer"
+%token <BSONCode> JAVASCRIPT "Code"
+%token <BSONSymbol> SYMBOL "Symbol"
+%token <BSONCodeWScope> JAVASCRIPT_W_SCOPE "CodeWScope"
+%token <int> INT_NON_ZERO "non-zero integer"
+%token <long long> LONG_NON_ZERO "non-zero long"
+%token <double> DOUBLE_NON_ZERO "non-zero double"
+%token <Decimal128> DECIMAL_NON_ZERO "non-zero decimal"
+%token <Timestamp> TIMESTAMP "Timestamp"
+%token <UserMinKey> MIN_KEY "minKey"
+%token <UserMaxKey> MAX_KEY "maxKey"
 %token START_PIPELINE START_MATCH
 
 //
@@ -230,12 +255,17 @@
 // Aggregate expressions
 %nterm <CNode> expression compoundExpression exprFixedTwoArg expressionArray expressionObject
 %nterm <CNode> expressionFields maths add atan2 boolExps and or not literalEscapes const literal
+%nterm <CNode> stringExps concat dateFromString dateToString indexOfBytes indexOfCP
+%nterm <CNode> ltrim regexFind regexFindAll regexMatch regexArgs replaceOne replaceAll rtrim
+%nterm <CNode> split strLenBytes strLenCP strcasecmp substr substrBytes substrCP 
+%nterm <CNode> toLower toUpper trim
 %nterm <CNode> compExprs cmp eq gt gte lt lte ne
-%nterm <CNode> typeExpression typeValue convert toBool toDate toDecimal toDouble toInt toLong
+%nterm <CNode> typeExpression convert toBool toDate toDecimal toDouble toInt toLong
 %nterm <CNode> toObjectId toString type
 %nterm <CNode> abs ceil divide exponent floor ln log logten mod multiply pow round sqrt subtract trunc
 %nterm <std::pair<CNode::Fieldname, CNode>> onErrorArg onNullArg
-%nterm <std::vector<CNode>> expressions values
+%nterm <std::pair<CNode::Fieldname, CNode>> formatArg timezoneArg charsArg optionsArg
+%nterm <std::vector<CNode>> expressions values exprZeroToTwo
 %nterm <CNode> matchExpression filterFields filterVal
 
 %start start;
@@ -274,7 +304,7 @@ stage:
     inhibitOptimization | unionWith | skip | limit | project | sample
 ;
 
-sample: STAGE_SAMPLE START_OBJECT SIZE_ARG num END_OBJECT {
+sample: STAGE_SAMPLE START_OBJECT ARG_SIZE num END_OBJECT {
         $$ = CNode{CNode::ObjectChildren{std::pair{KeyFieldname::sample, 
                 CNode{CNode::ObjectChildren{
                     {KeyFieldname::sizeArg, $num},
@@ -290,7 +320,7 @@ inhibitOptimization:
 ;
 
 unionWith:
-    STAGE_UNION_WITH START_ORDERED_OBJECT COLL_ARG string PIPELINE_ARG double END_OBJECT {
+    STAGE_UNION_WITH START_ORDERED_OBJECT ARG_COLL string ARG_PIPELINE double END_OBJECT {
     auto pipeline = $double;
     $$ = CNode{CNode::ObjectChildren{std::pair{KeyFieldname::unionWith,
         CNode{CNode::ObjectChildren{
@@ -315,7 +345,17 @@ limit:
 
 project:
     STAGE_PROJECT START_OBJECT projectFields END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{std::pair{KeyFieldname::project, $projectFields}}};
+        auto&& fields = $projectFields;
+        if (auto inclusion = c_node_validation::validateProjectionAsInclusionOrExclusion(fields);
+            inclusion.isOK())
+            $$ = CNode{CNode::ObjectChildren{std::pair{inclusion.getValue() ==
+                                                       c_node_validation::IsInclusion::yes ?
+                                                       KeyFieldname::projectInclusion :
+                                                       KeyFieldname::projectExclusion,
+                                                       std::move(fields)}}};
+        else
+            // Pass the location of the $project token to the error reporting function.
+            error(@1, inclusion.getStatus().reason());
     }
 ;
 
@@ -340,6 +380,16 @@ projectField:
 
 projection:
     string
+    | binary
+    | undefined
+    | objectId
+    | date
+    | null
+    | regex
+    | dbPointer
+    | javascript
+    | symbol
+    | javascriptWScope
     | INT_NON_ZERO {
         $$ = CNode{NonZeroKey{$1}};
     }
@@ -370,6 +420,9 @@ projection:
     | BOOL_FALSE {
         $$ = CNode{KeyValue::falseKey};
     }
+    | timestamp
+    | minKey
+    | maxKey
     | compoundExpression
 ;
 
@@ -443,26 +496,53 @@ argAsUserFieldname:
     // Here we need to list all keys representing args passed to operators so they can be converted
     // back to string in contexts where they're not special. It's laborious but this is the
     // perennial Bison way.
-    COLL_ARG {
+    ARG_COLL {
         $$ = UserFieldname{"coll"};
     }
-    | PIPELINE_ARG {
+    | ARG_PIPELINE {
         $$ = UserFieldname{"pipeline"};
     }
-    | SIZE_ARG {
+    | ARG_SIZE {
         $$ = UserFieldname{"size"};
     }
-    | INPUT_ARG {
+    | ARG_INPUT {
         $$ = UserFieldname{"input"};
     }
-    | TO_ARG {
+    | ARG_TO {
         $$ = UserFieldname{"to"};
     }
-    | ON_ERROR_ARG {
+    | ARG_ON_ERROR {
         $$ = UserFieldname{"onError"};
     }
-    | ON_NULL_ARG {
+    | ARG_ON_NULL {
         $$ = UserFieldname{"onNull"};
+    }
+    | ARG_DATE_STRING {
+        $$ = UserFieldname{"dateString"};
+    }
+    | ARG_FORMAT {
+        $$ = UserFieldname{"format"};
+    }
+    | ARG_TIMEZONE {
+        $$ = UserFieldname{"timezone"};
+    }
+    | ARG_DATE {
+        $$ = UserFieldname{"date"};
+    }
+    | ARG_CHARS {
+        $$ = UserFieldname{"chars"};
+    }
+    | ARG_REGEX {
+        $$ = UserFieldname{"regex"};
+    }
+    | ARG_OPTIONS {
+        $$ = UserFieldname{"options"};
+    }
+    | ARG_FIND {
+        $$ = UserFieldname{"find"};
+    }
+    | ARG_REPLACEMENT {
+        $$ = UserFieldname{"replacement"};
     }
 ;
 
@@ -585,6 +665,72 @@ aggExprAsUserFieldname:
     }
     | TRUNC {
         $$ = UserFieldname{"$trunc"};
+    }
+    | CONCAT {
+        $$ = UserFieldname{"$concat"};
+    }
+    | DATE_FROM_STRING {
+        $$ = UserFieldname{"$dateFromString"};
+    }
+    | DATE_TO_STRING {
+        $$ = UserFieldname{"$dateToString"};
+    }
+    | INDEX_OF_BYTES {
+        $$ = UserFieldname{"$indexOfBytes"};
+    }
+    | INDEX_OF_CP {
+        $$ = UserFieldname{"$indexOfCP"};
+    }
+    | LTRIM {
+        $$ = UserFieldname{"$ltrim"};
+    }
+    | REGEX_FIND {
+        $$ = UserFieldname{"$regexFind"};
+    }
+    | REGEX_FIND_ALL {
+        $$ = UserFieldname{"$regexFindAll"};
+    }
+    | REGEX_MATCH {
+        $$ = UserFieldname{"$regexMatch"};
+    }
+    | REPLACE_ONE {
+        $$ = UserFieldname{"$replaceOne"};
+    }
+    | REPLACE_ALL {
+        $$ = UserFieldname{"$replaceAll"};
+    }
+    | RTRIM {
+        $$ = UserFieldname{"$rtrim"};
+    }
+    | SPLIT {
+        $$ = UserFieldname{"$split"};
+    }
+    | STR_LEN_BYTES {
+        $$ = UserFieldname{"$strLenBytes"};
+    }
+    | STR_LEN_CP {
+        $$ = UserFieldname{"$strLenCP"};
+    }
+    | STR_CASE_CMP {
+        $$ = UserFieldname{"$strcasecmp"};
+    }
+    | SUBSTR {
+        $$ = UserFieldname{"$substr"};
+    }
+    | SUBSTR_BYTES {
+        $$ = UserFieldname{"$substrBytes"};
+    }
+    | SUBSTR_CP {
+        $$ = UserFieldname{"$substrCP"};
+    }
+    | TO_LOWER {
+        $$ = UserFieldname{"$toLower"};
+    }
+    | TRIM {
+        $$ = UserFieldname{"$trim"};
+    }
+    | TO_UPPER {
+        $$ = UserFieldname{"$toUpper"};
     }
 ;
 
@@ -762,7 +908,7 @@ exprFixedTwoArg: START_ARRAY expression[expr1] expression[expr2] END_ARRAY {
 
 compoundExpression:
     expressionArray | expressionObject | maths | boolExps | literalEscapes | compExprs
-    | typeExpression
+    | typeExpression | stringExps
 ;
 
 // These are arrays occuring in Expressions outside of $const/$literal. They may contain further
@@ -814,12 +960,9 @@ maths:
 ;
 
 add:
-    START_OBJECT ADD START_ARRAY expression[expr1] expression[expr2] expressions END_ARRAY END_OBJECT {
+    START_OBJECT ADD expressionArray END_OBJECT {
         $$ = CNode{CNode::ObjectChildren{{KeyFieldname::add,
-                                          CNode{CNode::ArrayChildren{$expr1, $expr2}}}}};
-        auto&& others = $expressions;
-        auto&& array = $$.objectChildren()[0].second.arrayChildren();
-        array.insert(array.end(), others.begin(), others.end());
+                                          $expressionArray}}};
     }
 ;
 
@@ -920,22 +1063,16 @@ boolExps:
 ;
 
 and:
-    START_OBJECT AND START_ARRAY expression[expr1] expression[expr2] expressions END_ARRAY END_OBJECT {
+    START_OBJECT AND expressionArray END_OBJECT {
         $$ = CNode{CNode::ObjectChildren{{KeyFieldname::andExpr,
-                                          CNode{CNode::ArrayChildren{$expr1, $expr2}}}}};
-        auto&& others = $expressions;
-        auto&& array = $$.objectChildren()[0].second.arrayChildren();
-        array.insert(array.end(), others.begin(), others.end());
+                                          $expressionArray}}};
     }
 ;
 
 or:
-    START_OBJECT OR START_ARRAY expression[expr1] expression[expr2] expressions END_ARRAY END_OBJECT {
+    START_OBJECT OR expressionArray END_OBJECT {
         $$ = CNode{CNode::ObjectChildren{{KeyFieldname::orExpr,
-                                          CNode{CNode::ArrayChildren{$expr1, $expr2}}}}};
-        auto&& others = $expressions;
-        auto&& array = $$.objectChildren()[0].second.arrayChildren();
-        array.insert(array.end(), others.begin(), others.end());
+                                          $expressionArray}}};
     }
 ;
 
@@ -943,6 +1080,245 @@ not:
     START_OBJECT NOT START_ARRAY expression END_ARRAY END_OBJECT {
         $$ = CNode{CNode::ObjectChildren{{KeyFieldname::notExpr,
                                           CNode{CNode::ArrayChildren{$expression}}}}};
+    }
+;
+
+stringExps:
+    concat | dateFromString | dateToString | indexOfBytes | indexOfCP | ltrim | regexFind
+    | regexFindAll | regexMatch | replaceOne | replaceAll | rtrim | split | strLenBytes | strLenCP 
+    | strcasecmp | substr | substrBytes | substrCP | toLower | trim | toUpper
+;
+
+concat:
+    START_OBJECT CONCAT START_ARRAY expressions END_ARRAY END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::concat,
+                                          CNode{CNode::ArrayChildren{}}}}};
+        auto&& others = $expressions;
+        auto&& array = $$.objectChildren()[0].second.arrayChildren();
+        array.insert(array.end(), others.begin(), others.end());
+    }
+;
+
+formatArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::formatArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_FORMAT expression {
+        $$ = std::pair{KeyFieldname::formatArg, $expression};
+    }
+;
+
+timezoneArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::timezoneArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_TIMEZONE expression {
+        $$ = std::pair{KeyFieldname::timezoneArg, $expression};
+    }
+;
+
+dateFromString:
+    START_OBJECT DATE_FROM_STRING START_ORDERED_OBJECT ARG_DATE_STRING expression formatArg timezoneArg 
+            onErrorArg onNullArg END_OBJECT END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dateFromString, CNode{CNode::ObjectChildren{
+                                         {KeyFieldname::dateStringArg, $expression},
+                                         $formatArg, $timezoneArg, $onErrorArg, $onNullArg}}}}};
+    }
+;
+
+dateToString:
+    START_OBJECT DATE_TO_STRING START_ORDERED_OBJECT ARG_DATE expression formatArg timezoneArg onNullArg 
+            END_OBJECT END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dateToString, CNode{CNode::ObjectChildren{
+                                         {KeyFieldname::dateArg, $expression},
+                                         $formatArg, $timezoneArg, $onNullArg}}}}};
+    }
+;
+
+exprZeroToTwo:
+    %empty { 
+        $$ = CNode::ArrayChildren{};
+    }
+    | expression {
+        $$ = CNode::ArrayChildren{$expression};
+    }
+    | expression[expr1] expression[expr2] {
+        $$ = CNode::ArrayChildren{$expr1, $expr2};
+    }
+;
+
+indexOfBytes:
+    START_OBJECT INDEX_OF_BYTES START_ARRAY expression[expr1] expression[expr2] exprZeroToTwo 
+            END_ARRAY END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::indexOfBytes, 
+                    CNode{CNode::ArrayChildren{$expr1, $expr2}}}}};
+        auto&& others = $exprZeroToTwo;
+        auto&& array = $$.objectChildren()[0].second.arrayChildren();
+        array.insert(array.end(), others.begin(), others.end());
+    }
+;
+
+indexOfCP:
+    START_OBJECT INDEX_OF_CP START_ARRAY expression[expr1] expression[expr2] exprZeroToTwo 
+            END_ARRAY END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::indexOfCP, 
+                    CNode{CNode::ArrayChildren{$expr1, $expr2}}}}};
+        auto&& others = $exprZeroToTwo;
+        auto&& array = $$.objectChildren()[0].second.arrayChildren();
+        array.insert(array.end(), others.begin(), others.end());
+    }
+;
+
+charsArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::charsArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_CHARS expression {
+        $$ = std::pair{KeyFieldname::charsArg, $expression};
+    }
+;
+
+ltrim:
+    START_OBJECT LTRIM START_ORDERED_OBJECT charsArg ARG_INPUT expression END_OBJECT END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::ltrim, CNode{CNode::ObjectChildren{
+                                         {KeyFieldname::inputArg, $expression},
+                                         $charsArg}}}}};
+    }
+;
+
+rtrim:
+    START_OBJECT RTRIM START_ORDERED_OBJECT charsArg ARG_INPUT expression END_OBJECT END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::rtrim, CNode{CNode::ObjectChildren{
+                                         {KeyFieldname::inputArg, $expression},
+                                         $charsArg}}}}};
+    }
+;
+
+trim:
+    START_OBJECT TRIM START_ORDERED_OBJECT charsArg ARG_INPUT expression END_OBJECT END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::trim, CNode{CNode::ObjectChildren{
+                                         {KeyFieldname::inputArg, $expression},
+                                         $charsArg}}}}};
+    }
+;
+
+optionsArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::optionsArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_OPTIONS expression {
+        $$ = std::pair{KeyFieldname::optionsArg, $expression};
+    }
+;
+
+regexArgs: START_ORDERED_OBJECT ARG_INPUT expression[input] optionsArg ARG_REGEX expression[regex] END_OBJECT {
+    // Note that the order of these arguments must match the constructor for the regex expression.
+    $$ = CNode{CNode::ObjectChildren{
+                 {KeyFieldname::inputArg, $input},
+                 {KeyFieldname::regexArg, $regex},
+                 $optionsArg}};
+};
+
+regexFind:
+    START_OBJECT REGEX_FIND regexArgs END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::regexFind, $regexArgs}}};
+    }
+;
+
+regexFindAll:
+    START_OBJECT REGEX_FIND_ALL regexArgs END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::regexFindAll, $regexArgs}}};
+    }
+;
+
+regexMatch:
+    START_OBJECT REGEX_MATCH regexArgs END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::regexMatch, $regexArgs}}};
+    }
+;
+
+replaceOne:
+    START_OBJECT REPLACE_ONE START_ORDERED_OBJECT ARG_FIND expression[find] ARG_INPUT expression[input]
+        ARG_REPLACEMENT expression[replace] END_OBJECT END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::replaceOne, CNode{CNode::ObjectChildren{
+                                         {KeyFieldname::inputArg, $input},
+                                         {KeyFieldname::findArg, $find},
+                                         {KeyFieldname::replacementArg, $replace}}}}}};
+    }
+;
+
+replaceAll:
+    START_OBJECT REPLACE_ALL START_ORDERED_OBJECT ARG_FIND expression[find] ARG_INPUT expression[input]
+        ARG_REPLACEMENT expression[replace] END_OBJECT END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::replaceAll, CNode{CNode::ObjectChildren{
+                                         {KeyFieldname::inputArg, $input},
+                                         {KeyFieldname::findArg, $find},
+                                         {KeyFieldname::replacementArg, $replace}}}}}};
+    }
+;
+
+split:
+    START_OBJECT SPLIT START_ARRAY expression[expr1] expression[expr2] END_ARRAY END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::split,
+                                          CNode{CNode::ArrayChildren{$expr1, $expr2}}}}};
+    }
+;
+
+strLenBytes:
+    START_OBJECT STR_LEN_BYTES expression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::strLenBytes,
+                                          $expression}}};
+    }
+;
+
+strLenCP:
+    START_OBJECT STR_LEN_CP expression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::strLenCP,
+                                          $expression}}};
+    }
+;
+
+strcasecmp:
+    START_OBJECT STR_CASE_CMP START_ARRAY expression[expr1] expression[expr2] 
+            END_ARRAY END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::strcasecmp, 
+                    CNode{CNode::ArrayChildren{$expr1, $expr2}}}}};
+    }
+;
+
+substr:
+    START_OBJECT SUBSTR START_ARRAY expression[expr1] expression[expr2] 
+            expression[expr3] END_ARRAY END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::substr, 
+                    CNode{CNode::ArrayChildren{$expr1, $expr2, $expr3}}}}};
+    }
+;
+
+substrBytes:
+    START_OBJECT SUBSTR_BYTES START_ARRAY expression[expr1] expression[expr2] 
+            expression[expr3] END_ARRAY END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::substrBytes, 
+                    CNode{CNode::ArrayChildren{$expr1, $expr2, $expr3}}}}};
+    }
+;
+
+substrCP:
+    START_OBJECT SUBSTR_CP START_ARRAY expression[expr1] expression[expr2] 
+            expression[expr3] END_ARRAY END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::substrCP, 
+                    CNode{CNode::ArrayChildren{$expr1, $expr2, $expr3}}}}};
+    }
+;
+
+toLower:
+    START_OBJECT TO_LOWER expression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::toLower, $expression}}};
+    }
+;
+
+toUpper:
+    START_OBJECT TO_UPPER expression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::toUpper, $expression}}};
     }
 ;
 
@@ -1067,17 +1443,12 @@ typeExpression:
     | type
 ;
 
-// Used in 'to' argument for $convert. Can be any valid expression that resolves to a string
-// or numeric identifier of a BSON type.
-typeValue:
-    string | int | long | double | decimal;
-
 // Optional argument for $convert.
 onErrorArg:
     %empty {
         $$ = std::pair{KeyFieldname::onErrorArg, CNode{KeyValue::absentKey}};
     }
-    | ON_ERROR_ARG expression {
+    | ARG_ON_ERROR expression {
         $$ = std::pair{KeyFieldname::onErrorArg, $expression};
     }
 ;
@@ -1087,16 +1458,17 @@ onNullArg:
     %empty {
         $$ = std::pair{KeyFieldname::onNullArg, CNode{KeyValue::absentKey}};
     }
-    | ON_NULL_ARG expression {
+    | ARG_ON_NULL expression {
         $$ = std::pair{KeyFieldname::onNullArg, $expression};
     }
 ;
 
 convert:
-    START_OBJECT CONVERT START_ORDERED_OBJECT INPUT_ARG expression TO_ARG typeValue onErrorArg onNullArg END_OBJECT END_OBJECT {
+    START_OBJECT CONVERT START_ORDERED_OBJECT ARG_INPUT expression[input] onErrorArg onNullArg
+        ARG_TO expression[to] END_OBJECT END_OBJECT {
         $$ = CNode{CNode::ObjectChildren{{KeyFieldname::convert, CNode{CNode::ObjectChildren{
-                                         {KeyFieldname::inputArg, $expression},
-                                         {KeyFieldname::toArg, $typeValue},
+                                         {KeyFieldname::inputArg, $input},
+                                         {KeyFieldname::toArg, $to},
                                          $onErrorArg, $onNullArg}}}}};
     }
 ;

@@ -86,7 +86,7 @@ void onDbVersionMismatch(OperationContext* opCtx,
 SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext,
                                                   const NamespaceString nss,
                                                   bool runRecover) {
-    return ExecutorFuture<void>(migrationutil::getMigrationUtilExecutor())
+    return ExecutorFuture<void>(Grid::get(serviceContext)->getExecutorPool()->getFixedExecutor())
         .then([=] {
             ThreadClient tc("RecoverRefreshThread", serviceContext);
             {
@@ -103,7 +103,7 @@ SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext
             ON_BLOCK_EXIT([&] {
                 UninterruptibleLockGuard noInterrupt(opCtx->lockState());
                 AutoGetCollection autoColl(
-                    opCtx.get(), nss, MODE_IX, AutoGetCollection::ViewMode::kViewsForbidden);
+                    opCtx.get(), nss, MODE_IX, AutoGetCollectionViewMode::kViewsForbidden);
 
                 auto* const csr = CollectionShardingRuntime::get(opCtx.get(), nss);
                 auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx.get(), csr);
@@ -153,15 +153,12 @@ void onShardVersionMismatch(OperationContext* opCtx,
         std::shared_ptr<Notification<void>> critSecSignal;
         boost::optional<SharedSemiFuture<void>> inRecoverOrRefresh;
 
-        // Flag set to true if a recovery needs to be eventually performed
-        bool runRecover;
-
         // Flag indicating wether the current thread has triggered a recover/refresh
         bool triggeredRecoverRefresh = false;
 
         {
             AutoGetCollection autoColl(
-                opCtx, nss, MODE_IS, AutoGetCollection::ViewMode::kViewsForbidden);
+                opCtx, nss, MODE_IS, AutoGetCollectionViewMode::kViewsForbidden);
 
             auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
 
@@ -186,7 +183,8 @@ void onShardVersionMismatch(OperationContext* opCtx,
                     }
                 }
 
-                runRecover = collDesc ? false : true;
+                // If the shard doesn't yet know its filtering metadata, recovery needs to be run
+                const bool runRecover = collDesc ? false : true;
 
                 // If the critical section is not busy and no recover/refresh is ongoing,
                 // initialize the RecoverRefreshThread thread and associate it to the CSR.
@@ -235,19 +233,22 @@ ScopedShardVersionCriticalSection::ScopedShardVersionCriticalSection(OperationCo
             AutoGetCollection autoColl(_opCtx,
                                        _nss,
                                        MODE_S,
-                                       AutoGetCollection::ViewMode::kViewsForbidden,
+                                       AutoGetCollectionViewMode::kViewsForbidden,
                                        _opCtx->getServiceContext()->getPreciseClockSource()->now() +
                                            Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
 
             auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
+
             inRecoverOrRefresh = csr->getShardVersionRecoverRefreshFuture(_opCtx);
             critSecSignal =
                 csr->getCriticalSectionSignal(_opCtx, ShardingMigrationCriticalSection::kWrite);
+
             if (!inRecoverOrRefresh && !critSecSignal) {
                 auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
                 inRecoverOrRefresh = csr->getShardVersionRecoverRefreshFuture(_opCtx);
                 critSecSignal =
                     csr->getCriticalSectionSignal(_opCtx, ShardingMigrationCriticalSection::kWrite);
+
                 if (!inRecoverOrRefresh && !critSecSignal) {
                     CollectionShardingRuntime::get(_opCtx, _nss)
                         ->enterCriticalSectionCatchUpPhase(csrLock);
@@ -285,7 +286,7 @@ void ScopedShardVersionCriticalSection::enterCommitPhase() {
     AutoGetCollection autoColl(_opCtx,
                                _nss,
                                MODE_IS,
-                               AutoGetCollection::ViewMode::kViewsForbidden,
+                               AutoGetCollectionViewMode::kViewsForbidden,
                                _opCtx->getServiceContext()->getPreciseClockSource()->now() +
                                    Milliseconds(migrationLockAcquisitionMaxWaitMS.load()));
     auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
@@ -327,7 +328,7 @@ CollectionMetadata forceGetCurrentMetadata(OperationContext* opCtx, const Namesp
         return CollectionMetadata();
     }
 
-    return CollectionMetadata(routingInfo.cm(), shardingState->shardId());
+    return CollectionMetadata(*routingInfo.cm(), shardingState->shardId());
 }
 
 ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
@@ -420,7 +421,7 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
         }
     }
 
-    CollectionMetadata metadata(std::move(cm), shardingState->shardId());
+    CollectionMetadata metadata(*cm, shardingState->shardId());
     const auto newShardVersion = metadata.getShardVersion();
 
     csr->setFilteringMetadata(opCtx, std::move(metadata));

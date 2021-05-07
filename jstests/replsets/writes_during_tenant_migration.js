@@ -3,7 +3,7 @@
  * then rejects the writes if the migration commits and and internally retries the writes if the
  * migration aborts.
  *
- * @tags: [requires_fcv_46]
+ * @tags: [requires_fcv_47]
  */
 (function() {
 'use strict';
@@ -386,6 +386,7 @@ const testCases = {
     _configsvrUpdateZoneKeyRange: {skip: isNotRunOnUserDatabase},
     _flushDatabaseCacheUpdates: {skip: isNotRunOnUserDatabase},
     _flushRoutingTableCacheUpdates: {skip: isNotRunOnUserDatabase},
+    _flushRoutingTableCacheUpdatesWithWriteConcern: {skip: isNotRunOnUserDatabase},
     _getNextSessionMods: {skip: isNotRunOnUserDatabase},
     _getUserCacheGeneration: {skip: isNotRunOnUserDatabase},
     _hashBSONElement: {skip: isNotRunOnUserDatabase},
@@ -663,6 +664,7 @@ const testCases = {
     grantPrivilegesToRole: {skip: isAuthCommand},
     grantRolesToRole: {skip: isAuthCommand},
     grantRolesToUser: {skip: isAuthCommand},
+    hello: {skip: isNotRunOnUserDatabase},
     hostInfo: {skip: isNotRunOnUserDatabase},
     httpClientRequest: {skip: isNotRunOnUserDatabase},
     insert: {
@@ -681,7 +683,6 @@ const testCases = {
     },
     internalRenameIfOptionsAndIndexesMatch: {skip: isNotRunOnUserDatabase},
     invalidateUserCache: {skip: isNotRunOnUserDatabase},
-    isMaster: {skip: isNotRunOnUserDatabase},
     killAllSessions: {skip: isNotRunOnUserDatabase},
     killAllSessionsByPattern: {skip: isNotRunOnUserDatabase},
     killCursors: {skip: isNotWriteCommand},
