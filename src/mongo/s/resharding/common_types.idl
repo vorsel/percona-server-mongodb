@@ -47,8 +47,8 @@ enums:
             kCloning: "cloning"
             kMirroring: "mirroring"
             kCommitted: "committed"
-            kDropping: "dropping"
             kRenaming: "renaming"
+            kDropping: "dropping"
             kDone: "done"
             kError: "error"
 
@@ -56,17 +56,20 @@ enums:
         description: "The current state of a donor shard for a resharding operation."
         type: string
         values:
-            kInitializing: "initialized"
-            kDonatingInitialData: "donating-initial-data"
-            kDonatingOplogEntries: "donating-oplog-entries"
+            kUnused: "unused"
+            kInitializing: "initializing"
+            kDonating: "donating"
             kMirroring: "mirroring"
             kDropping: "dropping"
+            kDone: "done"
             kError: "error"
 
     RecipientState:
         description: "The current state of a recipient shard for a resharding operation."
         type: string
         values:
+            kUnused: "unused"
+            kInitializing: "initializing"
             kCloning: "cloning"
             kApplying: "applying"
             kSteadyState: "steady-state"

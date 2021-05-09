@@ -336,7 +336,6 @@ Status V2UserDocumentParser::parseRoleVector(const BSONArray& rolesArray,
 
 Status V2UserDocumentParser::initializeAuthenticationRestrictionsFromUserDocument(
     const BSONObj& privDoc, User* user) const {
-    RestrictionDocuments::sequence_type restrictionVector;
 
     // Restrictions on the user
     const auto authenticationRestrictions = privDoc[AUTHENTICATION_RESTRICTIONS_FIELD_NAME];
@@ -352,7 +351,9 @@ Status V2UserDocumentParser::initializeAuthenticationRestrictionsFromUserDocumen
             return restrictions.getStatus();
         }
 
-        restrictionVector.push_back(restrictions.getValue());
+        if (user) {
+            user->setRestrictions(RestrictionDocuments({std::move(restrictions.getValue())}));
+        }
     }
 
     // Restrictions from roles
@@ -363,6 +364,7 @@ Status V2UserDocumentParser::initializeAuthenticationRestrictionsFromUserDocumen
                           "'inheritedAuthenticationRestrictions' field must be an array");
         }
 
+        RestrictionDocuments::sequence_type authRest;
         for (const auto& roleRestriction : BSONArray(inherited.Obj())) {
             if (roleRestriction.type() != Array) {
                 return Status(ErrorCodes::UnsupportedFormat,
@@ -375,12 +377,14 @@ Status V2UserDocumentParser::initializeAuthenticationRestrictionsFromUserDocumen
                 return roleRestrictionDoc.getStatus();
             }
 
-            restrictionVector.push_back(roleRestrictionDoc.getValue());
+            if (user) {
+                authRest.push_back(std::move(roleRestrictionDoc.getValue()));
+            }
         }
-    }
 
-    if (user) {
-        user->setRestrictions(RestrictionDocuments(restrictionVector));
+        if (user) {
+            user->setIndirectRestrictions(RestrictionDocuments(std::move(authRest)));
+        }
     }
 
     return Status::OK();
@@ -417,6 +421,10 @@ Status V2UserDocumentParser::initializeUserRolesFromUserDocument(const BSONObj& 
 Status V2UserDocumentParser::initializeUserIndirectRolesFromUserDocument(const BSONObj& privDoc,
                                                                          User* user) const {
     BSONElement indirectRolesElement = privDoc[INHERITED_ROLES_FIELD_NAME];
+
+    if (!indirectRolesElement) {
+        return Status::OK();
+    }
 
     if (indirectRolesElement.type() != Array) {
         return Status(ErrorCodes::UnsupportedFormat,
@@ -495,6 +503,27 @@ Status V2UserDocumentParser::initializeUserPrivilegesFromUserDocument(const BSON
     }
     user->setPrivileges(privileges);
     return Status::OK();
+}
+
+Status V2UserDocumentParser::initializeUserFromUserDocument(const BSONObj& privDoc,
+                                                            User* user) const try {
+    auto userName = extractUserNameFromUserDocument(privDoc);
+    uassert(ErrorCodes::BadValue,
+            str::stream() << "User name from privilege document \"" << userName
+                          << "\" doesn't match name of provided User \""
+                          << user->getName().getUser() << "\"",
+            userName == user->getName().getUser());
+
+    user->setID(extractUserIDFromUserDocument(privDoc));
+    uassertStatusOK(initializeUserCredentialsFromUserDocument(user, privDoc));
+    uassertStatusOK(initializeUserRolesFromUserDocument(privDoc, user));
+    uassertStatusOK(initializeUserIndirectRolesFromUserDocument(privDoc, user));
+    uassertStatusOK(initializeUserPrivilegesFromUserDocument(privDoc, user));
+    uassertStatusOK(initializeAuthenticationRestrictionsFromUserDocument(privDoc, user));
+
+    return Status::OK();
+} catch (const AssertionException& ex) {
+    return ex.toStatus();
 }
 
 }  // namespace mongo

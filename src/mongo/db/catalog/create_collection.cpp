@@ -70,13 +70,13 @@ Status _createView(OperationContext* opCtx,
 
         if (opCtx->writesAreReplicated() &&
             !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
-            return Status(ErrorCodes::NotMaster,
+            return Status(ErrorCodes::NotWritablePrimary,
                           str::stream() << "Not primary while creating collection " << nss);
         }
 
         // Create 'system.views' in a separate WUOW if it does not exist.
         WriteUnitOfWork wuow(opCtx);
-        Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+        const Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
             opCtx, NamespaceString(db->getSystemViewsName()));
         if (!coll) {
             coll = db->createCollection(opCtx, NamespaceString(db->getSystemViewsName()));
@@ -130,7 +130,7 @@ Status _createCollection(OperationContext* opCtx,
 
         if (opCtx->writesAreReplicated() &&
             !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss)) {
-            return Status(ErrorCodes::NotMaster,
+            return Status(ErrorCodes::NotWritablePrimary,
                           str::stream() << "Not primary while creating collection " << nss);
         }
 

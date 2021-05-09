@@ -445,9 +445,14 @@ repl::OpTime MigrationDestinationManager::cloneDocumentsFromDonor(
     repl::OpTime lastOpApplied;
 
     stdx::thread inserterThread{[&] {
-        Client::initKillableThread("chunkInserter", opCtx->getServiceContext());
+        Client::initThread("chunkInserter", opCtx->getServiceContext(), nullptr);
+        auto client = Client::getCurrent();
+        {
+            stdx::lock_guard lk(*client);
+            client->setSystemOperationKillableByStepdown(lk);
+        }
 
-        auto inserterOpCtx = Client::getCurrent()->makeOperationContext();
+        auto inserterOpCtx = client->makeOperationContext();
         auto consumerGuard = makeGuard([&] {
             batches.closeConsumerEnd();
             lastOpApplied = repl::ReplClientInfo::forClient(inserterOpCtx->getClient()).getLastOp();
@@ -713,7 +718,7 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
 
         // Checks that the collection's UUID matches the donor's.
         auto checkUUIDsMatch = [&](const Collection* collection) {
-            uassert(ErrorCodes::NotMaster,
+            uassert(ErrorCodes::NotWritablePrimary,
                     str::stream() << "Unable to create collection " << nss.ns()
                                   << " because the node is not primary",
                     repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nss));
@@ -732,7 +737,7 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
 
         // Gets the missing indexes and checks if the collection is empty (auto-healing is
         // possible).
-        auto checkEmptyOrGetMissingIndexesFromDonor = [&](Collection* collection) {
+        auto checkEmptyOrGetMissingIndexesFromDonor = [&](const Collection* collection) {
             auto indexCatalog = collection->getIndexCatalog();
             auto indexSpecs = indexCatalog->removeExistingIndexesNoChecks(
                 opCtx, collectionOptionsAndIndexes.indexSpecs);
@@ -798,8 +803,14 @@ void MigrationDestinationManager::cloneCollectionIndexesAndOptions(
 }
 
 void MigrationDestinationManager::_migrateThread() {
-    Client::initKillableThread("migrateThread", getGlobalServiceContext());
-    auto uniqueOpCtx = Client::getCurrent()->makeOperationContext();
+    Client::initThread("migrateThread");
+    auto client = Client::getCurrent();
+    {
+        stdx::lock_guard lk(*client);
+        client->setSystemOperationKillableByStepdown(lk);
+    }
+
+    auto uniqueOpCtx = client->makeOperationContext();
     auto opCtx = uniqueOpCtx.get();
 
     if (AuthorizationManager::get(opCtx->getServiceContext())->isAuthEnabled()) {
@@ -946,7 +957,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
     auto newClient = outerOpCtx->getServiceContext()->makeClient("MigrationCoordinator");
     {
         stdx::lock_guard<Client> lk(*newClient.get());
-        newClient->setSystemOperationKillable(lk);
+        newClient->setSystemOperationKillableByStepdown(lk);
     }
 
     AlternativeClientRegion acr(newClient);
@@ -1002,7 +1013,7 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                     return toInsert;
                 }());
 
-                const WriteResult reply = performInserts(opCtx, insertOp, true);
+                const auto reply = write_ops_exec::performInserts(opCtx, insertOp, true);
 
                 for (unsigned long i = 0; i < reply.results.size(); ++i) {
                     uassertStatusOKWithContext(

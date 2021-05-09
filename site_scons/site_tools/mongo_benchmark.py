@@ -25,6 +25,7 @@ Pseudo-builders for building and registering benchmarks.
 """
 from SCons.Script import Action
 
+from site_scons.mongo import insort_wrapper
 
 def exists(env):
     return True
@@ -36,10 +37,10 @@ def build_benchmark(env, target, source, **kwargs):
     bmEnv.InjectThirdParty(libraries=["benchmark"])
 
     if bmEnv.TargetOSIs("windows"):
-        bmEnv.Append(LIBS=["ShLwApi.lib"])
+        bmEnv.Append(LIBS=["ShLwApi"])
 
     libdeps = kwargs.get("LIBDEPS", bmEnv.get("LIBDEPS", [])).copy()
-    libdeps.append("$BUILD_DIR/mongo/unittest/benchmark_main")
+    insort_wrapper(libdeps, "$BUILD_DIR/mongo/unittest/benchmark_main")
 
     kwargs["LIBDEPS"] = libdeps
     benchmark_test_components = {"tests", "benchmarks"}

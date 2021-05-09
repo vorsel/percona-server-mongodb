@@ -89,6 +89,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog.h"
 #include "mongo/db/shutdown_in_progress_quiesce_info.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/db/vector_clock_mutable.h"
@@ -2295,7 +2296,7 @@ StatusWith<OpTime> ReplicationCoordinatorImpl::getLatestWriteOpTime(OperationCon
     Lock::GlobalLock globalLock(opCtx, MODE_IS);
     // Check if the node is primary after acquiring global IS lock.
     if (!canAcceptNonLocalWrites()) {
-        return {ErrorCodes::NotMaster, "Not primary so can't get latest write optime"};
+        return {ErrorCodes::NotWritablePrimary, "Not primary so can't get latest write optime"};
     }
     auto oplog = LocalOplogInfo::get(opCtx)->getCollection();
     if (!oplog) {
@@ -2331,7 +2332,7 @@ BSONObj ReplicationCoordinatorImpl::runCmdOnPrimaryAndAwaitResponse(
 
     const auto primaryHostAndPort = getCurrentPrimaryHostAndPort();
     if (primaryHostAndPort.empty()) {
-        uassertStatusOK(Status{ErrorCodes::NoConfigMaster, "Primary is unknown/down."});
+        uassertStatusOK(Status{ErrorCodes::NoConfigPrimary, "Primary is unknown/down."});
     }
 
     // Run the command via AsyncDBClient which performs a network call. This is also the desired
@@ -2379,7 +2380,7 @@ void ReplicationCoordinatorImpl::_killConflictingOpsOnStepUpAndStepDown(
 
     for (ServiceContext::LockedClientsCursor cursor(serviceCtx); Client* client = cursor.next();) {
         stdx::lock_guard<Client> lk(*client);
-        if (client->isFromSystemConnection() && !client->shouldKillSystemOperation(lk)) {
+        if (client->isFromSystemConnection() && !client->canKillSystemOperationInStepdown(lk)) {
             continue;
         }
 
@@ -2388,7 +2389,8 @@ void ReplicationCoordinatorImpl::_killConflictingOpsOnStepUpAndStepDown(
         // Don't kill step up/step down thread.
         if (toKill && !toKill->isKillPending() && toKill->getOpID() != rstlOpCtx->getOpID()) {
             auto locker = toKill->lockState();
-            if (locker->wasGlobalLockTakenInModeConflictingWithWrites() ||
+            if (toKill->shouldAlwaysInterruptAtStepDownOrUp() ||
+                locker->wasGlobalLockTakenInModeConflictingWithWrites() ||
                 PrepareConflictTracker::get(toKill).isWaitingOnPrepareConflict()) {
                 serviceCtx->killOperation(lk, toKill, reason);
                 arsc->incrementUserOpsKilled();
@@ -2530,7 +2532,9 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     // Note this check is inherently racy - it's always possible for the node to stepdown from some
     // other path before we acquire the global exclusive lock.  This check is just to try to save us
     // from acquiring the global X lock unnecessarily.
-    uassert(ErrorCodes::NotMaster, "not primary so can't step down", getMemberState().primary());
+    uassert(ErrorCodes::NotWritablePrimary,
+            "not primary so can't step down",
+            getMemberState().primary());
 
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &stepdownHangBeforeRSTLEnqueue, opCtx, "stepdownHangBeforeRSTLEnqueue");
@@ -2866,7 +2870,7 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
         stdx::lock_guard<Latch> lock(_mutex);
         if ((_memberState.startup() && client->isFromUserConnection()) || _memberState.startup2() ||
             _memberState.rollback()) {
-            return Status{ErrorCodes::NotMasterOrSecondary,
+            return Status{ErrorCodes::NotPrimaryOrSecondary,
                           "Oplog collection reads are not allowed while in the rollback or "
                           "startup state."};
         }
@@ -2878,7 +2882,7 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
 
     if (opCtx->inMultiDocumentTransaction()) {
         if (!_readWriteAbility->canAcceptNonLocalWrites_UNSAFE()) {
-            return Status(ErrorCodes::NotMaster,
+            return Status(ErrorCodes::NotWritablePrimary,
                           "Multi-document transactions are only allowed on replica set primaries.");
         }
     }
@@ -2887,10 +2891,10 @@ Status ReplicationCoordinatorImpl::checkCanServeReadsFor_UNSAFE(OperationContext
         if (isPrimaryOrSecondary) {
             return Status::OK();
         }
-        return Status(ErrorCodes::NotMasterOrSecondary,
+        return Status(ErrorCodes::NotPrimaryOrSecondary,
                       "not master or secondary; cannot currently read from this replSet member");
     }
-    return Status(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
+    return Status(ErrorCodes::NotPrimaryNoSecondaryOk, "not master and slaveOk=false");
 }
 
 bool ReplicationCoordinatorImpl::isInPrimaryOrSecondaryState(OperationContext* opCtx) const {
@@ -2903,6 +2907,9 @@ bool ReplicationCoordinatorImpl::isInPrimaryOrSecondaryState_UNSAFE() const {
 
 bool ReplicationCoordinatorImpl::shouldRelaxIndexConstraints(OperationContext* opCtx,
                                                              const NamespaceString& ns) {
+    if (ReplSettings::shouldRecoverFromOplogAsStandalone()) {
+        return true;
+    }
     return !canAcceptWritesFor(opCtx, ns);
 }
 
@@ -3015,7 +3022,7 @@ void ReplicationCoordinatorImpl::processReplSetGetConfig(BSONObjBuilder* result,
     }
 
     if (commitmentStatus) {
-        uassert(ErrorCodes::NotMaster,
+        uassert(ErrorCodes::NotWritablePrimary,
                 "commitmentStatus is only supported on primary.",
                 _readWriteAbility->canAcceptNonLocalWrites(lock));
         auto configWriteConcern = _getConfigReplicationWriteConcern();
@@ -3292,7 +3299,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
 
     if (!force && !_readWriteAbility->canAcceptNonLocalWrites(lk)) {
         return Status(
-            ErrorCodes::NotMaster,
+            ErrorCodes::NotWritablePrimary,
             str::stream()
                 << "Safe reconfig is only allowed on a writable PRIMARY. Current state is "
                 << _getMemberState_inlock().toString());
@@ -3464,7 +3471,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     {
         Lock::GlobalLock globalLock(opCtx, LockMode::MODE_IX);
         if (!force && !_readWriteAbility->canAcceptNonLocalWrites(opCtx)) {
-            return {ErrorCodes::NotMaster, "Stepped down when persisting new config"};
+            return {ErrorCodes::NotWritablePrimary, "Stepped down when persisting new config"};
         }
 
         // Don't write no-op for internal and external force reconfig.
@@ -3480,7 +3487,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
         }
     }
     // Wait for durability of the new config document.
-    opCtx->recoveryUnit()->waitUntilDurable(opCtx);
+    JournalFlusher::get(opCtx)->waitForJournalFlush();
 
     configStateGuard.dismiss();
     _finishReplSetReconfig(opCtx, newConfig, force, myIndex);
@@ -3577,7 +3584,7 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
     auto contentChanged =
         SimpleBSONObjComparator::kInstance.evaluate(oldConfig.toBSON() != newConfigCopy.toBSON());
     if (defaultDurableChanged || (isForceReconfig && contentChanged)) {
-        _dropAllSnapshots_inlock();
+        _clearCommittedSnapshot_inlock();
     }
 
     lk.unlock();
@@ -4062,31 +4069,6 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
         // When transitioning from other follower states to SECONDARY, run for election on a
         // single-node replica set.
         result = kActionStartSingleNodeElection;
-    }
-
-    if (newState.rollback()) {
-        // When we start rollback, we need to drop all snapshots since we may need to create
-        // out-of-order snapshots. This would be necessary even if the SnapshotName was completely
-        // monotonically increasing because we don't necessarily have a snapshot of every write.
-        // If we didn't drop all snapshots on rollback it could lead to the following situation:
-        //
-        //  |--------|-------------|-------------|
-        //  | OpTime | HasSnapshot | Committed   |
-        //  |--------|-------------|-------------|
-        //  | (0, 1) | *           | *           |
-        //  | (0, 2) | *           | ROLLED BACK |
-        //  | (1, 2) |             | *           |
-        //  |--------|-------------|-------------|
-        //
-        // When we try to make (1,2) the commit point, we'd find (0,2) as the newest snapshot
-        // before the commit point, but it would be invalid to mark it as the committed snapshot
-        // since it was never committed.
-        _dropAllSnapshots_inlock();
-    }
-
-    if (_memberState.rollback()) {
-        // Ensure that no snapshots were created while we were in rollback.
-        invariant(!_currentCommittedSnapshot);
     }
 
     // If we are transitioning from secondary, cancel any scheduled takeovers.
@@ -5413,14 +5395,14 @@ bool ReplicationCoordinatorImpl::_updateCommittedSnapshot(WithLock lk,
     return true;
 }
 
-void ReplicationCoordinatorImpl::dropAllSnapshots() {
+void ReplicationCoordinatorImpl::clearCommittedSnapshot() {
     stdx::lock_guard<Latch> lock(_mutex);
-    _dropAllSnapshots_inlock();
+    _clearCommittedSnapshot_inlock();
 }
 
-void ReplicationCoordinatorImpl::_dropAllSnapshots_inlock() {
+void ReplicationCoordinatorImpl::_clearCommittedSnapshot_inlock() {
     _currentCommittedSnapshot = boost::none;
-    _externalState->dropAllSnapshots();
+    _externalState->clearCommittedSnapshot();
 }
 
 void ReplicationCoordinatorImpl::waitForElectionFinish_forTest() {

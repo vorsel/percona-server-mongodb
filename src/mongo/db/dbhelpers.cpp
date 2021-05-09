@@ -130,7 +130,7 @@ bool Helpers::findById(OperationContext* opCtx,
     invariant(database);
 
     // TODO ForRead?
-    Collection* collection =
+    const Collection* collection =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, NamespaceString(ns));
     if (!collection) {
         return false;
@@ -139,7 +139,7 @@ bool Helpers::findById(OperationContext* opCtx,
     if (nsFound)
         *nsFound = true;
 
-    IndexCatalog* catalog = collection->getIndexCatalog();
+    const IndexCatalog* catalog = collection->getIndexCatalog();
     const IndexDescriptor* desc = catalog->findIdIndex(opCtx);
 
     if (!desc)
@@ -245,7 +245,7 @@ void Helpers::upsert(OperationContext* opCtx,
     request.setNamespaceString(requestNs);
 
     request.setQuery(filter);
-    request.setUpdateModification(updateMod);
+    request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(updateMod));
     request.setUpsert();
     request.setFromMigration(fromMigrate);
     request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::NO_YIELD);
@@ -260,7 +260,7 @@ void Helpers::putSingleton(OperationContext* opCtx, const char* ns, BSONObj obj)
     auto request = UpdateRequest();
     request.setNamespaceString(requestNs);
 
-    request.setUpdateModification(obj);
+    request.setUpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(obj));
     request.setUpsert();
 
     update(opCtx, context.db(), request);
@@ -287,7 +287,7 @@ BSONObj Helpers::inferKeyPattern(const BSONObj& o) {
 void Helpers::emptyCollection(OperationContext* opCtx, const NamespaceString& nss) {
     OldClientContext context(opCtx, nss.ns());
     repl::UnreplicatedWritesBlock uwb(opCtx);
-    Collection* collection = context.db()
+    const Collection* collection = context.db()
         ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)
         : nullptr;
     deleteObjects(opCtx, collection, nss, BSONObj(), false);

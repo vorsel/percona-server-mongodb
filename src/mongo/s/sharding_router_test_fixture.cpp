@@ -188,8 +188,18 @@ ShardingTestFixture::ShardingTestFixture()
 
 ShardingTestFixture::~ShardingTestFixture() {
     CatalogCacheLoader::clearForTests(getServiceContext());
-    if (Grid::get(getServiceContext()) && Grid::get(getServiceContext())->getExecutorPool()) {
-        Grid::get(getServiceContext())->getExecutorPool()->shutdownAndJoin();
+
+    if (auto grid = Grid::get(getServiceContext())) {
+        if (grid->getExecutorPool()) {
+            grid->getExecutorPool()->shutdownAndJoin();
+        }
+        if (grid->catalogClient()) {
+            grid->catalogClient()->shutDown(operationContext());
+        }
+        if (grid->shardRegistry()) {
+            grid->shardRegistry()->shutdown();
+        }
+        grid->clearForUnitTests();
     }
 }
 
@@ -387,15 +397,24 @@ void ShardingTestFixture::checkReadConcern(const BSONObj& cmdObj,
     auto readConcernObj = readConcernElem.Obj();
     ASSERT_EQ("majority", readConcernObj[repl::ReadConcernArgs::kLevelFieldName].str());
 
-    auto afterElem = readConcernObj[repl::ReadConcernArgs::kAfterOpTimeFieldName];
-    ASSERT_EQ(Object, afterElem.type());
+    auto afterOpTimeElem = readConcernObj[repl::ReadConcernArgs::kAfterOpTimeFieldName];
+    auto afterClusterTimeElem = readConcernObj[repl::ReadConcernArgs::kAfterClusterTimeFieldName];
+    if (afterOpTimeElem.type() != EOO) {
+        ASSERT_EQ(EOO, afterClusterTimeElem.type());
+        ASSERT_EQ(Object, afterOpTimeElem.type());
 
-    auto afterObj = afterElem.Obj();
+        auto afterOpTimeObj = afterOpTimeElem.Obj();
 
-    ASSERT_TRUE(afterObj.hasField(repl::OpTime::kTimestampFieldName));
-    ASSERT_EQ(expectedTS, afterObj[repl::OpTime::kTimestampFieldName].timestamp());
-    ASSERT_TRUE(afterObj.hasField(repl::OpTime::kTermFieldName));
-    ASSERT_EQ(expectedTerm, afterObj[repl::OpTime::kTermFieldName].numberLong());
+        ASSERT_TRUE(afterOpTimeObj.hasField(repl::OpTime::kTimestampFieldName));
+        ASSERT_EQ(expectedTS, afterOpTimeObj[repl::OpTime::kTimestampFieldName].timestamp());
+        ASSERT_TRUE(afterOpTimeObj.hasField(repl::OpTime::kTermFieldName));
+        ASSERT_EQ(expectedTerm, afterOpTimeObj[repl::OpTime::kTermFieldName].numberLong());
+    } else {
+        ASSERT_EQ(EOO, afterOpTimeElem.type());
+        ASSERT_EQ(bsonTimestamp, afterClusterTimeElem.type());
+
+        ASSERT_EQ(expectedTS, afterClusterTimeElem.timestamp());
+    }
 }
 
 std::unique_ptr<ShardingCatalogClient> ShardingTestFixture::makeShardingCatalogClient(

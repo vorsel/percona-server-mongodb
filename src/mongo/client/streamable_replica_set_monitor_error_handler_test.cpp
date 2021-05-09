@@ -108,11 +108,11 @@ public:
     inline static const std::vector<Error> kNotMasterAndNodeRecovering{
         ErrorCodes::InterruptedAtShutdown,
         ErrorCodes::InterruptedDueToReplStateChange,
-        ErrorCodes::NotMasterOrSecondary,
+        ErrorCodes::NotPrimaryOrSecondary,
         ErrorCodes::PrimarySteppedDown,
         ErrorCodes::ShutdownInProgress,
-        ErrorCodes::NotMaster,
-        ErrorCodes::NotMasterNoSlaveOk};
+        ErrorCodes::NotWritablePrimary,
+        ErrorCodes::NotPrimaryNoSecondaryOk};
 
     inline static const std::string kSetName = "setName";
     inline static const HostAndPort kHost = HostAndPort("foobar:123");

@@ -49,13 +49,13 @@ env.Library(
         "auth_op_observer.cpp",
     ],
     LIBDEPS_PRIVATE=[
-        'auth',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/catalog/collection_options',
         '$BUILD_DIR/mongo/db/index/index_descriptor',
         '$BUILD_DIR/mongo/db/op_observer',
         '$BUILD_DIR/mongo/db/op_observer_util',
         '$BUILD_DIR/mongo/db/repl/oplog_entry',
+        'auth',
     ]
 )
 
@@ -65,9 +65,12 @@ env.Library(
         'user.cpp',
     ],
     LIBDEPS=[
-        'authprivilege',
         '$BUILD_DIR/mongo/base',
+    ],
+    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/crypto/sha_block_${MONGO_CRYPTO}',
+        'authentication_restriction',
+        'authprivilege',
     ],
 )
 
@@ -82,17 +85,16 @@ env.Library(
 )
 
 env.Library(
-    target="role_graph",
+    target="builtin_roles",
     source=[
-        'role_graph.cpp',
-        'role_graph_builtin_roles.cpp',
+        'builtin_roles.cpp',
     ],
     LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
         'auth',
         'auth_options',
         'authprivilege',
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
     ],
 )
 
@@ -102,12 +104,15 @@ env.Library(
         'user_document_parser.cpp',
     ],
     LIBDEPS=[
-        'auth',
-        'user',
-        'role_graph_update',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
         '$BUILD_DIR/mongo/bson/util/bson_extract',
+        'auth',
+        'user',
+    ],
+    LIBDEPS_PRIVATE=[
+        'address_restriction',
+        'authprivilege',
     ],
 )
 
@@ -122,19 +127,6 @@ env.Library(
 )
 
 env.Library(
-    target='role_graph_update',
-    source=[
-        'role_graph_update.cpp',
-    ],
-    LIBDEPS=[
-        'auth',
-        'auth_options',
-        'role_graph',
-        '$BUILD_DIR/mongo/db/update/update_driver',
-    ],
-)
-
-env.Library(
     target='auth_impl_internal',
     source=[
         'authorization_manager_impl.cpp',
@@ -145,15 +137,6 @@ env.Library(
         env.Idlc('authorization_manager_impl_parameters.idl')[0],
     ],
     LIBDEPS=[
-        'address_restriction',
-        'auth',
-        'authentication_restriction',
-        'authorization_manager_global',
-        'authprivilege',
-        'role_graph',
-        'sasl_options',
-        'user',
-        'user_document_parser',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/base/secure_allocator',
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
@@ -161,19 +144,27 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/document_validation',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/global_settings',
-        '$BUILD_DIR/mongo/db/ldap_options',
         '$BUILD_DIR/mongo/db/ldap/ldapmanager',
+        '$BUILD_DIR/mongo/db/ldap_options',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/pipeline/lite_parsed_document_source',
         '$BUILD_DIR/mongo/db/update/update_driver',
-        '$BUILD_DIR/mongo/util/icu',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
+        '$BUILD_DIR/mongo/util/icu',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
         '$BUILD_DIR/mongo/util/net/ssl_types',
+        'address_restriction',
+        'auth',
+        'authorization_manager_global',
+        'authprivilege',
+        'builtin_roles',
+        'sasl_options',
+        'user',
+        'user_document_parser',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/util/caching',
         '$BUILD_DIR/mongo/idl/server_parameter',
+        '$BUILD_DIR/mongo/util/caching',
     ],
 )
 
@@ -189,11 +180,11 @@ env.Library(
         'user_management_commands_parser.cpp',
     ],
     LIBDEPS=[
-        'auth',
-        'address_restriction',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
         '$BUILD_DIR/mongo/db/common',
+        'address_restriction',
+        'auth',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/rpc/metadata_impersonated_user',
@@ -210,11 +201,11 @@ env.Library(
         '$BUILD_DIR/mongo/idl/server_parameter',
     ],
     LIBDEPS=[
-        'auth',
         '$BUILD_DIR/mongo/db/ldap/ldapmanager',
         '$BUILD_DIR/mongo/db/ldap_options',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/service_context',
+        'auth',
     ],
 )
 
@@ -227,22 +218,16 @@ env.Library(
         '$BUILD_DIR/mongo/base',
     ],
     LIBDEPS_PRIVATE=[
-        'sasl_options',
-        'security_file',
-        'user',
         '$BUILD_DIR/mongo/base/secure_allocator',
         '$BUILD_DIR/mongo/client/authentication',
         '$BUILD_DIR/mongo/crypto/sha_block_${MONGO_CRYPTO}',
         '$BUILD_DIR/mongo/util/icu',
         '$BUILD_DIR/mongo/util/md5',
+        'sasl_options',
+        'security_file',
+        'user',
     ],
 )
-
-## NOTE: We could make external auth non-optional by removing this
-## predicate check on the SASL_CLIENT flag.
-optionalExternalSaslDeps = []
-if env['MONGO_BUILD_SASL_CLIENT']:
-    optionalExternalSaslDeps = ['external/externalsaslauth']
 
 env.Library(
     target='authservercommon',
@@ -255,8 +240,9 @@ env.Library(
         'auth',
         'auth_impl_internal',
         'authorization_manager_global',
+        'external/externalsaslauth' if env['MONGO_BUILD_SASL_CLIENT'] else [],
         'saslauth',
-    ] + optionalExternalSaslDeps,
+    ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/client/sasl_client',
         '$BUILD_DIR/mongo/db/audit',
@@ -298,18 +284,18 @@ env.Library(
 )
 
 env.Library(
-  target='sasl_options_init',
-  source=[
-      'sasl_options_init.cpp',
-       env.Idlc('sasl_options.idl')[0],
-  ],
-  LIBDEPS=[
-    'sasl_options'
-  ],
-  LIBDEPS_PRIVATE=[
-       '$BUILD_DIR/mongo/util/options_parser/options_parser',
-       '$BUILD_DIR/mongo/util/net/network',
-  ],
+    target='sasl_options_init',
+    source=[
+        'sasl_options_init.cpp',
+        env.Idlc('sasl_options.idl')[0],
+    ],
+    LIBDEPS=[
+        'sasl_options'
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/util/net/network',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser',
+    ],
 )
 
 env.Library(
@@ -320,10 +306,6 @@ env.Library(
         'sasl_scram_server_conversation.cpp',
     ],
     LIBDEPS=[
-        'auth',
-        'authprivilege',
-        'sasl_options',
-        'user',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/base/secure_allocator',
         '$BUILD_DIR/mongo/crypto/sha_block_${MONGO_CRYPTO}',
@@ -331,6 +313,10 @@ env.Library(
         '$BUILD_DIR/mongo/util/icu',
         '$BUILD_DIR/mongo/util/md5',
         '$BUILD_DIR/mongo/util/net/network',
+        'auth',
+        'authprivilege',
+        'sasl_options',
+        'user',
     ],
 )
 
@@ -341,12 +327,12 @@ env.Library(
         'authz_session_external_state_d.cpp',
     ],
     LIBDEPS=[
-        'authservercommon',
-        'auth_impl_internal_local',
         '$BUILD_DIR/mongo/db/db_raii',
         '$BUILD_DIR/mongo/db/dbdirectclient',
         '$BUILD_DIR/mongo/db/dbhelpers',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        'auth_impl_internal_local',
+        'authservercommon',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
@@ -362,9 +348,9 @@ env.Library(
         env.Idlc('user_cache_invalidator_job_parameters.idl')[0],
         ],
     LIBDEPS=[
-        'authservercommon',
         '$BUILD_DIR/mongo/s/catalog/dist_lock_manager',
         '$BUILD_DIR/mongo/s/coreshard',
+        'authservercommon',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/idl/server_parameter',
@@ -394,10 +380,10 @@ env.Library(
         env.Idlc('address_restriction.idl')[0],
     ],
     LIBDEPS_PRIVATE=[
-        'authentication_restriction',
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/util/net/network',
         '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/util/net/network',
+        'authentication_restriction',
     ],
 )
 
@@ -410,9 +396,9 @@ env.CppUnitTest(
         'authorization_manager_test.cpp',
         'authorization_session_for_test.cpp',
         'authorization_session_test.cpp',
+        'builtin_roles_test.cpp',
         'privilege_parser_test.cpp',
         'restriction_test.cpp',
-        'role_graph_test.cpp',
         'sasl_authentication_session_test.cpp',
         'sasl_mechanism_registry_test.cpp',
         'sasl_scram_test.cpp',

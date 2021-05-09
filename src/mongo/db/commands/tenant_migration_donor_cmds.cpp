@@ -29,6 +29,10 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/tenant_migration_donor_cmds_gen.h"
+#include "mongo/db/repl/primary_only_service.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/tenant_migration_donor_service.h"
 #include "mongo/db/repl/tenant_migration_donor_util.h"
 
 namespace mongo {
@@ -42,18 +46,50 @@ public:
 
     public:
         using InvocationBase::InvocationBase;
+
         void typedRun(OperationContext* opCtx) {
+            uassert(ErrorCodes::CommandNotSupported,
+                    "donorStartMigration command not enabled",
+                    repl::enableTenantMigrations);
+
             const RequestType& requestBody = request();
 
-            const TenantMigrationDonorDocument donorStateDoc(
-                requestBody.getMigrationId(),
-                requestBody.getRecipientConnectionString().toString(),
-                requestBody.getDatabasePrefix().toString(),
-                TenantMigrationDonorStateEnum::kDataSync);
+            // Sanity check that donor and recipient do not share any of the same hosts for
+            // migration
+            const auto donorConnectionString =
+                repl::ReplicationCoordinator::get(opCtx)->getConfig().getConnectionString();
+            const auto donorServers = donorConnectionString.getServers();
+            const auto recipientServers =
+                uassertStatusOK(
+                    MongoURI::parse(requestBody.getRecipientConnectionString().toString()))
+                    .getServers();
+            for (const auto server : donorServers) {
+                uassert(ErrorCodes::InvalidOptions,
+                        "recipient and donor hosts must be different",
+                        std::none_of(recipientServers.begin(),
+                                     recipientServers.end(),
+                                     [&](const HostAndPort& recipientServer) {
+                                         return server == recipientServer;
+                                     }));
+            }
 
-            tenant_migration_donor::startMigration(opCtx, donorStateDoc);
+            const auto donorStateDoc =
+                TenantMigrationDonorDocument(requestBody.getMigrationId(),
+                                             requestBody.getRecipientConnectionString().toString(),
+                                             requestBody.getReadPreference(),
+                                             requestBody.getDatabasePrefix().toString(),
+                                             TenantMigrationDonorStateEnum::kDataSync)
+                    .toBSON();
+
+            auto donorService =
+                repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
+                    ->lookupServiceByName(TenantMigrationDonorService::kServiceName);
+            auto donor =
+                TenantMigrationDonorService::Instance::getOrCreate(donorService, donorStateDoc);
+            uassertStatusOK(donor->checkIfOptionsConflict(donorStateDoc));
+
+            donor->getCompletionFuture().get();
         }
-
 
         void doCheckAuthorization(OperationContext* opCtx) const {}
 
@@ -84,16 +120,20 @@ class DonorWaitForMigrationToCommitCmd : public TypedCommand<DonorWaitForMigrati
 public:
     using Request = DonorWaitForMigrationToCommit;
 
-
     class Invocation : public InvocationBase {
 
     public:
         using InvocationBase::InvocationBase;
 
-        void typedRun(OperationContext* opCtx) {}
+        void typedRun(OperationContext* opCtx) {
+            uassert(ErrorCodes::CommandNotSupported,
+                    "donorWaitForMigrationToCommit command not enabled",
+                    repl::enableTenantMigrations);
+        }
 
     private:
         void doCheckAuthorization(OperationContext* opCtx) const {}
+
         bool supportsWriteConcern() const override {
             return false;
         }
@@ -103,7 +143,7 @@ public:
     };
 
     std::string help() const override {
-        return "Wait for migration to be commited.";
+        return "Wait for migration to be committed.";
     }
     bool adminOnly() const override {
         return true;
@@ -113,7 +153,7 @@ public:
         return BasicCommand::AllowedOnSecondary::kNever;
     }
 
-} donorWaitForMigrationToCommit;
+} donorWaitForMigrationToCommitCmd;
 
 class DonorForgetMigrationCmd : public TypedCommand<DonorForgetMigrationCmd> {
 public:
@@ -124,10 +164,15 @@ public:
     public:
         using InvocationBase::InvocationBase;
 
-        void typedRun(OperationContext* opCtx) {}
+        void typedRun(OperationContext* opCtx) {
+            uassert(ErrorCodes::CommandNotSupported,
+                    "donorForgetMigration command not enabled",
+                    repl::enableTenantMigrations);
+        }
 
     private:
         void doCheckAuthorization(OperationContext* opCtx) const {}
+
         bool supportsWriteConcern() const override {
             return false;
         }
@@ -147,7 +192,7 @@ public:
     BasicCommand::AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return BasicCommand::AllowedOnSecondary::kNever;
     }
-} donorForgetMigration;
+} donorForgetMigrationCmd;
 
 }  // namespace
 }  // namespace mongo

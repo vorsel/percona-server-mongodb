@@ -3,6 +3,7 @@
  * build has been initialized but has not yet begun the collection scan phase.
  *
  * @tags: [
+ *   requires_majority_read_concern,
  *   requires_persistence,
  *   requires_replication,
  * ]
@@ -22,7 +23,9 @@ rst.initiate();
 const coll = rst.getPrimary().getDB(dbName).getCollection(jsTestName());
 assert.commandWorked(coll.insert({a: 1}));
 
-ResumableIndexBuildTest.run(rst, dbName, coll.getName(), {a: 1}, failPointName, {});
+ResumableIndexBuildTest.run(rst, dbName, coll.getName(), {a: 1}, failPointName, {}, "initialized", {
+    numScannedAferResume: 1
+});
 
 rst.stopSet();
 })();

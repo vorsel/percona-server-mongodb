@@ -85,9 +85,14 @@ protected:
             nullptr,
             false,
             epoch,
+            boost::none,
             {ChunkType{kNss, range, ChunkVersion(1, 0, epoch), kOtherShard}});
 
-        return CollectionMetadata(ChunkManager(rt, boost::none), kThisShard);
+        return CollectionMetadata(ChunkManager(kThisShard,
+                                               DatabaseVersion(UUID::gen(), 1),
+                                               makeStandaloneRoutingTableHistory(std::move(rt)),
+                                               boost::none),
+                                  kThisShard);
     }
 
     /**
@@ -127,9 +132,13 @@ protected:
         splitChunks.emplace_back(
             kNss, ChunkRange(maxKey, chunkToSplit.getMax()), chunkVersion, kOtherShard);
 
-        auto rt = cm->getRoutingHistory()->makeUpdated(splitChunks);
+        auto rt = cm->getRoutingTableHistory_ForTest().makeUpdated(boost::none, splitChunks);
 
-        return CollectionMetadata(ChunkManager(rt, boost::none), kThisShard);
+        return CollectionMetadata(ChunkManager(cm->dbPrimary(),
+                                               cm->dbVersion(),
+                                               makeStandaloneRoutingTableHistory(std::move(rt)),
+                                               boost::none),
+                                  kThisShard);
     }
 
     static CollectionMetadata cloneMetadataMinusChunk(const CollectionMetadata& metadata,
@@ -147,10 +156,14 @@ protected:
         auto chunkVersion = cm->getVersion();
         chunkVersion.incMajor();
 
-        auto rt = cm->getRoutingHistory()->makeUpdated(
-            {ChunkType(kNss, ChunkRange(minKey, maxKey), chunkVersion, kOtherShard)});
+        auto rt = cm->getRoutingTableHistory_ForTest().makeUpdated(
+            boost::none, {ChunkType(kNss, ChunkRange(minKey, maxKey), chunkVersion, kOtherShard)});
 
-        return CollectionMetadata(ChunkManager(rt, boost::none), kThisShard);
+        return CollectionMetadata(ChunkManager(cm->dbPrimary(),
+                                               cm->dbVersion(),
+                                               makeStandaloneRoutingTableHistory(std::move(rt)),
+                                               boost::none),
+                                  kThisShard);
     }
 
     std::shared_ptr<MetadataManager> _manager;

@@ -148,6 +148,7 @@ struct Instruction {
         isArray,
         isString,
         isNumber,
+        isBinData,
         typeMatch,
 
         function,
@@ -181,11 +182,17 @@ enum class Builtin : uint8_t {
     addToArray,       // agg function to append to an array
     addToSet,         // agg function to append to a set
     doubleDoubleSum,  // special double summation
+    bitTestZero,      // test bitwise mask & value is zero
+    bitTestMask,      // test bitwise mask & value is mask
+    bitTestPosition,  // test BinData with a bit position list
 };
 
 class CodeFragment {
 public:
     auto& instrs() {
+        return _instrs;
+    }
+    const auto& instrs() const {
         return _instrs;
     }
     auto stackSize() const {
@@ -250,6 +257,7 @@ public:
     void appendIsArray();
     void appendIsString();
     void appendIsNumber();
+    void appendIsBinData();
     void appendTypeMatch(uint32_t typeMask);
     void appendFunction(Builtin f, uint8_t arity);
     void appendJump(int jumpOffset);
@@ -294,8 +302,8 @@ class ByteCode {
 public:
     ~ByteCode();
 
-    std::tuple<uint8_t, value::TypeTags, value::Value> run(CodeFragment* code);
-    bool runPredicate(CodeFragment* code);
+    std::tuple<uint8_t, value::TypeTags, value::Value> run(const CodeFragment* code);
+    bool runPredicate(const CodeFragment* code);
 
 private:
     std::vector<uint8_t> _argStackOwned;
@@ -394,6 +402,10 @@ private:
                                                             value::Value accValue,
                                                             value::TypeTags fieldTag,
                                                             value::Value fieldValue);
+    std::tuple<bool, value::TypeTags, value::Value> convertBitTestValue(value::TypeTags maskTag,
+                                                                        value::Value maskValue,
+                                                                        value::TypeTags valueTag,
+                                                                        value::Value value);
 
     std::tuple<bool, value::TypeTags, value::Value> builtinSplit(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDate(uint8_t arity);
@@ -407,6 +419,9 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinAddToArray(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinAddToSet(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDoubleDoubleSum(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinBitTestZero(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinBitTestMask(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinBitTestPosition(uint8_t arity);
 
     std::tuple<bool, value::TypeTags, value::Value> dispatchBuiltin(Builtin f, uint8_t arity);
 

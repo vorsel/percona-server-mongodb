@@ -48,7 +48,8 @@ DatabaseCloner::DatabaseCloner(const std::string& dbName,
                                DBClientConnection* client,
                                StorageInterface* storageInterface,
                                ThreadPool* dbPool)
-    : BaseCloner("DatabaseCloner"_sd, sharedData, source, client, storageInterface, dbPool),
+    : InitialSyncBaseCloner(
+          "DatabaseCloner"_sd, sharedData, source, client, storageInterface, dbPool),
       _dbName(dbName),
       _listCollectionsStage("listCollections", this, &DatabaseCloner::listCollectionsStage) {
     invariant(!dbName.empty());
@@ -152,12 +153,11 @@ void DatabaseCloner::postStage() {
                         "Collection clone failed",
                         "namespace"_attr = sourceNss,
                         "error"_attr = collStatus.toString());
-            setInitialSyncFailedStatus(
-                {ErrorCodes::InitialSyncFailure,
-                 collStatus
-                     .withContext(str::stream()
-                                  << "Error cloning collection '" << sourceNss.toString() << "'")
-                     .toString()});
+            setSyncFailedStatus({ErrorCodes::InitialSyncFailure,
+                                 collStatus
+                                     .withContext(str::stream() << "Error cloning collection '"
+                                                                << sourceNss.toString() << "'")
+                                     .toString()});
         }
         {
             stdx::lock_guard<Latch> lk(_mutex);

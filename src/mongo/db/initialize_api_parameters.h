@@ -41,7 +41,9 @@ namespace mongo {
  * This function parses a command's API Version parameters from a request and stores the apiVersion,
  * apiStrict, and apiDeprecationErrors fields.
  */
-const APIParametersFromClient initializeAPIParameters(const BSONObj& requestBody, Command* command);
+const APIParametersFromClient initializeAPIParameters(OperationContext* opCtx,
+                                                      const BSONObj& requestBody,
+                                                      Command* command);
 
 /**
  * Decorates operation context with methods to retrieve apiVersion, apiStrict, and
@@ -50,19 +52,25 @@ const APIParametersFromClient initializeAPIParameters(const BSONObj& requestBody
 class APIParameters {
 
 public:
-    APIParameters();
+    static constexpr StringData kAPIVersionFieldName = "apiVersion"_sd;
+    static constexpr StringData kAPIStrictFieldName = "apiStrict"_sd;
+    static constexpr StringData kAPIDeprecationErrorsFieldName = "apiDeprecationErrors"_sd;
+
+    APIParameters() = default;
     static APIParameters& get(OperationContext* opCtx);
     static APIParameters fromClient(const APIParametersFromClient& apiParamsFromClient);
 
-    const StringData getAPIVersion() const {
+    void appendInfo(BSONObjBuilder* builder) const;
+
+    const boost::optional<std::string>& getAPIVersion() const {
         return _apiVersion;
     }
 
     void setAPIVersion(StringData apiVersion) {
-        _apiVersion = apiVersion;
+        _apiVersion = apiVersion.toString();
     }
 
-    const bool getAPIStrict() const {
+    const boost::optional<bool>& getAPIStrict() const {
         return _apiStrict;
     }
 
@@ -70,7 +78,7 @@ public:
         _apiStrict = apiStrict;
     }
 
-    const bool getAPIDeprecationErrors() const {
+    const boost::optional<bool>& getAPIDeprecationErrors() const {
         return _apiDeprecationErrors;
     }
 
@@ -78,19 +86,16 @@ public:
         _apiDeprecationErrors = apiDeprecationErrors;
     }
 
-    const bool getParamsPassed() const {
-        return _paramsPassed;
+    bool getParamsPassed() const {
+        return _apiVersion || _apiStrict || _apiDeprecationErrors;
     }
 
-    void setParamsPassed(bool noParamsPassed) {
-        _paramsPassed = noParamsPassed;
-    }
+    BSONObj toBSON() const;
 
 private:
-    StringData _apiVersion;
-    bool _apiStrict;
-    bool _apiDeprecationErrors;
-    bool _paramsPassed;
+    boost::optional<std::string> _apiVersion;
+    boost::optional<bool> _apiStrict;
+    boost::optional<bool> _apiDeprecationErrors;
 };
 
 }  // namespace mongo

@@ -33,6 +33,8 @@
 #include <vector>
 
 #include "mongo/db/repl/base_cloner.h"
+#include "mongo/db/repl/initial_sync_base_cloner.h"
+#include "mongo/db/repl/initial_sync_shared_data.h"
 #include "mongo/db/repl/task_runner.h"
 #include "mongo/util/progress_meter.h"
 
@@ -44,7 +46,7 @@ const int kProgressMeterSecondsBetween = 60;
 const int kProgressMeterCheckInterval = 128;
 }  // namespace
 
-class CollectionCloner final : public BaseCloner {
+class CollectionCloner final : public InitialSyncBaseCloner {
 public:
     struct Stats {
         static constexpr StringData kDocumentsToCopyFieldName = "documentsToCopy"_sd;

@@ -83,6 +83,7 @@
 #include "mongo/db/repl/tenant_migration_donor_util.h"
 #include "mongo/db/repl/timestamp_block.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
+#include "mongo/db/s/resharding_util.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/server_write_concern_metrics.h"
@@ -212,7 +213,7 @@ void _logOpsInner(OperationContext* opCtx,
                   const NamespaceString& nss,
                   std::vector<Record>* records,
                   const std::vector<Timestamp>& timestamps,
-                  Collection* oplogCollection,
+                  const Collection* oplogCollection,
                   OpTime finalOpTime,
                   Date_t wallTime) {
     auto replCoord = ReplicationCoordinator::get(opCtx);
@@ -225,13 +226,29 @@ void _logOpsInner(OperationContext* opCtx,
             ss << "(" << record.id << ", " << redact(record.data.toBson()) << ") ";
         }
         ss << "]";
-        uasserted(ErrorCodes::NotMaster, ss);
+        uasserted(ErrorCodes::NotWritablePrimary, ss);
     }
 
-    // The oplogEntry for renameCollection has nss set to the fromCollection's ns. renameCollection
-    // can be across databases, but a tenant will never be able to rename into a database with a
-    // different prefix, so it is safe to use the fromCollection's db's prefix for this check.
-    tenant_migration_donor::onWriteToDatabase(opCtx, nss.db());
+    // TODO (SERVER-50598): Not allow tenant migration donor to write "commitIndexBuild" and
+    // "abortIndexBuild" oplog entries in the blocking state.
+    // Allow that for now since if the donor doesn't write either a commit or abort oplog entry,
+    // some resources will not be released on the donor nodes, and this can lead to deadlocks.
+    auto isCommitOrAbortIndexBuild =
+        std::any_of(records->begin(), records->end(), [](Record record) {
+            auto o = record.data.toBson().getObjectField("o");
+            return o.hasField("commitIndexBuild") || o.hasField("abortIndexBuild");
+        });
+
+    if (!isCommitOrAbortIndexBuild) {
+        // Throw TenantMigrationConflict error if the database for 'nss' is being migrated.
+        // The oplog entry for renameCollection has 'nss' set to the fromCollection's ns.
+        // renameCollection can be across databases, but a tenant will never be able to rename into
+        // a database with a different prefix, so it is safe to use the fromCollection's db's prefix
+        // for this check.
+        tenant_migration_donor::onWriteToDatabase(opCtx, nss.db());
+    } else {
+        invariant(records->size() == 1);
+    }
 
     Status result = oplogCollection->insertDocumentsForOplog(opCtx, records, timestamps);
     if (!result.isOK()) {
@@ -519,7 +536,7 @@ void createOplog(OperationContext* opCtx,
     const ReplSettings& replSettings = ReplicationCoordinator::get(opCtx)->getSettings();
 
     OldClientContext ctx(opCtx, oplogCollectionName.ns());
-    Collection* collection =
+    const Collection* collection =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, oplogCollectionName);
 
     if (collection) {
@@ -568,6 +585,8 @@ void createOplog(OperationContext* opCtx,
         }
         uow.commit();
     });
+
+    createSlimOplogView(opCtx, ctx.db());
 
     /* sync here so we don't get any surprising lag later when we try to sync */
     service->getStorageEngine()->flushAllFiles(opCtx, /*callerHoldsReadLock*/ false);
@@ -962,7 +981,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
     }
 
     NamespaceString requestNss;
-    Collection* collection = nullptr;
+    const Collection* collection = nullptr;
     if (auto uuid = op.getUuid()) {
         CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
         collection = catalog.lookupCollectionByUUID(opCtx, uuid.get());
@@ -1000,7 +1019,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
     if (op.getObject2())
         o2 = op.getObject2().get();
 
-    IndexCatalog* indexCatalog = collection == nullptr ? nullptr : collection->getIndexCatalog();
+    const IndexCatalog* indexCatalog =
+        collection == nullptr ? nullptr : collection->getIndexCatalog();
     const bool haveWrappingWriteUnitOfWork = opCtx->lockState()->inAWriteUnitOfWork();
     uassert(ErrorCodes::CommandNotSupportedOnView,
             str::stream() << "applyOps not supported on view: " << requestNss.ns(),
@@ -1051,21 +1071,34 @@ Status applyOperation_inlock(OperationContext* opCtx,
             if (opOrGroupedInserts.isGroupedInserts()) {
                 // Grouped inserts.
 
-                // Cannot apply an array insert with applyOps command. No support for wiping out the
-                // provided timestamps and using new ones for oplog.
+                // Cannot apply an array insert with applyOps command.  But can apply grouped
+                // inserts on primary as part of a tenant migration.
                 uassert(ErrorCodes::OperationFailed,
                         "Cannot apply an array insert with applyOps",
-                        !opCtx->writesAreReplicated());
+                        !opCtx->writesAreReplicated() || tenantMigrationRecipientInfo(opCtx));
 
                 std::vector<InsertStatement> insertObjs;
                 const auto insertOps = opOrGroupedInserts.getGroupedInserts();
-                for (const auto iOp : insertOps) {
-                    invariant(iOp->getTerm());
-                    insertObjs.emplace_back(
-                        iOp->getObject(), iOp->getTimestamp(), iOp->getTerm().get());
+                WriteUnitOfWork wuow(opCtx);
+                if (!opCtx->writesAreReplicated()) {
+                    for (const auto iOp : insertOps) {
+                        invariant(iOp->getTerm());
+                        insertObjs.emplace_back(
+                            iOp->getObject(), iOp->getTimestamp(), iOp->getTerm().get());
+                    }
+                } else {
+                    // Applying grouped inserts on the primary as part of a tenant migration.
+                    // We assign new optimes as the optimes on the donor are not relevant to
+                    // the recipient.
+                    std::vector<OplogSlot> slots = getNextOpTimes(opCtx, insertOps.size());
+                    auto slotIter = slots.begin();
+                    for (const auto iOp : insertOps) {
+                        insertObjs.emplace_back(
+                            iOp->getObject(), slotIter->getTimestamp(), slotIter->getTerm());
+                        slotIter++;
+                    }
                 }
 
-                WriteUnitOfWork wuow(opCtx);
                 OpDebug* const nullOpDebug = nullptr;
                 Status status = collection->insertDocuments(opCtx,
                                                             insertObjs.begin(),
@@ -1183,7 +1216,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     auto request = UpdateRequest();
                     request.setNamespaceString(requestNss);
                     request.setQuery(b.done());
-                    request.setUpdateModification(o);
+                    request.setUpdateModification(
+                        write_ops::UpdateModification::parseFromClassicUpdate(o));
                     request.setUpsert();
                     request.setFromOplogApplication(true);
 
@@ -1197,7 +1231,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                         }
 
                         UpdateResult res = update(opCtx, db, request);
-                        if (res.numMatched == 0 && res.upserted.isEmpty()) {
+                        if (res.numMatched == 0 && res.upsertedId.isEmpty()) {
                             LOGV2_ERROR(21257,
                                         "No document was updated even though we got a DuplicateKey "
                                         "error when inserting");
@@ -1293,7 +1327,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 }
 
                 UpdateResult ur = update(opCtx, db, request);
-                if (ur.numMatched == 0 && ur.upserted.isEmpty()) {
+                if (ur.numMatched == 0 && ur.upsertedId.isEmpty()) {
                     if (collection && collection->isCapped() &&
                         mode == OplogApplication::Mode::kSecondary) {
                         // We can't assume there was a problem when the collection is capped,
@@ -1344,7 +1378,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                         }
                     }
                 } else if (mode == OplogApplication::Mode::kSecondary && !upsertOplogEntry &&
-                           !ur.upserted.isEmpty() && !(collection && collection->isCapped())) {
+                           !ur.upsertedId.isEmpty() && !(collection && collection->isCapped())) {
                     // This indicates we upconverted an update to an upsert, and it did indeed
                     // upsert.  In steady state mode this is unexpected.
                     LOGV2_WARNING(2170001,
@@ -1720,7 +1754,7 @@ void acquireOplogCollectionForLogging(OperationContext* opCtx) {
     }
 }
 
-void establishOplogCollectionForLogging(OperationContext* opCtx, Collection* oplog) {
+void establishOplogCollectionForLogging(OperationContext* opCtx, const Collection* oplog) {
     invariant(opCtx->lockState()->isW());
     invariant(oplog);
     LocalOplogInfo::get(opCtx)->setCollection(oplog);

@@ -47,6 +47,7 @@
 #include "mongo/transport/session.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/interruptible.h"
 #include "mongo/util/lockable_adapter.h"
 #include "mongo/util/time_support.h"
@@ -63,6 +64,19 @@ class StringData;
 namespace repl {
 class UnreplicatedWritesBlock;
 }  // namespace repl
+
+// Enabling the maxTimeAlwaysTimeOut fail point will cause any query or command run with a
+// valid non-zero max time to fail immediately.  Any getmore operation on a cursor already
+// created with a valid non-zero max time will also fail immediately.
+//
+// This fail point cannot be used with the maxTimeNeverTimeOut fail point.
+extern FailPoint maxTimeAlwaysTimeOut;
+
+// Enabling the maxTimeNeverTimeOut fail point will cause the server to never time out any
+// query, command, or getmore operation, regardless of whether a max time is set.
+//
+// This fail point cannot be used with the maxTimeAlwaysTimeOut fail point.
+extern FailPoint maxTimeNeverTimeOut;
 
 /**
  * This class encompasses the state required by an operation and lives from the time a network
@@ -408,6 +422,22 @@ public:
     }
 
     /**
+     * Sets that this operation should always get killed during stepDown and stepUp, regardless of
+     * whether or not it's taken a write lock.
+     */
+    void setAlwaysInterruptAtStepDownOrUp() {
+        _alwaysInterruptAtStepDownOrUp.store(true);
+    }
+
+    /**
+     * Indicates that this operation should always get killed during stepDown and stepUp, regardless
+     * of whether or not it's taken a write lock.
+     */
+    bool shouldAlwaysInterruptAtStepDownOrUp() {
+        return _alwaysInterruptAtStepDownOrUp.load();
+    }
+
+    /**
      * Clears metadata associated with a multi-document transaction.
      */
     void resetMultiDocumentTransactionState() {
@@ -600,6 +630,10 @@ private:
     bool _shouldParticipateInFlowControl = true;
     bool _inMultiDocumentTransaction = false;
     bool _isStartingMultiDocumentTransaction = false;
+
+    // If true, this OpCtx will get interrupted during replica set stepUp and stepDown, regardless
+    // of what locks it's taken.
+    AtomicWord<bool> _alwaysInterruptAtStepDownOrUp{false};
 
     // If populated, this is an owned singleton BSONObj whose only field, 'comment', is a copy of
     // the 'comment' field from the input command object.

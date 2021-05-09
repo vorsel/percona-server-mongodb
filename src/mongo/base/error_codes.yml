@@ -153,7 +153,9 @@ error_codes:
     - {code: 120,name: OplogStartMissing}
     # Error code 121 is only for the document validator on collections.
     - {code: 121,name: DocumentValidationFailure,
-                extra: 'doc_validation_error::DocumentValidationFailureInfo'}
+                extra: 'doc_validation_error::DocumentValidationFailureInfo',
+                # TODO SERVER-50524: Make extra info mandatory when 5.0 becomes last-lts.
+                extraIsOptional: True}
     - {code: 122,name: OBSOLETE_ReadAfterOptimeTimeout}
     - {code: 123,name: NotAReplicaSet}
     - {code: 124,name: IncompatibleElectionProtocol}
@@ -181,7 +183,7 @@ error_codes:
     - {code: 146,name: ExceededMemoryLimit}
     - {code: 147,name: ZLibError}
     - {code: 148,name: ReadConcernMajorityNotEnabled,categories: [VoteAbortError]}
-    - {code: 149,name: NoConfigMaster}
+    - {code: 149,name: NoConfigPrimary}
     - {code: 150,name: StaleEpoch,categories: [StaleShardVersionError,NeedRetargettingError]}
     - {code: 151,name: OperationCannotBeBatched}
     - {code: 152,name: OplogOutOfOrder}
@@ -395,6 +397,7 @@ error_codes:
 
     - {code: 325, name: TenantMigrationAborted}
 
+    - {code: 326, name: OplogQueryMinTsMissing}
 
     # Error codes 4000-8999 are reserved.
 
@@ -402,7 +405,7 @@ error_codes:
     - {code: 9001,name: SocketException,categories: [NetworkError,RetriableError]}
     - {code: 9996,name: OBSOLETE_RecvStaleConfig}
     - {code: 10003,name: CannotGrowDocumentInCappedNamespace}
-    - {code: 10107,name: NotMaster,categories: [NotMasterError,RetriableError]}
+    - {code: 10107,name: NotWritablePrimary,categories: [NotMasterError,RetriableError]}
     - {code: 10334,name: BSONObjectTooLarge}
     - {code: 11000,name: DuplicateKey,extra: DuplicateKeyErrorInfo}
     - {code: 11600,name: InterruptedAtShutdown,categories: [Interruption,ShutdownError,CancelationError,RetriableError]}
@@ -416,8 +419,8 @@ error_codes:
     - {code: 13388,name: StaleConfig,
                     extra: StaleConfigInfo,
                     categories: [StaleShardVersionError,NeedRetargettingError]}
-    - {code: 13435,name: NotMasterNoSlaveOk,categories: [NotMasterError,RetriableError]}
-    - {code: 13436,name: NotMasterOrSecondary,categories: [NotMasterError,RetriableError]}
+    - {code: 13435,name: NotPrimaryNoSecondaryOk,categories: [NotMasterError,RetriableError]}
+    - {code: 13436,name: NotPrimaryOrSecondary,categories: [NotMasterError,RetriableError]}
     - {code: 14031,name: OutOfDiskSpace}
     - {code: 17280,name: OBSOLETE_KeyTooLong}
     - {code: 46841,name: ClientMarkedKilled,categories: [Interruption,CancelationError]}

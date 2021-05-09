@@ -91,33 +91,45 @@ SharedSemiFuture<void> recoverRefreshShardVersion(ServiceContext* serviceContext
             ThreadClient tc("RecoverRefreshThread", serviceContext);
             {
                 stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillable(lk);
+                tc->setSystemOperationKillableByStepdown(lk);
             }
 
             if (MONGO_unlikely(hangInRecoverRefreshThread.shouldFail())) {
                 hangInRecoverRefreshThread.pauseWhileSet();
             }
 
-            auto opCtx = tc->makeOperationContext();
+            auto opCtxHolder = tc->makeOperationContext();
+            auto const opCtx = opCtxHolder.get();
+
+            boost::optional<CollectionMetadata> currentMetadata;
 
             ON_BLOCK_EXIT([&] {
                 UninterruptibleLockGuard noInterrupt(opCtx->lockState());
                 AutoGetCollection autoColl(
-                    opCtx.get(), nss, MODE_IX, AutoGetCollectionViewMode::kViewsForbidden);
+                    opCtx, nss, MODE_IX, AutoGetCollectionViewMode::kViewsForbidden);
 
-                auto* const csr = CollectionShardingRuntime::get(opCtx.get(), nss);
-                auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx.get(), csr);
+                auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
+
+                if (currentMetadata) {
+                    csr->setFilteringMetadata(opCtx, *currentMetadata);
+                } else {
+                    // If currentMetadata is uninitialized, an error occurred in the current spawned
+                    // thread. Filtering metadata is cleared to force a new recover/refresh.
+                    csr->clearFilteringMetadata(opCtx);
+                }
+
+                auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr);
                 csr->resetShardVersionRecoverRefreshFuture(csrLock);
             });
 
             if (runRecover) {
-                auto* const replCoord = repl::ReplicationCoordinator::get(opCtx.get());
+                auto* const replCoord = repl::ReplicationCoordinator::get(opCtx);
                 if (!replCoord->isReplEnabled() || replCoord->getMemberState().primary()) {
-                    migrationutil::recoverMigrationCoordinations(opCtx.get(), nss);
+                    migrationutil::recoverMigrationCoordinations(opCtx, nss);
                 }
             }
 
-            forceShardFilteringMetadataRefresh(opCtx.get(), nss, true);
+            currentMetadata = forceGetCurrentMetadata(opCtx, nss);
         })
         .semi()
         .share();
@@ -321,14 +333,24 @@ CollectionMetadata forceGetCurrentMetadata(OperationContext* opCtx, const Namesp
     auto* const shardingState = ShardingState::get(opCtx);
     invariant(shardingState->canAcceptShardedCommands());
 
-    auto routingInfo = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(opCtx, nss, true));
+    try {
+        const auto cm =
+            uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(
+                opCtx, nss, true));
 
-    if (!routingInfo.cm()) {
+        if (!cm.isSharded()) {
+            return CollectionMetadata();
+        }
+
+        return CollectionMetadata(cm, shardingState->shardId());
+    } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>& ex) {
+        LOGV2(505070,
+              "Namespace {namespace} not found, collection may have been dropped",
+              "Namespace not found, collection may have been dropped",
+              "namespace"_attr = nss,
+              "error"_attr = redact(ex));
         return CollectionMetadata();
     }
-
-    return CollectionMetadata(*routingInfo.cm(), shardingState->shardId());
 }
 
 ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
@@ -344,13 +366,12 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
     auto* const shardingState = ShardingState::get(opCtx);
     invariant(shardingState->canAcceptShardedCommands());
 
-    auto routingInfo =
+    const auto cm =
         uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(
             opCtx, nss, forceRefreshFromThisThread));
-    auto cm = routingInfo.cm();
 
-    if (!cm) {
-        // No chunk manager, so unsharded. Avoid using AutoGetCollection() as it returns the
+    if (!cm.isSharded()) {
+        // The collection is not sharded. Avoid using AutoGetCollection() as it returns the
         // InvalidViewDefinition error code if an invalid view is in the 'system.views' collection.
         AutoGetDb autoDb(opCtx, nss.db(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
@@ -373,8 +394,8 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
         if (optMetadata) {
             const auto& metadata = *optMetadata;
             if (metadata.isSharded() &&
-                metadata.getCollVersion().epoch() == cm->getVersion().epoch() &&
-                metadata.getCollVersion() >= cm->getVersion()) {
+                metadata.getCollVersion().epoch() == cm.getVersion().epoch() &&
+                metadata.getCollVersion() >= cm.getVersion()) {
                 LOGV2_DEBUG(
                     22063,
                     1,
@@ -384,7 +405,7 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
                     "metadata",
                     "namespace"_attr = nss,
                     "latestCollectionVersion"_attr = metadata.getCollVersion(),
-                    "refreshedCollectionVersion"_attr = cm->getVersion());
+                    "refreshedCollectionVersion"_attr = cm.getVersion());
                 return metadata.getShardVersion();
             }
         }
@@ -404,8 +425,8 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
         if (optMetadata) {
             const auto& metadata = *optMetadata;
             if (metadata.isSharded() &&
-                metadata.getCollVersion().epoch() == cm->getVersion().epoch() &&
-                metadata.getCollVersion() >= cm->getVersion()) {
+                metadata.getCollVersion().epoch() == cm.getVersion().epoch() &&
+                metadata.getCollVersion() >= cm.getVersion()) {
                 LOGV2_DEBUG(
                     22064,
                     1,
@@ -415,13 +436,13 @@ ChunkVersion forceShardFilteringMetadataRefresh(OperationContext* opCtx,
                     "metadata",
                     "namespace"_attr = nss,
                     "latestCollectionVersion"_attr = metadata.getCollVersion(),
-                    "refreshedCollectionVersion"_attr = cm->getVersion());
+                    "refreshedCollectionVersion"_attr = cm.getVersion());
                 return metadata.getShardVersion();
             }
         }
     }
 
-    CollectionMetadata metadata(*cm, shardingState->shardId());
+    CollectionMetadata metadata(cm, shardingState->shardId());
     const auto newShardVersion = metadata.getShardVersion();
 
     csr->setFilteringMetadata(opCtx, std::move(metadata));

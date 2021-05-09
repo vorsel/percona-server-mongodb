@@ -217,8 +217,6 @@ IndexEntry indexEntryFromIndexCatalogEntry(OperationContext* opCtx,
 
             LOGV2_DEBUG(20920,
                         2,
-                        "Multikey path metadata range index scan stats: {{ index: {index}, "
-                        "numSeeks: {numSeeks}, keysExamined: {keysExamined}}}",
                         "Multikey path metadata range index scan stats",
                         "index"_attr = desc->indexName(),
                         "numSeeks"_attr = mkAccessStats.keysExamined,
@@ -317,6 +315,10 @@ void fillOutPlannerParams(OperationContext* opCtx,
 
     if (internalQueryPlannerEnableIndexIntersection.load()) {
         plannerParams->options |= QueryPlannerParams::INDEX_INTERSECTION;
+    }
+
+    if (internalQueryEnumerationPreferLockstepOrEnumeration.load()) {
+        plannerParams->options |= QueryPlannerParams::ENUMERATE_OR_CHILDREN_LOCKSTEP;
     }
 
     if (internalQueryPlannerGenerateCoveredWholeIndexScans.load()) {
@@ -528,7 +530,6 @@ public:
         if (nullptr == _collection) {
             LOGV2_DEBUG(20921,
                         2,
-                        "Collection {namespace} does not exist. Using EOF plan: {query}",
                         "Collection does not exist. Using EOF plan",
                         "namespace"_attr = _cq->ns(),
                         "canonicalQuery"_attr = redact(_cq->toStringShort()));
@@ -591,7 +592,6 @@ public:
                         turnIxscanIntoCount(querySolution.get())) {
                         LOGV2_DEBUG(20923,
                                     2,
-                                    "Using fast count: {query}",
                                     "Using fast count",
                                     "query"_attr = redact(_cq->toStringShort()));
                     }
@@ -607,7 +607,6 @@ public:
             SubplanStage::canUseSubplanning(*_cq)) {
             LOGV2_DEBUG(20924,
                         2,
-                        "Running query as sub-queries: {query}",
                         "Running query as sub-queries",
                         "query"_attr = redact(_cq->toStringShort()));
             return buildSubPlan(plannerParams);
@@ -633,7 +632,6 @@ public:
 
                     LOGV2_DEBUG(20925,
                                 2,
-                                "Using fast count: {query}, planSummary: {planSummary}",
                                 "Using fast count",
                                 "query"_attr = redact(_cq->toStringShort()),
                                 "planSummary"_attr = result->getPlanSummary());
@@ -648,14 +646,11 @@ public:
             auto root = buildExecutableTree(*solutions[0]);
             result->emplace(std::move(root), std::move(solutions[0]));
 
-            LOGV2_DEBUG(
-                20926,
-                2,
-                "Only one plan is available; it will be run but will not be cached. {query}, "
-                "planSummary: {planSummary}",
-                "Only one plan is available; it will be run but will not be cached",
-                "query"_attr = redact(_cq->toStringShort()),
-                "planSummary"_attr = result->getPlanSummary());
+            LOGV2_DEBUG(20926,
+                        2,
+                        "Only one plan is available; it will be run but will not be cached",
+                        "query"_attr = redact(_cq->toStringShort()),
+                        "planSummary"_attr = result->getPlanSummary());
 
             return std::move(result);
         }
@@ -1038,17 +1033,30 @@ std::unique_ptr<sbe::RuntimePlanner> makeRuntimePlannerIfNeeded(
     return nullptr;
 }
 
+std::unique_ptr<PlanYieldPolicySBE> makeSbeYieldPolicy(
+    OperationContext* opCtx,
+    PlanYieldPolicy::YieldPolicy requestedYieldPolicy,
+    NamespaceString nss) {
+    auto whileYieldingFn = [nss = std::move(nss)](OperationContext* yieldingOpCtx) {
+        CurOp::get(yieldingOpCtx)->yielded();
+        PlanYieldPolicy::handleDuringYieldFailpoints(yieldingOpCtx, nss);
+    };
+    return std::make_unique<PlanYieldPolicySBE>(requestedYieldPolicy,
+                                                opCtx->getServiceContext()->getFastClockSource(),
+                                                internalQueryExecYieldIterations.load(),
+                                                Milliseconds{internalQueryExecYieldPeriodMS.load()},
+                                                std::move(whileYieldingFn));
+}
+
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getSlotBasedExecutor(
     OperationContext* opCtx,
     const Collection* collection,
     std::unique_ptr<CanonicalQuery> cq,
     PlanYieldPolicy::YieldPolicy requestedYieldPolicy,
     size_t plannerOptions) {
-    auto yieldPolicy =
-        std::make_unique<PlanYieldPolicySBE>(requestedYieldPolicy,
-                                             opCtx->getServiceContext()->getFastClockSource(),
-                                             internalQueryExecYieldIterations.load(),
-                                             Milliseconds{internalQueryExecYieldPeriodMS.load()});
+    invariant(cq);
+    auto nss = cq->nss();
+    auto yieldPolicy = makeSbeYieldPolicy(opCtx, requestedYieldPolicy, nss);
     SlotBasedPrepareExecutionHelper helper{
         opCtx, collection, cq.get(), yieldPolicy.get(), plannerOptions};
     auto executionResult = helper.prepare();
@@ -1074,14 +1082,18 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getSlotBasedExe
                                            std::move(cq),
                                            {std::move(plan.root), std::move(plan.data)},
                                            collection,
-                                           {},
+                                           std::move(nss),
                                            std::move(plan.results),
                                            std::move(yieldPolicy));
     }
     // No need for runtime planning, just use the constructed plan stage tree.
     invariant(roots.size() == 1);
-    return plan_executor_factory::make(
-        opCtx, std::move(cq), std::move(roots[0]), collection, {}, std::move(yieldPolicy));
+    return plan_executor_factory::make(opCtx,
+                                       std::move(cq),
+                                       std::move(roots[0]),
+                                       collection,
+                                       std::move(nss),
+                                       std::move(yieldPolicy));
 }
 }  // namespace
 
@@ -1193,7 +1205,7 @@ StatusWith<std::unique_ptr<projection_ast::Projection>> makeProjection(const BSO
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDelete(
     OpDebug* opDebug,
-    Collection* collection,
+    const Collection* collection,
     ParsedDelete* parsedDelete,
     boost::optional<ExplainOptions::Verbosity> verbosity) {
     auto expCtx = parsedDelete->expCtx();
@@ -1237,7 +1249,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
         // contains an EOF stage.
         LOGV2_DEBUG(20927,
                     2,
-                    "Collection {namespace} does not exist. Using EOF stage: {query}",
                     "Collection does not exist. Using EOF stage",
                     "namespace"_attr = nss.ns(),
                     "query"_attr = redact(request->getQuery()));
@@ -1270,11 +1281,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
 
             if (descriptor && CanonicalQuery::isSimpleIdQuery(unparsedQuery) &&
                 request->getProj().isEmpty() && hasCollectionDefaultCollation) {
-                LOGV2_DEBUG(20928,
-                            2,
-                            "Using idhack: {query}",
-                            "Using idhack",
-                            "query"_attr = redact(unparsedQuery));
+                LOGV2_DEBUG(20928, 2, "Using idhack", "query"_attr = redact(unparsedQuery));
 
                 auto idHackStage = std::make_unique<IDHackStage>(
                     expCtx.get(), unparsedQuery["_id"].wrap(), ws.get(), collection, descriptor);
@@ -1356,7 +1363,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpdate(
     OpDebug* opDebug,
-    Collection* collection,
+    const Collection* collection,
     ParsedUpdate* parsedUpdate,
     boost::optional<ExplainOptions::Verbosity> verbosity) {
     auto expCtx = parsedUpdate->expCtx();
@@ -1410,7 +1417,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpda
     if (!collection) {
         LOGV2_DEBUG(20929,
                     2,
-                    "Collection {namespace} does not exist. Using EOF stage: {query}",
                     "Collection does not exist. Using EOF stage",
                     "namespace"_attr = nss.ns(),
                     "query"_attr = redact(request->getQuery()));
@@ -1438,11 +1444,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpda
 
             if (descriptor && CanonicalQuery::isSimpleIdQuery(unparsedQuery) &&
                 request->getProj().isEmpty() && hasCollectionDefaultCollation) {
-                LOGV2_DEBUG(20930,
-                            2,
-                            "Using idhack: {query}",
-                            "Using idhack",
-                            "query"_attr = redact(unparsedQuery));
+                LOGV2_DEBUG(20930, 2, "Using idhack", "query"_attr = redact(unparsedQuery));
 
                 // Working set 'ws' is discarded. InternalPlanner::updateWithIdHack() makes its own
                 // WorkingSet.
@@ -2056,7 +2058,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorForS
 
     LOGV2_DEBUG(20931,
                 2,
-                "Using fast distinct: {query}, planSummary: {planSummary}",
                 "Using fast distinct",
                 "query"_attr = redact(parsedDistinct->getQuery()->toStringShort()),
                 "planSummary"_attr = Explain::getPlanSummary(root.get()));
@@ -2101,7 +2102,6 @@ getExecutorDistinctFromIndexSolutions(OperationContext* opCtx,
 
             LOGV2_DEBUG(20932,
                         2,
-                        "Using fast distinct: {query}, planSummary: {planSummary}",
                         "Using fast distinct",
                         "query"_attr = redact(parsedDistinct->getQuery()->toStringShort()),
                         "planSummary"_attr = Explain::getPlanSummary(root.get()));

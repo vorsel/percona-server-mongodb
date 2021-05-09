@@ -66,6 +66,8 @@ public:
     static constexpr StringData kUse44SortKeysName = "use44SortKeys"_sd;
     static constexpr StringData kIsMapReduceCommandName = "isMapReduceCommand"_sd;
     static constexpr StringData kLetName = "let"_sd;
+    static constexpr StringData kCollectionUUIDName = "collectionUUID"_sd;
+    static constexpr StringData kRequestResumeToken = "$_requestResumeToken"_sd;
 
     static constexpr long long kDefaultBatchSize = 101;
 
@@ -180,6 +182,10 @@ public:
         return _bypassDocumentValidation;
     }
 
+    bool getRequestResumeToken() const {
+        return _requestResumeToken;
+    }
+
     /**
      * Returns an empty object if no collation was specified.
      */
@@ -227,6 +233,10 @@ public:
         return _isMapReduceCommand;
     }
 
+    const auto& getCollectionUUID() const {
+        return _collectionUUID;
+    }
+
     //
     // Setters for optional fields.
     //
@@ -267,6 +277,10 @@ public:
         _bypassDocumentValidation = shouldBypassDocumentValidation;
     }
 
+    void setRequestResumeToken(bool requestResumeToken) {
+        _requestResumeToken = requestResumeToken;
+    }
+
     void setMaxTimeMS(unsigned int maxTimeMS) {
         _maxTimeMS = maxTimeMS;
     }
@@ -297,6 +311,10 @@ public:
 
     void setIsMapReduceCommand(bool isMapReduce) {
         _isMapReduceCommand = isMapReduce;
+    }
+
+    void setCollectionUUID(UUID collectionUUID) {
+        _collectionUUID = std::move(collectionUUID);
     }
 
 private:
@@ -333,6 +351,7 @@ private:
     bool _fromMongos = false;
     bool _needsMerge = false;
     bool _bypassDocumentValidation = false;
+    bool _requestResumeToken = false;
 
     // A user-specified maxTimeMS limit, or a value of '0' if not specified.
     unsigned int _maxTimeMS = 0;
@@ -348,6 +367,9 @@ private:
     // A document containing runtime constants; i.e. values that do not change once computed (e.g.
     // $$NOW).
     boost::optional<RuntimeConstants> _runtimeConstants;
+
+    // The expected UUID of the namespace the aggregation executes on.
+    boost::optional<UUID> _collectionUUID;
 
     // A document containing user-specified let parameter constants; i.e. values that do not change
     // once computed.

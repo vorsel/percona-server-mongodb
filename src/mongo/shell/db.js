@@ -197,6 +197,16 @@ DB.prototype.adminCommand = function(obj, extra) {
 
 DB.prototype._adminCommand = DB.prototype.adminCommand;  // alias old name
 
+DB.prototype._runCommandWithoutApiStrict = function(command) {
+    let commandWithoutApiStrict = Object.assign({}, command);
+    if (this.getMongo().getApiParameters().strict) {
+        // Permit this command invocation, even if it's not in the requested API version.
+        commandWithoutApiStrict["apiStrict"] = false;
+    }
+
+    return this.runCommand(commandWithoutApiStrict);
+};
+
 DB.prototype._runAggregate = function(cmdObj, aggregateOptions) {
     assert(cmdObj.pipeline instanceof Array, "cmdObj must contain a 'pipeline' array");
     assert(cmdObj.aggregate !== undefined, "cmdObj must contain 'aggregate' field");
@@ -550,7 +560,7 @@ DB.prototype.help = function() {
     print("\tdb.getLastErrorObj() - return full status object");
     print("\tdb.getLogComponents()");
     print("\tdb.getMongo() get the server connection object");
-    print("\tdb.getMongo().setSlaveOk() allow queries on a replication slave server");
+    print("\tdb.getMongo().setSecondaryOk() allow queries on a replication secondary server");
     print("\tdb.getName()");
     print("\tdb.getProfilingLevel() - deprecated");
     print("\tdb.getProfilingStatus() - returns if profiling is on and slow threshold");
@@ -560,6 +570,7 @@ DB.prototype.help = function() {
         "\tdb.getWriteConcern() - returns the write concern used for any operations on this db, inherited from server object if set");
     print("\tdb.hostInfo() get details about the server's host");
     print("\tdb.isMaster() check replica primary status");
+    print("\tdb.hello() check replica primary status");
     print("\tdb.killOp(opid) kills the current operation in the db");
     print("\tdb.listCommands() lists all the db commands");
     print("\tdb.loadServerScripts() loads all the scripts in db.system.js");
@@ -894,6 +905,10 @@ DB.prototype.isMaster = function() {
     return this.runCommand("isMaster");
 };
 
+DB.prototype.hello = function() {
+    return this.runCommand("hello");
+};
+
 var commandUnsupported = function(res) {
     return (!res.ok &&
             (res.errmsg.startsWith("no such cmd") || res.errmsg.startsWith("no such command") ||
@@ -1104,7 +1119,8 @@ DB.prototype.printSecondaryReplicationInfo = function() {
     var L = this.getSiblingDB("local");
 
     if (L.system.replset.count() != 0) {
-        var status = this.adminCommand({'replSetGetStatus': 1});
+        const status =
+            this.getSiblingDB('admin')._runCommandWithoutApiStrict({'replSetGetStatus': 1});
         primary = getPrimary(status.members);
         if (primary) {
             startOptimeDate = primary.optimeDate;
@@ -1126,7 +1142,7 @@ DB.prototype.printSecondaryReplicationInfo = function() {
 };
 
 DB.prototype.serverBuildInfo = function() {
-    return this._adminCommand("buildinfo");
+    return this.getSiblingDB("admin")._runCommandWithoutApiStrict({buildinfo: 1});
 };
 
 // Used to trim entries from the metrics.commands that have never been executed
@@ -1240,20 +1256,32 @@ DB.autocomplete = function(obj) {
 };
 
 DB.prototype.setSlaveOk = function(value) {
-    if (value == undefined)
-        value = true;
-    this._slaveOk = value;
+    print(
+        "WARNING: setSlaveOk() is deprecated and may be removed in the next major release. Please use setSecondaryOk() instead.");
+    this.setSecondaryOk(value);
 };
 
 DB.prototype.getSlaveOk = function() {
-    if (this._slaveOk != undefined)
-        return this._slaveOk;
-    return this._mongo.getSlaveOk();
+    print(
+        "WARNING: getSlaveOk() is deprecated and may be removed in the next major release. Please use getSecondaryOk() instead.");
+    return this.getSecondaryOk();
+};
+
+DB.prototype.setSecondaryOk = function(value) {
+    if (value == undefined)
+        value = true;
+    this._secondaryOk = value;
+};
+
+DB.prototype.getSecondaryOk = function() {
+    if (this._secondaryOk != undefined)
+        return this._secondaryOk;
+    return this._mongo.getSecondaryOk();
 };
 
 DB.prototype.getQueryOptions = function() {
     var options = 0;
-    if (this.getSlaveOk())
+    if (this.getSecondaryOk())
         options |= 4;
     return options;
 };

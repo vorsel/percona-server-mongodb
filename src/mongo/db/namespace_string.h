@@ -118,6 +118,12 @@ public:
     // Namespace for pending range deletions.
     static const NamespaceString kRangeDeletionNamespace;
 
+    // Namespace for the config server's resharding operation state.
+    static const NamespaceString kConfigReshardingOperationsNamespace;
+
+    // Namespace for the donor shard's local resharding operation state.
+    static const NamespaceString kDonorReshardingOperationsNamespace;
+
     // Namespace for balancer settings and default read and write concerns.
     static const NamespaceString kConfigSettingsNamespace;
 

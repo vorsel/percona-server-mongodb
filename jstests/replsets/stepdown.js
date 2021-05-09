@@ -174,7 +174,7 @@ try {
     jsTestLog('Do stepdown of primary ' + master + ' that should not work');
     assert.commandFailedWithCode(master.getDB("admin").runCommand(
                                      {replSetStepDown: ReplSetTest.kDefaultTimeoutMS, force: true}),
-                                 ErrorCodes.NotMaster);
+                                 ErrorCodes.NotWritablePrimary);
 
     // Check that the 'total' and 'failed' fields of 'replSetStepDown' and
     // 'replSetStepDownWithForce' have been incremented in serverStatus.
@@ -239,7 +239,7 @@ assert.soon(function() {
 replTest.add();
 print("\ncheck shutdown command");
 
-master = replTest._master;
+master = replTest.getPrimary();
 var slave = replTest._slaves[0];
 
 try {

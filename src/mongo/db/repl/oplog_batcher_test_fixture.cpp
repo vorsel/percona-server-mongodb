@@ -147,7 +147,9 @@ StatusWith<OplogBufferMock::Value> OplogBufferMock::findByTimestamp(OperationCon
             str::stream() << "No such timestamp in collection: " << ts.toString()};
 }
 
-Status OplogBufferMock::seekToTimestamp(OperationContext* opCtx, const Timestamp& ts, bool exact) {
+Status OplogBufferMock::seekToTimestamp(OperationContext* opCtx,
+                                        const Timestamp& ts,
+                                        SeekStrategy exact) {
     stdx::unique_lock<Latch> lk(_mutex);
     for (std::size_t i = 0; i < _data.size(); i++) {
         if (_data[i]["ts"].timestamp() == ts) {
@@ -158,7 +160,7 @@ Status OplogBufferMock::seekToTimestamp(OperationContext* opCtx, const Timestamp
             break;
         }
     }
-    if (!exact)
+    if (exact != SeekStrategy::kExact)
         return Status::OK();
     return {ErrorCodes::KeyNotFound, str::stream() << "Timestamp not found: " << ts.toString()};
 }
@@ -166,13 +168,13 @@ Status OplogBufferMock::seekToTimestamp(OperationContext* opCtx, const Timestamp
 /**
  * Generates an insert oplog entry with the given number used for the timestamp.
  */
-OplogEntry makeInsertOplogEntry(int t, const NamespaceString& nss) {
+OplogEntry makeInsertOplogEntry(int t, const NamespaceString& nss, boost::optional<UUID> uuid) {
     BSONObj oField = BSON("_id" << t << "a" << t);
     return OplogEntry(OpTime(Timestamp(t, 1), 1),  // optime
                       boost::none,                 // hash
                       OpTypeEnum::kInsert,         // op type
                       nss,                         // namespace
-                      boost::none,                 // uuid
+                      uuid,                        // uuid
                       boost::none,                 // fromMigrate
                       OplogEntry::kOplogVersion,   // version
                       oField,                      // o

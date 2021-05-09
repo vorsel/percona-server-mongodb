@@ -90,7 +90,7 @@ void serializeReply(OperationContext* opCtx,
                     ReplyStyle replyStyle,
                     bool continueOnError,
                     size_t opsInBatch,
-                    WriteResult result,
+                    write_ops_exec::WriteResult result,
                     BSONObjBuilder* out) {
     if (shouldSkipOutput(opCtx))
         return;
@@ -154,8 +154,9 @@ void serializeReply(OperationContext* opCtx,
                 BSONObjBuilder errInfo(error.subobjStart("errInfo"));
                 staleInfo->serialize(&errInfo);
             }
-        } else if (auto docValidationError =
-                       status.extraInfo<doc_validation_error::DocumentValidationFailureInfo>()) {
+        } else if (ErrorCodes::DocumentValidationFailure == status.code() && status.extraInfo()) {
+            auto docValidationError =
+                status.extraInfo<doc_validation_error::DocumentValidationFailureInfo>();
             error.append("code", static_cast<int>(ErrorCodes::DocumentValidationFailure));
             error.append("errInfo", docValidationError->getDetails());
         } else {
@@ -306,7 +307,7 @@ private:
         }
 
         void runImpl(OperationContext* opCtx, BSONObjBuilder& result) const override {
-            auto reply = performInserts(opCtx, _batch);
+            auto reply = write_ops_exec::performInserts(opCtx, _batch);
             serializeReply(opCtx,
                            ReplyStyle::kNotUpdate,
                            !_batch.getWriteCommandBase().getOrdered(),
@@ -404,7 +405,7 @@ private:
         }
 
         void runImpl(OperationContext* opCtx, BSONObjBuilder& result) const override {
-            auto reply = performUpdates(opCtx, _batch);
+            auto reply = write_ops_exec::performUpdates(opCtx, _batch);
             serializeReply(opCtx,
                            ReplyStyle::kUpdate,
                            !_batch.getWriteCommandBase().getOrdered(),
@@ -515,7 +516,7 @@ private:
         }
 
         void runImpl(OperationContext* opCtx, BSONObjBuilder& result) const override {
-            auto reply = performDeletes(opCtx, _batch);
+            auto reply = write_ops_exec::performDeletes(opCtx, _batch);
             serializeReply(opCtx,
                            ReplyStyle::kNotUpdate,
                            !_batch.getWriteCommandBase().getOrdered(),

@@ -192,7 +192,7 @@ TEST(OpMsg, DocumentSequenceMaxWriteBatchWorks) {
     conn->dropCollection("test.collection");
 }
 
-TEST(OpMsg, CloseConnectionOnFireAndForgetNotMasterError) {
+TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
     const auto connStr = unittest::getFixtureConnectionString();
 
     // This test only works against a replica set.
@@ -219,14 +219,14 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotMasterError) {
         })"))
                            .serialize();
 
-        // Round-trip command fails with NotMaster error. Note that this failure is in command
-        // dispatch which ignores w:0.
+        // Round-trip command fails with NotWritablePrimary error. Note that this failure is in
+        // command dispatch which ignores w:0.
         Message reply;
         ASSERT(conn.call(request, reply, /*assertOK*/ true, nullptr));
         ASSERT_EQ(
             getStatusFromCommandResult(
                 conn.parseCommandReplyMessage(conn.getServerAddress(), reply)->getCommandReply()),
-            ErrorCodes::NotMaster);
+            ErrorCodes::NotWritablePrimary);
 
         // Fire-and-forget closes connection when it sees that error. Note that this is using call()
         // rather than say() so that we get an error back when the connection is closed. Normally
@@ -568,7 +568,7 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterCorrectly) {
         ASSERT(conn);
     }
 
-    auto tickSource = getGlobalServiceContext()->getTickSource();
+    auto clockSource = getGlobalServiceContext()->getPreciseClockSource();
 
     // Issue an isMaster command without a topology version.
     auto isMasterCmd = BSON("isMaster" << 1);
@@ -590,11 +590,11 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterCorrectly) {
     OpMsg::setFlag(&request, OpMsg::kExhaustSupported);
 
     // Run isMaster command to initiate the exhaust stream.
-    auto beforeExhaustCommand = tickSource->getTicks();
+    auto beforeExhaustCommand = clockSource->now();
     ASSERT(conn->call(request, reply));
-    auto afterFirstResponse = tickSource->getTicks();
+    auto afterFirstResponse = clockSource->now();
     // Allow for clock skew when testing the response time.
-    ASSERT_GT(tickSource->ticksTo<Milliseconds>(afterFirstResponse - beforeExhaustCommand),
+    ASSERT_GT(duration_cast<Milliseconds>(afterFirstResponse - beforeExhaustCommand),
               Milliseconds(50));
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     res = OpMsg::parse(reply).body;
@@ -605,9 +605,9 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterCorrectly) {
     // Receive next exhaust message.
     auto lastRequestId = reply.header().getId();
     ASSERT_OK(conn->recv(reply, lastRequestId));
-    auto afterSecondResponse = tickSource->getTicks();
+    auto afterSecondResponse = clockSource->now();
     // Allow for clock skew when testing the response time.
-    ASSERT_GT(tickSource->ticksTo<Milliseconds>(afterSecondResponse - afterFirstResponse),
+    ASSERT_GT(duration_cast<Milliseconds>(afterSecondResponse - afterFirstResponse),
               Milliseconds(50));
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     res = OpMsg::parse(reply).body;
@@ -631,7 +631,7 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterWithTopologyChange) {
         ASSERT(conn);
     }
 
-    auto tickSource = getGlobalServiceContext()->getTickSource();
+    auto clockSource = getGlobalServiceContext()->getPreciseClockSource();
 
     // Issue an isMaster command without a topology version.
     auto isMasterCmd = BSON("isMaster" << 1);
@@ -656,11 +656,11 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterWithTopologyChange) {
 
     // Run isMaster command to initiate the exhaust stream. The first response should be received
     // immediately.
-    auto beforeExhaustCommand = tickSource->getTicks();
+    auto beforeExhaustCommand = clockSource->now();
     ASSERT(conn->call(request, reply));
-    auto afterFirstResponse = tickSource->getTicks();
+    auto afterFirstResponse = clockSource->now();
     // Allow for clock skew when testing the response time.
-    ASSERT_LT(tickSource->ticksTo<Milliseconds>(afterFirstResponse - beforeExhaustCommand),
+    ASSERT_LT(duration_cast<Milliseconds>(afterFirstResponse - beforeExhaustCommand),
               Milliseconds(50));
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     res = OpMsg::parse(reply).body;
@@ -671,9 +671,9 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterWithTopologyChange) {
     // Receive next exhaust message. The second response waits for 'maxAwaitTimeMS'.
     auto lastRequestId = reply.header().getId();
     ASSERT_OK(conn->recv(reply, lastRequestId));
-    auto afterSecondResponse = tickSource->getTicks();
+    auto afterSecondResponse = clockSource->now();
     // Allow for clock skew when testing the response time.
-    ASSERT_GT(tickSource->ticksTo<Milliseconds>(afterSecondResponse - afterFirstResponse),
+    ASSERT_GT(duration_cast<Milliseconds>(afterSecondResponse - afterFirstResponse),
               Milliseconds(50));
     ASSERT(OpMsg::isFlagSet(reply, OpMsg::kMoreToCome));
     res = OpMsg::parse(reply).body;
@@ -893,7 +893,8 @@ TEST(OpMsg, ExhaustIsMasterMetricDecrementsOnNewOpAfterTerminatingExhaustStream)
                                    << "failCommand"
                                    << "mode" << BSON("times" << 1) << "data"
                                    << BSON("threadName" << threadName << "errorCode"
-                                                        << ErrorCodes::NotMaster << "failCommands"
+                                                        << ErrorCodes::NotWritablePrimary
+                                                        << "failCommands"
                                                         << BSON_ARRAY("isMaster")));
     auto response = conn2->runCommand(OpMsgRequest::fromDBAndBody("admin", failPointObj));
     ASSERT_OK(getStatusFromCommandResult(response->getCommandReply()));
@@ -983,7 +984,8 @@ TEST(OpMsg, ExhaustIsMasterMetricOnNewExhaustIsMasterAfterTerminatingExhaustStre
                                    << "failCommand"
                                    << "mode" << BSON("times" << 1) << "data"
                                    << BSON("threadName" << threadName << "errorCode"
-                                                        << ErrorCodes::NotMaster << "failCommands"
+                                                        << ErrorCodes::NotWritablePrimary
+                                                        << "failCommands"
                                                         << BSON_ARRAY("isMaster")));
     auto response = conn2->runCommand(OpMsgRequest::fromDBAndBody("admin", failPointObj));
     ASSERT_OK(getStatusFromCommandResult(response->getCommandReply()));

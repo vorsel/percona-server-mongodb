@@ -106,7 +106,7 @@ public:
 
         {
             stdx::lock_guard<Client> lk(*tc.get());
-            tc.get()->setSystemOperationKillable(lk);
+            tc.get()->setSystemOperationKillableByStepdown(lk);
         }
 
         while (true) {
@@ -212,8 +212,7 @@ private:
                 continue;
             }
 
-            AutoGetCollection autoColl(&opCtx, *nss, MODE_IS);
-            Collection* coll = autoColl.getCollection();
+            AutoGetCollection coll(&opCtx, *nss, MODE_IS);
             // The collection with `uuid` might be renamed before the lock and the wrong
             // namespace would be locked and looked up so we double check here.
             if (!coll || coll->uuid() != uuid)
@@ -296,14 +295,12 @@ private:
                     "key"_attr = key,
                     "name"_attr = name);
 
-        AutoGetCollection autoGetCollection(opCtx, collectionNSS, MODE_IX);
+        AutoGetCollection collection(opCtx, collectionNSS, MODE_IX);
         if (MONGO_unlikely(hangTTLMonitorWithLock.shouldFail())) {
             LOGV2(22534, "Hanging due to hangTTLMonitorWithLock fail point");
             hangTTLMonitorWithLock.pauseWhileSet(opCtx);
         }
 
-
-        Collection* collection = autoGetCollection.getCollection();
         if (!collection) {
             // Collection was dropped.
             return;
@@ -375,7 +372,7 @@ private:
 
         auto exec =
             InternalPlanner::deleteWithIndexScan(opCtx,
-                                                 collection,
+                                                 collection.getCollection(),
                                                  std::move(params),
                                                  desc,
                                                  startKey,
@@ -385,7 +382,9 @@ private:
                                                  direction);
 
         try {
-            exec->executePlan();
+            const auto numDeleted = exec->executeDelete();
+            ttlDeletedDocuments.increment(numDeleted);
+            LOGV2_DEBUG(22536, 1, "deleted: {numDeleted}", "numDeleted"_attr = numDeleted);
         } catch (const ExceptionFor<ErrorCodes::QueryPlanKilled>&) {
             // It is expected that a collection drop can kill a query plan while the TTL monitor is
             // deleting an old document, so ignore this error.
@@ -398,10 +397,6 @@ private:
                           "error"_attr = redact(exception.toStatus()));
             return;
         }
-
-        const long long numDeleted = DeleteStage::getNumDeleted(*exec);
-        ttlDeletedDocuments.increment(numDeleted);
-        LOGV2_DEBUG(22536, 1, "deleted: {numDeleted}", "numDeleted"_attr = numDeleted);
     }
 
     // Protects the state below.

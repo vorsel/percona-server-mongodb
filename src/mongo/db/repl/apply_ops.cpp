@@ -260,7 +260,7 @@ Status _applyOps(OperationContext* opCtx,
                 result->append("codeName", ErrorCodes::errorString(ex.code()));
                 result->append("errmsg", ex.what());
                 result->append("results", ab.arr());
-                return Status(ex.code(), ex.what());
+                return ex.toStatus();
             }
         }
 
@@ -315,7 +315,7 @@ Status _checkPrecondition(OperationContext* opCtx,
         if (!database) {
             return {ErrorCodes::NamespaceNotFound, "database in ns does not exist: " + nss.ns()};
         }
-        Collection* collection =
+        const Collection* collection =
             CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
         if (!collection) {
             return {ErrorCodes::NamespaceNotFound, "collection in ns does not exist: " + nss.ns()};
@@ -412,7 +412,7 @@ Status applyOps(OperationContext* opCtx,
         opCtx->writesAreReplicated() && !replCoord->canAcceptWritesForDatabase(opCtx, dbName);
 
     if (userInitiatedWritesAndNotPrimary)
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while applying ops to database " << dbName);
 
     if (auto preCondition = info.getPreCondition()) {

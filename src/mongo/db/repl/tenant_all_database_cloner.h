@@ -32,12 +32,14 @@
 #include <vector>
 
 #include "mongo/db/repl/base_cloner.h"
+#include "mongo/db/repl/tenant_base_cloner.h"
 #include "mongo/db/repl/tenant_database_cloner.h"
+#include "mongo/db/repl/tenant_migration_shared_data.h"
 
 namespace mongo {
 namespace repl {
 
-class TenantAllDatabaseCloner final : public BaseCloner {
+class TenantAllDatabaseCloner final : public TenantBaseCloner {
 public:
     struct Stats {
         size_t databasesCloned{0};
@@ -48,7 +50,7 @@ public:
         void append(BSONObjBuilder* builder) const;
     };
 
-    TenantAllDatabaseCloner(InitialSyncSharedData* sharedData,
+    TenantAllDatabaseCloner(TenantMigrationSharedData* sharedData,
                             const HostAndPort& source,
                             DBClientConnection* client,
                             StorageInterface* storageInterface,
@@ -93,10 +95,6 @@ private:
      * the sync source.
      */
     void postStage() final;
-
-    std::string describeForFuzzer(BaseClonerStage* stage) const final {
-        return "admin db: { " + stage->getName() + ": 1 }";
-    }
 
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.

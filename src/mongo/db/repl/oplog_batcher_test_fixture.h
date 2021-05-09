@@ -62,7 +62,9 @@ public:
     bool peek(OperationContext* opCtx, Value* value) final;
     boost::optional<Value> lastObjectPushed(OperationContext* opCtx) const final;
     StatusWith<Value> findByTimestamp(OperationContext* opCtx, const Timestamp& ts) final;
-    Status seekToTimestamp(OperationContext* opCtx, const Timestamp& ts, bool exact = true) final;
+    Status seekToTimestamp(OperationContext* opCtx,
+                           const Timestamp& ts,
+                           SeekStrategy exact = SeekStrategy::kExact) final;
 
 private:
     mutable Mutex _mutex = MONGO_MAKE_LATCH("OplogBufferMock::_mutex");
@@ -77,7 +79,9 @@ private:
 
 
 // Convenience routines for creating oplog entries to test with.
-OplogEntry makeInsertOplogEntry(int t, const NamespaceString& nss);
+OplogEntry makeInsertOplogEntry(int t,
+                                const NamespaceString& nss,
+                                boost::optional<UUID> uuid = boost::none);
 OplogEntry makeApplyOpsOplogEntry(int t,
                                   bool prepare,
                                   const std::vector<OplogEntry>& innerOps = {});

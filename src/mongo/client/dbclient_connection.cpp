@@ -678,8 +678,10 @@ unsigned long long DBClientConnection::query(std::function<void(DBClientCursorBa
 DBClientConnection::DBClientConnection(bool _autoReconnect,
                                        double so_timeout,
                                        MongoURI uri,
-                                       const HandshakeValidationHook& hook)
-    : autoReconnect(_autoReconnect),
+                                       const HandshakeValidationHook& hook,
+                                       const ClientAPIVersionParameters* apiParameters)
+    : DBClientBase(apiParameters),
+      autoReconnect(_autoReconnect),
       _autoReconnectBackoff(Seconds(1), Seconds(2)),
       _hook(hook),
       _uri(std::move(uri)) {
@@ -817,7 +819,7 @@ void DBClientConnection::handleNotMasterResponse(const BSONObj& replyBody,
     auto monitor = ReplicaSetMonitor::get(_parentReplSetName);
     if (monitor) {
         monitor->failedHost(_serverAddress,
-                            {ErrorCodes::NotMaster,
+                            {ErrorCodes::NotWritablePrimary,
                              str::stream() << "got not master from: " << _serverAddress
                                            << " of repl set: " << _parentReplSetName});
     }

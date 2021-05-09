@@ -112,7 +112,7 @@ public:
                              const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
                              const boost::optional<OplogSlot> slot) final;
     void onCreateCollection(OperationContext* opCtx,
-                            Collection* coll,
+                            const Collection* coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
                             const BSONObj& idIndex,
@@ -214,5 +214,8 @@ private:
         const std::vector<repl::ReplOperation>& stmts,
         const repl::OpTime& prepareOrCommitOptime) {}
 };
+
+extern const OperationContext::Decoration<boost::optional<OpObserverImpl::DocumentKey>>
+    documentKeyDecoration;
 
 }  // namespace mongo

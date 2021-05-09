@@ -53,14 +53,14 @@ namespace mongo {
 MONGO_FAIL_POINT_DEFINE(hangDropCollectionBeforeLockAcquisition);
 MONGO_FAIL_POINT_DEFINE(hangDuringDropCollection);
 
-Status _checkNssAndReplState(OperationContext* opCtx, Collection* coll) {
+Status _checkNssAndReplState(OperationContext* opCtx, const Collection* coll) {
     if (!coll) {
         return Status(ErrorCodes::NamespaceNotFound, "ns not found");
     }
 
     if (opCtx->writesAreReplicated() &&
         !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, coll->ns())) {
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while dropping collection " << coll->ns());
     }
 
@@ -103,7 +103,7 @@ Status _dropView(OperationContext* opCtx,
 
     if (opCtx->writesAreReplicated() &&
         !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, collectionName)) {
-        return Status(ErrorCodes::NotMaster,
+        return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while dropping collection " << collectionName);
     }
 
@@ -134,7 +134,7 @@ Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
     // which may have changed when we released the collection lock temporarily.
     opCtx->recoveryUnit()->abandonSnapshot();
 
-    Collection* coll =
+    const Collection* coll =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, startingNss);
     Status status = _checkNssAndReplState(opCtx, coll);
     if (!status.isOK()) {
@@ -181,15 +181,12 @@ Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
         autoDb.emplace(opCtx, startingNss.db(), MODE_IX);
         collLock.emplace(opCtx, dbAndUUID, MODE_X);
 
-        // Serialize the drop with refreshes to prevent dropping a collection and creating the same
-        // nss as a view while refreshing.
-        CollectionShardingState::get(opCtx, startingNss)->checkShardVersionOrThrow(opCtx);
-
         // Abandon the snapshot as the index catalog will compare the in-memory state to the
         // disk state, which may have changed when we released the collection lock temporarily.
         opCtx->recoveryUnit()->abandonSnapshot();
 
-        coll = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, collectionUUID);
+        const Collection* coll =
+            CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, collectionUUID);
         status = _checkNssAndReplState(opCtx, coll);
         if (!status.isOK()) {
             return status;
@@ -209,6 +206,10 @@ Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
     if (resolvedNss.isDropPendingNamespace()) {
         return Status::OK();
     }
+
+    // Serialize the drop with refreshes to prevent dropping a collection and creating the same
+    // nss as a view while refreshing.
+    CollectionShardingState::get(opCtx, resolvedNss)->checkShardVersionOrThrow(opCtx);
 
     WriteUnitOfWork wunit(opCtx);
 
@@ -236,7 +237,7 @@ Status _dropCollection(OperationContext* opCtx,
                        DropCollectionSystemCollectionMode systemCollectionMode,
                        BSONObjBuilder& result) {
     Lock::CollectionLock collLock(opCtx, collectionName, MODE_X);
-    Collection* coll =
+    const Collection* coll =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collectionName);
     Status status = _checkNssAndReplState(opCtx, coll);
     if (!status.isOK()) {
@@ -299,7 +300,7 @@ Status dropCollection(OperationContext* opCtx,
                     return Status(ErrorCodes::NamespaceNotFound, "ns not found");
                 }
 
-                Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+                const Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
                     opCtx, collectionName);
 
                 if (!coll) {
@@ -336,7 +337,7 @@ Status dropCollectionForApplyOps(OperationContext* opCtx,
             return Status(ErrorCodes::NamespaceNotFound, "ns not found");
         }
 
-        Collection* coll =
+        const Collection* coll =
             CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collectionName);
 
         BSONObjBuilder unusedBuilder;

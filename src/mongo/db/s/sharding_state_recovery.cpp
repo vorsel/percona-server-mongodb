@@ -160,11 +160,12 @@ Status modifyRecoveryDocument(OperationContext* opCtx,
         auto updateReq = UpdateRequest();
         updateReq.setNamespaceString(NamespaceString::kServerConfigurationNamespace);
         updateReq.setQuery(RecoveryDocument::getQuery());
-        updateReq.setUpdateModification(updateObj);
+        updateReq.setUpdateModification(
+            write_ops::UpdateModification::parseFromClassicUpdate(updateObj));
         updateReq.setUpsert();
 
         UpdateResult result = update(opCtx, autoGetOrCreateDb->getDb(), updateReq);
-        invariant(result.numDocsModified == 1 || !result.upserted.isEmpty());
+        invariant(result.numDocsModified == 1 || !result.upsertedId.isEmpty());
         invariant(result.numMatched <= 1);
 
         // Wait until the majority write concern has been satisfied, but do it outside of lock

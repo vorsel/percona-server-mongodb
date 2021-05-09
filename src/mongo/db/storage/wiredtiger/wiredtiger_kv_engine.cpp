@@ -944,6 +944,10 @@ void WiredTigerKVEngine::startAsyncThreads() {
     }
 }
 
+void WiredTigerKVEngine::notifyStartupComplete() {
+    WiredTigerUtil::notifyStartupComplete();
+}
+
 void WiredTigerKVEngine::appendGlobalStats(BSONObjBuilder& b) {
     BSONObjBuilder bb(b.subobjStart("concurrentTransactions"));
     {
@@ -1057,6 +1061,8 @@ void WiredTigerKVEngine::cleanShutdown() {
     LOGV2(22317, "WiredTigerKVEngine shutting down");
     // Ensure that key db is destroyed on exit
     ON_BLOCK_EXIT([&] { _encryptionKeyDB.reset(nullptr); });
+    WiredTigerUtil::resetTableLoggingInfo();
+
     if (!_readOnly)
         syncSizeInfo(true);
     if (!_conn) {
@@ -3054,7 +3060,7 @@ void WiredTigerKVEngine::setInitialDataTimestamp(Timestamp initialDataTimestamp)
     _initialDataTimestamp.store(initialDataTimestamp.asULL());
 }
 
-Timestamp WiredTigerKVEngine::getInitialDataTimestamp() {
+Timestamp WiredTigerKVEngine::getInitialDataTimestamp() const {
     return Timestamp(_initialDataTimestamp.load());
 }
 

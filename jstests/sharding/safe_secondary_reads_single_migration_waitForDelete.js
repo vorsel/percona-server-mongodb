@@ -15,7 +15,6 @@
  *                 *when the range has been deleted on the donor.*
  * - behavior: Must be one of "unshardedOnly", "targetsPrimaryUsesConnectionVersioning" or
  * "versioned". Determines what system profiler checks are performed.
- * @tags: [requires_fcv_47]
  */
 (function() {
 "use strict";
@@ -202,6 +201,7 @@ let testCases = {
     insert: {skip: "primary only"},
     invalidateUserCache: {skip: "does not return user data"},
     isdbgrid: {skip: "does not return user data"},
+    isMaster: {skip: "does not return user data"},
     killAllSessions: {skip: "does not return user data"},
     killAllSessionsByPattern: {skip: "does not return user data"},
     killCursors: {skip: "does not return user data"},
@@ -214,6 +214,7 @@ let testCases = {
     listShards: {skip: "does not return user data"},
     lockInfo: {skip: "primary only"},
     logApplicationMessage: {skip: "primary only"},
+    logMessage: {skip: "does not return user data"},
     logRotate: {skip: "does not return user data"},
     logout: {skip: "does not return user data"},
     makeSnapshot: {skip: "does not return user data"},
@@ -307,6 +308,10 @@ let testCases = {
     startSession: {skip: "does not return user data"},
     stopRecordingTraffic: {skip: "does not return user data"},
     testDeprecation: {skip: "does not return user data"},
+    testDeprecationInVersion2: {skip: "does not return user data"},
+    testRemoval: {skip: "does not return user data"},
+    testVersions1And2: {skip: "does not return user data"},
+    testVersion2: {skip: "does not return user data"},
     top: {skip: "does not return user data"},
     unsetSharding: {skip: "does not return user data"},
     update: {skip: "primary only"},

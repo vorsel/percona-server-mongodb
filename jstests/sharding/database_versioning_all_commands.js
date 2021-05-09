@@ -1,7 +1,6 @@
 /**
  * Specifies for each command whether it is expected to send a databaseVersion, and verifies that
  * the commands match the specification.
- * @tags: [requires_fcv_47]
  */
 (function() {
 'use strict';
@@ -464,6 +463,7 @@ let testCases = {
     },
     invalidateUserCache: {skip: "executes locally on mongos (not sent to any remote node)"},
     isdbgrid: {skip: "executes locally on mongos (not sent to any remote node)"},
+    isMaster: {skip: "executes locally on mongos (not sent to any remote node)"},
     killCursors: {skip: "requires a previously established cursor"},
     killAllSessions: {skip: "always broadcast to all hosts in the cluster"},
     killAllSessionsByPattern: {skip: "always broadcast to all hosts in the cluster"},
@@ -490,6 +490,7 @@ let testCases = {
     },
     listShards: {skip: "does not forward command to primary shard"},
     logApplicationMessage: {skip: "not on a user database", conditional: true},
+    logMessage: {skip: "not on a user database"},
     logRotate: {skip: "executes locally on mongos (not sent to any remote node)"},
     logout: {skip: "not on a user database"},
     mapReduce: {
@@ -628,6 +629,10 @@ let testCases = {
     startSession: {skip: "executes locally on mongos (not sent to any remote node)"},
     stopRecordingTraffic: {skip: "executes locally on mongos (not sent to any remote node)"},
     testDeprecation: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testDeprecationInVersion2: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testRemoval: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testVersion2: {skip: "executes locally on mongos (not sent to any remote node)"},
+    testVersions1And2: {skip: "executes locally on mongos (not sent to any remote node)"},
     update: {
         run: {
             sendsDbVersion: true,

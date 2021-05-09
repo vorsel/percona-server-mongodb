@@ -111,7 +111,7 @@ void DurableViewCatalogImpl::_iterate(OperationContext* opCtx,
                                       ViewCatalogLookupBehavior lookupBehavior) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_db->getSystemViewsName(), MODE_IS));
 
-    Collection* systemViews =
+    const Collection* systemViews =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, _db->getSystemViewsName());
     if (!systemViews) {
         return;
@@ -186,7 +186,7 @@ void DurableViewCatalogImpl::upsert(OperationContext* opCtx,
     NamespaceString systemViewsNs(_db->getSystemViewsName());
     dassert(opCtx->lockState()->isCollectionLockedForMode(systemViewsNs, MODE_X));
 
-    Collection* systemViews =
+    const Collection* systemViews =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, systemViewsNs);
     invariant(systemViews);
 
@@ -197,7 +197,6 @@ void DurableViewCatalogImpl::upsert(OperationContext* opCtx,
     if (!id.isValid() || !systemViews->findDoc(opCtx, id, &oldView)) {
         LOGV2_DEBUG(22544,
                     2,
-                    "Insert view {view} into {viewCatalog}",
                     "Insert view to system views catalog",
                     "view"_attr = view,
                     "viewCatalog"_attr = _db->getSystemViewsName());
@@ -219,7 +218,7 @@ void DurableViewCatalogImpl::remove(OperationContext* opCtx, const NamespaceStri
     dassert(opCtx->lockState()->isDbLockedForMode(_db->name(), MODE_IX));
     dassert(opCtx->lockState()->isCollectionLockedForMode(name, MODE_IX));
 
-    Collection* systemViews =
+    const Collection* systemViews =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, _db->getSystemViewsName());
     dassert(opCtx->lockState()->isCollectionLockedForMode(systemViews->ns(), MODE_X));
 
@@ -232,7 +231,6 @@ void DurableViewCatalogImpl::remove(OperationContext* opCtx, const NamespaceStri
 
     LOGV2_DEBUG(22545,
                 2,
-                "Remove view {view} from {viewCatalog}",
                 "Remove view from system views catalog",
                 "view"_attr = name,
                 "viewCatalog"_attr = _db->getSystemViewsName());

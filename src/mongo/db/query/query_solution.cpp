@@ -212,6 +212,7 @@ QuerySolutionNode* CollectionScanNode::clone() const {
     copy->tailable = this->tailable;
     copy->direction = this->direction;
     copy->shouldTrackLatestOplogTimestamp = this->shouldTrackLatestOplogTimestamp;
+    copy->assertMinTsHasNotFallenOffOplog = this->assertMinTsHasNotFallenOffOplog;
     copy->shouldWaitForOplogVisibility = this->shouldWaitForOplogVisibility;
 
     return copy;
@@ -472,6 +473,7 @@ void IndexScanNode::appendToString(str::stream* ss, int indent) const {
     *ss << "IXSCAN\n";
     addIndent(ss, indent + 1);
     *ss << "indexName = " << index.identifier.catalogName << '\n';
+    addIndent(ss, indent + 1);
     *ss << "keyPattern = " << index.keyPattern << '\n';
     if (nullptr != filter) {
         addIndent(ss, indent + 1);

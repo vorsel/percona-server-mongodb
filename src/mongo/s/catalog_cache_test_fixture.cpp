@@ -59,7 +59,7 @@ void CatalogCacheTestFixture::setUp() {
     CollatorFactoryInterface::set(getServiceContext(), std::make_unique<CollatorFactoryMock>());
 }
 
-executor::NetworkTestEnv::FutureHandle<boost::optional<CachedCollectionRoutingInfo>>
+executor::NetworkTestEnv::FutureHandle<boost::optional<ChunkManager>>
 CatalogCacheTestFixture::scheduleRoutingInfoForcedRefresh(const NamespaceString& nss) {
     return launchAsync([this, nss] {
         auto client = getServiceContext()->makeClient("Test");
@@ -70,13 +70,13 @@ CatalogCacheTestFixture::scheduleRoutingInfoForcedRefresh(const NamespaceString&
     });
 }
 
-executor::NetworkTestEnv::FutureHandle<boost::optional<CachedCollectionRoutingInfo>>
+executor::NetworkTestEnv::FutureHandle<boost::optional<ChunkManager>>
 CatalogCacheTestFixture::scheduleRoutingInfoUnforcedRefresh(const NamespaceString& nss) {
     return launchAsync([this, nss] {
         auto client = getServiceContext()->makeClient("Test");
         auto const catalogCache = Grid::get(getServiceContext())->catalogCache();
 
-        return boost::make_optional(
+        return boost::optional<ChunkManager>(
             uassertStatusOK(catalogCache->getCollectionRoutingInfo(operationContext(), nss)));
     });
 }
@@ -108,7 +108,8 @@ ChunkManager CatalogCacheTestFixture::makeChunkManager(
     const ShardKeyPattern& shardKeyPattern,
     std::unique_ptr<CollatorInterface> defaultCollator,
     bool unique,
-    const std::vector<BSONObj>& splitPoints) {
+    const std::vector<BSONObj>& splitPoints,
+    boost::optional<ReshardingFields> reshardingFields) {
     ChunkVersion version(1, 0, OID::gen());
 
     const BSONObj databaseBSON = [&]() {
@@ -125,6 +126,10 @@ ChunkManager CatalogCacheTestFixture::makeChunkManager(
 
         if (defaultCollator) {
             coll.setDefaultCollation(defaultCollator->getSpec().toBSON());
+        }
+
+        if (reshardingFields) {
+            coll.setReshardingFields(std::move(reshardingFields));
         }
 
         return coll.toBSON();
@@ -160,11 +165,7 @@ ChunkManager CatalogCacheTestFixture::makeChunkManager(
     expectFindSendBSONObjVector(kConfigHostAndPort, {collectionBSON});
     expectFindSendBSONObjVector(kConfigHostAndPort, initialChunks);
 
-    auto routingInfo = future.default_timed_get();
-    ASSERT(routingInfo->cm());
-    ASSERT(routingInfo->db().primary());
-
-    return *routingInfo->cm();
+    return *future.default_timed_get();
 }
 
 void CatalogCacheTestFixture::expectGetDatabase(NamespaceString nss, std::string shardId) {
@@ -188,13 +189,13 @@ void CatalogCacheTestFixture::expectGetCollection(NamespaceString nss,
     }());
 }
 
-CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShards(
+ChunkManager CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShards(
     NamespaceString nss) {
 
     return loadRoutingTableWithTwoChunksAndTwoShardsImpl(nss, BSON("_id" << 1));
 }
 
-CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShardsHash(
+ChunkManager CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShardsHash(
     NamespaceString nss) {
 
     return loadRoutingTableWithTwoChunksAndTwoShardsImpl(nss,
@@ -202,7 +203,7 @@ CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChun
                                                               << "hashed"));
 }
 
-CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShardsImpl(
+ChunkManager CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShardsImpl(
     NamespaceString nss, const BSONObj& shardKey) {
     const OID epoch = OID::gen();
     const ShardKeyPattern shardKeyPattern(shardKey);
@@ -230,7 +231,7 @@ CachedCollectionRoutingInfo CatalogCacheTestFixture::loadRoutingTableWithTwoChun
         return std::vector<BSONObj>{chunk1.toConfigBSON(), chunk2.toConfigBSON()};
     }());
 
-    return future.default_timed_get().get();
+    return *future.default_timed_get();
 }
 
 }  // namespace mongo

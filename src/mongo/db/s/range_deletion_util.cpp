@@ -83,7 +83,7 @@ MONGO_FAIL_POINT_DEFINE(throwInternalErrorInDeleteRange);
  * enqueued for deletion.
  */
 bool collectionUuidHasChanged(const NamespaceString& nss,
-                              Collection* currentCollection,
+                              const Collection* currentCollection,
                               UUID expectedCollectionUuid) {
 
     if (!currentCollection) {
@@ -121,7 +121,7 @@ bool collectionUuidHasChanged(const NamespaceString& nss,
  * the range failed.
  */
 StatusWith<int> deleteNextBatch(OperationContext* opCtx,
-                                Collection* collection,
+                                const Collection* collection,
                                 BSONObj const& keyPattern,
                                 ChunkRange const& range,
                                 int numDocsToRemovePerBatch) {
@@ -242,7 +242,7 @@ auto withTemporaryOperationContext(Callable&& callable) {
     ThreadClient tc(migrationutil::kRangeDeletionThreadName, getGlobalServiceContext());
     {
         stdx::lock_guard<Client> lk(*tc.get());
-        tc->setSystemOperationKillable(lk);
+        tc->setSystemOperationKillableByStepdown(lk);
     }
     auto uniqueOpCtx = Client::getCurrent()->makeOperationContext();
     auto opCtx = uniqueOpCtx.get();

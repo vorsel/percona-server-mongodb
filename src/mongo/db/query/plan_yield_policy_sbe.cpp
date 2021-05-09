@@ -33,17 +33,16 @@
 
 namespace mongo {
 
-// TODO SERVER-48616: Need to change how we bump the CurOp yield counter. We shouldn't do it here
-// so that SBE does not depend on CurOp. But we should still expose that statistic and keep it fresh
-// as the operation executes.
 Status PlanYieldPolicySBE::yield(OperationContext* opCtx, std::function<void()> whileYieldingFn) {
-    if (!_rootStage) {
+    if (_yieldingPlans.empty()) {
         // This yield policy isn't bound to an execution tree yet.
         return Status::OK();
     }
 
     try {
-        _rootStage->saveState();
+        for (auto&& root : _yieldingPlans) {
+            root->saveState();
+        }
 
         opCtx->recoveryUnit()->abandonSnapshot();
 
@@ -51,7 +50,13 @@ Status PlanYieldPolicySBE::yield(OperationContext* opCtx, std::function<void()> 
             whileYieldingFn();
         }
 
-        _rootStage->restoreState();
+        if (_duringAllYieldsFn) {
+            _duringAllYieldsFn(opCtx);
+        }
+
+        for (auto&& root : _yieldingPlans) {
+            root->restoreState();
+        }
     } catch (...) {
         return exceptionToStatus();
     }

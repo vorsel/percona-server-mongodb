@@ -33,6 +33,7 @@
 
 #include "mongo/db/storage/storage_debug_util.h"
 
+#include "mongo/db/catalog/validate_results.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/storage/key_string.h"
@@ -74,8 +75,7 @@ void printKeyString(const RecordId& recordId,
 
 void printCollectionAndIndexTableEntries(OperationContext* opCtx, const NamespaceString& nss) {
     invariant(!opCtx->lockState()->isLocked());
-    AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-    Collection* coll = autoColl.getCollection();
+    AutoGetCollection coll(opCtx, nss, MODE_IS);
 
     LOGV2(51807, "Dumping collection table and index tables' entries for debugging...");
 

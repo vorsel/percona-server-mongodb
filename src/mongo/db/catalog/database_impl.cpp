@@ -172,27 +172,31 @@ void DatabaseImpl::init(OperationContext* const opCtx) const {
 
     auto& catalog = CollectionCatalog::get(opCtx);
     for (const auto& uuid : catalog.getAllCollectionUUIDsFromDb(_name)) {
-        auto collection = catalog.lookupCollectionByUUID(opCtx, uuid);
+        auto collection = catalog.lookupCollectionByUUIDForMetadataWrite(opCtx, uuid);
         invariant(collection);
         // If this is called from the repair path, the collection is already initialized.
         if (!collection->isInitialized())
             collection->init(opCtx);
     }
 
-    // At construction time of the viewCatalog, the CollectionCatalog map wasn't initialized yet,
-    // so no system.views collection would be found. Now that we're sufficiently initialized, reload
-    // the viewCatalog to populate its in-memory state. If there are problems with the catalog
-    // contents as might be caused by incorrect mongod versions or similar, they are found right
-    // away.
-    auto views = ViewCatalog::get(this);
-    Status reloadStatus = views->reload(opCtx, ViewCatalogLookupBehavior::kValidateDurableViews);
-    if (!reloadStatus.isOK()) {
-        LOGV2_WARNING_OPTIONS(20326,
-                              {logv2::LogTag::kStartupWarnings},
-                              "Unable to parse views; remove any invalid views "
-                              "from the collection to restore server functionality",
-                              "error"_attr = redact(reloadStatus),
-                              "namespace"_attr = _viewsName);
+    // When in repair mode, record stores are not loaded. Thus the ViewsCatalog cannot be reloaded.
+    if (!storageGlobalParams.repair) {
+        // At construction time of the viewCatalog, the CollectionCatalog map wasn't initialized
+        // yet, so no system.views collection would be found. Now that we're sufficiently
+        // initialized, reload the viewCatalog to populate its in-memory state. If there are
+        // problems with the catalog contents as might be caused by incorrect mongod versions or
+        // similar, they are found right away.
+        auto views = ViewCatalog::get(this);
+        Status reloadStatus =
+            views->reload(opCtx, ViewCatalogLookupBehavior::kValidateDurableViews);
+        if (!reloadStatus.isOK()) {
+            LOGV2_WARNING_OPTIONS(20326,
+                                  {logv2::LogTag::kStartupWarnings},
+                                  "Unable to parse views; remove any invalid views "
+                                  "from the collection to restore server functionality",
+                                  "error"_attr = redact(reloadStatus),
+                                  "namespace"_attr = _viewsName);
+        }
     }
 }
 
@@ -356,7 +360,8 @@ Status DatabaseImpl::dropCollectionEvenIfSystem(OperationContext* opCtx,
             "dropCollection() cannot accept a valid drop optime when writes are replicated.");
     }
 
-    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+    Collection* collection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespaceForMetadataWrite(opCtx, nss);
 
     if (!collection) {
         return Status::OK();  // Post condition already met.
@@ -485,7 +490,7 @@ void DatabaseImpl::_dropCollectionIndexes(OperationContext* opCtx,
 
 Status DatabaseImpl::_finishDropCollection(OperationContext* opCtx,
                                            const NamespaceString& nss,
-                                           Collection* collection) const {
+                                           const Collection* collection) const {
     UUID uuid = collection->uuid();
     LOGV2(20318,
           "Finishing collection drop for {namespace} ({uuid}).",
@@ -523,7 +528,7 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
     }
 
     Collection* collToRename =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, fromNss);
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespaceForMetadataWrite(opCtx, fromNss);
     if (!collToRename) {
         return Status(ErrorCodes::NamespaceNotFound, "collection not found to rename");
     }
@@ -656,10 +661,15 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
         createOplogSlot = repl::getNextOpTime(opCtx);
     }
 
-    if (MONGO_unlikely(hangAndFailAfterCreateCollectionReservesOpTime.shouldFail())) {
-        hangAndFailAfterCreateCollectionReservesOpTime.pauseWhileSet(opCtx);
-        uasserted(51267, "hangAndFailAfterCreateCollectionReservesOpTime fail point enabled");
-    }
+    hangAndFailAfterCreateCollectionReservesOpTime.executeIf(
+        [&](const BSONObj&) {
+            hangAndFailAfterCreateCollectionReservesOpTime.pauseWhileSet(opCtx);
+            uasserted(51267, "hangAndFailAfterCreateCollectionReservesOpTime fail point enabled");
+        },
+        [&](const BSONObj& data) {
+            auto fpNss = data["nss"].str();
+            return fpNss.empty() || fpNss == nss.toString();
+        });
 
     _checkCanCreateCollection(opCtx, nss, optionsWithUUID);
     assertMovePrimaryInProgress(opCtx, nss);
@@ -809,7 +819,8 @@ void DatabaseImpl::checkForIdIndexesAndDropPendingCollections(OperationContext* 
         if (nss.isSystem())
             continue;
 
-        Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+        const Collection* coll =
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
         if (!coll)
             continue;
 
@@ -920,6 +931,11 @@ Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
     }
 
     if (collectionOptions.isView()) {
+        if (nss.isSystem())
+            return Status(
+                ErrorCodes::InvalidNamespace,
+                "View name cannot start with 'system.', which is reserved for system namespaces");
+
         uassertStatusOK(createView(opCtx, nss, collectionOptions));
     } else {
         invariant(createCollection(opCtx, nss, collectionOptions, createDefaultIndexes, idIndex),

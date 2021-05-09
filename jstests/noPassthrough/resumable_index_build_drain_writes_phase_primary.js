@@ -3,7 +3,11 @@
  * build is in the drain writes phase on a primary, and that the index build is subsequently
  * completed when the node is started back up.
  *
- * @tags: [requires_persistence, requires_replication]
+ * @tags: [
+ *   requires_majority_read_concern,
+ *   requires_persistence,
+ *   requires_replication,
+ * ]
  */
 (function() {
 "use strict";
@@ -36,6 +40,8 @@ ResumableIndexBuildTest.run(rst,
                             {a: 1},
                             "hangIndexBuildDuringDrainWritesPhase",
                             {iteration: 0},
+                            "drain writes",
+                            {skippedPhaseLogID: 20392},
                             [{a: 2}, {a: 3}],
                             [{a: 4}, {a: 5}]);
 ResumableIndexBuildTest.run(rst,
@@ -44,6 +50,8 @@ ResumableIndexBuildTest.run(rst,
                             {a: 1},
                             "hangIndexBuildDuringDrainWritesPhase",
                             {iteration: 1},
+                            "drain writes",
+                            {skippedPhaseLogID: 20392},
                             [{a: 6}, {a: 7}],
                             [{a: 8}, {a: 9}]);
 

@@ -42,6 +42,7 @@
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/matcher/expression_internal_expr_eq.h"
 #include "mongo/db/matcher/expression_text.h"
+#include "mongo/db/query/canonical_query_encoder.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/index_tag.h"
 #include "mongo/db/query/indexability.h"
@@ -55,11 +56,13 @@ namespace {
 
 namespace wcp = ::mongo::wildcard_planning;
 
-// Can't index negations of {$eq: <Array>} or {$in: [<Array>, ...]}. Note that we could
-// use the index in principle, though we would need to generate special bounds.
-bool isEqualsArrayOrNotInArray(const MatchExpression* me) {
+// Can't index negations of {$eq: <Array>}, {$lt: <Array>}, {$gt: <Array>}, {$lte: <Array>}, {$gte:
+// <Array>}, or {$in: [<Array>, ...]}. Note that we could use the index in principle, though we
+// would need to generate special bounds.
+bool isComparisonWithArrayPred(const MatchExpression* me) {
     const auto type = me->matchType();
-    if (type == MatchExpression::EQ) {
+    if (type == MatchExpression::EQ || type == MatchExpression::LT || type == MatchExpression::GT ||
+        type == MatchExpression::LTE || type == MatchExpression::GTE) {
         return static_cast<const ComparisonMatchExpression*>(me)->getData().type() ==
             BSONType::Array;
     } else if (type == MatchExpression::MATCH_IN) {
@@ -68,7 +71,6 @@ bool isEqualsArrayOrNotInArray(const MatchExpression* me) {
             return elt.type() == BSONType::Array;
         });
     }
-
     return false;
 }
 
@@ -286,7 +288,6 @@ std::vector<IndexEntry> QueryPlannerIXSelect::findIndexesByHint(
             if (entry.identifier.catalogName == hintName) {
                 LOGV2_DEBUG(20952,
                             5,
-                            "Hint by name specified, restricting indices to {keyPattern}",
                             "Hint by name specified, restricting indices",
                             "name"_attr = entry.identifier.catalogName,
                             "keyPattern"_attr = entry.keyPattern);
@@ -298,7 +299,6 @@ std::vector<IndexEntry> QueryPlannerIXSelect::findIndexesByHint(
             if (SimpleBSONObjComparator::kInstance.evaluate(entry.keyPattern == hintedIndex)) {
                 LOGV2_DEBUG(20953,
                             5,
-                            "Hint specified, restricting indices to {keyPattern}",
                             "Hint specified, restricting indices",
                             "name"_attr = entry.identifier.catalogName,
                             "keyPattern"_attr = entry.keyPattern);
@@ -446,7 +446,16 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
                 return false;
             }
 
-            if (isEqualsArrayOrNotInArray(child)) {
+            // Comparisons with arrays have strange enough semantics that inverting the bounds
+            // within a $not has many complex special cases. We avoid indexing these queries, even
+            // though it is sometimes possible to build useful bounds.
+            if (isComparisonWithArrayPred(child)) {
+                return false;
+            }
+
+            // $gt and $lt to MinKey/MaxKey must build inexact bounds if the index is multikey and
+            // therefore cannot be inverted safely in a $not.
+            if (index.multikey && (child->isGTMinKey() || child->isLTMaxKey())) {
                 return false;
             }
 
@@ -471,6 +480,11 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
                     return false;
                 }
             }
+        }
+
+        if (index.pathHasMultikeyComponent(keyPatternElt.fieldNameStringData()) && !index.sparse &&
+            isQueryNegatingGTEorLTENull(node)) {
+            return false;
         }
 
         // If this is an $elemMatch value, make sure _all_ of the children can use the index.
@@ -586,7 +600,6 @@ bool QueryPlannerIXSelect::_compatible(const BSONElement& keyPatternElt,
         return false;
     } else {
         LOGV2_WARNING(20954,
-                      "Unknown indexing for node {node} and field {field}",
                       "Unknown indexing for given node and field",
                       "node"_attr = node->debugString(),
                       "field"_attr = keyPatternElt.toString());
@@ -626,7 +639,7 @@ bool QueryPlannerIXSelect::nodeIsSupportedBySparseIndex(const MatchExpression* q
 
 bool QueryPlannerIXSelect::logicalNodeMayBeSupportedByAnIndex(const MatchExpression* queryExpr) {
     return !(queryExpr->matchType() == MatchExpression::NOT &&
-             isEqualsArrayOrNotInArray(queryExpr->getChild(0)));
+             isComparisonWithArrayPred(queryExpr->getChild(0)));
 }
 
 bool QueryPlannerIXSelect::nodeIsSupportedByWildcardIndex(const MatchExpression* queryExpr) {

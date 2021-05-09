@@ -79,6 +79,7 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/fcv_op_observer.h"
 #include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/ftdc/ftdc_mongod.h"
 #include "mongo/db/global_settings.h"
@@ -114,6 +115,8 @@
 #include "mongo/db/read_write_concern_defaults_cache_lookup_mongod.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/primary_only_service.h"
+#include "mongo/db/repl/primary_only_service_op_observer.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replica_set_aware_service.h"
 #include "mongo/db/repl/replication_consistency_markers_impl.h"
@@ -124,6 +127,7 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/repl/tenant_migration_donor_service.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/repl_set_member_in_standalone_mode.h"
@@ -253,7 +257,7 @@ void logStartup(OperationContext* opCtx) {
     Lock::GlobalWrite lk(opCtx);
     AutoGetOrCreateDb autoDb(opCtx, startupLogCollectionName.db(), mongo::MODE_X);
     Database* db = autoDb.getDb();
-    Collection* collection =
+    const Collection* collection =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, startupLogCollectionName);
     WriteUnitOfWork wunit(opCtx);
     if (!collection) {
@@ -297,6 +301,13 @@ void initializeCommandHooks(ServiceContext* serviceContext) {
 
     MirrorMaestro::init(serviceContext);
     CommandInvocationHooks::set(serviceContext, std::make_shared<MongodCommandInvocationHooks>());
+}
+
+void registerPrimaryOnlyServices(ServiceContext* serviceContext) {
+    auto registry = repl::PrimaryOnlyServiceRegistry::get(serviceContext);
+    std::unique_ptr<TenantMigrationDonorService> tenantMigrationDonorService =
+        std::make_unique<TenantMigrationDonorService>(serviceContext);
+    registry->registerService(std::move(tenantMigrationDonorService));
 }
 
 MONGO_FAIL_POINT_DEFINE(shutdownAtStartup);
@@ -471,6 +482,10 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
         LOGV2(20536, "Flow Control is enabled on this deployment");
     }
 
+    // Notify the storage engine that startup is completed before repair exits below, as repair sets
+    // the upgrade flag to true.
+    serviceContext->getStorageEngine()->notifyStartupComplete();
+
     if (storageGlobalParams.upgrade) {
         LOGV2(20537, "Finished checking dbs");
         exitCleanly(EXIT_CLEAN);
@@ -499,8 +514,8 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
                           "error"_attr = redact(status));
             if (status == ErrorCodes::AuthSchemaIncompatible) {
                 exitCleanly(EXIT_NEED_UPGRADE);
-            } else if (status == ErrorCodes::NotMaster) {
-                // Try creating the indexes if we become master.  If we do not become master,
+            } else if (status == ErrorCodes::NotWritablePrimary) {
+                // Try creating the indexes if we become primary.  If we do not become primary,
                 // the master will create the indexes and we will replicate them.
             } else {
                 quickExit(EXIT_FAILURE);
@@ -985,6 +1000,10 @@ void setUpReplication(ServiceContext* serviceContext) {
     repl::setOplogCollectionName(serviceContext);
 
     IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
+
+    // Register primary-only services here so that the services are started up when the replication
+    // coordinator starts up.
+    registerPrimaryOnlyServices(serviceContext);
 }
 
 void setUpObservers(ServiceContext* serviceContext) {
@@ -999,6 +1018,9 @@ void setUpObservers(ServiceContext* serviceContext) {
         opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
     }
     opObserverRegistry->addObserver(std::make_unique<AuthOpObserver>());
+    opObserverRegistry->addObserver(
+        std::make_unique<repl::PrimaryOnlyServiceOpObserver>(serviceContext));
+    opObserverRegistry->addObserver(std::make_unique<FcvOpObserver>());
 
     setupFreeMonitoringOpObserver(opObserverRegistry.get());
 
@@ -1105,6 +1127,10 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
 
     LOGV2_OPTIONS(4784902, {LogComponent::kSharding}, "Shutting down the WaitForMajorityService");
     WaitForMajorityService::get(serviceContext).shutDown();
+
+    LOGV2_OPTIONS(
+        5006600, {LogComponent::kReplication}, "Shutting down the PrimaryOnlyServiceRegistry");
+    repl::PrimaryOnlyServiceRegistry::get(serviceContext)->shutdown();
 
     // Join the logical session cache before the transport layer.
     if (auto lsc = LogicalSessionCache::get(serviceContext)) {
@@ -1310,7 +1336,9 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
 #endif
 
     FlowControl::shutdown(serviceContext);
+#ifdef MONGO_CONFIG_SSL
     OCSPManager::shutdown(serviceContext);
+#endif
 }
 
 }  // namespace

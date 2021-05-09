@@ -32,9 +32,10 @@
 #include <vector>
 
 #include "mongo/bson/bsonmisc.h"
-#include "mongo/db/repl/cloner_test_fixture.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
+#include "mongo/db/repl/tenant_cloner_test_fixture.h"
 #include "mongo/db/repl/tenant_collection_cloner.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
@@ -54,13 +55,13 @@ public:
     }
 };
 
-class TenantCollectionClonerTest : public ClonerTestFixture {
+class TenantCollectionClonerTest : public TenantClonerTestFixture {
 public:
     TenantCollectionClonerTest() {}
 
 protected:
     void setUp() override {
-        ClonerTestFixture::setUp();
+        TenantClonerTestFixture::setUp();
         _standardCreateCollectionFn = [this](OperationContext* opCtx,
                                              const NamespaceString& nss,
                                              const CollectionOptions& options) -> Status {
@@ -84,8 +85,6 @@ protected:
         };
 
         _mockServer->assignCollectionUuid(_nss.ns(), _collUuid);
-        _mockServer->setCommandReply("replSetGetRBID",
-                                     BSON("ok" << 1 << "rbid" << _sharedData->getRollBackId()));
         _mockClient->setOperationTime(_operationTime);
     }
     std::unique_ptr<TenantCollectionCloner> makeCollectionCloner(
@@ -94,7 +93,7 @@ protected:
         _options = options;
         return std::make_unique<TenantCollectionCloner>(_nss,
                                                         options,
-                                                        _sharedData.get(),
+                                                        getSharedData(),
                                                         _source,
                                                         _mockClient.get(),
                                                         &_storageInterface,
@@ -141,16 +140,8 @@ protected:
                                                        << "a_1"),
                                               BSON("v" << 1 << "key" << BSON("b" << 1) << "name"
                                                        << "b_1")};
-    static std::string _tenantId;
-    static NamespaceString _nss;
-    static Timestamp _operationTime;
+    const NamespaceString _nss = {_tenantId + "_testDb", "testcoll"};
 };
-
-/* static */
-std::string TenantCollectionClonerTest::_tenantId = "tenant42";
-NamespaceString TenantCollectionClonerTest::_nss = {_tenantId + "_testDb", "testcoll"};
-Timestamp TenantCollectionClonerTest::_operationTime = Timestamp(12345, 42);
-
 
 TEST_F(TenantCollectionClonerTest, CountStage) {
     auto cloner = makeCollectionCloner();
@@ -342,6 +333,36 @@ TEST_F(TenantCollectionClonerTest, InsertDocumentsSingleBatch) {
 
     auto stats = cloner->getStats();
     ASSERT_EQUALS(1u, stats.receivedBatches);
+}
+
+TEST_F(TenantCollectionClonerTest, BatchSizeStoredInConstructor) {
+    auto batchSizeDefault = collectionClonerBatchSize;
+    collectionClonerBatchSize = 3;
+    ON_BLOCK_EXIT([&]() { collectionClonerBatchSize = batchSizeDefault; });
+
+    // Set up data for preliminary stages.
+    _mockServer->setCommandReply("count", createCountResponse(7));
+    _mockServer->setCommandReply("listIndexes",
+                                 createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+    _mockServer->setCommandReply("find", createFindResponse());
+
+    // Set up documents to be returned from upstream node. It should take 3 batches to clone the
+    // documents.
+    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 4));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 5));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 6));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 7));
+
+    auto cloner = makeCollectionCloner();
+    ASSERT_OK(cloner->run());
+
+    ASSERT_EQUALS(7, _numDocsInserted);
+
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(3u, stats.receivedBatches);
 }
 
 TEST_F(TenantCollectionClonerTest, InsertDocumentsMultipleBatches) {

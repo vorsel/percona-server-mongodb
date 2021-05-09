@@ -56,6 +56,7 @@ PlanExecutorSBE::PlanExecutorSBE(
       _cq{std::move(cq)},
       _yieldPolicy(std::move(yieldPolicy)) {
     invariant(_root);
+    invariant(!_nss.isEmpty());
 
     auto&& data = root.second;
 
@@ -91,17 +92,11 @@ PlanExecutorSBE::PlanExecutorSBE(
 
     // Callers are allowed to disable yielding for this plan by passing a null yield policy.
     if (_yieldPolicy) {
-        _yieldPolicy->setRootStage(_root.get());
-    }
-
-    // We may still need to initialize _nss from either collection or _cq.
-    if (_nss.isEmpty()) {
-        if (collection) {
-            _nss = collection->ns();
-        } else {
-            invariant(_cq);
-            _nss = _cq->getQueryRequest().nss();
-        }
+        // Clear any formerly registered plans and register '_root' to yield. This is needed because
+        // multiple candidate plans may have been registered during runtime planning, before the
+        // PlanExecutor was created. All but one candidate plan ('_root') have since been discarded.
+        _yieldPolicy->clearRegisteredPlans();
+        _yieldPolicy->registerPlan(_root.get());
     }
 }
 

@@ -474,7 +474,7 @@ void appendErrorLabelsAndTopologyVersion(OperationContext* opCtx,
         (wcCode && ErrorCodes::isA<ErrorCategory::ShutdownError>(*wcCode));
 
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    // NotMaster errors always include a topologyVersion, since we increment topologyVersion on
+    // NotPrimary errors always include a topologyVersion, since we increment topologyVersion on
     // stepdown. ShutdownErrors only include a topologyVersion if the server is in quiesce mode,
     // since we only increment the topologyVersion at shutdown and alert waiting isMaster commands
     // if the server enters quiesce mode.
@@ -629,6 +629,9 @@ void invokeWithSessionCheckedOut(OperationContext* opCtx,
     }
 
     tenant_migration_donor::checkIfCanReadOrBlock(opCtx, request.getDatabase());
+
+    // Use the API parameters that were stored when the transaction was initiated.
+    APIParameters::get(opCtx) = txnParticipant.getAPIParameters(opCtx);
 
     try {
         tenant_migration_donor::migrationConflictRetry(
@@ -858,21 +861,24 @@ bool runCommandImpl(OperationContext* opCtx,
     // This fail point blocks all commands which are running on the specified namespace, or which
     // are present in the given list of commands.If no namespace or command list are provided,then
     // the failpoint will block all commands.
-    waitAfterCommandFinishesExecution.execute([&](const BSONObj& data) {
-        auto ns = data["ns"].valueStringDataSafe();
-        auto commands =
-            data.hasField("commands") ? data["commands"].Array() : std::vector<BSONElement>();
-
-        // If 'ns' or 'commands' is not set, block for all the namespaces or commands respectively.
-        if ((ns.empty() || invocation->ns().ns() == ns) &&
-            (commands.empty() ||
-             std::any_of(commands.begin(), commands.end(), [&request](auto& element) {
-                 return element.valueStringDataSafe() == request.getCommandName();
-             }))) {
+    waitAfterCommandFinishesExecution.executeIf(
+        [&](const BSONObj& data) {
             CurOpFailpointHelpers::waitWhileFailPointEnabled(
                 &waitAfterCommandFinishesExecution, opCtx, "waitAfterCommandFinishesExecution");
-        }
-    });
+        },
+        [&](const BSONObj& data) {
+            auto ns = data["ns"].valueStringDataSafe();
+            auto commands =
+                data.hasField("commands") ? data["commands"].Array() : std::vector<BSONElement>();
+
+            // If 'ns' or 'commands' is not set, block for all the namespaces or commands
+            // respectively.
+            return (ns.empty() || invocation->ns().ns() == ns) &&
+                (commands.empty() ||
+                 std::any_of(commands.begin(), commands.end(), [&request](auto& element) {
+                     return element.valueStringDataSafe() == request.getCommandName();
+                 }));
+        });
 
     behaviors.waitForLinearizableReadConcern(opCtx);
     tenant_migration_donor::checkIfLinearizableReadWasAllowedOrThrow(opCtx, request.getDatabase());
@@ -933,7 +939,7 @@ void execCommandDatabase(OperationContext* opCtx,
         (opCtx->getClient()->session()->getTags() & transport::Session::kInternalClient);
 
     try {
-        auto const apiParamsFromClient = initializeAPIParameters(request.body, command);
+        const auto apiParamsFromClient = initializeAPIParameters(opCtx, request.body, command);
         Client* client = opCtx->getClient();
 
         {
@@ -943,10 +949,11 @@ void execCommandDatabase(OperationContext* opCtx,
         }
 
         auto& apiParams = APIParameters::get(opCtx);
-        auto& apiVersionMetrics = ApplicationApiVersionMetrics::get(opCtx->getServiceContext());
+        auto& apiVersionMetrics = APIVersionMetrics::get(opCtx->getServiceContext());
         const auto& clientMetadata = ClientMetadataIsMasterState::get(client).getClientMetadata();
         if (clientMetadata) {
-            apiVersionMetrics.update(clientMetadata.get(), apiParams);
+            auto appName = clientMetadata.get().getApplicationName().toString();
+            apiVersionMetrics.update(appName, apiParams);
         }
 
         sleepMillisAfterCommandExecutionBegins.execute([&](const BSONObj& data) {
@@ -1048,13 +1055,13 @@ void execCommandDatabase(OperationContext* opCtx,
                 couldHaveOptedIn && ReadPreferenceSetting::get(opCtx).canRunOnSecondary();
             bool canRunHere = commandCanRunHere(opCtx, dbname, command, inMultiDocumentTransaction);
             if (!canRunHere && couldHaveOptedIn) {
-                uasserted(ErrorCodes::NotMasterNoSlaveOk, "not master and slaveOk=false");
+                uasserted(ErrorCodes::NotPrimaryNoSecondaryOk, "not master and slaveOk=false");
             }
 
             if (MONGO_unlikely(respondWithNotPrimaryInCommandDispatch.shouldFail())) {
-                uassert(ErrorCodes::NotMaster, "not primary", canRunHere);
+                uassert(ErrorCodes::NotWritablePrimary, "not primary", canRunHere);
             } else {
-                uassert(ErrorCodes::NotMaster, "not master", canRunHere);
+                uassert(ErrorCodes::NotWritablePrimary, "not master", canRunHere);
             }
 
             if (!command->maintenanceOk() &&
@@ -1062,14 +1069,14 @@ void execCommandDatabase(OperationContext* opCtx,
                 !replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, dbname) &&
                 !replCoord->getMemberState().secondary()) {
 
-                uassert(ErrorCodes::NotMasterOrSecondary,
+                uassert(ErrorCodes::NotPrimaryOrSecondary,
                         "node is recovering",
                         !replCoord->getMemberState().recovering());
-                uassert(ErrorCodes::NotMasterOrSecondary,
+                uassert(ErrorCodes::NotPrimaryOrSecondary,
                         "node is not in primary or recovering state",
                         replCoord->getMemberState().primary());
                 // Check ticket SERVER-21432, slaveOk commands are allowed in drain mode
-                uassert(ErrorCodes::NotMasterOrSecondary,
+                uassert(ErrorCodes::NotPrimaryOrSecondary,
                         "node is in drain mode",
                         optedIn || alwaysAllowed);
             }
@@ -1102,12 +1109,17 @@ void execCommandDatabase(OperationContext* opCtx,
         int maxTimeMS = uassertStatusOK(QueryRequest::parseMaxTimeMS(cmdOptionMaxTimeMSField));
         int maxTimeMSOpOnly = uassertStatusOK(QueryRequest::parseMaxTimeMS(maxTimeMSOpOnlyField));
 
+        // The "hello" command should not inherit the deadline from the user op it is operating as a
+        // part of as that can interfere with replica set monitoring and host selection.
+        bool ignoreMaxTimeMSOpOnly = command->getName() == "hello"_sd;
+
         if ((maxTimeMS > 0 || maxTimeMSOpOnly > 0) &&
             command->getLogicalOp() != LogicalOp::opGetMore) {
             uassert(40119,
                     "Illegal attempt to set operation deadline within DBDirectClient",
                     !opCtx->getClient()->isInDirectClient());
-            if (maxTimeMSOpOnly > 0 && (maxTimeMS == 0 || maxTimeMSOpOnly < maxTimeMS)) {
+            if (!ignoreMaxTimeMSOpOnly && maxTimeMSOpOnly > 0 &&
+                (maxTimeMS == 0 || maxTimeMSOpOnly < maxTimeMS)) {
                 opCtx->storeMaxTimeMS(Milliseconds{maxTimeMS});
                 opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMSOpOnly},
                                              ErrorCodes::MaxTimeMSExpired);
@@ -1147,6 +1159,13 @@ void execCommandDatabase(OperationContext* opCtx,
         if (startTransaction) {
             opCtx->lockState()->setSharedLocksShouldTwoPhaseLock(true);
             opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
+        }
+
+        if (opCtx->inMultiDocumentTransaction() && !startTransaction) {
+            uassert(4937700,
+                    "API parameters are only allowed in the first command of a multi-document "
+                    "transaction",
+                    !APIParameters::get(opCtx).getParamsPassed());
         }
 
         // Remember whether or not this operation is starting a transaction, in case something
@@ -1409,7 +1428,7 @@ DbResponse receivedCommands(OperationContext* opCtx,
         if (LastError::get(opCtx->getClient()).hadNotMasterError()) {
             if (c && c->getReadWriteType() == Command::ReadWriteType::kWrite)
                 notMasterUnackWrites.increment();
-            uasserted(ErrorCodes::NotMaster,
+            uasserted(ErrorCodes::NotWritablePrimary,
                       str::stream()
                           << "Not-master error while processing '" << request.getCommandName()
                           << "' operation  on '" << request.getDatabase() << "' database via "
@@ -1525,7 +1544,7 @@ void receivedInsert(OperationContext* opCtx, const NamespaceString& nsString, co
         audit::logInsertAuthzCheck(opCtx->getClient(), nsString, obj, status.code());
         uassertStatusOK(status);
     }
-    performInserts(opCtx, insertOp);
+    write_ops_exec::performInserts(opCtx, insertOp);
 }
 
 void receivedUpdate(OperationContext* opCtx, const NamespaceString& nsString, const Message& m) {
@@ -1548,7 +1567,7 @@ void receivedUpdate(OperationContext* opCtx, const NamespaceString& nsString, co
                                status.code());
     uassertStatusOK(status);
 
-    performUpdates(opCtx, updateOp);
+    write_ops_exec::performUpdates(opCtx, updateOp);
 }
 
 void receivedDelete(OperationContext* opCtx, const NamespaceString& nsString, const Message& m) {
@@ -1561,7 +1580,7 @@ void receivedDelete(OperationContext* opCtx, const NamespaceString& nsString, co
     audit::logDeleteAuthzCheck(opCtx->getClient(), nsString, singleDelete.getQ(), status.code());
     uassertStatusOK(status);
 
-    performDeletes(opCtx, deleteOp);
+    write_ops_exec::performDeletes(opCtx, deleteOp);
 }
 
 DbResponse receivedGetMore(OperationContext* opCtx,
@@ -1711,7 +1730,7 @@ Future<DbResponse> ServiceEntryPointCommon::handleRequest(OperationContext* opCt
     DbResponse dbresponse;
     if (op == dbMsg || (op == dbQuery && isCommand)) {
         dbresponse = receivedCommands(opCtx, m, behaviors);
-        // IsMaster should take kMaxAwaitTimeMs at most, log if it takes twice that.
+        // Hello should take kMaxAwaitTimeMs at most, log if it takes twice that.
         if (auto command = currentOp.getCommand(); command && (command->getName() == "hello")) {
             slowMsOverride =
                 2 * durationCount<Milliseconds>(SingleServerIsMasterMonitor::kMaxAwaitTime);
@@ -1760,12 +1779,13 @@ Future<DbResponse> ServiceEntryPointCommon::handleRequest(OperationContext* opCt
                         "error"_attr = redact(ue));
             debug.errInfo = ue.toStatus();
         }
-        // A NotMaster error can be set either within receivedInsert/receivedUpdate/receivedDelete
-        // or within the AssertionException handler above.  Either way, we want to throw an
-        // exception here, which will cause the client to be disconnected.
+        // A NotWritablePrimary error can be set either within
+        // receivedInsert/receivedUpdate/receivedDelete or within the AssertionException handler
+        // above.  Either way, we want to throw an exception here, which will cause the client to be
+        // disconnected.
         if (LastError::get(opCtx->getClient()).hadNotMasterError()) {
             notMasterLegacyUnackWrites.increment();
-            uasserted(ErrorCodes::NotMaster,
+            uasserted(ErrorCodes::NotWritablePrimary,
                       str::stream()
                           << "Not-master error while processing '" << networkOpToString(op)
                           << "' operation  on '" << nsString << "' namespace via legacy "
@@ -1774,8 +1794,8 @@ Future<DbResponse> ServiceEntryPointCommon::handleRequest(OperationContext* opCt
     }
 
     // Mark the op as complete, and log it if appropriate. Returns a boolean indicating whether
-    // this op should be sampled for profiling.
-    const bool shouldSample = currentOp.completeAndLogOperation(
+    // this op should be written to the profiler.
+    const bool shouldProfile = currentOp.completeAndLogOperation(
         opCtx, MONGO_LOGV2_DEFAULT_COMPONENT, dbresponse.response.size(), slowMsOverride, forceLog);
 
     Top::get(opCtx->getServiceContext())
@@ -1784,7 +1804,7 @@ Future<DbResponse> ServiceEntryPointCommon::handleRequest(OperationContext* opCt
             durationCount<Microseconds>(currentOp.elapsedTimeExcludingPauses()),
             currentOp.getReadWriteType());
 
-    if (currentOp.shouldDBProfile(shouldSample)) {
+    if (shouldProfile) {
         // Performance profiling is on
         if (opCtx->lockState()->isReadLocked()) {
             LOGV2_DEBUG(21970, 1, "Note: not profiling because of recursive read lock");

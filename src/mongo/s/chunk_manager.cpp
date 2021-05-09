@@ -49,9 +49,6 @@
 namespace mongo {
 namespace {
 
-// Used to generate sequence numbers to assign to each newly created RoutingTableHistory
-AtomicWord<unsigned> nextCMSequenceNumber(0);
-
 bool allElementsAreOfType(BSONType type, const BSONObj& obj) {
     for (auto&& elem : obj) {
         if (elem.type() != type) {
@@ -214,7 +211,8 @@ void validateChunk(const std::shared_ptr<ChunkInfo>& chunk, const ChunkVersion& 
     invariant(chunk->getLastmod() >= version);
 }
 
-ChunkMap ChunkMap::createMerged(const std::vector<std::shared_ptr<ChunkInfo>>& changedChunks) {
+ChunkMap ChunkMap::createMerged(
+    const std::vector<std::shared_ptr<ChunkInfo>>& changedChunks) const {
     size_t chunkMapIndex = 0;
     size_t changedChunkIndex = 0;
 
@@ -303,18 +301,20 @@ ChunkMap::_overlappingBounds(const BSONObj& min, const BSONObj& max, bool isMaxI
 ShardVersionTargetingInfo::ShardVersionTargetingInfo(const OID& epoch)
     : shardVersion(0, 0, epoch) {}
 
-RoutingTableHistory::RoutingTableHistory(NamespaceString nss,
-                                         boost::optional<UUID> uuid,
-                                         KeyPattern shardKeyPattern,
-                                         std::unique_ptr<CollatorInterface> defaultCollator,
-                                         bool unique,
-                                         ChunkMap chunkMap)
-    : _sequenceNumber(nextCMSequenceNumber.addAndFetch(1)),
-      _nss(std::move(nss)),
+RoutingTableHistory::RoutingTableHistory(
+    NamespaceString nss,
+    boost::optional<UUID> uuid,
+    KeyPattern shardKeyPattern,
+    std::unique_ptr<CollatorInterface> defaultCollator,
+    bool unique,
+    boost::optional<TypeCollectionReshardingFields> reshardingFields,
+    ChunkMap chunkMap)
+    : _nss(std::move(nss)),
       _uuid(uuid),
       _shardKeyPattern(shardKeyPattern),
       _defaultCollator(std::move(defaultCollator)),
       _unique(unique),
+      _reshardingFields(std::move(reshardingFields)),
       _chunkMap(std::move(chunkMap)),
       _shardVersions(_chunkMap.constructShardVersionMap()) {}
 
@@ -342,7 +342,7 @@ Chunk ChunkManager::findIntersectingChunk(const BSONObj& shardKey, const BSONObj
         for (BSONElement elt : shardKey) {
             uassert(ErrorCodes::ShardKeyNotFound,
                     str::stream() << "Cannot target single shard due to collation of key "
-                                  << elt.fieldNameStringData() << " for namespace " << getns(),
+                                  << elt.fieldNameStringData() << " for namespace " << _rt->nss(),
                     !CollationIndexKey::isCollatableType(elt.type()));
         }
     }
@@ -351,7 +351,7 @@ Chunk ChunkManager::findIntersectingChunk(const BSONObj& shardKey, const BSONObj
 
     uassert(ErrorCodes::ShardKeyNotFound,
             str::stream() << "Cannot target single shard using key " << shardKey
-                          << " for namespace " << getns(),
+                          << " for namespace " << _rt->nss(),
             chunkInfo && chunkInfo->containsKey(shardKey));
 
     return Chunk(*chunkInfo, _clusterTime);
@@ -374,7 +374,7 @@ void ChunkManager::getShardIdsForQuery(boost::intrusive_ptr<ExpressionContext> e
                                        const BSONObj& query,
                                        const BSONObj& collation,
                                        std::set<ShardId>* shardIds) const {
-    auto qr = std::make_unique<QueryRequest>(_rt->getns());
+    auto qr = std::make_unique<QueryRequest>(_rt->nss());
     qr->setFilter(query);
 
     if (auto uuid = getUUID())
@@ -649,6 +649,14 @@ IndexBounds ChunkManager::collapseQuerySolution(const QuerySolutionNode* node) {
     return bounds;
 }
 
+ChunkManager ChunkManager::makeAtTime(const ChunkManager& cm, Timestamp clusterTime) {
+    return ChunkManager(cm.dbPrimary(), cm.dbVersion(), cm._rt, clusterTime);
+}
+
+std::string ChunkManager::toString() const {
+    return _rt ? _rt->toString() : "UNSHARDED";
+}
+
 bool RoutingTableHistory::compatibleWith(const RoutingTableHistory& other,
                                          const ShardId& shardName) const {
     // Return true if the shard version is the same in the two chunk managers
@@ -700,53 +708,42 @@ std::string RoutingTableHistory::toString() const {
     return sb.str();
 }
 
-std::shared_ptr<RoutingTableHistory> RoutingTableHistory::makeNew(
+RoutingTableHistory RoutingTableHistory::makeNew(
     NamespaceString nss,
     boost::optional<UUID> uuid,
     KeyPattern shardKeyPattern,
     std::unique_ptr<CollatorInterface> defaultCollator,
     bool unique,
     OID epoch,
+    boost::optional<TypeCollectionReshardingFields> reshardingFields,
     const std::vector<ChunkType>& chunks) {
     return RoutingTableHistory(std::move(nss),
                                std::move(uuid),
                                std::move(shardKeyPattern),
                                std::move(defaultCollator),
                                std::move(unique),
+                               boost::none,
                                ChunkMap{epoch})
-        .makeUpdated(chunks);
+        .makeUpdated(std::move(reshardingFields), chunks);
 }
 
-std::shared_ptr<RoutingTableHistory> RoutingTableHistory::makeUpdated(
-    const std::vector<ChunkType>& changedChunks) {
-
-    // It's possible for there to be one chunk in changedChunks without the routing table having
-    // changed. We skip copying the ChunkMap when this happens.
-    if (changedChunks.size() == 1 && changedChunks[0].getVersion() == getVersion()) {
-        return shared_from_this();
-    }
-
+RoutingTableHistory RoutingTableHistory::makeUpdated(
+    boost::optional<TypeCollectionReshardingFields> reshardingFields,
+    const std::vector<ChunkType>& changedChunks) const {
     auto changedChunkInfos = flatten(changedChunks);
     auto chunkMap = _chunkMap.createMerged(changedChunkInfos);
 
-    // If at least one diff was applied, the metadata is correct, but it might not have changed so
-    // in this case there is no need to recreate the chunk manager.
-    //
-    // NOTE: In addition to the above statement, it is also important that we return the same chunk
-    // manager object, because the write commands' code relies on changes of the chunk manager's
-    // sequence number to detect batch writes not making progress because of chunks moving across
-    // shards too frequently.
-    if (chunkMap.getVersion() == getVersion()) {
-        return shared_from_this();
-    }
+    // If at least one diff was applied, the collection's version must have advanced
+    invariant(getVersion().epoch() == chunkMap.getVersion().epoch());
+    invariant(getVersion().isOlderThan(chunkMap.getVersion()));
 
-    return std::shared_ptr<RoutingTableHistory>(
-        new RoutingTableHistory(_nss,
-                                _uuid,
-                                KeyPattern(getShardKeyPattern().getKeyPattern()),
-                                CollatorInterface::cloneCollator(getDefaultCollator()),
-                                isUnique(),
-                                std::move(chunkMap)));
+    return RoutingTableHistory(_nss,
+                               _uuid,
+                               getShardKeyPattern().getKeyPattern(),
+                               CollatorInterface::cloneCollator(getDefaultCollator()),
+                               isUnique(),
+                               std::move(reshardingFields),
+                               std::move(chunkMap));
 }
 
 }  // namespace mongo

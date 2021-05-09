@@ -46,7 +46,7 @@ Object.keys(mechStats).forEach(function(mech) {
         assert.eq(specStats.received, 0);
     }
     assert.eq(specStats.received, specStats.successful);
-    assert.eq(clusterStats.received, clusterStats.successful);
+    assert.gte(clusterStats.received, clusterStats.successful);
 });
 
 admin.logout();

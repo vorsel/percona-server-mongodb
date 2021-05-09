@@ -31,15 +31,28 @@
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/database.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/s/resharding/donor_oplog_id_gen.h"
+#include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/resharded_chunk_gen.h"
+#include "mongo/s/shard_id.h"
 
 namespace mongo {
 
 constexpr auto kReshardingOplogPrePostImageOps = "prePostImageOps"_sd;
+
+/**
+ * Sends _flushRoutingTableCacheUpdatesWithWriteConcern to a list of shards. Throws if one of the
+ * shards fails to refresh.
+ */
+void tellShardsToRefresh(OperationContext* opCtx,
+                         const std::vector<ShardId>& shardIds,
+                         const NamespaceString& nss,
+                         std::shared_ptr<executor::TaskExecutor> executor);
 
 /**
  * Asserts that there is not a hole or overlap in the chunks.
@@ -75,6 +88,13 @@ void validateZones(const std::vector<mongo::BSONObj>& zones,
  * sure that the donorOplogNS is properly resolved and ns is set in the expCtx.
  */
 std::unique_ptr<Pipeline, PipelineDeleter> createAggForReshardingOplogBuffer(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, const BSONObj& resumeToken);
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const boost::optional<ReshardingDonorOplogId>& resumeToken);
+
+/**
+ * Creates a view on the oplog that facilitates the specialized oplog tailing a resharding recipient
+ * performs on a donor.
+ */
+void createSlimOplogView(OperationContext* opCtx, Database* db);
 
 }  // namespace mongo

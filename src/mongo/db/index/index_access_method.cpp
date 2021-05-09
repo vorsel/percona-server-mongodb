@@ -84,6 +84,13 @@ bool isMultikeyFromPaths(const MultikeyPaths& multikeyPaths) {
                        [](const MultikeyComponents& components) { return !components.empty(); });
 }
 
+SortOptions makeSortOptions(size_t maxMemoryUsageBytes) {
+    return SortOptions()
+        .TempDir(storageGlobalParams.dbpath + "/_tmp")
+        .ExtSortAllowed()
+        .MaxMemoryUsageBytes(maxMemoryUsageBytes);
+}
+
 }  // namespace
 
 struct BtreeExternalSortComparison {
@@ -281,7 +288,7 @@ RecordId AbstractIndexAccessMethod::findSingle(OperationContext* opCtx,
 
 void AbstractIndexAccessMethod::validate(OperationContext* opCtx,
                                          int64_t* numKeys,
-                                         ValidateResults* fullResults) const {
+                                         IndexValidateResults* fullResults) const {
     long long keys = 0;
     _newInterface->fullValidate(opCtx, &keys, fullResults);
     *numKeys = keys;
@@ -387,7 +394,7 @@ void AbstractIndexAccessMethod::prepareUpdate(OperationContext* opCtx,
 }
 
 Status AbstractIndexAccessMethod::update(OperationContext* opCtx,
-                                         Collection* coll,
+                                         const Collection* coll,
                                          const UpdateTicket& ticket,
                                          int64_t* numInserted,
                                          int64_t* numDeleted) {
@@ -495,10 +502,7 @@ std::unique_ptr<IndexAccessMethod::BulkBuilder> AbstractIndexAccessMethod::initi
 AbstractIndexAccessMethod::BulkBuilderImpl::BulkBuilderImpl(IndexCatalogEntry* index,
                                                             size_t maxMemoryUsageBytes)
     : _indexCatalogEntry(index),
-      _sorter(Sorter::make(SortOptions()
-                               .TempDir(storageGlobalParams.dbpath + "/_tmp")
-                               .ExtSortAllowed()
-                               .MaxMemoryUsageBytes(maxMemoryUsageBytes),
+      _sorter(Sorter::make(makeSortOptions(maxMemoryUsageBytes),
                            BtreeExternalSortComparison(),
                            _makeSorterSettings())) {}
 
@@ -508,10 +512,7 @@ AbstractIndexAccessMethod::BulkBuilderImpl::BulkBuilderImpl(IndexCatalogEntry* i
     : _indexCatalogEntry(index),
       _sorter(Sorter::makeFromExistingRanges(sorterInfo.getFileName()->toString(),
                                              *sorterInfo.getRanges(),
-                                             SortOptions()
-                                                 .TempDir(sorterInfo.getTempDir()->toString())
-                                                 .ExtSortAllowed()
-                                                 .MaxMemoryUsageBytes(maxMemoryUsageBytes),
+                                             makeSortOptions(maxMemoryUsageBytes),
                                              BtreeExternalSortComparison(),
                                              _makeSorterSettings())),
       _keysInserted(*sorterInfo.getNumKeys()) {}
@@ -725,7 +726,7 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
 }
 
 void AbstractIndexAccessMethod::setIndexIsMultikey(OperationContext* opCtx,
-                                                   Collection* collection,
+                                                   const Collection* collection,
                                                    MultikeyPaths paths) {
     _indexCatalogEntry->setMultikey(opCtx, collection, paths);
 }

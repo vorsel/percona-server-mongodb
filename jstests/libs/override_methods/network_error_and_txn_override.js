@@ -105,6 +105,7 @@ const kNonRetryableCommands = new Set([
     "dropUser",
     "emptycapped",
     "godinsert",
+    "internalRenameIfOptionsAndIndexesMatch",
     "renameCollection",
     "updateRole",
     "updateUser",
@@ -835,8 +836,8 @@ function shouldRetryWithNetworkErrorOverride(
     if (!res.ok) {
         if (RetryableWritesUtil.isRetryableCode(res.code)) {
             // Don't decrement retries, because the command returned before the connection was
-            // closed, so a subsequent attempt will receive a network error (or NotMaster error)
-            // and need to retry.
+            // closed, so a subsequent attempt will receive a network error (or NotWritablePrimary
+            // error) and need to retry.
             logError("Retrying failed response with retryable code");
             return kContinue;
         }

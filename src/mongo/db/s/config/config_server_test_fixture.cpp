@@ -68,7 +68,6 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
 #include "mongo/s/database_version_helpers.h"
-#include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_id.h"
@@ -233,22 +232,23 @@ Status ConfigServerTestFixture::updateToConfigCollection(OperationContext* opCtx
                                                          const BSONObj& query,
                                                          const BSONObj& update,
                                                          const bool upsert) {
-    auto updateResponse = getConfigShard()->runCommand(opCtx,
-                                                       kReadPref,
-                                                       ns.db().toString(),
-                                                       [&]() {
-                                                           write_ops::Update updateOp(ns);
-                                                           updateOp.setUpdates({[&] {
-                                                               write_ops::UpdateOpEntry entry;
-                                                               entry.setQ(query);
-                                                               entry.setU(update);
-                                                               entry.setUpsert(upsert);
-                                                               return entry;
-                                                           }()});
-                                                           return updateOp.toBSON({});
-                                                       }(),
-                                                       Shard::kDefaultConfigCommandTimeout,
-                                                       Shard::RetryPolicy::kNoRetry);
+    auto updateResponse = getConfigShard()->runCommand(
+        opCtx,
+        kReadPref,
+        ns.db().toString(),
+        [&]() {
+            write_ops::Update updateOp(ns);
+            updateOp.setUpdates({[&] {
+                write_ops::UpdateOpEntry entry;
+                entry.setQ(query);
+                entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
+                entry.setUpsert(upsert);
+                return entry;
+            }()});
+            return updateOp.toBSON({});
+        }(),
+        Shard::kDefaultConfigCommandTimeout,
+        Shard::RetryPolicy::kNoRetry);
 
 
     BatchedCommandResponse batchResponse;

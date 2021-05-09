@@ -2,6 +2,7 @@
 
 import SCons
 
+from site_scons.mongo import insort_wrapper
 import libdeps
 import json
 
@@ -196,11 +197,11 @@ if not use_system_version_of_library('kms-message'):
 
 if use_system_libunwind:
     thirdPartyEnvironmentModifications['unwind'] = {
-        'SYSLIBDEPS' : [env['LIBDEPS_UNWIND_SYSLIBDEP'], 'lzma'],
+        'SYSLIBDEPS_PRIVATE' : [env['LIBDEPS_UNWIND_SYSLIBDEP'], 'lzma'],
     }
 elif use_vendored_libunwind:
     thirdPartyEnvironmentModifications['unwind'] = {
-        'SYSLIBDEPS' : ['lzma'],
+        'SYSLIBDEPS_PRIVATE' : ['lzma'],
     }
 
 def injectThirdParty(thisEnv, libraries=[], parts=[]):
@@ -244,7 +245,7 @@ for builder_name in ('Program', 'SharedLibrary', 'LoadableModule', 'StaticLibrar
             lds = env.get('LIBDEPS', [])
             shim_allocator = '$BUILD_DIR/third_party/shim_allocator'
             if shim_allocator not in lds:
-                lds.append(shim_allocator)
+                insort_wrapper(lds, shim_allocator)
                 env['LIBDEPS'] = lds
 
         return target, source
@@ -371,11 +372,11 @@ else:
     boostEnv.SConscript(boostDirectory + '/SConscript', exports={ 'env' : boostEnv })
     boostEnv = boostEnv.Clone(
         LIBDEPS_INTERFACE=[
-            boostDirectory + '/boost_program_options',
             boostDirectory + '/boost_filesystem',
-            boostDirectory + '/boost_system',
             boostDirectory + '/boost_iostreams',
             boostDirectory + '/boost_log',
+            boostDirectory + '/boost_program_options',
+            boostDirectory + '/boost_system',
         ])
 
 boostEnv.Library(
@@ -550,6 +551,16 @@ gperftoolsEnv.Library(
         "shim_allocator.cpp",
     ],
     DISABLE_ALLOCATOR_SHIM_INJECTION=True,
+    LIBDEPS_TAGS=[
+        # The shim allocator must be linked to every node, including what would
+        # be considered a leaf node to ensure the system allocator
+        # is not linked in before tcmalloc. This tag allows nodes tagged as
+        # leaf nodes to still get the correct allocator.
+        'lint-leaf-node-allowed-dep',
+        # This tag allows the allocator to be linked to nodes marked as not
+        # allowed to have public dependencies.
+        'lint-public-dep-allowed'
+    ],
 )
 
 

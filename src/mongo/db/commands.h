@@ -178,12 +178,6 @@ struct CommandHelpers {
                                            const BSONObj& request);
 
     /**
-     * Appends passthrough fields from a cmdObj to a given *internal* command request.
-     */
-    static BSONObj appendInternalPassthroughFields(const BSONObj& cmdObjWithPassthroughFields,
-                                                   const BSONObj& request);
-
-    /**
      * Returns a copy of 'cmdObj' with a majority writeConcern appended.  If the command object does
      * not contain a writeConcern, 'defaultWC' will be used instead, if supplied.
      */
@@ -516,6 +510,13 @@ public:
      * Checks if the command is also known by the provided alias.
      */
     bool hasAlias(const StringData& alias) const;
+
+    /**
+     * Audit when this command fails authz check.
+     */
+    virtual bool auditAuthorizationFailure() const {
+        return true;
+    }
 
 private:
     // The full name of the command

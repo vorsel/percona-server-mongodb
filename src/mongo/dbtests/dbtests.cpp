@@ -105,8 +105,8 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
     Collection* coll;
     {
         WriteUnitOfWork wunit(opCtx);
-        coll =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, NamespaceString(ns));
+        coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespaceForMetadataWrite(
+            opCtx, NamespaceString(ns));
         if (!coll) {
             coll = autoDb.getDb()->createCollection(opCtx, NamespaceString(ns));
         }
@@ -184,7 +184,7 @@ int dbtestsMain(int argc, char** argv) {
 
     mongo::runGlobalInitializersOrDie(std::vector<std::string>(argv, argv + argc));
     // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
-    serverGlobalParams.featureCompatibility.setVersion(
+    serverGlobalParams.mutableFeatureCompatibility.setVersion(
         ServerGlobalParams::FeatureCompatibility::kLatest);
     repl::ReplSettings replSettings;
     replSettings.setOplogSizeBytes(10 * 1024 * 1024);

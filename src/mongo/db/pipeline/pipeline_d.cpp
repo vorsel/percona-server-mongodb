@@ -33,13 +33,10 @@
 
 #include "mongo/db/pipeline/pipeline_d.h"
 
-#include <memory>
-
 #include "mongo/base/exact_cast.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -75,19 +72,12 @@
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/sort_pattern.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
-#include "mongo/db/transaction_participant.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
-#include "mongo/s/catalog_cache.h"
-#include "mongo/s/chunk_manager.h"
-#include "mongo/s/chunk_version.h"
-#include "mongo/s/grid.h"
 #include "mongo/s/query/document_source_merge_cursors.h"
-#include "mongo/s/write_ops/cluster_write.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
@@ -103,12 +93,17 @@ namespace {
  * Returns a PlanExecutor which uses a random cursor to sample documents if successful. Returns {}
  * if the storage engine doesn't support random cursors, or if 'sampleSize' is a large enough
  * percentage of the collection.
+ *
+ * If needed, adds DocumentSourceSampleFromRandomCursor to the front of the pipeline, replacing the
+ * $sample stage. This is needed if we select an optimized plan for $sample taking advantage of
+ * storage engine support for random cursors.
  */
 StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorExecutor(
     const Collection* coll,
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     long long sampleSize,
-    long long numRecords) {
+    long long numRecords,
+    Pipeline* pipeline) {
     OperationContext* opCtx = expCtx->opCtx;
 
     // Verify that we are already under a collection lock. We avoid taking locks ourselves in this
@@ -140,6 +135,8 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
             ->getOwnershipFilter(
                 opCtx, CollectionShardingState::OrphanCleanupPolicy::kDisallowOrphanCleanup);
 
+    TrialStage* trialStage = nullptr;
+
     // Because 'numRecords' includes orphan documents, our initial decision to optimize the $sample
     // cursor may have been mistaken. For sharded collections, build a TRIAL plan that will switch
     // to a collection scan if the ratio of orphaned to owned documents encountered over the first
@@ -168,10 +165,24 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
                                             std::move(collScanPlan),
                                             kMaxPresampleSize,
                                             minWorkAdvancedRatio);
+        trialStage = static_cast<TrialStage*>(root.get());
     }
 
-    return plan_executor_factory::make(
+    auto exec = plan_executor_factory::make(
         expCtx, std::move(ws), std::move(root), coll, PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+
+    // For sharded collections, the root of the plan tree is a TrialStage that may have chosen
+    // either a random-sampling cursor trial plan or a COLLSCAN backup plan. We can only optimize
+    // the $sample aggregation stage if the trial plan was chosen.
+    if (!trialStage || !trialStage->pickedBackupPlan()) {
+        // Replace $sample stage with $sampleFromRandomCursor stage.
+        pipeline->popFront();
+        std::string idString = coll->ns().isOplog() ? "ts" : "_id";
+        pipeline->addInitialSource(
+            DocumentSourceSampleFromRandomCursor::create(expCtx, sampleSize, idString, numRecords));
+    }
+
+    return exec;
 }
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExecutor(
@@ -325,28 +336,13 @@ PipelineD::buildInnerQueryExecutor(const Collection* collection,
             const long long sampleSize = sampleStage->getSampleSize();
             const long long numRecords = collection->getRecordStore()->numRecords(expCtx->opCtx);
             auto exec = uassertStatusOK(
-                createRandomCursorExecutor(collection, expCtx, sampleSize, numRecords));
+                createRandomCursorExecutor(collection, expCtx, sampleSize, numRecords, pipeline));
             if (exec) {
-                // For sharded collections, the root of the plan tree is a TrialStage that may have
-                // chosen either a random-sampling cursor trial plan or a COLLSCAN backup plan. We
-                // can only optimize the $sample aggregation stage if the trial plan was chosen.
-                auto* trialStage = (exec->getRootStage()->stageType() == StageType::STAGE_TRIAL
-                                        ? static_cast<TrialStage*>(exec->getRootStage())
-                                        : nullptr);
-                if (!trialStage || !trialStage->pickedBackupPlan()) {
-                    // Replace $sample stage with $sampleFromRandomCursor stage.
-                    pipeline->popFront();
-                    std::string idString = collection->ns().isOplog() ? "ts" : "_id";
-                    pipeline->addInitialSource(DocumentSourceSampleFromRandomCursor::create(
-                        expCtx, sampleSize, idString, numRecords));
-                }
-
                 // The order in which we evaluate these arguments is significant. We'd like to be
                 // sure that the DocumentSourceCursor is created _last_, because if we run into a
                 // case where a DocumentSourceCursor has been created (yet hasn't been put into a
                 // Pipeline) and an exception is thrown, an invariant will trigger in the
                 // DocumentSourceCursor. This is a design flaw in DocumentSourceCursor.
-
                 auto deps = pipeline->getDependencies(DepsTracker::kAllMetadata);
                 const auto cursorType = deps.hasNoRequirements()
                     ? DocumentSourceCursor::CursorType::kEmptyDocuments
@@ -655,6 +651,12 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
 
     if (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage()) {
         invariant(expCtx->tailableMode == TailableModeEnum::kTailableAndAwaitData);
+        plannerOpts |= (QueryPlannerParams::TRACK_LATEST_OPLOG_TS |
+                        QueryPlannerParams::ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG);
+    }
+
+    // The aggregate command's $_requestResumeToken parameter can only be used for the oplog.
+    if (aggRequest && aggRequest->getRequestResumeToken()) {
         plannerOpts |= QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
     }
 

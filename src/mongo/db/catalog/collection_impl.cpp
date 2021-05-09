@@ -65,6 +65,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/key_string.h"
@@ -400,7 +401,15 @@ Status CollectionImpl::checkValidation(OperationContext* opCtx, const BSONObj& d
     if (validatorMatchExpr->matchesBSON(document))
         return Status::OK();
 
-    BSONObj generatedError = doc_validation_error::generateError(*validatorMatchExpr, document);
+    // TODO SERVER-50524: remove these FCV checks when 5.0 becomes last-lts in order to make sure
+    // that an upgrade from 4.4 directly to the 5.0 LTS version is supported.
+    const auto isFCVAtLeast47 = serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+            ServerGlobalParams::FeatureCompatibility::Version::kVersion47);
+    BSONObj generatedError;
+    if (isFCVAtLeast47) {
+        generatedError = doc_validation_error::generateError(*validatorMatchExpr, document);
+    }
 
     if (_validationAction == ValidationAction::WARN) {
         LOGV2_WARNING(20294,
@@ -411,8 +420,13 @@ Status CollectionImpl::checkValidation(OperationContext* opCtx, const BSONObj& d
         return Status::OK();
     }
 
-    return {doc_validation_error::DocumentValidationFailureInfo(generatedError),
-            "Document failed validation"};
+    static constexpr auto kValidationFailureErrorStr = "Document failed validation"_sd;
+    if (isFCVAtLeast47) {
+        return {doc_validation_error::DocumentValidationFailureInfo(generatedError),
+                kValidationFailureErrorStr};
+    } else {
+        return {ErrorCodes::DocumentValidationFailure, kValidationFailureErrorStr};
+    }
 }
 
 Collection::Validator CollectionImpl::parseValidator(
@@ -469,7 +483,7 @@ Collection::Validator CollectionImpl::parseValidator(
 
 Status CollectionImpl::insertDocumentsForOplog(OperationContext* opCtx,
                                                std::vector<Record>* records,
-                                               const std::vector<Timestamp>& timestamps) {
+                                               const std::vector<Timestamp>& timestamps) const {
     dassert(opCtx->lockState()->isWriteLocked());
 
     // Since this is only for the OpLog, we can assume these for simplicity.
@@ -492,7 +506,7 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
                                        const std::vector<InsertStatement>::const_iterator begin,
                                        const std::vector<InsertStatement>::const_iterator end,
                                        OpDebug* opDebug,
-                                       bool fromMigrate) {
+                                       bool fromMigrate) const {
 
     auto status = checkFailCollectionInsertsFailPoint(_ns, (begin != end ? begin->doc : BSONObj()));
     if (!status.isOK()) {
@@ -560,15 +574,14 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
 Status CollectionImpl::insertDocument(OperationContext* opCtx,
                                       const InsertStatement& docToInsert,
                                       OpDebug* opDebug,
-                                      bool fromMigrate) {
+                                      bool fromMigrate) const {
     std::vector<InsertStatement> docs;
     docs.push_back(docToInsert);
     return insertDocuments(opCtx, docs.begin(), docs.end(), opDebug, fromMigrate);
 }
 
-Status CollectionImpl::insertDocumentForBulkLoader(OperationContext* opCtx,
-                                                   const BSONObj& doc,
-                                                   const OnRecordInsertedFn& onRecordInserted) {
+Status CollectionImpl::insertDocumentForBulkLoader(
+    OperationContext* opCtx, const BSONObj& doc, const OnRecordInsertedFn& onRecordInserted) const {
 
     auto status = checkFailCollectionInsertsFailPoint(_ns, doc);
     if (!status.isOK()) {
@@ -622,7 +635,7 @@ Status CollectionImpl::insertDocumentForBulkLoader(OperationContext* opCtx,
 Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
                                         const std::vector<InsertStatement>::const_iterator begin,
                                         const std::vector<InsertStatement>::const_iterator end,
-                                        OpDebug* opDebug) {
+                                        OpDebug* opDebug) const {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_IX));
 
     const size_t count = std::distance(begin, end);
@@ -726,7 +739,7 @@ void CollectionImpl::deleteDocument(OperationContext* opCtx,
                                     OpDebug* opDebug,
                                     bool fromMigrate,
                                     bool noWarn,
-                                    Collection::StoreDeletedDoc storeDeletedDoc) {
+                                    Collection::StoreDeletedDoc storeDeletedDoc) const {
     if (isCapped()) {
         LOGV2(20291,
               "failing remove on a capped ns {ns}",
@@ -766,7 +779,7 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
                                         const BSONObj& newDoc,
                                         bool indexesAffected,
                                         OpDebug* opDebug,
-                                        CollectionUpdateArgs* args) {
+                                        CollectionUpdateArgs* args) const {
     {
         auto status = checkValidation(opCtx, newDoc);
         if (!status.isOK()) {
@@ -859,7 +872,7 @@ StatusWith<RecordData> CollectionImpl::updateDocumentWithDamages(
     const Snapshotted<RecordData>& oldRec,
     const char* damageSource,
     const mutablebson::DamageVector& damages,
-    CollectionUpdateArgs* args) {
+    CollectionUpdateArgs* args) const {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_IX));
     invariant(oldRec.snapshotId() == opCtx->recoveryUnit()->getSnapshotId());
     invariant(updateWithDamagesSupported());

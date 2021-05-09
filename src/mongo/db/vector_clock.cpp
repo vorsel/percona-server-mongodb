@@ -53,6 +53,14 @@ VectorClock* VectorClock::get(OperationContext* ctx) {
     return get(ctx->getClient()->getServiceContext());
 }
 
+const VectorClock* VectorClock::get(const ServiceContext* service) {
+    return vectorClockDecoration(service);
+}
+
+const VectorClock* VectorClock::get(const OperationContext* ctx) {
+    return get(ctx->getClient()->getServiceContext());
+}
+
 VectorClock::VectorClock() = default;
 
 VectorClock::~VectorClock() = default;
@@ -160,7 +168,7 @@ public:
              Component component) const override {
         if (serverGlobalParams.featureCompatibility.isVersionInitialized() &&
             serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-                ServerGlobalParams::FeatureCompatibility::Version::kVersion47)) {
+                ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To47)) {
             return ActualFormat::out(service, opCtx, permitRefresh, out, time, component);
         }
         return false;
@@ -331,12 +339,17 @@ bool VectorClock::gossipOut(OperationContext* opCtx,
     if (opCtx && opCtx->getClient()) {
         clientSessionTags = opCtx->getClient()->getSessionTags();
     }
-    VectorTime now = getTime();
-    if (clientSessionTags & transport::Session::kInternalClient) {
-        return _gossipOutInternal(opCtx, outMessage, now._time);
-    } else {
-        return _gossipOutExternal(opCtx, outMessage, now._time);
+
+    ComponentSet toGossip = clientSessionTags & transport::Session::kInternalClient
+        ? _gossipOutInternal()
+        : _gossipOutExternal();
+
+    auto now = getTime();
+    bool clusterTimeWasOutput = false;
+    for (auto component : toGossip) {
+        clusterTimeWasOutput |= _gossipOutComponent(opCtx, outMessage, now._time, component);
     }
+    return clusterTimeWasOutput;
 }
 
 void VectorClock::gossipIn(OperationContext* opCtx,
@@ -350,11 +363,18 @@ void VectorClock::gossipIn(OperationContext* opCtx,
     if (opCtx && opCtx->getClient()) {
         clientSessionTags = opCtx->getClient()->getSessionTags();
     }
-    if (clientSessionTags & transport::Session::kInternalClient) {
-        _advanceTime(_gossipInInternal(opCtx, inMessage, couldBeUnauthenticated));
-    } else {
-        _advanceTime(_gossipInExternal(opCtx, inMessage, couldBeUnauthenticated));
+
+    ComponentSet toGossip = clientSessionTags & transport::Session::kInternalClient
+        ? _gossipInInternal()
+        : _gossipInExternal();
+
+    LogicalTimeArray newTime;
+    for (auto component : toGossip) {
+        _gossipInComponent(opCtx, inMessage, couldBeUnauthenticated, &newTime, component);
     }
+    // Since the times in LogicalTimeArray are default constructed (ie. to Timestamp(0, 0)), any
+    // component not present in the input BSONObj won't be advanced.
+    _advanceTime(std::move(newTime));
 }
 
 bool VectorClock::_gossipOutComponent(OperationContext* opCtx,

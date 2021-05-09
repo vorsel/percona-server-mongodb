@@ -64,7 +64,14 @@ protected:
         const ShardKeyPattern shardKeyPattern(BSON("_id" << 1));
 
         auto rt = RoutingTableHistory::makeNew(
-            kNss, UUID::gen(), shardKeyPattern.getKeyPattern(), nullptr, false, epoch, [&] {
+            kNss,
+            UUID::gen(),
+            shardKeyPattern.getKeyPattern(),
+            nullptr,
+            false,
+            epoch,
+            boost::none,
+            [&] {
                 ChunkVersion version(1, 0, epoch);
 
                 ChunkType chunk1(kNss,
@@ -96,7 +103,10 @@ protected:
                 return std::vector<ChunkType>{chunk1, chunk2, chunk3, chunk4};
             }());
 
-        ChunkManager cm(rt, boost::none);
+        ChunkManager cm(ShardId("0"),
+                        DatabaseVersion(UUID::gen(), 1),
+                        makeStandaloneRoutingTableHistory(std::move(rt)),
+                        boost::none);
         ASSERT_EQ(4, cm.numChunks());
 
         {

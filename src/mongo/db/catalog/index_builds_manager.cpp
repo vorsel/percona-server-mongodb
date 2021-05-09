@@ -121,7 +121,7 @@ Status IndexBuildsManager::setUpIndexBuild(OperationContext* opCtx,
 }
 
 Status IndexBuildsManager::startBuildingIndex(OperationContext* opCtx,
-                                              Collection* collection,
+                                              const Collection* collection,
                                               const UUID& buildUUID,
                                               boost::optional<RecordId> resumeAfterRecordId) {
     auto builder = invariant(_getBuilder(buildUUID));
@@ -277,7 +277,7 @@ Status IndexBuildsManager::drainBackgroundWrites(
 
 Status IndexBuildsManager::retrySkippedRecords(OperationContext* opCtx,
                                                const UUID& buildUUID,
-                                               Collection* collection) {
+                                               const Collection* collection) {
     auto builder = invariant(_getBuilder(buildUUID));
     return builder->retrySkippedRecords(opCtx, collection);
 }
@@ -331,8 +331,9 @@ bool IndexBuildsManager::abortIndexBuild(OperationContext* opCtx,
 }
 
 bool IndexBuildsManager::abortIndexBuildWithoutCleanupForRollback(OperationContext* opCtx,
-                                                                  Collection* collection,
-                                                                  const UUID& buildUUID) {
+                                                                  const Collection* collection,
+                                                                  const UUID& buildUUID,
+                                                                  bool isResumable) {
     auto builder = _getBuilder(buildUUID);
     if (!builder.isOK()) {
         return false;
@@ -343,7 +344,7 @@ bool IndexBuildsManager::abortIndexBuildWithoutCleanupForRollback(OperationConte
           "Index build aborted without cleanup for rollback",
           "buildUUID"_attr = buildUUID);
 
-    if (auto resumeInfo = builder.getValue()->abortWithoutCleanupForRollback(opCtx)) {
+    if (auto resumeInfo = builder.getValue()->abortWithoutCleanupForRollback(opCtx, isResumable)) {
         _resumeInfos.push_back(std::move(*resumeInfo));
     }
 
@@ -351,8 +352,9 @@ bool IndexBuildsManager::abortIndexBuildWithoutCleanupForRollback(OperationConte
 }
 
 bool IndexBuildsManager::abortIndexBuildWithoutCleanupForShutdown(OperationContext* opCtx,
-                                                                  Collection* collection,
-                                                                  const UUID& buildUUID) {
+                                                                  const Collection* collection,
+                                                                  const UUID& buildUUID,
+                                                                  bool isResumable) {
     auto builder = _getBuilder(buildUUID);
     if (!builder.isOK()) {
         return false;
@@ -361,7 +363,7 @@ bool IndexBuildsManager::abortIndexBuildWithoutCleanupForShutdown(OperationConte
     LOGV2(
         4841500, "Index build aborted without cleanup for shutdown", "buildUUID"_attr = buildUUID);
 
-    builder.getValue()->abortWithoutCleanupForShutdown(opCtx);
+    builder.getValue()->abortWithoutCleanupForShutdown(opCtx, isResumable);
     return true;
 }
 
@@ -408,7 +410,7 @@ StatusWith<int> IndexBuildsManager::_moveRecordToLostAndFound(
     invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IX));
 
     auto originalCollection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
-    Collection* localCollection =
+    const Collection* localCollection =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, lostAndFoundNss);
 
     // Create the collection if it doesn't exist.

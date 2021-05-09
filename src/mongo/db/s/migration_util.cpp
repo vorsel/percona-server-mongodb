@@ -169,7 +169,7 @@ void retryIdempotentWorkAsPrimaryUntilSuccessOrStepdown(
 
             {
                 stdx::lock_guard<Client> lk(*newClient.get());
-                newClient->setSystemOperationKillable(lk);
+                newClient->setSystemOperationKillableByStepdown(lk);
             }
 
             auto newOpCtx = newClient->makeOperationContext();
@@ -293,7 +293,7 @@ ExecutorFuture<void> submitRangeDeletionTask(OperationContext* opCtx,
             ThreadClient tc(kRangeDeletionThreadName, serviceContext);
             {
                 stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillable(lk);
+                tc->setSystemOperationKillableByStepdown(lk);
             }
             auto uniqueOpCtx = tc->makeOperationContext();
             auto opCtx = uniqueOpCtx.get();
@@ -379,7 +379,7 @@ ExecutorFuture<void> submitRangeDeletionTask(OperationContext* opCtx,
             ThreadClient tc(kRangeDeletionThreadName, serviceContext);
             {
                 stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillable(lk);
+                tc->setSystemOperationKillableByStepdown(lk);
             }
             auto uniqueOpCtx = tc->makeOperationContext();
             auto opCtx = uniqueOpCtx.get();
@@ -420,7 +420,7 @@ void resubmitRangeDeletionsOnStepUp(ServiceContext* serviceContext) {
             ThreadClient tc("ResubmitRangeDeletions", serviceContext);
             {
                 stdx::lock_guard<Client> lk(*tc.get());
-                tc->setSystemOperationKillable(lk);
+                tc->setSystemOperationKillableByStepdown(lk);
             }
 
             auto opCtx = tc->makeOperationContext();
@@ -667,8 +667,9 @@ void markAsReadyRangeDeletionTaskOnRecipient(OperationContext* opCtx,
                                              const UUID& migrationId) {
     write_ops::Update updateOp(NamespaceString::kRangeDeletionNamespace);
     auto queryFilter = BSON(RangeDeletionTask::kIdFieldName << migrationId);
-    auto updateModification = write_ops::UpdateModification(
-        BSON("$unset" << BSON(RangeDeletionTask::kPendingFieldName << "")));
+    auto updateModification =
+        write_ops::UpdateModification(write_ops::UpdateModification::parseFromClassicUpdate(
+            BSON("$unset" << BSON(RangeDeletionTask::kPendingFieldName << ""))));
     write_ops::UpdateOpEntry updateEntry(queryFilter, updateModification);
     updateEntry.setMulti(false);
     updateEntry.setUpsert(false);
@@ -700,7 +701,8 @@ void advanceTransactionOnRecipient(OperationContext* opCtx,
     write_ops::Update updateOp(NamespaceString::kServerConfigurationNamespace);
     auto queryFilter = BSON("_id"
                             << "migrationCoordinatorStats");
-    auto updateModification = write_ops::UpdateModification(BSON("$inc" << BSON("count" << 1)));
+    auto updateModification = write_ops::UpdateModification(
+        write_ops::UpdateModification::parseFromClassicUpdate(BSON("$inc" << BSON("count" << 1))));
 
     write_ops::UpdateOpEntry updateEntry(queryFilter, updateModification);
     updateEntry.setMulti(false);
@@ -826,7 +828,7 @@ void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx) {
                               ThreadClient tc("TriggerMigrationRecovery", serviceContext);
                               {
                                   stdx::lock_guard<Client> lk(*tc.get());
-                                  tc->setSystemOperationKillable(lk);
+                                  tc->setSystemOperationKillableByStepdown(lk);
                               }
 
                               auto opCtx = tc->makeOperationContext();
@@ -894,13 +896,7 @@ void recoverMigrationCoordinations(OperationContext* opCtx, NamespaceString nss)
 
             hangInRefreshFilteringMetadataUntilSuccessInterruptible.pauseWhileSet(opCtx);
 
-            CollectionMetadata currentMetadata;
-            try {
-                currentMetadata = forceGetCurrentMetadata(opCtx, doc.getNss());
-            } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-                // A filtering metadata refresh can throw NamespaceNotFound if the database was
-                // dropped from the cluster.
-            }
+            auto currentMetadata = forceGetCurrentMetadata(opCtx, doc.getNss());
 
             if (hangInRefreshFilteringMetadataUntilSuccessThenSimulateErrorUninterruptible
                     .shouldFail()) {

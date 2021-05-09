@@ -227,7 +227,16 @@ void CommandHelpers::auditLogAuthEvent(OperationContext* opCtx,
     };
 
     NamespaceString nss = invocation ? invocation->ns() : NamespaceString(request.getDatabase());
-    audit::logCommandAuthzCheck(opCtx->getClient(), request, Hook(invocation, &nss), err);
+
+    // Always audit errors other than Unauthorized.
+    //
+    // When we get Unauthorized (usually),
+    // then only audit if our Command definition wants it (default),
+    // or if we don't know our Command definition.
+    if ((err != ErrorCodes::Unauthorized) || !invocation ||
+        invocation->definition()->auditAuthorizationFailure()) {
+        audit::logCommandAuthzCheck(opCtx->getClient(), request, Hook(invocation, &nss), err);
+    }
 }
 
 void CommandHelpers::uassertNoDocumentSequences(StringData commandName,
@@ -358,44 +367,17 @@ void CommandHelpers::appendCommandWCStatus(BSONObjBuilder& result,
     }
 }
 
-namespace {
-
-enum class FilterApiParameters { kPreserveApiParameters, kRemoveApiParameters };
-
-BSONObj _appendPassthroughFields(const BSONObj& cmdObjWithPassthroughFields,
-                                 const BSONObj& request,
-                                 FilterApiParameters filterApiParameters) {
-    BSONObjBuilder b;
-    b.appendElements(request);
-    for (const auto& elem :
-         CommandHelpers::filterCommandRequestForPassthrough(cmdObjWithPassthroughFields)) {
-        const auto name = elem.fieldNameStringData();
-        if (request.hasField(name)) {
-            continue;
-        }
-        if (filterApiParameters == FilterApiParameters::kRemoveApiParameters &&
-            isApiParameter(name)) {
-            continue;
-        }
-        if (!isGenericArgument(name)) {
-            continue;
-        }
-        b.append(elem);
-    }
-    return b.obj();
-}
-}  // namespace
-
 BSONObj CommandHelpers::appendPassthroughFields(const BSONObj& cmdObjWithPassthroughFields,
                                                 const BSONObj& request) {
-    return _appendPassthroughFields(
-        cmdObjWithPassthroughFields, request, FilterApiParameters::kPreserveApiParameters);
-}
-
-BSONObj CommandHelpers::appendInternalPassthroughFields(const BSONObj& cmdObjWithPassthroughFields,
-                                                        const BSONObj& request) {
-    return _appendPassthroughFields(
-        cmdObjWithPassthroughFields, request, FilterApiParameters::kRemoveApiParameters);
+    BSONObjBuilder b;
+    b.appendElements(request);
+    for (const auto& elem : filterCommandRequestForPassthrough(cmdObjWithPassthroughFields)) {
+        const auto name = elem.fieldNameStringData();
+        if (isGenericArgument(name) && !request.hasField(name)) {
+            b.append(elem);
+        }
+    }
+    return b.obj();
 }
 
 BSONObj CommandHelpers::appendMajorityWriteConcern(const BSONObj& cmdObj,
@@ -488,7 +470,9 @@ bool CommandHelpers::uassertShouldAttemptParse(OperationContext* opCtx,
     try {
         return checkAuthorizationImplPreParse(opCtx, command, request);
     } catch (const ExceptionFor<ErrorCodes::Unauthorized>& e) {
-        CommandHelpers::auditLogAuthEvent(opCtx, nullptr, request, e.code());
+        if (command->auditAuthorizationFailure()) {
+            CommandHelpers::auditLogAuthEvent(opCtx, nullptr, request, e.code());
+        }
         throw;
     }
 }

@@ -120,7 +120,7 @@ public:
                                           const BSONObj& spec,
                                           OnInitFn onInit);
     StatusWith<std::vector<BSONObj>> initForResume(OperationContext* opCtx,
-                                                   Collection* collection,
+                                                   const Collection* collection,
                                                    const std::vector<BSONObj>& specs,
                                                    const ResumeIndexInfo& resumeInfo);
 
@@ -151,7 +151,7 @@ public:
      */
     Status insertAllDocumentsInCollection(
         OperationContext* opCtx,
-        Collection* collection,
+        const Collection* collection,
         boost::optional<RecordId> resumeAfterRecordId = boost::none);
 
     /**
@@ -206,7 +206,7 @@ public:
      * of an index build, so it must ensure that before it finishes, it has indexed all documents in
      * a collection, requiring a call to this function upon completion.
      */
-    Status retrySkippedRecords(OperationContext* opCtx, Collection* collection);
+    Status retrySkippedRecords(OperationContext* opCtx, const Collection* collection);
 
     /**
      * Check any constraits that may have been temporarily violated during the index build for
@@ -276,7 +276,8 @@ public:
      *
      * This should only be used during rollback.
      */
-    boost::optional<ResumeIndexInfo> abortWithoutCleanupForRollback(OperationContext* opCtx);
+    boost::optional<ResumeIndexInfo> abortWithoutCleanupForRollback(OperationContext* opCtx,
+                                                                    bool isResumable);
 
     /**
      * May be called at any time after construction but before a successful commit(). Suppresses
@@ -287,7 +288,7 @@ public:
      *
      * This should only be used during shutdown.
      */
-    void abortWithoutCleanupForShutdown(OperationContext* opCtx);
+    void abortWithoutCleanupForShutdown(OperationContext* opCtx, bool isResumable);
 
     /**
      * Returns true if this build block supports background writes while building an index. This is
@@ -310,13 +311,13 @@ private:
 
     /**
      * This function should be used for shutdown and rollback. When called for shutdown, writes the
-     * resumable index build state to disk if resuamble index builds are supported. When called for
-     * rollback, returns the information to resume the index build if resuamble index builds are
+     * resumable index build state to disk if resumable index builds are supported. When called for
+     * rollback, returns the information to resume the index build if resumable index builds are
      * supported.
      */
-    boost::optional<ResumeIndexInfo> _abortWithoutCleanup(OperationContext* opCtx, bool shutdown);
-
-    bool _isResumable(OperationContext* opCtx) const;
+    boost::optional<ResumeIndexInfo> _abortWithoutCleanup(OperationContext* opCtx,
+                                                          bool shutdown,
+                                                          bool isResumable);
 
     void _writeStateToDisk(OperationContext* opCtx) const;
 

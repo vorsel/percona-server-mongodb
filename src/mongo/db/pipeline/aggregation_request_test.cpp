@@ -55,19 +55,27 @@ const Document kDefaultCursorOptionDocument{
 //
 
 TEST(AggregationRequestTest, ShouldParseAllKnownOptions) {
-    NamespaceString nss("a.collection");
-    const BSONObj inputBson = fromjson(
+    // Using oplog namespace so that validation of $_requestResumeToken succeeds.
+    NamespaceString nss("local.oplog.rs");
+    BSONObj inputBson = fromjson(
         "{pipeline: [{$match: {a: 'abc'}}], explain: false, allowDiskUse: true, fromMongos: true, "
-        "needsMerge: true, bypassDocumentValidation: true, collation: {locale: 'en_US'}, cursor: "
+        "needsMerge: true, bypassDocumentValidation: true, $_requestResumeToken: true, collation: "
+        "{locale: 'en_US'}, cursor: "
         "{batchSize: 10}, hint: {a: 1}, maxTimeMS: 100, readConcern: {level: 'linearizable'}, "
         "$queryOptions: {$readPreference: 'nearest'}, exchange: {policy: "
         "'roundrobin', consumers:NumberInt(2)}, isMapReduceCommand: true}");
+    auto uuid = UUID::gen();
+    BSONObjBuilder uuidBob;
+    uuid.appendToBuilder(&uuidBob, AggregationRequest::kCollectionUUIDName);
+    inputBson = inputBson.addField(uuidBob.obj().firstElement());
+
     auto request = unittest::assertGet(AggregationRequest::parseFromBSON(nss, inputBson));
     ASSERT_FALSE(request.getExplain());
     ASSERT_TRUE(request.shouldAllowDiskUse());
     ASSERT_TRUE(request.isFromMongos());
     ASSERT_TRUE(request.needsMerge());
     ASSERT_TRUE(request.shouldBypassDocumentValidation());
+    ASSERT_TRUE(request.getRequestResumeToken());
     ASSERT_EQ(request.getBatchSize(), 10);
     ASSERT_BSONOBJ_EQ(request.getHint(), BSON("a" << 1));
     ASSERT_BSONOBJ_EQ(request.getCollation(),
@@ -82,6 +90,14 @@ TEST(AggregationRequestTest, ShouldParseAllKnownOptions) {
                            << "nearest"));
     ASSERT_TRUE(request.getExchangeSpec().is_initialized());
     ASSERT_TRUE(request.getIsMapReduceCommand());
+    ASSERT_EQ(*request.getCollectionUUID(), uuid);
+}
+
+TEST(AggregationRequestTest, ShouldParseExplicitRequestResumeTokenFalseForNonOplog) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson("{pipeline: [], $_requestResumeToken: false, cursor: {}}");
+    auto request = unittest::assertGet(AggregationRequest::parseFromBSON(nss, inputBson));
+    ASSERT_FALSE(request.getRequestResumeToken());
 }
 
 TEST(AggregationRequestTest, ShouldParseExplicitExplainTrue) {
@@ -155,6 +171,7 @@ TEST(AggregationRequestTest, ShouldNotSerializeOptionalValuesIfEquivalentToDefau
     request.setFromMongos(false);
     request.setNeedsMerge(false);
     request.setBypassDocumentValidation(false);
+    request.setRequestResumeToken(false);
     request.setCollation(BSONObj());
     request.setHint(BSONObj());
     request.setMaxTimeMS(0u);
@@ -176,6 +193,7 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
     request.setFromMongos(true);
     request.setNeedsMerge(true);
     request.setBypassDocumentValidation(true);
+    request.setRequestResumeToken(true);
     request.setBatchSize(10);
     request.setMaxTimeMS(10u);
     const auto hintObj = BSON("a" << 1);
@@ -193,6 +211,8 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
     const auto letParamsObj = BSON("foo"
                                    << "bar");
     request.setLetParameters(letParamsObj);
+    auto uuid = UUID::gen();
+    request.setCollectionUUID(uuid);
 
     auto expectedSerialization =
         Document{{AggregationRequest::kCommandName, nss.coll()},
@@ -201,6 +221,7 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
                  {AggregationRequest::kFromMongosName, true},
                  {AggregationRequest::kNeedsMergeName, true},
                  {bypassDocumentValidationCommandOption(), true},
+                 {AggregationRequest::kRequestResumeToken, true},
                  {AggregationRequest::kCollationName, collationObj},
                  {AggregationRequest::kCursorName,
                   Value(Document({{AggregationRequest::kBatchSizeName, 10}}))},
@@ -209,7 +230,8 @@ TEST(AggregationRequestTest, ShouldSerializeOptionalValuesIfSet) {
                  {QueryRequest::kUnwrappedReadPrefField, readPrefObj},
                  {QueryRequest::cmdOptionMaxTimeMS, 10},
                  {AggregationRequest::kIsMapReduceCommandName, true},
-                 {AggregationRequest::kLetName, letParamsObj}};
+                 {AggregationRequest::kLetName, letParamsObj},
+                 {AggregationRequest::kCollectionUUIDName, uuid}};
     ASSERT_DOCUMENT_EQ(request.serializeToCommandObj(), expectedSerialization);
 }
 
@@ -430,6 +452,12 @@ TEST(AggregationRequestTest, ShouldRejectExplainExecStatsVerbosityWithWriteConce
             .getStatus());
 }
 
+TEST(AggregationRequestTest, ShouldRejectRequestResumeTokenIfNonOplogNss) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBson = fromjson("{pipeline: [], $_requestResumeToken: true}");
+    ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
+}
+
 TEST(AggregationRequestTest, CannotParseNeedsMerge34) {
     NamespaceString nss("a.collection");
     const BSONObj inputBson =
@@ -503,6 +531,14 @@ TEST(AggregationRequestTest, ShouldRejectInvalidWriteConcern) {
         fromjson("{pipeline: [{$match: {a: 'abc'}}], cursor: {}, writeConcern: 'invalid'}");
     ASSERT_NOT_OK(AggregationRequest::parseFromBSON(nss, inputBson).getStatus());
 }
+
+TEST(AggregationRequestTest, ShouldRejectInvalidCollectionUUID) {
+    NamespaceString nss("a.collection");
+    const BSONObj inputBSON = fromjson("{pipeline: [{$match: {}}], collectionUUID: 2}");
+    ASSERT_EQUALS(AggregationRequest::parseFromBSON(nss, inputBSON).getStatus().code(),
+                  ErrorCodes::InvalidUUID);
+}
+
 //
 // Ignore fields parsed elsewhere.
 //

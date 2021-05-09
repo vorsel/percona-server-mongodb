@@ -235,23 +235,25 @@ TEST(CstGrammarTest, InvalidParseLimitArray) {
 TEST(CstGrammarTest, ParsesProject) {
     {
         CNode output;
-        auto input =
-            fromjson("{pipeline: [{$project: {a: 1.0, b: NumberInt(1), _id: NumberLong(1)}}]}");
+        auto input = fromjson(
+            "{pipeline: [{$project: {a: 1.0, b: {c: NumberInt(1), d: NumberDecimal('1.0') }, _id: "
+            "NumberLong(1)}}]}");
         BSONLexer lexer(input["pipeline"].Array(), PipelineParserGen::token::START_PIPELINE);
         auto parseTree = PipelineParserGen(lexer, &output);
         ASSERT_EQ(0, parseTree.parse());
         auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
         ASSERT_EQ(1, stages.size());
         ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
-        ASSERT_EQ(stages[0].toBson().toString(),
-                  "{ projectInclusion: { a: \"<NonZeroKey of type double 1.000000>\", b: "
-                  "\"<NonZeroKey of "
-                  "type int 1>\", id: \"<NonZeroKey of type long 1>\" } }");
+        ASSERT_EQ(
+            stages[0].toBson().toString(),
+            "{ projectInclusion: { a: \"<NonZeroKey of type double 1.000000>\", b: { "
+            "<CompoundInclusionKey>: { c: \"<NonZeroKey of type int 1>\", d: \"<NonZeroKey "
+            "of type decimal 1.00000000000000>\" } }, id: \"<NonZeroKey of type long 1>\" } }");
     }
     {
         CNode output;
-        auto input =
-            fromjson("{pipeline: [{$project: {a: 0.0, b: NumberInt(0), c: NumberLong(0)}}]}");
+        auto input = fromjson(
+            "{pipeline: [{$project: {a: 0.0, b: NumberInt(0), c: { d: { e: NumberLong(0)}}}}]}");
         BSONLexer lexer(input["pipeline"].Array(), PipelineParserGen::token::START_PIPELINE);
         auto parseTree = PipelineParserGen(lexer, &output);
         ASSERT_EQ(0, parseTree.parse());
@@ -261,7 +263,7 @@ TEST(CstGrammarTest, ParsesProject) {
         ASSERT_EQ(
             stages[0].toBson().toString(),
             "{ projectExclusion: { a: \"<KeyValue doubleZeroKey>\", b: \"<KeyValue intZeroKey>\", "
-            "c: \"<KeyValue longZeroKey>\" } }");
+            "c: { <CompoundExclusionKey>: { d: { e: \"<KeyValue longZeroKey>\" } } } } }");
     }
     {
         CNode output;
@@ -307,6 +309,40 @@ TEST(CstGrammarTest, FailsToParseMixedProject) {
     {
         CNode output;
         auto input = fromjson("{pipeline: [{$project: {a: 0, b: {$add: [5, 67]}}}]}");
+        BSONLexer lexer(input["pipeline"].Array(), PipelineParserGen::token::START_PIPELINE);
+        auto parseTree = PipelineParserGen(lexer, &output);
+        ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
+    }
+}
+
+TEST(CstGrammarTest, FailsToParseCompoundMixedProject) {
+    {
+        CNode output;
+        auto input = fromjson("{pipeline: [{$project: {a: {b: 1, c: 0.0}}}]}");
+        BSONLexer lexer(input["pipeline"].Array(), PipelineParserGen::token::START_PIPELINE);
+        auto parseTree = PipelineParserGen(lexer, &output);
+        ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
+    }
+    {
+        CNode output;
+        auto input = fromjson("{pipeline: [{$project: {a: {b: {c: {d: NumberLong(0)}, e: 45}}}}]}");
+        BSONLexer lexer(input["pipeline"].Array(), PipelineParserGen::token::START_PIPELINE);
+        auto parseTree = PipelineParserGen(lexer, &output);
+        ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
+    }
+}
+
+TEST(CstGrammarTest, FailsToParseProjectWithDollarFieldNames) {
+    {
+        CNode output;
+        auto input = fromjson("{pipeline: [{$project: {$a: 1}}]}");
+        BSONLexer lexer(input["pipeline"].Array(), PipelineParserGen::token::START_PIPELINE);
+        auto parseTree = PipelineParserGen(lexer, &output);
+        ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
+    }
+    {
+        CNode output;
+        auto input = fromjson("{pipeline: [{$project: {b: 1, $a: 1}}]}");
         BSONLexer lexer(input["pipeline"].Array(), PipelineParserGen::token::START_PIPELINE);
         auto parseTree = PipelineParserGen(lexer, &output);
         ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
@@ -838,22 +874,57 @@ TEST(CstGrammarTest, ParsesEmptyMatchInFind) {
     BSONLexer lexer(input, PipelineParserGen::token::START_MATCH);
     auto parseTree = PipelineParserGen(lexer, &output);
     ASSERT_EQ(0, parseTree.parse());
-    auto stage = output;
-    ASSERT(KeyFieldname::match == stage.firstKeyFieldname());
-    ASSERT_EQ(stage.toBson().toString(), "{ match: {} }");
+    ASSERT_EQ(output.toBson().toString(), "{}");
 }
 
-TEST(CstGrammarTest, ParsesMatchInFind) {
+TEST(CstGrammarTest, ParsesMatchWithEqualityPredicates) {
     CNode output;
-    auto input = fromjson("{a: 1.0, b: NumberInt(1), _id: NumberLong(1)}");
+    auto input = fromjson("{a: 5.0, b: NumberInt(10), _id: NumberLong(15)}");
     BSONLexer lexer(input, PipelineParserGen::token::START_MATCH);
     auto parseTree = PipelineParserGen(lexer, &output);
     ASSERT_EQ(0, parseTree.parse());
-    auto stage = output;
-    ASSERT(KeyFieldname::match == stage.firstKeyFieldname());
-    ASSERT_EQ(stage.toBson().toString(),
-              "{ match: { a: \"<UserDouble 1.000000>\", b: \"<UserInt 1>\", id: \"<UserLong "
-              "1>\" } }");
+    ASSERT_EQ(output.toBson().toString(),
+              "{ a: \"<UserDouble 5.000000>\", b: \"<UserInt 10>\", _id: \"<UserLong 15>\" }");
+}
+
+TEST(CstGrammarTest, FailsToParseDollarPrefixedPredicates) {
+    {
+        auto input = fromjson("{$atan2: [3, 5]}");
+        BSONLexer lexer(input, PipelineParserGen::token::START_MATCH);
+        ASSERT_THROWS_CODE_AND_WHAT(
+            PipelineParserGen(lexer, nullptr).parse(),
+            AssertionException,
+            ErrorCodes::FailedToParse,
+            "syntax error, unexpected ATAN2 at element '$atan2' of input filter");
+    }
+    {
+        auto input = fromjson("{$prefixed: 5}");
+        BSONLexer lexer(input, PipelineParserGen::token::START_MATCH);
+        ASSERT_THROWS_CODE_AND_WHAT(
+            PipelineParserGen(lexer, nullptr).parse(),
+            AssertionException,
+            ErrorCodes::FailedToParse,
+            "syntax error, unexpected $-prefixed fieldname at element '$prefixed' of input filter");
+    }
+}
+
+TEST(CstGrammarTest, ParsesBasicSort) {
+    CNode output;
+    auto input = fromjson("{val: 1, test: -1}");
+    BSONLexer lexer(input, PipelineParserGen::token::START_SORT);
+    auto parseTree = PipelineParserGen(lexer, &output);
+    ASSERT_EQ(0, parseTree.parse());
+    ASSERT_EQ(output.toBson().toString(),
+              "{ val: \"<KeyValue intOneKey>\", test: \"<KeyValue intNegOneKey>\" }");
+}
+
+TEST(CstGrammarTest, ParsesMetaSort) {
+    CNode output;
+    auto input = fromjson("{val: {$meta: \"textScore\"}}");
+    BSONLexer lexer(input, PipelineParserGen::token::START_SORT);
+    auto parseTree = PipelineParserGen(lexer, &output);
+    ASSERT_EQ(0, parseTree.parse());
+    ASSERT_EQ(output.toBson().toString(), "{ val: { meta: \"<KeyValue textScore>\" } }");
 }
 
 }  // namespace

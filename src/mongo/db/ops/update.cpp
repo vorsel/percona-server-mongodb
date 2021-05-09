@@ -62,7 +62,7 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
     const NamespaceString& nsString = request.getNamespaceString();
     invariant(opCtx->lockState()->isCollectionLockedForMode(nsString, MODE_IX));
 
-    Collection* collection;
+    const Collection* collection;
 
     // The update stage does not create its own collection.  As such, if the update is
     // an upsert, create the collection that the update stage inserts into beforehand.
@@ -95,10 +95,6 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
     auto exec = uassertStatusOK(
         getExecutorUpdate(nullOpDebug, collection, &parsedUpdate, boost::none /* verbosity */));
 
-    exec->executePlan();
-
-    const UpdateStats* updateStats = UpdateStage::getUpdateStats(exec.get());
-
-    return UpdateStage::makeUpdateResult(updateStats);
+    return exec->executeUpdate();
 }
 }  // namespace mongo

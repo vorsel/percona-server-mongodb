@@ -54,36 +54,6 @@ using std::endl;
 using std::string;
 using std::unique_ptr;
 
-namespace {
-
-void _appendUserInfo(const CurOp& c, BSONObjBuilder& builder, AuthorizationSession* authSession) {
-    UserNameIterator nameIter = authSession->getAuthenticatedUserNames();
-
-    UserName bestUser;
-    if (nameIter.more())
-        bestUser = *nameIter;
-
-    std::string opdb(nsToDatabase(c.getNS()));
-
-    BSONArrayBuilder allUsers(builder.subarrayStart("allUsers"));
-    for (; nameIter.more(); nameIter.next()) {
-        BSONObjBuilder nextUser(allUsers.subobjStart());
-        nextUser.append(AuthorizationManager::USER_NAME_FIELD_NAME, nameIter->getUser());
-        nextUser.append(AuthorizationManager::USER_DB_FIELD_NAME, nameIter->getDB());
-        nextUser.doneFast();
-
-        if (nameIter->getDB() == opdb) {
-            bestUser = *nameIter;
-        }
-    }
-    allUsers.doneFast();
-
-    builder.append("user", bestUser.getUser().empty() ? "" : bestUser.getFullName());
-}
-
-}  // namespace
-
-
 void profile(OperationContext* opCtx, NetworkOp op) {
     // Initialize with 1kb at start in order to avoid realloc later
     BufBuilder profileBufBuilder(1024);
@@ -110,7 +80,7 @@ void profile(OperationContext* opCtx, NetworkOp op) {
     }
 
     AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
-    _appendUserInfo(*CurOp::get(opCtx), b, authSession);
+    OpDebug::appendUserInfo(*CurOp::get(opCtx), b, authSession);
 
     const BSONObj p = b.done();
 
@@ -160,7 +130,7 @@ void profile(OperationContext* opCtx, NetworkOp op) {
         EnforcePrepareConflictsBlock enforcePrepare(opCtx);
 
         uassertStatusOK(createProfileCollection(opCtx, db));
-        Collection* const coll =
+        const Collection* const coll =
             CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, dbProfilingNS);
 
         invariant(!opCtx->shouldParticipateInFlowControl());
@@ -190,7 +160,7 @@ Status createProfileCollection(OperationContext* opCtx, Database* db) {
     // collection creation would endlessly throw errors because the collection exists: must check
     // and see the collection exists in order to break free.
     return writeConflictRetry(opCtx, "createProfileCollection", dbProfilingNS.ns(), [&] {
-        Collection* const collection =
+        const Collection* const collection =
             CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, dbProfilingNS);
         if (collection) {
             if (!collection->isCapped()) {

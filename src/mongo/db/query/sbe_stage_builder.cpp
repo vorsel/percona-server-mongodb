@@ -58,6 +58,13 @@ namespace mongo::stage_builder {
 std::unique_ptr<sbe::RuntimeEnvironment> makeRuntimeEnvironment(
     OperationContext* opCtx, sbe::value::SlotIdGenerator* slotIdGenerator) {
     auto env = std::make_unique<sbe::RuntimeEnvironment>();
+
+    // Register an unowned global timezone database for datetime expression evaluation.
+    env->registerSlot("timeZoneDB"_sd,
+                      sbe::value::TypeTags::timeZoneDB,
+                      sbe::value::bitcastFrom(getTimeZoneDatabase(opCtx)),
+                      false,
+                      slotIdGenerator);
     return env;
 }
 
@@ -145,8 +152,16 @@ std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::buildFetch(const QuerySol
                              _returnKeySlot ? sbe::makeSV(*_returnKeySlot) : sbe::makeSV());
 
     if (fn->filter) {
-        stage = generateFilter(
-            fn->filter.get(), std::move(stage), &_slotIdGenerator, *_data.resultSlot);
+        auto relevantSlots = sbe::makeSV(*_data.resultSlot, *_data.recordIdSlot);
+        if (_returnKeySlot) {
+            relevantSlots.push_back(*_returnKeySlot);
+        }
+
+        stage = generateFilter(fn->filter.get(),
+                               std::move(stage),
+                               &_slotIdGenerator,
+                               *_data.resultSlot,
+                               std::move(relevantSlots));
     }
 
     return stage;
@@ -323,7 +338,8 @@ std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::buildProjectionDefault(
                                             std::move(inputStage),
                                             &_slotIdGenerator,
                                             &_frameIdGenerator,
-                                            *_data.resultSlot);
+                                            *_data.resultSlot,
+                                            _data.env);
     _data.resultSlot = slot;
     return std::move(stage);
 }
@@ -357,8 +373,12 @@ std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::buildOr(const QuerySoluti
     }
 
     if (orn->filter) {
-        stage = generateFilter(
-            orn->filter.get(), std::move(stage), &_slotIdGenerator, *_data.resultSlot);
+        auto relevantSlots = sbe::makeSV(*_data.resultSlot, *_data.recordIdSlot);
+        stage = generateFilter(orn->filter.get(),
+                               std::move(stage),
+                               &_slotIdGenerator,
+                               *_data.resultSlot,
+                               std::move(relevantSlots));
     }
 
     return stage;

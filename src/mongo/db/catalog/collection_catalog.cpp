@@ -268,8 +268,13 @@ std::shared_ptr<const Collection> CollectionCatalog::lookupCollectionByUUIDForRe
     return (coll && coll->isCommitted()) ? coll : nullptr;
 }
 
-Collection* CollectionCatalog::lookupCollectionByUUID(OperationContext* opCtx,
-                                                      CollectionUUID uuid) const {
+Collection* CollectionCatalog::lookupCollectionByUUIDForMetadataWrite(OperationContext* opCtx,
+                                                                      CollectionUUID uuid) {
+    return const_cast<Collection*>(lookupCollectionByUUID(opCtx, uuid));
+}
+
+const Collection* CollectionCatalog::lookupCollectionByUUID(OperationContext* opCtx,
+                                                            CollectionUUID uuid) const {
     if (auto coll = UncommittedCollections::getForTxn(opCtx, uuid)) {
         return coll.get();
     }
@@ -309,8 +314,13 @@ std::shared_ptr<const Collection> CollectionCatalog::lookupCollectionByNamespace
     return (coll && coll->isCommitted()) ? coll : nullptr;
 }
 
-Collection* CollectionCatalog::lookupCollectionByNamespace(OperationContext* opCtx,
-                                                           const NamespaceString& nss) const {
+Collection* CollectionCatalog::lookupCollectionByNamespaceForMetadataWrite(
+    OperationContext* opCtx, const NamespaceString& nss) {
+    return const_cast<Collection*>(lookupCollectionByNamespace(opCtx, nss));
+}
+
+const Collection* CollectionCatalog::lookupCollectionByNamespace(OperationContext* opCtx,
+                                                                 const NamespaceString& nss) const {
     if (auto coll = UncommittedCollections::getForTxn(opCtx, nss)) {
         return coll.get();
     }
@@ -453,24 +463,26 @@ std::vector<std::string> CollectionCatalog::getAllDbNames() const {
     return ret;
 }
 
-void CollectionCatalog::setDatabaseProfileLevel(StringData dbName, int newProfileLevel) {
-    stdx::lock_guard<Latch> lock(_profileLevelsLock);
-    _databaseProfileLevels[dbName] = newProfileLevel;
+void CollectionCatalog::setDatabaseProfileSettings(
+    StringData dbName, CollectionCatalog::ProfileSettings newProfileSettings) {
+    stdx::lock_guard<Latch> lock(_profileSettingsLock);
+    _databaseProfileSettings[dbName] = newProfileSettings;
 }
 
-int CollectionCatalog::getDatabaseProfileLevel(StringData dbName) const {
-    stdx::lock_guard<Latch> lock(_profileLevelsLock);
-    auto it = _databaseProfileLevels.find(dbName);
-    if (it != _databaseProfileLevels.end()) {
+CollectionCatalog::ProfileSettings CollectionCatalog::getDatabaseProfileSettings(
+    StringData dbName) const {
+    stdx::lock_guard<Latch> lock(_profileSettingsLock);
+    auto it = _databaseProfileSettings.find(dbName);
+    if (it != _databaseProfileSettings.end()) {
         return it->second;
     }
 
-    return serverGlobalParams.defaultProfile;
+    return {serverGlobalParams.defaultProfile, ProfileFilter::getDefault()};
 }
 
-void CollectionCatalog::clearDatabaseProfileLevel(StringData dbName) {
-    stdx::lock_guard<Latch> lock(_profileLevelsLock);
-    _databaseProfileLevels.erase(dbName);
+void CollectionCatalog::clearDatabaseProfileSettings(StringData dbName) {
+    stdx::lock_guard<Latch> lock(_profileSettingsLock);
+    _databaseProfileSettings.erase(dbName);
 }
 
 void CollectionCatalog::registerCollection(CollectionUUID uuid, std::shared_ptr<Collection> coll) {

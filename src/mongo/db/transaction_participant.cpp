@@ -64,6 +64,7 @@
 #include "mongo/db/storage/flow_control.h"
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/db/transaction_participant_gen.h"
+#include "mongo/db/vector_clock_mutable.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log_with_sampling.h"
@@ -328,7 +329,7 @@ void TransactionParticipant::performNoopWrite(OperationContext* opCtx, StringDat
 
     {
         AutoGetOplog oplogWrite(opCtx, OplogAccessMode::kWrite);
-        uassert(ErrorCodes::NotMaster,
+        uassert(ErrorCodes::NotWritablePrimary,
                 "Not primary when performing noop write for {}"_format(msg),
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
 
@@ -494,7 +495,7 @@ void TransactionParticipant::Participant::beginOrContinue(OperationContext* opCt
     repl::ReplicationStateTransitionLockGuard rstl(opCtx, MODE_IX);
     if (opCtx->writesAreReplicated()) {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        uassert(ErrorCodes::NotMaster,
+        uassert(ErrorCodes::NotWritablePrimary,
                 "Not primary so we cannot begin or continue a transaction",
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
         // Disallow multi-statement transactions on shard servers that have
@@ -745,6 +746,7 @@ TransactionParticipant::TxnResources::TxnResources(WithLock wl,
                                opCtx->getServiceContext()->getStorageEngine()->newRecoveryUnit()),
                            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
 
+    _apiParameters = APIParameters::get(opCtx);
     _readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     _uncommittedCollections = UncommittedCollections::get(opCtx).shareResources();
 }
@@ -821,8 +823,15 @@ void TransactionParticipant::TxnResources::release(OperationContext* opCtx) {
 
     opCtx->setWriteUnitOfWork(WriteUnitOfWork::createForSnapshotResume(opCtx, _ruState));
 
+    auto& apiParameters = APIParameters::get(opCtx);
+    apiParameters = _apiParameters;
+
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     readConcernArgs = _readConcernArgs;
+}
+
+void TransactionParticipant::TxnResources::setNoEvictionAfterRollback() {
+    _recoveryUnit->setNoEvictionAfterRollback();
 }
 
 TransactionParticipant::SideTransactionBlock::SideTransactionBlock(OperationContext* opCtx)
@@ -1346,7 +1355,7 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
     const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
 
     if (opCtx->writesAreReplicated()) {
-        uassert(ErrorCodes::NotMaster,
+        uassert(ErrorCodes::NotWritablePrimary,
                 "Not primary so we cannot commit a prepared transaction",
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
     }
@@ -1388,11 +1397,16 @@ void TransactionParticipant::Participant::commitPreparedTransaction(
         OplogSlot commitOplogSlot;
         boost::optional<OplogSlotReserver> oplogSlotReserver;
 
-        // On primary, we reserve an oplog slot before committing the transaction so that no
-        // writes that are causally related to the transaction commit enter the oplog at a
-        // timestamp earlier than the commit oplog entry.
         if (opCtx->writesAreReplicated()) {
             invariant(!commitOplogEntryOpTime);
+            // When this receiving node is not in a readable state, the cluster time gossiping
+            // protocol is not enabled, thus it is necessary to advance it explicitely,
+            // so that causal consistency is maintained in these situations.
+            VectorClockMutable::get(opCtx)->tickClusterTimeTo(LogicalTime(commitTimestamp));
+
+            // On primary, we reserve an oplog slot before committing the transaction so that no
+            // writes that are causally related to the transaction commit enter the oplog at a
+            // timestamp earlier than the commit oplog entry.
             oplogSlotReserver.emplace(opCtx);
             commitOplogSlot = oplogSlotReserver->getLastSlot();
             invariant(commitOplogSlot.getTimestamp() >= commitTimestamp,
@@ -1487,6 +1501,15 @@ void TransactionParticipant::Participant::shutdown(OperationContext* opCtx) {
     o(lock).txnResourceStash = boost::none;
 }
 
+APIParameters TransactionParticipant::Participant::getAPIParameters(OperationContext* opCtx) const {
+    // If we have are in a retryable write, use the API parameters that the client passed in with
+    // the write, instead of the first write's API parameters.
+    if (o().txnResourceStash && !o().txnState.isInRetryableWriteMode()) {
+        return o().txnResourceStash->getAPIParameters();
+    }
+    return APIParameters::get(opCtx);
+}
+
 bool TransactionParticipant::Observer::expiredAsOf(Date_t when) const {
     return o().txnState.isInProgress() && o().transactionExpireDate &&
         o().transactionExpireDate < when;
@@ -1520,7 +1543,7 @@ void TransactionParticipant::Participant::_abortActivePreparedTransaction(Operat
 
     if (opCtx->writesAreReplicated()) {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-        uassert(ErrorCodes::NotMaster,
+        uassert(ErrorCodes::NotWritablePrimary,
                 "Not primary so we cannot abort a prepared transaction",
                 replCoord->canAcceptWritesForDatabase(opCtx, "admin"));
     }
@@ -1635,6 +1658,7 @@ void TransactionParticipant::Participant::_abortTransactionOnSession(OperationCo
         _logSlowTransaction(opCtx,
                             &(o().txnResourceStash->locker()->getLockerInfo(boost::none))->stats,
                             TerminationCause::kAborted,
+                            o().txnResourceStash->getAPIParameters(),
                             o().txnResourceStash->getReadConcernArgs());
     }
 
@@ -1642,6 +1666,9 @@ void TransactionParticipant::Participant::_abortTransactionOnSession(OperationCo
                                                      : TransactionState::kAbortedWithoutPrepare;
 
     stdx::lock_guard<Client> lk(*opCtx->getClient());
+    if (o().txnResourceStash && opCtx->recoveryUnit()->getNoEvictionAfterRollback()) {
+        o(lk).txnResourceStash->setNoEvictionAfterRollback();
+    }
     _resetTransactionState(lk, nextState);
 }
 
@@ -1652,6 +1679,7 @@ void TransactionParticipant::Participant::_cleanUpTxnResourceOnOpCtx(
         opCtx,
         &(opCtx->lockState()->getLockerInfo(CurOp::get(*opCtx)->getLockStatsBase()))->stats,
         terminationCause,
+        APIParameters::get(opCtx),
         repl::ReadConcernArgs::get(opCtx));
 
     // Reset the WUOW. We should be able to abort empty transactions that don't have WUOW.
@@ -1869,6 +1897,7 @@ std::string TransactionParticipant::Participant::_transactionInfoForLog(
     OperationContext* opCtx,
     const SingleThreadedLockStats* lockStats,
     TerminationCause terminationCause,
+    APIParameters apiParameters,
     repl::ReadConcernArgs readConcernArgs) const {
     invariant(lockStats);
 
@@ -1883,6 +1912,7 @@ std::string TransactionParticipant::Participant::_transactionInfoForLog(
 
     parametersBuilder.append("txnNumber", o().activeTxnNumber);
     parametersBuilder.append("autocommit", p().autoCommit ? *p().autoCommit : true);
+    apiParameters.appendInfo(&parametersBuilder);
     readConcernArgs.appendInfo(&parametersBuilder);
 
     s << "parameters:" << parametersBuilder.obj().toString() << ",";
@@ -1942,6 +1972,7 @@ void TransactionParticipant::Participant::_transactionInfoForLog(
     OperationContext* opCtx,
     const SingleThreadedLockStats* lockStats,
     TerminationCause terminationCause,
+    APIParameters apiParameters,
     repl::ReadConcernArgs readConcernArgs,
     logv2::DynamicAttributes* pAttrs) const {
     invariant(lockStats);
@@ -1955,6 +1986,7 @@ void TransactionParticipant::Participant::_transactionInfoForLog(
 
     parametersBuilder.append("txnNumber", o().activeTxnNumber);
     parametersBuilder.append("autocommit", p().autoCommit ? *p().autoCommit : true);
+    apiParameters.appendInfo(&parametersBuilder);
     readConcernArgs.appendInfo(&parametersBuilder);
 
     pAttrs->add("parameters", parametersBuilder.obj());
@@ -2009,6 +2041,7 @@ BSONObj TransactionParticipant::Participant::_transactionInfoBSONForLog(
     OperationContext* opCtx,
     const SingleThreadedLockStats* lockStats,
     TerminationCause terminationCause,
+    APIParameters apiParameters,
     repl::ReadConcernArgs readConcernArgs) const {
     invariant(lockStats);
 
@@ -2021,6 +2054,7 @@ BSONObj TransactionParticipant::Participant::_transactionInfoBSONForLog(
 
     parametersBuilder.append("txnNumber", o().activeTxnNumber);
     parametersBuilder.append("autocommit", p().autoCommit ? *p().autoCommit : true);
+    apiParameters.appendInfo(&parametersBuilder);
     readConcernArgs.appendInfo(&parametersBuilder);
 
     BSONObjBuilder logLine;
@@ -2085,6 +2119,7 @@ void TransactionParticipant::Participant::_logSlowTransaction(
     OperationContext* opCtx,
     const SingleThreadedLockStats* lockStats,
     TerminationCause terminationCause,
+    APIParameters apiParameters,
     repl::ReadConcernArgs readConcernArgs) {
     // Only log multi-document transactions.
     if (!o().txnState.isInRetryableWriteMode()) {
@@ -2099,7 +2134,8 @@ void TransactionParticipant::Participant::_logSlowTransaction(
                                         Milliseconds(serverGlobalParams.slowMS))
                 .first) {
             logv2::DynamicAttributes attr;
-            _transactionInfoForLog(opCtx, lockStats, terminationCause, readConcernArgs, &attr);
+            _transactionInfoForLog(
+                opCtx, lockStats, terminationCause, apiParameters, readConcernArgs, &attr);
             LOGV2_OPTIONS(51802, {logv2::LogComponent::kTransaction}, "transaction", attr);
         }
     }
@@ -2326,7 +2362,8 @@ UpdateRequest TransactionParticipant::Participant::_makeUpdateRequest(
     auto updateRequest = UpdateRequest();
     updateRequest.setNamespaceString(NamespaceString::kSessionTransactionsTableNamespace);
 
-    updateRequest.setUpdateModification(sessionTxnRecord.toBSON());
+    updateRequest.setUpdateModification(
+        write_ops::UpdateModification::parseFromClassicUpdate(sessionTxnRecord.toBSON()));
     updateRequest.setQuery(BSON(SessionTxnRecord::kSessionIdFieldName << _sessionId().toBSON()));
     updateRequest.setUpsert(true);
 

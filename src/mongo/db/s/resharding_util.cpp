@@ -27,17 +27,71 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/document_source_lookup.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/s/resharding_util.h"
+#include "mongo/db/storage/write_unit_of_work.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/async_requests_sender.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/request_types/flush_routing_table_cache_updates_gen.h"
 
 namespace mongo {
+
+void tellShardsToRefresh(OperationContext* opCtx,
+                         const std::vector<ShardId>& shardIds,
+                         const NamespaceString& nss,
+                         std::shared_ptr<executor::TaskExecutor> executor) {
+    auto cmd = _flushRoutingTableCacheUpdatesWithWriteConcern(nss);
+    cmd.setSyncFromConfig(true);
+    cmd.setDbName(nss.db());
+    auto cmdObj =
+        cmd.toBSON(BSON(WriteConcernOptions::kWriteConcernField << WriteConcernOptions::Majority));
+
+    std::vector<AsyncRequestsSender::Request> requests;
+    for (const auto& shardId : shardIds) {
+        requests.emplace_back(shardId, cmdObj);
+    }
+
+    if (!requests.empty()) {
+        AsyncRequestsSender ars(opCtx,
+                                executor,
+                                "admin",
+                                requests,
+                                ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                Shard::RetryPolicy::kIdempotent);
+
+        while (!ars.done()) {
+            // Retrieve the responses and throw at the first failure.
+            auto response = ars.next();
+
+            auto generateErrorContext = [&]() -> std::string {
+                return str::stream()
+                    << "Unable to _flushRoutingTableCacheUpdatesWithWriteConcern for namespace "
+                    << nss.ns() << " on " << response.shardId;
+            };
+
+            auto shardResponse =
+                uassertStatusOKWithContext(std::move(response.swResponse), generateErrorContext());
+
+            auto status = getStatusFromCommandResult(shardResponse.data);
+            uassertStatusOKWithContext(status, generateErrorContext());
+
+            auto wcStatus = getWriteConcernStatusFromCommandResult(shardResponse.data);
+            uassertStatusOKWithContext(wcStatus, generateErrorContext());
+        }
+    }
+}
 
 void checkForHolesAndOverlapsInChunks(std::vector<ReshardedChunk>& chunks,
                                       const KeyPattern& keyPattern) {
@@ -114,12 +168,13 @@ void validateZones(const std::vector<mongo::BSONObj>& zones,
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter> createAggForReshardingOplogBuffer(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, const BSONObj& resumeToken) {
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const boost::optional<ReshardingDonorOplogId>& resumeToken) {
     std::list<boost::intrusive_ptr<DocumentSource>> stages;
 
-    if (!resumeToken.isEmpty()) {
-        stages.emplace_back(
-            DocumentSourceMatch::create(BSON("_id" << BSON("$gt" << resumeToken)), expCtx));
+    if (resumeToken) {
+        stages.emplace_back(DocumentSourceMatch::create(
+            BSON("_id" << BSON("$gt" << resumeToken->toBSON())), expCtx));
     }
 
     stages.emplace_back(DocumentSourceSort::create(expCtx, BSON("_id" << 1)));
@@ -149,6 +204,50 @@ std::unique_ptr<Pipeline, PipelineDeleter> createAggForReshardingOplogBuffer(
     stages.emplace_back(DocumentSourceLookUp::createFromBson(lookupBSON.firstElement(), expCtx));
 
     return Pipeline::create(std::move(stages), expCtx);
+}
+
+void createSlimOplogView(OperationContext* opCtx, Database* db) {
+    writeConflictRetry(
+        opCtx, "createReshardingOplog", "local.system.resharding.slimOplogForGraphLookup", [&] {
+            {
+                // Create 'system.views' in a separate WUOW if it does not exist.
+                WriteUnitOfWork wuow(opCtx);
+                const Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+                    opCtx, NamespaceString(db->getSystemViewsName()));
+                if (!coll) {
+                    coll = db->createCollection(opCtx, NamespaceString(db->getSystemViewsName()));
+                }
+                invariant(coll);
+                wuow.commit();
+            }
+
+            // Resharding uses the `prevOpTime` to link oplog related entries via a
+            // $graphLookup. Large transactions and prepared transaction use prevOpTime to identify
+            // earlier oplog entries from the same transaction. Retryable writes (identified via the
+            // presence of `stmtId`) use prevOpTime to identify earlier run statements from the same
+            // retryable write.  This view will unlink oplog entries from the same retryable write
+            // by zeroing out their `prevOpTime`.
+            CollectionOptions options;
+            options.viewOn = NamespaceString::kRsOplogNamespace.coll().toString();
+            options.pipeline = BSON_ARRAY(BSON(
+                "$project" << BSON(
+                    "_id"
+                    << "$ts"
+                    << "op" << 1 << "o" << BSON("applyOps" << BSON("ui" << 1 << "reshardDest" << 1))
+                    << "ts" << 1 << "prevOpTime.ts"
+                    << BSON("$cond" << BSON("if" << BSON("$eq" << BSON_ARRAY(BSON("$type"
+                                                                                  << "$stmtId")
+                                                                             << "missing"))
+                                                 << "then"
+                                                 << "$prevOpTime.ts"
+                                                 << "else" << Timestamp::min())))));
+            WriteUnitOfWork wuow(opCtx);
+            uassertStatusOK(
+                db->createView(opCtx,
+                               NamespaceString("local.system.resharding.slimOplogForGraphLookup"),
+                               options));
+            wuow.commit();
+        });
 }
 
 }  // namespace mongo

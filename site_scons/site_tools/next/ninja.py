@@ -207,9 +207,24 @@ def generate_depfile(env, node, dependencies):
     """
     Ninja tool function for writing a depfile. The depfile should include
     the node path followed by all the dependent files in a makefile format.
+
+    dependencies arg can be a list or a subst generator which returns a list.
     """
+
     depfile = os.path.join(get_path(env['NINJA_BUILDDIR']), str(node) + '.depfile')
-    depfile_contents = str(node) + ": " + ' '.join(sorted(dependencies))
+
+    # subst_list will take in either a raw list or a subst callable which generates
+    # a list, and return a list of CmdStringHolders which can be converted into raw strings.
+    # If a raw list was passed in, then scons_list will make a list of lists from the original
+    # values and even subst items in the list if they are substitutable. Flatten will flatten
+    # the list in that case, to ensure for either input we have a list of CmdStringHolders.
+    deps_list = env.Flatten(env.subst_list(dependencies))
+
+    # Now that we have the deps in a list as CmdStringHolders, we can convert them into raw strings
+    # and make sure to escape the strings to handle spaces in paths. We also will sort the result
+    # keep the order of the list consistent.
+    escaped_depends = sorted([dep.escape(env.get("ESCAPE", lambda x: x)) for dep in deps_list])
+    depfile_contents = str(node) + ": " + ' '.join(escaped_depends)
 
     need_rewrite = False
     try:
@@ -786,14 +801,9 @@ class NinjaState:
         generate_depfile(
             self.env,
             ninja_file_path,
-            [self.env.File("#SConstruct").path] + glob("src/**/SConscript", recursive=True)
+            self.env['NINJA_REGENERATE_DEPS']
         )
 
-        # TODO: We're working on getting an API into SCons that will
-        # allow us to query the actual SConscripts used. Right now
-        # this glob method has deficiencies like skipping
-        # jstests/SConscript and being specific to the MongoDB
-        # repository layout.
         ninja.build(
             ninja_file_path,
             rule="REGENERATE",
@@ -986,7 +996,7 @@ def gen_get_response_file_command(env, rule, tool, tool_is_dynamic=False):
         variables[rule] = cmd
         if use_command_env:
             variables["env"] = get_command_env(env)
-        return rule, variables
+        return rule, variables, [tool_command]
 
     return get_response_file_command
 
@@ -1016,13 +1026,21 @@ def generate_command(env, node, action, targets, sources, executor=None):
     return cmd.replace("$", "$$")
 
 
-def get_shell_command(env, node, action, targets, sources, executor=None):
+def get_generic_shell_command(env, node, action, targets, sources, executor=None):
     return (
         "CMD",
         {
             "cmd": generate_command(env, node, action, targets, sources, executor=None),
             "env": get_command_env(env),
         },
+        # Since this function is a rule mapping provider, it must return a list of dependencies,
+        # and usually this would be the path to a tool, such as a compiler, used for this rule.
+        # However this function is to generic to be able to reliably extract such deps
+        # from the command, so we return a placeholder empty list. It should be noted that
+        # generally this function will not be used soley and is more like a template to generate
+        # the basics for a custom provider which may have more specific options for a provier
+        # function for a custom NinjaRuleMapping.
+        []
     )
 
 
@@ -1058,12 +1076,12 @@ def get_command(env, node, action):  # pylint: disable=too-many-branches
     if not comstr:
         return None
 
-    provider = __NINJA_RULE_MAPPING.get(comstr, get_shell_command)
-    rule, variables = provider(sub_env, node, action, tlist, slist, executor=executor)
+    provider = __NINJA_RULE_MAPPING.get(comstr, get_generic_shell_command)
+    rule, variables, provider_deps = provider(sub_env, node, action, tlist, slist, executor=executor)
 
     # Get the dependencies for all targets
     implicit = list({dep for tgt in tlist for dep in get_dependencies(tgt)})
-
+    implicit.extend(provider_deps)
     ninja_build = {
         "order_only": get_order_only(node),
         "outputs": get_outputs(node),
@@ -1126,7 +1144,7 @@ def register_custom_handler(env, name, handler):
 
 
 def register_custom_rule_mapping(env, pre_subst_string, rule):
-    """Register a custom handler for SCons function actions."""
+    """Register a function to call for a given rule."""
     global __NINJA_RULE_MAPPING
     __NINJA_RULE_MAPPING[pre_subst_string] = rule
 
@@ -1139,7 +1157,7 @@ def register_custom_rule(env, rule, command, description="", deps=None, pool=Non
     }
 
     if use_depfile:
-        rule_obj["depfile"] = os.path.join(get_path(env['NINJA_BUILDDIR']),'$out.depfile')
+        rule_obj["depfile"] = os.path.join(get_path(env['NINJA_BUILDDIR']), '$out.depfile')
 
     if deps is not None:
         rule_obj["deps"] = deps
@@ -1315,6 +1333,14 @@ def generate(env):
     env.AlwaysBuild(ninja_file)
     env.Alias("$NINJA_ALIAS_NAME", ninja_file)
 
+    # TODO: API for getting the SConscripts programmatically
+    # exists upstream: https://github.com/SCons/scons/issues/3625
+    def ninja_generate_deps(env):
+        return sorted([env.File("#SConstruct").path] + glob("**/SConscript", recursive=True))
+    env['_NINJA_REGENERATE_DEPS_FUNC'] = ninja_generate_deps
+
+    env['NINJA_REGENERATE_DEPS'] = env.get('NINJA_REGENERATE_DEPS', '${_NINJA_REGENERATE_DEPS_FUNC(__env__)}')
+
     # This adds the required flags such that the generated compile
     # commands will create depfiles as appropriate in the Ninja file.
     if env["PLATFORM"] == "win32":
@@ -1326,7 +1352,7 @@ def generate(env):
 
     # Provide a way for custom rule authors to easily access command
     # generation.
-    env.AddMethod(get_shell_command, "NinjaGetShellCommand")
+    env.AddMethod(get_generic_shell_command, "NinjaGetGenericShellCommand")
     env.AddMethod(gen_get_response_file_command, "NinjaGenResponseFileProvider")
 
     # Provides a way for users to handle custom FunctionActions they

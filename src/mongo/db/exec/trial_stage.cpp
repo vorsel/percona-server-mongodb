@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/trial_stage.h"
@@ -40,7 +38,6 @@
 #include "mongo/db/exec/or.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -199,15 +196,6 @@ void TrialStage::doReattachToOperationContext() {
     }
     if (_queuedData) {
         _queuedData->reattachToOperationContext(opCtx());
-    }
-}
-
-void TrialStage::doDispose() {
-    if (_backupPlan) {
-        _backupPlan->dispose(opCtx());
-    }
-    if (_queuedData) {
-        _queuedData->dispose(opCtx());
     }
 }
 

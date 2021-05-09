@@ -28,13 +28,13 @@
  */
 
 //
-// This is a grammar file to describe the syntax of the aggregation pipeline language. It is 
+// This is a grammar file to describe the syntax of the aggregation pipeline language. It is
 // ingested by GNU Bison (https://www.gnu.org/software/bison/) to generate native C++ parser code
 // based on the rules provided here.
-// 
-// To manually generate the parser files, run 
+//
+// To manually generate the parser files, run
 // 'bison pipeline_grammar.yy -o pipeline_parser_gen.cpp'.
-// 
+//
 %require "3.5"
 %language "c++"
 
@@ -80,8 +80,9 @@
 }
 
 // Cpp only.
-%code { 
+%code {
     #include "mongo/db/cst/bson_lexer.h"
+    #include "mongo/db/cst/c_node_disambiguation.h"
     #include "mongo/db/cst/c_node_validation.h"
     #include "mongo/db/cst/key_fieldname.h"
     #include "mongo/platform/decimal128.h"
@@ -95,7 +96,7 @@
         }
     }  // namespace mongo
 
-    // Default location for actions, called each time a rule is matched but before the action is 
+    // Default location for actions, called each time a rule is matched but before the action is
     // run. Also called when bison encounters a syntax ambiguity, which should not be relevant for
     // mongo.
     #define YYLLOC_DEFAULT(newPos, rhsPositions, nRhs)
@@ -111,9 +112,9 @@
 //
 
 // If adding to this list, keep in alphabetical order since some rules expect a strict sorted order
-// of tokens based on their enum value. The appended strings are used to generate user-friendly 
+// of tokens based on their enum value. The appended strings are used to generate user-friendly
 // error messages.
-%token 
+%token
     ABS
     ADD
     AND
@@ -143,8 +144,12 @@
     CONVERT
     DATE_FROM_STRING
     DATE_TO_STRING
+    DECIMAL_NEGATIVE_ONE "-1 (decimal)"
+    DECIMAL_ONE "1 (decimal)"
     DECIMAL_ZERO "zero (decimal)"
     DIVIDE
+    DOUBLE_NEGATIVE_ONE "-1 (double)"
+    DOUBLE_ONE "1 (double)"
     DOUBLE_ZERO "zero (double)"
     END_ARRAY "end of array"
     END_OBJECT "end of object"
@@ -156,21 +161,27 @@
     ID
     INDEX_OF_BYTES
     INDEX_OF_CP
+    INT_NEGATIVE_ONE "-1 (int)"
+    INT_ONE "1 (int)"
     INT_ZERO "zero (int)"
     LITERAL
     LN
     LOG
     LOGTEN
+    LONG_NEGATIVE_ONE "-1 (long)"
+    LONG_ONE "1 (long)"
     LONG_ZERO "zero (long)"
     LT
     LTE
     LTRIM
+    META
     MOD
     MULTIPLY
     NE
     NOT
     OR
     POW
+    RAND_VAL "randVal"
     REGEX_FIND
     REGEX_FIND_ALL
     REGEX_MATCH
@@ -195,6 +206,7 @@
     SUBSTR_BYTES
     SUBSTR_CP
     SUBTRACT
+    TEXT_SCORE "textScore"
     TO_BOOL
     TO_DATE
     TO_DECIMAL
@@ -224,14 +236,17 @@
 %token <BSONCode> JAVASCRIPT "Code"
 %token <BSONSymbol> SYMBOL "Symbol"
 %token <BSONCodeWScope> JAVASCRIPT_W_SCOPE "CodeWScope"
-%token <int> INT_NON_ZERO "non-zero integer"
-%token <long long> LONG_NON_ZERO "non-zero long"
-%token <double> DOUBLE_NON_ZERO "non-zero double"
-%token <Decimal128> DECIMAL_NON_ZERO "non-zero decimal"
+%token <int> INT_OTHER "arbitrary integer"
+%token <long long> LONG_OTHER "arbitrary long"
+%token <double> DOUBLE_OTHER "arbitrary double"
+%token <Decimal128> DECIMAL_OTHER "arbitrary decimal"
 %token <Timestamp> TIMESTAMP "Timestamp"
 %token <UserMinKey> MIN_KEY "minKey"
 %token <UserMaxKey> MAX_KEY "maxKey"
-%token START_PIPELINE START_MATCH
+%token <std::string> DOLLAR_STRING "$-prefixed string"
+%token <std::string> DOLLAR_DOLLAR_STRING "$$-prefixed string"
+%token <std::string> DOLLAR_PREF_FIELDNAME "$-prefixed fieldname"
+%token START_PIPELINE START_MATCH START_SORT
 
 //
 // Semantic values (aka the C++ types produced by the actions).
@@ -244,12 +259,12 @@
 %nterm <std::pair<CNode::Fieldname, CNode>> projectField expressionField valueField filterField
 
 // Literals.
-%nterm <CNode> dbPointer javascript symbol javascriptWScope int timestamp long double decimal 
-%nterm <CNode> minKey maxKey value string binary undefined objectId bool date null regex
-%nterm <CNode> simpleValue compoundValue valueArray valueObject valueFields
+%nterm <CNode> dbPointer javascript symbol javascriptWScope int timestamp long double decimal
+%nterm <CNode> minKey maxKey value string fieldPath binary undefined objectId bool date null regex
+%nterm <CNode> simpleValue compoundValue valueArray valueObject valueFields variable
 
 // Pipeline stages and related non-terminals.
-%nterm <CNode> stageList stage inhibitOptimization unionWith skip limit project sample
+%nterm <CNode> pipeline stageList stage inhibitOptimization unionWith skip limit project sample
 %nterm <CNode> projectFields projection num
 
 // Aggregate expressions
@@ -257,7 +272,7 @@
 %nterm <CNode> expressionFields maths add atan2 boolExps and or not literalEscapes const literal
 %nterm <CNode> stringExps concat dateFromString dateToString indexOfBytes indexOfCP
 %nterm <CNode> ltrim regexFind regexFindAll regexMatch regexArgs replaceOne replaceAll rtrim
-%nterm <CNode> split strLenBytes strLenCP strcasecmp substr substrBytes substrCP 
+%nterm <CNode> split strLenBytes strLenCP strcasecmp substr substrBytes substrCP
 %nterm <CNode> toLower toUpper trim
 %nterm <CNode> compExprs cmp eq gt gte lt lte ne
 %nterm <CNode> typeExpression convert toBool toDate toDecimal toDouble toInt toLong
@@ -268,34 +283,45 @@
 %nterm <std::vector<CNode>> expressions values exprZeroToTwo
 %nterm <CNode> matchExpression filterFields filterVal
 
+// Sort related rules
+%nterm <CNode> sortSpecs specList metaSort oneOrNegOne metaSortKeyword
+%nterm <std::pair<CNode::Fieldname, CNode>> sortSpec
+
 %start start;
 //
 // Grammar rules
 //
 %%
 
-start: 
-    START_PIPELINE pipeline
+start:
+    START_PIPELINE pipeline {
+        invariant(cst);
+        *cst = $pipeline;
+    }
     | START_MATCH matchExpression {
-        *cst = CNode{$matchExpression};
+        invariant(cst);
+        *cst = $matchExpression;
+    }
+    | START_SORT sortSpecs {
+        *cst = CNode{$sortSpecs};
     }
 ;
 
 // Entry point to pipeline parsing.
 pipeline:
     START_ARRAY stageList END_ARRAY {
-        *cst = $stageList;
+        $$ = $stageList;
     }
 ;
 
 stageList:
     %empty { }
-    | START_OBJECT stage END_OBJECT stageList[stagesArg] { 
+    | START_OBJECT stage END_OBJECT stageList[stagesArg] {
         $$ = CNode{CNode::ArrayChildren{$stage}};
     }
 ;
 
-// Special rule to hint to the lexer that the next set of tokens should be sorted. Note that the 
+// Special rule to hint to the lexer that the next set of tokens should be sorted. Note that the
 // sort order is not lexicographical, but rather based on the enum generated from the %token list
 // above.
 START_ORDERED_OBJECT: { lexer.sortObjTokens(); } START_OBJECT;
@@ -305,7 +331,7 @@ stage:
 ;
 
 sample: STAGE_SAMPLE START_OBJECT ARG_SIZE num END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{std::pair{KeyFieldname::sample, 
+        $$ = CNode{CNode::ObjectChildren{std::pair{KeyFieldname::sample,
                 CNode{CNode::ObjectChildren{
                     {KeyFieldname::sizeArg, $num},
                 }}
@@ -314,7 +340,7 @@ sample: STAGE_SAMPLE START_OBJECT ARG_SIZE num END_OBJECT {
 ;
 
 inhibitOptimization:
-    STAGE_INHIBIT_OPTIMIZATION START_OBJECT END_OBJECT { 
+    STAGE_INHIBIT_OPTIMIZATION START_OBJECT END_OBJECT {
         $$ = CNode{CNode::ObjectChildren{std::pair{KeyFieldname::inhibitOptimization, CNode::noopLeaf()}}};
     }
 ;
@@ -390,25 +416,49 @@ projection:
     | javascript
     | symbol
     | javascriptWScope
-    | INT_NON_ZERO {
+    | INT_ONE {
+        $$ = CNode{NonZeroKey{1}};
+    }
+    | INT_NEGATIVE_ONE {
+        $$ = CNode{NonZeroKey{-1}};
+    }
+    | INT_OTHER {
         $$ = CNode{NonZeroKey{$1}};
     }
     | INT_ZERO {
         $$ = CNode{KeyValue::intZeroKey};
     }
-    | LONG_NON_ZERO {
+    | LONG_ONE {
+        $$ = CNode{NonZeroKey{1ll}};
+    }
+    | LONG_NEGATIVE_ONE {
+        $$ = CNode{NonZeroKey{-1ll}};
+    }
+    | LONG_OTHER {
         $$ = CNode{NonZeroKey{$1}};
     }
     | LONG_ZERO {
         $$ = CNode{KeyValue::longZeroKey};
     }
-    | DOUBLE_NON_ZERO {
+    | DOUBLE_ONE {
+        $$ = CNode{NonZeroKey{1.0}};
+    }
+    | DOUBLE_NEGATIVE_ONE {
+        $$ = CNode{NonZeroKey{-1.0}};
+    }
+    | DOUBLE_OTHER {
         $$ = CNode{NonZeroKey{$1}};
     }
     | DOUBLE_ZERO {
         $$ = CNode{KeyValue::doubleZeroKey};
     }
-    | DECIMAL_NON_ZERO {
+    | DECIMAL_ONE {
+        $$ = CNode{NonZeroKey{1.0}};
+    }
+    | DECIMAL_NEGATIVE_ONE {
+        $$ = CNode{NonZeroKey{-1.0}};
+    }
+    | DECIMAL_OTHER {
         $$ = CNode{NonZeroKey{$1}};
     }
     | DECIMAL_ZERO {
@@ -423,7 +473,12 @@ projection:
     | timestamp
     | minKey
     | maxKey
-    | compoundExpression
+    | compoundExpression {
+        $$ = c_node_disambiguation::disambiguateCompoundProjection($1);
+        if (stdx::holds_alternative<CompoundInconsistentKey>($$.payload))
+            // TODO SERVER-50498: error() instead of uasserting
+            uasserted(ErrorCodes::FailedToParse, "object project field cannot contain both inclusion and exclusion indicators");
+    }
 ;
 
 projectionFieldname:
@@ -432,7 +487,7 @@ projectionFieldname:
 
 matchExpression:
     START_OBJECT filterFields END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{std::pair{KeyFieldname::match, $filterFields}}};
+        $$ = $filterFields;
     }
 ;
 
@@ -446,11 +501,7 @@ filterFields:
     }
 ;
 
-filterField:
-    ID filterVal {
-        $$ = {KeyFieldname::id, $filterVal};
-    }
-    | filterFieldname filterVal {
+filterField: filterFieldname filterVal {
         $$ = {$filterFieldname, $filterVal};
     }
 ;
@@ -459,8 +510,9 @@ filterVal:
     value
 ;
 
+// Filter predicates are *not* allowed over $-prefixed field names.
 filterFieldname:
-    invariableUserFieldname | stageAsUserFieldname | argAsUserFieldname | aggExprAsUserFieldname
+    idAsUserFieldname | invariableUserFieldname | argAsUserFieldname
 ;
 
 invariableUserFieldname:
@@ -684,6 +736,9 @@ aggExprAsUserFieldname:
     | LTRIM {
         $$ = UserFieldname{"$ltrim"};
     }
+    | META {
+        $$ = UserFieldname{"$meta"};
+    }
     | REGEX_FIND {
         $$ = UserFieldname{"$regexFind"};
     }
@@ -734,13 +789,38 @@ aggExprAsUserFieldname:
     }
 ;
 
-// Rules for literal non-terminals. 
+// Rules for literal non-terminals.
 string:
     STRING {
         $$ = CNode{UserString{$1}};
     }
+    // Here we need to list all keys in value BSON positions so they can be converted back to string
+    // in contexts where they're not special. It's laborious but this is the perennial Bison way.
+    | RAND_VAL {
+        $$ = CNode{UserString{"randVal"}};
+    }
+    | TEXT_SCORE {
+        $$ = CNode{UserString{"textScore"}};
+    }
 ;
 
+fieldPath:
+    DOLLAR_STRING {
+        std::string str = $1;
+        if (str.size() == 1) {
+            error(@1, "'$' by iteslf is not a valid FieldPath");
+        }
+        $$ = CNode{UserFieldPath{str.substr(1), false}};
+    }
+variable:
+    DOLLAR_DOLLAR_STRING {
+        std::string str = $1.substr(2);
+        auto status = c_node_validation::validateVariableName(str);
+        if (!status.isOK()) {
+            error(@1, status.reason());
+        }
+        $$ = CNode{UserFieldPath{str, true}};
+    }
 binary:
     BINARY {
         $$ = CNode{UserBinary{$1}};
@@ -820,38 +900,62 @@ maxKey:
 ;
 
 int:
-    INT_NON_ZERO {
+    INT_OTHER {
         $$ = CNode{UserInt{$1}};
     }
     | INT_ZERO {
         $$ = CNode{UserInt{0}};
     }
+    | INT_ONE {
+        $$ = CNode{UserInt{1}};
+    }
+    | INT_NEGATIVE_ONE {
+        $$ = CNode{UserInt{-1}};
+    }
 ;
 
 long:
-    LONG_NON_ZERO {
+    LONG_OTHER {
         $$ = CNode{UserLong{$1}};
     }
     | LONG_ZERO {
         $$ = CNode{UserLong{0ll}};
     }
+    | LONG_ONE {
+        $$ = CNode{UserLong{1ll}};
+    }
+    | LONG_NEGATIVE_ONE {
+        $$ = CNode{UserLong{-1ll}};
+    }
 ;
 
 double:
-    DOUBLE_NON_ZERO {
+    DOUBLE_OTHER {
         $$ = CNode{UserDouble{$1}};
     }
     | DOUBLE_ZERO {
         $$ = CNode{UserDouble{0.0}};
     }
+    | DOUBLE_ONE {
+        $$ = CNode{UserDouble{1.0}};
+    }
+    | DOUBLE_NEGATIVE_ONE {
+        $$ = CNode{UserDouble{-1.0}};
+    }
 ;
 
 decimal:
-    DECIMAL_NON_ZERO {
+    DECIMAL_OTHER {
         $$ = CNode{UserDecimal{$1}};
     }
     | DECIMAL_ZERO {
         $$ = CNode{UserDecimal{0.0}};
+    }
+    | DECIMAL_ONE {
+        $$ = CNode{UserDecimal{1.0}};
+    }
+    | DECIMAL_NEGATIVE_ONE {
+        $$ = CNode{UserDecimal{-1.0}};
     }
 ;
 
@@ -866,6 +970,8 @@ bool:
 
 simpleValue:
     string
+    | fieldPath
+    | variable
     | binary
     | undefined
     | objectId
@@ -1085,7 +1191,7 @@ not:
 
 stringExps:
     concat | dateFromString | dateToString | indexOfBytes | indexOfCP | ltrim | regexFind
-    | regexFindAll | regexMatch | replaceOne | replaceAll | rtrim | split | strLenBytes | strLenCP 
+    | regexFindAll | regexMatch | replaceOne | replaceAll | rtrim | split | strLenBytes | strLenCP
     | strcasecmp | substr | substrBytes | substrCP | toLower | trim | toUpper
 ;
 
@@ -1118,7 +1224,7 @@ timezoneArg:
 ;
 
 dateFromString:
-    START_OBJECT DATE_FROM_STRING START_ORDERED_OBJECT ARG_DATE_STRING expression formatArg timezoneArg 
+    START_OBJECT DATE_FROM_STRING START_ORDERED_OBJECT ARG_DATE_STRING expression formatArg timezoneArg
             onErrorArg onNullArg END_OBJECT END_OBJECT {
         $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dateFromString, CNode{CNode::ObjectChildren{
                                          {KeyFieldname::dateStringArg, $expression},
@@ -1127,7 +1233,7 @@ dateFromString:
 ;
 
 dateToString:
-    START_OBJECT DATE_TO_STRING START_ORDERED_OBJECT ARG_DATE expression formatArg timezoneArg onNullArg 
+    START_OBJECT DATE_TO_STRING START_ORDERED_OBJECT ARG_DATE expression formatArg timezoneArg onNullArg
             END_OBJECT END_OBJECT {
         $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dateToString, CNode{CNode::ObjectChildren{
                                          {KeyFieldname::dateArg, $expression},
@@ -1136,7 +1242,7 @@ dateToString:
 ;
 
 exprZeroToTwo:
-    %empty { 
+    %empty {
         $$ = CNode::ArrayChildren{};
     }
     | expression {
@@ -1148,9 +1254,9 @@ exprZeroToTwo:
 ;
 
 indexOfBytes:
-    START_OBJECT INDEX_OF_BYTES START_ARRAY expression[expr1] expression[expr2] exprZeroToTwo 
+    START_OBJECT INDEX_OF_BYTES START_ARRAY expression[expr1] expression[expr2] exprZeroToTwo
             END_ARRAY END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::indexOfBytes, 
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::indexOfBytes,
                     CNode{CNode::ArrayChildren{$expr1, $expr2}}}}};
         auto&& others = $exprZeroToTwo;
         auto&& array = $$.objectChildren()[0].second.arrayChildren();
@@ -1159,9 +1265,9 @@ indexOfBytes:
 ;
 
 indexOfCP:
-    START_OBJECT INDEX_OF_CP START_ARRAY expression[expr1] expression[expr2] exprZeroToTwo 
+    START_OBJECT INDEX_OF_CP START_ARRAY expression[expr1] expression[expr2] exprZeroToTwo
             END_ARRAY END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::indexOfCP, 
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::indexOfCP,
                     CNode{CNode::ArrayChildren{$expr1, $expr2}}}}};
         auto&& others = $exprZeroToTwo;
         auto&& array = $$.objectChildren()[0].second.arrayChildren();
@@ -1279,33 +1385,33 @@ strLenCP:
 ;
 
 strcasecmp:
-    START_OBJECT STR_CASE_CMP START_ARRAY expression[expr1] expression[expr2] 
+    START_OBJECT STR_CASE_CMP START_ARRAY expression[expr1] expression[expr2]
             END_ARRAY END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::strcasecmp, 
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::strcasecmp,
                     CNode{CNode::ArrayChildren{$expr1, $expr2}}}}};
     }
 ;
 
 substr:
-    START_OBJECT SUBSTR START_ARRAY expression[expr1] expression[expr2] 
+    START_OBJECT SUBSTR START_ARRAY expression[expr1] expression[expr2]
             expression[expr3] END_ARRAY END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::substr, 
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::substr,
                     CNode{CNode::ArrayChildren{$expr1, $expr2, $expr3}}}}};
     }
 ;
 
 substrBytes:
-    START_OBJECT SUBSTR_BYTES START_ARRAY expression[expr1] expression[expr2] 
+    START_OBJECT SUBSTR_BYTES START_ARRAY expression[expr1] expression[expr2]
             expression[expr3] END_ARRAY END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::substrBytes, 
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::substrBytes,
                     CNode{CNode::ArrayChildren{$expr1, $expr2, $expr3}}}}};
     }
 ;
 
 substrCP:
-    START_OBJECT SUBSTR_CP START_ARRAY expression[expr1] expression[expr2] 
+    START_OBJECT SUBSTR_CP START_ARRAY expression[expr1] expression[expr2]
             expression[expr3] END_ARRAY END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::substrCP, 
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::substrCP,
                     CNode{CNode::ArrayChildren{$expr1, $expr2, $expr3}}}}};
     }
 ;
@@ -1319,6 +1425,70 @@ toLower:
 toUpper:
     START_OBJECT TO_UPPER expression END_OBJECT {
         $$ = CNode{CNode::ObjectChildren{{KeyFieldname::toUpper, $expression}}};
+    }
+;
+
+metaSortKeyword:
+    RAND_VAL {
+        $$ = CNode{KeyValue::randVal};
+    }
+    | TEXT_SCORE {
+        $$ = CNode{KeyValue::textScore};
+    }
+;
+
+metaSort:
+    START_OBJECT META metaSortKeyword END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::meta, $metaSortKeyword}}};
+}
+;
+
+sortSpecs:
+    START_OBJECT specList END_OBJECT {
+        $$ = $2;
+}
+
+specList:
+    %empty {
+        $$ = CNode::noopLeaf();
+    }
+    | specList[sortArg] sortSpec {
+        $$ = $sortArg;
+        $$.objectChildren().emplace_back($sortSpec);
+    }
+;
+
+oneOrNegOne:
+    INT_ONE {
+        $$ = CNode{KeyValue::intOneKey};
+    }
+    | INT_NEGATIVE_ONE {
+        $$ = CNode{KeyValue::intNegOneKey};
+    }
+    | LONG_ONE {
+        $$ = CNode{KeyValue::longOneKey};
+    }
+    | LONG_NEGATIVE_ONE {
+        $$ = CNode{KeyValue::longNegOneKey};
+    }
+    | DOUBLE_ONE {
+        $$ = CNode{KeyValue::doubleOneKey};
+    }
+    | DOUBLE_NEGATIVE_ONE {
+        $$ = CNode{KeyValue::doubleNegOneKey};
+    }
+    | DECIMAL_ONE {
+        $$ = CNode{KeyValue::decimalOneKey};
+    }
+    | DECIMAL_NEGATIVE_ONE {
+        $$ = CNode{KeyValue::decimalNegOneKey};
+    }
+
+sortSpec:
+    valueFieldname metaSort {
+        $$ = {$1, $2};
+    } | valueFieldname oneOrNegOne {
+        $$ = {$1, $2};
     }
 ;
 

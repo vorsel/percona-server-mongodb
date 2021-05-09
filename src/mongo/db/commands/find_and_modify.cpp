@@ -58,6 +58,7 @@
 #include "mongo/db/ops/parsed_delete.h"
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/update_request.h"
+#include "mongo/db/ops/write_ops_exec.h"
 #include "mongo/db/ops/write_ops_retryability.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
@@ -165,22 +166,24 @@ void appendCommandResponse(const PlanExecutor* exec,
                            const boost::optional<BSONObj>& value,
                            BSONObjBuilder* result) {
     if (isRemove) {
-        find_and_modify::serializeRemove(DeleteStage::getNumDeleted(*exec), value, result);
+        find_and_modify::serializeRemove(value, result);
     } else {
-        const auto updateStats = UpdateStage::getUpdateStats(exec);
+        const auto updateResult = exec->getUpdateResult();
 
         // Note we have to use the objInserted from the stats here, rather than 'value' because the
         // _id field could have been excluded by a projection.
-        find_and_modify::serializeUpsert(updateStats->inserted ? 1 : updateStats->nMatched,
-                                         value,
-                                         updateStats->nMatched > 0,
-                                         updateStats->objInserted,
-                                         result);
+        find_and_modify::serializeUpsert(
+            !updateResult.upsertedId.isEmpty() ? 1 : updateResult.numMatched,
+            value,
+            updateResult.numMatched > 0,
+            updateResult.upsertedId.isEmpty() ? BSONElement{}
+                                              : updateResult.upsertedId.firstElement(),
+            result);
     }
 }
 
 void assertCanWrite(OperationContext* opCtx, const NamespaceString& nsString) {
-    uassert(ErrorCodes::NotMaster,
+    uassert(ErrorCodes::NotWritablePrimary,
             str::stream() << "Not primary while running findAndModify command on collection "
                           << nsString.ns(),
             repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, nsString));
@@ -200,7 +203,7 @@ void recordStatsForTopCommand(OperationContext* opCtx) {
                 curOp->getReadWriteType());
 }
 
-void checkIfTransactionOnCappedColl(Collection* coll, bool inTransaction) {
+void checkIfTransactionOnCappedColl(const Collection* coll, bool inTransaction) {
     if (coll && coll->isCapped()) {
         uassert(
             ErrorCodes::OperationNotSupportedInTransaction,
@@ -282,7 +285,7 @@ public:
 
             CollectionShardingState::get(opCtx, nsString)->checkShardVersionOrThrow(opCtx);
 
-            Collection* const collection = autoColl.getCollection();
+            const Collection* const collection = autoColl.getCollection();
 
             const auto exec =
                 uassertStatusOK(getExecutorDelete(opDebug, collection, &parsedDelete, verbosity));
@@ -307,7 +310,7 @@ public:
 
             CollectionShardingState::get(opCtx, nsString)->checkShardVersionOrThrow(opCtx);
 
-            Collection* const collection = autoColl.getCollection();
+            const Collection* const collection = autoColl.getCollection();
             const auto exec =
                 uassertStatusOK(getExecutorUpdate(opDebug, collection, &parsedUpdate, verbosity));
 
@@ -414,7 +417,7 @@ public:
                             uassertStatusOK(parsedUpdate.parseQueryToCQ());
                         }
 
-                        if (!UpdateStage::shouldRetryDuplicateKeyException(
+                        if (!write_ops_exec::shouldRetryDuplicateKeyException(
                                 parsedUpdate, *ex.extraInfo<DuplicateKeyErrorInfo>())) {
                             throw;
                         }
@@ -465,7 +468,7 @@ public:
 
         assertCanWrite(opCtx, nsString);
 
-        Collection* const collection = autoColl.getCollection();
+        const Collection* const collection = autoColl.getCollection();
         checkIfTransactionOnCappedColl(collection, inTransaction);
 
         const auto exec = uassertStatusOK(
@@ -489,9 +492,9 @@ public:
         opDebug->setPlanSummaryMetrics(summaryStats);
 
         // Fill out OpDebug with the number of deleted docs.
-        opDebug->additiveMetrics.ndeleted = DeleteStage::getNumDeleted(*exec);
+        opDebug->additiveMetrics.ndeleted = docFound ? 1 : 0;
 
-        if (curOp->shouldDBProfile()) {
+        if (curOp->shouldDBProfile(opCtx)) {
             curOp->debug().execStats = exec->getStats();
         }
         recordStatsForTopCommand(opCtx);
@@ -521,7 +524,7 @@ public:
 
         assertCanWrite(opCtx, nsString);
 
-        Collection* collection = autoColl.getCollection();
+        const Collection* collection = autoColl.getCollection();
 
         // Create the collection if it does not exist when performing an upsert because the
         // update stage does not create its own collection
@@ -565,10 +568,10 @@ public:
         if (collection) {
             CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, collection, summaryStats);
         }
-        UpdateStage::recordUpdateStatsInOpDebug(UpdateStage::getUpdateStats(exec.get()), opDebug);
+        write_ops_exec::recordUpdateResultInOpDebug(exec->getUpdateResult(), opDebug);
         opDebug->setPlanSummaryMetrics(summaryStats);
 
-        if (curOp->shouldDBProfile()) {
+        if (curOp->shouldDBProfile(opCtx)) {
             curOp->debug().execStats = exec->getStats();
         }
         recordStatsForTopCommand(opCtx);

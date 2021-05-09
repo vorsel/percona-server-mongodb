@@ -109,7 +109,8 @@ public:
             return response;
         }());
 
-        future.default_timed_get().get();
+        const auto cm = future.default_timed_get();
+        ASSERT(cm->isSharded());
     }
 
 protected:

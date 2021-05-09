@@ -39,21 +39,40 @@ public:
     PlanYieldPolicySBE(YieldPolicy policy,
                        ClockSource* clockSource,
                        int yieldFrequency,
-                       Milliseconds yieldPeriod)
-        : PlanYieldPolicy(policy, clockSource, yieldFrequency, yieldPeriod) {
+                       Milliseconds yieldPeriod,
+                       std::function<void(OperationContext*)> duringAllYieldsFn)
+        : PlanYieldPolicy(policy, clockSource, yieldFrequency, yieldPeriod),
+          _duringAllYieldsFn(std::move(duringAllYieldsFn)) {
         uassert(4822879,
                 "WRITE_CONFLICT_RETRY_ONLY yield policy is not supported in SBE",
                 policy != YieldPolicy::WRITE_CONFLICT_RETRY_ONLY);
     }
 
-    void setRootStage(sbe::PlanStage* rootStage) {
-        _rootStage = rootStage;
+    /**
+     * Registers the tree rooted at 'plan' to yield, in addition to all other plans that have been
+     * previously registered with this yield policy.
+     */
+    void registerPlan(sbe::PlanStage* plan) {
+        _yieldingPlans.push_back(plan);
+    }
+
+    /**
+     * Clears the list of plans currently registered to yield.
+     */
+    void clearRegisteredPlans() {
+        _yieldingPlans.clear();
     }
 
 private:
     Status yield(OperationContext* opCtx, std::function<void()> whileYieldingFn = nullptr) override;
 
-    sbe::PlanStage* _rootStage = nullptr;
+    // A function provided on construction which gets called every time a yield is triggered. This
+    // is in contrast to the 'whileYieldFn'parameter to the 'yield()' method, which can be different
+    // on each yield. Both functions will get called as part of an SBE plan yielding.
+    std::function<void(OperationContext*)> _duringAllYieldsFn;
+
+    // The list of plans registered to yield when the configured policy triggers a yield.
+    std::vector<sbe::PlanStage*> _yieldingPlans;
 };
 
 }  // namespace mongo

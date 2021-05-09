@@ -96,6 +96,7 @@ public:
             nullptr,
             false,
             epoch,
+            boost::none,
             {ChunkType{kNss,
                        ChunkRange{BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)},
                        ChunkVersion(1, 0, epoch),
@@ -106,7 +107,11 @@ public:
         CollectionShardingRuntime::get(operationContext(), kNss)
             ->setFilteringMetadata(
                 operationContext(),
-                CollectionMetadata(ChunkManager(rt, boost::none), ShardId("dummyShardId")));
+                CollectionMetadata(ChunkManager(ShardId("dummyShardId"),
+                                                DatabaseVersion(UUID::gen(), 1),
+                                                makeStandaloneRoutingTableHistory(std::move(rt)),
+                                                boost::none),
+                                   ShardId("dummyShardId")));
     }
 
     UUID uuid() const {

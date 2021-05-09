@@ -44,6 +44,7 @@
 #include "mongo/db/exec/sort.h"
 #include "mongo/db/json.h"
 #include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/plan_executor_impl.h"
 #include "mongo/dbtests/dbtests.h"
 
 /**
@@ -75,7 +76,7 @@ public:
         _client.insert(ns(), obj);
     }
 
-    void getRecordIds(set<RecordId>* out, Collection* coll) {
+    void getRecordIds(set<RecordId>* out, const Collection* coll) {
         auto cursor = coll->getCursor(&_opCtx);
         while (auto record = cursor->next()) {
             out->insert(record->id);
@@ -85,7 +86,7 @@ public:
     /**
      * We feed a mix of (key, unowned, owned) data to the sort stage.
      */
-    void insertVarietyOfObjects(WorkingSet* ws, QueuedDataStage* ms, Collection* coll) {
+    void insertVarietyOfObjects(WorkingSet* ws, QueuedDataStage* ms, const Collection* coll) {
         set<RecordId> recordIds;
         getRecordIds(&recordIds, coll);
 
@@ -110,7 +111,7 @@ public:
      * which is owned by the caller.
      */
     unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutorWithSortStage(
-        Collection* coll) {
+        const Collection* coll) {
         // Build the mock scan stage which feeds the data.
         auto ws = std::make_unique<WorkingSet>();
         _workingSet = ws.get();
@@ -151,7 +152,7 @@ public:
      * If extAllowed is true, sorting will use use external sorting if available.
      * If limit is not zero, we limit the output of the sort stage to 'limit' results.
      */
-    void sortAndCheck(int direction, Collection* coll) {
+    void sortAndCheck(int direction, const Collection* coll) {
         auto ws = std::make_unique<WorkingSet>();
         auto queuedDataStage = std::make_unique<QueuedDataStage>(_expCtx.get(), ws.get());
 
@@ -258,7 +259,7 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
+        const Collection* coll =
             CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
@@ -281,7 +282,7 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
+        const Collection* coll =
             CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
@@ -313,7 +314,7 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
+        const Collection* coll =
             CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
@@ -339,7 +340,7 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
+        const Collection* coll =
             CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
@@ -354,7 +355,13 @@ public:
         getRecordIds(&recordIds, coll);
 
         auto exec = makePlanExecutorWithSortStage(coll);
-        SortStage* ss = static_cast<SortStageDefault*>(exec->getRootStage());
+
+        // This test is specifically for the classic PlanStage execution engine, so assert that we
+        // have the right kind of PlanExecutor.
+        auto execImpl = dynamic_cast<PlanExecutorImpl*>(exec.get());
+        ASSERT(execImpl);
+
+        SortStage* ss = static_cast<SortStageDefault*>(execImpl->getRootStage());
         SortKeyGeneratorStage* keyGenStage =
             static_cast<SortKeyGeneratorStage*>(ss->getChildren()[0].get());
         QueuedDataStage* queuedDataStage =
@@ -448,7 +455,7 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
+        const Collection* coll =
             CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);
@@ -463,7 +470,13 @@ public:
         getRecordIds(&recordIds, coll);
 
         auto exec = makePlanExecutorWithSortStage(coll);
-        SortStage* ss = static_cast<SortStageDefault*>(exec->getRootStage());
+
+        // This test is specifically for the classic PlanStage execution engine, so assert that we
+        // have the right kind of PlanExecutor.
+        auto execImpl = dynamic_cast<PlanExecutorImpl*>(exec.get());
+        ASSERT(execImpl);
+
+        SortStage* ss = static_cast<SortStageDefault*>(execImpl->getRootStage());
         SortKeyGeneratorStage* keyGenStage =
             static_cast<SortKeyGeneratorStage*>(ss->getChildren()[0].get());
         QueuedDataStage* queuedDataStage =
@@ -546,7 +559,7 @@ public:
     void run() {
         dbtests::WriteContextForTests ctx(&_opCtx, ns());
         Database* db = ctx.db();
-        Collection* coll =
+        const Collection* coll =
             CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss());
         if (!coll) {
             WriteUnitOfWork wuow(&_opCtx);

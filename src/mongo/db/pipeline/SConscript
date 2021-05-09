@@ -55,6 +55,15 @@ env.Library(
 )
 
 env.Library(
+    target='variable_validation',
+    source=[
+        "variable_validation.cpp",
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ]
+)
+env.Library(
     target='expression_context',
     source=[
         'expression.cpp',
@@ -80,10 +89,11 @@ env.Library(
         '$BUILD_DIR/mongo/util/summation',
         'aggregation_request',
         'dependencies',
+        'variable_validation',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/vector_clock',
         '$BUILD_DIR/mongo/db/mongohasher',
+        '$BUILD_DIR/mongo/db/vector_clock',
     ],
 )
 
@@ -155,10 +165,10 @@ env.Library(
         'sharded_agg_helpers.cpp',
     ],
     LIBDEPS=[
-        'aggregation',
         '$BUILD_DIR/mongo/s/async_requests_sender',
         '$BUILD_DIR/mongo/s/commands/shared_cluster_commands',
         '$BUILD_DIR/mongo/s/query/cluster_query',
+        'aggregation',
     ],
 )
 
@@ -406,6 +416,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/service_context_d',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
+        '$BUILD_DIR/mongo/db/storage/devnull/storage_devnull_core',
         '$BUILD_DIR/mongo/executor/thread_pool_task_executor_test_fixture',
         '$BUILD_DIR/mongo/s/is_mongos',
         '$BUILD_DIR/mongo/s/query/router_exec_stage',

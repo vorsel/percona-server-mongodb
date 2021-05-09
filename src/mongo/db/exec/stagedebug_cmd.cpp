@@ -27,8 +27,6 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
-
 #include "mongo/platform/basic.h"
 
 #include <memory>
@@ -63,7 +61,6 @@
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/plan_executor_factory.h"
-#include "mongo/logv2/log.h"
 
 namespace mongo {
 
@@ -151,14 +148,14 @@ public:
         auto expCtx = make_intrusive<ExpressionContext>(
             opCtx, std::unique_ptr<CollatorInterface>(nullptr), nss);
 
-        // Need a context to get the actual Collection*
+        // Need a context to get the actual const Collection*
         // TODO A write lock is currently taken here to accommodate stages that perform writes
         //      (e.g. DeleteStage).  This should be changed to use a read lock for read-only
         //      execution trees.
         AutoGetCollection autoColl(opCtx, nss, MODE_IX);
 
         // Make sure the collection is valid.
-        Collection* collection = autoColl.getCollection();
+        const Collection* collection = autoColl.getCollection();
         uassert(ErrorCodes::NamespaceNotFound,
                 str::stream() << "Couldn't find collection " << nss.ns(),
                 collection);
@@ -204,7 +201,7 @@ public:
     }
 
     PlanStage* parseQuery(const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                          Collection* collection,
+                          const Collection* collection,
                           BSONObj obj,
                           WorkingSet* workingSet,
                           const NamespaceString& nss,

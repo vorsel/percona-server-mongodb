@@ -3,7 +3,6 @@
 //   does_not_support_stepdowns,
 //   requires_emptycapped,
 //   requires_fastcount,
-//   requires_fcv_47,
 //   requires_getmore,
 //   requires_non_retryable_commands,
 //   requires_non_retryable_writes,
@@ -343,6 +342,7 @@ let viewsCommandTests = {
     internalRenameIfOptionsAndIndexesMatch: {skip: isAnInternalCommand},
     invalidateUserCache: {skip: isUnrelated},
     isdbgrid: {skip: isUnrelated},
+    isMaster: {skip: isUnrelated},
     killCursors: {
         setup: function(conn) {
             assert.commandWorked(conn.collection.remove({}));
@@ -386,6 +386,7 @@ let viewsCommandTests = {
     listShards: {skip: isUnrelated},
     lockInfo: {skip: isUnrelated},
     logApplicationMessage: {skip: isUnrelated},
+    logMessage: {skip: isUnrelated},
     logRotate: {skip: isUnrelated},
     logout: {skip: isUnrelated},
     makeSnapshot: {skip: isAnInternalCommand},
@@ -421,6 +422,7 @@ let viewsCommandTests = {
     refineCollectionShardKey: {skip: isUnrelated},
     refreshLogicalSessionCacheNow: {skip: isAnInternalCommand},
     reapLogicalSessionCacheNow: {skip: isAnInternalCommand},
+    recipientForgetMigration: {skip: isUnrelated},
     recipientSyncData: {skip: isUnrelated},
     refreshSessions: {skip: isUnrelated},
     reIndex: {
@@ -551,6 +553,10 @@ let viewsCommandTests = {
     startSession: {skip: isAnInternalCommand},
     stopRecordingTraffic: {skip: isUnrelated},
     testDeprecation: {skip: isAnInternalCommand},
+    testDeprecationInVersion2: {skip: isAnInternalCommand},
+    testRemoval: {skip: isAnInternalCommand},
+    testVersion2: {skip: isAnInternalCommand},
+    testVersions1And2: {skip: isAnInternalCommand},
     top: {skip: "tested in views/views_stats.js"},
     touch: {skip: wasRemovedInBinaryVersion44},
     unsetSharding: {skip: isAnInternalCommand},

@@ -30,9 +30,9 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/clientcursor.h"
-#include "mongo/db/repl/cloner_test_fixture.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
+#include "mongo/db/repl/tenant_cloner_test_fixture.h"
 #include "mongo/db/repl/tenant_database_cloner.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
@@ -48,13 +48,13 @@ struct TenantCollectionCloneInfo {
     bool collCreated = false;
 };
 
-class TenantDatabaseClonerTest : public ClonerTestFixture {
+class TenantDatabaseClonerTest : public TenantClonerTestFixture {
 public:
     TenantDatabaseClonerTest() {}
 
 protected:
     void setUp() override {
-        ClonerTestFixture::setUp();
+        TenantClonerTestFixture::setUp();
         _storageInterface.createCollFn = [this](OperationContext* opCtx,
                                                 const NamespaceString& nss,
                                                 const CollectionOptions& options) -> Status {
@@ -76,13 +76,12 @@ protected:
             collInfo->numDocsInserted += ops.size();
             return Status::OK();
         };
-        setInitialSyncId();
         _mockClient->setOperationTime(_operationTime);
     }
 
     std::unique_ptr<TenantDatabaseCloner> makeDatabaseCloner() {
         return std::make_unique<TenantDatabaseCloner>(_dbName,
-                                                      _sharedData.get(),
+                                                      getSharedData(),
                                                       _source,
                                                       _mockClient.get(),
                                                       &_storageInterface,
@@ -127,15 +126,8 @@ protected:
 
     std::map<NamespaceString, TenantCollectionCloneInfo> _collections;
 
-    static std::string _tenantId;
-    static std::string _dbName;
-    static Timestamp _operationTime;
+    const std::string _dbName = _tenantId + "_testDb";
 };
-
-/* static */
-std::string TenantDatabaseClonerTest::_tenantId = "tenant42";
-std::string TenantDatabaseClonerTest::_dbName = _tenantId + "_testDb";
-Timestamp TenantDatabaseClonerTest::_operationTime = Timestamp(12345, 42);
 
 // A database may have no collections. Nothing to do for the tenant database cloner.
 TEST_F(TenantDatabaseClonerTest, ListCollectionsReturnedNoCollections) {
@@ -144,7 +136,7 @@ TEST_F(TenantDatabaseClonerTest, ListCollectionsReturnedNoCollections) {
     auto cloner = makeDatabaseCloner();
 
     ASSERT_OK(cloner->run());
-    ASSERT_OK(_sharedData->getInitialSyncStatus(WithLock::withoutLock()));
+    ASSERT_OK(getSharedData()->getStatus(WithLock::withoutLock()));
     ASSERT(getCollectionsFromCloner(cloner.get()).empty());
 }
 
@@ -171,7 +163,7 @@ TEST_F(TenantDatabaseClonerTest, ListCollections) {
     _mockServer->setCommandReply("find", createFindResponse());
 
     ASSERT_OK(cloner->run());
-    ASSERT_OK(_sharedData->getInitialSyncStatus(WithLock::withoutLock()));
+    ASSERT_OK(getSharedData()->getStatus(WithLock::withoutLock()));
     auto collections = getCollectionsFromCloner(cloner.get());
 
     ASSERT_EQUALS(2U, collections.size());
@@ -214,7 +206,7 @@ TEST_F(TenantDatabaseClonerTest, ListCollectionsAllowsExtraneousFields) {
     _mockServer->setCommandReply("find", createFindResponse());
 
     ASSERT_OK(cloner->run());
-    ASSERT_OK(_sharedData->getInitialSyncStatus(WithLock::withoutLock()));
+    ASSERT_OK(getSharedData()->getStatus(WithLock::withoutLock()));
     auto collections = getCollectionsFromCloner(cloner.get());
 
     ASSERT_EQUALS(2U, collections.size());

@@ -194,6 +194,8 @@ public:
      * true, unless the storage engine cannot guarantee durability, which should never happen when
      * isDurable() returned true. This cannot be called from inside a unit of work, and should
      * fail if it is. This method invariants if the caller holds any locks, except for repair.
+     *
+     * Can throw write interruption errors from the JournalListener.
      */
     virtual bool waitUntilDurable(OperationContext* opCtx) = 0;
 
@@ -235,8 +237,8 @@ public:
      * If no snapshot has yet been marked as Majority Committed, returns a status with error code
      * ReadConcernMajorityNotAvailableYet. After this returns successfully, at any point where
      * implementations attempt to acquire committed snapshot, if there are none available due to a
-     * call to SnapshotManager::dropAllSnapshots(), a AssertionException with the same code should
-     * be thrown.
+     * call to SnapshotManager::clearCommittedSnapshot(), a AssertionException with the same code
+     * should be thrown.
      *
      * StorageEngines that don't support a SnapshotManager should use the default
      * implementation.
@@ -631,6 +633,14 @@ public:
         _mustBeTimestamped = true;
     }
 
+    void setNoEvictionAfterRollback() {
+        _noEvictionAfterRollback = true;
+    }
+
+    bool getNoEvictionAfterRollback() const {
+        return _noEvictionAfterRollback;
+    }
+
 protected:
     RecoveryUnit();
 
@@ -670,6 +680,8 @@ protected:
     }
 
     bool _mustBeTimestamped = false;
+
+    bool _noEvictionAfterRollback = false;
 
 private:
     // Sets the snapshot associated with this RecoveryUnit to a new globally unique id number.

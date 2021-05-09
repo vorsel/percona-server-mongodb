@@ -174,6 +174,43 @@ function arrayEq(al, ar, verbose = false, valueComparator, fieldsToSkip = []) {
     return true;
 }
 
+function arrayDiff(al, ar, verbose = false, valueComparator) {
+    // Check that these are both arrays.
+    if (!(al instanceof Array)) {
+        debug('arrayDiff: al is not an array: ' + tojson(al));
+        return false;
+    }
+
+    if (!(ar instanceof Array)) {
+        debug('arrayDiff: ar is not an array: ' + tojson(ar));
+        return false;
+    }
+
+    // Keep a set of which indexes we've already used to avoid considering [1,1] as equal to [1,2].
+    const matchedIndexesInRight = new Set();
+    let unmatchedElementsInLeft = [];
+    for (let leftElem of al) {
+        let foundMatch = false;
+        for (let i = 0; i < ar.length; ++i) {
+            if (!matchedIndexesInRight.has(i) && anyEq(leftElem, ar[i], verbose, valueComparator)) {
+                matchedIndexesInRight.add(i);  // Don't use the same value each time.
+                foundMatch = true;
+                break;
+            }
+        }
+        if (!foundMatch) {
+            unmatchedElementsInLeft.push(leftElem);
+        }
+    }
+    let unmatchedElementsInRight = [];
+    for (let i = 0; i < ar.length; ++i) {
+        if (!matchedIndexesInRight.has(i)) {
+            unmatchedElementsInRight.push(ar[i]);
+        }
+    }
+    return {left: unmatchedElementsInLeft, right: unmatchedElementsInRight};
+}
+
 /**
  * Makes a shallow copy of 'a'.
  */
@@ -244,46 +281,33 @@ function orderedArrayEq(al, ar, verbose = false) {
 }
 
 /**
- * Asserts that the given aggregation fails with a specific code. Error message is optional.
+ * Assert that the given aggregation fails with a specific code. Error message is optional. Note
+ * that 'code' can be an array of possible codes.
  */
 function assertErrorCode(coll, pipe, code, errmsg, options = {}) {
     if (!Array.isArray(pipe)) {
         pipe = [pipe];
     }
 
-    let cmd = {pipeline: pipe};
-    cmd.cursor = {batchSize: 0};
-
+    let cmd = {pipeline: pipe, cursor: {batchSize: 0}};
     for (let opt of Object.keys(options)) {
         cmd[opt] = options[opt];
     }
 
-    let cursorRes = coll.runCommand("aggregate", cmd);
-    if (cursorRes.ok) {
+    let resultObj = coll.runCommand("aggregate", cmd);
+    if (resultObj.ok) {
         let followupBatchSize = 0;  // default
-        let cursor = new DBCommandCursor(coll.getDB(), cursorRes, followupBatchSize);
-
-        let error = assert.throws(function() {
-            cursor.itcount();
-        }, [], "expected error: " + code);
-
-        assert.eq(error.code, code, tojson(error));
-    } else {
-        assert.eq(cursorRes.code, code, tojson(cursorRes));
+        let cursor = new DBCommandCursor(coll.getDB(), resultObj, followupBatchSize);
+        let assertThrowsMsg = "expected one of the following error codes: " + tojson(code);
+        resultObj = assert.throws(() => cursor.itcount(), [], assertThrowsMsg);
     }
-}
 
-/**
- * Assert that an aggregation fails with a list of specific codes.
- */
-function assertErrorCodes(coll, pipe, codes) {
-    const response = assert.commandFailedWithCode(
-        coll.getDB().runCommand({aggregate: coll.getName(), pipeline: pipe, cursor: {}}), codes);
+    assert.commandFailedWithCode(resultObj, code, errmsg);
 }
 
 /**
  * Assert that an aggregation fails with a specific code and the error message contains the given
- * string.
+ * string. Note that 'code' can be an array of possible codes.
  */
 function assertErrCodeAndErrMsgContains(coll, pipe, code, expectedMessage) {
     const response = assert.commandFailedWithCode(

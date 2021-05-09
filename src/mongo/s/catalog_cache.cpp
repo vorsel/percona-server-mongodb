@@ -106,9 +106,16 @@ std::shared_ptr<RoutingTableHistory> refreshCollectionRoutingInfo(
         // Otherwise, we're making a whole new routing table.
         if (existingRoutingInfo &&
             existingRoutingInfo->getVersion().epoch() == collectionAndChunks.epoch) {
+            if (collectionAndChunks.changedChunks.size() == 1 &&
+                collectionAndChunks.changedChunks[0].getVersion() ==
+                    existingRoutingInfo->getVersion())
+                return existingRoutingInfo;
 
-            return existingRoutingInfo->makeUpdated(collectionAndChunks.changedChunks);
+            return std::make_shared<RoutingTableHistory>(
+                existingRoutingInfo->makeUpdated(std::move(collectionAndChunks.reshardingFields),
+                                                 collectionAndChunks.changedChunks));
         }
+
         auto defaultCollator = [&]() -> std::unique_ptr<CollatorInterface> {
             if (!collectionAndChunks.defaultCollation.isEmpty()) {
                 // The collation should have been validated upon collection creation
@@ -117,13 +124,16 @@ std::shared_ptr<RoutingTableHistory> refreshCollectionRoutingInfo(
             }
             return nullptr;
         }();
-        return RoutingTableHistory::makeNew(nss,
-                                            collectionAndChunks.uuid,
-                                            KeyPattern(collectionAndChunks.shardKeyPattern),
-                                            std::move(defaultCollator),
-                                            collectionAndChunks.shardKeyIsUnique,
-                                            collectionAndChunks.epoch,
-                                            collectionAndChunks.changedChunks);
+
+        return std::make_shared<RoutingTableHistory>(
+            RoutingTableHistory::makeNew(nss,
+                                         collectionAndChunks.uuid,
+                                         KeyPattern(collectionAndChunks.shardKeyPattern),
+                                         std::move(defaultCollator),
+                                         collectionAndChunks.shardKeyIsUnique,
+                                         collectionAndChunks.epoch,
+                                         std::move(collectionAndChunks.reshardingFields),
+                                         collectionAndChunks.changedChunks));
     }();
 
     std::set<ShardId> shardIds;
@@ -180,8 +190,8 @@ StatusWith<CachedDatabaseInfo> CatalogCache::getDatabase(OperationContext* opCtx
     }
 }
 
-StatusWith<CachedCollectionRoutingInfo> CatalogCache::getCollectionRoutingInfo(
-    OperationContext* opCtx, const NamespaceString& nss) {
+StatusWith<ChunkManager> CatalogCache::getCollectionRoutingInfo(OperationContext* opCtx,
+                                                                const NamespaceString& nss) {
     return _getCollectionRoutingInfo(opCtx, nss).statusWithInfo;
 }
 
@@ -198,8 +208,9 @@ CatalogCache::RefreshResult CatalogCache::_getCollectionRoutingInfo(OperationCon
 }
 
 
-StatusWith<CachedCollectionRoutingInfo> CatalogCache::getCollectionRoutingInfoAt(
-    OperationContext* opCtx, const NamespaceString& nss, Timestamp atClusterTime) {
+StatusWith<ChunkManager> CatalogCache::getCollectionRoutingInfoAt(OperationContext* opCtx,
+                                                                  const NamespaceString& nss,
+                                                                  Timestamp atClusterTime) {
     return _getCollectionRoutingInfoAt(opCtx, nss, atClusterTime).statusWithInfo;
 }
 
@@ -276,12 +287,10 @@ CatalogCache::RefreshResult CatalogCache::_getCollectionRoutingInfoAt(
             continue;
         }
 
-        return {CachedCollectionRoutingInfo(nss,
-                                            dbInfo,
-                                            collEntry->routingInfo
-                                                ? boost::optional<ChunkManager>(ChunkManager(
-                                                      collEntry->routingInfo, atClusterTime))
-                                                : boost::none),
+        return {ChunkManager(dbInfo.primaryId(),
+                             dbInfo.databaseVersion(),
+                             collEntry->routingInfo,
+                             atClusterTime),
                 refreshActionTaken};
     }
 }
@@ -293,7 +302,7 @@ StatusWith<CachedDatabaseInfo> CatalogCache::getDatabaseWithRefresh(OperationCon
     return getDatabase(opCtx, dbName);
 }
 
-StatusWith<CachedCollectionRoutingInfo> CatalogCache::getCollectionRoutingInfoWithRefresh(
+StatusWith<ChunkManager> CatalogCache::getCollectionRoutingInfoWithRefresh(
     OperationContext* opCtx, const NamespaceString& nss, bool forceRefreshFromThisThread) {
     auto refreshResult = _getCollectionRoutingInfoWithForcedRefresh(opCtx, nss);
     // We want to ensure that we don't join an in-progress refresh because that
@@ -308,15 +317,18 @@ StatusWith<CachedCollectionRoutingInfo> CatalogCache::getCollectionRoutingInfoWi
     return refreshResult.statusWithInfo;
 }
 
-StatusWith<CachedCollectionRoutingInfo> CatalogCache::getShardedCollectionRoutingInfoWithRefresh(
+StatusWith<ChunkManager> CatalogCache::getShardedCollectionRoutingInfoWithRefresh(
     OperationContext* opCtx, const NamespaceString& nss) {
-    auto routingInfoStatus = _getCollectionRoutingInfoWithForcedRefresh(opCtx, nss).statusWithInfo;
-    if (routingInfoStatus.isOK() && !routingInfoStatus.getValue().cm()) {
+    auto swRoutingInfo = _getCollectionRoutingInfoWithForcedRefresh(opCtx, nss).statusWithInfo;
+    if (!swRoutingInfo.isOK())
+        return swRoutingInfo;
+
+    auto cri(std::move(swRoutingInfo.getValue()));
+    if (!cri.isSharded())
         return {ErrorCodes::NamespaceNotSharded,
                 str::stream() << "Collection " << nss.ns() << " is not sharded."};
-    }
 
-    return routingInfoStatus;
+    return cri;
 }
 
 void CatalogCache::onStaleDatabaseVersion(const StringData dbName,
@@ -330,48 +342,6 @@ void CatalogCache::onStaleDatabaseVersion(const StringData dbName,
                                   "db"_attr = dbName,
                                   "version"_attr = version);
         _databaseCache.advanceTimeInStore(dbName.toString(), version);
-    }
-}
-
-void CatalogCache::onStaleShardVersion(CachedCollectionRoutingInfo&& ccriToInvalidate,
-                                       const ShardId& staleShardId) {
-    _stats.countStaleConfigErrors.addAndFetch(1);
-
-    // Ensure the move constructor of CachedCollectionRoutingInfo is invoked in order to clear the
-    // input argument so it can't be used anymore
-    auto ccri(ccriToInvalidate);
-
-    if (!ccri._cm) {
-        // We received StaleShardVersion for a collection we thought was unsharded. The collection
-        // must have become sharded.
-        onEpochChange(ccri._nss);
-        return;
-    }
-
-    // We received StaleShardVersion for a collection we thought was sharded. Either a migration
-    // occurred to or from a shard we contacted, or the collection was dropped.
-    stdx::lock_guard<Latch> lg(_mutex);
-
-    const auto nss = ccri._cm->getns();
-    const auto itDb = _collectionsByDb.find(nss.db());
-    if (itDb == _collectionsByDb.end()) {
-        // The database was dropped.
-        return;
-    }
-
-    auto itColl = itDb->second.find(nss.ns());
-    if (itColl == itDb->second.end()) {
-        // The collection was dropped.
-    } else if (itColl->second->needsRefresh && itColl->second->epochHasChanged) {
-        // If the epoch has changed, this implies that all routing requests have already been
-        // marked to block behind the next catalog cache refresh. We do not need to mark the shard
-        // as stale in this case.
-        return;
-    } else if (itColl->second->routingInfo->getVersion() == ccri._cm->getVersion()) {
-        // If the versions match, the last version of the routing information that we used is no
-        // longer valid, so trigger a refresh.
-        itColl->second->needsRefresh = true;
-        itColl->second->routingInfo->setShardStale(staleShardId);
     }
 }
 
@@ -668,9 +638,9 @@ void CatalogCache::_scheduleCollectionRefresh(WithLock lk,
         setOperationShouldBlockBehindCatalogCacheRefresh(opCtx.get(), false);
 
         // TODO(SERVER-49876): remove clang-tidy NOLINT comments.
-        if (existingRoutingInfo && newRoutingInfo &&     // NOLINT(bugprone-use-after-move)
-            existingRoutingInfo->getSequenceNumber() ==  // NOLINT(bugprone-use-after-move)
-                newRoutingInfo->getSequenceNumber()) {   // NOLINT(bugprone-use-after-move)
+        if (existingRoutingInfo && newRoutingInfo &&  // NOLINT(bugprone-use-after-move)
+            existingRoutingInfo->getVersion() ==      // NOLINT(bugprone-use-after-move)
+                newRoutingInfo->getVersion()) {       // NOLINT(bugprone-use-after-move)
             // If the routingInfo hasn't changed, we need to manually reset stale shards.
             newRoutingInfo->setAllShardsRefreshed();
         }
@@ -886,10 +856,5 @@ BSONObj ComparableChunkVersion::toBSON() const {
 std::string ComparableChunkVersion::toString() const {
     return toBSON().toString();
 }
-
-CachedCollectionRoutingInfo::CachedCollectionRoutingInfo(NamespaceString nss,
-                                                         CachedDatabaseInfo db,
-                                                         boost::optional<ChunkManager> cm)
-    : _nss(std::move(nss)), _db(std::move(db)), _cm(std::move(cm)) {}
 
 }  // namespace mongo

@@ -61,7 +61,8 @@ CollectionCloner::CollectionCloner(const NamespaceString& sourceNss,
                                    DBClientConnection* client,
                                    StorageInterface* storageInterface,
                                    ThreadPool* dbPool)
-    : BaseCloner("CollectionCloner"_sd, sharedData, source, client, storageInterface, dbPool),
+    : InitialSyncBaseCloner(
+          "CollectionCloner"_sd, sharedData, source, client, storageInterface, dbPool),
       _sourceNss(sourceNss),
       _collectionOptions(collectionOptions),
       _sourceDbAndUuid(NamespaceString("UNINITIALIZED")),
@@ -86,7 +87,7 @@ CollectionCloner::CollectionCloner(const NamespaceString& sourceNss,
               try {
                   work(executor::TaskExecutor::CallbackArgs(nullptr, {}, status, opCtx));
               } catch (const DBException& e) {
-                  setInitialSyncFailedStatus(e.toStatus());
+                  setSyncFailedStatus(e.toStatus());
               }
               return TaskRunner::NextAction::kDisposeOperationContext;
           };
@@ -353,13 +354,12 @@ void CollectionCloner::runQuery() {
 void CollectionCloner::handleNextBatch(DBClientCursorBatchIterator& iter) {
     {
         stdx::lock_guard<InitialSyncSharedData> lk(*getSharedData());
-        if (!getSharedData()->getInitialSyncStatus(lk).isOK()) {
+        if (!getSharedData()->getStatus(lk).isOK()) {
             static constexpr char message[] =
                 "Collection cloning cancelled due to initial sync failure";
-            LOGV2(21136, message, "error"_attr = getSharedData()->getInitialSyncStatus(lk));
+            LOGV2(21136, message, "error"_attr = getSharedData()->getStatus(lk));
             uasserted(ErrorCodes::CallbackCanceled,
-                      str::stream()
-                          << message << ": " << getSharedData()->getInitialSyncStatus(lk));
+                      str::stream() << message << ": " << getSharedData()->getStatus(lk));
         }
     }
 

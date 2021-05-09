@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
 #include "mongo/platform/basic.h"
 
@@ -47,13 +47,13 @@ namespace repl {
 // and recorded the results and the operationTime.
 MONGO_FAIL_POINT_DEFINE(tenantAllDatabaseClonerHangAfterGettingOperationTime);
 
-TenantAllDatabaseCloner::TenantAllDatabaseCloner(InitialSyncSharedData* sharedData,
+TenantAllDatabaseCloner::TenantAllDatabaseCloner(TenantMigrationSharedData* sharedData,
                                                  const HostAndPort& source,
                                                  DBClientConnection* client,
                                                  StorageInterface* storageInterface,
                                                  ThreadPool* dbPool,
                                                  StringData tenantId)
-    : BaseCloner(
+    : TenantBaseCloner(
           "TenantAllDatabaseCloner"_sd, sharedData, source, client, storageInterface, dbPool),
       _tenantId(tenantId),
       _listDatabasesStage("listDatabases", this, &TenantAllDatabaseCloner::listDatabasesStage) {}
@@ -144,7 +144,7 @@ void TenantAllDatabaseCloner::postStage() {
                           "totalDbs"_attr = _databases.size(),
                           "error"_attr = dbStatus.toString(),
                           "tenantId"_attr = _tenantId);
-            setInitialSyncFailedStatus(dbStatus);
+            setSyncFailedStatus(dbStatus);
             return;
         }
         {

@@ -38,6 +38,7 @@
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/validate_results.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -129,13 +130,12 @@ void createCollection(OperationContext* opCtx,
  */
 int _createIndexOnEmptyCollection(OperationContext* opCtx, NamespaceString nss, BSONObj indexSpec) {
     Lock::DBLock dbLock(opCtx, nss.db(), MODE_X);
-    AutoGetCollection autoColl(opCtx, nss, MODE_X);
-    auto coll = autoColl.getCollection();
-
-    auto indexCatalog = coll->getIndexCatalog();
-    ASSERT(indexCatalog);
+    AutoGetCollection coll(opCtx, nss, MODE_X);
 
     WriteUnitOfWork wunit(opCtx);
+    auto indexCatalog = coll.getWritableCollection()->getIndexCatalog();
+    ASSERT(indexCatalog);
+
     ASSERT_OK(indexCatalog->createIndexOnEmptyCollection(opCtx, indexSpec).getStatus());
     wunit.commit();
 
@@ -160,7 +160,7 @@ int64_t getIndexKeyCount(OperationContext* opCtx,
                          const IndexDescriptor* desc) {
     auto idx = cat->getEntry(desc)->accessMethod();
     int64_t numKeys;
-    ValidateResults fullRes;
+    IndexValidateResults fullRes;
     idx->validate(opCtx, &numKeys, &fullRes);
     return numKeys;
 }

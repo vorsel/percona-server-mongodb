@@ -30,6 +30,7 @@
 #pragma once
 
 #include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/privilege.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
@@ -72,11 +73,11 @@ public:
                               const UserName& userName,
                               BSONObj* result) override;
 
-    Status getRoleDescription(OperationContext* opCtx,
-                              const RoleName& roleName,
-                              PrivilegeFormat privilegeFormat,
-                              AuthenticationRestrictionsFormat,
-                              BSONObj* result) override;
+    Status rolesExist(OperationContext* opCtx, const std::vector<RoleName>& roleNames) override;
+
+    StatusWith<ResolvedRoleData> resolveRoles(OperationContext* opCtx,
+                                              const std::vector<RoleName>& roleNames,
+                                              ResolveRoleOption option) override;
 
     Status getRolesDescription(OperationContext* opCtx,
                                const std::vector<RoleName>& roleName,
@@ -89,7 +90,7 @@ public:
                                     PrivilegeFormat privilegeFormat,
                                     AuthenticationRestrictionsFormat,
                                     bool showBuiltinRoles,
-                                    std::vector<BSONObj>* result) override;
+                                    BSONArrayBuilder* result) override;
 
     StatusWith<UserHandle> acquireUser(OperationContext* opCtx, const UserName& userName) override;
     StatusWith<UserHandle> acquireUserForSessionRefresh(OperationContext* opCtx,
@@ -113,7 +114,7 @@ public:
     void updatePinnedUsersList(std::vector<UserName> names) override;
 
     void logOp(OperationContext* opCtx,
-               const char* opstr,
+               StringData opstr,
                const NamespaceString& nss,
                const BSONObj& obj,
                const BSONObj* patt) override;

@@ -204,7 +204,7 @@ public:
             CurOp& curOp = *CurOp::get(_opCtx);
             OpDebug* opDebug = &curOp.debug();
             UpdateDriver driver(_expCtx);
-            Collection* collection = ctx.getCollection();
+            const Collection* collection = ctx.getCollection();
             ASSERT(collection);
 
             // Collection should be empty.
@@ -219,7 +219,8 @@ public:
 
             request.setUpsert();
             request.setQuery(query);
-            request.setUpdateModification(updates);
+            request.setUpdateModification(
+                write_ops::UpdateModification::parseFromClassicUpdate(updates));
 
             const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
             const auto constants = boost::none;
@@ -275,7 +276,7 @@ public:
             CurOp& curOp = *CurOp::get(_opCtx);
             OpDebug* opDebug = &curOp.debug();
             UpdateDriver driver(_expCtx);
-            Collection* coll =
+            const Collection* coll =
                 CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, nss);
             ASSERT(coll);
 
@@ -293,7 +294,8 @@ public:
 
             request.setMulti();
             request.setQuery(query);
-            request.setUpdateModification(updates);
+            request.setUpdateModification(
+                write_ops::UpdateModification::parseFromClassicUpdate(updates));
 
             const std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
             const auto constants = boost::none;
@@ -386,7 +388,7 @@ public:
         // Various variables we'll need.
         dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         OpDebug* opDebug = &CurOp::get(_opCtx)->debug();
-        Collection* coll = ctx.getCollection();
+        const Collection* coll = ctx.getCollection();
         ASSERT(coll);
         auto request = UpdateRequest();
         request.setNamespaceString(nss);
@@ -402,7 +404,8 @@ public:
 
         // Populate the request.
         request.setQuery(query);
-        request.setUpdateModification(fromjson("{$set: {x: 0}}"));
+        request.setUpdateModification(
+            write_ops::UpdateModification::parseFromClassicUpdate(fromjson("{$set: {x: 0}}")));
         request.setSort(BSONObj());
         request.setMulti(false);
         request.setReturnDocs(UpdateRequest::RETURN_OLD);
@@ -478,7 +481,7 @@ public:
         // Various variables we'll need.
         dbtests::WriteContextForTests ctx(&_opCtx, nss.ns());
         OpDebug* opDebug = &CurOp::get(_opCtx)->debug();
-        Collection* coll = ctx.getCollection();
+        const Collection* coll = ctx.getCollection();
         ASSERT(coll);
         auto request = UpdateRequest();
         request.setNamespaceString(nss);
@@ -494,7 +497,8 @@ public:
 
         // Populate the request.
         request.setQuery(query);
-        request.setUpdateModification(fromjson("{$set: {x: 0}}"));
+        request.setUpdateModification(
+            write_ops::UpdateModification::parseFromClassicUpdate(fromjson("{$set: {x: 0}}")));
         request.setSort(BSONObj());
         request.setMulti(false);
         request.setReturnDocs(UpdateRequest::RETURN_NEW);

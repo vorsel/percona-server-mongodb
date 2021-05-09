@@ -44,4 +44,6 @@ enum class IsInclusion : bool { no, yes };
 
 StatusWith<IsInclusion> validateProjectionAsInclusionOrExclusion(const CNode& projects);
 
+Status validateVariableName(std::string varStr);
+
 }  // namespace mongo::c_node_validation

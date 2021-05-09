@@ -73,6 +73,7 @@
 #include "mongo/db/repl/rollback_source.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/session_catalog_mongod.h"
+#include "mongo/db/storage/control/journal_flusher.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/remove_saver.h"
 #include "mongo/db/transaction_participant.h"
@@ -906,7 +907,8 @@ void rollbackCreateIndexes(OperationContext* opCtx, UUID uuid, std::set<std::str
         CollectionCatalog::get(opCtx).lookupNSSByUUID(opCtx, uuid);
     invariant(nss);
     Lock::DBLock dbLock(opCtx, nss->db(), MODE_X);
-    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
+    Collection* collection =
+        CollectionCatalog::get(opCtx).lookupCollectionByUUIDForMetadataWrite(opCtx, uuid);
 
     // If we cannot find the collection, we skip over dropping the index.
     if (!collection) {
@@ -969,7 +971,8 @@ void rollbackDropIndexes(OperationContext* opCtx,
     invariant(nss);
     Lock::DBLock dbLock(opCtx, nss->db(), MODE_IX);
     Lock::CollectionLock collLock(opCtx, *nss, MODE_X);
-    Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, *nss);
+    const Collection* collection =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, *nss);
 
     // If we cannot find the collection, we skip over dropping the index.
     if (!collection) {
@@ -1013,7 +1016,7 @@ void rollbackDropIndexes(OperationContext* opCtx,
  */
 void dropCollection(OperationContext* opCtx,
                     NamespaceString nss,
-                    Collection* collection,
+                    const Collection* collection,
                     Database* db) {
     if (RollbackImpl::shouldCreateDataFiles()) {
         RemoveSaver removeSaver("rollback", "", collection->uuid().toString());
@@ -1496,7 +1499,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
             Database* db = dbLock.getDb();
             if (db) {
-                Collection* collection =
+                const Collection* collection =
                     CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
                 dropCollection(opCtx, *nss, collection, db);
                 LOGV2_DEBUG(21698,
@@ -1572,7 +1575,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
             invariant(db);
 
             Collection* collection =
-                CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
+                CollectionCatalog::get(opCtx).lookupCollectionByUUIDForMetadataWrite(opCtx, uuid);
             invariant(collection);
 
             auto infoResult = rollbackSource.getCollectionInfoByUUID(nss->db().toString(), uuid);
@@ -1726,7 +1729,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                 const NamespaceString docNss(doc.ns);
                 Lock::DBLock docDbLock(opCtx, docNss.db(), MODE_X);
                 OldClientContext ctx(opCtx, doc.ns.toString());
-                Collection* collection = catalog.lookupCollectionByUUID(opCtx, uuid);
+                Collection* collection =
+                    catalog.lookupCollectionByUUIDForMetadataWrite(opCtx, uuid);
 
                 // Adds the doc to our rollback file if the collection was not dropped while
                 // rolling back createCollection operations. Does not log an error when
@@ -1863,7 +1867,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                     request.setNamespaceString(*nss);
 
                     request.setQuery(pattern);
-                    request.setUpdateModification(idAndDoc.second);
+                    request.setUpdateModification(
+                        write_ops::UpdateModification::parseFromClassicUpdate(idAndDoc.second));
                     request.setGod();
                     request.setUpsert();
 
@@ -1943,7 +1948,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         Lock::CollectionLock oplogCollectionLoc(opCtx, oplogNss, MODE_X);
         OldClientContext ctx(opCtx, oplogNss.ns());
         Collection* oplogCollection =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, oplogNss);
+            CollectionCatalog::get(opCtx).lookupCollectionByNamespaceForMetadataWrite(opCtx,
+                                                                                      oplogNss);
         if (!oplogCollection) {
             fassertFailedWithStatusNoTrace(
                 40495,
@@ -2150,7 +2156,7 @@ void rollback(OperationContext* opCtx,
     // so that if we wind up shutting down uncleanly in response to something we rolled back
     // we know that we won't wind up right back in the same situation when we start back up
     // because the rollback wasn't durable.
-    opCtx->recoveryUnit()->waitUntilDurable(opCtx);
+    JournalFlusher::get(opCtx)->waitForJournalFlush();
 
     // If we detected that we rolled back the shardIdentity document as part of this rollback
     // then we must shut down to clear the in-memory ShardingState associated with the

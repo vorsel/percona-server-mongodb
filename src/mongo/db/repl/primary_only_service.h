@@ -42,7 +42,9 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -86,26 +88,29 @@ public:
      */
     class Instance {
     public:
+        friend class PrimaryOnlyService;
+
         virtual ~Instance() = default;
 
-        /**
-         * Schedules work to call this instance's 'run' method against the provided
-         * ScopedTaskExecutor. Also includes checking to ensure that run is only ever scheduled
-         * once.
-         */
-        void scheduleRun(std::shared_ptr<executor::ScopedTaskExecutor> executor);
+        SharedSemiFuture<void> getCompletionFuture() {
+            return _completionPromise.getFuture();
+        }
 
     protected:
         /**
          * This is the main function that PrimaryOnlyService implementations will need to implement,
          * and is where the bulk of the work those services perform is scheduled. All work run for
-         * this Instance should be scheduled on 'executor'. Instances are responsible for inserting,
+         * this Instance *must* be scheduled on 'executor'. Instances are responsible for inserting,
          * updating, and deleting their state documents as needed.
          */
-        virtual void run(std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept = 0;
+        virtual SemiFuture<void> run(
+            std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept = 0;
 
     private:
         bool _running = false;
+
+        // Promise that gets emplaced when the future returned by run() resolves.
+        SharedPromise<void> _completionPromise;
     };
 
     /**
@@ -114,7 +119,7 @@ public:
      * proper derived Instance type.
      */
     template <class InstanceType>
-    class TypedInstance : public Instance {
+    class TypedInstance : public Instance, public std::enable_shared_from_this<InstanceType> {
     public:
         TypedInstance() = default;
         virtual ~TypedInstance() = default;
@@ -191,6 +196,27 @@ public:
      */
     void onStepDown();
 
+    /**
+     * Releases the shared_ptr for the given InstanceID (if present) from management by this
+     * service. This is called by the OpObserver when a state document in this service's state
+     * document collection is deleted, and is the main way that instances get removed from
+     * _instances and deleted.
+     */
+    void releaseInstance(const InstanceID& id);
+
+    /**
+     * Releases all Instances from _instances. Called by the OpObserver if this service's state
+     * document collection is dropped.
+     */
+    void releaseAllInstances();
+
+    /**
+     * Returns whether this service is currently running.  This is true only when the node is in
+     * state PRIMARY *and* this service has finished all asynchronous work associated with resuming
+     * after stepUp.
+     */
+    bool isRunning() const;
+
 protected:
     /**
      * Constructs a new Instance object with the given initial state.
@@ -209,7 +235,7 @@ protected:
      * new Instance (by calling constructInstance()), registers it in _instances, and returns it.
      * It is illegal to call this more than once with 'initialState' documents that have the same
      * _id but are otherwise not completely identical.
-     * Throws NotMaster if the node is not currently primary.
+     * Throws NotWritablePrimary if the node is not currently primary.
      */
     std::shared_ptr<Instance> getOrCreateInstance(BSONObj initialState);
 
@@ -221,9 +247,15 @@ private:
      */
     void _rebuildInstances() noexcept;
 
+    /**
+     * Schedules work to call the provided instance's 'run' method. Must be called while holding
+     * _mutex.
+     */
+    void _scheduleRun(WithLock, std::shared_ptr<Instance> instance);
+
     ServiceContext* const _serviceContext;
 
-    Mutex _mutex = MONGO_MAKE_LATCH("PrimaryOnlyService::_mutex");
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("PrimaryOnlyService::_mutex");
 
     // Condvar to receive notifications when _rebuildInstances has completed after stepUp.
     stdx::condition_variable _rebuildCV;
@@ -283,12 +315,18 @@ public:
     void registerService(std::unique_ptr<PrimaryOnlyService> service);
 
     /**
-     * Looks up a registered service.  Calling it with a non-registered service name is a programmer
-     * error as all services should be known statically and registered at startup. Since all
-     * services live for the lifetime of the mongod process (unlike their Instance objects), there's
-     * no concern about the returned pointer becoming invalid.
+     * Looks up a registered service by service name.  Calling it with a non-registered service name
+     * is a programmer error as all services should be known statically and registered at startup.
+     * Since all services live for the lifetime of the mongod process (unlike their Instance
+     * objects), there's no concern about the returned pointer becoming invalid.
      */
-    PrimaryOnlyService* lookupService(StringData serviceName);
+    PrimaryOnlyService* lookupServiceByName(StringData serviceName);
+
+    /**
+     * Looks up a registered service by the namespace of its state document collection. Returns
+     * nullptr if no service is found with the given state document namespace.
+     */
+    PrimaryOnlyService* lookupServiceByNamespace(const NamespaceString& ns);
 
     /**
      * Shuts down all registered services.
@@ -302,7 +340,11 @@ public:
     void onStepDown() final;
 
 private:
-    StringMap<std::unique_ptr<PrimaryOnlyService>> _services;
+    StringMap<std::unique_ptr<PrimaryOnlyService>> _servicesByName;
+
+    // Doesn't own the service, contains a pointer to the service owned by _servicesByName.
+    // This is safe since services don't change after startup.
+    StringMap<PrimaryOnlyService*> _servicesByNamespace;
 };
 
 }  // namespace repl

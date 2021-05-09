@@ -348,7 +348,7 @@ void InitialSyncer::_cancelRemainingWork_inlock() {
         // We actually hold the required lock, but the lock object itself is not passed through.
         _clearRetriableError(WithLock::withoutLock());
         stdx::lock_guard<InitialSyncSharedData> lock(*_sharedData);
-        _sharedData->setInitialSyncStatusIfOK(
+        _sharedData->setStatusIfOK(
             lock, Status{ErrorCodes::CallbackCanceled, "Initial sync attempt canceled"});
     }
     if (_client) {
@@ -578,10 +578,14 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
     const executor::TaskExecutor::CallbackArgs& callbackArgs,
     std::uint32_t initialSyncAttempt,
     std::uint32_t initialSyncMaxAttempts) noexcept {
-    auto status = _checkForShutdownAndConvertStatus_inlock(
-        callbackArgs,
-        str::stream() << "error while starting initial sync attempt " << (initialSyncAttempt + 1)
-                      << " of " << initialSyncMaxAttempts);
+    auto status = [&] {
+        stdx::lock_guard<Latch> lock(_mutex);
+        return _checkForShutdownAndConvertStatus_inlock(
+            callbackArgs,
+            str::stream() << "error while starting initial sync attempt "
+                          << (initialSyncAttempt + 1) << " of " << initialSyncMaxAttempts);
+    }();
+
     if (!status.isOK()) {
         _finishInitialSyncAttempt(status);
         return;
@@ -632,7 +636,7 @@ void InitialSyncer::_startInitialSyncAttemptCallback(
                 "Resetting feature compatibility version to last-lts. If the sync source is in "
                 "latest feature compatibility version, we will find out when we clone the "
                 "server configuration collection (admin.system.version)");
-    serverGlobalParams.featureCompatibility.reset();
+    serverGlobalParams.mutableFeatureCompatibility.reset();
 
     // Clear the oplog buffer.
     _oplogBuffer->clear(makeOpCtx().get());

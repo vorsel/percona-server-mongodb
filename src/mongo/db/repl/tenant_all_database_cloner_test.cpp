@@ -31,10 +31,10 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/repl/cloner_test_fixture.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/storage_interface_mock.h"
 #include "mongo/db/repl/tenant_all_database_cloner.h"
+#include "mongo/db/repl/tenant_cloner_test_fixture.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
 #include "mongo/logv2/log.h"
@@ -45,18 +45,13 @@
 namespace mongo {
 namespace repl {
 
-class TenantAllDatabaseClonerTest : public ClonerTestFixture {
+class TenantAllDatabaseClonerTest : public TenantClonerTestFixture {
 public:
     TenantAllDatabaseClonerTest() {}
 
 protected:
-    void setUp() override {
-        ClonerTestFixture::setUp();
-        _mockClient->setOperationTime(_operationTime);
-    }
-
     std::unique_ptr<TenantAllDatabaseCloner> makeAllDatabaseCloner() {
-        return std::make_unique<TenantAllDatabaseCloner>(_sharedData.get(),
+        return std::make_unique<TenantAllDatabaseCloner>(getSharedData(),
                                                          _source,
                                                          _mockClient.get(),
                                                          &_storageInterface,
@@ -79,21 +74,11 @@ protected:
         return bob.obj();
     }
 
-    static Timestamp _operationTime;
-    static std::string _tenantId;
-    static std::string _tenantDbA;
-    static std::string _tenantDbAAB;
-    static std::string _tenantDbABC;
-    static std::string _tenantDbB;
+    const std::string _tenantDbA = _tenantId + "_a";
+    const std::string _tenantDbAAB = _tenantId + "_aab";
+    const std::string _tenantDbABC = _tenantId + "_abc";
+    const std::string _tenantDbB = _tenantId + "_b";
 };
-
-/* static */
-Timestamp TenantAllDatabaseClonerTest::_operationTime = Timestamp(12345, 67);
-std::string TenantAllDatabaseClonerTest::_tenantId = "tenant42";
-std::string TenantAllDatabaseClonerTest::_tenantDbA = _tenantId + "_a";
-std::string TenantAllDatabaseClonerTest::_tenantDbAAB = _tenantId + "_aab";
-std::string TenantAllDatabaseClonerTest::_tenantDbABC = _tenantId + "_abc";
-std::string TenantAllDatabaseClonerTest::_tenantDbB = _tenantId + "_b";
 
 TEST_F(TenantAllDatabaseClonerTest, FailsOnListDatabases) {
     Status expectedResult{ErrorCodes::BadValue, "foo"};

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kReplicationInitialSync
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTenantMigration
 
 #include "mongo/platform/basic.h"
 
@@ -65,16 +65,18 @@ MONGO_FAIL_POINT_DEFINE(tenantMigrationHangDuringCollectionClone);
 
 TenantCollectionCloner::TenantCollectionCloner(const NamespaceString& sourceNss,
                                                const CollectionOptions& collectionOptions,
-                                               InitialSyncSharedData* sharedData,
+                                               TenantMigrationSharedData* sharedData,
                                                const HostAndPort& source,
                                                DBClientConnection* client,
                                                StorageInterface* storageInterface,
                                                ThreadPool* dbPool,
                                                StringData tenantId)
-    : BaseCloner("TenantCollectionCloner"_sd, sharedData, source, client, storageInterface, dbPool),
+    : TenantBaseCloner(
+          "TenantCollectionCloner"_sd, sharedData, source, client, storageInterface, dbPool),
       _sourceNss(sourceNss),
       _collectionOptions(collectionOptions),
       _sourceDbAndUuid(NamespaceString("UNINITIALIZED")),
+      _collectionClonerBatchSize(collectionClonerBatchSize),
       _countStage("count", this, &TenantCollectionCloner::countStage),
       _listIndexesStage("listIndexes", this, &TenantCollectionCloner::listIndexesStage),
       _createCollectionStage(
@@ -92,7 +94,7 @@ TenantCollectionCloner::TenantCollectionCloner(const NamespaceString& sourceNss,
               try {
                   work(executor::TaskExecutor::CallbackArgs(nullptr, {}, status, opCtx));
               } catch (const DBException& e) {
-                  setInitialSyncFailedStatus(e.toStatus());
+                  setSyncFailedStatus(e.toStatus());
               }
               return TaskRunner::NextAction::kDisposeOperationContext;
           };
@@ -363,7 +365,8 @@ void TenantCollectionCloner::setMetadataReader() {
                 return readResult.getStatus().withContext(
                     "tenant collection cloner failed to read repl set metadata");
             }
-            this->setLastVisibleOpTime(readResult.getValue().getLastOpVisible());
+            stdx::lock_guard<TenantMigrationSharedData> lk(*getSharedData());
+            getSharedData()->setLastVisibleOpTime(lk, readResult.getValue().getLastOpVisible());
             return Status::OK();
         });
 }

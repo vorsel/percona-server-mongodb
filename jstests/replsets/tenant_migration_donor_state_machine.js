@@ -2,7 +2,12 @@
  * Tests the TenantMigrationAccessBlocker and donor state document are updated correctly after
  * the donorStartMigration command is run.
  *
- * @tags: [requires_fcv_47]
+ * Tenant migrations are not expected to be run on servers with ephemeralForTest, and in particular
+ * this test fails on ephemeralForTest because the donor has to wait for the write to set the
+ * migration state to "committed" and "aborted" to be majority committed but it cannot do that on
+ * ephemeralForTest.
+ *
+ * @tags: [requires_fcv_47, incompatible_with_eft]
  */
 
 (function() {
@@ -19,9 +24,13 @@ const accessState = {
     kReject: 3
 };
 
-const donorRst = new ReplSetTest(
-    {nodes: [{}, {rsConfig: {priority: 0}}, {rsConfig: {priority: 0}}], name: 'donor'});
-const recipientRst = new ReplSetTest({nodes: 1, name: 'recipient'});
+const donorRst = new ReplSetTest({
+    nodes: [{}, {rsConfig: {priority: 0}}, {rsConfig: {priority: 0}}],
+    name: 'donor',
+    nodeOptions: {setParameter: {enableTenantMigrations: true}}
+});
+const recipientRst = new ReplSetTest(
+    {nodes: 1, name: 'recipient', nodeOptions: {setParameter: {enableTenantMigrations: true}}});
 
 const kDBPrefix = 'testDb';
 const kConfigDonorsNS = "config.tenantMigrationDonors";

@@ -36,6 +36,7 @@
 #include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/db/cst/c_node.h"
 #include "mongo/db/cst/cst_pipeline_translation.h"
+#include "mongo/db/cst/cst_sort_translation.h"
 #include "mongo/db/cst/key_fieldname.h"
 #include "mongo/db/cst/key_value.h"
 #include "mongo/db/exec/document_value/document.h"
@@ -47,6 +48,7 @@
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_source_skip.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/sort_pattern.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
@@ -56,6 +58,31 @@ using namespace std::string_literals;
 auto getExpCtx() {
     auto nss = NamespaceString{"db", "coll"};
     return boost::intrusive_ptr<ExpressionContextForTest>{new ExpressionContextForTest(nss)};
+}
+
+void assertSortPatternsEQ(SortPattern correct, SortPattern fromTest) {
+    for (size_t i = 0; i < correct.size(); ++i) {
+        ASSERT_EQ(correct[i].isAscending, fromTest[i].isAscending);
+        if (correct[i].fieldPath) {
+            if (fromTest[i].fieldPath) {
+                ASSERT_EQ(correct[i].fieldPath->fullPath(), fromTest[i].fieldPath->fullPath());
+            } else {
+                FAIL("Pattern missing fieldpath");
+            }
+        } else if (fromTest[i].fieldPath) {
+            FAIL("Pattern incorrectly had fieldpath");
+        }
+        if (correct[i].expression) {
+            if (fromTest[i].expression)
+                ASSERT_EQ(correct[i].expression->serialize(false).toString(),
+                          fromTest[i].expression->serialize(false).toString());
+            else {
+                FAIL("Pattern missing expression");
+            }
+        } else if (fromTest[i].expression) {
+            FAIL("Pattern incorrectly had expression");
+        }
+    }
 }
 
 TEST(CstPipelineTranslationTest, TranslatesEmpty) {
@@ -124,6 +151,38 @@ TEST(CstPipelineTranslationTest, TranslatesMultifieldInclusionProjection) {
         singleDoc.getTransformer().serializeTransformation(boost::none).toBson()));
 }
 
+TEST(CstPipelineTranslationTest, TranslatesCompoundObjectInclusionProjection) {
+    // [
+    //     { $project: { a: { b: {
+    //         c: true,
+    //         d: 88,
+    //         e: { f: NumberLong(-3) },
+    //     } } } }
+    // ]
+    const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
+        {KeyFieldname::projectInclusion,
+         CNode{CNode::ObjectChildren{
+             {UserFieldname{"a"},
+              CNode{CompoundInclusionKey{CNode{CNode::ObjectChildren{
+                  {{UserFieldname{"b"},
+                    CNode{CNode::ObjectChildren{
+                        {{UserFieldname{"c"}, CNode{KeyValue::trueKey}},
+                         {UserFieldname{"d"}, CNode{CNode{NonZeroKey{88}}}},
+                         {UserFieldname{"e"},
+                          CNode{CNode::ObjectChildren{
+                              {{UserFieldname{"f"}, CNode{NonZeroKey{-3ll}}}}}}}}}}}}}}}}}}}}}}}};
+    auto pipeline = cst_pipeline_translation::translatePipeline(cst, getExpCtx());
+    auto& sources = pipeline->getSources();
+    ASSERT_EQ(1u, sources.size());
+    auto iter = sources.begin();
+    auto& singleDoc = dynamic_cast<DocumentSourceSingleDocumentTransformation&>(**iter);
+    // DocumenSourceSingleDocumentTransformation reorders fields so we need to be insensitive.
+    ASSERT(UnorderedFieldsBSONObjComparator{}.evaluate(
+        BSON("_id" << true << "a"
+                   << BSON("b" << BSON("c" << true << "d" << true << "e" << BSON("f" << true)))) ==
+        singleDoc.getTransformer().serializeTransformation(boost::none).toBson()));
+}
+
 TEST(CstPipelineTranslationTest, TranslatesOneFieldExclusionProjectionStage) {
     const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
         {KeyFieldname::projectExclusion,
@@ -153,6 +212,37 @@ TEST(CstPipelineTranslationTest, TranslatesMultifieldExclusionProjection) {
     // DocumenSourceSingleDocumentTransformation reorders fields so we need to be insensitive.
     ASSERT(UnorderedFieldsBSONObjComparator{}.evaluate(
         BSON("_id" << false << "a" << false << "b" << false) ==
+        singleDoc.getTransformer().serializeTransformation(boost::none).toBson()));
+}
+
+TEST(CstPipelineTranslationTest, TranslatesCompoundObjectExclusionProjection) {
+    // [
+    //     { $project: { a: { b: {
+    //         c: false,
+    //         d: 0,
+    //         e: { f: NumberLong(0) },
+    //     } } } }
+    // ]
+    const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
+        {KeyFieldname::projectExclusion,
+         CNode{CNode::ObjectChildren{
+             {UserFieldname{"a"},
+              CNode{CompoundExclusionKey{CNode{CNode::ObjectChildren{
+                  {{UserFieldname{"b"},
+                    CNode{CNode::ObjectChildren{
+                        {{UserFieldname{"c"}, CNode{KeyValue::falseKey}},
+                         {UserFieldname{"d"}, CNode{CNode{NonZeroKey{0}}}},
+                         {UserFieldname{"e"},
+                          CNode{CNode::ObjectChildren{
+                              {{UserFieldname{"f"}, CNode{NonZeroKey{0ll}}}}}}}}}}}}}}}}}}}}}}}};
+    auto pipeline = cst_pipeline_translation::translatePipeline(cst, getExpCtx());
+    auto& sources = pipeline->getSources();
+    ASSERT_EQ(1u, sources.size());
+    auto iter = sources.begin();
+    auto& singleDoc = dynamic_cast<DocumentSourceSingleDocumentTransformation&>(**iter);
+    // DocumenSourceSingleDocumentTransformation reorders fields so we need to be insensitive.
+    ASSERT(UnorderedFieldsBSONObjComparator{}.evaluate(
+        BSON("a" << BSON("b" << BSON("c" << false << "d" << false << "e" << BSON("f" << false)))) ==
         singleDoc.getTransformer().serializeTransformation(boost::none).toBson()));
 }
 
@@ -701,11 +791,11 @@ TEST(CstPipelineTranslationTest, TranslatesToLongExpression) {
 }
 
 TEST(CstPipelineTranslationTest, TranslatesToObjectIdExpression) {
-    const auto cst =
-        CNode{CNode::ObjectChildren{{KeyFieldname::toObjectId, CNode{UserString{"$_id"}}}}};
+    const auto cst = CNode{
+        CNode::ObjectChildren{{KeyFieldname::toObjectId, CNode{UserFieldPath{"_id", false}}}}};
     auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
     ASSERT_TRUE(ValueComparator().evaluate(
-        Value(fromjson("{$convert: {input: {$const: '$_id'}, to: {$const: 'objectId'}}}")) ==
+        Value(fromjson("{$convert: {input: '$_id', to: {$const: 'objectId'}}}")) ==
         expr->serialize(false)));
 }
 
@@ -737,10 +827,10 @@ TEST(CstPipelineTranslationTest, AbsConstantTranslation) {
 }
 
 TEST(CstPipelineTranslationTest, AbsVariableTransation) {
-    const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::abs, CNode{UserString{"$foo"}}}}};
+    const auto cst =
+        CNode{CNode::ObjectChildren{{KeyFieldname::abs, CNode{UserFieldPath{"foo", false}}}}};
     auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
-    // TODO SERVER-49927 This should be a field path.
-    ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$abs: [{$const: \"$foo\"}]}")) ==
+    ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$abs: [\"$foo\"]}")) ==
                                            expr->serialize(false)));
 }
 
@@ -947,16 +1037,16 @@ TEST(CstPipelineTranslationTest, TranslatesDateToStringExpression) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::dateToString,
          CNode{CNode::ObjectChildren{
-             {KeyFieldname::dateArg, CNode{UserString{"$date"}}},
+             {KeyFieldname::dateArg, CNode{UserFieldPath{"date", false}}},
              {KeyFieldname::formatArg, CNode{UserString{"%Y-%m-%d"}}},
              {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
              {KeyFieldname::onNullArg, CNode{UserString{"8/10/20"}}},
          }}}}};
     auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
     ASSERT_TRUE(ValueComparator().evaluate(
-        Value(fromjson(
-            "{$dateToString: {date: {$const: \"$date\"}, format: {$const: \"%Y-%m-%d\"}, timezone: "
-            "{$const: \"America/New_York\"}, onNull: {$const: \"8/10/20\"}}}")) ==
+        Value(
+            fromjson("{$dateToString: {date: \"$date\", format: {$const: \"%Y-%m-%d\"}, timezone: "
+                     "{$const: \"America/New_York\"}, onNull: {$const: \"8/10/20\"}}}")) ==
         expr->serialize(false)))
         << expr->serialize(false);
 }
@@ -1139,5 +1229,89 @@ TEST(CstPipelineTranslationTest, TranslatesRegexMatch) {
         << expr->serialize(false);
 }
 
+TEST(CstPipelineTranslationTest, RecognizesSingleDollarAsNonConst) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::trunc,
+         CNode{CNode::ArrayChildren{CNode{UserFieldPath{"val", false}},
+                                    CNode{UserFieldPath{"places", false}}}}}}};
+    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$trunc: [\"$val\", \"$places\"]}")) ==
+                                           expr->serialize(false)));
+}
+
+TEST(CstPipelineTranslationTest, RecognizesDoubleDollarAsNonConst) {
+    const auto cst =
+        CNode{CNode::ObjectChildren{{KeyFieldname::toDate, CNode{UserFieldPath{"NOW", true}}}}};
+    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$convert: {input: \"$$NOW\", to: {$const: 'date'}}}")) ==
+        expr->serialize(false)));
+}
+
+TEST(CstPipelineTranslationTest, InvalidDollarPrefixStringFails) {
+    {
+        const auto cst = CNode{
+            CNode::ObjectChildren{{KeyFieldname::toDate, CNode{UserFieldPath{"NOWX", true}}}}};
+        ASSERT_THROWS_CODE(cst_pipeline_translation::translateExpression(cst, getExpCtx()),
+                           AssertionException,
+                           17276);
+    }
+}
+
+TEST(CstSortTranslationTest, BasicSortGeneratesCorrectSortPattern) {
+    const auto cst =
+        CNode{CNode::ObjectChildren{{UserFieldname{"val"}, CNode{KeyValue::intOneKey}}}};
+    auto expCtx = getExpCtx();
+    auto pattern = cst_sort_translation::translateSortSpec(cst, expCtx);
+    auto correctPattern = SortPattern(fromjson("{val: 1}"), expCtx);
+    assertSortPatternsEQ(correctPattern, pattern);
+}
+
+TEST(CstSortTranslationTest, MultiplePartSortGeneratesCorrectSortPattern) {
+    {
+        const auto cst =
+            CNode{CNode::ObjectChildren{{UserFieldname{"val"}, CNode{KeyValue::intOneKey}},
+                                        {UserFieldname{"test"}, CNode{KeyValue::intNegOneKey}}}};
+        auto expCtx = getExpCtx();
+        auto pattern = cst_sort_translation::translateSortSpec(cst, expCtx);
+        auto correctPattern = SortPattern(fromjson("{val: 1, test: -1}"), expCtx);
+        assertSortPatternsEQ(correctPattern, pattern);
+    }
+    {
+        const auto cst =
+            CNode{CNode::ObjectChildren{{UserFieldname{"val"}, CNode{KeyValue::doubleOneKey}},
+                                        {UserFieldname{"test"}, CNode{KeyValue::intNegOneKey}},
+                                        {UserFieldname{"third"}, CNode{KeyValue::longNegOneKey}}}};
+        auto expCtx = getExpCtx();
+        auto pattern = cst_sort_translation::translateSortSpec(cst, expCtx);
+        auto correctPattern = SortPattern(fromjson("{val: 1, test: -1, third: -1}"), expCtx);
+        assertSortPatternsEQ(correctPattern, pattern);
+    }
+}
+
+TEST(CstSortTranslationTest, SortWithMetaGeneratesCorrectSortPattern) {
+    {
+        const auto cst = CNode{CNode::ObjectChildren{
+            {UserFieldname{"val"},
+             CNode{
+                 CNode::ObjectChildren{{KeyFieldname::meta, CNode{KeyValue::randVal}}},
+             }}}};
+        auto expCtx = getExpCtx();
+        auto pattern = cst_sort_translation::translateSortSpec(cst, expCtx);
+        auto correctPattern = SortPattern(fromjson("{val: {$meta: \"randVal\"}}"), expCtx);
+        assertSortPatternsEQ(correctPattern, pattern);
+    }
+    {
+        const auto cst = CNode{CNode::ObjectChildren{
+            {UserFieldname{"val"},
+             CNode{
+                 CNode::ObjectChildren{{KeyFieldname::meta, CNode{KeyValue::textScore}}},
+             }}}};
+        auto expCtx = getExpCtx();
+        auto pattern = cst_sort_translation::translateSortSpec(cst, expCtx);
+        auto correctPattern = SortPattern(fromjson("{val: {$meta: \"textScore\"}}"), expCtx);
+        assertSortPatternsEQ(correctPattern, pattern);
+    }
+}
 }  // namespace
 }  // namespace mongo

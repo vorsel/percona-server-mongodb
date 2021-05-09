@@ -34,12 +34,14 @@
 
 #include "mongo/db/repl/base_cloner.h"
 #include "mongo/db/repl/task_runner.h"
+#include "mongo/db/repl/tenant_base_cloner.h"
+#include "mongo/db/repl/tenant_migration_shared_data.h"
 #include "mongo/util/progress_meter.h"
 
 namespace mongo {
 namespace repl {
 
-class TenantCollectionCloner : public BaseCloner {
+class TenantCollectionCloner : public TenantBaseCloner {
 public:
     struct Stats {
         static constexpr StringData kDocumentsToCopyFieldName = "documentsToCopy"_sd;
@@ -69,7 +71,7 @@ public:
 
     TenantCollectionCloner(const NamespaceString& ns,
                            const CollectionOptions& collectionOptions,
-                           InitialSyncSharedData* sharedData,
+                           TenantMigrationSharedData* sharedData,
                            const HostAndPort& source,
                            DBClientConnection* client,
                            StorageInterface* storageInterface,
@@ -133,11 +135,6 @@ private:
         }
     };
 
-    std::string describeForFuzzer(BaseClonerStage* stage) const final {
-        return _sourceNss.db() + " db: { " + stage->getName() + ": UUID(\"" +
-            _sourceDbAndUuid.uuid()->toString() + "\") coll: " + _sourceNss.coll() + " }";
-    }
-
     /**
      * The preStage sets the start time in _stats.
      */
@@ -199,12 +196,6 @@ private:
      */
     void setMetadataReader();
     void unsetMetadataReader();
-    void setLastVisibleOpTime(OpTime opTime) {
-        _lastVisibleOpTime = opTime;
-    }
-    OpTime getLastVisibleOpTime() {
-        return _lastVisibleOpTime;
-    }
 
     // All member variables are labeled with one of the following codes indicating the
     // synchronization rules for accessing them.
@@ -237,15 +228,10 @@ private:
     // only destroyed after those threads exit.
     TaskRunner _dbWorkTaskRunner;  // (R)
 
-    // TODO(SERVER-49780): Move this into TenantMigrationSharedData.
-    OpTime _lastVisibleOpTime;  // (X)
-
     // The database name prefix of the tenant associated with this migration.
-    // TODO(SERVER-49780): Consider moving this into TenantMigrationSharedData.
     std::string _tenantId;  // (R)
 
     // The operationTime returned with the listIndexes result.
-    // TODO(SERVER-49780): Consider moving this into TenantMigrationSharedData.
     Timestamp _operationTime;  // (X)
 };
 

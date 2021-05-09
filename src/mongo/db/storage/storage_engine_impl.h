@@ -76,6 +76,8 @@ public:
 
     virtual void finishInit() override;
 
+    virtual void notifyStartupComplete() override;
+
     virtual RecoveryUnit* newRecoveryUnit() override;
 
     virtual std::vector<std::string> listDatabases() const override;
@@ -126,7 +128,7 @@ public:
 
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
-    virtual Timestamp getInitialDataTimestamp() override;
+    virtual Timestamp getInitialDataTimestamp() const override;
 
     virtual void setOldestTimestampFromStable() override;
 
@@ -394,7 +396,8 @@ private:
                                const std::string& ident,
                                InternalIdentReconcilePolicy internalIdentReconcilePolicy,
                                ReconcileResult* reconcileResult,
-                               std::set<std::string>* internalIdentsToDrop);
+                               std::set<std::string>* internalIdentsToDrop,
+                               std::set<std::string>* allInternalIdents);
 
     class RemoveDBChange;
 

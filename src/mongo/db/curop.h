@@ -31,10 +31,13 @@
 #pragma once
 
 #include "mongo/config.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/cursor_id.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/profile_filter.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/logv2/attribute_storage.h"
@@ -112,6 +115,11 @@ public:
         void incrementNinserted(long long n);
 
         /**
+         * Increments nUpserted by n.
+         */
+        void incrementNUpserted(long long n);
+
+        /**
          * Increments prepareReadConflicts by n.
          */
         void incrementPrepareReadConflicts(long long n);
@@ -135,6 +143,7 @@ public:
         boost::optional<long long> nModified;
         boost::optional<long long> ninserted;
         boost::optional<long long> ndeleted;
+        boost::optional<long long> nUpserted;
 
         // Number of index keys inserted.
         boost::optional<long long> keysInserted;
@@ -170,6 +179,10 @@ public:
                 FlowControlTicketholder::CurOp flowControlStats,
                 BSONObjBuilder& builder) const;
 
+    static std::function<BSONObj(ProfileFilter::Args args)> appendStaged(StringSet requestedFields,
+                                                                         bool needWholeDocument);
+    static void appendUserInfo(const CurOp&, BSONObjBuilder&, AuthorizationSession*);
+
     /**
      * Copies relevant plan summary metrics to this OpDebug instance.
      */
@@ -178,7 +191,7 @@ public:
     /**
      * The resulting object has zeros omitted. As is typical in this file.
      */
-    BSONObj makeFlowControlObject(FlowControlTicketholder::CurOp flowControlStats) const;
+    static BSONObj makeFlowControlObject(FlowControlTicketholder::CurOp flowControlStats);
 
     /**
      * Make object from $search stats with non-populated values omitted.
@@ -217,7 +230,6 @@ public:
     // True if a replan was triggered during the execution of this operation.
     std::optional<std::string> replanReason;
 
-    bool upsert{false};  // true if the update actually did an insert
     bool cursorExhausted{
         false};  // true if the cursor has been closed at end a find/getMore operation
 
@@ -406,12 +418,20 @@ public:
     }
 
     /**
+     * Gets the name of the namespace on which the current operation operates.
+     */
+    NamespaceString getNSS() const {
+        return NamespaceString{_ns};
+    }
+
+    /**
      * Returns true if the elapsed time of this operation is such that it should be profiled or
      * profile level is set to 2. Uses total time if the operation is done, current elapsed time
-     * otherwise. The argument shouldSample prevents slow diagnostic logging at profile 1
-     * when set to false.
+     * otherwise.
+     *
+     * When a custom filter is set, we conservatively assume it would match this operation.
      */
-    bool shouldDBProfile(bool shouldSample = true) {
+    bool shouldDBProfile(OperationContext* opCtx) {
         // If profiling rate limit feature is enabled then we have different logic
         if (serverGlobalParams.rateLimit > 1)
             return _shouldDBProfileWithRateLimit();
@@ -420,8 +440,11 @@ public:
         if (_dbprofile >= 2)
             return true;
 
-        if (!shouldSample || _dbprofile <= 0)
+        if (_dbprofile <= 0)
             return false;
+
+        if (CollectionCatalog::get(opCtx).getDatabaseProfileSettings(getNSS().db()).filter)
+            return true;
 
         return elapsedTimeExcludingPauses() >= Milliseconds{serverGlobalParams.slowMS};
     }
@@ -719,7 +742,7 @@ public:
 
     void setGenericCursor_inlock(GenericCursor gc);
 
-    const boost::optional<SingleThreadedLockStats> getLockStatsBase() {
+    boost::optional<SingleThreadedLockStats> getLockStatsBase() const {
         return _lockStatsBase;
     }
 

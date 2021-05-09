@@ -81,10 +81,12 @@ class UpdateStage : public RequiresMutableCollectionStage {
     UpdateStage& operator=(const UpdateStage&) = delete;
 
 public:
+    static constexpr StringData kStageType = "UPDATE"_sd;
+
     UpdateStage(ExpressionContext* expCtx,
                 const UpdateStageParams& params,
                 WorkingSet* ws,
-                Collection* collection,
+                const Collection* collection,
                 PlanStage* child);
 
     bool isEOF() override;
@@ -98,38 +100,11 @@ public:
 
     const SpecificStats* getSpecificStats() const final;
 
-    static const char* kStageType;
-
-    /**
-     * Gets a pointer to the UpdateStats inside 'exec'.
-     *
-     * The 'exec' must have an UPDATE stage as its root stage, and the plan must be EOF before
-     * calling this method.
-     */
-    static const UpdateStats* getUpdateStats(const PlanExecutor* exec);
-
-    /**
-     * Populate 'opDebug' with stats from 'updateStats' describing the execution of this update.
-     */
-    static void recordUpdateStatsInOpDebug(const UpdateStats* updateStats, OpDebug* opDebug);
-
-    /**
-     * Converts 'updateStats' into an UpdateResult.
-     */
-    static UpdateResult makeUpdateResult(const UpdateStats* updateStats);
-
-    /**
-     * Returns true if an update failure due to a given DuplicateKey error is eligible for retry.
-     * Requires that parsedUpdate.hasParsedQuery() is true.
-     */
-    static bool shouldRetryDuplicateKeyException(const ParsedUpdate& parsedUpdate,
-                                                 const DuplicateKeyErrorInfo& errorInfo);
-
 protected:
     UpdateStage(ExpressionContext* expCtx,
                 const UpdateStageParams& params,
                 WorkingSet* ws,
-                Collection* collection);
+                const Collection* collection);
 
     void doSaveStateRequiresCollection() final {}
 
@@ -156,14 +131,6 @@ protected:
     mutablebson::DamageVector _damages;
 
 private:
-    static const UpdateStats kEmptyUpdateStats;
-
-    /**
-     * Returns whether a given MatchExpression contains is a MatchType::EQ or a MatchType::AND node
-     * with only MatchType::EQ children.
-     */
-    static bool matchContainsOnlyAndedEqualityNodes(const MatchExpression& root);
-
     /**
      * Computes the result of applying mods to the document 'oldObj' at RecordId 'recordId' in
      * memory, then commits these changes to the database. Returns a possibly unowned copy

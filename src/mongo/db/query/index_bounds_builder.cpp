@@ -568,12 +568,12 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             *tightnessOut = IndexBoundsBuilder::EXACT;
         }
 
-        // This disables indexed negation of array inequality.
-        // TODO: SERVER-45233 Perform correct behavior here once indexed array inequality without
-        // negation's semantics are correctly determined and implemented.
-        massert(ErrorCodes::InternalError,
-                "Indexed negation of array inequality not supported.",
-                *tightnessOut == IndexBoundsBuilder::EXACT);
+        // Generally speaking inverting bounds can only be done for exact bounds. Any looser bounds
+        // (like INEXACT_FETCH) would signal that inversion would be mistakenly excluding some
+        // values. One exception is for collation, whose index bounds are tracked as INEXACT_FETCH,
+        // but only because the index data is different than the user data, not because the range
+        // is imprecise.
+        invariant(*tightnessOut == IndexBoundsBuilder::EXACT || index.collator);
 
         // If the index is multikey on this path, it doesn't matter what the tightness of the child
         // is, we must return INEXACT_FETCH. Consider a multikey index on 'a' with document
@@ -888,14 +888,12 @@ void IndexBoundsBuilder::_translatePredicate(const MatchExpression* expr,
             *tightnessOut = IndexBoundsBuilder::INEXACT_FETCH;
         } else {
             LOGV2_WARNING(20934,
-                          "Planner error trying to build geo bounds for {element} index element",
                           "Planner error trying to build geo bounds for an index element",
                           "element"_attr = elt.toString());
             verify(0);
         }
     } else {
         LOGV2_WARNING(20935,
-                      "Planner error, trying to build bounds for expression: {expression}",
                       "Planner error while trying to build bounds for expression",
                       "expression"_attr = redact(expr->debugString()));
         verify(0);
@@ -1203,8 +1201,7 @@ void IndexBoundsBuilder::alignBounds(IndexBounds* bounds, const BSONObj& kp, int
 
     if (!bounds->isValidFor(kp, scanDir)) {
         LOGV2(20933,
-              "INVALID BOUNDS: {bounds}\nkp = {keyPattern}\nscanDir = {scanDirection}",
-              "INVALID BOUNDS",
+              "Invalid bounds",
               "bounds"_attr = redact(bounds->toString()),
               "keyPattern"_attr = redact(kp),
               "scanDirection"_attr = scanDir);

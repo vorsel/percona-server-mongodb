@@ -25,8 +25,7 @@
  *   does_not_support_stepdowns,
  *   requires_majority_read_concern,
  *   requires_profiling,
- *   uses_transactions,
- *   requires_fcv_47
+ *   uses_transactions
  * ]
  */
 (function() {
@@ -473,6 +472,7 @@ let testCases = {
     internalRenameIfOptionsAndIndexesMatch: {skip: "internal command"},
     invalidateUserCache: {skip: "does not accept read or write concern"},
     isdbgrid: {skip: "does not accept read or write concern"},
+    isMaster: {skip: "does not accept read or write concern"},
     killAllSessions: {skip: "does not accept read or write concern"},
     killAllSessionsByPattern: {skip: "does not accept read or write concern"},
     killCursors: {skip: "does not accept read or write concern"},
@@ -485,6 +485,7 @@ let testCases = {
     listShards: {skip: "does not accept read or write concern"},
     lockInfo: {skip: "does not accept read or write concern"},
     logApplicationMessage: {skip: "does not accept read or write concern"},
+    logMessage: {skip: "does not accept read or write concern"},
     logRotate: {skip: "does not accept read or write concern"},
     logout: {skip: "does not accept read or write concern"},
     makeSnapshot: {skip: "does not accept read or write concern"},
@@ -506,6 +507,7 @@ let testCases = {
     profile: {skip: "does not accept read or write concern"},
     reIndex: {skip: "does not accept read or write concern"},
     reapLogicalSessionCacheNow: {skip: "does not accept read or write concern"},
+    recipientForgetMigration: {skip: "does not accept read or write concern"},
     recipientSyncData: {skip: "does not accept read or write concern"},
     refineCollectionShardKey: {skip: "does not accept read or write concern"},
     refreshLogicalSessionCacheNow: {skip: "does not accept read or write concern"},
@@ -621,6 +623,10 @@ let testCases = {
     startSession: {skip: "does not accept read or write concern"},
     stopRecordingTraffic: {skip: "does not accept read or write concern"},
     testDeprecation: {skip: "does not accept read or write concern"},
+    testDeprecationInVersion2: {skip: "does not accept read or write concern"},
+    testRemoval: {skip: "does not accept read or write concern"},
+    testVersions1And2: {skip: "does not accept read or write concern"},
+    testVersion2: {skip: "does not accept read or write concern"},
     top: {skip: "does not accept read or write concern"},
     unsetSharding: {skip: "internal command"},
     update: {

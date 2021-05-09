@@ -127,6 +127,14 @@ Status AuthzManagerExternalStateMock::findOne(OperationContext* opCtx,
     return Status::OK();
 }
 
+
+bool AuthzManagerExternalStateMock::hasOne(OperationContext* opCtx,
+                                           const NamespaceString& collectionName,
+                                           const BSONObj& query) {
+    BSONObjCollection::iterator iter;
+    return _findOneIter(opCtx, collectionName, query, &iter).isOK();
+}
+
 Status AuthzManagerExternalStateMock::query(
     OperationContext* opCtx,
     const NamespaceString& collectionName,
@@ -189,7 +197,8 @@ Status AuthzManagerExternalStateMock::updateOne(OperationContext* opCtx,
         new ExpressionContext(opCtx, std::unique_ptr<CollatorInterface>(nullptr), collectionName));
     UpdateDriver driver(std::move(expCtx));
     std::map<StringData, std::unique_ptr<ExpressionWithPlaceholder>> arrayFilters;
-    driver.parse(updatePattern, arrayFilters);
+    driver.parse(write_ops::UpdateModification::parseFromClassicUpdate(updatePattern),
+                 arrayFilters);
 
     BSONObjCollection::iterator iter;
     Status status = _findOneIter(opCtx, collectionName, query, &iter);

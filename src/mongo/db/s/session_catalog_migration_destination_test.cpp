@@ -248,7 +248,7 @@ public:
             txnParticipant.beginOrContinue(
                 innerOpCtx.get(), *sessionInfo.getTxnNumber(), boost::none, boost::none);
 
-            const auto reply = performInserts(innerOpCtx.get(), insertRequest);
+            const auto reply = write_ops_exec::performInserts(innerOpCtx.get(), insertRequest);
             ASSERT(reply.results.size() == 1);
             ASSERT(reply.results[0].isOK());
         });
@@ -1728,7 +1728,8 @@ TEST_F(SessionCatalogMigrationDestinationTest, MigratingKnownStmtWhileOplogTrunc
     {
         AutoGetCollection oplogColl(opCtx, NamespaceString::kRsOplogNamespace, MODE_X);
         WriteUnitOfWork wuow(opCtx);
-        ASSERT_OK(oplogColl.getCollection()->truncate(opCtx));  // Empties the oplog collection.
+        ASSERT_OK(
+            oplogColl.getWritableCollection()->truncate(opCtx));  // Empties the oplog collection.
         wuow.commit();
     }
 
