@@ -80,6 +80,15 @@ public:
          */
         Status checkIfOptionsConflict(BSONObj options);
 
+        /**
+         * Returns a Future that will be resolved when the migration has committed or aborted.
+         */
+        SharedSemiFuture<void> getDecisionFuture() const {
+            return _decisionPromise.getFuture();
+        }
+
+        void onReceiveDonorForgetMigration();
+
     private:
         const NamespaceString _stateDocumentsNS = NamespaceString::kTenantMigrationDonorsNamespace;
 
@@ -98,10 +107,24 @@ public:
         repl::OpTime _updateStateDocument(const TenantMigrationDonorStateEnum nextState);
 
         /**
+         * Sets the "expireAt" time for the state document to be garbage collected.
+         */
+        repl::OpTime _markStateDocumentAsGarbageCollectable();
+
+        /**
          * Waits for given opTime to be majority committed.
          */
         ExecutorFuture<void> _waitForMajorityWriteConcern(
             const std::shared_ptr<executor::ScopedTaskExecutor>& executor, repl::OpTime opTime);
+
+        /**
+         * Sends the given command to the recipient replica set.
+         */
+        ExecutorFuture<void> _sendCommandToRecipient(
+            OperationContext* opCtx,
+            const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+            RemoteCommandTargeter* recipientTargeter,
+            const BSONObj& cmdObj);
 
         /**
          * Sends the recipientSyncData command to the recipient replica set.
@@ -110,12 +133,27 @@ public:
             const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
             RemoteCommandTargeter* recipientTargeter);
 
+        /**
+         * Sends the recipientForgetMigration command to the recipient replica set.
+         */
+        ExecutorFuture<void> _sendRecipientForgetMigrationCommand(
+            const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+            RemoteCommandTargeter* recipientTargeter);
+
+        mutable Mutex _mutex = MONGO_MAKE_LATCH("TenantMigrationDonorService::_mutex");
+
         ServiceContext* _serviceContext;
 
         TenantMigrationDonorDocument _stateDoc;
 
         std::shared_ptr<TenantMigrationAccessBlocker> _mtab;
         boost::optional<Status> _abortReason;
+
+        // Promise that is resolved when the donor has majority-committed the migration decision.
+        SharedPromise<void> _decisionPromise;
+
+        // Promise that is resolved when the donor receives the donorForgetMigration command.
+        SharedPromise<void> _receivedDonorForgetMigrationPromise;
     };
 
 private:

@@ -136,10 +136,12 @@ public:
      */
     class ValueHandle {
     public:
-        // The two constructors below are present in order to offset the fact that the cache doesn't
-        // support pinning items. Their only usage must be in the authorization mananager for the
-        // internal authentication user.
+        // The three constructors below are present in order to offset the fact that the cache
+        // doesn't support pinning items. Their only usage must be in the authorization mananager
+        // for the internal authentication user.
         ValueHandle(Value&& value) : _valueHandle({std::move(value), Date_t::min()}) {}
+        ValueHandle(Value&& value, const Time& t)
+            : _valueHandle({std::move(value), Date_t::min()}, t) {}
         ValueHandle() = default;
 
         operator bool() const {
@@ -286,6 +288,16 @@ public:
         const Key& key,
         CacheCausalConsistency causalConsistency = CacheCausalConsistency::kLatestCached) {
         return acquireAsync(key, causalConsistency).get(opCtx);
+    }
+
+    /**
+     * Acquires the latest value from the cache, or an empty ValueHandle if the key is not present
+     * in the cache.
+     *
+     * Doesn't attempt to lookup, and so doesn't block.
+     */
+    ValueHandle peekLatestCached(const Key& key) {
+        return {_cache.get(key, CacheCausalConsistency::kLatestCached)};
     }
 
     /**
@@ -544,7 +556,11 @@ public:
                 if constexpr (std::is_same_v<Time, CacheNotCausallyConsistent>) {
                     return _cache._lookupFn(opCtx, _key, _cachedValue);
                 } else {
-                    return _cache._lookupFn(opCtx, _key, _cachedValue, _minTimeInStore);
+                    auto minTimeInStore = [&] {
+                        stdx::lock_guard lg(_cache._mutex);
+                        return _minTimeInStore;
+                    }();
+                    return _cache._lookupFn(opCtx, _key, _cachedValue, minTimeInStore);
                 }
             });
         }));

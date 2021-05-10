@@ -128,6 +128,7 @@
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/tenant_migration_donor_service.h"
+#include "mongo/db/repl/tenant_migration_recipient_service.h"
 #include "mongo/db/repl/topology_coordinator.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/repl_set_member_in_standalone_mode.h"
@@ -138,6 +139,7 @@
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
+#include "mongo/db/s/resharding/resharding_coordinator_service.h"
 #include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
@@ -305,9 +307,15 @@ void initializeCommandHooks(ServiceContext* serviceContext) {
 
 void registerPrimaryOnlyServices(ServiceContext* serviceContext) {
     auto registry = repl::PrimaryOnlyServiceRegistry::get(serviceContext);
-    std::unique_ptr<TenantMigrationDonorService> tenantMigrationDonorService =
-        std::make_unique<TenantMigrationDonorService>(serviceContext);
-    registry->registerService(std::move(tenantMigrationDonorService));
+
+    std::vector<std::unique_ptr<repl::PrimaryOnlyService>> services;
+    services.push_back(std::make_unique<TenantMigrationDonorService>(serviceContext));
+    services.push_back(std::make_unique<repl::TenantMigrationRecipientService>(serviceContext));
+    services.push_back(std::make_unique<ReshardingCoordinatorService>(serviceContext));
+
+    for (auto& service : services) {
+        registry->registerService(std::move(service));
+    }
 }
 
 MONGO_FAIL_POINT_DEFINE(shutdownAtStartup);
@@ -447,13 +455,6 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     initializeSNMP();
 
     startWatchdog(serviceContext);
-
-    // When starting up after an unclean shutdown, we do not attempt to use any of the temporary
-    // files left from the previous run. Thus, we remove them in this case.
-    if (!storageGlobalParams.readOnly &&
-        LastStorageEngineShutdownState::kUnclean == lastStorageEngineShutdownState) {
-        boost::filesystem::remove_all(storageGlobalParams.dbpath + "/_tmp/");
-    }
 
     if (mongodGlobalParams.scriptingEnabled) {
         ScriptEngine::setup();
@@ -1127,10 +1128,6 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
 
     LOGV2_OPTIONS(4784902, {LogComponent::kSharding}, "Shutting down the WaitForMajorityService");
     WaitForMajorityService::get(serviceContext).shutDown();
-
-    LOGV2_OPTIONS(
-        5006600, {LogComponent::kReplication}, "Shutting down the PrimaryOnlyServiceRegistry");
-    repl::PrimaryOnlyServiceRegistry::get(serviceContext)->shutdown();
 
     // Join the logical session cache before the transport layer.
     if (auto lsc = LogicalSessionCache::get(serviceContext)) {

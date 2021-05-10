@@ -46,9 +46,7 @@ replTest.initiate(config);
 
 // Get connections.
 var oldPrimary = replTest.getPrimary();
-var newPrimary = replTest._slaves[0];
-var pureSecondary = replTest._slaves[1];
-var arbiters = [replTest.nodes[3], replTest.nodes[4]];
+var [newPrimary, pureSecondary, ...arbiters] = replTest.getSecondaries();
 
 // This is the collection that all of the tests will use.
 var collName = name + '.collection';
@@ -77,7 +75,7 @@ assert.eq(doDirtyRead(oldPrimaryColl), 'INVALID');
 assert.eq(doCommittedRead(oldPrimaryColl), 'old');
 
 // Change the partitioning so that oldPrimary is isolated, and newPrimary can be elected.
-oldPrimary.setSlaveOk();
+oldPrimary.setSecondaryOk();
 oldPrimary.disconnect(arbiters);
 newPrimary.reconnect(arbiters);
 assert.soon(() => newPrimary.adminCommand('isMaster').ismaster, '', 60 * 1000);

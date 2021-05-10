@@ -29,8 +29,9 @@ RollbackResumableIndexBuildTest.run(rollbackTest,
                                     {a: 1},
                                     rollbackStartFailPointName,
                                     {iteration: 1},
-                                    "hangAfterSettingUpIndexBuildUnlocked",
+                                    "hangAfterSettingUpIndexBuild",
                                     {},
+                                    "setYieldAllLocksHang",
                                     insertsToBeRolledBack);
 
 // Rollback to the collection scan phase.
@@ -41,7 +42,8 @@ RollbackResumableIndexBuildTest.run(rollbackTest,
                                     rollbackStartFailPointName,
                                     {iteration: 1},
                                     "hangIndexBuildDuringCollectionScanPhaseBeforeInsertion",
-                                    {fieldsToMatch: {a: 2}},
+                                    {iteration: 1},
+                                    "setYieldAllLocksHang",
                                     insertsToBeRolledBack);
 
 rollbackTest.stop();

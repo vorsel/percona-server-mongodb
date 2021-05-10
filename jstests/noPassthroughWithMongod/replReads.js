@@ -1,4 +1,4 @@
-// Test that doing slaveOk reads from secondaries hits all the secondaries evenly
+// Test that doing secondaryOk reads from secondaries hits all the secondaries evenly
 // @tags: [requires_sharding]
 
 function testReadLoadBalancing(numReplicas) {
@@ -13,7 +13,7 @@ function testReadLoadBalancing(numReplicas) {
     s.getDB("test").foo.insert({a: 123});
 
     primary = s.rs0.getPrimary();
-    secondaries = s.rs0._slaves;
+    secondaries = s.rs0.getSecondaries();
 
     function rsStats() {
         return s.getDB("admin").runCommand("connPoolStats")["replicaSets"][s.rs0.name];
@@ -52,7 +52,7 @@ function testReadLoadBalancing(numReplicas) {
 
     for (var i = 0; i < secondaries.length * 10; i++) {
         conn = new Mongo(s._mongos[0].host);
-        conn.setSlaveOk();
+        conn.setSecondaryOk();
         conn.getDB('test').foo.findOne();
         connections.push(conn);
     }
@@ -99,11 +99,11 @@ function testReadLoadBalancing(numReplicas) {
     }, "one slave not ok", 180000, 5000);
 
     // Secondaries may change here
-    secondaries = s.rs0._slaves;
+    secondaries = s.rs0.getSecondaries();
 
     for (var i = 0; i < secondaries.length * 10; i++) {
         conn = new Mongo(s._mongos[0].host);
-        conn.setSlaveOk();
+        conn.setSecondaryOk();
         conn.getDB('test').foo.findOne();
         connections.push(conn);
     }

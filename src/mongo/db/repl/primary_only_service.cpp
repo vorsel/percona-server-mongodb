@@ -36,7 +36,9 @@
 #include <utility>
 
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/ops/write_ops.h"
@@ -195,6 +197,12 @@ void PrimaryOnlyServiceRegistry::onStartup(OperationContext* opCtx) {
     }
 }
 
+void PrimaryOnlyServiceRegistry::onShutdown() {
+    for (auto& service : _servicesByName) {
+        service.second->shutdown();
+    }
+}
+
 void PrimaryOnlyServiceRegistry::onStepUpComplete(OperationContext* opCtx, long long term) {
     auto replCoord = ReplicationCoordinator::get(opCtx);
 
@@ -219,14 +227,20 @@ void PrimaryOnlyServiceRegistry::onStepDown() {
     }
 }
 
-void PrimaryOnlyServiceRegistry::shutdown() {
+void PrimaryOnlyServiceRegistry::reportServiceInfo(BSONObjBuilder* result) {
+    BSONObjBuilder subBuilder(result->subobjStart("primaryOnlyServices"));
     for (auto& service : _servicesByName) {
-        service.second->shutdown();
+        subBuilder.appendNumber(service.first, service.second->getNumberOfInstances());
     }
 }
 
 PrimaryOnlyService::PrimaryOnlyService(ServiceContext* serviceContext)
     : _serviceContext(serviceContext) {}
+
+size_t PrimaryOnlyService::getNumberOfInstances() {
+    stdx::lock_guard lk(_mutex);
+    return _instances.size();
+}
 
 bool PrimaryOnlyService::isRunning() const {
     stdx::lock_guard lk(_mutex);

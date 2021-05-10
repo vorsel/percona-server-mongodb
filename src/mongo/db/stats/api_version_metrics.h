@@ -29,7 +29,7 @@
 
 #pragma once
 
-#include "mongo/db/initialize_api_parameters.h"
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/rpc/metadata/client_metadata.h"

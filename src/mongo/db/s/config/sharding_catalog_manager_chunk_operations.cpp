@@ -46,6 +46,7 @@
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/snapshot_window_options_gen.h"
+#include "mongo/db/transaction_participant_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -334,12 +335,14 @@ BSONObj getShardAndCollectionVersion(OperationContext* opCtx,
     ChunkVersion shardVersion;
 
     if (!swDonorShardVersion.isOK()) {
-        // The query to find 'nss' chunks belonging to the donor shard didn't return any, meaning
-        // the last chunk was donated
-        uassert(505770,
-                str::stream() << "Couldn't retrieve donor chunks from config server",
-                swDonorShardVersion.getStatus().code() == 50577);
-        shardVersion = ChunkVersion(0, 0, collectionVersion.epoch());
+        if (swDonorShardVersion.getStatus().code() == 50577) {
+            // The query to find 'nss' chunks belonging to the donor shard didn't return any chunks,
+            // meaning the last chunk for fromShard was donated. Gracefully handle the error.
+            shardVersion = ChunkVersion(0, 0, collectionVersion.epoch());
+        } else {
+            // Bubble up any other error
+            uassertStatusOK(swDonorShardVersion);
+        }
     } else {
         shardVersion = swDonorShardVersion.getValue();
     }
@@ -844,8 +847,9 @@ StatusWith<BSONObj> ShardingCatalogManager::commitChunkMigration(
     // Drop old history. Keep at least 1 entry so ChunkInfo::getShardIdAt finds valid history for
     // any query younger than the history window.
     if (!MONGO_unlikely(skipExpiringOldChunkHistory.shouldFail())) {
-        const int kHistorySecs = 10;
-        auto windowInSeconds = std::max(minSnapshotHistoryWindowInSeconds.load(), kHistorySecs);
+        auto windowInSeconds = std::max(std::max(minSnapshotHistoryWindowInSeconds.load(),
+                                                 gTransactionLifetimeLimitSeconds.load()),
+                                        10);
         int entriesDeleted = 0;
         while (newHistory.size() > 1 &&
                newHistory.back().getValidAfter().getSecs() + windowInSeconds <

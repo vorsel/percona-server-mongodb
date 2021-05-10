@@ -358,15 +358,18 @@ public:
     /*
      * Returns the list of API versions that include this command.
      */
-    virtual const std::set<std::string>& apiVersions() const {
-        return kNoApiVersions;
-    }
+    virtual const std::set<std::string>& apiVersions() const;
 
     /*
      * Returns the list of API versions in which this command is deprecated.
      */
-    virtual const std::set<std::string>& deprecatedApiVersions() const {
-        return kNoApiVersions;
+    virtual const std::set<std::string>& deprecatedApiVersions() const;
+
+    /*
+     * Some commands permit any values for apiVersion, apiStrict, and apiDeprecationErrors.
+     */
+    virtual bool acceptsAnyApiVersionParameters() const {
+        return false;
     }
 
     /**

@@ -904,11 +904,13 @@ env.Library(
         '$BUILD_DIR/mongo/db/s/sharding_api_d',
         '$BUILD_DIR/mongo/db/stats/api_version_metrics',
         '$BUILD_DIR/mongo/db/stats/counters',
+        '$BUILD_DIR/mongo/db/stats/resource_consumption_metrics',
         '$BUILD_DIR/mongo/db/stats/server_read_concern_write_concern_metrics',
         '$BUILD_DIR/mongo/db/stats/top',
         '$BUILD_DIR/mongo/db/storage/storage_engine_lock_file',
         '$BUILD_DIR/mongo/db/storage/storage_engine_metadata',
         'commands/server_status_core',
+        'initialize_api_parameters',
         'introspect',
         'lasterror',
         'query_exec',
@@ -1500,13 +1502,35 @@ env.Library(
 env.Library(
     target='shared_request_handling',
     source=[
-        'initialize_api_parameters.cpp',
         'transaction_validation.cpp',
-        env.Idlc('initialize_api_parameters.idl')[0],
     ],
     LIBDEPS=[
+        'api_parameters',
         'error_labels',
         'logical_session_cache_impl',
+    ],
+)
+
+env.Library(
+    target='api_parameters',
+    source=[
+        'api_parameters.cpp',
+        env.Idlc('api_parameters.idl')[0],
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/idl/server_parameter',
+    ],
+)
+
+env.Library(
+    target='initialize_api_parameters',
+    source=[
+        'initialize_api_parameters.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        'api_parameters',
+        'commands',
     ],
 )
 
@@ -2155,6 +2179,7 @@ env.Library(
         'repl/replication_recovery',
         'repl/serveronly_repl',
         'repl/storage_interface_impl',
+        'repl/tenant_migration_recipient_service',
         'repl/topology_coordinator',
         'repl/wait_for_majority_service',
         's/sessions_collection_config_server',

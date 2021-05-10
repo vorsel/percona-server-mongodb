@@ -314,8 +314,10 @@ TEST_F(MigrationUtilsTest, TestInvalidUUID) {
     ASSERT_FALSE(migrationutil::checkForConflictingDeletions(opCtx, range, wrongUuid));
 }
 
-// Fixture that uses a mocked CatalogCacheLoader and CatalogClient to allow metadata refreshes
-// without using the mock network.
+/**
+ * Fixture that uses a mocked CatalogCacheLoader and CatalogClient to allow metadata refreshes
+ * without using the mock network.
+ */
 class SubmitRangeDeletionTaskTest : public ShardServerTestFixture {
 public:
     const HostAndPort kConfigHostAndPort{"dummy", 123};
@@ -362,9 +364,8 @@ public:
 
     void tearDown() override {
         WaitForMajorityService::get(getServiceContext()).shutDown();
-        CatalogCacheLoader::clearForTests(getServiceContext());
-        ShardingMongodTestFixture::tearDown();
-        CollectionShardingStateFactory::clear(getServiceContext());
+
+        ShardServerTestFixture::tearDown();
     }
 
     // Mock for the ShardingCatalogClient used to satisfy loading all shards for the ShardRegistry
@@ -521,7 +522,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(
         Status(ErrorCodes::NamespaceNotFound, "dummy errmsg"));
-    forceShardFilteringMetadataRefresh(opCtx, kNss, true);
+    forceShardFilteringMetadataRefresh(opCtx, kNss);
 
     auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
 
@@ -552,7 +553,7 @@ TEST_F(SubmitRangeDeletionTaskTest, SucceedsIfFilteringMetadataUUIDMatchesTaskUU
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
         makeChangedChunks(ChunkVersion(1, 0, kEpoch)));
     _mockCatalogClient->setCollections({coll});
-    forceShardFilteringMetadataRefresh(opCtx, kNss, true);
+    forceShardFilteringMetadataRefresh(opCtx, kNss);
 
     // The task should have been submitted successfully.
     auto cleanupCompleteFuture = migrationutil::submitRangeDeletionTask(opCtx, deletionTask);
@@ -595,7 +596,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(
         Status(ErrorCodes::NamespaceNotFound, "dummy errmsg"));
-    forceShardFilteringMetadataRefresh(opCtx, kNss, true);
+    forceShardFilteringMetadataRefresh(opCtx, kNss);
 
     auto collectionUUID = createCollectionAndGetUUID(kNss);
     auto deletionTask = createDeletionTask(kNss, collectionUUID, 0, 10, _myShardName);
@@ -632,7 +633,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
         makeChangedChunks(ChunkVersion(1, 0, staleEpoch)));
     _mockCatalogClient->setCollections({staleColl});
-    forceShardFilteringMetadataRefresh(opCtx, kNss, true);
+    forceShardFilteringMetadataRefresh(opCtx, kNss);
 
     auto collectionUUID = createCollectionAndGetUUID(kNss);
     auto deletionTask = createDeletionTask(kNss, collectionUUID, 0, 10, _myShardName);

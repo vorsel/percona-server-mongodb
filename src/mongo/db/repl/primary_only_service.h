@@ -217,6 +217,11 @@ public:
      */
     bool isRunning() const;
 
+    /**
+     * Returns the number of currently running Instances of this service.
+     */
+    size_t getNumberOfInstances();
+
 protected:
     /**
      * Constructs a new Instance object with the given initial state.
@@ -329,11 +334,13 @@ public:
     PrimaryOnlyService* lookupServiceByNamespace(const NamespaceString& ns);
 
     /**
-     * Shuts down all registered services.
+     * Adds a 'primaryOnlyServices' sub-obj to the 'result' BSONObjBuilder containing a count of the
+     * number of active instances for each registered service.
      */
-    void shutdown();
+    void reportServiceInfo(BSONObjBuilder* result);
 
     void onStartup(OperationContext*) final;
+    void onShutdown() final;
     void onStepUpBegin(OperationContext*, long long term) final {}
     void onBecomeArbiter() final {}
     void onStepUpComplete(OperationContext*, long long term) final;

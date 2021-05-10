@@ -768,12 +768,12 @@ functions:
         set -o errexit
 
         cat <<EOF > notary_env.sh
-        export NOTARY_TOKEN=${signing_auth_token_46}
+        export NOTARY_TOKEN=${signing_auth_token_48}
         export BARQUE_USERNAME=${barque_user}
         export BARQUE_API_KEY=${barque_api_key}
         EOF
 
-        echo "${signing_auth_token_46}" > signing_auth_token
+        echo "${signing_auth_token_48}" > signing_auth_token
 
   "set up remote credentials": &set_up_remote_credentials
     command: shell.exec
@@ -3630,7 +3630,7 @@ tasks:
           set -o errexit
           set -o verbose
           # TODO SERVER-49884 Remove this when we no longer check in generated Bison.
-          BISON_GENERATED_PATTERN=pipeline_parser_gen\.cpp
+          BISON_GENERATED_PATTERN=parser_gen\.cpp
           # This could probably be accelerated with gnu parallel
           /opt/mongodbtoolchain/v3/bin/clang-tidy \
             -p ./compile_commands.json \
@@ -7797,7 +7797,7 @@ tasks:
           mv distsrc.${ext|tgz} mongodb-src-${src_suffix}.${ext|tar.gz} || true
           /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-${push_name}-${push_arch}-${suffix}.msi || true
 
-          /usr/local/bin/notary-client.py --key-name "server-4.6" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz} mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+          /usr/local/bin/notary-client.py --key-name "server-4.8" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz} mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}
 
     # Put the binaries tarball/zipfile
     - command: s3.put
@@ -10468,16 +10468,15 @@ buildvariants:
   - name: snmp
   - name: .updatefuzzer
 
-- name: enterprise-rhel-62-64-bit-resumable-index-builds
-  display_name: "Enterprise RHEL 6.2 (resumable index builds)"
+- name: enterprise-rhel-62-64-bit-non-resumable-index-builds
+  display_name: "Enterprise RHEL 6.2 (non-resumable index builds)"
   modules:
   - enterprise
   run_on:
   - rhel62-small
-  expansions: &enterprise-rhel-62-64-bit-resumable-index-builds-expansions
+  expansions: &enterprise-rhel-62-64-bit-non-resumable-index-builds-expansions
     test_flags: >-
-      --mongodSetParameters="{enableResumableIndexBuilds: true}"
-      --excludeWithAnyTags=resumable_index_build_incompatible
+      --mongodSetParameters="{enableResumableIndexBuilds: false}"
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
       --ssl
@@ -12752,6 +12751,7 @@ buildvariants:
     num_scons_link_jobs_available: 0.99
     record_with: --recordWith /opt/undodb5/bin/live-record
     exec_timeout_secs: 14400 # 4 hours
+    test_flags: --excludeWithAnyTags=requires_fast_memory
   tasks:
   - name: compile_without_package_TG
   - name: .jscore .common
@@ -12765,6 +12765,24 @@ buildvariants:
   - name: sharded_jscore_txns_sharded_collections
   - name: sharding_jscore_passthrough
   - name: sharding_jscore_op_query_passthrough
+  - name: aggregation
+  - name: aggregation_auth
+  - name: aggregation_disabled_optimization
+  - name: aggregation_ese
+  - name: aggregation_ese_gcm
+  - name: aggregation_facet_unwind_passthrough
+  - name: aggregation_slot_based_execution
+  - name: .auth .gle
+  - name: .jscore .encrypt
+  - name: noPassthroughWithMongod_gen
+  - name: parallel_compatibility
+  - name: serial_run
+  - name: session_jscore_passthrough
+  - name: .aggfuzzer
+  - name: query_fuzzer_standalone_gen
+  - name: update_fuzzer_gen
+  - name: jstestfuzz_gen
+  - name: jstestfuzz_interrupt_gen
 
 - <<: *enterprise-rhel-62-64-bit-dynamic-required-template
   name: rhel-62-64-bit-dynamic-visibility-test

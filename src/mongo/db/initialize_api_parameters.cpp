@@ -27,7 +27,16 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/initialize_api_parameters.h"
+
+#include <string>
+
+#include "mongo/db/commands.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
@@ -42,6 +51,10 @@ const APIParametersFromClient initializeAPIParameters(OperationContext* opCtx,
             498870,
             "The apiVersion parameter is required, please configure your MongoClient's API version",
             apiParamsFromClient.getApiVersion());
+    }
+
+    if (command->acceptsAnyApiVersionParameters()) {
+        return apiParamsFromClient;
     }
 
     if (apiParamsFromClient.getApiDeprecationErrors() || apiParamsFromClient.getApiStrict()) {
@@ -86,46 +99,6 @@ const APIParametersFromClient initializeAPIParameters(OperationContext* opCtx,
     }
 
     return apiParamsFromClient;
-}
-
-const OperationContext::Decoration<APIParameters> handle =
-    OperationContext::declareDecoration<APIParameters>();
-
-APIParameters& APIParameters::get(OperationContext* opCtx) {
-    return handle(opCtx);
-}
-
-APIParameters APIParameters::fromClient(const APIParametersFromClient& apiParamsFromClient) {
-    APIParameters apiParameters = APIParameters();
-    auto apiVersion = apiParamsFromClient.getApiVersion();
-    auto apiStrict = apiParamsFromClient.getApiStrict();
-    auto apiDeprecationErrors = apiParamsFromClient.getApiDeprecationErrors();
-
-    if (apiVersion) {
-        apiParameters.setAPIVersion(apiVersion.value());
-    }
-
-    if (apiStrict) {
-        apiParameters.setAPIStrict(apiStrict.value());
-    }
-
-    if (apiDeprecationErrors) {
-        apiParameters.setAPIDeprecationErrors(apiDeprecationErrors.value());
-    }
-
-    return apiParameters;
-}
-
-void APIParameters::appendInfo(BSONObjBuilder* builder) const {
-    if (_apiVersion) {
-        builder->append(kAPIVersionFieldName, *_apiVersion);
-    }
-    if (_apiStrict) {
-        builder->append(kAPIStrictFieldName, *_apiStrict);
-    }
-    if (_apiDeprecationErrors) {
-        builder->append(kAPIDeprecationErrorsFieldName, *_apiDeprecationErrors);
-    }
 }
 
 }  // namespace mongo

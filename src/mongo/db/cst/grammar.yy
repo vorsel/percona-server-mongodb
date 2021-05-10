@@ -28,12 +28,11 @@
  */
 
 //
-// This is a grammar file to describe the syntax of the aggregation pipeline language. It is
+// This is a grammar file to describe the syntax of the Mongo Query Language. It is
 // ingested by GNU Bison (https://www.gnu.org/software/bison/) to generate native C++ parser code
 // based on the rules provided here.
 //
-// To manually generate the parser files, run
-// 'bison pipeline_grammar.yy -o pipeline_parser_gen.cpp'.
+// To manually generate the parser files, run 'bison grammar.yy -o parser_gen.cpp'.
 //
 %require "3.5"
 %language "c++"
@@ -56,7 +55,7 @@
 
 %define parse.assert
 %define api.namespace {mongo}
-%define api.parser.class {PipelineParserGen}
+%define api.parser.class {ParserGen}
 
 // Track locations of symbols.
 %locations
@@ -90,7 +89,7 @@
 
     namespace mongo {
         // Mandatory error function.
-        void PipelineParserGen::error (const PipelineParserGen::location_type& loc,
+        void ParserGen::error (const ParserGen::location_type& loc,
                                        const std::string& msg) {
             uasserted(ErrorCodes::FailedToParse, str::stream() << msg << " at element " << loc);
         }
@@ -122,6 +121,7 @@
     ARG_COLL "coll argument"
     ARG_DATE "date argument"
     ARG_DATE_STRING "dateString argument"
+    ARG_FILTER "filter"
     ARG_FIND "find argument"
     ARG_FORMAT "format argument"
     ARG_INPUT "input argument"
@@ -129,9 +129,12 @@
     ARG_ON_NULL "onNull argument"
     ARG_OPTIONS "options argument"
     ARG_PIPELINE "pipeline argument"
+    ARG_Q "q"
+    ARG_QUERY "query"
     ARG_REGEX "regex argument"
     ARG_REPLACEMENT "replacement argument"
     ARG_SIZE "size argument"
+    ARG_SORT "sort argument"
     ARG_TIMEZONE "timezone argument"
     ARG_TO "to argument"
     ATAN2
@@ -178,6 +181,7 @@
     MOD
     MULTIPLY
     NE
+    NOR
     NOT
     OR
     POW
@@ -246,17 +250,16 @@
 %token <std::string> DOLLAR_STRING "$-prefixed string"
 %token <std::string> DOLLAR_DOLLAR_STRING "$$-prefixed string"
 %token <std::string> DOLLAR_PREF_FIELDNAME "$-prefixed fieldname"
-%token START_PIPELINE START_MATCH START_SORT
 
 //
 // Semantic values (aka the C++ types produced by the actions).
 //
 
 // Possible user fieldnames.
-%nterm <CNode::Fieldname> projectionFieldname expressionFieldname stageAsUserFieldname filterFieldname
+%nterm <CNode::Fieldname> projectionFieldname expressionFieldname stageAsUserFieldname predFieldname
 %nterm <CNode::Fieldname> argAsUserFieldname aggExprAsUserFieldname invariableUserFieldname
 %nterm <CNode::Fieldname> idAsUserFieldname valueFieldname
-%nterm <std::pair<CNode::Fieldname, CNode>> projectField expressionField valueField filterField
+%nterm <std::pair<CNode::Fieldname, CNode>> projectField expressionField valueField
 
 // Literals.
 %nterm <CNode> dbPointer javascript symbol javascriptWScope int timestamp long double decimal
@@ -281,7 +284,11 @@
 %nterm <std::pair<CNode::Fieldname, CNode>> onErrorArg onNullArg
 %nterm <std::pair<CNode::Fieldname, CNode>> formatArg timezoneArg charsArg optionsArg
 %nterm <std::vector<CNode>> expressions values exprZeroToTwo
-%nterm <CNode> matchExpression filterFields filterVal
+
+// Match expressions.
+%nterm <CNode> match predicates compoundMatchExprs predValue additionalExprs
+%nterm <std::pair<CNode::Fieldname, CNode>> predicate logicalExpr operatorExpression notExpr
+%nterm <CNode::Fieldname> logicalExprField
 
 // Sort related rules
 %nterm <CNode> sortSpecs specList metaSort oneOrNegOne metaSortKeyword
@@ -294,16 +301,20 @@
 %%
 
 start:
-    START_PIPELINE pipeline {
-        invariant(cst);
+    ARG_PIPELINE pipeline {
         *cst = $pipeline;
     }
-    | START_MATCH matchExpression {
-        invariant(cst);
-        *cst = $matchExpression;
+    | ARG_FILTER match {
+        *cst = $match;
     }
-    | START_SORT sortSpecs {
-        *cst = CNode{$sortSpecs};
+    | ARG_QUERY match {
+        *cst = $match;
+    }
+    | ARG_Q match {
+        *cst = $match;
+    }
+    | ARG_SORT sortSpecs {
+        *cst = $sortSpecs;
     }
 ;
 
@@ -485,35 +496,91 @@ projectionFieldname:
     invariableUserFieldname | stageAsUserFieldname | argAsUserFieldname | aggExprAsUserFieldname
 ;
 
-matchExpression:
-    START_OBJECT filterFields END_OBJECT {
-        $$ = $filterFields;
+match:
+    START_OBJECT predicates END_OBJECT {
+        $$ = $predicates;
     }
 ;
 
-filterFields:
+predicates:
     %empty {
         $$ = CNode::noopLeaf();
     }
-    | filterFields[filterArg] filterField {
+    | predicates[filterArg] predicate {
         $$ = $filterArg;
-        $$.objectChildren().emplace_back($filterField);
+        $$.objectChildren().emplace_back($predicate);
     }
 ;
 
-filterField: filterFieldname filterVal {
-        $$ = {$filterFieldname, $filterVal};
+predicate: predFieldname predValue {
+        $$ = {$predFieldname, $predValue};
+    }
+    | logicalExpr {
+        $$ = $logicalExpr;
     }
 ;
 
-filterVal:
-    value
+// TODO SERVER-48847: This rule assumes that object predicates always contain sub-expressions.
+// Will need to expand to allow comparisons against literal objects (note that order of fields
+// in object predicates is important! --> {a: 1, $gt: 2} is different than {$gt: 2, a: 1}).
+predValue:
+    simpleValue 
+    | START_OBJECT compoundMatchExprs END_OBJECT {
+        $$ = $compoundMatchExprs;
+    }
+;
+
+compoundMatchExprs: 
+    %empty {
+        $$ = CNode::noopLeaf();
+    }
+    | compoundMatchExprs[exprs] operatorExpression {
+        $$ = $exprs;
+        $$.objectChildren().emplace_back($operatorExpression);
+    }
+;
+
+// Rules for the operators which act on a path.
+operatorExpression: notExpr
+
+notExpr:
+    NOT regex {
+        $$ = std::pair{KeyFieldname::notExpr, $regex};
+    }
+    // $not requires an object with atleast one expression.
+    | NOT START_OBJECT operatorExpression compoundMatchExprs END_OBJECT {
+        auto&& exprs = $compoundMatchExprs;
+        exprs.objectChildren().emplace_back($operatorExpression);
+
+        $$ = std::pair{KeyFieldname::notExpr, std::move(exprs)};
+    }
+;
+
+// Logical expressions accept an array of objects, with at least one element.
+logicalExpr: logicalExprField START_ARRAY match additionalExprs END_ARRAY {
+        auto&& children = $additionalExprs;
+        children.arrayChildren().emplace_back($match);
+        $$ = {$logicalExprField, std::move(children)};
+    }
+;
+
+logicalExprField: 
+    AND { $$ = KeyFieldname::andExpr; }
+    | OR { $$ = KeyFieldname::orExpr; }
+    | NOR { $$ = KeyFieldname::norExpr; }
+
+additionalExprs: 
+    %empty {
+        $$ = CNode{CNode::ArrayChildren{}};
+    }
+    | additionalExprs[exprs] match {
+        $$ = $exprs;
+        $$.arrayChildren().emplace_back($match);
+    }
 ;
 
 // Filter predicates are *not* allowed over $-prefixed field names.
-filterFieldname:
-    idAsUserFieldname | invariableUserFieldname | argAsUserFieldname
-;
+predFieldname: idAsUserFieldname | argAsUserFieldname | invariableUserFieldname;
 
 invariableUserFieldname:
     FIELDNAME {
@@ -595,6 +662,12 @@ argAsUserFieldname:
     }
     | ARG_REPLACEMENT {
         $$ = UserFieldname{"replacement"};
+    }
+    | ARG_FILTER {
+        $$ = UserFieldname{"filter"};
+    }
+    | ARG_Q {
+        $$ = UserFieldname{"q"};
     }
 ;
 

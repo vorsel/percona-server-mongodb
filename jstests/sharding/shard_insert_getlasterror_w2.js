@@ -64,14 +64,13 @@ assert.commandWorked(bulk.execute({w: replNodes, wtimeout: 30000}));
 
 // Take down two nodes and make sure slaveOk reads still work
 var primary = replSet1.getPrimary();
-var secondary1 = replSet1._slaves[0];
-var secondary2 = replSet1._slaves[1];
+var [secondary1, secondary2] = replSet1.getSecondaries();
 replSet1.stop(secondary1);
 replSet1.stop(secondary2);
 replSet1.waitForState(primary, ReplSetTest.State.SECONDARY);
 
 testDB.getMongo().adminCommand({setParameter: 1, logLevel: 1});
-testDB.getMongo().setSlaveOk();
+testDB.getMongo().setSecondaryOk();
 print("trying some queries");
 assert.soon(function() {
     try {

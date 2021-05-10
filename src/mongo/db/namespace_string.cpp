@@ -72,6 +72,9 @@ const NamespaceString NamespaceString::kMigrationCoordinatorsNamespace(Namespace
 const NamespaceString NamespaceString::kTenantMigrationDonorsNamespace(NamespaceString::kConfigDb,
                                                                        "tenantMigrationDonors");
 
+const NamespaceString NamespaceString::kTenantMigrationRecipientsNamespace(
+    NamespaceString::kConfigDb, "tenantMigrationRecipients");
+
 const NamespaceString NamespaceString::kShardConfigCollectionsNamespace(NamespaceString::kConfigDb,
                                                                         "cache.collections");
 const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceString::kConfigDb,
@@ -139,6 +142,18 @@ bool NamespaceString::isLegalClientSystemNS() const {
     }
 
     return false;
+}
+
+/**
+ * Oplog entries on 'system.views' should also be processed one at a time. View catalog immediately
+ * reflects changes for each oplog entry so we can see inconsistent view catalog if multiple oplog
+ * entries on 'system.views' are being applied out of the original order.
+ *
+ * Process updates to 'admin.system.version' individually as well so the secondary's FCV when
+ * processing each operation matches the primary's when committing that operation.
+ */
+bool NamespaceString::mustBeAppliedInOwnOplogBatch() const {
+    return isSystemDotViews() || isServerConfigurationCollection() || isPrivilegeCollection();
 }
 
 NamespaceString NamespaceString::makeListCollectionsNSS(StringData dbName) {
@@ -252,7 +267,7 @@ bool NamespaceString::isConfigDotCacheDotChunks() const {
 }
 
 bool NamespaceString::isTemporaryReshardingCollection() const {
-    return coll().startsWith("system.resharding.");
+    return coll().startsWith(kTemporaryReshardingCollectionPrefix);
 }
 
 bool NamespaceString::isReplicated() const {

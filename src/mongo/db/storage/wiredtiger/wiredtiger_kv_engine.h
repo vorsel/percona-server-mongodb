@@ -104,8 +104,6 @@ public:
 
     ~WiredTigerKVEngine();
 
-    void startAsyncThreads() override;
-
     void notifyStartupComplete() override;
 
     void setRecordStoreExtraOptions(const std::string& options);
@@ -119,6 +117,8 @@ public:
     bool supportsCheckpoints() const override {
         return !isEphemeral();
     }
+
+    void checkpoint() override;
 
     bool isDurable() const override {
         return _durable;
@@ -384,7 +384,6 @@ public:
 
 private:
     class WiredTigerSessionSweeper;
-    class WiredTigerCheckpointThread;
 
     // srcPath, destPath, session, cursor
     typedef std::tuple<boost::filesystem::path, boost::filesystem::path, std::shared_ptr<WiredTigerSession>, WT_CURSOR*> DBTuple;
@@ -481,7 +480,6 @@ private:
     const bool _keepDataHistory = true;
 
     std::unique_ptr<WiredTigerSessionSweeper> _sessionSweeper;
-    std::unique_ptr<WiredTigerCheckpointThread> _checkpointThread;
 
     std::string _rsOptions;
     std::string _indexOptions;
@@ -507,6 +505,8 @@ private:
     // Timestamp of data at startup. Used internally to advise checkpointing and recovery to a
     // timestamp. Provided by replication layer because WT does not persist timestamps.
     AtomicWord<std::uint64_t> _initialDataTimestamp;
+
+    AtomicWord<std::uint64_t> _oplogNeededForCrashRecovery;
 
     std::unique_ptr<WiredTigerEngineRuntimeConfigParameter> _runTimeConfigParam;
 

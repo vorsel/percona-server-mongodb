@@ -342,7 +342,7 @@ Status StorageEngineImpl::_recoverOrphanedCollection(OperationContext* opCtx,
     return Status::OK();
 }
 
-bool StorageEngineImpl::_handleInternalIdents(
+bool StorageEngineImpl::_handleInternalIdent(
     OperationContext* opCtx,
     const std::string& ident,
     InternalIdentReconcilePolicy internalIdentReconcilePolicy,
@@ -361,14 +361,15 @@ bool StorageEngineImpl::_handleInternalIdents(
         return true;
     }
 
+    if (!_catalog->isResumableIndexBuildIdent(ident)) {
+        return false;
+    }
+
     // When starting up after a clean shutdown and resumable index builds are supported, find the
     // internal idents that contain the relevant information to resume each index build and recover
     // the state.
     auto rs = _engine->getRecordStore(opCtx, "", ident, CollectionOptions());
 
-    // Look at the contents to determine whether this ident will contain information for
-    // resuming an index build.
-    // TODO SERVER-49215: differentiate the internal idents without looking at the contents.
     auto cursor = rs->getCursor(opCtx);
     auto record = cursor->next();
     if (record) {
@@ -376,36 +377,35 @@ bool StorageEngineImpl::_handleInternalIdents(
 
         // Parse the documents here so that we can restart the build if the document doesn't
         // contain all the necessary information to be able to resume building the index.
-        if (doc.hasField("phase")) {
-            ResumeIndexInfo resumeInfo;
-            try {
-                if (MONGO_unlikely(failToParseResumeIndexInfo.shouldFail())) {
-                    uasserted(ErrorCodes::FailPointEnabled,
-                              "failToParseResumeIndexInfo fail point is enabled");
-                }
-
-                resumeInfo = ResumeIndexInfo::parse(IDLParserErrorContext("ResumeIndexInfo"), doc);
-            } catch (const DBException& e) {
-                LOGV2(4916300, "Failed to parse resumable index info", "error"_attr = e.toStatus());
-
-                // Ignore the error so that we can restart the index build instead of resume it. We
-                // should drop the internal ident if we failed to parse.
-                internalIdentsToDrop->insert(ident);
-                return true;
+        ResumeIndexInfo resumeInfo;
+        try {
+            if (MONGO_unlikely(failToParseResumeIndexInfo.shouldFail())) {
+                uasserted(ErrorCodes::FailPointEnabled,
+                          "failToParseResumeIndexInfo fail point is enabled");
             }
 
-            reconcileResult->indexBuildsToResume.push_back(resumeInfo);
+            resumeInfo = ResumeIndexInfo::parse(IDLParserErrorContext("ResumeIndexInfo"), doc);
+        } catch (const DBException& e) {
+            LOGV2(4916300, "Failed to parse resumable index info", "error"_attr = e.toStatus());
 
-            // Once we have parsed the resume info, we can safely drop the internal ident.
+            // Ignore the error so that we can restart the index build instead of resume it. We
+            // should drop the internal ident if we failed to parse.
             internalIdentsToDrop->insert(ident);
-
-            LOGV2(4916301,
-                  "Found unfinished index build to resume",
-                  "buildUUID"_attr = resumeInfo.getBuildUUID(),
-                  "collectionUUID"_attr = resumeInfo.getCollectionUUID(),
-                  "phase"_attr = IndexBuildPhase_serializer(resumeInfo.getPhase()));
             return true;
         }
+
+        reconcileResult->indexBuildsToResume.push_back(resumeInfo);
+
+        // Once we have parsed the resume info, we can safely drop the internal ident.
+        internalIdentsToDrop->insert(ident);
+
+        LOGV2(4916301,
+              "Found unfinished index build to resume",
+              "buildUUID"_attr = resumeInfo.getBuildUUID(),
+              "collectionUUID"_attr = resumeInfo.getCollectionUUID(),
+              "phase"_attr = IndexBuildPhase_serializer(resumeInfo.getPhase()));
+
+        return true;
     }
 
     return false;
@@ -464,12 +464,12 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
             continue;
         }
 
-        if (_handleInternalIdents(opCtx,
-                                  it,
-                                  internalIdentReconcilePolicy,
-                                  &reconcileResult,
-                                  &internalIdentsToDrop,
-                                  &allInternalIdents)) {
+        if (_handleInternalIdent(opCtx,
+                                 it,
+                                 internalIdentReconcilePolicy,
+                                 &reconcileResult,
+                                 &internalIdentsToDrop,
+                                 &allInternalIdents)) {
             continue;
         }
 
@@ -686,8 +686,6 @@ void StorageEngineImpl::finishInit() {
     // A storage engine may need to start threads that require OperationsContexts with real Lockers,
     // as opposed to LockerNoops. Placing the start logic here, after the StorageEngine has been
     // instantiated, causes makeOperationContext() to create LockerImpls instead of LockerNoops.
-    _engine->startAsyncThreads();
-
     if (_engine->supportsRecoveryTimestamp()) {
         _timestampMonitor = std::make_unique<TimestampMonitor>(
             _engine.get(), getGlobalServiceContext()->getPeriodicRunner());
@@ -887,10 +885,18 @@ std::unique_ptr<TemporaryRecordStore> StorageEngineImpl::makeTemporaryRecordStor
     OperationContext* opCtx) {
     std::unique_ptr<RecordStore> rs =
         _engine->makeTemporaryRecordStore(opCtx, _catalog->newInternalIdent());
-    LOGV2_DEBUG(22258,
+    LOGV2_DEBUG(22258, 1, "Created temporary record store", "ident"_attr = rs->getIdent());
+    return std::make_unique<TemporaryKVRecordStore>(getEngine(), std::move(rs));
+}
+
+std::unique_ptr<TemporaryRecordStore>
+StorageEngineImpl::makeTemporaryRecordStoreForResumableIndexBuild(OperationContext* opCtx) {
+    std::unique_ptr<RecordStore> rs =
+        _engine->makeTemporaryRecordStore(opCtx, _catalog->newInternalResumableIndexBuildIdent());
+    LOGV2_DEBUG(4921500,
                 1,
-                "created temporary record store: {rs_getIdent}",
-                "rs_getIdent"_attr = rs->getIdent());
+                "Created temporary record store for resumable index build",
+                "ident"_attr = rs->getIdent());
     return std::make_unique<TemporaryKVRecordStore>(getEngine(), std::move(rs));
 }
 
@@ -906,6 +912,10 @@ void StorageEngineImpl::setJournalListener(JournalListener* jl) {
 
 void StorageEngineImpl::setStableTimestamp(Timestamp stableTimestamp, bool force) {
     _engine->setStableTimestamp(stableTimestamp, force);
+}
+
+Timestamp StorageEngineImpl::getStableTimestamp() const {
+    return _engine->getStableTimestamp();
 }
 
 void StorageEngineImpl::setInitialDataTimestamp(Timestamp initialDataTimestamp) {
@@ -1046,6 +1056,10 @@ void StorageEngineImpl::addDropPendingIdent(const Timestamp& dropTimestamp,
                                             const NamespaceString& nss,
                                             std::shared_ptr<Ident> ident) {
     _dropPendingIdentReaper.addDropPendingIdent(dropTimestamp, nss, ident);
+}
+
+void StorageEngineImpl::checkpoint() {
+    _engine->checkpoint();
 }
 
 void StorageEngineImpl::_onMinOfCheckpointAndOldestTimestampChanged(const Timestamp& timestamp) {

@@ -30,7 +30,7 @@ function prependDbPrefixToDbNameIfApplicable(dbName) {
         // ignored.
         return dbName;
     }
-    return isBlacklistedDb(dbName) ? dbName : TestData.dbPrefix + dbName;
+    return isBlacklistedDb(dbName) ? dbName : TestData.dbPrefix + "_" + dbName;
 }
 
 /**
@@ -51,7 +51,7 @@ function prependDbPrefixToNsIfApplicable(ns) {
  * If the given database name starts TestData.dbPrefix, removes the prefix.
  */
 function extractOriginalDbName(dbName) {
-    return dbName.replace(TestData.dbPrefix, "");
+    return dbName.replace(TestData.dbPrefix + "_", "");
 }
 
 /**
@@ -67,7 +67,7 @@ function extractOriginalNs(ns) {
  * Removes all occurrences of TestDatabase.dbPrefix in the string.
  */
 function removeDbPrefixFromString(string) {
-    return string.replace(new RegExp(TestData.dbPrefix, "g"), "");
+    return string.replace(new RegExp(TestData.dbPrefix + "_", "g"), "");
 }
 
 /**
@@ -183,14 +183,23 @@ Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
     // applicable database names and namespaces.
     const cmdObjWithDbPrefix = createCmdObjWithDbPrefix(cmdObj);
 
-    let resObj = originalRunCommand.apply(
-        this, [prependDbPrefixToDbNameIfApplicable(dbName), cmdObjWithDbPrefix, options]);
+    let numAttempts = 0;
 
-    // Remove TestData.dbPrefix from all database names and namespaces in the resObj since tests
-    // assume the command was run against the original database.
-    removeDbPrefix(resObj);
+    while (true) {
+        numAttempts++;
+        let resObj = originalRunCommand.apply(
+            this, [prependDbPrefixToDbNameIfApplicable(dbName), cmdObjWithDbPrefix, options]);
 
-    return resObj;
+        // Remove TestData.dbPrefix from all database names and namespaces in the resObj since tests
+        // assume the command was run against the original database.
+        removeDbPrefix(resObj);
+
+        if (resObj.code != ErrorCodes.TenantMigrationAborted) {
+            return resObj;
+        }
+        jsTest.log("Got TenantMigrationAborted after trying " + numAttempts +
+                   " times, retrying command " + tojson(cmdObj));
+    }
 };
 
 Mongo.prototype.runCommandWithMetadata = function(dbName, metadata, commandArgs) {
@@ -198,14 +207,23 @@ Mongo.prototype.runCommandWithMetadata = function(dbName, metadata, commandArgs)
     // applicable database names and namespaces.
     const commandArgsWithDbPrefix = createCmdObjWithDbPrefix(commandArgs);
 
-    let resObj = originalRunCommand.apply(
-        this, [prependDbPrefixToDbNameIfApplicable(dbName), metadata, commandArgsWithDbPrefix]);
+    let numAttempts = 0;
 
-    // Remove TestData.dbPrefix from all database names and namespaces in the resObj since tests
-    // assume the command was run against the original database.
-    removeDbPrefix(resObj);
+    while (true) {
+        numAttempts++;
+        let resObj = originalRunCommand.apply(
+            this, [prependDbPrefixToDbNameIfApplicable(dbName), metadata, commandArgsWithDbPrefix]);
 
-    return resObj;
+        // Remove TestData.dbPrefix from all database names and namespaces in the resObj since tests
+        // assume the command was run against the original database.
+        removeDbPrefix(resObj);
+
+        if (resObj.code != ErrorCodes.TenantMigrationAborted) {
+            return resObj;
+        }
+        jsTest.log("Got TenantMigrationAborted after trying " + numAttempts +
+                   " times, retrying command " + tojson(commandArgs));
+    }
 };
 
 OverrideHelpers.prependOverrideInParallelShell(

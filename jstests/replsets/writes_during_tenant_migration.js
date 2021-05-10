@@ -1,7 +1,6 @@
 /**
  * Tests that the donor blocks writes that are executed while the migration in the blocking state,
- * then rejects the writes if the migration commits and and internally retries the writes if the
- * migration aborts.
+ * then rejects the writes when the migration completes.
  *
  * Tenant migrations are not expected to be run on servers with ephemeralForTest, and in particular
  * this test fails on ephemeralForTest because the donor has to wait for the write to set the
@@ -30,6 +29,7 @@ const primary = donorRst.getPrimary();
 const kRecipientConnString = recipientRst.getURL();
 const kCollName = "testColl";
 
+const kTenantDefinedDbName = "0";
 const kTestDoc = {
     x: -1
 };
@@ -51,11 +51,12 @@ const kMaxTimeMS = 1 * 1000;
 
 function startMigration(host, dbName, recipientConnString) {
     const primary = new Mongo(host);
+    const dbPrefix = dbName.split('_')[0];
     return primary.adminCommand({
         donorStartMigration: 1,
         migrationId: UUID(),
         recipientConnectionString: recipientConnString,
-        databasePrefix: dbName,
+        databasePrefix: dbPrefix,
         readPreference: {mode: "primary"}
     });
 }
@@ -230,11 +231,12 @@ function testWriteNoMigration(testCase, testOpts) {
  * Tests that the donor rejects writes after the migration commits.
  */
 function testWriteIsRejectedIfSentAfterMigrationHasCommitted(testCase, testOpts) {
+    const dbPrefix = testOpts.dbName.split('_')[0];
     assert.commandWorked(testOpts.primaryDB.adminCommand({
         donorStartMigration: 1,
         migrationId: UUID(),
         recipientConnectionString: kRecipientConnString,
-        databasePrefix: testOpts.dbName,
+        databasePrefix: dbPrefix,
         readPreference: {mode: "primary"}
     }));
 
@@ -247,11 +249,12 @@ function testWriteIsRejectedIfSentAfterMigrationHasCommitted(testCase, testOpts)
  */
 function testWriteIsAcceptedIfSentAfterMigrationHasAborted(testCase, testOpts) {
     let abortFp = configureFailPoint(testOpts.primaryDB, "abortTenantMigrationAfterBlockingStarts");
+    const dbPrefix = testOpts.dbName.split('_')[0];
     assert.commandFailedWithCode(testOpts.primaryDB.adminCommand({
         donorStartMigration: 1,
         migrationId: UUID(),
         recipientConnectionString: kRecipientConnString,
-        databasePrefix: testOpts.dbName,
+        databasePrefix: dbPrefix,
         readPreference: {mode: "primary"}
     }),
                                  ErrorCodes.TenantMigrationAborted);
@@ -321,10 +324,10 @@ function testBlockedWriteGetsUnblockedAndRejectedIfMigrationCommits(testCase, te
 }
 
 /**
- * Tests that the donor blocks writes that are executed in the blocking state and internally retries
- * them after the migration aborts.
+ * Tests that the donor blocks writes that are executed in the blocking state and rejects them after
+ * the migration aborts.
  */
-function testBlockedReadGetsUnblockedAndRetriedIfMigrationAborts(testCase, testOpts) {
+function testBlockedReadGetsUnblockedAndRejectedIfMigrationAborts(testCase, testOpts) {
     let blockingFp =
         configureFailPoint(testOpts.primaryDB, "pauseTenantMigrationAfterBlockingStarts");
     let abortFp = configureFailPoint(testOpts.primaryDB, "abortTenantMigrationAfterBlockingStarts");
@@ -346,8 +349,8 @@ function testBlockedReadGetsUnblockedAndRetriedIfMigrationAborts(testCase, testO
     blockingFp.wait();
 
     // The migration should unpause and abort after the write is blocked. Verify that the write is
-    // retried and succeeds.
-    runCommand(testOpts);
+    // rejected.
+    runCommand(testOpts, ErrorCodes.TenantMigrationAborted);
 
     // Verify that the migration aborted due to the simulated error.
     resumeMigrationThread.join();
@@ -355,7 +358,7 @@ function testBlockedReadGetsUnblockedAndRetriedIfMigrationAborts(testCase, testO
     abortFp.off();
     assert.commandFailedWithCode(migrationThread.returnData(), ErrorCodes.TenantMigrationAborted);
 
-    testCase.assertCommandSucceeded(testOpts.primaryDB, testOpts.dbName, testOpts.collName);
+    testCase.assertCommandFailed(testOpts.primaryDB, testOpts.dbName, testOpts.collName);
 }
 
 const isNotWriteCommand = "not a write command";
@@ -841,11 +844,12 @@ const testFuncs = {
     inAborted: testWriteIsAcceptedIfSentAfterMigrationHasAborted,
     inBlocking: testWriteBlocksIfMigrationIsInBlocking,
     inBlockingThenCommitted: testBlockedWriteGetsUnblockedAndRejectedIfMigrationCommits,
-    inBlockingThenAborted: testBlockedReadGetsUnblockedAndRetriedIfMigrationAborts
+    inBlockingThenAborted: testBlockedReadGetsUnblockedAndRejectedIfMigrationAborts
 };
 
 for (const [testName, testFunc] of Object.entries(testFuncs)) {
     for (const [commandName, testCase] of Object.entries(testCases)) {
+        // Database name is [tenant_id (database prefix)]_[tenant defined database name]
         let baseDbName = commandName + "-" + testName + "0";
 
         if (testCase.skip) {
@@ -853,7 +857,12 @@ for (const [testName, testFunc] of Object.entries(testFuncs)) {
             continue;
         }
 
-        runTest(primary, testCase, testFunc, baseDbName + "Basic", kCollName);
+        runTest(primary,
+                testCase,
+                testFunc,
+                baseDbName + "Basic" +
+                    "_" + kTenantDefinedDbName,
+                kCollName);
 
         // TODO (SERVER-49844): Test transactional writes during migration.
         if (testCase.isSupportedInTransaction && testName == "noMigration") {
@@ -862,9 +871,13 @@ for (const [testName, testFunc] of Object.entries(testFuncs)) {
         }
 
         if (testCase.isRetryableWriteCommand) {
-            runTest(primary, testCase, testFunc, baseDbName + "Retryable", kCollName, {
-                useRetryableWrite: true
-            });
+            runTest(primary,
+                    testCase,
+                    testFunc,
+                    baseDbName + "Retryable" +
+                        "_" + kTenantDefinedDbName,
+                    kCollName,
+                    {useRetryableWrite: true});
         }
     }
 }

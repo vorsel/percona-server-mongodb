@@ -357,7 +357,8 @@ void ReplicationCoordinatorExternalStateImpl::clearAppliedThroughIfCleanShutdown
     // Ensure that all writes are visible before reading. If we failed mid-batch, it would be
     // possible to read from a kNoOverlap ReadSource where not all writes to the minValid document
     // are visible, generating a writeConflict that would not resolve.
-    opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+    invariant(RecoveryUnit::ReadSource::kNoTimestamp ==
+              opCtx->recoveryUnit()->getTimestampReadSource());
 
     auto loadLastOpTimeAndWallTimeResult = loadLastOpTimeAndWallTime(opCtx);
     if (_replicationProcess->getConsistencyMarkers()->getOplogTruncateAfterPoint(opCtx).isNull() &&
@@ -830,7 +831,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
             // run the sharding onStepUp machinery. The onStepDown counterpart to these methods is
             // already idempotent, so the machinery will remain in the stepped down state.
             if (ErrorCodes::isShutdownError(status.code()) ||
-                ErrorCodes::isNotMasterError(status.code())) {
+                ErrorCodes::isNotPrimaryError(status.code())) {
                 return;
             }
             fassertFailedWithStatus(
@@ -874,7 +875,7 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         // the sharding onStepUp machinery. The onStepDown counterpart to these methods is already
         // idempotent, so the machinery will remain in the stepped down state.
         if (ErrorCodes::isShutdownError(status.code()) ||
-            ErrorCodes::isNotMasterError(status.code())) {
+            ErrorCodes::isNotPrimaryError(status.code())) {
             return;
         }
         fassert(40107, status);

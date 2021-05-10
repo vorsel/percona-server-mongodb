@@ -73,6 +73,9 @@ public:
     static constexpr StringData kOrphanCollectionPrefix = "orphan."_sd;
     static constexpr StringData kOrphanCollectionDb = "local"_sd;
 
+    // Prefix for temporary resharding collection.
+    static constexpr StringData kTemporaryReshardingCollectionPrefix = "system.resharding."_sd;
+
     // Namespace for storing configuration data, which needs to be replicated if the server is
     // running as a replica set. Documents in this collection should represent some configuration
     // state of the server, which needs to be recovered/consulted at startup. Each document in this
@@ -109,6 +112,9 @@ public:
     // Namespace for storing the persisted state of tenant migration donors.
     static const NamespaceString kTenantMigrationDonorsNamespace;
 
+    // Namespace for storing the persisted state of tenant migration recipient service instances.
+    static const NamespaceString kTenantMigrationRecipientsNamespace;
+
     // Namespace for replica set configuration settings.
     static const NamespaceString kSystemReplSetNamespace;
 
@@ -118,7 +124,7 @@ public:
     // Namespace for pending range deletions.
     static const NamespaceString kRangeDeletionNamespace;
 
-    // Namespace for the config server's resharding operation state.
+    // Namespace for the coordinator's resharding operation state.
     static const NamespaceString kConfigReshardingOperationsNamespace;
 
     // Namespace for the donor shard's local resharding operation state.
@@ -330,6 +336,11 @@ public:
      * Returns true if this namespace refers to a drop-pending collection.
      */
     bool isDropPendingNamespace() const;
+
+    /**
+     * Returns true if operations on this namespace must be applied in their own oplog batch.
+     */
+    bool mustBeAppliedInOwnOplogBatch() const;
 
     /**
      * Returns the drop-pending namespace name for this namespace, provided the given optime.

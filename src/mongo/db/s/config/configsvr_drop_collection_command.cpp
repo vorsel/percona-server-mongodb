@@ -59,8 +59,12 @@ class ConfigSvrDropCollectionCommand : public BasicCommand {
 public:
     ConfigSvrDropCollectionCommand() : BasicCommand("_configsvrDropCollection") {}
 
-    const std::set<std::string>& apiVersions() const {
-        return kApiVersions1;
+    /**
+     * We accept any apiVersion, apiStrict, and/or apiDeprecationErrors, and forward it with the
+     * "drop" command to shards.
+     */
+    bool acceptsAnyApiVersionParameters() const override {
+        return true;
     }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
@@ -129,7 +133,9 @@ public:
         auto collDistLock = uassertStatusOK(
             catalogClient->getDistLockManager()->lock(opCtx, nss.ns(), "dropCollection", waitFor));
 
-        ON_BLOCK_EXIT([opCtx, nss] { Grid::get(opCtx)->catalogCache()->onEpochChange(nss); });
+        ON_BLOCK_EXIT([opCtx, nss] {
+            Grid::get(opCtx)->catalogCache()->invalidateCollectionEntry_LINEARIZABLE(nss);
+        });
 
         _dropCollection(opCtx, nss);
 

@@ -36,10 +36,11 @@ replTest.initiateWithAnyNodeAsPrimary(
 
 // Get connections and collection.
 var primary = replTest.getPrimary();
-var healthySecondary = replTest._slaves[0];
-healthySecondary.setSlaveOk();
-var noSnapshotSecondary = replTest._slaves[1];
-noSnapshotSecondary.setSlaveOk();
+var secondaries = replTest.getSecondaries();
+var healthySecondary = secondaries[0];
+healthySecondary.setSecondaryOk();
+var noSnapshotSecondary = secondaries[1];
+noSnapshotSecondary.setSecondaryOk();
 
 // Do a write, wait for it to replicate, and ensure it is visible.
 var res = primary.getDB(name).runCommandWithMetadata(  //

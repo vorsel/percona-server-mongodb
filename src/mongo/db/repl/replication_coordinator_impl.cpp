@@ -938,6 +938,9 @@ void ReplicationCoordinatorImpl::shutdown(OperationContext* opCtx) {
         return;
     }
 
+    LOGV2_DEBUG(5074000, 1, "Shutting down the replica set aware services.");
+    ReplicaSetAwareServiceRegistry::get(_service).onShutdown();
+
     LOGV2(21328, "Shutting down replication subsystems");
 
     // Used to shut down outside of the lock.
@@ -1189,7 +1192,7 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
                       "Automatic reconfig to increment the config term on stepup failed",
                       "error"_attr = reconfigStatus);
                 // If the node stepped down after we released the lock, we can just return.
-                if (ErrorCodes::isNotMasterError(reconfigStatus.code())) {
+                if (ErrorCodes::isNotPrimaryError(reconfigStatus.code())) {
                     return;
                 }
                 // Writing this new config with a new term is somewhat "best effort", and if we get

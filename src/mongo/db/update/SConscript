@@ -11,12 +11,15 @@ env.Library(
         'path_support.cpp',
         'storage_validation.cpp',
         'v1_log_builder.cpp',
+        'v2_log_builder.cpp',
+        'update_oplog_entry_serialization.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/matcher/expressions',
+        'update_document_diff',
     ],
 )
 
@@ -48,7 +51,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/update_index_data',
         '$BUILD_DIR/mongo/db/vector_clock_mutable',
         'update_common',
-        'update_document_diff',
     ],
 )
 
@@ -61,6 +63,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/pipeline/pipeline',
+        'update_common',
         'update_document_diff',
         'update_nodes',
     ],
@@ -136,6 +139,7 @@ env.CppUnitTest(
         'update_object_node_test.cpp',
         'update_serialization_test.cpp',
         'v1_log_builder_test.cpp',
+        'v2_log_builder_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',

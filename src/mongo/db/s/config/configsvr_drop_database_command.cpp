@@ -29,6 +29,7 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
@@ -54,8 +55,12 @@ class ConfigSvrDropDatabaseCommand : public BasicCommand {
 public:
     ConfigSvrDropDatabaseCommand() : BasicCommand("_configsvrDropDatabase") {}
 
-    const std::set<std::string>& apiVersions() const {
-        return kApiVersions1;
+    /**
+     * We accept any apiVersion, apiStrict, and/or apiDeprecationErrors, and forward it with the
+     * "dropDatabase" command to shards.
+     */
+    bool acceptsAnyApiVersionParameters() const override {
+        return true;
     }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
@@ -177,6 +182,7 @@ public:
             status, str::stream() << "Could not remove database '" << dbname << "' from metadata");
 
         // Send _flushDatabaseCacheUpdates to all shards
+        IgnoreAPIParametersBlock ignoreApiParametersBlock{opCtx};
         for (const ShardId& shardId : allShardIds) {
             const auto shard =
                 uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));

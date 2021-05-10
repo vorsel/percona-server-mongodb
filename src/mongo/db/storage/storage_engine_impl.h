@@ -119,12 +119,17 @@ public:
     virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStore(
         OperationContext* opCtx) override;
 
+    virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreForResumableIndexBuild(
+        OperationContext* opCtx) override;
+
     virtual std::unique_ptr<TemporaryRecordStore> makeTemporaryRecordStoreFromExistingIdent(
         OperationContext* opCtx, StringData ident) override;
 
     virtual void cleanShutdown() override;
 
     virtual void setStableTimestamp(Timestamp stableTimestamp, bool force = false) override;
+
+    virtual Timestamp getStableTimestamp() const override;
 
     virtual void setInitialDataTimestamp(Timestamp initialDataTimestamp) override;
 
@@ -318,6 +323,8 @@ public:
                              const NamespaceString& nss,
                              std::shared_ptr<Ident> ident) override;
 
+    void checkpoint() override;
+
     DurableCatalog* getCatalog() override {
         return _catalog.get();
     }
@@ -392,12 +399,12 @@ private:
      * Returns whether the given ident is an internal ident and if it should be dropped or used to
      * resume an index build.
      */
-    bool _handleInternalIdents(OperationContext* opCtx,
-                               const std::string& ident,
-                               InternalIdentReconcilePolicy internalIdentReconcilePolicy,
-                               ReconcileResult* reconcileResult,
-                               std::set<std::string>* internalIdentsToDrop,
-                               std::set<std::string>* allInternalIdents);
+    bool _handleInternalIdent(OperationContext* opCtx,
+                              const std::string& ident,
+                              InternalIdentReconcilePolicy internalIdentReconcilePolicy,
+                              ReconcileResult* reconcileResult,
+                              std::set<std::string>* internalIdentsToDrop,
+                              std::set<std::string>* allInternalIdents);
 
     class RemoveDBChange;
 

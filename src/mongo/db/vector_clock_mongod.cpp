@@ -79,6 +79,7 @@ private:
     // ReplicaSetAwareService methods implementation
 
     void onStartup(OperationContext* opCtx) override {}
+    void onShutdown() override {}
     void onStepUpBegin(OperationContext* opCtx, long long term) override;
     void onStepUpComplete(OperationContext* opCtx, long long term) override {}
     void onStepDown() override;
@@ -351,11 +352,10 @@ Future<void> VectorClockMongoD::_doWhileQueueNotEmptyOrError(ServiceContext* ser
 
                     PersistentTaskStore<VectorClockDocument> store(
                         NamespaceString::kVectorClockNamespace);
-                    store.update(opCtx,
+                    store.upsert(opCtx,
                                  QUERY(VectorClockDocument::k_idFieldName << vcd.get_id()),
                                  vcd.toBSON(),
-                                 WriteConcerns::kMajorityWriteConcern,
-                                 true /* upsert */);
+                                 WriteConcerns::kMajorityWriteConcern);
                 } else {
                     // Persist as secondary, by asking the primary
                     auto const shardingState = ShardingState::get(opCtx);

@@ -26,7 +26,7 @@ RollbackResumableIndexBuildTest.runIndexBuildComplete(rollbackTest,
                                                       dbName,
                                                       coll.getName(),
                                                       {a: 1},
-                                                      "hangAfterSettingUpIndexBuildUnlocked",
+                                                      "hangAfterSettingUpIndexBuild",
                                                       {},
                                                       insertsToBeRolledBack);
 

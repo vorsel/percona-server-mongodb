@@ -194,6 +194,7 @@ const allCommands = {
     hello: {skip: isNotAUserDataRead},
     hostInfo: {skip: isNotAUserDataRead},
     httpClientRequest: {skip: isNotAUserDataRead},
+    importCollection: {skip: isNotAUserDataRead},
     insert: {skip: isPrimaryOnly},
     internalRenameIfOptionsAndIndexesMatch: {skip: isAnInternalCommand},
     invalidateUserCache: {skip: isNotAUserDataRead},

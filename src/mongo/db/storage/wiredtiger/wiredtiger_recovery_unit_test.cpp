@@ -61,13 +61,6 @@ public:
                   false,                  // .repair
                   false                   // .readOnly
           ) {
-        // Deliberately not calling _engine->startAsyncThreads() because it starts an asynchronous
-        // checkpointing thread that can interfere with unit tests manipulating checkpoints
-        // manually.
-        //
-        // Alternatively, we would have to start using wiredTigerGlobalOptions.checkpointDelaySecs
-        // to set a high enough value such that the async thread never runs during testing.
-
         repl::ReplicationCoordinator::set(
             getGlobalServiceContext(),
             std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
@@ -203,7 +196,8 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, NoOverlapReadSource) {
     }
 
     // Read without a timestamp. The write should be visible.
-    ASSERT_EQ(opCtx1->recoveryUnit()->getTimestampReadSource(), RecoveryUnit::ReadSource::kUnset);
+    ASSERT_EQ(opCtx1->recoveryUnit()->getTimestampReadSource(),
+              RecoveryUnit::ReadSource::kNoTimestamp);
     RecordData unused;
     ASSERT_TRUE(rs->findRecord(opCtx1, rid1, &unused));
 
@@ -237,7 +231,7 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, NoOverlapReadSource) {
 
         // Read without a timestamp, and we should see the first and third records.
         opCtx1->recoveryUnit()->abandonSnapshot();
-        opCtx1->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kUnset);
+        opCtx1->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
         ASSERT_TRUE(rs->findRecord(opCtx1, rid1, &unused));
         ASSERT_FALSE(rs->findRecord(opCtx1, rid2, &unused));
         ASSERT_TRUE(rs->findRecord(opCtx1, rid3, &unused));
