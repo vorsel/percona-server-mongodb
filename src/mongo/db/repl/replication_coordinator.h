@@ -408,8 +408,13 @@ public:
     /*
      * Returns the same as getMyLastAppliedOpTime() and additionally returns the wall clock time
      * corresponding to that OpTime.
+     *
+     * When rollbackSafe is true, this returns an empty OpTimeAndWallTime if the node is in ROLLBACK
+     * state. The lastAppliedOpTime during ROLLBACK might be temporarily pointing to an oplog entry
+     * in the divergent branch of history which would become invalid after the rollback finishes.
      */
-    virtual OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const = 0;
+    virtual OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime(
+        bool rollbackSafe = false) const = 0;
 
     /**
      * Returns the last optime recorded by setMyLastDurableOpTime.
@@ -740,8 +745,7 @@ public:
      * "configVersion" will be populated with our config version if and only if we return
      * InvalidReplicaSetConfig.
      */
-    virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
-                                                long long* configVersion) = 0;
+    virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates) = 0;
 
     /**
      * Returns a bool indicating whether or not this node builds indexes.

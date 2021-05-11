@@ -40,6 +40,7 @@
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/import_collection_oplog_entry_gen.h"
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -73,6 +74,9 @@ using repl::OplogEntry;
 const OperationContext::Decoration<boost::optional<OpObserverImpl::DocumentKey>>
     documentKeyDecoration =
         OperationContext::declareDecoration<boost::optional<OpObserverImpl::DocumentKey>>();
+
+const OperationContext::Decoration<boost::optional<ShardId>> destinedRecipientDecoration =
+    OperationContext::declareDecoration<boost::optional<ShardId>>();
 
 namespace {
 
@@ -151,8 +155,9 @@ struct OpTimeBundle {
 /**
  * Write oplog entry(ies) for the update operation.
  */
-OpTimeBundle replLogUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
-    MutableOplogEntry oplogEntry;
+OpTimeBundle replLogUpdate(OperationContext* opCtx,
+                           const OplogUpdateEntryArgs& args,
+                           MutableOplogEntry oplogEntry) {
     oplogEntry.setNss(args.nss);
     oplogEntry.setUuid(args.uuid);
 
@@ -215,6 +220,7 @@ OpTimeBundle replLogDelete(OperationContext* opCtx,
     MutableOplogEntry oplogEntry;
     oplogEntry.setNss(nss);
     oplogEntry.setUuid(uuid);
+    oplogEntry.setDestinedRecipient(destinedRecipientDecoration(opCtx));
 
     repl::OplogLink oplogLink;
     repl::appendOplogEntryChainInfo(opCtx, &oplogEntry, &oplogLink, stmtId);
@@ -454,6 +460,7 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
 
         for (auto iter = first; iter != last; iter++) {
             auto operation = MutableOplogEntry::makeInsertOperation(nss, uuid.get(), iter->doc);
+            shardAnnotateOplogEntry(opCtx, nss, iter->doc, operation);
             txnParticipant.addTransactionOperation(opCtx, operation);
         }
     } else {
@@ -535,6 +542,8 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
         auto operation = MutableOplogEntry::makeUpdateOperation(
             args.nss, args.uuid, args.updateArgs.update, args.updateArgs.criteria);
 
+        shardAnnotateOplogEntry(opCtx, args.nss, args.updateArgs.updatedDoc, operation);
+
         if (args.updateArgs.preImageRecordingEnabledForCollection) {
             invariant(args.updateArgs.preImageDoc);
             operation.setPreImage(args.updateArgs.preImageDoc->getOwned());
@@ -542,7 +551,11 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
 
         txnParticipant.addTransactionOperation(opCtx, operation);
     } else {
-        opTime = replLogUpdate(opCtx, args);
+        MutableOplogEntry oplogEntry;
+        shardAnnotateOplogEntry(
+            opCtx, args.nss, args.updateArgs.updatedDoc, oplogEntry.getDurableReplOperation());
+        opTime = replLogUpdate(opCtx, args, std::move(oplogEntry));
+
         SessionTxnRecord sessionTxnRecord;
         sessionTxnRecord.setLastWriteOpTime(opTime.writeOpTime);
         sessionTxnRecord.setLastWriteDate(opTime.wallClockTime);
@@ -580,6 +593,10 @@ void OpObserverImpl::aboutToDelete(OperationContext* opCtx,
                                    BSONObj const& doc) {
     documentKeyDecoration(opCtx).emplace(getDocumentKey(opCtx, nss, doc));
 
+    repl::DurableReplOperation op;
+    shardAnnotateOplogEntry(opCtx, nss, doc, op);
+    destinedRecipientDecoration(opCtx) = op.getDestinedRecipient();
+
     shardObserveAboutToDelete(opCtx, nss, doc);
 }
 
@@ -604,6 +621,8 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
         if (deletedDoc) {
             operation.setPreImage(deletedDoc->getOwned());
         }
+
+        operation.setDestinedRecipient(destinedRecipientDecoration(opCtx));
 
         txnParticipant.addTransactionOperation(opCtx, operation);
     } else {
@@ -664,7 +683,7 @@ void OpObserverImpl::onInternalOpMessage(
 }
 
 void OpObserverImpl::onCreateCollection(OperationContext* opCtx,
-                                        const Collection* coll,
+                                        const CollectionPtr& coll,
                                         const NamespaceString& collectionName,
                                         const CollectionOptions& options,
                                         const BSONObj& idIndex,
@@ -736,7 +755,8 @@ void OpObserverImpl::onCollMod(OperationContext* opCtx,
     if (!db) {
         return;
     }
-    const Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+    const CollectionPtr& coll =
+        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
 
     invariant(coll->uuid() == uuid);
     invariant(DurableCatalog::get(opCtx)->isEqualToMetadataUUID(opCtx, coll->getCatalogId(), uuid));
@@ -868,6 +888,24 @@ void OpObserverImpl::onRenameCollection(OperationContext* const opCtx,
     preRenameCollection(
         opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
     postRenameCollection(opCtx, fromCollection, toCollection, uuid, dropTargetUUID, stayTemp);
+}
+
+void OpObserverImpl::onImportCollection(OperationContext* opCtx,
+                                        const UUID& importUUID,
+                                        const NamespaceString& nss,
+                                        long long numRecords,
+                                        long long dataSize,
+                                        const BSONObj& catalogEntry,
+                                        const BSONObj& storageMetadata,
+                                        bool isDryRun) {
+    ImportCollectionOplogEntry importCollection(
+        nss, importUUID, numRecords, dataSize, catalogEntry, storageMetadata, isDryRun);
+
+    MutableOplogEntry oplogEntry;
+    oplogEntry.setOpType(repl::OpTypeEnum::kCommand);
+    oplogEntry.setNss(nss.getCommandNS());
+    oplogEntry.setObject(importCollection.toBSON());
+    logOperation(opCtx, &oplogEntry);
 }
 
 void OpObserverImpl::onApplyOps(OperationContext* opCtx,
@@ -1067,6 +1105,14 @@ int logOplogEntriesForTransaction(OperationContext* opCtx,
         auto implicitCommit = lastOp && !prepare;
         auto implicitPrepare = lastOp && prepare;
         auto isPartialTxn = !lastOp;
+        if (isPartialTxn) {
+            // Partial transactions create multiple oplog entries in the same WriteUnitOfWork.
+            // Because of this, partial transactions will set multiple timestamps, violating the
+            // multi timestamp constraint. It's safe to ignore the multi timestamp constraints here
+            // as additional rollback logic is in place for this case.
+            opCtx->recoveryUnit()->ignoreAllMultiTimestampConstraints();
+        }
+
         // A 'prepare' oplog entry should never include a 'partialTxn' field.
         invariant(!(isPartialTxn && implicitPrepare));
         if (implicitPrepare) {

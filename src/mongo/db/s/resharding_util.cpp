@@ -55,6 +55,7 @@
 #include "mongo/s/async_requests_sender.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/flush_routing_table_cache_updates_gen.h"
+#include "mongo/s/shard_invalidated_for_targeting_exception.h"
 #include "mongo/s/shard_key_pattern.h"
 
 namespace mongo {
@@ -71,18 +72,11 @@ UUID getCollectionUuid(OperationContext* opCtx, const NamespaceString& nss) {
     return *uuid;
 }
 
-// Assembles the namespace string for the temporary resharding collection based on the source
-// namespace components.
-NamespaceString getTempReshardingNss(StringData db, const UUID& sourceUuid) {
-    return NamespaceString(db,
-                           fmt::format("{}{}",
-                                       NamespaceString::kTemporaryReshardingCollectionPrefix,
-                                       sourceUuid.toString()));
-}
-
 // Ensure that this shard owns the document. This must be called after verifying that we
 // are in a resharding operation so that we are guaranteed that migrations are suspended.
-bool documentBelongsToMe(OperationContext* opCtx, CollectionShardingState* css, BSONObj doc) {
+bool documentBelongsToMe(OperationContext* opCtx,
+                         CollectionShardingState* css,
+                         const BSONObj& doc) {
     auto currentKeyPattern = ShardKeyPattern(css->getCollectionDescription(opCtx).getKeyPattern());
     auto ownershipFilter = css->getOwnershipFilter(
         opCtx, CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup);
@@ -92,7 +86,7 @@ bool documentBelongsToMe(OperationContext* opCtx, CollectionShardingState* css, 
 
 boost::optional<TypeCollectionDonorFields> getDonorFields(OperationContext* opCtx,
                                                           const NamespaceString& sourceNss,
-                                                          BSONObj fullDocument) {
+                                                          const BSONObj& fullDocument) {
     auto css = CollectionShardingState::get(opCtx, sourceNss);
     auto collDesc = css->getCollectionDescription(opCtx);
 
@@ -115,6 +109,32 @@ boost::optional<TypeCollectionDonorFields> getDonorFields(OperationContext* opCt
 
 }  // namespace
 
+DonorShardEntry makeDonorShard(ShardId shardId,
+                               DonorStateEnum donorState,
+                               boost::optional<Timestamp> minFetchTimestamp) {
+    DonorShardEntry entry(shardId);
+    entry.setState(donorState);
+    if (minFetchTimestamp) {
+        auto minFetchTimestampStruct = MinFetchTimestamp();
+        minFetchTimestampStruct.setMinFetchTimestamp(minFetchTimestamp);
+        entry.setMinFetchTimestampStruct(minFetchTimestampStruct);
+    }
+    return entry;
+}
+
+RecipientShardEntry makeRecipientShard(ShardId shardId,
+                                       RecipientStateEnum recipientState,
+                                       boost::optional<Timestamp> strictConsistencyTimestamp) {
+    RecipientShardEntry entry(shardId);
+    entry.setState(recipientState);
+    if (strictConsistencyTimestamp) {
+        auto strictConsistencyTimestampStruct = StrictConsistencyTimestamp();
+        strictConsistencyTimestampStruct.setStrictConsistencyTimestamp(strictConsistencyTimestamp);
+        entry.setStrictConsistencyTimestampStruct(strictConsistencyTimestampStruct);
+    }
+    return entry;
+}
+
 UUID getCollectionUUIDFromChunkManger(const NamespaceString& originalNss, const ChunkManager& cm) {
     auto collectionUUID = cm.getUUID();
     uassert(ErrorCodes::InvalidUUID,
@@ -123,14 +143,60 @@ UUID getCollectionUUIDFromChunkManger(const NamespaceString& originalNss, const 
 
     return collectionUUID.get();
 }
-NamespaceString constructTemporaryReshardingNss(const NamespaceString& originalNss,
-                                                const ChunkManager& cm) {
-    auto collectionUUID = getCollectionUUIDFromChunkManger(originalNss, cm);
-    NamespaceString tempReshardingNss(
-        originalNss.db(),
-        "{}{}"_format(NamespaceString::kTemporaryReshardingCollectionPrefix,
-                      collectionUUID.toString()));
-    return tempReshardingNss;
+
+NamespaceString constructTemporaryReshardingNss(StringData db, const UUID& sourceUuid) {
+    return NamespaceString(db,
+                           fmt::format("{}{}",
+                                       NamespaceString::kTemporaryReshardingCollectionPrefix,
+                                       sourceUuid.toString()));
+}
+
+BatchedCommandRequest buildInsertOp(const NamespaceString& nss, std::vector<BSONObj> docs) {
+    BatchedCommandRequest request([&] {
+        write_ops::Insert insertOp(nss);
+        insertOp.setDocuments(docs);
+        return insertOp;
+    }());
+
+    return request;
+}
+
+BatchedCommandRequest buildUpdateOp(const NamespaceString& nss,
+                                    const BSONObj& query,
+                                    const BSONObj& update,
+                                    bool upsert,
+                                    bool multi) {
+    BatchedCommandRequest request([&] {
+        write_ops::Update updateOp(nss);
+        updateOp.setUpdates({[&] {
+            write_ops::UpdateOpEntry entry;
+            entry.setQ(query);
+            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
+            entry.setUpsert(upsert);
+            entry.setMulti(multi);
+            return entry;
+        }()});
+        return updateOp;
+    }());
+
+    return request;
+}
+
+BatchedCommandRequest buildDeleteOp(const NamespaceString& nss,
+                                    const BSONObj& query,
+                                    bool multiDelete) {
+    BatchedCommandRequest request([&] {
+        write_ops::Delete deleteOp(nss);
+        deleteOp.setDeletes({[&] {
+            write_ops::DeleteOpEntry entry;
+            entry.setQ(query);
+            entry.setMulti(multiDelete);
+            return entry;
+        }()});
+        return deleteOp;
+    }());
+
+    return request;
 }
 
 void tellShardsToRefresh(OperationContext* opCtx,
@@ -218,6 +284,23 @@ void validateReshardedChunks(const std::vector<mongo::BSONObj>& chunks,
     checkForHolesAndOverlapsInChunks(validChunks, keyPattern);
 }
 
+Timestamp getHighestMinFetchTimestamp(const std::vector<DonorShardEntry>& donorShards) {
+    invariant(!donorShards.empty());
+
+    auto maxMinFetchTimestamp = Timestamp::min();
+    for (auto& donor : donorShards) {
+        auto donorFetchTimestamp = donor.getMinFetchTimestamp();
+        uassert(4957300,
+                "All donors must have a minFetchTimestamp, but donor {} does not."_format(
+                    donor.getId()),
+                donorFetchTimestamp.is_initialized());
+        if (maxMinFetchTimestamp < donorFetchTimestamp.value()) {
+            maxMinFetchTimestamp = donorFetchTimestamp.value();
+        }
+    }
+    return maxMinFetchTimestamp;
+}
+
 void checkForOverlappingZones(std::vector<TagsType>& zones) {
     std::sort(zones.begin(), zones.end(), [](const TagsType& a, const TagsType& b) {
         return SimpleBSONObjComparator::kInstance.evaluate(a.getMinKey() < b.getMinKey());
@@ -254,8 +337,9 @@ void validateZones(const std::vector<mongo::BSONObj>& zones,
 
 std::unique_ptr<Pipeline, PipelineDeleter> createAggForReshardingOplogBuffer(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const boost::optional<ReshardingDonorOplogId>& resumeToken) {
-    std::list<boost::intrusive_ptr<DocumentSource>> stages;
+    const boost::optional<ReshardingDonorOplogId>& resumeToken,
+    bool doAttachDocumentCursor) {
+    Pipeline::SourceContainer stages;
 
     if (resumeToken) {
         stages.emplace_back(DocumentSourceMatch::create(
@@ -288,34 +372,22 @@ std::unique_ptr<Pipeline, PipelineDeleter> createAggForReshardingOplogBuffer(
     BSONObj lookupBSON(BSON("" << lookupBuilder.obj()));
     stages.emplace_back(DocumentSourceLookUp::createFromBson(lookupBSON.firstElement(), expCtx));
 
-    return Pipeline::create(std::move(stages), expCtx);
-}
-
-std::unique_ptr<Pipeline, PipelineDeleter> createConfigTxnCloningPipelineForResharding(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    Timestamp fetchTimestamp,
-    boost::optional<LogicalSessionId> startAfter) {
-    invariant(!fetchTimestamp.isNull());
-
-    std::list<boost::intrusive_ptr<DocumentSource>> stages;
-    if (startAfter) {
-        stages.emplace_back(DocumentSourceMatch::create(
-            BSON("_id" << BSON("$gt" << startAfter->toBSON())), expCtx));
+    auto pipeline = Pipeline::create(std::move(stages), expCtx);
+    if (doAttachDocumentCursor) {
+        pipeline = expCtx->mongoProcessInterface->attachCursorSourceToPipeline(
+            pipeline.release(), false /* allowTargetingShards */);
     }
-    stages.emplace_back(DocumentSourceSort::create(expCtx, BSON("_id" << 1)));
-    stages.emplace_back(DocumentSourceMatch::create(
-        BSON("lastWriteOpTime.ts" << BSON("$lt" << fetchTimestamp)), expCtx));
 
-    return Pipeline::create(std::move(stages), expCtx);
+    return pipeline;
 }
 
 void createSlimOplogView(OperationContext* opCtx, Database* db) {
     writeConflictRetry(
-        opCtx, "createReshardingOplog", "local.system.resharding.slimOplogForGraphLookup", [&] {
+        opCtx, "createReshardingSlimOplog", "local.system.resharding.slimOplogForGraphLookup", [&] {
             {
                 // Create 'system.views' in a separate WUOW if it does not exist.
                 WriteUnitOfWork wuow(opCtx);
-                const Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+                CollectionPtr coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
                     opCtx, NamespaceString(db->getSystemViewsName()));
                 if (!coll) {
                     coll = db->createCollection(opCtx, NamespaceString(db->getSystemViewsName()));
@@ -625,7 +697,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> createAggForCollectionCloning(
 
 boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
                                               const NamespaceString& sourceNss,
-                                              BSONObj fullDocument) {
+                                              const BSONObj& fullDocument) {
     auto donorFields = getDonorFields(opCtx, sourceNss, fullDocument);
     if (!donorFields)
         return boost::none;
@@ -633,10 +705,10 @@ boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
     bool allowLocks = true;
     auto tempNssRoutingInfo = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
         opCtx,
-        getTempReshardingNss(sourceNss.db(), getCollectionUuid(opCtx, sourceNss)),
+        constructTemporaryReshardingNss(sourceNss.db(), getCollectionUuid(opCtx, sourceNss)),
         allowLocks);
 
-    uassert(ErrorCodes::ShardInvalidatedForTargeting,
+    uassert(ShardInvalidatedForTargetingInfo(sourceNss),
             "Routing information is not available for the temporary resharding collection.",
             tempNssRoutingInfo.getStatus() != ErrorCodes::StaleShardVersion);
 
@@ -648,6 +720,34 @@ boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
     return tempNssRoutingInfo.getValue()
         .findIntersectingChunkWithSimpleCollation(shardKey)
         .getShardId();
+}
+
+bool isFinalOplog(const repl::OplogEntry& oplog) {
+    if (oplog.getOpType() != repl::OpTypeEnum::kNoop) {
+        return false;
+    }
+
+    auto o2Field = oplog.getObject2();
+    if (!o2Field) {
+        return false;
+    }
+
+    return o2Field->getField("type").valueStringDataSafe() == "reshardFinalOp"_sd;
+}
+
+bool isFinalOplog(const repl::OplogEntry& oplog, UUID reshardingUUID) {
+    if (!isFinalOplog(oplog)) {
+        return false;
+    }
+
+    return uassertStatusOK(UUID::parse(oplog.getObject2()->getField("reshardingUUID"))) ==
+        reshardingUUID;
+}
+
+
+NamespaceString getLocalOplogBufferNamespace(UUID reshardingUUID, ShardId donorShardId) {
+    return NamespaceString("config.localReshardingOplogBuffer.{}.{}"_format(
+        reshardingUUID.toString(), donorShardId.toString()));
 }
 
 }  // namespace mongo

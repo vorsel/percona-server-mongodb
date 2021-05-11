@@ -92,7 +92,7 @@ public:
 
         WriteUnitOfWork wunit(opCtx);
         UnreplicatedWritesBlock unreplicatedWritesBlock(opCtx);
-        const Collection* collection =
+        CollectionPtr collection =
             CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
         if (!collection) {
             collection = db->createCollection(opCtx, nss);
@@ -162,7 +162,7 @@ public:
             // end.
             auto exec = InternalPlanner::collectionScan(opCtx,
                                                         fullNs.ns(),
-                                                        collection.getCollection(),
+                                                        &collection.getCollection(),
                                                         PlanYieldPolicy::YieldPolicy::NO_YIELD,
                                                         InternalPlanner::BACKWARD);
 

@@ -39,6 +39,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/namespace_string',
         ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/catalog/collection_catalog',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/repl/read_concern_args',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
@@ -171,12 +172,13 @@ env.Library(
     target='storage_options',
     source=[
         'storage_options.cpp',
-        env.Idlc('storage_parameters.idl')[0],
+        'storage_parameters.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/idl/feature_flag',
         '$BUILD_DIR/mongo/idl/server_parameter',
     ],
 )
@@ -243,6 +245,9 @@ env.Library(
         'index_entry_comparison',
         'key_string',
     ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
+    ]
 )
 
 env.Library(
@@ -269,6 +274,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/unittest/unittest',
     ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
+    ]
 )
 
 
@@ -282,6 +290,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/unittest/unittest',
     ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
+    ]
 )
 
 env.Library(
@@ -351,6 +362,10 @@ env.Library(
         '$BUILD_DIR/mongo/util/fail_point',
         'recovery_unit_base',
     ],
+    LIBDEPS_TAGS=[
+        'libdeps-cyclic-typeinfo'
+    ],
+
 )
 
 env.Library(
@@ -416,7 +431,7 @@ env.Library(
 env.Library(
     target='flow_control_parameters',
     source=[
-        env.Idlc('flow_control_parameters.idl')[0],
+        'flow_control_parameters.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/idl/server_parameter',
@@ -441,6 +456,9 @@ env.Library(
         '$BUILD_DIR/mongo/util/fail_point',
         'flow_control_parameters',
     ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+    ]
 )
 
 env.CppUnitTest(
@@ -534,7 +552,7 @@ env.Library(
 env.Library(
     target='two_phase_index_build_knobs_idl',
     source=[
-        env.Idlc('two_phase_index_build_knobs.idl')[0],
+        'two_phase_index_build_knobs.idl',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/idl/server_parameter',
@@ -571,7 +589,7 @@ env.CppLibfuzzerTest(
         'key_string_to_bson_fuzzer.cpp',
     ],
     LIBDEPS=[
-        'key_string',
         '$BUILD_DIR/mongo/base',
+        'key_string',
     ],
 )

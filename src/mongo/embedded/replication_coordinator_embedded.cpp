@@ -228,7 +228,8 @@ void ReplicationCoordinatorEmbedded::resetMyLastOpTimes() {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-OpTimeAndWallTime ReplicationCoordinatorEmbedded::getMyLastAppliedOpTimeAndWallTime() const {
+OpTimeAndWallTime ReplicationCoordinatorEmbedded::getMyLastAppliedOpTimeAndWallTime(
+    bool rollbackSafe) const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -375,8 +376,7 @@ void ReplicationCoordinatorEmbedded::incrementNumCatchUpOpsIfCatchingUp(long num
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Status ReplicationCoordinatorEmbedded::processReplSetUpdatePosition(const UpdatePositionArgs&,
-                                                                    long long*) {
+Status ReplicationCoordinatorEmbedded::processReplSetUpdatePosition(const UpdatePositionArgs&) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -459,7 +459,7 @@ Status ReplicationCoordinatorEmbedded::processHeartbeatV1(const ReplSetHeartbeat
 }
 
 long long ReplicationCoordinatorEmbedded::getTerm() const {
-    UASSERT_NOT_IMPLEMENTED;
+    return 3;  // arbitrary constant number
 }
 
 Status ReplicationCoordinatorEmbedded::updateTerm(OperationContext*, long long) {

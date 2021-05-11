@@ -42,7 +42,6 @@
 #include "mongo/db/wire_version.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
-#include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/topology_version_gen.h"
 #include "mongo/s/mongos_topology_coordinator.h"
 #include "mongo/transport/message_compressor_manager.h"
@@ -51,22 +50,19 @@
 
 namespace mongo {
 
-// Hangs in the beginning of each isMaster command when set.
-MONGO_FAIL_POINT_DEFINE(waitInIsMaster);
+// Hangs in the beginning of each hello command when set.
+MONGO_FAIL_POINT_DEFINE(waitInHello);
 
 namespace {
 
 constexpr auto kHelloString = "hello"_sd;
-// Aliases for the hello command in order to provide backwards compatibility.
 constexpr auto kCamelCaseIsMasterString = "isMaster"_sd;
 constexpr auto kLowerCaseIsMasterString = "ismaster"_sd;
 
 
 class CmdHello : public BasicCommandWithReplyBuilderInterface {
 public:
-    CmdHello()
-        : BasicCommandWithReplyBuilderInterface(
-              kHelloString, {kCamelCaseIsMasterString, kLowerCaseIsMasterString}) {}
+    CmdHello() : CmdHello(kHelloString, {}) {}
 
     const std::set<std::string>& apiVersions() const {
         return kApiVersions1;
@@ -100,41 +96,10 @@ public:
                              rpc::ReplyBuilderInterface* replyBuilder) final {
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
 
-        waitInIsMaster.pauseWhileSet(opCtx);
+        waitInHello.pauseWhileSet(opCtx);
 
-        // Parse the command name, which should be one of the following: hello, isMaster, or
-        // ismaster. If the command is "hello", we must attach an "isWritablePrimary" response field
-        // instead of "ismaster".
-        bool useLegacyResponseFields = (cmdObj.firstElementFieldNameStringData() != kHelloString);
-
-        auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx->getClient());
-        bool seenIsMaster = clientMetadataIsMasterState.hasSeenIsMaster();
-        if (!seenIsMaster) {
-            clientMetadataIsMasterState.setSeenIsMaster();
-        }
-
-        BSONElement element = cmdObj[kMetadataDocumentName];
-        if (!element.eoo()) {
-            if (seenIsMaster) {
-                uasserted(ErrorCodes::ClientMetadataCannotBeMutated,
-                          "The client metadata document may only be sent in the first isMaster");
-            }
-
-            auto swParseClientMetadata = ClientMetadata::parse(element);
-            uassertStatusOK(swParseClientMetadata.getStatus());
-
-            invariant(swParseClientMetadata.getValue());
-
-            swParseClientMetadata.getValue().get().logClientMetadata(opCtx->getClient());
-
-            swParseClientMetadata.getValue().get().setMongoSMetadata(
-                getHostNameCachedAndPort(),
-                opCtx->getClient()->clientAddress(true),
-                VersionInfoInterface::instance().version());
-
-            clientMetadataIsMasterState.setClientMetadata(
-                opCtx->getClient(), std::move(swParseClientMetadata.getValue()));
-        }
+        auto client = opCtx->getClient();
+        ClientMetadata::tryFinalize(client);
 
         // If a client is following the awaitable isMaster protocol, maxAwaitTimeMS should be
         // present if and only if topologyVersion is present in the request.
@@ -175,7 +140,7 @@ public:
         auto mongosIsMasterResponse =
             mongosTopCoord->awaitIsMasterResponse(opCtx, clientTopologyVersion, deadline);
 
-        mongosIsMasterResponse->appendToBuilder(&result, useLegacyResponseFields);
+        mongosIsMasterResponse->appendToBuilder(&result, useLegacyResponseFields());
         // The isMaster response always includes a topologyVersion.
         auto currentMongosTopologyVersion = mongosIsMasterResponse->getTopologyVersion();
 
@@ -206,15 +171,15 @@ public:
         saslMechanismRegistry.advertiseMechanismNamesForUser(opCtx, cmdObj, &result);
 
         if (opCtx->isExhaust()) {
-            LOGV2_DEBUG(23872, 3, "Using exhaust for isMaster protocol");
+            LOGV2_DEBUG(23872, 3, "Using exhaust for isMaster or hello protocol");
 
             uassert(51763,
-                    "An isMaster request with exhaust must specify 'maxAwaitTimeMS'",
+                    "An isMaster or hello request with exhaust must specify 'maxAwaitTimeMS'",
                     maxAwaitTimeMSField);
             invariant(clientTopologyVersion);
 
-            InExhaustIsMaster::get(opCtx->getClient()->session().get())
-                ->setInExhaustIsMaster(true /* inExhaustIsMaster */);
+            InExhaustHello::get(opCtx->getClient()->session().get())
+                ->setInExhaust(true /* inExhaust */, getName());
 
             if (clientTopologyVersion->getProcessId() ==
                     currentMongosTopologyVersion.getProcessId() &&
@@ -242,7 +207,27 @@ public:
         return true;
     }
 
+protected:
+    CmdHello(const StringData cmdName, const std::initializer_list<StringData>& alias)
+        : BasicCommandWithReplyBuilderInterface(cmdName, alias) {}
+
+    virtual bool useLegacyResponseFields() {
+        return false;
+    }
+
 } hello;
+
+class CmdIsMaster : public CmdHello {
+
+public:
+    CmdIsMaster() : CmdHello(kCamelCaseIsMasterString, {kLowerCaseIsMasterString}) {}
+
+protected:
+    bool useLegacyResponseFields() override {
+        return true;
+    }
+
+} isMaster;
 
 }  // namespace
 }  // namespace mongo

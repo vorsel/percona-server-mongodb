@@ -40,10 +40,10 @@ function assertBinVersionComparesEqual(v1, v2) {
               "Expected \"" + v1 + "\" to compare equal to \"" + v2 + "\"");
 }
 
-// The current version is in the 4.5 series. This has to be changed very time we bump
+// Test the current latest version. This has to be changed very time we bump
 // the major version pair, but it provides a useful test of assumptions.
-assertBinVersionsEqual("4.5", version());
-assertBinVersionComparesEqual("4.5", version());
+assertBinVersionsEqual("4.9", version());
+assertBinVersionComparesEqual("4.9", version());
 
 // "latest" is the same version as the shell, "last-lts" is not.
 assertBinVersionsEqual("latest", version());
@@ -57,8 +57,18 @@ assertBinVersionComparesEqual("", version());
 assertBinVersionsNotEqual("latest", "last-lts");
 assertBinVersionsNotEqual("last-lts", version());
 
+assertBinVersionsNotEqual("latest", "last-continuous");
+assertBinVersionsNotEqual("last-continuous", version());
+
 assertBinVersionComparesHigher("latest", "last-lts");
 assertBinVersionComparesLower("last-lts", version());
+
+assertBinVersionComparesHigher("latest", "last-continuous");
+assertBinVersionComparesLower("last-continuous", version());
+
+if (lastContinuousFCV === lastLTSFCV) {
+    assertBinVersionComparesEqual("last-lts", "last-continuous");
+}
 
 // 3.2 means 3.2.z for any value of z. It does not mean 3.0 or 3.0.w.
 assertBinVersionsEqual("3.2", "3.2.4");

@@ -382,7 +382,7 @@ error_codes:
     - {code: 319,name: MovePrimaryInProgress}
 
     - {code: 320, name: TenantMigrationConflict,extra: TenantMigrationConflictInfo}
-    - {code: 321, name: TenantMigrationCommitted}
+    - {code: 321, name: TenantMigrationCommitted,extra: TenantMigrationCommittedInfo}
 
     - {code: 322, name: APIVersionError, categories: [VersionedAPIError]}
     - {code: 323, name: APIStrictError, categories: [VersionedAPIError]}
@@ -395,6 +395,8 @@ error_codes:
     - {code: 327, name: NoSuchTenantMigration}
 
     - {code: 328, name: TenantMigrationAccessBlockerShuttingDown, categories: [InternalOnly]}
+
+    - {code: 329, name: TenantMigrationInProgress}
 
     # Error codes 4000-8999 are reserved.
 

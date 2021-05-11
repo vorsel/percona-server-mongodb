@@ -54,6 +54,7 @@
 #include "mongo/db/pipeline/pipeline_d.h"
 #include "mongo/db/query/collection_index_usage_tracker_decoration.h"
 #include "mongo/db/query/collection_query_info.h"
+#include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/repl/speculative_majority_read_info.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
@@ -155,9 +156,8 @@ std::vector<Document> CommonMongodProcessInterface::getIndexStats(OperationConte
                                                                   const NamespaceString& ns,
                                                                   StringData host,
                                                                   bool addShardName) {
-    AutoGetCollectionForReadCommand autoColl(opCtx, ns);
+    AutoGetCollectionForReadCommand collection(opCtx, ns);
 
-    const Collection* collection = autoColl.getCollection();
     std::vector<Document> indexStats;
     if (!collection) {
         LOGV2_DEBUG(23881,
@@ -194,7 +194,14 @@ std::vector<Document> CommonMongodProcessInterface::getIndexStats(OperationConte
         auto entry = idxCatalog->getEntry(idx);
         doc["spec"] = Value(idx->infoObj());
 
-        if (!entry->isReady(opCtx)) {
+        // Not all indexes in the CollectionIndexUsageTracker may be visible or consistent with our
+        // snapshot. For this reason, it is unsafe to check `isReady` on the entry, which
+        // asserts that the index's in-memory state is consistent with our snapshot.
+        if (!entry->isPresentInMySnapshot(opCtx)) {
+            continue;
+        }
+
+        if (!entry->isReadyInMySnapshot(opCtx)) {
             doc["building"] = Value(true);
         }
 
@@ -226,14 +233,12 @@ Status CommonMongodProcessInterface::appendRecordCount(OperationContext* opCtx,
 Status CommonMongodProcessInterface::appendQueryExecStats(OperationContext* opCtx,
                                                           const NamespaceString& nss,
                                                           BSONObjBuilder* builder) const {
-    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+    AutoGetCollectionForReadCommand collection(opCtx, nss);
 
-    if (!autoColl.getDb()) {
+    if (!collection.getDb()) {
         return {ErrorCodes::NamespaceNotFound,
                 str::stream() << "Database [" << nss.db().toString() << "] not found."};
     }
-
-    const Collection* collection = autoColl.getCollection();
 
     if (!collection) {
         return {ErrorCodes::NamespaceNotFound,
@@ -260,12 +265,11 @@ Status CommonMongodProcessInterface::appendQueryExecStats(OperationContext* opCt
 
 BSONObj CommonMongodProcessInterface::getCollectionOptions(OperationContext* opCtx,
                                                            const NamespaceString& nss) {
-    AutoGetCollectionForReadCommand autoColl(opCtx, nss);
+    AutoGetCollectionForReadCommand collection(opCtx, nss);
     BSONObj collectionOptions = {};
-    if (!autoColl.getDb()) {
+    if (!collection.getDb()) {
         return collectionOptions;
     }
-    const Collection* collection = autoColl.getCollection();
     if (!collection) {
         return collectionOptions;
     }
@@ -411,12 +415,11 @@ std::vector<BSONObj> CommonMongodProcessInterface::getMatchingPlanCacheEntryStat
         return !matchExp ? true : matchExp->matchesBSON(obj);
     };
 
-    AutoGetCollection autoColl(opCtx, nss, MODE_IS);
-    const auto collection = autoColl.getCollection();
+    AutoGetCollection collection(opCtx, nss, MODE_IS);
     uassert(
         50933, str::stream() << "collection '" << nss.toString() << "' does not exist", collection);
 
-    const auto planCache = CollectionQueryInfo::get(collection).getPlanCache();
+    const auto planCache = CollectionQueryInfo::get(collection.getCollection()).getPlanCache();
     invariant(planCache);
 
     return planCache->getMatchingStats(serializer, predicate);
@@ -490,6 +493,17 @@ BSONObj CommonMongodProcessInterface::_reportCurrentOpForClient(
 void CommonMongodProcessInterface::_reportCurrentOpsForTransactionCoordinators(
     OperationContext* opCtx, bool includeIdle, std::vector<BSONObj>* ops) const {
     reportCurrentOpsForTransactionCoordinators(opCtx, includeIdle, ops);
+}
+
+void CommonMongodProcessInterface::_reportCurrentOpsForPrimaryOnlyServices(
+    OperationContext* opCtx,
+    CurrentOpConnectionsMode connMode,
+    CurrentOpSessionsMode sessionMode,
+    std::vector<BSONObj>* ops) const {
+    auto registry = repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext());
+    invariant(registry);
+
+    registry->reportServiceInfoForCurrentOp(connMode, sessionMode, ops);
 }
 
 void CommonMongodProcessInterface::_reportCurrentOpsForIdleSessions(

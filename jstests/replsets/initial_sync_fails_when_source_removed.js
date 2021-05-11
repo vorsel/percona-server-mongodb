@@ -1,6 +1,7 @@
 /**
  * Tests that initial sync will abort an attempt if the sync source is removed during cloning.
  * This test will timeout if the attempt is not aborted.
+ * @tags: [live_record_incompatible]
  */
 (function() {
 "use strict";
@@ -55,6 +56,8 @@ assert.commandWorked(initialSyncNodeDb.adminCommand(
 beforeStageFailPoint.wait();
 
 jsTestLog("Testing removing sync source in cloner " + cloner + " stage " + stage);
+// Avoid closing the connection when the node transitions to REMOVED.
+assert.commandWorked(initialSyncNode.adminCommand({hello: 1, hangUpOnStepDown: false}));
 // We can't use remove/reInitiate here because that does not properly remove a node
 // in the middle of a config.
 let config = rst.getReplSetConfig();

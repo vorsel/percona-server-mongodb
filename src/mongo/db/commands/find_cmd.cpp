@@ -289,12 +289,12 @@ public:
 
             // The collection may be NULL. If so, getExecutor() should handle it by returning an
             // execution tree with an EOFStage.
-            const Collection* const collection = ctx->getCollection();
+            const auto& collection = ctx->getCollection();
 
             // Get the execution plan for the query.
             bool permitYield = true;
             auto exec =
-                uassertStatusOK(getExecutorFind(opCtx, collection, std::move(cq), permitYield));
+                uassertStatusOK(getExecutorFind(opCtx, &collection, std::move(cq), permitYield));
 
             auto bodyBuilder = result->getBodyBuilder();
             // Got the execution tree. Explain it.
@@ -315,14 +315,14 @@ public:
             // Although it is a command, a find command gets counted as a query.
             globalOpCounters.gotQuery();
 
-            // Parse the command BSON to a QueryRequest. Pass in the parsedNss in case _request.body
-            // does not have a UUID.
-            auto parsedNss =
-                NamespaceString{CommandHelpers::parseNsFromCommand(_dbName, _request.body)};
+            const BSONObj& cmdObj = _request.body;
+
+            // Parse the command BSON to a QueryRequest. Pass in the parsedNss in case cmdObj does
+            // not have a UUID.
+            auto parsedNss = NamespaceString{CommandHelpers::parseNsFromCommand(_dbName, cmdObj)};
             const bool isExplain = false;
             const bool isOplogNss = (parsedNss == NamespaceString::kRsOplogNamespace);
-            auto qr =
-                parseCmdObjectToQueryRequest(opCtx, std::move(parsedNss), _request.body, isExplain);
+            auto qr = parseCmdObjectToQueryRequest(opCtx, std::move(parsedNss), cmdObj, isExplain);
 
             // Only allow speculative majority for internal commands that specify the correct flag.
             uassert(ErrorCodes::ReadConcernMajorityNotEnabled,
@@ -366,7 +366,15 @@ public:
                         AutoGetCollectionViewMode::kViewsPermitted);
             const auto& nss = ctx->getNss();
 
-            qr->refreshNSS(opCtx);
+            uassert(ErrorCodes::NamespaceNotFound,
+                    str::stream() << "UUID " << qr->uuid().get()
+                                  << " specified in query request not found",
+                    ctx || !qr->uuid());
+
+            // Set the namespace if a collection was found, as opposed to nothing or a view.
+            if (ctx) {
+                qr->refreshNSS(ctx->getNss());
+            }
 
             // Check whether we are allowed to read from this node after acquiring our locks.
             uassertStatusOK(replCoord->checkCanServeReadsFor(
@@ -412,7 +420,7 @@ public:
                 return;
             }
 
-            const Collection* const collection = ctx->getCollection();
+            const auto& collection = ctx->getCollection();
 
             if (cq->getQueryRequest().isReadOnce()) {
                 // The readOnce option causes any storage-layer cursors created during plan
@@ -423,11 +431,11 @@ public:
             // Get the execution plan for the query.
             bool permitYield = true;
             auto exec =
-                uassertStatusOK(getExecutorFind(opCtx, collection, std::move(cq), permitYield));
+                uassertStatusOK(getExecutorFind(opCtx, &collection, std::move(cq), permitYield));
 
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
-                CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanSummary());
+                CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanExplainer().getPlanSummary());
             }
 
             if (!collection) {
@@ -455,6 +463,7 @@ public:
             BSONObj obj;
             PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
             std::uint64_t numResults = 0;
+            bool stashedResult = false;
 
             try {
                 while (!FindCommon::enoughForFirstBatch(originalQR, numResults) &&
@@ -463,6 +472,7 @@ public:
                     // later.
                     if (!FindCommon::haveSpaceForNext(obj, numResults, firstBatch.bytesUsed())) {
                         exec->enqueue(obj);
+                        stashedResult = true;
                         break;
                     }
 
@@ -476,15 +486,26 @@ public:
             } catch (DBException& exception) {
                 firstBatch.abandon();
 
+                auto&& explainer = exec->getPlanExplainer();
+                auto&& [stats, _] =
+                    explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
                 LOGV2_WARNING(23798,
                               "Plan executor error during find command: {error}, "
-                              "stats: {stats}",
+                              "stats: {stats}, cmd: {cmd}",
                               "Plan executor error during find command",
                               "error"_attr = exception.toStatus(),
-                              "stats"_attr = redact(exec->getStats()));
+                              "stats"_attr = redact(stats),
+                              "cmd"_attr = cmdObj);
 
                 exception.addContext("Executor error during find command");
                 throw;
+            }
+
+            // For empty batches, or in the case where the final result was added to the batch
+            // rather than being stashed, we update the PBRT to ensure that it is the most recent
+            // available.
+            if (!stashedResult) {
+                firstBatch.setPostBatchResumeToken(exec->getPostBatchResumeToken());
             }
 
             // Set up the cursor for getMore.

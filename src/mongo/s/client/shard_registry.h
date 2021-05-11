@@ -137,12 +137,8 @@ private:
 
     /**
      * Puts the given shard object into the lookup maps.
-     *
-     * If useOriginalCS = true it will use the ConnectionSring used for shard creation to update
-     * lookup maps. Otherwise the current connection string from the Shard's RemoteCommandTargeter
-     * will be used. Only called during ShardRegistryData construction.
      */
-    void _addShard(std::shared_ptr<Shard>, bool useOriginalCS);
+    void _addShard(std::shared_ptr<Shard>);
 
     // Map of shardName -> Shard
     ShardMap _shardIdLookup;
@@ -177,6 +173,11 @@ public:
      * A callback type for functions that can be called on shard removal.
      */
     using ShardRemovalHook = std::function<void(const ShardId&)>;
+
+    /**
+     * Used when informing updateReplSetHosts() of a new connection string for a shard.
+     */
+    enum class ConnectionStringUpdateType { kConfirmed, kPossible };
 
     /**
      * Instantiates a new shard registry.
@@ -256,7 +257,8 @@ public:
      * up the corresponding Shard object based on the replica set name, then updates the
      * ShardRegistry's notion of what hosts make up that shard.
      */
-    void updateReplSetHosts(const ConnectionString& newConnString);
+    void updateReplSetHosts(const ConnectionString& givenConnString,
+                            ConnectionStringUpdateType updateType);
 
     /**
      * Instantiates a new detached shard connection, which does not appear in the list of shards
@@ -425,6 +427,8 @@ private:
     using LatestConnStrings = stdx::unordered_map<ShardId, ConnectionString, ShardId::Hasher>;
 
     std::pair<std::vector<LatestConnStrings::value_type>, Increment> _getLatestConnStrings() const;
+
+    void _removeReplicaSet(const std::string& setName);
 
     void _initializeCacheIfNecessary() const;
 

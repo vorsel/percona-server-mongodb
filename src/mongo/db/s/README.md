@@ -121,23 +121,22 @@ databases for unsharded collections.
 
 The shard versioning protocol tracks the placement of chunks for sharded collections.
 
-Each chunk has a version called the "chunk version." A chunk version consists of three elements:
+Each chunk has a version called the "chunk version." A chunk version is represented as C<M, m, E> and consists of three elements:
 
-1. The major version - an integer incremented when a chunk moves shards.
-1. The minor version - an integer incremented when a chunk is split.
-1. The epoch - an object ID shared among all chunks for a collection that distinguishes a unique instance of the collection. The epoch remains unchanged for the lifetime of the chunk, unless the collection is dropped or the collection's shard key has been refined using the refineCollectionShardKey command.
+1. The *M* major version - an integer incremented when a chunk moves shards.
+1. The *m* minor version - an integer incremented when a chunk is split.
+1. The *E* epoch  - an object ID shared among all chunks for a collection that distinguishes a unique instance of the collection. The epoch remains unchanged for the lifetime of the chunk, unless the collection is dropped or the collection's shard key has been refined using the refineCollectionShardKey command.
 
 To completely define the shard versioning protocol, we introduce two extra terms - the "shard
 version" and "collection version."
 
-1. Shard version - For a sharded collection, this is the highest chunk version seen on a particular shard.
-1. Collection version - For a sharded collection, this is the highest chunk version seen across all shards.
+1. Shard version - For a sharded collection, this is the highest chunk version seen on a particular shard. The version of the *i* shard is represented as SV<sub>i</sub><M<sub>SV<sub>i</sub></sub>, m<sub>SV<sub>i</sub></sub>, E<sub>SV<sub>i</sub></sub>>.
+1. Collection version - For a sharded collection, this is the highest chunk version seen across all shards. The collection version is represented as CV<M<sub>cv</sub>, m<sub>cv</sub>, E<sub>cv</sub>>.
 
 ### Database versioning
 
 The database versioning protocol tracks the placement of databases for unsharded collections. The
-“database version” indicates on which shard a database currently exists. A database version
-consists of two elements:
+"database version" indicates on which shard a database currently exists. A database version is represented as DBV<uuid, Mod> and consists of two elements:
 
 1. The UUID - a unique identifier to distinguish different instances of the database. The UUID remains unchanged for the lifetime of the database, unless the database is dropped and recreated.
 1. The last modified field - an integer incremented when the database changes its primary shard.
@@ -157,18 +156,17 @@ scenarios:
 
 ### Types of operations that will cause the versioning information to become stale
 
-Operation Type                            | Version Modification Behavior                                                                                             |
---------------                            | -----------------------------                                                                                             |
-Moving a chunk                            | Incremements the chunk's major version                                                                                    |
-Splitting a chunk                         | If the shard version is equal to the collection version, increases the major version; always increments the minor version |
-Merging a chunk                           | Sets the chunk's major version to the collection version plus one; will set the chunk's minor version to zero             |
-Dropping a collection                     | Sets the chunk's version and epoch to the unsharded constant defined below                                                |
-Refining a collection’s shard key         | Creates a new epoch while maintaining the chunk’s major and minor version                                                 |
-Changing the primary shard for a database | Increments the database’s last modified field                                                                             |
-Dropping a database                       | Creates a new UUID and set the last modified field to one                                                                 |
+Before going through the table that explains which operations modify the versioning information and how, it is important to give a bit more information about the move chunk operation. When we move a chunk C from the *i* shard to the *j* shard, where *i* and *j* are different, we end up updating the shard version of both shards. For the recipient shard (i.e. *j* shard), the version of the migrated chunk defines its shard version. For the donor shard (i.e. *i* shard) what we do is looking for another chunk of that collection on that shard and update its version. That chunk is called the control chunk and its version defines the *i* shard version. If there are no other chunks, the shard version is updated to SV<sub>i</sub><0, 0, E<sub>cv</sub>>.
 
-Refer to [SERVER-41480](https://jira.mongodb.org/browse/SERVER-41480) for the reasoning behind the
-complicated behavior with splitting a chunk.
+Operation Type                                      | Version Modification Behavior                                                                                |
+--------------                                      | -----------------------------                                                                                |
+Moving a chunk C <br> C<M, m, E>                    | C<M<sub>cv</sub> + 1, 0, E<sub>cv</sub>> <br> ControlChunk<<sub>cv</sub> + 1, 1, E<sub>cv</sub>> if any      |
+Splitting a chunk C into n pieces <br> C<M, m, E>   | C<sub>new 1</sub><M<sub>cv</sub>, m<sub>cv</sub> + 1, E<sub>cv</sub>> <br> ... <br> C<sub>new n</sub><M<sub>cv</sub>, m<sub>cv</sub> + n, E<sub>cv</sub>>                                                         |
+Merging chunks C<sub>1</sub>, ..., C<sub>n</sub> <br> C<sub>1</sub><M<sub>1</sub>, m<sub>1</sub>, E<sub>1</sub>> <br> ... <br> C<sub>n</sub><M<sub>n</sub>, m<sub>n</sub>, E<sub>n</sub>> <br> | C<sub>new</sub><M<sub>cv</sub>, m<sub>cv</sub> + 1, E<sub>cv</sub>>    |
+Dropping a collection                               | SV<sub>i</sub><0, 0, objectid()> forall i in 1 <= i  <= #Shards                                              |
+Refining a collection's shard key                   | C<sub>i</sub><M<sub>i</sub>, m<sub>i</sub>, E<sub>new</sub>>  forall i in 1 <= i  <= #Chunks                 |
+Changing the primary shard for a DB <br> DBV<uuid, Mod> | DBV<uuid, Mod + 1>                                                                                       |
+Dropping a database                                 | The dropped DB doesn't have a DBV                                                                            |
 
 ### Special versioning conventions
 
@@ -530,43 +528,75 @@ mergeChunks, and moveChunk all take the chunk ResourceMutex.
 
 ---
 
-# The logical clock and causal consistency
+# The vector clock and causal consistency
+
+The vector clock is used to manage various logical times and clocks across the distributed system, for the purpose of ensuring various guarantees about the ordering of distributed events (ie. "causality").
+
+These causality guarantees are implemented by assigning certain _logical times_ to relevant _events_ in the system.  These logical times are strictly monotonically increasing, and are communicated ("gossiped") between nodes on all messages (both requests and responses).  This allows the order of distributed operations to be controlled in the same manner as with a Lamport clock.
+
+## Vector clock
+
+The VectorClock class manages these logical time, all of which have similar requirements (and possibly special relationships with each other).  There are currently three such components of the vector clock:
+
+1. _ClusterTime_
+1. _ConfigTime_
+1. _TopologyTime_
+
+Each of these has a type of LogicalTime, which is similar to Timestamp - it is an unsigned 64 bit integer representing a combination of unix epoch (high 32 bit) and an integer 32 bit counter (low 32 bit).  Together, the LogicalTimes for all vector clock components are known as the VectorTime.  Each LogicalTime must always strictly monotonically increase, and there are two ways that this can happen:
+
+1. _Ticking_ is when a node encounters circumstances that require it to unilaterally increase the value.  This can either be some incremental amount (usually 1), or to some appropriate LogicalTime value.
+1. _Advancing_ happens in response to learning about a larger value from some other node, ie. gossiping.
+
+Each component has rules regarding when (and how) it is ticked, and when (and how) it is gossiped.  These define the system state that the component "tracks", what the component can be used for, and its relationship to the other components.
+
+Since mongoses are stateless, they can never tick any vector clock component.  In order to enforce this, the VectorClockMutable class (a sub-class of VectorClock that provides the ticking API) is not linked on mongos.
+
+## Component relationships
+
+As explained in more detail below, certain relationships are preserved between between the vector clock components, most importantly:
+```
+ClusterTime >= ConfigTime >= TopologyTime
+```
+
+As a result, it is important to ensure that times are fetched correctly from the VectorClock.  The `getTime()` function returns a `VectorTime` which contains an atomic snapshot of all components.  Thus code should always be written such as:
+```
+auto currentTime = VectorClock::get(opCtx)->getTime();
+doSomeWork(currentTime.clusterTime());
+doOtherWork(currentTime.configTime());    // Always passes a timestamp <= what was passed to doSomeWork()
+```
+
+And generally speaking, code such as the following is incorrect:
+```
+doSomeWork(VectorClock::get(opCtx)->getTime().clusterTime());
+doOtherWork(VectorClock::get(opCtx)->getTime().configTime());    // Might pass a timestamp > what was passed to doSomeWork()
+```
+because the timestamp received by `doOtherWork()` could be greater than the one received by `doSomeWork()` (ie. apparently violating the property).
+
+To discourage this incorrect pattern, it is forbidden to use the result of getTime() as a temporary (r-value) in this way; it must always first be stored in a variable.
+
+## ClusterTime
+
 Starting from v3.6 MongoDB provides session based causal consistency. All operations in the causally
 consistent session will be execute in the order that preserves the causality. In particular it
 means that client of the session has guarantees to
+
 * Read own writes
 * Monotonic reads and writes
 * Writes follow reads
+
 Causal consistency guarantees described in details in the [**server
 documentation**](https://docs.mongodb.com/v4.0/core/read-isolation-consistency-recency/#causal-consistency).
-Causality is implemented by assigning to all operations in the system a strictly monotonically increasing  scalar number - a cluster time - and making sure that
-the operations are executed in the order of the cluster times. To achieve this in a distributed
-system MongoDB implements gossiping protocol which distributes the cluster time across all the
-nodes: mongod, mongos, drivers and mongo shell clients. Separately from gossiping the cluster time is incremented only on the nodes that can write -
-i.e. primary nodes.
 
-## Cluster time
-ClusterTime refers to the time value of the node's logical clock. Its represented as an unsigned 64
-bit integer representing a combination of unix epoch (high 32 bit) and an integer 32 bit counter (low 32 bit). It's
-incremented only when state changing events occur. As the state is represented by the oplog entries
-the oplog optime is derived from the cluster time.
+### ClusterTime ticking
+The ClusterTime tracks the state of user databases.  As such, it is ticked only when the state of user databases change, i.e. when a mongod in PRIMARY state performs a write.  (In fact, there are a small number of other situations that tick ClusterTime, such as during step-up after a mongod node has won an election.)  The OpTime value used in the oplog entry for the write is obtained by converting this ticked ClusterTime to a Timestamp, and appending the current replication election term.
 
-### Cluster time gossiping
-Every node (mongod, mongos, config servers, clients) keep track on the maximum value of the
-ClusterTime it has seen. Every node adds this value to each message it sends.
+The ticking itself is performed by first incrementing the unix epoch part to the current walltime (if necessary), and then incrementing the counter by 1.  (Parallel insertion into the oplog will increment by N, rather than 1, and allocate the resulting range of ClusterTime values to the oplog entries.)
 
-### Cluster time ticking
-Every node in the cluster has a LogicalClock that keeps an in-memory version of the node's
-ClusterTime. ClusterTime can be converted to the OpTime, the time stored in MongoDB's replication oplog. OpTime
-can be used to identify entries and corresponding events in the oplog. OpTime is represented by a
-<Time><Increment><ElectionTerm> triplet. Here, the <ElectionTerm> is specific to the MongoDB
-replication protocol. It is local to the replica set and not a global state that should be included in the ClusterTime.
-To associate the ClusterTime with an oplog entry when events occur, [**MongoDB first computes the next ClusterTime
-value on the node, and then uses that value to create an OpTime (with the election term).**](https://github.com/mongodb/mongo/blob/v4.4/src/mongo/db/logical_clock.cpp#L102)
-This OpTime is what gets written to the oplog. This update does not require the OpTime format to change, remaining tied to a physical time. All the
-existing tools that use the oplog, such as backup and recovery, remain forward compatible.
+### ClusterTime gossiping
+The ClusterTime is gossiped by all nodes in the system: mongoses, shard mongods, config server mongods, and clients such as drivers or the shell.  It is gossiped with both internal clients (other mongod/mongos nodes in the cluster) and external clients (drivers, the shell).  It uses the `$clusterTime` field to do this, using the `SignedComponentFormat` described below.
 
-Example of ClusterTime gossiping and incrementing:
+### ClusterTime example
+Example of ClusterTime gossiping and ticking:
 1. Client sends a write command to the primary, the message includes its current value of the ClusterTime: T1.
 1. Primary node receives the message and advances its ClusterTime to T1, if T1 is greater than the primary
 node's current ClusterTime value.
@@ -576,19 +606,23 @@ the only time a new value of ClusterTime is generated.
 1. Result is returned to the client, it includes the new ClusterTime T2.
 1. The client advances its ClusterTime to T2.
 
+### SignedComponentFormat: ClusterTime signing
 
-### Cluster time signing
-As shown before, nodes advance their logical clocks to the maximum ClusterTime that they receive in the client
+As explained above, nodes advance their ClusterTime to the maximum value that they receive in the client
 messages. The next oplog entry will use this value in the timestamp portion of the OpTime. But a malicious client
-could modify their maximum ClusterTime sent in a message.  For example, it could send the <greatest possible
-cluster time - 1> . This value, once written to the oplogs of replica set nodes, will not be incrementable and the
-nodes will be unable to accept any changes (writes against the database). The only way to recover from this situation
-would be to unload the data, clean it, and reload back with the correct OpTime. This malicious attack would take the
-affected shard offline, affecting the availability of the entire system. To mitigate this risk,
-MongoDB added a HMAC- SHA1 signature that is used to verify the value of the ClusterTime on the server. ClusterTime values can be read
-by any node, but only MongoDB processes can sign new values. The signature cannot be generated by clients.
+could modify their maximum ClusterTime sent in a message.  For example, it could send the `<greatest possible
+cluster time - 1>`. This value, once written to the oplogs of replica set nodes, will not be incrementable (since LogicalTimes are unsigned) and the
+nodes will then be unable to accept any changes (writes against the database). This ClusterTime
+would eventually be gossiped across the entire cluster, affecting the availability of the whole
+system.  The only ways to recover from this situation involve downtime (eg. dump and restore the
+entire cluster).
 
-Here is an example of the document that distributes ClusterTime:
+To mitigate this risk, a HMAC-SHA1 signature is used to verify the value of the ClusterTime on the
+server. ClusterTime values can be read by any node, but only MongoDB processes can sign new values.
+The signature cannot be generated by clients. This means that servers can trust that validly signed
+ClusterTime values supplied by (otherwise untrusted) clients must have been generated by a server.
+
+Here is an example of the document that gossips ClusterTime:
 ```
 "$clusterTime" : {
     "clusterTime" :
@@ -605,11 +639,13 @@ Every time the mongod or mongos receives a message that includes a
 ClusterTime that is greater than the value of its logical clock, they will validate it by generating the signature using the key
 with the keyId from the message. If the signature does not match, the message will be rejected.
 
-## Key management
+### Key management
 To provide HMAC message verification all nodes inside a security perimeter i.e. mongos and mongod  need to access a secret key to generate and
 verify message signatures. MongoDB maintains keys in a `system.keys` collection in the `admin`
 database. In the sharded cluster this collection is located on the config server, in the Replica Set
-its on the primary node. The key document has the following format:
+its managed by the primary node (and propagated to secondaries via normal replication).
+
+The key document has the following format:
 ```
 {
     _id: <NumberLong>,
@@ -625,17 +661,18 @@ there is always one key that is valid for the next 3 months (the default). The s
 requests the key that was used for signing the message by its Id which is also stored in the
 signature. Since the old keys are never deleted from the `system.keys` collection they are always
 available to verify the messages signed in the past.
-As the message verification is on the critical path each node also keeps the in memory cache of the
+
+As the message verification is on the critical path each node also keeps an in memory cache of the
 valid keys.
 
-## Handling operator errors
+### Handling operator errors
 The risk of malicious clients affecting ClusterTime is mitigated by a signature, but it is still possible to advance the
 ClusterTime to the end of time by changing the wall clock value. This may happen as a result of operator error. Once
 the data with the OpTime containing the end of time timestamp is committed to the majority of nodes it cannot be
-changed. To mitigate this, we implemented a limit on the rate of change. The ClusterTime on a node cannot be advanced
-more than the number of seconds defined by the `maxAcceptableLogicalClockDriftSecs` parameter (default value is one year).
+changed. To mitigate this, there is a limit on the magnitude by which the (epoch part of the) ClusterTime can be
+advanced.  This limit is the `maxAcceptableLogicalClockDriftSecs` parameter (default value is one year).
 
-## Causal consistency in sessions
+### Causal consistency in sessions
 When a write event is sent from a client, that client has no idea what time is associated with the write, because the time
 was assigned after the message was sent. But the node that processes the write does know, as it incremented its
 ClusterTime and applied the write to the oplog. To make the client aware of the write's ClusterTime, it will be included
@@ -647,16 +684,69 @@ the received `operationTime` - in the `afterClusterTime` field of the request. T
 needs to return data with an associated ClusterTime greater than or equal to the requested `afterClusterTime` value.
 
 Below is an example of causally consistent "read own write" for the products collection that is sharded and has chunks on Shards A and B.
-1. The client sends db.products.insert({_id: 10, price: 100}) to a mongos and it gets routed to Shard A.
+1. The client sends `db.products.insert({_id: 10, price: 100})` to a mongos and it gets routed to Shard A.
 1. The primary on Shard A computes the ClusterTime, and ticks as described in the previous sections.
 1. Shard A returns the result with the `operationTime` that was written to the oplog.
-1. The client conditionally updates its local lastOperationTime value with the returned `operationTime` value
-1. The client sends a read db.products.aggregate([{$count: "numProducts"}]) to mongos and it gets routed to all shards where this collection has chunks: i.e. Shard A and Shard B.
+1. The client conditionally updates its local `lastOperationTime` value with the returned `operationTime` value
+1. The client sends a read `db.products.aggregate([{$count: "numProducts"}])` to mongos and it gets routed to all shards where this collection has chunks: i.e. Shard A and Shard B.
   To be sure that it can "read own write" the client includes the `afterClusterTime` field in the request and passes the `operationTime` value it received from the write.
 1. Shard B checks if the data with the requested OpTime is in its oplog. If not, it performs a noop write, then returns the result to mongos.
  It includes the `operationTime` that was the top of the oplog at the moment the read was performed.
 1. Shard A checks if the data with the requested OpTime is in its oplog and returns the result to mongos. It includes the `operationTime` that was the top of the oplog at the moment the read was performed.
 1. mongos aggregates the results and returns to the client with the largest `operationTime` it has seen in the responses from shards A and B.
+
+## ConfigTime
+
+ConfigTime is similar to the legacy `configOpTime` value used for causally consistent reads from config servers, but as a LogicalTime rather than an OpTime.
+
+### ConfigTime ticking
+The ConfigTime tracks the sharding state stored on the config servers.  As such, it is ticked only by config servers when they advance their majority commit point, and is ticked by increasing to that majority commit point value.  Since the majority commit point is based on oplog OpTimes, which are based the ClusterTime, this means that the ConfigTime ticks between ClusterTime values.  It also means that it is always true that ConfigTime <= ClusterTime, ie. ConfigTime "lags" ClusterTime.
+
+The ConfigTime value is then used when querying the config servers to ensure that the returned state
+is causally consistent.  This is done by using the ConfigTime as the parameter to `$afterOpTime`
+field of the Read Concern (with an Uninitialised term, so that it's not used in comparisons), and as
+the `minClusterTime` parameter to the read preference (to ensure that a current config server is
+targeted, if possible).
+
+### ConfigTime gossiping
+The ConfigTime is gossiped only by sharded cluster nodes: mongoses, shard mongods, and config server mongods.  Clients (drivers/shell), and plain replica sets do not gossip ConfigTime.  In addition, ConfigTime is only gossiped with internal clients (other mongos/mongod nodes), as identified by the kInternalClient flag (set during the `hello` command sent by mongos/mongod).
+
+It uses the `$configTime` field with the `PlainComponentFormat`, which simply represents the LogicalTime value as a Timestamp:
+```
+"$configTime" : Timestamp(1495470881, 5)
+```
+
+## TopologyTime
+
+TopologyTime is related to the "topology" of the sharded cluster, in terms of the shards present.
+
+### TopologyTime ticking
+Since the TopologyTime tracks the cluster topology, it ticks when a shard is added or removed from the cluster.  This is done by ticking TopologyTime to the ConfigTime of the write issued by the `_configsvrAddShard` or `_configsvrRemoveShard` command.  Thus, the property holds that TopologyTime <= ConfigTime, ie. TopologyTime "lags" ConfigTime.
+
+The TopologyTime value is then used by the ShardRegistry to know when it needs to refresh from the config servers.
+
+### TopologyTime gossiping
+The TopologyTime is gossiped identically to ConfigTime, except with a field name of `$topologyTime`.  (Note that this name is very similar to the unrelated `$topologyVersion` field returned by the streaming `hello` command response.)
+
+## Code references
+
+* [**Base VectorClock class**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/db/vector_clock.h) (contains querying, advancing, gossiping the time)
+* [**VectorClockMutable class**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/db/vector_clock_mutable.h) (adds ticking and persistence, not linked on mongos)
+* [**VectorClockMongoD class**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/db/vector_clock_mongod.cpp) (specific implementation used by mongod nodes)
+* [**VectorClockMongoS class**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/s/vector_clock_mongos.cpp) (specific implementation used by mongos nodes)
+
+* [**Definition of which components use which gossiping format**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/db/vector_clock.cpp#L322-L330)
+* [**PlainComponentFormat class**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/db/vector_clock.cpp#L125-L155) (for gossiping without signatures, and persistence formatting)
+* [**SignedComponentFormat class**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/db/vector_clock.cpp#L186-L320) (for signed gossiping of ClusterTime)
+* [**LogicalTimeValidator class**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/db/logical_time_validator.h) (generates and validates ClusterTime signatures)
+* [**KeysCollectionManager class**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/db/keys_collection_manager.h) (maintains the ClusterTime signing keys in `admin.system.keys`)
+
+* [**Definition of which components are gossiped internally/externally by mongod**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/db/vector_clock_mongod.cpp#L389-L406)
+* [**Definition of when components may be ticked by mongod**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/db/vector_clock_mongod.cpp#L408-L450)
+* [**Definition of which components are gossiped internally/externally by mongos**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/s/vector_clock_mongos.cpp#L71-L79)
+
+* [**Ticking ClusterTime**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/db/repl/local_oplog_info.cpp#L125) (main usage, search for `tickClusterTime` to find unusual cases)
+* [**Ticking ConfigTime and TopologyTime**](https://github.com/mongodb/mongo/blob/3681b03baa/src/mongo/db/s/config_server_op_observer.cpp#L252-L256)
 
 ---
 

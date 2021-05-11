@@ -135,7 +135,8 @@ bool ReplicationCoordinatorNoOp::buildsIndexes() {
     MONGO_UNREACHABLE;
 }
 
-OpTimeAndWallTime ReplicationCoordinatorNoOp::getMyLastAppliedOpTimeAndWallTime() const {
+OpTimeAndWallTime ReplicationCoordinatorNoOp::getMyLastAppliedOpTimeAndWallTime(
+    bool rollbackSafe) const {
     MONGO_UNREACHABLE;
 }
 
@@ -351,8 +352,7 @@ void ReplicationCoordinatorNoOp::incrementNumCatchUpOpsIfCatchingUp(long numOps)
     MONGO_UNREACHABLE;
 }
 
-Status ReplicationCoordinatorNoOp::processReplSetUpdatePosition(const UpdatePositionArgs&,
-                                                                long long*) {
+Status ReplicationCoordinatorNoOp::processReplSetUpdatePosition(const UpdatePositionArgs&) {
     MONGO_UNREACHABLE;
 }
 

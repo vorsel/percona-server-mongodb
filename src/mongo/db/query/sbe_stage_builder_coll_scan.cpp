@@ -54,13 +54,13 @@ namespace {
  * Checks whether a callback function should be created for a ScanStage and returns it, if so. The
  * logic in the provided callback will be executed when the ScanStage is opened or reopened.
  */
-sbe::ScanOpenCallback makeOpenCallbackIfNeeded(const Collection* collection,
+sbe::ScanOpenCallback makeOpenCallbackIfNeeded(const CollectionPtr& collection,
                                                const CollectionScanNode* csn) {
     if (csn->direction == CollectionScanParams::FORWARD && csn->shouldWaitForOplogVisibility) {
         invariant(!csn->tailable);
         invariant(collection->ns().isOplog());
 
-        return [](OperationContext* opCtx, const Collection* collection, bool reOpen) {
+        return [](OperationContext* opCtx, const CollectionPtr& collection, bool reOpen) {
             if (!reOpen) {
                 // Forward, non-tailable scans from the oplog need to wait until all oplog entries
                 // before the read begins to be visible. This isn't needed for reverse scans because
@@ -87,7 +87,7 @@ sbe::ScanOpenCallback makeOpenCallbackIfNeeded(const Collection* collection,
  * of the same SlotId (the latter is returned purely for convenience purposes).
  */
 std::tuple<std::vector<std::string>, sbe::value::SlotVector, boost::optional<sbe::value::SlotId>>
-makeOplogTimestampSlotsIfNeeded(const Collection* collection,
+makeOplogTimestampSlotsIfNeeded(const CollectionPtr& collection,
                                 sbe::value::SlotIdGenerator* slotIdGenerator,
                                 bool shouldTrackLatestOplogTimestamp) {
     if (shouldTrackLatestOplogTimestamp) {
@@ -118,7 +118,7 @@ std::tuple<sbe::value::SlotId,
            boost::optional<sbe::value::SlotId>,
            std::unique_ptr<sbe::PlanStage>>
 generateOptimizedOplogScan(OperationContext* opCtx,
-                           const Collection* collection,
+                           const CollectionPtr& collection,
                            const CollectionScanNode* csn,
                            sbe::value::SlotIdGenerator* slotIdGenerator,
                            sbe::value::FrameIdGenerator* frameIdGenerator,
@@ -192,7 +192,7 @@ generateOptimizedOplogScan(OperationContext* opCtx,
                 csn->nodeId(),
                 *seekRecordIdSlot,
                 sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
-                                           seekRecordId->repr())),
+                                           sbe::value::bitcastFrom<int64_t>(seekRecordId->repr()))),
             std::move(stage),
             sbe::makeSV(),
             sbe::makeSV(*seekRecordIdSlot),
@@ -212,7 +212,9 @@ generateOptimizedOplogScan(OperationContext* opCtx,
             sbe::makeE<sbe::EPrimBinary>(
                 sbe::EPrimBinary::lessEq,
                 sbe::makeE<sbe::EVariable>(*tsSlot),
-                sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Timestamp, (*csn->maxTs).asULL())),
+                sbe::makeE<sbe::EConstant>(
+                    sbe::value::TypeTags::Timestamp,
+                    sbe::value::bitcastFrom<uint64_t>((*csn->maxTs).asULL()))),
             csn->nodeId());
     }
 
@@ -300,7 +302,7 @@ std::tuple<sbe::value::SlotId,
            boost::optional<sbe::value::SlotId>,
            std::unique_ptr<sbe::PlanStage>>
 generateGenericCollScan(OperationContext* opCtx,
-                        const Collection* collection,
+                        const CollectionPtr& collection,
                         const CollectionScanNode* csn,
                         sbe::value::SlotIdGenerator* slotIdGenerator,
                         sbe::value::FrameIdGenerator* frameIdGenerator,
@@ -356,8 +358,9 @@ generateGenericCollScan(OperationContext* opCtx,
                 sbe::makeS<sbe::CoScanStage>(csn->nodeId()), 1, boost::none, csn->nodeId()),
             csn->nodeId(),
             seekSlot,
-            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
-                                       csn->resumeAfterRecordId->repr()));
+            sbe::makeE<sbe::EConstant>(
+                sbe::value::TypeTags::NumberInt64,
+                sbe::value::bitcastFrom<int64_t>(csn->resumeAfterRecordId->repr())));
 
         // Construct a 'seek' branch of the 'union'. If we're succeeded to reposition the cursor,
         // the branch will output  the 'seekSlot' to start the real scan from, otherwise it will
@@ -398,8 +401,8 @@ generateGenericCollScan(OperationContext* opCtx,
         // Construct a union stage from the 'seek' and 'fail' branches. Note that this stage will
         // ever produce a single call to getNext() due to a 'limit 1' sitting on top of it.
         auto unionStage = sbe::makeS<sbe::UnionStage>(
-            make_vector<std::unique_ptr<sbe::PlanStage>>(std::move(seekBranch),
-                                                         std::move(failBranch)),
+            makeVector<std::unique_ptr<sbe::PlanStage>>(std::move(seekBranch),
+                                                        std::move(failBranch)),
             std::vector<sbe::value::SlotVector>{sbe::makeSV(seekSlot), sbe::makeSV(unusedSlot)},
             sbe::makeSV(*seekRecordIdSlot),
             csn->nodeId());
@@ -447,7 +450,7 @@ std::tuple<sbe::value::SlotId,
            boost::optional<sbe::value::SlotId>,
            std::unique_ptr<sbe::PlanStage>>
 generateCollScan(OperationContext* opCtx,
-                 const Collection* collection,
+                 const CollectionPtr& collection,
                  const CollectionScanNode* csn,
                  sbe::value::SlotIdGenerator* slotIdGenerator,
                  sbe::value::FrameIdGenerator* frameIdGenerator,

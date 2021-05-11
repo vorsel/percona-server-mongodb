@@ -39,6 +39,7 @@
 
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
@@ -117,6 +118,7 @@ bool handleCursorCommand(OperationContext* opCtx,
                          const NamespaceString& nsForCursor,
                          std::vector<ClientCursor*> cursors,
                          const AggregationRequest& request,
+                         const BSONObj& cmdObj,
                          rpc::ReplyBuilderInterface* result) {
     invariant(!cursors.empty());
     long long batchSize = request.getBatchSize();
@@ -182,11 +184,15 @@ bool handleCursorCommand(OperationContext* opCtx,
             exec = nullptr;
             break;
         } catch (DBException& exception) {
+            auto&& explainer = exec->getPlanExplainer();
+            auto&& [stats, _] =
+                explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
             LOGV2_WARNING(23799,
-                          "Aggregate command executor error: {error}, stats: {stats}",
+                          "Aggregate command executor error: {error}, stats: {stats}, cmd: {cmd}",
                           "Aggregate command executor error",
                           "error"_attr = exception.toStatus(),
-                          "stats"_attr = redact(exec->getStats()));
+                          "stats"_attr = redact(stats),
+                          "cmd"_attr = cmdObj);
 
             exception.addContext("PlanExecutor error during aggregation");
             throw;
@@ -329,10 +335,11 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
  * 'collator'. Otherwise, returns ErrorCodes::OptionNotSupportedOnView.
  */
 Status collatorCompatibleWithPipeline(OperationContext* opCtx,
-                                      Database* db,
+                                      StringData dbName,
                                       const CollatorInterface* collator,
                                       const LiteParsedPipeline& liteParsedPipeline) {
-    if (!db) {
+    auto viewCatalog = DatabaseHolder::get(opCtx)->getSharedViewCatalog(opCtx, dbName);
+    if (!viewCatalog) {
         return Status::OK();
     }
     for (auto&& potentialViewNs : liteParsedPipeline.getInvolvedNamespaces()) {
@@ -340,7 +347,7 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
             continue;
         }
 
-        auto view = ViewCatalog::get(db)->lookup(opCtx, potentialViewNs.ns());
+        auto view = viewCatalog->lookup(opCtx, potentialViewNs.ns());
         if (!view) {
             continue;
         }
@@ -563,7 +570,7 @@ Status runAggregate(OperationContext* opCtx,
             }
         }
 
-        const Collection* collection = ctx ? ctx->getCollection() : nullptr;
+        const auto& collection = ctx ? ctx->getCollection() : CollectionPtr::null;
 
         // If this is a view, resolve it by finding the underlying collection and stitching view
         // pipelines and this request's pipeline together. We then release our locks before
@@ -589,8 +596,10 @@ Status runAggregate(OperationContext* opCtx,
                 }
             }
 
-            auto resolvedView =
-                uassertStatusOK(ViewCatalog::get(ctx->getDb())->resolveView(opCtx, nss));
+
+            auto resolvedView = uassertStatusOK(DatabaseHolder::get(opCtx)
+                                                    ->getSharedViewCatalog(opCtx, nss.db())
+                                                    ->resolveView(opCtx, nss));
             uassert(std::move(resolvedView),
                     "On sharded systems, resolved views must be executed by mongos",
                     !ShardingState::get(opCtx)->enabled());
@@ -630,9 +639,8 @@ Status runAggregate(OperationContext* opCtx,
         // Check that the view's collation matches the collation of any views involved in the
         // pipeline.
         if (!pipelineInvolvedNamespaces.empty()) {
-            invariant(ctx);
             auto pipelineCollationStatus = collatorCompatibleWithPipeline(
-                opCtx, ctx->getDb(), expCtx->getCollator(), liteParsedPipeline);
+                opCtx, nss.db(), expCtx->getCollator(), liteParsedPipeline);
             if (!pipelineCollationStatus.isOK()) {
                 return pipelineCollationStatus;
             }
@@ -701,7 +709,7 @@ Status runAggregate(OperationContext* opCtx,
         }
 
         {
-            auto planSummary = execs[0]->getPlanSummary();
+            auto planSummary = execs[0]->getPlanExplainer().getPlanSummary();
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             curOp->setPlanSummary_inlock(std::move(planSummary));
         }
@@ -752,13 +760,14 @@ Status runAggregate(OperationContext* opCtx,
         auto explainExecutor = pins[0]->getExecutor();
         auto bodyBuilder = result->getBodyBuilder();
         if (auto pipelineExec = dynamic_cast<PlanExecutorPipeline*>(explainExecutor)) {
-            Explain::explainPipelineExecutor(pipelineExec, *(expCtx->explain), &bodyBuilder);
+            Explain::explainPipeline(
+                pipelineExec, true /* executePipeline */, *(expCtx->explain), &bodyBuilder);
         } else {
-            invariant(pins[0]->getExecutor()->lockPolicy() ==
-                      PlanExecutor::LockPolicy::kLockExternally);
             invariant(explainExecutor->getOpCtx() == opCtx);
-            // The explainStages() function for a non-pipeline executor expects to be called with
-            // the appropriate collection lock already held. Make sure it has not been released yet.
+            // The explainStages() function for a non-pipeline executor may need to execute the plan
+            // to collect statistics. If the PlanExecutor uses kLockExternally policy, the
+            // appropriate collection lock must be already held. Make sure it has not been released
+            // yet.
             invariant(ctx);
             Explain::explainStages(explainExecutor,
                                    ctx->getCollection(),
@@ -768,20 +777,20 @@ Status runAggregate(OperationContext* opCtx,
         }
     } else {
         // Cursor must be specified, if explain is not.
-        const bool keepCursor =
-            handleCursorCommand(opCtx, expCtx, origNss, std::move(cursors), request, result);
+        const bool keepCursor = handleCursorCommand(
+            opCtx, expCtx, origNss, std::move(cursors), request, cmdObj, result);
         if (keepCursor) {
             cursorFreer.dismiss();
         }
 
         PlanSummaryStats stats;
-        pins[0].getCursor()->getExecutor()->getSummaryStats(&stats);
+        pins[0].getCursor()->getExecutor()->getPlanExplainer().getSummaryStats(&stats);
         curOp->debug().setPlanSummaryMetrics(stats);
         curOp->debug().nreturned = stats.nReturned;
         // For an optimized away pipeline, signal the cache that a query operation has completed.
         // For normal pipelines this is done in DocumentSourceCursor.
         if (ctx && ctx->getCollection()) {
-            const Collection* coll = ctx->getCollection();
+            const CollectionPtr& coll = ctx->getCollection();
             CollectionQueryInfo::get(coll).notifyOfQuery(opCtx, coll, stats);
         }
     }

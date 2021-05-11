@@ -87,7 +87,7 @@ public:
      * The behavior of the insertion can be specified through 'options'.
      */
     virtual Status insert(OperationContext* opCtx,
-                          const Collection* coll,
+                          const CollectionPtr& coll,
                           const BSONObj& obj,
                           const RecordId& loc,
                           const InsertDeleteOptions& options,
@@ -100,7 +100,7 @@ public:
      * multikey in the catalog, and sets the path-level multikey information if applicable.
      */
     virtual Status insertKeysAndUpdateMultikeyPaths(OperationContext* opCtx,
-                                                    const Collection* coll,
+                                                    const CollectionPtr& coll,
                                                     const KeyStringSet& keys,
                                                     const KeyStringSet& multikeyMetadataKeys,
                                                     const MultikeyPaths& multikeyPaths,
@@ -114,7 +114,7 @@ public:
      * insertion of these keys should cause the index to become multikey.
      */
     virtual Status insertKeys(OperationContext* opCtx,
-                              const Collection* coll,
+                              const CollectionPtr& coll,
                               const KeyStringSet& keys,
                               const RecordId& loc,
                               const InsertDeleteOptions& options,
@@ -155,10 +155,14 @@ public:
      * 'numDeleted' will be set to the number of keys removed from the index for the document.
      */
     virtual Status update(OperationContext* opCtx,
-                          const Collection* coll,
+                          const CollectionPtr& coll,
                           const UpdateTicket& ticket,
                           int64_t* numInserted,
                           int64_t* numDeleted) = 0;
+
+    virtual std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx,
+                                                                        bool dupsAllowed) = 0;
+
 
     /**
      * Returns an unpositioned cursor over 'this' index.
@@ -203,6 +207,11 @@ public:
      */
     virtual long long getSpaceUsedBytes(OperationContext* opCtx) const = 0;
 
+    /**
+     * The number of unused free bytes consumed by this index on disk.
+     */
+    virtual long long getFreeStorageBytes(OperationContext* opCtx) const = 0;
+
     virtual RecordId findSingle(OperationContext* opCtx, const BSONObj& key) const = 0;
 
     /**
@@ -215,7 +224,7 @@ public:
      * Sets this index as multikey with the provided paths.
      */
     virtual void setIndexIsMultikey(OperationContext* opCtx,
-                                    const Collection* collection,
+                                    const CollectionPtr& collection,
                                     KeyStringSet multikeyMetadataKeys,
                                     MultikeyPaths paths) = 0;
 
@@ -237,6 +246,12 @@ public:
                               const RecordId& loc,
                               const InsertDeleteOptions& options) = 0;
 
+        /**
+         * Inserts the keyString directly into the sorter. No additional logic (related to multikey
+         * paths, etc.) is performed.
+         */
+        virtual void addToSorter(const KeyString::Value& keyString) = 0;
+
         virtual const MultikeyPaths& getMultikeyPaths() const = 0;
 
         virtual bool isMultikey() const = 0;
@@ -253,15 +268,10 @@ public:
         virtual int64_t getKeysInserted() const = 0;
 
         /**
-         * Returns the current state of this BulkBuilder's underlying Sorter that has been already
-         * persisted to disk.
+         * Persists on disk the keys that have been inserted using this BulkBuilder. Returns the
+         * state of the underlying Sorter.
          */
-        virtual Sorter::PersistedState getPersistedSorterState() const = 0;
-
-        /**
-         * Persists on disk the keys that have been inserted using this BulkBuilder.
-         */
-        virtual void persistDataForShutdown() = 0;
+        virtual Sorter::PersistedState persistDataForShutdown() = 0;
     };
 
     /**
@@ -459,7 +469,7 @@ public:
                               std::unique_ptr<SortedDataInterface> btree);
 
     Status insert(OperationContext* opCtx,
-                  const Collection* coll,
+                  const CollectionPtr& coll,
                   const BSONObj& obj,
                   const RecordId& loc,
                   const InsertDeleteOptions& options,
@@ -467,7 +477,7 @@ public:
                   int64_t* numInserted) final;
 
     Status insertKeys(OperationContext* opCtx,
-                      const Collection* coll,
+                      const CollectionPtr& coll,
                       const KeyStringSet& keys,
                       const RecordId& loc,
                       const InsertDeleteOptions& options,
@@ -475,7 +485,7 @@ public:
                       int64_t* numInserted) final;
 
     Status insertKeysAndUpdateMultikeyPaths(OperationContext* opCtx,
-                                            const Collection* coll,
+                                            const CollectionPtr& coll,
                                             const KeyStringSet& keys,
                                             const KeyStringSet& multikeyMetadataKeys,
                                             const MultikeyPaths& multikeyPaths,
@@ -499,7 +509,7 @@ public:
                        UpdateTicket* ticket) const final;
 
     Status update(OperationContext* opCtx,
-                  const Collection* coll,
+                  const CollectionPtr& coll,
                   const UpdateTicket& ticket,
                   int64_t* numInserted,
                   int64_t* numDeleted) final;
@@ -507,6 +517,9 @@ public:
     std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx,
                                                            bool isForward) const final;
     std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx) const final;
+
+    std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx,
+                                                                bool dupsAllowed) final;
 
     Status initializeAsEmpty(OperationContext* opCtx) final;
 
@@ -520,12 +533,14 @@ public:
 
     long long getSpaceUsedBytes(OperationContext* opCtx) const final;
 
+    long long getFreeStorageBytes(OperationContext* opCtx) const final;
+
     RecordId findSingle(OperationContext* opCtx, const BSONObj& key) const final;
 
     Status compact(OperationContext* opCtx) final;
 
     void setIndexIsMultikey(OperationContext* opCtx,
-                            const Collection* collection,
+                            const CollectionPtr& collection,
                             KeyStringSet multikeyMetadataKeys,
                             MultikeyPaths paths) final;
 

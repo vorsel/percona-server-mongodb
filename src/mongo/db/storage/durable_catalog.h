@@ -144,6 +144,35 @@ public:
         const CollectionOptions& options,
         bool allocateDefaultSpace) = 0;
 
+    /**
+     * Import a collection by inserting the given metadata into the durable catalog and instructing
+     * the storage engine to import the corresponding idents. The metadata object should be a valid
+     * catalog entry and contain the following fields:
+     * "md": A document representing the BSONCollectionCatalogEntry::MetaData of the collection.
+     * "idxIdent": A document containing {<index_name>: <index_ident>} pairs for all indexes.
+     * "ns": Namespace of the collection being imported.
+     * "ident": Ident of the collection file.
+     *
+     * On success, returns an ImportResult structure containing the RecordId which identifies the
+     * new record store in the durable catalog, ownership of the new RecordStore and the UUID of the
+     * collection imported.
+     *
+     * The collection must be locked in MODE_X when calling this function.
+     */
+    struct ImportResult {
+        ImportResult(RecordId catalogId, std::unique_ptr<RecordStore> rs, UUID uuid)
+            : catalogId(catalogId), rs(std::move(rs)), uuid(uuid) {}
+        RecordId catalogId;
+        std::unique_ptr<RecordStore> rs;
+        UUID uuid;
+    };
+    enum class ImportCollectionUUIDOption { kKeepOld, kGenerateNew };
+    virtual StatusWith<ImportResult> importCollection(OperationContext* opCtx,
+                                                      const NamespaceString& nss,
+                                                      const BSONObj& metadata,
+                                                      const BSONObj& storageMetadata,
+                                                      ImportCollectionUUIDOption uuidOption) = 0;
+
     virtual Status renameCollection(OperationContext* opCtx,
                                     RecordId catalogId,
                                     const NamespaceString& toNss,
@@ -310,5 +339,9 @@ public:
     virtual KVPrefix getIndexPrefix(OperationContext* opCtx,
                                     RecordId catalogId,
                                     StringData indexName) const = 0;
+
+    virtual void setRand_forTest(const std::string& rand) = 0;
+
+    virtual std::string getRand_forTest() const = 0;
 };
 }  // namespace mongo

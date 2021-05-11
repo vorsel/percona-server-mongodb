@@ -206,18 +206,18 @@ void updateSessionEntry(OperationContext* opCtx, const UpdateRequest& updateRequ
     // Current code only supports replacement update.
     dassert(UpdateDriver::isDocReplacement(updateRequest.getUpdateModification()));
 
-    AutoGetCollection autoColl(opCtx, NamespaceString::kSessionTransactionsTableNamespace, MODE_IX);
+    AutoGetCollection collection(
+        opCtx, NamespaceString::kSessionTransactionsTableNamespace, MODE_IX);
 
     uassert(40527,
             str::stream() << "Unable to persist transaction state because the session transaction "
                              "collection is missing. This indicates that the "
                           << NamespaceString::kSessionTransactionsTableNamespace.ns()
                           << " collection has been manually deleted.",
-            autoColl.getCollection());
+            collection.getCollection());
 
     WriteUnitOfWork wuow(opCtx);
 
-    auto collection = autoColl.getCollection();
     auto idIndex = collection->getIndexCatalog()->findIdIndex(opCtx);
 
     uassert(40672,
@@ -749,7 +749,7 @@ TransactionParticipant::TxnResources::TxnResources(WithLock wl,
 
     _apiParameters = APIParameters::get(opCtx);
     _readConcernArgs = repl::ReadConcernArgs::get(opCtx);
-    _uncommittedCollections = UncommittedCollections::get(opCtx).shareResources();
+    _uncommittedCollections = UncommittedCollections::get(opCtx).releaseResources();
 }
 
 TransactionParticipant::TxnResources::~TxnResources() {
@@ -1688,7 +1688,7 @@ void TransactionParticipant::Participant::_cleanUpTxnResourceOnOpCtx(
         // We could have failed trying to get the initial global lock; in that case we will have a
         // WriteUnitOfWork but not have allocated the storage transaction.  That is the only case
         // where it is legal to abort a unit of work without the RSTL.
-        invariant(opCtx->lockState()->isRSTLLocked() || !opCtx->recoveryUnit()->inActiveTxn());
+        invariant(opCtx->lockState()->isRSTLLocked() || !opCtx->recoveryUnit()->isActive());
         opCtx->setWriteUnitOfWork(nullptr);
     }
 
@@ -2250,7 +2250,7 @@ void TransactionParticipant::Participant::onWriteOpCompletedOnPrimary(
         opCtx, std::move(stmtIdsWritten), sessionTxnRecord.getLastWriteOpTime());
 }
 
-void TransactionParticipant::Participant::onMigrateCompletedOnPrimary(
+void TransactionParticipant::Participant::onRetryableWriteCloningCompleted(
     OperationContext* opCtx,
     std::vector<StmtId> stmtIdsWritten,
     const SessionTxnRecord& sessionTxnRecord) {

@@ -122,6 +122,12 @@ public:
         const CollectionOptions& options,
         bool allocateDefaultSpace);
 
+    StatusWith<ImportResult> importCollection(OperationContext* opCtx,
+                                              const NamespaceString& nss,
+                                              const BSONObj& metadata,
+                                              const BSONObj& storageMetadata,
+                                              ImportCollectionUUIDOption uuidOption) override;
+
     Status renameCollection(OperationContext* opCtx,
                             RecordId catalogId,
                             const NamespaceString& toNss,
@@ -209,6 +215,10 @@ public:
                             RecordId catalogId,
                             StringData indexName) const;
 
+    void setRand_forTest(const std::string& rand);
+
+    std::string getRand_forTest() const;
+
 private:
     class AddIdentChange;
     class RemoveIdentChange;
@@ -223,6 +233,9 @@ private:
                                 NamespaceString nss,
                                 const CollectionOptions& options,
                                 KVPrefix prefix);
+    StatusWith<Entry> _importEntry(OperationContext* opCtx,
+                                   NamespaceString nss,
+                                   const BSONObj& metadata);
     Status _replaceEntry(OperationContext* opCtx,
                          RecordId catalogId,
                          const NamespaceString& toNss,
@@ -238,17 +251,21 @@ private:
 
     std::string _newInternalIdent(StringData identStem);
 
-    // Helpers only used by constructor and init(). Don't call from elsewhere.
     static std::string _newRand();
-    bool _hasEntryCollidingWithRand() const;
+
+    /**
+     * The '_randLock' must be passed in.
+     */
+    bool _hasEntryCollidingWithRand(WithLock) const;
 
     RecordStore* _rs;  // not owned
     const bool _directoryPerDb;
     const bool _directoryForIndexes;
 
-    // These two are only used for ident generation inside _newUniqueIdent.
-    std::string _rand;  // effectively const after init() returns
-    AtomicWord<unsigned long long> _next;
+    // Protects '_rand' and '_next'.
+    mutable Mutex _randLock = MONGO_MAKE_LATCH("DurableCatalogImpl::_rand");
+    std::string _rand;
+    unsigned long long _next;
 
     std::map<RecordId, Entry> _catalogIdToEntryMap;
     mutable Mutex _catalogIdToEntryMapLock =

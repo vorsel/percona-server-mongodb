@@ -93,11 +93,11 @@ public:
             CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)->getCatalogId();
         std::string indexIdent =
             _storageEngine->getCatalog()->getIndexIdent(opCtx, catalogId, indexName);
-        return dropIdent(opCtx, opCtx->recoveryUnit(), indexIdent);
+        return dropIdent(opCtx->recoveryUnit(), indexIdent);
     }
 
-    Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) {
-        return _storageEngine->getEngine()->dropIdent(opCtx, ru, ident);
+    Status dropIdent(RecoveryUnit* ru, StringData ident) {
+        return _storageEngine->getEngine()->dropIdent(ru, ident);
     }
 
     StatusWith<StorageEngine::ReconcileResult> reconcile(OperationContext* opCtx) {
@@ -157,10 +157,9 @@ public:
         }
         BSONObj spec = builder.append("name", key).append("v", 2).done();
 
-        const Collection* collection =
+        CollectionPtr collection =
             CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collNs);
-        auto descriptor =
-            std::make_unique<IndexDescriptor>(collection, IndexNames::findPluginName(spec), spec);
+        auto descriptor = std::make_unique<IndexDescriptor>(IndexNames::findPluginName(spec), spec);
 
         auto ret = DurableCatalog::get(opCtx)->prepareForIndexBuild(opCtx,
                                                                     collection->getCatalogId(),
@@ -171,13 +170,13 @@ public:
     }
 
     void indexBuildSuccess(OperationContext* opCtx, NamespaceString collNs, std::string key) {
-        const Collection* collection =
+        CollectionPtr collection =
             CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collNs);
         DurableCatalog::get(opCtx)->indexBuildSuccess(opCtx, collection->getCatalogId(), key);
     }
 
     Status removeEntry(OperationContext* opCtx, StringData collNs, DurableCatalog* catalog) {
-        const Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+        CollectionPtr collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
             opCtx, NamespaceString(collNs));
         return dynamic_cast<DurableCatalogImpl*>(catalog)->_removeEntry(opCtx,
                                                                         collection->getCatalogId());

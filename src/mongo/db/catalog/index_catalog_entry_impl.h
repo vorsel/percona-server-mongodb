@@ -155,14 +155,17 @@ public:
      * as multikey here.
      */
     void setMultikey(OperationContext* opCtx,
-                     const Collection* coll,
+                     const CollectionPtr& coll,
                      const KeyStringSet& multikeyMetadataKeys,
                      const MultikeyPaths& multikeyPaths) final;
 
-    // if this ready is ready for queries
     bool isReady(OperationContext* opCtx) const final;
 
     bool isFrozen() const final;
+
+    bool isPresentInMySnapshot(OperationContext* opCtx) const final;
+
+    bool isReadyInMySnapshot(OperationContext* opCtx) const final;
 
     KVPrefix getPrefix() const final {
         return _prefix;
@@ -172,7 +175,7 @@ public:
      * If return value is not boost::none, reads with majority read concern using an older snapshot
      * must treat this index as unfinished.
      */
-    boost::optional<Timestamp> getMinimumVisibleSnapshot() final {
+    boost::optional<Timestamp> getMinimumVisibleSnapshot() const final {
         return _minVisibleSnapshot;
     }
 
@@ -188,11 +191,8 @@ private:
      * Used by setMultikey() only.
      */
     Status _setMultikeyInMultiDocumentTransaction(OperationContext* opCtx,
-                                                  const Collection* collection,
+                                                  const CollectionPtr& collection,
                                                   const MultikeyPaths& multikeyPaths);
-
-    bool _catalogIsReady(OperationContext* opCtx) const;
-    bool _catalogIsPresent(OperationContext* opCtx) const;
 
     /**
      * Retrieves the multikey information associated with this index from '_collection',
@@ -205,7 +205,7 @@ private:
      * Sets on-disk multikey flag for this index.
      */
     void _catalogSetMultikey(OperationContext* opCtx,
-                             const Collection* collection,
+                             const CollectionPtr& collection,
                              const MultikeyPaths& multikeyPaths);
 
     KVPrefix _catalogGetPrefix(OperationContext* opCtx) const;

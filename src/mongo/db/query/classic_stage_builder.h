@@ -39,7 +39,7 @@ namespace mongo::stage_builder {
 class ClassicStageBuilder : public StageBuilder<PlanStage> {
 public:
     ClassicStageBuilder(OperationContext* opCtx,
-                        const Collection* collection,
+                        const CollectionPtr& collection,
                         const CanonicalQuery& cq,
                         const QuerySolution& solution,
                         WorkingSet* ws)

@@ -126,22 +126,42 @@
     ALL_ELEMENTS_TRUE "allElementsTrue"
     AND
     ANY_ELEMENT_TRUE "anyElementTrue"
+    ARG_CASE_SENSITIVE "$caseSensitive argument"
+    ARRAY_ELEM_AT
+    ARRAY_TO_OBJECT
+    ARG_AS "as argument"
     ARG_CHARS "chars argument"
     ARG_COLL "coll argument"
+    ARG_COND "cond argument"
     ARG_DATE "date argument"
     ARG_DATE_STRING "dateString argument"
+    ARG_DAY "day argument"
+    ARG_DIACRITIC_SENSITIVE "$diacriticSensitive argument"
+    ARG_FILTER "filter"
     ARG_FIND "find argument"
     ARG_FORMAT "format argument"
+    ARG_HOUR "hour argument"
     ARG_INPUT "input argument"
+    ARG_ISO_8601 "ISO 8601 argument"
+    ARG_ISO_DAY_OF_WEEK "ISO day of week argument"
+    ARG_ISO_WEEK "ISO week argument"
+    ARG_ISO_WEEK_YEAR "ISO week year argument"
+    ARG_LANGUAGE "$language argument"
+    ARG_MILLISECOND "millisecond argument"
+    ARG_MINUTE "minute argument"
+    ARG_MONTH "month argument"
     ARG_ON_ERROR "onError argument"
     ARG_ON_NULL "onNull argument"
     ARG_OPTIONS "options argument"
     ARG_PIPELINE "pipeline argument"
     ARG_REGEX "regex argument"
     ARG_REPLACEMENT "replacement argument"
+    ARG_SEARCH "$search argument"
+    ARG_SECOND "second argument"
     ARG_SIZE "size argument"
     ARG_TIMEZONE "timezone argument"
     ARG_TO "to argument"
+    ARG_YEAR "year argument"
     ASIN
     ASINH
     ATAN
@@ -151,13 +171,20 @@
     BOOL_TRUE "true"
     CEIL
     CMP
+    COMMENT
     CONCAT
+    CONCAT_ARRAYS
     CONST_EXPR
     CONVERT
     COS
     COSH
+    DATE_FROM_PARTS
     DATE_FROM_STRING
+    DATE_TO_PARTS
     DATE_TO_STRING
+    DAY_OF_MONTH
+    DAY_OF_WEEK
+    DAY_OF_YEAR
     DECIMAL_NEGATIVE_ONE "-1 (decimal)"
     DECIMAL_ONE "1 (decimal)"
     DECIMAL_ZERO "zero (decimal)"
@@ -166,22 +193,34 @@
     DOUBLE_NEGATIVE_ONE "-1 (double)"
     DOUBLE_ONE "1 (double)"
     DOUBLE_ZERO "zero (double)"
+    ELEM_MATCH "elemMatch operator"
     END_ARRAY "end of array"
     END_OBJECT "end of object"
     EQ
+    EXISTS
     EXPONENT
+    EXPR
+    FILTER
+    FIRST
     FLOOR
     GEO_NEAR_DISTANCE "geoNearDistance"
     GEO_NEAR_POINT "geoNearPoint"
     GT
     GTE
+    HOUR
     ID
+    IN_
+    INDEX_KEY "indexKey"
+    INDEX_OF_ARRAY
     INDEX_OF_BYTES
     INDEX_OF_CP
-    INDEX_KEY "indexKey"
     INT_NEGATIVE_ONE "-1 (int)"
     INT_ONE "1 (int)"
     INT_ZERO "zero (int)"
+    IS_ARRAY
+    ISO_DAY_OF_WEEK
+    ISO_WEEK
+    ISO_WEEK_YEAR
     LITERAL
     LN
     LOG
@@ -193,7 +232,10 @@
     LTE
     LTRIM
     META
+    MILLISECOND
+    MINUTE
     MOD
+    MONTH
     MULTIPLY
     NE
     NOR
@@ -212,19 +254,21 @@
     RTRIM
     SEARCH_HIGHLIGHTS "searchHighlights"
     SEARCH_SCORE "searchScore"
+    SECOND
     SET_DIFFERENCE "setDifference"
     SET_EQUALS "setEquals"
     SET_INTERSECTION "setIntersection"
     SET_IS_SUBSET "setIsSubset"
     SET_UNION "setUnion"
-    SLICE "slice"
-    SORT_KEY "sortKey"
     SIN
     SINH
+    SLICE "slice"
+    SORT_KEY "sortKey"
     SPLIT
     SQRT
     STAGE_INHIBIT_OPTIMIZATION
     STAGE_LIMIT
+    STAGE_MATCH
     STAGE_PROJECT
     STAGE_SAMPLE
     STAGE_SKIP
@@ -240,6 +284,7 @@
     SUBTRACT
     TAN
     TANH
+    TEXT
     TEXT_SCORE "textScore"
     TO_BOOL
     TO_DATE
@@ -254,6 +299,9 @@
     TRIM
     TRUNC
     TYPE
+    WEEK
+    WHERE
+    YEAR
 
     END_OF_FILE 0 "EOF"
 ;
@@ -288,57 +336,77 @@
 //
 
 // Possible fieldnames.
-%nterm <CNode::Fieldname> aggregationProjectionFieldname projectionFieldname expressionFieldname 
+%nterm <CNode::Fieldname> aggregationProjectionFieldname projectionFieldname expressionFieldname
 %nterm <CNode::Fieldname> stageAsUserFieldname argAsUserFieldname argAsProjectionPath
-%nterm <CNode::Fieldname> aggExprAsUserFieldname invariableUserFieldname
-%nterm <CNode::Fieldname> idAsUserFieldname idAsProjectionPath valueFieldname predFieldname
-%nterm <std::pair<CNode::Fieldname, CNode>> projectField projectionObjectField expressionField
-%nterm <std::pair<CNode::Fieldname, CNode>> valueField
+%nterm <CNode::Fieldname> aggExprAsUserFieldname invariableUserFieldname sortFieldname
+%nterm <CNode::Fieldname> idAsUserFieldname elemMatchAsUserFieldname idAsProjectionPath
+%nterm <CNode::Fieldname> valueFieldname predFieldname
+%nterm <std::pair<CNode::Fieldname, CNode>> aggregationProjectField aggregationProjectionObjectField
+%nterm <std::pair<CNode::Fieldname, CNode>> expressionField valueField
 %nterm <std::string> arg
 
 // Literals.
 %nterm <CNode> dbPointer javascript symbol javascriptWScope int timestamp long double decimal
 %nterm <CNode> minKey maxKey value string aggregationFieldPath binary undefined objectId bool date
 %nterm <CNode> null regex simpleValue compoundValue valueArray valueObject valueFields variable
+%nterm <CNode> typeArray typeValue
 
 // Pipeline stages and related non-terminals.
-%nterm <CNode> pipeline stageList stage inhibitOptimization unionWith skip limit project sample
-%nterm <CNode> projectFields projectionObjectFields topLevelProjection projection projectionObject
-%nterm <CNode> num
+%nterm <CNode> pipeline stageList stage inhibitOptimization unionWith skip limit matchStage project sample
+%nterm <CNode> aggregationProjectFields aggregationProjectionObjectFields
+%nterm <CNode> topLevelAggregationProjection aggregationProjection projectionCommon
+%nterm <CNode> aggregationProjectionObject num
 
-// Aggregate expressions
-%nterm <CNode> expression compoundNonObjectExpression exprFixedTwoArg exprFixedThreeArg
-%nterm <CNode> arrayManipulation slice expressionArray expressionObject expressionFields maths meta
-%nterm <CNode> add boolExprs and or not literalEscapes const literal stringExps concat
-%nterm <CNode> dateFromString dateToString indexOfBytes indexOfCP ltrim regexFind regexFindAll
-%nterm <CNode> regexMatch regexArgs replaceOne replaceAll rtrim split strLenBytes strLenCP
-%nterm <CNode> strcasecmp substr substrBytes substrCP toLower toUpper trim
+// Aggregate expressions.
+%nterm <CNode> expression exprFixedTwoArg exprFixedThreeArg slice expressionArray expressionObject
+%nterm <CNode> expressionFields maths meta add boolExprs and or not literalEscapes const literal
+%nterm <CNode> stringExps concat dateFromString dateToString indexOfBytes indexOfCP ltrim regexFind
+%nterm <CNode> regexFindAll regexMatch regexArgs replaceOne replaceAll rtrim split strLenBytes
+%nterm <CNode> strLenCP strcasecmp substr substrBytes substrCP toLower toUpper trim
 %nterm <CNode> compExprs cmp eq gt gte lt lte ne
+%nterm <CNode> dateExps dateFromParts dateToParts dayOfMonth dayOfWeek dayOfYear hour
+%nterm <CNode> isoDayOfWeek isoWeek isoWeekYear millisecond minute month second week year
 %nterm <CNode> typeExpression convert toBool toDate toDecimal toDouble toInt toLong
 %nterm <CNode> toObjectId toString type
 %nterm <CNode> abs ceil divide exponent floor ln log logten mod multiply pow round sqrt subtract trunc
+%nterm <CNode> arrayExps arrayElemAt arrayToObject concatArrays filter first in indexOfArray isArray
 %nterm <std::pair<CNode::Fieldname, CNode>> onErrorArg onNullArg
+%nterm <std::pair<CNode::Fieldname, CNode>> asArg
 %nterm <std::pair<CNode::Fieldname, CNode>> formatArg timezoneArg charsArg optionsArg
+%nterm <std::pair<CNode::Fieldname, CNode>> hourArg minuteArg secondArg millisecondArg dayArg
+%nterm <std::pair<CNode::Fieldname, CNode>> isoWeekArg iso8601Arg monthArg isoDayOfWeekArg
 %nterm <std::vector<CNode>> expressions values exprZeroToTwo
 %nterm <CNode> setExpression allElementsTrue anyElementTrue setDifference setEquals
 %nterm <CNode> setIntersection setIsSubset setUnion
 
 %nterm <CNode> trig sin cos tan sinh cosh tanh asin acos atan asinh acosh atanh atan2
 %nterm <CNode> degreesToRadians radiansToDegrees
-%nterm <CNode> nonArrayExpression nonArrayCompoundExpression nonArrayNonObjCompoundExpression
-%nterm <CNode> expressionSingletonArray singleArgExpression
+%nterm <CNode> nonArrayExpression nonArrayCompoundExpression aggregationOperator
+%nterm <CNode> aggregationOperatorWithoutSlice expressionSingletonArray singleArgExpression
+%nterm <CNode> nonArrayNonObjExpression
 // Match expressions.
-%nterm <CNode> match predicates compoundMatchExprs predValue additionalExprs
-%nterm <std::pair<CNode::Fieldname, CNode>> predicate logicalExpr operatorExpression notExpr
+%nterm <CNode> matchExpression predicates compoundMatchExprs predValue additionalExprs
+%nterm <std::pair<CNode::Fieldname, CNode>> predicate fieldPredicate logicalExpr operatorExpression notExpr matchMod
+%nterm <std::pair<CNode::Fieldname, CNode>> existsExpr typeExpr commentExpr
 %nterm <CNode::Fieldname> logicalExprField
+%nterm <std::vector<CNode>> typeValues
+%nterm <std::pair<CNode::Fieldname, CNode>> matchExpr matchText matchWhere
 
-// Sort related rules
+// $text arguments
+%nterm <CNode> textArgCaseSensitive textArgDiacriticSensitive textArgLanguage textArgSearch
+
+// Find Projection specific rules.
+%nterm <CNode> findProject findProjectFields topLevelFindProjection findProjection
+%nterm <CNode> findProjectionSlice elemMatch findProjectionObject findProjectionObjectFields
+%nterm <std::pair<CNode::Fieldname, CNode>> findProjectField findProjectionObjectField
+
+// Sort related rules.
 %nterm <CNode> sortSpecs specList metaSort oneOrNegOne metaSortKeyword
 %nterm <std::pair<CNode::Fieldname, CNode>> sortSpec
 
 %start start;
 // Sentinel tokens to indicate the starting point in the grammar.
-%token START_PIPELINE START_MATCH START_SORT
+%token START_PIPELINE START_MATCH START_PROJECT START_SORT
 
 //
 // Grammar rules
@@ -349,8 +417,11 @@ start:
     START_PIPELINE pipeline {
         *cst = $pipeline;
     }
-    | START_MATCH match {
-        *cst = $match;
+    | START_MATCH matchExpression {
+        *cst = $matchExpression;
+    }
+    | START_PROJECT findProject {
+        *cst = $findProject;
     }
     | START_SORT sortSpecs {
         *cst = $sortSpecs;
@@ -374,10 +445,10 @@ stageList:
 // Special rule to hint to the lexer that the next set of tokens should be sorted. Note that the
 // sort order is not lexicographical, but rather based on the enum generated from the %token list
 // above.
-START_ORDERED_OBJECT: { lexer.sortObjTokens(); } START_OBJECT;
+START_ORDERED_OBJECT: START_OBJECT { lexer.sortObjTokens(); };
 
 stage:
-    inhibitOptimization | unionWith | skip | limit | project | sample
+    inhibitOptimization | unionWith | skip | limit | matchStage | project | sample
 ;
 
 sample: STAGE_SAMPLE START_OBJECT ARG_SIZE num END_OBJECT {
@@ -419,9 +490,15 @@ limit:
         $$ = CNode{CNode::ObjectChildren{std::pair{KeyFieldname::limit, $num}}};
 };
 
+matchStage:
+    STAGE_MATCH matchExpression {
+        $$ = CNode{CNode::ObjectChildren{std::pair{KeyFieldname::match, $matchExpression}}};
+    }
+;
+
 project:
-    STAGE_PROJECT START_OBJECT projectFields END_OBJECT {
-        auto&& fields = $projectFields;
+    STAGE_PROJECT START_OBJECT aggregationProjectFields END_OBJECT {
+        auto&& fields = $aggregationProjectFields;
         if (auto status = c_node_validation::validateNoConflictingPathsInProjectFields(fields);
             !status.isOK())
             error(@1, status.reason());
@@ -438,27 +515,27 @@ project:
     }
 ;
 
-projectFields:
+aggregationProjectFields:
     %empty {
         $$ = CNode::noopLeaf();
     }
-    | projectFields[projectArg] projectField {
+    | aggregationProjectFields[projectArg] aggregationProjectField {
         $$ = $projectArg;
-        $$.objectChildren().emplace_back($projectField);
+        $$.objectChildren().emplace_back($aggregationProjectField);
     }
 ;
 
-projectField:
-    ID topLevelProjection {
-        $$ = {KeyFieldname::id, $topLevelProjection};
+aggregationProjectField:
+    ID topLevelAggregationProjection {
+        $$ = {KeyFieldname::id, $topLevelAggregationProjection};
     }
-    | aggregationProjectionFieldname topLevelProjection {
-        $$ = {$aggregationProjectionFieldname, $topLevelProjection};
+    | aggregationProjectionFieldname topLevelAggregationProjection {
+        $$ = {$aggregationProjectionFieldname, $topLevelAggregationProjection};
     }
 ;
 
-topLevelProjection:
-    projection {
+topLevelAggregationProjection:
+    aggregationProjection {
         auto projection = $1;
         $$ = stdx::holds_alternative<CNode::ObjectChildren>(projection.payload) &&
             stdx::holds_alternative<FieldnamePath>(projection.objectChildren()[0].first) ?
@@ -471,7 +548,13 @@ topLevelProjection:
     }
 ;
 
-projection:
+aggregationProjection:
+    projectionCommon
+    | aggregationProjectionObject
+    | aggregationOperator
+;
+
+projectionCommon:
     string
     | binary
     | undefined
@@ -540,8 +623,7 @@ projection:
     | timestamp
     | minKey
     | maxKey
-    | projectionObject
-    | compoundNonObjectExpression
+    | expressionArray
 ;
 
 // An aggregationProjectionFieldname is a projectionFieldname that is not positional.
@@ -551,18 +633,17 @@ aggregationProjectionFieldname:
         if (stdx::holds_alternative<PositionalProjectionPath>(stdx::get<FieldnamePath>($$)))
             error(@1, "positional projection forbidden in $project aggregation pipeline stage");
     }
+;
 
 // Dollar-prefixed fieldnames are illegal.
 projectionFieldname:
     FIELDNAME {
-        auto components = make_vector<std::string>($1);
+        auto components = makeVector<std::string>($1);
         if (auto positional =
             c_node_validation::validateProjectionPathAsNormalOrPositional(components);
             positional.isOK()) {
-            if (positional.getValue() == c_node_validation::IsPositional::yes)
-                $$ = PositionalProjectionPath{std::move(components)};
-            else
-                $$ = ProjectionPath{std::move(components)};
+            $$ = c_node_disambiguation::disambiguateProjectionPathType(std::move(components),
+                                                                       positional.getValue());
         } else {
             error(@1, positional.getStatus().reason());
         }
@@ -573,10 +654,8 @@ projectionFieldname:
         if (auto positional =
             c_node_validation::validateProjectionPathAsNormalOrPositional(components);
             positional.isOK()) {
-            if (positional.getValue() == c_node_validation::IsPositional::yes)
-                $$ = PositionalProjectionPath{std::move(components)};
-            else
-                $$ = ProjectionPath{std::move(components)};
+            $$ = c_node_disambiguation::disambiguateProjectionPathType(std::move(components),
+                                                                       positional.getValue());
         } else {
             error(@1, positional.getStatus().reason());
         }
@@ -584,35 +663,35 @@ projectionFieldname:
 ;
 
 // These are permitted to contain fieldnames with multiple path components such as {"a.b.c": ""}.
-projectionObject:
-    START_OBJECT projectionObjectFields END_OBJECT {
-        $$ = $projectionObjectFields;
+aggregationProjectionObject:
+    START_OBJECT aggregationProjectionObjectFields END_OBJECT {
+        $$ = $aggregationProjectionObjectFields;
     }
 ;
 
 // Projection objects cannot be empty.
-projectionObjectFields:
-    projectionObjectField {
+aggregationProjectionObjectFields:
+    aggregationProjectionObjectField {
         $$ = CNode::noopLeaf();
-        $$.objectChildren().emplace_back($projectionObjectField);
+        $$.objectChildren().emplace_back($aggregationProjectionObjectField);
     }
-    | projectionObjectFields[projectArg] projectionObjectField {
+    | aggregationProjectionObjectFields[projectArg] aggregationProjectionObjectField {
         $$ = $projectArg;
-        $$.objectChildren().emplace_back($projectionObjectField);
+        $$.objectChildren().emplace_back($aggregationProjectionObjectField);
     }
 ;
 
-projectionObjectField:
+aggregationProjectionObjectField:
     // _id is no longer a key when we descend past the directly projected fields.
-    idAsProjectionPath projection {
-        $$ = {$idAsProjectionPath, $projection};
+    idAsProjectionPath aggregationProjection {
+        $$ = {$idAsProjectionPath, $aggregationProjection};
     }
-    | aggregationProjectionFieldname projection {
-        $$ = {$aggregationProjectionFieldname, $projection};
+    | aggregationProjectionFieldname aggregationProjection {
+        $$ = {$aggregationProjectionFieldname, $aggregationProjection};
     }
 ;
 
-match:
+matchExpression:
     START_OBJECT predicates END_OBJECT {
         $$ = $predicates;
     }
@@ -628,11 +707,19 @@ predicates:
     }
 ;
 
-predicate: predFieldname predValue {
+predicate:
+    fieldPredicate
+    | commentExpr
+
+    // pathless match operators
+    | logicalExpr
+    | matchExpr
+    | matchText
+    | matchWhere
+;
+
+fieldPredicate: predFieldname predValue {
         $$ = {$predFieldname, $predValue};
-    }
-    | logicalExpr {
-        $$ = $logicalExpr;
     }
 ;
 
@@ -657,14 +744,66 @@ compoundMatchExprs:
 ;
 
 // Rules for the operators which act on a path.
-operatorExpression: notExpr
+operatorExpression:
+    notExpr | existsExpr | typeExpr | matchMod
+;
+
+existsExpr:
+    EXISTS value {
+        $$ = std::pair{KeyFieldname::existsExpr, $value};
+    }
+;
+
+typeArray:
+    START_ARRAY typeValues END_ARRAY {
+        $$ = CNode{$typeValues};
+    }
+;
+
+typeValues:
+    %empty { }
+    | typeValues[ts] typeValue {
+        $$ = $ts;
+        $$.emplace_back($typeValue);
+    }
+;
+
+typeValue:
+    num | string
+;
+
+typeExpr:
+    TYPE typeValue {
+        auto&& type = $typeValue;
+        if (auto status = c_node_validation::validateTypeOperatorArgument(type); !status.isOK()) {
+          // TODO SERVER-50498: error() on the offending literal rather than the TYPE token.
+          // This will require removing the offending literal indicators in the error strings provided by the validation function.
+          error(@1, status.reason());
+        }
+        $$ = std::pair{KeyFieldname::type, std::move(type)};
+    }
+    | TYPE typeArray {
+        auto&& types = $typeArray;
+        if (auto status = c_node_validation::validateTypeOperatorArgument(types); !status.isOK()) {
+          error(@1, status.reason());
+        }
+       $$ = std::pair{KeyFieldname::type, std::move(types)};
+    }
+;
+
+commentExpr:
+   COMMENT value {
+      $$ = std::pair{KeyFieldname::commentExpr, $value};
+   }
+;
 
 notExpr:
     NOT regex {
         $$ = std::pair{KeyFieldname::notExpr, $regex};
     }
-    // $not requires an object with atleast one expression.
-    | NOT START_OBJECT operatorExpression compoundMatchExprs END_OBJECT {
+    // $not requires an object with at least one expression. 'compoundMatchExprs' comes before
+    // 'operatorExpression' to allow us to naturally emplace_back() into the CST.
+    | NOT START_OBJECT compoundMatchExprs operatorExpression END_OBJECT {
         auto&& exprs = $compoundMatchExprs;
         exprs.objectChildren().emplace_back($operatorExpression);
 
@@ -672,10 +811,20 @@ notExpr:
     }
 ;
 
-// Logical expressions accept an array of objects, with at least one element.
-logicalExpr: logicalExprField START_ARRAY match additionalExprs END_ARRAY {
+matchMod:
+    MOD START_ARRAY num[divisor] num[remainder] END_ARRAY {
+        $$ = {KeyFieldname::matchMod, CNode{CNode::ArrayChildren{
+            $divisor,
+            $remainder,
+        }}};
+    }
+;
+
+// Logical expressions accept an array of objects, with at least one element. 'additionalExprs'
+// comes before 'match' to allow us to naturally emplace_back() into the CST.
+logicalExpr: logicalExprField START_ARRAY additionalExprs matchExpression END_ARRAY {
         auto&& children = $additionalExprs;
-        children.arrayChildren().emplace_back($match);
+        children.arrayChildren().emplace_back($matchExpression);
         $$ = {$logicalExprField, std::move(children)};
     }
 ;
@@ -689,9 +838,9 @@ additionalExprs:
     %empty {
         $$ = CNode{CNode::ArrayChildren{}};
     }
-    | additionalExprs[exprs] match {
+    | additionalExprs[exprs] matchExpression {
         $$ = $exprs;
-        $$.arrayChildren().emplace_back($match);
+        $$.arrayChildren().emplace_back($matchExpression);
     }
 ;
 
@@ -702,6 +851,66 @@ invariableUserFieldname:
     FIELDNAME {
         $$ = UserFieldname{$1};
     }
+;
+
+matchExpr:
+    EXPR expression {
+        $$ = {KeyFieldname::expr, $expression};
+    }
+;
+
+matchText:
+    TEXT START_ORDERED_OBJECT
+    textArgCaseSensitive
+    textArgDiacriticSensitive
+    textArgLanguage
+    textArgSearch
+    END_OBJECT
+    {
+        $$ = {
+            KeyFieldname::text,
+            CNode{CNode::ObjectChildren{
+                {KeyFieldname::caseSensitive, $textArgCaseSensitive},
+                {KeyFieldname::diacriticSensitive, $textArgDiacriticSensitive},
+                {KeyFieldname::language, $textArgLanguage},
+                {KeyFieldname::search, $textArgSearch},
+            }
+        }};
+    }
+;
+textArgCaseSensitive:
+    %empty {
+        $$ = CNode{KeyValue::absentKey};
+    }
+    | ARG_CASE_SENSITIVE bool[val] {
+        $$ = $val;
+    }
+;
+textArgDiacriticSensitive:
+    %empty {
+        $$ = CNode{KeyValue::absentKey};
+    }
+    | ARG_DIACRITIC_SENSITIVE bool[val] {
+        $$ = $val;
+    }
+;
+textArgLanguage:
+    %empty {
+        $$ = CNode{KeyValue::absentKey};
+    }
+    | ARG_LANGUAGE string[val] {
+        $$ = $val;
+    }
+;
+textArgSearch:
+    ARG_SEARCH string[val] {
+        $$ = $val;
+    }
+;
+
+matchWhere:
+    WHERE string { $$ = {KeyFieldname::where, $string}; }
+    | WHERE javascript { $$ = {KeyFieldname::where, $javascript}; }
 ;
 
 stageAsUserFieldname:
@@ -719,6 +928,9 @@ stageAsUserFieldname:
     | STAGE_LIMIT {
         $$ = UserFieldname{"$limit"};
     }
+    | STAGE_MATCH {
+        $$ = UserFieldname{"$match"};
+    }
     | STAGE_PROJECT {
         $$ = UserFieldname{"$project"};
     }
@@ -735,17 +947,14 @@ argAsUserFieldname:
 
 argAsProjectionPath:
     arg {
-        auto components = make_vector<std::string>($1);
+        auto components = makeVector<std::string>($1);
         if (auto positional =
             c_node_validation::validateProjectionPathAsNormalOrPositional(components);
-            positional.isOK()) {
-            if (positional.getValue() == c_node_validation::IsPositional::yes)
-                $$ = PositionalProjectionPath{std::move(components)};
-            else
-                $$ = ProjectionPath{std::move(components)};
-        } else {
+            positional.isOK())
+            $$ = c_node_disambiguation::disambiguateProjectionPathType(std::move(components),
+                                                                       positional.getValue());
+        else
             error(@1, positional.getStatus().reason());
-        }
     }
 ;
 
@@ -800,6 +1009,57 @@ arg:
     }
     | ARG_REPLACEMENT {
         $$ = "replacement";
+    }
+    | ARG_HOUR {
+        $$ = UserFieldname{"hour"};
+    }
+    | ARG_YEAR {
+        $$ = UserFieldname{"year"};
+    }
+    | ARG_MINUTE {
+        $$ = UserFieldname{"minute"};
+    }
+    | ARG_SECOND {
+        $$ = UserFieldname{"second"};
+    }
+    | ARG_MILLISECOND {
+        $$ = UserFieldname{"millisecond"};
+    }
+    | ARG_DAY {
+        $$ = UserFieldname{"day"};
+    }
+    | ARG_ISO_DAY_OF_WEEK {
+        $$ = UserFieldname{"isoDayOfWeek"};
+    }
+    | ARG_ISO_WEEK {
+        $$ = UserFieldname{"isoWeek"};
+    }
+    | ARG_ISO_WEEK_YEAR {
+        $$ = UserFieldname{"isoWeekYear"};
+    }
+    | ARG_ISO_8601 {
+        $$ = UserFieldname{"iso8601"};
+    }
+    | ARG_MONTH {
+        $$ = UserFieldname{"month"};
+    }
+    | ARG_SEARCH {
+        $$ = UserFieldname{"$search"};
+    }
+    | ARG_LANGUAGE {
+        $$ = UserFieldname{"$language"};
+    }
+    | ARG_CASE_SENSITIVE {
+        $$ = UserFieldname{"$caseSensitive"};
+    }
+    | ARG_DIACRITIC_SENSITIVE {
+        $$ = UserFieldname{"$diacriticSensitive"};
+    }
+    | ARG_AS {
+        $$ = UserFieldname{"as"};
+    }
+    | ARG_COND {
+        $$ = UserFieldname{"cond"};
     }
 ;
 
@@ -868,7 +1128,7 @@ aggExprAsUserFieldname:
     }
     | TO_LONG {
         $$ = UserFieldname{"$toLong"};
-    }
+      }
     | TO_OBJECT_ID {
         $$ = UserFieldname{"$toObjectId"};
     }
@@ -928,6 +1188,51 @@ aggExprAsUserFieldname:
     }
     | CONCAT {
         $$ = UserFieldname{"$concat"};
+    }
+    | DATE_FROM_PARTS {
+       $$ = UserFieldname{"$dateFromParts"};
+    }
+    | DATE_TO_PARTS {
+       $$ = UserFieldname{"$dateToParts"};
+    }
+    | DAY_OF_MONTH {
+       $$ = UserFieldname{"$dayOfMonth"};
+    }
+    | DAY_OF_WEEK {
+       $$ = UserFieldname{"$dayOfWeek"};
+    }
+    | DAY_OF_YEAR {
+       $$ = UserFieldname{"$dayOfYear"};
+    }
+    | HOUR {
+       $$ = UserFieldname{"$hour"};
+    }
+    | ISO_DAY_OF_WEEK {
+       $$ = UserFieldname{"$isoDayOfWeek"};
+    }
+    | ISO_WEEK {
+       $$ = UserFieldname{"$isoWeek"};
+    }
+    | ISO_WEEK_YEAR {
+       $$ = UserFieldname{"$isoWeekYear"};
+    }
+    | MILLISECOND {
+       $$ = UserFieldname{"$millisecond"};
+    }
+    | MINUTE {
+       $$ = UserFieldname{"$minute"};
+    }
+    | MONTH {
+       $$ = UserFieldname{"$month"};
+    }
+    | SECOND {
+       $$ = UserFieldname{"$second"};
+    }
+    | WEEK {
+       $$ = UserFieldname{"$week"};
+    }
+    | YEAR {
+       $$ = UserFieldname{"$year"};
     }
     | DATE_FROM_STRING {
         $$ = UserFieldname{"$dateFromString"};
@@ -1057,6 +1362,30 @@ aggExprAsUserFieldname:
     }
     | RADIANS_TO_DEGREES {
         $$ = UserFieldname{"$radiansToDegrees"};
+    }
+    | ARRAY_ELEM_AT {
+        $$ = UserFieldname{"$arrayElemAt"};
+    }
+    | ARRAY_TO_OBJECT {
+        $$ = UserFieldname{"$arrayToObject"};
+    }
+    | CONCAT_ARRAYS {
+        $$ = UserFieldname{"$concatArrays"};
+    }
+    | FILTER {
+        $$ = UserFieldname{"$filter"};
+    }
+    | FIRST {
+        $$ = UserFieldname{"$first"};
+    }
+    | IN_ {
+        $$ = UserFieldname{"$in"};
+    }
+    | INDEX_OF_ARRAY {
+        $$ = UserFieldname{"$indexOfArray"};
+    }
+    | IS_ARRAY {
+        $$ = UserFieldname{"$isArray"};
     }
 ;
 
@@ -1300,27 +1629,35 @@ simpleValue:
 // expressions are allowed.
 expressions:
     %empty { }
-    | expression expressions[expressionArg] {
+    | expressions[expressionArg] expression {
         $$ = $expressionArg;
         $$.emplace_back($expression);
     }
 ;
 
 expression:
-    simpleValue | expressionObject | expressionArray | nonArrayNonObjCompoundExpression
+    simpleValue | expressionObject | expressionArray | aggregationOperator
 ;
 
 nonArrayExpression:
     simpleValue | nonArrayCompoundExpression
 ;
 
-nonArrayCompoundExpression:
-    expressionObject | nonArrayNonObjCompoundExpression
+nonArrayNonObjExpression:
+    simpleValue | aggregationOperator
 ;
 
-nonArrayNonObjCompoundExpression:
-    arrayManipulation | maths | meta | boolExprs | literalEscapes | compExprs | typeExpression
-    | stringExps | setExpression | trig
+nonArrayCompoundExpression:
+    expressionObject | aggregationOperator
+;
+
+aggregationOperator:
+    aggregationOperatorWithoutSlice | slice
+;
+
+aggregationOperatorWithoutSlice:
+    maths | boolExprs | literalEscapes | compExprs | typeExpression | stringExps | setExpression
+    | trig | meta | dateExps | arrayExps
 ;
 
 // Helper rule for expressions which take exactly two expression arguments.
@@ -1337,15 +1674,7 @@ exprFixedThreeArg:
     }
 ;
 
-compoundNonObjectExpression:
-    expressionArray | nonArrayNonObjCompoundExpression
-;
-
-arrayManipulation:
-    slice
-;
-
-slice :
+slice:
     START_OBJECT SLICE exprFixedTwoArg END_OBJECT {
         $$ = CNode{CNode::ObjectChildren{{KeyFieldname::slice,
                                           $exprFixedTwoArg}}};
@@ -1397,9 +1726,9 @@ expressionField:
     }
 ;
 
-// All fieldnames that don't indicate agg functons/operators.
+// All fieldnames that don't indicate agg functons/operators or start with dollars.
 expressionFieldname:
-    invariableUserFieldname | stageAsUserFieldname | argAsUserFieldname | idAsUserFieldname
+    invariableUserFieldname | argAsUserFieldname | idAsUserFieldname
 ;
 
 idAsUserFieldname:
@@ -1408,15 +1737,21 @@ idAsUserFieldname:
     }
 ;
 
+elemMatchAsUserFieldname:
+    ELEM_MATCH {
+        $$ = UserFieldname{"$elemMatch"};
+    }
+;
+
 idAsProjectionPath:
     ID {
-        $$ = ProjectionPath{make_vector<std::string>("_id")};
+        $$ = ProjectionPath{makeVector<std::string>("_id")};
     }
 ;
 
 maths:
-    add | abs | ceil | divide | exponent | floor | ln | log | logten | mod | multiply | pow
-| round | sqrt | subtract | trunc
+    add | abs | ceil | divide | exponent | floor | ln | log | logten | mod | multiply | pow | round
+    | sqrt | subtract | trunc
 ;
 
 meta:
@@ -1467,13 +1802,13 @@ atan2:
     }
 ;
 abs:
-    START_OBJECT ABS expression END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::abs, $expression}}};
+    START_OBJECT ABS singleArgExpression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::abs, $singleArgExpression}}};
     }
 ;
 ceil:
-    START_OBJECT CEIL expression END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::ceil, $expression}}};
+    START_OBJECT CEIL singleArgExpression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::ceil, $singleArgExpression}}};
     }
 ;
 divide:
@@ -1483,18 +1818,18 @@ divide:
     }
 ;
 exponent:
-        START_OBJECT EXPONENT expression END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::exponent, $expression}}};
+        START_OBJECT EXPONENT singleArgExpression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::exponent, $singleArgExpression}}};
     }
 ;
 floor:
-     START_OBJECT FLOOR expression END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::floor, $expression}}};
+     START_OBJECT FLOOR singleArgExpression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::floor, $singleArgExpression}}};
     }
 ;
 ln:
-  START_OBJECT LN expression END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::ln, $expression}}};
+  START_OBJECT LN singleArgExpression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::ln, $singleArgExpression}}};
  }
 ;
 log:
@@ -1504,8 +1839,8 @@ log:
   }
 ;
 logten:
-      START_OBJECT LOGTEN expression END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::logten, $expression}}};
+      START_OBJECT LOGTEN singleArgExpression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::logten, $singleArgExpression}}};
      }
 ;
 mod:
@@ -1536,8 +1871,8 @@ round:
     }
 ;
 sqrt:
-      START_OBJECT SQRT expression END_OBJECT {
-        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::sqrt, $expression}}};
+      START_OBJECT SQRT singleArgExpression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::sqrt, $singleArgExpression}}};
    }
 ;
 subtract:
@@ -1648,6 +1983,81 @@ not:
     }
 ;
 
+arrayExps:
+    arrayElemAt | arrayToObject | concatArrays | filter | first | in | indexOfArray | isArray
+;
+
+arrayElemAt:
+    START_OBJECT ARRAY_ELEM_AT exprFixedTwoArg END_OBJECT {
+          $$ = CNode{CNode::ObjectChildren{{KeyFieldname::arrayElemAt,
+                                             $exprFixedTwoArg}}};
+    }
+;
+
+arrayToObject:
+    START_OBJECT ARRAY_TO_OBJECT expression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::arrayToObject, $expression}}};
+    }
+;
+
+concatArrays:
+    START_OBJECT CONCAT_ARRAYS START_ARRAY expressions END_ARRAY END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::concatArrays,
+                                          CNode{$expressions}}}};
+    }
+;
+
+asArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::asArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_AS string {
+        $$ = std::pair{KeyFieldname::asArg, $string};
+    }
+;
+
+filter:
+    START_OBJECT FILTER START_ORDERED_OBJECT asArg ARG_COND expression[cond] ARG_INPUT expression[input] END_OBJECT END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::filter, CNode{CNode::ObjectChildren{
+                                        $asArg, {KeyFieldname::condArg, $cond}, {KeyFieldname::inputArg, $input}}}}}};
+      }
+;
+
+first:
+    START_OBJECT FIRST expression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::first, $expression}}};
+      }
+;
+
+in:
+  START_OBJECT IN_ exprFixedTwoArg END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::in,
+                                           $exprFixedTwoArg}}};
+    }
+;
+
+indexOfArray:
+    START_OBJECT INDEX_OF_ARRAY START_ARRAY expression[array] expression[search] expression[start]
+      expression[end] END_ARRAY END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::indexOfArray,
+                                           CNode{CNode::ArrayChildren{$array, $search, $start, $end}}}}};
+    }
+    | START_OBJECT INDEX_OF_ARRAY exprFixedTwoArg END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::indexOfArray,
+                                          $exprFixedTwoArg}}};
+    }
+    | START_OBJECT INDEX_OF_ARRAY exprFixedThreeArg END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::indexOfArray,
+                                          $exprFixedThreeArg}}};
+    }
+;
+
+isArray:
+    START_OBJECT IS_ARRAY singleArgExpression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::isArray, $singleArgExpression}}};
+    }
+;
+
 stringExps:
     concat | dateFromString | dateToString | indexOfBytes | indexOfCP | ltrim | regexFind
     | regexFindAll | regexMatch | replaceOne | replaceAll | rtrim | split | strLenBytes | strLenCP
@@ -1657,10 +2067,7 @@ stringExps:
 concat:
     START_OBJECT CONCAT START_ARRAY expressions END_ARRAY END_OBJECT {
         $$ = CNode{CNode::ObjectChildren{{KeyFieldname::concat,
-                                          CNode{CNode::ArrayChildren{}}}}};
-        auto&& others = $expressions;
-        auto&& array = $$.objectChildren()[0].second.arrayChildren();
-        array.insert(array.end(), others.begin(), others.end());
+                                          CNode{$expressions}}}};
     }
 ;
 
@@ -1682,6 +2089,7 @@ timezoneArg:
     }
 ;
 
+
 dateFromString:
     START_OBJECT DATE_FROM_STRING START_ORDERED_OBJECT ARG_DATE_STRING expression formatArg timezoneArg
             onErrorArg onNullArg END_OBJECT END_OBJECT {
@@ -1697,6 +2105,296 @@ dateToString:
         $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dateToString, CNode{CNode::ObjectChildren{
                                          {KeyFieldname::dateArg, $expression},
                                          $formatArg, $timezoneArg, $onNullArg}}}}};
+    }
+;
+
+dateExps:
+    dateFromParts | dateToParts | dayOfMonth | dayOfWeek | dayOfYear | hour | isoDayOfWeek | isoWeek | isoWeekYear |
+      millisecond | minute | month | second | week | year
+;
+
+hourArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::hourArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_HOUR expression {
+        $$ = std::pair{KeyFieldname::hourArg, $expression};
+    }
+;
+
+minuteArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::minuteArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_MINUTE expression {
+        $$ = std::pair{KeyFieldname::minuteArg, $expression};
+    }
+;
+
+secondArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::secondArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_SECOND expression {
+        $$ = std::pair{KeyFieldname::secondArg, $expression};
+    }
+;
+
+millisecondArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::millisecondArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_MILLISECOND expression {
+        $$ = std::pair{KeyFieldname::millisecondArg, $expression};
+    }
+;
+
+dayArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::dayArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_DAY expression {
+        $$ = std::pair{KeyFieldname::dayArg, $expression};
+    }
+;
+
+isoDayOfWeekArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::isoDayOfWeekArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_ISO_DAY_OF_WEEK expression {
+        $$ = std::pair{KeyFieldname::isoDayOfWeekArg, $expression};
+    }
+;
+
+isoWeekArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::isoWeekArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_ISO_WEEK expression {
+        $$ = std::pair{KeyFieldname::isoWeekArg, $expression};
+    }
+;
+
+iso8601Arg:
+    %empty {
+        $$ = std::pair{KeyFieldname::iso8601Arg, CNode{KeyValue::falseKey}};
+    }
+    | ARG_ISO_8601 bool {
+        $$ = std::pair{KeyFieldname::iso8601Arg, $bool};
+    }
+;
+
+monthArg:
+    %empty {
+        $$ = std::pair{KeyFieldname::monthArg, CNode{KeyValue::absentKey}};
+    }
+    | ARG_MONTH expression {
+        $$ = std::pair{KeyFieldname::monthArg, $expression};
+    }
+;
+
+dateFromParts:
+    START_OBJECT DATE_FROM_PARTS START_ORDERED_OBJECT dayArg hourArg millisecondArg minuteArg monthArg secondArg timezoneArg ARG_YEAR expression
+            END_OBJECT END_OBJECT {
+            $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dateFromParts, CNode{CNode::ObjectChildren{
+                                             {KeyFieldname::yearArg, $expression},
+                                             $monthArg, $dayArg, $hourArg, $minuteArg, $secondArg, $millisecondArg, $timezoneArg}}}}};
+    }
+    | START_OBJECT DATE_FROM_PARTS START_ORDERED_OBJECT dayArg hourArg isoDayOfWeekArg isoWeekArg ARG_ISO_WEEK_YEAR expression
+        millisecondArg minuteArg monthArg secondArg timezoneArg END_OBJECT END_OBJECT {
+            $$ = CNode {CNode::ObjectChildren{{KeyFieldname::dateFromParts, CNode{CNode::ObjectChildren{
+                                              {KeyFieldname::isoWeekYearArg, $expression},
+                                              $isoWeekArg, $isoDayOfWeekArg, $hourArg, $minuteArg, $secondArg, $millisecondArg, $timezoneArg}}}}};
+    }
+;
+
+dateToParts:
+     START_OBJECT DATE_TO_PARTS START_ORDERED_OBJECT ARG_DATE expression iso8601Arg timezoneArg END_OBJECT END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dateToParts, CNode{CNode::ObjectChildren{
+                                         {KeyFieldname::dateArg, $expression},
+                                         $timezoneArg, $iso8601Arg}}}}};
+    }
+;
+
+dayOfMonth:
+    START_OBJECT DAY_OF_MONTH nonArrayNonObjExpression END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dayOfMonth, $nonArrayNonObjExpression}}};
+    }
+    | START_OBJECT DAY_OF_MONTH START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dayOfMonth, CNode{CNode::ObjectChildren{
+                  {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT DAY_OF_MONTH expressionSingletonArray END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dayOfMonth, $expressionSingletonArray}}};
+    }
+;
+
+dayOfWeek:
+    START_OBJECT DAY_OF_WEEK nonArrayNonObjExpression END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dayOfWeek, $nonArrayNonObjExpression}}};
+
+    }
+    | START_OBJECT DAY_OF_WEEK START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dayOfWeek, CNode{CNode::ObjectChildren{
+                {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT DAY_OF_WEEK expressionSingletonArray END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dayOfWeek, $expressionSingletonArray}}};
+    }
+;
+
+isoDayOfWeek:
+    START_OBJECT ISO_DAY_OF_WEEK nonArrayNonObjExpression END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::isoDayOfWeek, $nonArrayNonObjExpression}}};
+
+    }
+    | START_OBJECT ISO_DAY_OF_WEEK START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::isoDayOfWeek, CNode{CNode::ObjectChildren{
+                {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT ISO_DAY_OF_WEEK expressionSingletonArray END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::isoDayOfWeek, $expressionSingletonArray}}};
+    }
+;
+
+dayOfYear:
+    START_OBJECT DAY_OF_YEAR nonArrayNonObjExpression END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dayOfYear, $nonArrayNonObjExpression}}};
+
+    }
+    | START_OBJECT DAY_OF_YEAR START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dayOfYear, CNode{CNode::ObjectChildren{
+                {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT DAY_OF_YEAR expressionSingletonArray END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::dayOfYear, $expressionSingletonArray}}};
+    }
+;
+
+hour:
+    START_OBJECT HOUR nonArrayNonObjExpression END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::hour, $nonArrayNonObjExpression}}};
+
+    }
+    | START_OBJECT HOUR START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::hour, CNode{CNode::ObjectChildren{
+                {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT HOUR expressionSingletonArray END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::hour, $expressionSingletonArray}}};
+    }
+;
+
+month:
+    START_OBJECT MONTH nonArrayNonObjExpression END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::month, $nonArrayNonObjExpression}}};
+
+    }
+    | START_OBJECT MONTH START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::month, CNode{CNode::ObjectChildren{
+                {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT MONTH expressionSingletonArray END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::month, $expressionSingletonArray}}};
+    }
+;
+
+week:
+    START_OBJECT WEEK nonArrayNonObjExpression END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::week, $nonArrayNonObjExpression}}};
+
+    }
+    | START_OBJECT WEEK START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::week, CNode{CNode::ObjectChildren{
+                {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT WEEK expressionSingletonArray END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::week, $expressionSingletonArray}}};
+    }
+;
+
+isoWeek:
+    START_OBJECT ISO_WEEK nonArrayNonObjExpression END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::isoWeek, $nonArrayNonObjExpression}}};
+
+    }
+    | START_OBJECT ISO_WEEK START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::isoWeek, CNode{CNode::ObjectChildren{
+                {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT ISO_WEEK expressionSingletonArray END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::isoWeek, $expressionSingletonArray}}};
+    }
+;
+
+isoWeekYear:
+    START_OBJECT ISO_WEEK_YEAR nonArrayNonObjExpression END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::isoWeekYear, $nonArrayNonObjExpression}}};
+
+    }
+    | START_OBJECT ISO_WEEK_YEAR START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::isoWeekYear, CNode{CNode::ObjectChildren{
+                {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT ISO_WEEK_YEAR expressionSingletonArray END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::isoWeekYear, $expressionSingletonArray}}};
+    }
+;
+
+year:
+    START_OBJECT YEAR nonArrayNonObjExpression END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::year, $nonArrayNonObjExpression}}};
+
+    }
+    | START_OBJECT YEAR START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::year, CNode{CNode::ObjectChildren{
+                {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT YEAR expressionSingletonArray END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::year, $expressionSingletonArray}}};
+    }
+;
+
+second:
+    START_OBJECT SECOND nonArrayNonObjExpression END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::second, $nonArrayNonObjExpression}}};
+
+    }
+    | START_OBJECT SECOND START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::second, CNode{CNode::ObjectChildren{
+                {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT SECOND expressionSingletonArray END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::second, $expressionSingletonArray}}};
+    }
+;
+
+millisecond:
+    START_OBJECT MILLISECOND nonArrayNonObjExpression END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::millisecond, $nonArrayNonObjExpression}}};
+
+    }
+    | START_OBJECT MILLISECOND START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::millisecond, CNode{CNode::ObjectChildren{
+                {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT MILLISECOND expressionSingletonArray END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::millisecond, $expressionSingletonArray}}};
+    }
+;
+
+minute:
+    START_OBJECT MINUTE nonArrayNonObjExpression END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::minute, $nonArrayNonObjExpression}}};
+
+    }
+    | START_OBJECT MINUTE START_ORDERED_OBJECT ARG_DATE expression timezoneArg END_OBJECT END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::minute, CNode{CNode::ObjectChildren{
+                {KeyFieldname::dateArg, $expression}, $timezoneArg}}}}};
+    }
+    | START_OBJECT MINUTE expressionSingletonArray END_OBJECT {
+       $$ = CNode{CNode::ObjectChildren{{KeyFieldname::minute, $expressionSingletonArray}}};
     }
 ;
 
@@ -1943,11 +2641,128 @@ oneOrNegOne:
         $$ = CNode{KeyValue::decimalNegOneKey};
     }
 
+sortFieldname:
+    valueFieldname {
+        $sortFieldname = SortPath{makeVector<std::string>(stdx::get<UserFieldname>($valueFieldname))};
+    } | DOTTED_FIELDNAME {
+        auto components = $DOTTED_FIELDNAME;
+        if (auto status = c_node_validation::validateSortPath(components);
+            !status.isOK())
+            error(@DOTTED_FIELDNAME, status.reason());
+        $sortFieldname = SortPath{std::move(components)};
+    }
+;
+
 sortSpec:
-    valueFieldname metaSort {
+    sortFieldname metaSort {
         $$ = {$1, $2};
-    } | valueFieldname oneOrNegOne {
+    } | sortFieldname oneOrNegOne {
         $$ = {$1, $2};
+    }
+;
+
+findProject:
+    START_OBJECT findProjectFields END_OBJECT {
+        auto&& fields = $findProjectFields;
+        if (auto status = c_node_validation::validateNoConflictingPathsInProjectFields(fields);
+            !status.isOK())
+            error(@1, status.reason());
+        if (auto inclusion = c_node_validation::validateProjectionAsInclusionOrExclusion(fields);
+            inclusion.isOK())
+            $$ = CNode{CNode::ObjectChildren{std::pair{inclusion.getValue() ==
+                                                       c_node_validation::IsInclusion::yes ?
+                                                       KeyFieldname::projectInclusion :
+                                                       KeyFieldname::projectExclusion,
+                                                       std::move(fields)}}};
+        else
+            // Pass the location of the project token to the error reporting function.
+            error(@1, inclusion.getStatus().reason());
+    }
+;
+
+findProjectFields:
+    %empty {
+        $$ = CNode::noopLeaf();
+    }
+    | findProjectFields[projectArg] findProjectField {
+        $$ = $projectArg;
+        $$.objectChildren().emplace_back($findProjectField);
+    }
+;
+
+findProjectField:
+    ID topLevelFindProjection {
+        $$ = {KeyFieldname::id, $topLevelFindProjection};
+    }
+    | projectionFieldname topLevelFindProjection {
+        $$ = {$projectionFieldname, $topLevelFindProjection};
+    }
+;
+
+topLevelFindProjection:
+    findProjection {
+        auto projection = $1;
+        $$ = stdx::holds_alternative<CNode::ObjectChildren>(projection.payload) &&
+            stdx::holds_alternative<FieldnamePath>(projection.objectChildren()[0].first) ?
+            c_node_disambiguation::disambiguateCompoundProjection(std::move(projection)) :
+            std::move(projection);
+        if (stdx::holds_alternative<CompoundInconsistentKey>($$.payload))
+            // TODO SERVER-50498: error() instead of uasserting
+            uasserted(ErrorCodes::FailedToParse, "object project field cannot contain both "
+                                                 "inclusion and exclusion indicators");
+    }
+;
+
+findProjection:
+    projectionCommon
+    | findProjectionObject
+    | aggregationOperatorWithoutSlice
+    | findProjectionSlice
+    | elemMatch
+;
+
+elemMatch:
+    START_OBJECT ELEM_MATCH matchExpression END_OBJECT {
+        $$ = {CNode::ObjectChildren{{KeyFieldname::elemMatch, $matchExpression}}};
+    }
+;
+
+findProjectionSlice:
+    START_OBJECT SLICE num END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::slice, $num}}};
+    }
+    | START_OBJECT SLICE START_ARRAY num[leftNum] num[rightNum] END_ARRAY END_OBJECT {
+        $$ = CNode{CNode::ObjectChildren{{KeyFieldname::slice,
+                                          CNode{CNode::ArrayChildren{$leftNum, $rightNum}}}}};
+    }
+;
+
+// These are permitted to contain fieldnames with multiple path components such as {"a.b.c": ""}.
+findProjectionObject:
+    START_OBJECT findProjectionObjectFields END_OBJECT {
+        $$ = $findProjectionObjectFields;
+    }
+;
+
+// Projection objects cannot be empty.
+findProjectionObjectFields:
+    findProjectionObjectField {
+        $$ = CNode::noopLeaf();
+        $$.objectChildren().emplace_back($findProjectionObjectField);
+    }
+    | findProjectionObjectFields[projectArg] findProjectionObjectField {
+        $$ = $projectArg;
+        $$.objectChildren().emplace_back($findProjectionObjectField);
+    }
+;
+
+findProjectionObjectField:
+    // _id is no longer a key when we descend past the directly projected fields.
+    idAsProjectionPath findProjection {
+        $$ = {$idAsProjectionPath, $findProjection};
+    }
+    | projectionFieldname findProjection {
+        $$ = {$projectionFieldname, $findProjection};
     }
 ;
 
@@ -2049,7 +2864,7 @@ valueArray:
 
 values:
     %empty { }
-    | value values[valuesArg] {
+    | values[valuesArg] value {
         $$ = $valuesArg;
         $$.emplace_back($value);
     }
@@ -2084,6 +2899,7 @@ valueFieldname:
     | argAsUserFieldname
     | aggExprAsUserFieldname
     | idAsUserFieldname
+    | elemMatchAsUserFieldname
 ;
 
 compExprs: cmp | eq | gt | gte | lt | lte | ne;

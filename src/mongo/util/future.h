@@ -249,6 +249,14 @@ public:
      */
     ExecutorFuture<T> thenRunOn(ExecutorPtr exec) && noexcept;
 
+    /**
+     * Returns an inline Future type from this SemiFuture.
+     *
+     * WARNING: Do not use this unless you're extremely sure of what you're doing, as callbacks
+     * chained to the resulting Future may run in unexpected places.
+     */
+    Future<T> unsafeToInlineFuture() && noexcept;
+
 private:
     friend class Promise<T>;
     friend class SharedPromise<T>;
@@ -261,7 +269,6 @@ private:
     template <typename>
     friend class SharedSemiFuture;
 
-    Future<T> unsafeToInlineFuture() && noexcept;
 
     explicit SemiFuture(future_details::SharedStateHolder<T_unless_void>&& impl)
         : _impl(std::move(impl)) {}
@@ -336,10 +343,17 @@ public:
     }
 
     /**
-     * This ends the Future continuation chain by calling a callback on completion. Use this to
-     * escape back into a callback-based API.
+     * Attaches a `func` callback that will consume the result of this `Future` when it completes. A
+     * `getAsync` call can be the tail end of a continuation chain, and that is only position at
+     * which it can appear.
      *
-     * For now, the callback must not fail, since there is nowhere to propagate the error to.
+     * The result argument passed to `func` is `Status` if `T` is `void`, otherwise `StatusWith<T>`.
+     * The `func(result)` return type must be `void`, and not a discarded return value.
+     *
+     * `func` must not throw an exception. It is invoked as if by a `noexcept` function, and it will
+     * `std::terminate` the process. This is because there is no appropriate context in which to
+     * handle such an asynchronous exception.
+     *
      * TODO decide how to handle func throwing.
      */
     TEMPLATE(typename Func)
@@ -600,6 +614,10 @@ public:
     // it should be doable, but will be fairly complicated.
     //
 
+    /**
+     * Attach a completion callback to asynchronously consume this `ExecutorFuture`'s result.
+     * \see `Future<T>::getAsync()`.
+     */
     TEMPLATE(typename Func)
     REQUIRES(future_details::isCallableExactR<void, Func, StatusOrStatusWith<T>>)
     void getAsync(Func&& func) && noexcept {
@@ -797,15 +815,6 @@ public:
         });
     }
 
-    /**
-     * Same as setFrom(Future) above, but takes a SemiFuture instead of a Future.
-     */
-    void setFrom(SemiFuture<T>&& future) noexcept {
-        setImpl([&](boost::intrusive_ptr<future_details::SharedState<T>>&& sharedState) {
-            std::move(future).propagateResultTo(sharedState.get());
-        });
-    }
-
     TEMPLATE(typename... Args)
     REQUIRES(std::is_constructible_v<T, Args...> || (std::is_void_v<T> && sizeof...(Args) == 0))
     void emplaceValue(Args&&... args) noexcept {
@@ -963,6 +972,16 @@ public:
         return SemiFuture<T>(toFutureImpl());
     }
 
+    /**
+     * Returns an inline Future type from this SharedSemiFuture.
+     *
+     * WARNING: Do not use this unless you're extremely sure of what you're doing, as callbacks
+     * chained to the resulting Future may run in unexpected places.
+     */
+    Future<T> unsafeToInlineFuture() const noexcept {
+        return Future<T>(toFutureImpl());
+    }
+
 private:
     template <typename>
     friend class SharedPromise;
@@ -986,10 +1005,6 @@ private:
     void propagateResultTo(U&& arg) const noexcept {
         toFutureImpl().propagateResultTo(std::forward<U>(arg));
     }
-    Future<T> unsafeToInlineFuture() const noexcept {
-        return Future<T>(toFutureImpl());
-    }
-
     explicit SharedSemiFuture(boost::intrusive_ptr<future_details::SharedState<T>> ptr)
         : _shared(std::move(ptr)) {}
     explicit SharedSemiFuture(future_details::SharedStateHolder<T>&& holder)

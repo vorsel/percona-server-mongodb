@@ -6,7 +6,7 @@
  *   assumes_read_preference_unchanged,
  *   requires_non_retryable_writes,
  *   requires_profiling,
- *   sbe_incompatible,
+ *   uses_parallel_shell,
  * ]
  */
 

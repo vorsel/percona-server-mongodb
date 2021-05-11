@@ -336,11 +336,15 @@ public:
             } catch (DBException& exception) {
                 nextBatch->abandon();
 
+                auto&& explainer = exec->getPlanExplainer();
+                auto&& [stats, _] =
+                    explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
                 LOGV2_WARNING(20478,
-                              "getMore command executor error: {error}, stats: {stats}",
+                              "getMore command executor error: {error}, stats: {stats}, cmd: {cmd}",
                               "getMore command executor error",
                               "error"_attr = exception.toStatus(),
-                              "stats"_attr = redact(exec->getStats()));
+                              "stats"_attr = redact(stats),
+                              "cmd"_attr = request.toBSON());
 
                 exception.addContext("Executor error during getMore");
                 throw;
@@ -349,6 +353,8 @@ public:
             if (state == PlanExecutor::IS_EOF) {
                 // The latest oplog timestamp may advance even when there are no results. Ensure
                 // that we have the latest postBatchResumeToken produced by the plan executor.
+                // The getMore command does not accept a batchSize of 0, so empty batches are
+                // always caused by hitting EOF and do not need to be handled separately.
                 nextBatch->setPostBatchResumeToken(exec->getPostBatchResumeToken());
             }
 
@@ -513,9 +519,9 @@ public:
                 opCtx->recoveryUnit()->setReadOnce(true);
             }
             exec->reattachToOperationContext(opCtx);
-            exec->restoreState();
+            exec->restoreState(readLock ? &readLock->getCollection() : nullptr);
 
-            auto planSummary = exec->getPlanSummary();
+            auto planSummary = exec->getPlanExplainer().getPlanSummary();
             {
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
                 curOp->setPlanSummary_inlock(planSummary);
@@ -560,7 +566,7 @@ public:
             // obtain these values we need to take a diff of the pre-execution and post-execution
             // metrics, as they accumulate over the course of a cursor's lifetime.
             PlanSummaryStats preExecutionStats;
-            exec->getSummaryStats(&preExecutionStats);
+            exec->getPlanExplainer().getSummaryStats(&preExecutionStats);
 
             // Mark this as an AwaitData operation if appropriate.
             if (cursorPin->isAwaitData() && !disableAwaitDataFailpointActive) {
@@ -581,10 +587,10 @@ public:
             // of this operation's CurOp to signal that we've hit this point and then spin until the
             // failpoint is released.
             std::function<void()> saveAndRestoreStateWithReadLockReacquisition =
-                [exec, dropAndReacquireReadLock]() {
+                [exec, dropAndReacquireReadLock, &readLock]() {
                     exec->saveState();
                     dropAndReacquireReadLock();
-                    exec->restoreState();
+                    exec->restoreState(&readLock->getCollection());
                 };
 
             waitWithPinnedCursorDuringGetMoreBatch.execute([&](const BSONObj& data) {
@@ -607,7 +613,7 @@ public:
                                                         &numResults);
 
             PlanSummaryStats postExecutionStats;
-            exec->getSummaryStats(&postExecutionStats);
+            exec->getPlanExplainer().getSummaryStats(&postExecutionStats);
             postExecutionStats.totalKeysExamined -= preExecutionStats.totalKeysExamined;
             postExecutionStats.totalDocsExamined -= preExecutionStats.totalDocsExamined;
             curOp->debug().setPlanSummaryMetrics(postExecutionStats);
@@ -620,7 +626,10 @@ public:
             if (cursorPin->getExecutor()->lockPolicy() !=
                     PlanExecutor::LockPolicy::kLocksInternally &&
                 curOp->shouldDBProfile(opCtx)) {
-                curOp->debug().execStats = exec->getStats();
+                auto&& explainer = exec->getPlanExplainer();
+                auto&& [stats, _] =
+                    explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+                curOp->debug().execStats = std::move(stats);
             }
 
             if (shouldSaveCursor) {

@@ -137,7 +137,8 @@ std::tuple<bool, value::TypeTags, value::Value> genericArithmeticOp(value::TypeT
                 if (!Op::doOperation(numericCast<int32_t>(lhsTag, lhsValue),
                                      numericCast<int32_t>(rhsTag, rhsValue),
                                      result)) {
-                    return {false, value::TypeTags::NumberInt32, value::bitcastFrom(result)};
+                    return {
+                        false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(result)};
                 }
                 // The result does not fit into int32_t so fallthru to the wider type.
             }
@@ -146,7 +147,8 @@ std::tuple<bool, value::TypeTags, value::Value> genericArithmeticOp(value::TypeT
                 if (!Op::doOperation(numericCast<int64_t>(lhsTag, lhsValue),
                                      numericCast<int64_t>(rhsTag, rhsValue),
                                      result)) {
-                    return {false, value::TypeTags::NumberInt64, value::bitcastFrom(result)};
+                    return {
+                        false, value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(result)};
                 }
                 // The result does not fit into int64_t so fallthru to the wider type.
             }
@@ -163,7 +165,7 @@ std::tuple<bool, value::TypeTags, value::Value> genericArithmeticOp(value::TypeT
                 Op::doOperation(numericCast<double>(lhsTag, lhsValue),
                                 numericCast<double>(rhsTag, rhsValue),
                                 result);
-                return {false, value::TypeTags::NumberDouble, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
             }
             default:
                 MONGO_UNREACHABLE;
@@ -173,19 +175,19 @@ std::tuple<bool, value::TypeTags, value::Value> genericArithmeticOp(value::TypeT
             int64_t result;
             if (!Op::doOperation(
                     numericCast<int64_t>(lhsTag, lhsValue), bitcastTo<int64_t>(rhsValue), result)) {
-                return {false, value::TypeTags::Date, value::bitcastFrom(result)};
+                return {false, value::TypeTags::Date, value::bitcastFrom<int64_t>(result)};
             }
         } else if (isNumber(rhsTag)) {
             int64_t result;
             if (!Op::doOperation(
                     bitcastTo<int64_t>(lhsValue), numericCast<int64_t>(rhsTag, rhsValue), result)) {
-                return {false, value::TypeTags::Date, value::bitcastFrom(result)};
+                return {false, value::TypeTags::Date, value::bitcastFrom<int64_t>(result)};
             }
         } else {
             int64_t result;
             if (!Op::doOperation(
                     bitcastTo<int64_t>(lhsValue), bitcastTo<int64_t>(lhsValue), result)) {
-                return {false, value::TypeTags::NumberInt64, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(result)};
             }
         }
         // We got here if the Date operation overflowed.
@@ -340,17 +342,17 @@ std::tuple<bool, value::TypeTags, value::Value> genericTrigonometricFun(value::T
             case value::TypeTags::NumberInt32: {
                 double result;
                 TrigFunction::computeFunction(numericCast<int32_t>(argTag, argValue), result);
-                return {false, value::TypeTags::NumberDouble, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
             }
             case value::TypeTags::NumberInt64: {
                 double result;
                 TrigFunction::computeFunction(numericCast<int64_t>(argTag, argValue), result);
-                return {false, value::TypeTags::NumberDouble, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
             }
             case value::TypeTags::NumberDouble: {
                 double result;
                 TrigFunction::computeFunction(numericCast<double>(argTag, argValue), result);
-                return {false, value::TypeTags::NumberDouble, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
             }
             case value::TypeTags::NumberDecimal: {
                 Decimal128 result;
@@ -399,22 +401,22 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericDiv(value::Type
                 assertNonZero(numericCast<double>(rhsTag, rhsValue) != 0);
                 auto result =
                     numericCast<double>(lhsTag, lhsValue) / numericCast<double>(rhsTag, rhsValue);
-                return {false, value::TypeTags::NumberDouble, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
             }
             case value::TypeTags::NumberInt64: {
                 assertNonZero(numericCast<double>(rhsTag, rhsValue) != 0);
                 auto result =
                     numericCast<double>(lhsTag, lhsValue) / numericCast<double>(rhsTag, rhsValue);
-                return {false, value::TypeTags::NumberDouble, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
             }
             case value::TypeTags::NumberDouble: {
                 assertNonZero(numericCast<double>(rhsTag, rhsValue) != 0);
                 auto result =
                     numericCast<double>(lhsTag, lhsValue) / numericCast<double>(rhsTag, rhsValue);
-                return {false, value::TypeTags::NumberDouble, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
             }
             case value::TypeTags::NumberDecimal: {
-                assertNonZero(numericCast<Decimal128>(rhsTag, rhsValue).isZero());
+                assertNonZero(!numericCast<Decimal128>(rhsTag, rhsValue).isZero());
                 auto result = numericCast<Decimal128>(lhsTag, lhsValue)
                                   .divide(numericCast<Decimal128>(rhsTag, rhsValue));
                 auto [tag, val] = value::makeCopyDecimal(result);
@@ -440,13 +442,13 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericIDiv(value::Typ
                 assertNonZero(numericCast<int32_t>(rhsTag, rhsValue) != 0);
                 auto result =
                     numericCast<int32_t>(lhsTag, lhsValue) / numericCast<int32_t>(rhsTag, rhsValue);
-                return {false, value::TypeTags::NumberInt32, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(result)};
             }
             case value::TypeTags::NumberInt64: {
                 assertNonZero(numericCast<int64_t>(rhsTag, rhsValue) != 0);
                 auto result =
                     numericCast<int64_t>(lhsTag, lhsValue) / numericCast<int64_t>(rhsTag, rhsValue);
-                return {false, value::TypeTags::NumberInt64, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(result)};
             }
             case value::TypeTags::NumberDouble: {
                 auto lhs = representAs<int64_t>(numericCast<double>(lhsTag, lhsValue));
@@ -458,7 +460,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericIDiv(value::Typ
                 assertNonZero(*rhs != 0);
                 auto result = *lhs / *rhs;
 
-                return {false, value::TypeTags::NumberInt64, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(result)};
             }
             case value::TypeTags::NumberDecimal: {
                 auto lhs = representAs<int64_t>(numericCast<Decimal128>(lhsTag, lhsValue));
@@ -470,7 +472,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericIDiv(value::Typ
                 assertNonZero(*rhs != 0);
                 auto result = *lhs / *rhs;
 
-                return {false, value::TypeTags::NumberInt64, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(result)};
             }
             default:
                 MONGO_UNREACHABLE;
@@ -492,19 +494,19 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericMod(value::Type
                 assertNonZero(numericCast<int32_t>(rhsTag, rhsValue) != 0);
                 auto result = overflow::safeMod(numericCast<int32_t>(lhsTag, lhsValue),
                                                 numericCast<int32_t>(rhsTag, rhsValue));
-                return {false, value::TypeTags::NumberInt32, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(result)};
             }
             case value::TypeTags::NumberInt64: {
                 assertNonZero(numericCast<int32_t>(rhsTag, rhsValue) != 0);
                 auto result = overflow::safeMod(numericCast<int64_t>(lhsTag, lhsValue),
                                                 numericCast<int64_t>(rhsTag, rhsValue));
-                return {false, value::TypeTags::NumberInt64, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(result)};
             }
             case value::TypeTags::NumberDouble: {
                 assertNonZero(numericCast<int32_t>(rhsTag, rhsValue) != 0);
                 auto result = fmod(numericCast<double>(lhsTag, lhsValue),
                                    numericCast<double>(rhsTag, rhsValue));
-                return {false, value::TypeTags::NumberDouble, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
             }
             case value::TypeTags::NumberDecimal: {
                 assertNonZero(numericCast<Decimal128>(rhsTag, rhsValue).isZero());
@@ -568,27 +570,30 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAbs(value::Type
         case value::TypeTags::NumberInt32: {
             auto operand = value::bitcastTo<int32_t>(operandValue);
             if (operand == std::numeric_limits<int32_t>::min()) {
-                return {false, value::TypeTags::NumberInt64, value::bitcastFrom(int64_t{operand})};
+                return {false,
+                        value::TypeTags::NumberInt64,
+                        value::bitcastFrom<int64_t>(-int64_t{operand})};
             }
 
             return {false,
                     value::TypeTags::NumberInt32,
-                    value::bitcastFrom(operand >= 0 ? operand : -operand)};
+                    value::bitcastFrom<int32_t>(operand >= 0 ? operand : -operand)};
         }
         case value::TypeTags::NumberInt64: {
             auto operand = value::bitcastTo<int64_t>(operandValue);
-            uassert(/* Intentionally duplicated */ 28680,
-                    "can't take $abs of long long min",
-                    operand != std::numeric_limits<int64_t>::min());
+            if (operand == std::numeric_limits<int64_t>::min()) {
+                // Absolute value of the minimum int64_t value does not fit in any integer type.
+                return {false, value::TypeTags::Nothing, 0};
+            }
             return {false,
                     value::TypeTags::NumberInt64,
-                    value::bitcastFrom(operand >= 0 ? operand : -operand)};
+                    value::bitcastFrom<int64_t>(operand >= 0 ? operand : -operand)};
         }
         case value::TypeTags::NumberDouble: {
             auto operand = value::bitcastTo<double>(operandValue);
             return {false,
                     value::TypeTags::NumberDouble,
-                    value::bitcastFrom(operand >= 0 ? operand : -operand)};
+                    value::bitcastFrom<double>(operand >= 0 ? operand : -operand)};
         }
         case value::TypeTags::NumberDecimal: {
             auto operand = value::bitcastTo<Decimal128>(operandValue);
@@ -600,11 +605,207 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAbs(value::Type
     }
 }
 
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericCeil(value::TypeTags operandTag,
+                                                                      value::Value operandValue) {
+    if (isNumber(operandTag)) {
+        switch (operandTag) {
+            case value::TypeTags::NumberDouble: {
+                auto result = std::ceil(value::bitcastTo<double>(operandValue));
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
+            }
+            case value::TypeTags::NumberDecimal: {
+                auto result =
+                    value::bitcastTo<Decimal128>(operandValue)
+                        .quantize(Decimal128::kNormalizedZero, Decimal128::kRoundTowardPositive);
+                auto [tag, value] = value::makeCopyDecimal(result);
+                return {true, tag, value};
+            }
+            default: {
+                // Ceil on integer values is the identity function.
+                return {false, operandTag, operandValue};
+            }
+        }
+    }
+
+    return {false, value::TypeTags::Nothing, 0};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericFloor(value::TypeTags operandTag,
+                                                                       value::Value operandValue) {
+    if (isNumber(operandTag)) {
+        switch (operandTag) {
+            case value::TypeTags::NumberDouble: {
+                auto result = std::floor(value::bitcastTo<double>(operandValue));
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
+            }
+            case value::TypeTags::NumberDecimal: {
+                auto result =
+                    value::bitcastTo<Decimal128>(operandValue)
+                        .quantize(Decimal128::kNormalizedZero, Decimal128::kRoundTowardNegative);
+                auto [tag, value] = value::makeCopyDecimal(result);
+                return {true, tag, value};
+            }
+            default: {
+                // Floor on integer values is the identity function.
+                return {false, operandTag, operandValue};
+            }
+        }
+    }
+
+    return {false, value::TypeTags::Nothing, 0};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericExp(value::TypeTags operandTag,
+                                                                     value::Value operandValue) {
+    switch (operandTag) {
+        case value::TypeTags::NumberDouble: {
+            auto result = exp(value::bitcastTo<double>(operandValue));
+            return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
+        }
+        case value::TypeTags::NumberDecimal: {
+            auto result = value::bitcastTo<Decimal128>(operandValue).exponential();
+            auto [tag, value] = value::makeCopyDecimal(result);
+            return {true, tag, value};
+        }
+        case value::TypeTags::NumberInt32:
+        case value::TypeTags::NumberInt64: {
+            auto operand = (operandTag == value::TypeTags::NumberInt32)
+                ? static_cast<double>(value::bitcastTo<int32_t>(operandValue))
+                : static_cast<double>(value::bitcastTo<int64_t>(operandValue));
+            return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(exp(operand))};
+        }
+        default:
+            return {false, value::TypeTags::Nothing, 0};
+    }
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericLn(value::TypeTags operandTag,
+                                                                    value::Value operandValue) {
+    switch (operandTag) {
+        case value::TypeTags::NumberDouble: {
+            auto operand = value::bitcastTo<double>(operandValue);
+            if (operand <= 0 && !std::isnan(operand)) {
+                // Logarithms are only defined on the domain of positive numbers and NaN. NaN is a
+                // legal input to ln(), returning NaN.
+                return {false, value::TypeTags::Nothing, 0};
+            }
+            // Note: NaN is a legal input to log(), returning NaN.
+            return {false,
+                    value::TypeTags::NumberDouble,
+                    value::bitcastFrom<double>(std::log(operand))};
+        }
+        case value::TypeTags::NumberDecimal: {
+            auto operand = value::bitcastTo<Decimal128>(operandValue);
+            if (!operand.isGreater(Decimal128::kNormalizedZero) && !operand.isNaN()) {
+                return {false, value::TypeTags::Nothing, 0};
+            }
+            auto operandLn = operand.logarithm();
+
+            auto [tag, value] = value::makeCopyDecimal(operandLn);
+            return {true, tag, value};
+        }
+        case value::TypeTags::NumberInt32:
+        case value::TypeTags::NumberInt64: {
+            auto operand = (operandTag == value::TypeTags::NumberInt32)
+                ? static_cast<double>(value::bitcastTo<int32_t>(operandValue))
+                : static_cast<double>(value::bitcastTo<int64_t>(operandValue));
+            if (operand <= 0 && !std::isnan(operand)) {
+                return {false, value::TypeTags::Nothing, 0};
+            }
+            return {false,
+                    value::TypeTags::NumberDouble,
+                    value::bitcastFrom<double>(std::log(operand))};
+        }
+        default:
+            return {false, value::TypeTags::Nothing, 0};
+    }
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericLog10(value::TypeTags operandTag,
+                                                                       value::Value operandValue) {
+    switch (operandTag) {
+        case value::TypeTags::NumberDouble: {
+            auto operand = value::bitcastTo<double>(operandValue);
+            if (operand <= 0 && !std::isnan(operand)) {
+                // Logarithms are only defined on the domain of positive numbers and NaN. NaN is a
+                // legal input to log10(), returning NaN.
+                return {false, value::TypeTags::Nothing, 0};
+            }
+            return {false,
+                    value::TypeTags::NumberDouble,
+                    value::bitcastFrom<double>(std::log10(operand))};
+        }
+        case value::TypeTags::NumberDecimal: {
+            auto operand = value::bitcastTo<Decimal128>(operandValue);
+            if (!operand.isGreater(Decimal128::kNormalizedZero) && !operand.isNaN()) {
+                return {false, value::TypeTags::Nothing, 0};
+            }
+            auto operandLog10 = operand.logarithm(Decimal128(10));
+
+            auto [tag, value] = value::makeCopyDecimal(operandLog10);
+            return {true, tag, value};
+        }
+        case value::TypeTags::NumberInt32:
+        case value::TypeTags::NumberInt64: {
+            auto operand = (operandTag == value::TypeTags::NumberInt32)
+                ? static_cast<double>(value::bitcastTo<int32_t>(operandValue))
+                : static_cast<double>(value::bitcastTo<int64_t>(operandValue));
+            if (operand <= 0 && !std::isnan(operand)) {
+                return {false, value::TypeTags::Nothing, 0};
+            }
+            return {false,
+                    value::TypeTags::NumberDouble,
+                    value::bitcastFrom<double>(std::log10(operand))};
+        }
+        default:
+            return {false, value::TypeTags::Nothing, 0};
+    }
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericSqrt(value::TypeTags operandTag,
+                                                                      value::Value operandValue) {
+    switch (operandTag) {
+        case value::TypeTags::NumberDouble: {
+            auto operand = value::bitcastTo<double>(operandValue);
+            if (operand < 0 && !std::isnan(operand)) {
+                // Sqrt is only defined in the domain of non-negative numbers and NaN. NaN is a
+                // legal input to sqrt(), returning NaN.
+                return {false, value::TypeTags::Nothing, 0};
+            }
+            // Note: NaN is a legal input to sqrt(), returning NaN.
+            return {
+                false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(sqrt(operand))};
+        }
+        case value::TypeTags::NumberDecimal: {
+            auto operand = value::bitcastTo<Decimal128>(operandValue);
+            if (operand.isLess(Decimal128::kNormalizedZero) && !operand.isNaN()) {
+                return {false, value::TypeTags::Nothing, 0};
+            }
+            auto [tag, value] = value::makeCopyDecimal(operand.squareRoot());
+            return {true, tag, value};
+        }
+        case value::TypeTags::NumberInt32:
+        case value::TypeTags::NumberInt64: {
+            auto operand = (operandTag == value::TypeTags::NumberInt32)
+                ? static_cast<double>(value::bitcastTo<int32_t>(operandValue))
+                : static_cast<double>(value::bitcastTo<int64_t>(operandValue));
+            if (operand < 0 && !std::isnan(operand)) {
+                return {false, value::TypeTags::Nothing, 0};
+            }
+            return {
+                false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(sqrt(operand))};
+        }
+        default:
+            return {false, value::TypeTags::Nothing, 0};
+    }
+}
+
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericNot(value::TypeTags tag,
                                                                      value::Value value) {
     if (tag == value::TypeTags::Boolean) {
-        return {
-            false, value::TypeTags::Boolean, value::bitcastFrom(!value::bitcastTo<bool>(value))};
+        return {false,
+                value::TypeTags::Boolean,
+                value::bitcastFrom<bool>(!value::bitcastTo<bool>(value))};
     } else {
         return {false, value::TypeTags::Nothing, 0};
     }
@@ -622,22 +823,25 @@ std::pair<value::TypeTags, value::Value> ByteCode::genericCompareEq(value::TypeT
         auto lhsStr = value::getStringView(lhsTag, lhsValue);
         auto rhsStr = value::getStringView(rhsTag, rhsValue);
 
-        return {value::TypeTags::Boolean, lhsStr.compare(rhsStr) == 0};
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(lhsStr.compare(rhsStr) == 0)};
     } else if (lhsTag == value::TypeTags::Boolean && rhsTag == value::TypeTags::Boolean) {
-        return {value::TypeTags::Boolean, (lhsValue != 0) == (rhsValue != 0)};
+        return {value::TypeTags::Boolean,
+                value::bitcastFrom<bool>(value::bitcastTo<bool>(lhsValue) ==
+                                         value::bitcastTo<bool>(rhsValue))};
     } else if (lhsTag == value::TypeTags::Null && rhsTag == value::TypeTags::Null) {
         // This is where Mongo differs from SQL.
-        return {value::TypeTags::Boolean, true};
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(true)};
     } else if (lhsTag == value::TypeTags::ObjectId && rhsTag == value::TypeTags::ObjectId) {
         return {value::TypeTags::Boolean,
-                (*value::getObjectIdView(lhsValue)) == (*value::getObjectIdView(rhsValue))};
+                value::bitcastFrom<bool>(*value::getObjectIdView(lhsValue) ==
+                                         *value::getObjectIdView(rhsValue))};
     } else if ((value::isArray(lhsTag) && value::isArray(rhsTag)) ||
                (value::isObject(lhsTag) && value::isObject(rhsTag)) ||
                (value::isBinData(lhsTag) && value::isBinData(rhsTag))) {
         auto [tag, val] = value::compareValue(lhsTag, lhsValue, rhsTag, rhsValue);
         if (tag == value::TypeTags::NumberInt32) {
             auto result = (value::bitcastTo<int32_t>(val) == 0);
-            return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
         }
     }
 
@@ -650,7 +854,7 @@ std::pair<value::TypeTags, value::Value> ByteCode::genericCompareNeq(value::Type
                                                                      value::Value rhsValue) {
     auto [tag, val] = genericCompareEq(lhsTag, lhsValue, rhsTag, rhsValue);
     if (tag == value::TypeTags::Boolean) {
-        return {tag, value::bitcastFrom(!value::bitcastTo<bool>(val))};
+        return {tag, value::bitcastFrom<bool>(!value::bitcastTo<bool>(val))};
     } else {
         return {tag, val};
     }
@@ -708,7 +912,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericAtan2(value::Ty
             case value::TypeTags::NumberDouble: {
                 auto result = std::atan2(numericCast<double>(argTag1, argValue1),
                                          numericCast<double>(argTag2, argValue2));
-                return {false, value::TypeTags::NumberDouble, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
             }
             case value::TypeTags::NumberDecimal: {
                 auto result = numericCast<Decimal128>(argTag1, argValue1)
@@ -741,7 +945,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericDegreesToRadian
             case value::TypeTags::NumberInt64:
             case value::TypeTags::NumberDouble: {
                 auto result = numericCast<double>(argTag, argValue) * kDoublePiOver180;
-                return {false, value::TypeTags::NumberDouble, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
             }
             case value::TypeTags::NumberDecimal: {
                 auto result =
@@ -764,7 +968,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::genericRadiansToDegree
             case value::TypeTags::NumberInt64:
             case value::TypeTags::NumberDouble: {
                 auto result = numericCast<double>(argTag, argValue) * kDouble180OverPi;
-                return {false, value::TypeTags::NumberDouble, value::bitcastFrom(result)};
+                return {false, value::TypeTags::NumberDouble, value::bitcastFrom<double>(result)};
             }
             case value::TypeTags::NumberDecimal: {
                 auto result =

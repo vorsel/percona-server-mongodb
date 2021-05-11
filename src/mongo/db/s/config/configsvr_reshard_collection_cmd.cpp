@@ -46,6 +46,16 @@
 namespace mongo {
 namespace {
 
+std::vector<TagsType> convertZones(const std::vector<BSONObj>& objs) {
+    std::vector<TagsType> zones;
+
+    for (const BSONObj& obj : objs) {
+        zones.push_back(uassertStatusOK(TagsType::fromBSON(obj)));
+    }
+
+    return zones;
+}
+
 class ConfigsvrReshardCollectionCommand final
     : public TypedCommand<ConfigsvrReshardCollectionCommand> {
 public:
@@ -85,6 +95,7 @@ public:
                         !collator);
             }
 
+            std::vector<TagsType> newZones;
             const auto& authoritativeTags = uassertStatusOK(
                 Grid::get(opCtx)->catalogClient()->getTagsForCollection(opCtx, nss));
             if (!authoritativeTags.empty()) {
@@ -92,6 +103,7 @@ public:
                         "Must specify value for zones field",
                         request().getZones());
                 validateZones(request().getZones().get(), authoritativeTags);
+                newZones = convertZones(request().getZones().get());
             }
 
             const auto cm = uassertStatusOK(
@@ -113,6 +125,11 @@ public:
 
             int numInitialChunks;
             std::set<ShardId> recipientShardIds;
+            std::vector<ChunkType> initialChunks;
+            ChunkVersion version(1, 0, OID::gen());
+            auto tempReshardingNss = constructTemporaryReshardingNss(
+                nss.db(), getCollectionUUIDFromChunkManger(nss, cm));
+
             if (presetReshardedChunksSpecified) {
                 const auto chunks = request().get_presetReshardedChunks().get();
                 validateReshardedChunks(
@@ -124,6 +141,15 @@ public:
                 for (const BSONObj& obj : chunks) {
                     recipientShardIds.emplace(
                         obj.getStringField(ReshardedChunk::kRecipientShardIdFieldName));
+
+                    auto reshardedChunk =
+                        ReshardedChunk::parse(IDLParserErrorContext("ReshardedChunk"), obj);
+                    initialChunks.emplace_back(
+                        tempReshardingNss,
+                        ChunkRange{reshardedChunk.getMin(), reshardedChunk.getMax()},
+                        version,
+                        reshardedChunk.getRecipientShardId());
+                    version.incMinor();
                 }
             } else {
                 numInitialChunks = request().getNumInitialChunks().get_value_or(cm.numChunks());
@@ -131,6 +157,15 @@ public:
                 // No presetReshardedChunks were provided, make the recipients list be the same as
                 // the donors list by default.
                 recipientShardIds = donorShardIds;
+
+                cm.forEachChunk([&](const auto& chunk) {
+                    initialChunks.emplace_back(tempReshardingNss,
+                                               ChunkRange{chunk.getMin(), chunk.getMax()},
+                                               version,
+                                               chunk.getShardId());
+                    version.incMinor();
+                    return true;
+                });
             }
 
             // Construct the lists of donor and recipient shard entries, where each ShardEntry is
@@ -154,7 +189,6 @@ public:
                                return entry;
                            });
 
-            auto tempReshardingNss = constructTemporaryReshardingNss(nss, cm);
             auto coordinatorDoc =
                 ReshardingCoordinatorDocument(std::move(tempReshardingNss),
                                               std::move(CoordinatorStateEnum::kInitializing),
@@ -171,7 +205,15 @@ public:
             auto registry = repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext());
             auto service = registry->lookupServiceByName(kReshardingCoordinatorServiceName);
             auto instance = ReshardingCoordinatorService::ReshardingCoordinator::getOrCreate(
-                service, coordinatorDoc.toBSON());
+                opCtx, service, coordinatorDoc.toBSON());
+
+            instance->setInitialChunksAndZones(std::move(initialChunks), std::move(newZones));
+
+            // This promise will currently be falsely fulfilled by a call to interrupt() inside
+            // the ReshardingCoordinatorService. This is to enable jsTests to pass while code
+            // is still being committed.
+            // TODO SERVER-51398 Change this comment and assess the current call to .wait().
+            instance->getObserver()->awaitAllDonorsReadyToDonate().wait();
         }
 
     private:

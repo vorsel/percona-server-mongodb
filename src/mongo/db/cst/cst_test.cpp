@@ -57,7 +57,7 @@ TEST(CstGrammarTest, BuildsAndPrints) {
         const auto cst = CNode{CNode::ObjectChildren{
             {KeyFieldname::projectInclusion,
              CNode{CNode::ObjectChildren{
-                 {ProjectionPath{make_vector<std::string>("a")}, CNode{KeyValue::trueKey}},
+                 {ProjectionPath{makeVector<std::string>("a")}, CNode{KeyValue::trueKey}},
                  {KeyFieldname::id, CNode{KeyValue::falseKey}}}}}}};
         ASSERT_BSONOBJ_EQ(
             fromjson("{\"<KeyFieldname projectInclusion>\": {\"<ProjectionPath a>\": \"<KeyValue "
@@ -274,12 +274,11 @@ TEST(CstGrammarTest, ParsesProject) {
         ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
         ASSERT_EQ(
             stages[0].toBson().toString(),
-            "{ <KeyFieldname projectInclusion>: { <KeyFieldname id>: \"<NonZeroKey of type "
-            "double 9.100000>\", <ProjectionPath a>: { <KeyFieldname add>: [ "
-            "{ <KeyFieldname add>: [ \"<UserInt 8>\", \"<UserInt 7>\", \"<UserInt 6>\" ] }, "
-            "\"<UserInt 5>\", "
-            "\"<UserInt 4>\" ] }, <ProjectionPath b>: { <KeyFieldname atan2>: [ \"<UserDouble "
-            "1.000000>\", { <KeyFieldname add>: [ \"<UserInt -3>\", \"<UserInt 2>\" ] } ] } } }");
+            "{ <KeyFieldname projectInclusion>: { <KeyFieldname id>: \"<NonZeroKey of type double "
+            "9.100000>\", <ProjectionPath a>: { <KeyFieldname add>: [ \"<UserInt 4>\", \"<UserInt "
+            "5>\", { <KeyFieldname add>: [ \"<UserInt 6>\", \"<UserInt 7>\", \"<UserInt 8>\" ] } ] "
+            "}, <ProjectionPath b>: { <KeyFieldname atan2>: [ \"<UserDouble 1.000000>\", { "
+            "<KeyFieldname add>: [ \"<UserInt 2>\", \"<UserInt -3>\" ] } ] } } }");
     }
     {
         CNode output;
@@ -373,6 +372,7 @@ TEST(CstGrammarTest, FailsToParseRedundantPaths) {
         ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
     }
 }
+
 TEST(CstGrammarTest, FailsToParsePrefixPaths) {
     {
         CNode output;
@@ -479,7 +479,7 @@ TEST(CstGrammarTest, BuildsAndPrintsAnd) {
             {KeyFieldname::andExpr,
              CNode{CNode::ArrayChildren{CNode{UserInt{0}}, CNode{UserBoolean{true}}}}}}};
         ASSERT_BSONOBJ_EQ(
-            fromjson("{\"<KeyFieldname andExpr>\": [\"<UserInt 0>\", \"<UserBoolean 1>\"]}"),
+            fromjson("{\"<KeyFieldname andExpr>\": [\"<UserInt 0>\", \"<UserBoolean true>\"]}"),
             cst.toBson());
     }
 }
@@ -522,7 +522,7 @@ TEST(CstGrammarTest, BuildsAndPrintsOr) {
             {KeyFieldname::orExpr,
              CNode{CNode::ArrayChildren{CNode{UserInt{0}}, CNode{UserBoolean{true}}}}}}};
         ASSERT_BSONOBJ_EQ(
-            fromjson("{\"<KeyFieldname orExpr>\": [\"<UserInt 0>\", \"<UserBoolean 1>\"]}"),
+            fromjson("{\"<KeyFieldname orExpr>\": [\"<UserInt 0>\", \"<UserBoolean true>\"]}"),
             cst.toBson());
     }
 }
@@ -537,13 +537,13 @@ TEST(CstGrammarTest, BuildsAndPrintsNot) {
     {
         const auto cst = CNode{CNode::ObjectChildren{
             {KeyFieldname::notExpr, CNode{CNode::ArrayChildren{CNode{UserBoolean{true}}}}}}};
-        ASSERT_BSONOBJ_EQ(fromjson("{\"<KeyFieldname notExpr>\": [\"<UserBoolean 1>\"]}"),
+        ASSERT_BSONOBJ_EQ(fromjson("{\"<KeyFieldname notExpr>\": [\"<UserBoolean true>\"]}"),
                           cst.toBson());
     }
     {
         const auto cst = CNode{CNode::ObjectChildren{
             {KeyFieldname::notExpr, CNode{CNode::ArrayChildren{CNode{UserBoolean{false}}}}}}};
-        ASSERT_BSONOBJ_EQ(fromjson("{\"<KeyFieldname notExpr>\": [\"<UserBoolean 0>\"]}"),
+        ASSERT_BSONOBJ_EQ(fromjson("{\"<KeyFieldname notExpr>\": [\"<UserBoolean false>\"]}"),
                           cst.toBson());
     }
 }
@@ -701,7 +701,7 @@ TEST(CstGrammarTest, BuildsAndPrintsToDecimal) {
     {
         const auto cst =
             CNode{CNode::ObjectChildren{{KeyFieldname::toDecimal, CNode{UserBoolean{false}}}}};
-        ASSERT_BSONOBJ_EQ(fromjson("{\"<KeyFieldname toDecimal>\": \"<UserBoolean 0>\"}"),
+        ASSERT_BSONOBJ_EQ(fromjson("{\"<KeyFieldname toDecimal>\": \"<UserBoolean false>\"}"),
                           cst.toBson());
     }
     {
@@ -716,7 +716,7 @@ TEST(CstGrammarTest, BuildsAndPrintsToDouble) {
     {
         const auto cst =
             CNode{CNode::ObjectChildren{{KeyFieldname::toDouble, CNode{UserBoolean{true}}}}};
-        ASSERT_BSONOBJ_EQ(fromjson("{\"<KeyFieldname toDouble>\": \"<UserBoolean 1>\"}"),
+        ASSERT_BSONOBJ_EQ(fromjson("{\"<KeyFieldname toDouble>\": \"<UserBoolean true>\"}"),
                           cst.toBson());
     }
     {
@@ -810,6 +810,28 @@ TEST(CstGrammarTest, ParsesValidNumberAbs) {
               "\"<UserInt 1>\" } } }");
 }
 
+TEST(CstGrammarTest, ParsesValidSingletonArrayAbs) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$abs: [1]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_EQ(0, parseTree.parse());
+    auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
+    ASSERT_EQ(1, stages.size());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
+    ASSERT_EQ(stages[0].toBson().toString(),
+              "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname abs>: [ "
+              "\"<UserInt 1>\" ] } } }");
+}
+
+TEST(CstGrammarTest, FailsToParseMultiElementArrayAbs) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$abs: [1, 2]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
+}
+
 TEST(CstGrammarTest, ParsesValidCeil) {
     CNode output;
     auto input = fromjson("{pipeline: [{$project: {val: {$ceil: 1.5}}}]}");
@@ -822,6 +844,28 @@ TEST(CstGrammarTest, ParsesValidCeil) {
     ASSERT_EQ(stages[0].toBson().toString(),
               "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname ceil>: "
               "\"<UserDouble 1.500000>\" } } }");
+}
+
+TEST(CstGrammarTest, ParsesValidSingletonArrayCeil) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$ceil: [1.5]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_EQ(0, parseTree.parse());
+    auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
+    ASSERT_EQ(1, stages.size());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
+    ASSERT_EQ(stages[0].toBson().toString(),
+              "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname ceil>: [ "
+              "\"<UserDouble 1.500000>\" ] } } }");
+}
+
+TEST(CstGrammarTest, FailsToParseMultiElementArrayCeil) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$ceil: [1, 2]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
 }
 
 TEST(CstGrammarTest, ParsesValidDivide) {
@@ -852,6 +896,28 @@ TEST(CstGrammarTest, ParsesValidExp) {
               "exponent>: \"<UserDouble 1.500000>\" } } }");
 }
 
+TEST(CstGrammarTest, ParsesValidSingletonArrayExp) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$exp: [1]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_EQ(0, parseTree.parse());
+    auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
+    ASSERT_EQ(1, stages.size());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
+    ASSERT_EQ(stages[0].toBson().toString(),
+              "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname "
+              "exponent>: [ \"<UserInt 1>\" ] } } }");
+}
+
+TEST(CstGrammarTest, FailsToParseMultiElementArrayExp) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$exp: [1, 2]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
+}
+
 TEST(CstGrammarTest, ParsesValidFloor) {
     CNode output;
     auto input = fromjson("{pipeline: [{$project: {val: {$floor: 1.5}}}]}");
@@ -866,9 +932,45 @@ TEST(CstGrammarTest, ParsesValidFloor) {
               "\"<UserDouble 1.500000>\" } } }");
 }
 
+TEST(CstGrammarTest, ParsesValidSingletonArrayFloor) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$floor: [1.5]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_EQ(0, parseTree.parse());
+    auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
+    ASSERT_EQ(1, stages.size());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
+    ASSERT_EQ(stages[0].toBson().toString(),
+              "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname floor>: "
+              "[ \"<UserDouble 1.500000>\" ] } } }");
+}
+
+TEST(CstGrammarTest, FailsToParseMultiElementArrayFloor) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$floor: [1.5, 2]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
+}
+
 TEST(CstGrammarTest, ParsesValidLn) {
     CNode output;
-    auto input = fromjson("{pipeline: [{$project: {val: {$ln: [37, 10]}}}]}");
+    auto input = fromjson("{pipeline: [{$project: {val: {$ln: 37}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_EQ(0, parseTree.parse());
+    auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
+    ASSERT_EQ(1, stages.size());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
+    ASSERT_EQ(stages[0].toBson().toString(),
+              "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname ln>: "
+              "\"<UserInt 37>\" } } }");
+}
+
+TEST(CstGrammarTest, ParsesValidSingletonArrayLn) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$ln: [1.5]}}}]}");
     BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
     auto parseTree = ParserGen(lexer, &output);
     ASSERT_EQ(0, parseTree.parse());
@@ -877,7 +979,15 @@ TEST(CstGrammarTest, ParsesValidLn) {
     ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
               "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname ln>: [ "
-              "\"<UserInt 10>\", \"<UserInt 37>\" ] } } }");
+              "\"<UserDouble 1.500000>\" ] } } }");
+}
+
+TEST(CstGrammarTest, FailsToParseMultiElementArrayLn) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$ln: [1, 2]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
 }
 
 TEST(CstGrammarTest, ParsesValidLog) {
@@ -906,6 +1016,28 @@ TEST(CstGrammarTest, ParsesValidLog10) {
     ASSERT_EQ(stages[0].toBson().toString(),
               "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname logten>: "
               "\"<UserDouble 1.500000>\" } } }");
+}
+
+TEST(CstGrammarTest, ParsesValidSingletonArrayLog10) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$log10: [1.5]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_EQ(0, parseTree.parse());
+    auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
+    ASSERT_EQ(1, stages.size());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
+    ASSERT_EQ(stages[0].toBson().toString(),
+              "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname logten>: "
+              "[ \"<UserDouble 1.500000>\" ] } } }");
+}
+
+TEST(CstGrammarTest, FailsToParseMultiElementArrayLog10) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$log10: [1, 2]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
 }
 
 TEST(CstGrammarTest, ParsesValidMod) {
@@ -979,6 +1111,28 @@ TEST(CstGrammarTest, ParsesValidSqrt) {
               "\"<UserInt 25>\" } } }");
 }
 
+TEST(CstGrammarTest, ParsesValidSingletonArraySqrt) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$sqrt: [25]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_EQ(0, parseTree.parse());
+    auto stages = stdx::get<CNode::ArrayChildren>(output.payload);
+    ASSERT_EQ(1, stages.size());
+    ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
+    ASSERT_EQ(stages[0].toBson().toString(),
+              "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname sqrt>: [ "
+              "\"<UserInt 25>\" ] } } }");
+}
+
+TEST(CstGrammarTest, FailsToParseMultiElementArraySqrt) {
+    CNode output;
+    auto input = fromjson("{pipeline: [{$project: {val: {$sqrt: [1, 2]}}}]}");
+    BSONLexer lexer(input["pipeline"].embeddedObject(), ParserGen::token::START_PIPELINE);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
+}
+
 TEST(CstGrammarTest, ParsesValidSubtract) {
     CNode output;
     auto input = fromjson("{pipeline: [{$project: {val: {$subtract: [10, 5]}}}]}");
@@ -1015,8 +1169,34 @@ TEST(CstGrammarTest, ParsesBasicSort) {
     auto parseTree = ParserGen(lexer, &output);
     ASSERT_EQ(0, parseTree.parse());
     ASSERT_EQ(output.toBson().toString(),
-              "{ <UserFieldname val>: \"<KeyValue intOneKey>\", <UserFieldname test>: \"<KeyValue "
+              "{ <SortPath val>: \"<KeyValue intOneKey>\", <SortPath test>: \"<KeyValue "
               "intNegOneKey>\" }");
+}
+
+TEST(CstGrammarTest, ParsesDottedPathSort) {
+    CNode output;
+    auto input = fromjson("{sort: {'a.b': 1}}");
+    BSONLexer lexer(input["sort"].embeddedObject(), ParserGen::token::START_SORT);
+    auto parseTree = ParserGen(lexer, &output);
+    ASSERT_EQ(0, parseTree.parse());
+    ASSERT_EQ(output.toBson().toString(), "{ <SortPath a.b>: \"<KeyValue intOneKey>\" }");
+}
+
+TEST(CstGrammarTest, FailsToParseDollarPrefixedSortPath) {
+    {
+        CNode output;
+        auto input = fromjson("{sort: {$a: 1}}");
+        BSONLexer lexer(input["sort"].embeddedObject(), ParserGen::token::START_SORT);
+        auto parseTree = ParserGen(lexer, &output);
+        ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
+    }
+    {
+        CNode output;
+        auto input = fromjson("{sort: {'a.$b': 1}}");
+        BSONLexer lexer(input["sort"].embeddedObject(), ParserGen::token::START_SORT);
+        auto parseTree = ParserGen(lexer, &output);
+        ASSERT_THROWS_CODE(parseTree.parse(), AssertionException, ErrorCodes::FailedToParse);
+    }
 }
 
 TEST(CstGrammarTest, ParsesMetaSort) {
@@ -1026,7 +1206,7 @@ TEST(CstGrammarTest, ParsesMetaSort) {
     auto parseTree = ParserGen(lexer, &output);
     ASSERT_EQ(0, parseTree.parse());
     ASSERT_EQ(output.toBson().toString(),
-              "{ <UserFieldname val>: { <KeyFieldname meta>: \"<KeyValue textScore>\" } }");
+              "{ <SortPath val>: { <KeyFieldname meta>: \"<KeyValue textScore>\" } }");
 }
 
 TEST(CstGrammarTest, ParsesValidAllElementsTrue) {
@@ -1040,7 +1220,7 @@ TEST(CstGrammarTest, ParsesValidAllElementsTrue) {
     ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
               "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname "
-              "allElementsTrue>: [ \"<UserInt 1>\", \"<UserBoolean 1>\" "
+              "allElementsTrue>: [ \"<UserBoolean true>\", \"<UserInt 1>\" "
               "] } } }");
 }
 
@@ -1055,7 +1235,7 @@ TEST(CstGrammarTest, ParsesValidSlice) {
     ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
               "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname slice>: "
-              "[ [ \"<UserInt 3>\", \"<UserInt 2>\", \"<UserInt 1>\" ], \"<UserInt -15>\", "
+              "[ [ \"<UserInt 1>\", \"<UserInt 2>\", \"<UserInt 3>\" ], \"<UserInt -15>\", "
               "\"<UserInt 2>\" ] } } }");
 }
 
@@ -1084,7 +1264,7 @@ TEST(CstGrammarTest, ParsesValidAnyElementTrue) {
     ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
               "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname "
-              "anyElementTrue>: [ \"<UserInt 0>\", \"<UserBoolean 0>\" "
+              "anyElementTrue>: [ \"<UserBoolean false>\", \"<UserInt 0>\" "
               "] } } }");
 }
 
@@ -1100,8 +1280,8 @@ TEST(CstGrammarTest, ParsesValidSetDifference) {
     ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
               "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname "
-              "setDifference>: [ [ \"<UserString c>\", \"<UserString a>\" ], "
-              "[ \"<UserString a>\", \"<UserString b>\" ] ] } } }");
+              "setDifference>: [ [ \"<UserString a>\", \"<UserString c>\" ], [ \"<UserString b>\", "
+              "\"<UserString a>\" ] ] } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidSetEquals) {
@@ -1116,8 +1296,8 @@ TEST(CstGrammarTest, ParsesValidSetEquals) {
     ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
               "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname "
-              "setEquals>: [ [ \"<UserString a>\", \"<UserString b>\", "
-              "\"<UserString a>\" ], [ \"<UserString a>\", \"<UserString b>\" ] ] } } }");
+              "setEquals>: [ [ \"<UserString a>\", \"<UserString b>\", \"<UserString a>\" ], [ "
+              "\"<UserString b>\", \"<UserString a>\" ] ] } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidSetIntersection) {
@@ -1133,9 +1313,8 @@ TEST(CstGrammarTest, ParsesValidSetIntersection) {
     ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
               "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname "
-              "setIntersection>: [ [ \"<UserString b>\", \"<UserString "
-              "a>\" ], "
-              "[ [ \"<UserString b>\", \"<UserString a>\" ] ] ] } } }");
+              "setIntersection>: [ [ \"<UserString a>\", \"<UserString b>\" ], [ [ \"<UserString "
+              "a>\", \"<UserString b>\" ] ] ] } } }");
 }
 
 TEST(CstGrammarTest, ParsesValidSetIsSubset) {
@@ -1165,7 +1344,7 @@ TEST(CstGrammarTest, ParsesValidSetUnion) {
     ASSERT(KeyFieldname::projectInclusion == stages[0].firstKeyFieldname());
     ASSERT_EQ(stages[0].toBson().toString(),
               "{ <KeyFieldname projectInclusion>: { <ProjectionPath val>: { <KeyFieldname "
-              "setUnion>: [ [ \"<UserInt 2>\", \"<UserInt 1>\" ], [ "
+              "setUnion>: [ [ \"<UserInt 1>\", \"<UserInt 2>\" ], [ "
               "\"<UserInt "
               "3>\" ] ] } } }");
 }

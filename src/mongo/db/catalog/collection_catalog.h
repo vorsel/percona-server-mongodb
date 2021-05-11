@@ -55,7 +55,7 @@ class CollectionCatalog {
     friend class iterator;
 
 public:
-    using CollectionInfoFn = std::function<bool(const Collection* collection)>;
+    using CollectionInfoFn = std::function<bool(const CollectionPtr& collection)>;
 
     enum class LifetimeMode {
         // Lifetime of writable Collection is managed by an active write unit of work. The writable
@@ -73,11 +73,17 @@ public:
 
     class iterator {
     public:
-        using value_type = const Collection*;
+        using value_type = CollectionPtr;
 
-        iterator(StringData dbName, uint64_t genNum, const CollectionCatalog& catalog);
-        iterator(std::map<std::pair<std::string, CollectionUUID>,
-                          std::shared_ptr<Collection>>::const_iterator mapIter);
+        iterator(OperationContext* opCtx,
+                 StringData dbName,
+                 uint64_t genNum,
+                 const CollectionCatalog& catalog);
+        iterator(OperationContext* opCtx,
+                 std::map<std::pair<std::string, CollectionUUID>,
+                          std::shared_ptr<Collection>>::const_iterator mapIter,
+                 uint64_t genNum,
+                 const CollectionCatalog& catalog);
         value_type operator*();
         iterator operator++();
         iterator operator++(int);
@@ -104,13 +110,13 @@ public:
         bool _repositionIfNeeded();
         bool _exhausted();
 
+        OperationContext* _opCtx;
         std::string _dbName;
         boost::optional<CollectionUUID> _uuid;
         uint64_t _genNum;
         std::map<std::pair<std::string, CollectionUUID>,
                  std::shared_ptr<Collection>>::const_iterator _mapIter;
         const CollectionCatalog* _catalog;
-        static constexpr Collection* _nullCollection = nullptr;
     };
 
     struct ProfileSettings {
@@ -159,7 +165,7 @@ public:
     /**
      * Deregister the collection.
      */
-    std::shared_ptr<Collection> deregisterCollection(CollectionUUID uuid);
+    std::shared_ptr<Collection> deregisterCollection(OperationContext* opCtx, CollectionUUID uuid);
 
     /**
      * Returns the RecoveryUnit's Change for dropping the collection
@@ -182,7 +188,7 @@ public:
     Collection* lookupCollectionByUUIDForMetadataWrite(OperationContext* opCtx,
                                                        LifetimeMode mode,
                                                        CollectionUUID uuid);
-    const Collection* lookupCollectionByUUID(OperationContext* opCtx, CollectionUUID uuid) const;
+    CollectionPtr lookupCollectionByUUID(OperationContext* opCtx, CollectionUUID uuid) const;
     std::shared_ptr<const Collection> lookupCollectionByUUIDForRead(OperationContext* opCtx,
                                                                     CollectionUUID uuid) const;
 
@@ -205,8 +211,8 @@ public:
     Collection* lookupCollectionByNamespaceForMetadataWrite(OperationContext* opCtx,
                                                             LifetimeMode mode,
                                                             const NamespaceString& nss);
-    const Collection* lookupCollectionByNamespace(OperationContext* opCtx,
-                                                  const NamespaceString& nss) const;
+    CollectionPtr lookupCollectionByNamespace(OperationContext* opCtx,
+                                              const NamespaceString& nss) const;
     std::shared_ptr<const Collection> lookupCollectionByNamespaceForRead(
         OperationContext* opCtx, const NamespaceString& nss) const;
 
@@ -324,8 +330,8 @@ public:
      */
     uint64_t getEpoch() const;
 
-    iterator begin(StringData db) const;
-    iterator end() const;
+    iterator begin(OperationContext* opCtx, StringData db) const;
+    iterator end(OperationContext* opCtx) const;
 
     /**
      * Lookup the name of a resource by its ResourceId. If there are multiple namespaces mapped to
@@ -348,18 +354,28 @@ public:
      * Commit unmanaged Collection that was acquired by lookupCollectionBy***ForMetadataWrite and
      * lifetime mode kUnmanagedClone.
      */
-    void commitUnmanagedClone(Collection* collection);
+    void commitUnmanagedClone(OperationContext* opCtx, Collection* collection);
 
     /**
      * Discard unmanaged Collection that was acquired by lookupCollectionBy***ForMetadataWrite and
      * lifetime mode kUnmanagedClone.
      */
-    void discardUnmanagedClone(Collection* collection);
+    void discardUnmanagedClone(OperationContext* opCtx, Collection* collection);
 
 private:
     friend class CollectionCatalog::iterator;
 
     std::shared_ptr<Collection> _lookupCollectionByUUID(WithLock, CollectionUUID uuid) const;
+
+    /**
+     * Helper to commit a cloned Collection into the catalog. It takes a vector of commit handlers
+     * that are executed in the same critical section that is used to install the Collection into
+     * the catalog.
+     */
+    void _commitWritableClone(
+        std::shared_ptr<Collection> cloned,
+        boost::optional<Timestamp> commitTime,
+        const std::vector<std::function<void(boost::optional<Timestamp>)>>& commitHandlers);
 
     const std::vector<CollectionUUID>& _getOrdering_inlock(const StringData& db,
                                                            const stdx::lock_guard<Latch>&);
@@ -388,7 +404,7 @@ private:
     /**
      * Generation number to track changes to the catalog that could invalidate iterators.
      */
-    uint64_t _generationNumber;
+    uint64_t _generationNumber = 0;
 
     // Incremented whenever the CollectionCatalog gets closed and reopened (onCloseCatalog and
     // onOpenCatalog).
@@ -420,4 +436,13 @@ private:
      */
     DatabaseProfileSettingsMap _databaseProfileSettings;
 };
+
+/**
+ * Functor for looking up Collection by UUID from the Collection Catalog. This is the default yield
+ * restore implementation for CollectionPtr when acquired from the catalog.
+ */
+struct LookupCollectionForYieldRestore {
+    const Collection* operator()(OperationContext* opCtx, CollectionUUID uuid) const;
+};
+
 }  // namespace mongo

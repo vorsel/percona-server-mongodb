@@ -591,6 +591,34 @@ DBClientCursor::DBClientCursor(DBClientBase* client,
     }
 }
 
+/* static */
+StatusWith<std::unique_ptr<DBClientCursor>> DBClientCursor::fromAggregationRequest(
+    DBClientBase* client, AggregationRequest aggRequest, bool secondaryOk, bool useExhaust) {
+    BSONObj ret;
+    try {
+        if (!client->runCommand(aggRequest.getNamespaceString().db().toString(),
+                                aggRequest.serializeToCommandObj().toBson(),
+                                ret,
+                                secondaryOk ? QueryOption_SlaveOk : 0)) {
+            return {ErrorCodes::CommandFailed, ret.toString()};
+        }
+    } catch (...) {
+        return exceptionToStatus();
+    }
+    long long cursorId = ret["cursor"].Obj()["id"].Long();
+    std::vector<BSONObj> firstBatch;
+    for (BSONElement elem : ret["cursor"].Obj()["firstBatch"].Array()) {
+        firstBatch.emplace_back(elem.Obj().getOwned());
+    }
+
+    return {std::make_unique<DBClientCursor>(client,
+                                             aggRequest.getNamespaceString(),
+                                             cursorId,
+                                             0,
+                                             useExhaust ? QueryOption_Exhaust : 0,
+                                             firstBatch)};
+}
+
 DBClientCursor::~DBClientCursor() {
     kill();
 }
@@ -607,13 +635,11 @@ void DBClientCursor::kill() {
                 }
             };
 
+            // We only need to kill the cursor if there aren't pending replies. Pending replies
+            // indicates that this is an exhaust cursor, so the connection must be closed and the
+            // cursor will automatically be cleaned up by the upstream server.
             if (_client && !_connectionHasPendingReplies) {
                 killCursor(_client);
-            } else {
-                // Use a side connection to send the kill cursor request.
-                verify(_scopedHost.size() || (_client && _connectionHasPendingReplies));
-                DBClientBase::withConnection_do_not_use(
-                    _client ? _client->getServerAddress() : _scopedHost, killCursor);
             }
         }
     });

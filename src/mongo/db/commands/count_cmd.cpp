@@ -177,7 +177,7 @@ public:
                                 result);
         }
 
-        const Collection* const collection = ctx->getCollection();
+        const auto& collection = ctx->getCollection();
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
@@ -190,7 +190,7 @@ public:
             opCtx, request.getCollation().value_or(BSONObj()), nss);
 
         auto statusWithPlanExecutor =
-            getExecutorCount(expCtx, collection, request, true /*explain*/, nss);
+            getExecutorCount(expCtx, &collection, request, true /*explain*/, nss);
         if (!statusWithPlanExecutor.isOK()) {
             return statusWithPlanExecutor.getStatus();
         }
@@ -240,7 +240,7 @@ public:
             return true;
         }
 
-        const Collection* const collection = ctx->getCollection();
+        const auto& collection = ctx->getCollection();
 
         // Prevent chunks from being cleaned up during yields - this allows us to only check the
         // version on initial entry into count.
@@ -252,7 +252,7 @@ public:
         auto statusWithPlanExecutor =
             getExecutorCount(makeExpressionContextForGetExecutor(
                                  opCtx, request.getCollation().value_or(BSONObj()), nss),
-                             collection,
+                             &collection,
                              request,
                              false /*explain*/,
                              nss);
@@ -264,20 +264,23 @@ public:
         auto curOp = CurOp::get(opCtx);
         {
             stdx::lock_guard<Client> lk(*opCtx->getClient());
-            curOp->setPlanSummary_inlock(exec->getPlanSummary());
+            curOp->setPlanSummary_inlock(exec->getPlanExplainer().getPlanSummary());
         }
 
         auto countResult = exec->executeCount();
 
         PlanSummaryStats summaryStats;
-        exec->getSummaryStats(&summaryStats);
+        exec->getPlanExplainer().getSummaryStats(&summaryStats);
         if (collection) {
             CollectionQueryInfo::get(collection).notifyOfQuery(opCtx, collection, summaryStats);
         }
         curOp->debug().setPlanSummaryMetrics(summaryStats);
 
         if (curOp->shouldDBProfile(opCtx)) {
-            curOp->debug().execStats = exec->getStats();
+            auto&& explainer = exec->getPlanExplainer();
+            auto&& [stats, _] =
+                explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+            curOp->debug().execStats = std::move(stats);
         }
 
         result.appendNumber("n", countResult);

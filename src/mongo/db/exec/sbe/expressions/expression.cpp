@@ -183,7 +183,8 @@ std::unique_ptr<vm::CodeFragment> EPrimBinary::compile(CompileCtx& ctx) const {
             break;
         case EPrimBinary::logicAnd: {
             auto codeFalseBranch = std::make_unique<vm::CodeFragment>();
-            codeFalseBranch->appendConstVal(value::TypeTags::Boolean, false);
+            codeFalseBranch->appendConstVal(value::TypeTags::Boolean,
+                                            value::bitcastFrom<bool>(false));
             // Jump to the merge point that will be right after the thenBranch (rhs).
             codeFalseBranch->appendJump(rhs->instrs().size());
 
@@ -198,7 +199,8 @@ std::unique_ptr<vm::CodeFragment> EPrimBinary::compile(CompileCtx& ctx) const {
         }
         case EPrimBinary::logicOr: {
             auto codeTrueBranch = std::make_unique<vm::CodeFragment>();
-            codeTrueBranch->appendConstVal(value::TypeTags::Boolean, true);
+            codeTrueBranch->appendConstVal(value::TypeTags::Boolean,
+                                           value::bitcastFrom<bool>(true));
 
             // Jump to the merge point that will be right after the thenBranch (true branch).
             rhs->appendJump(codeTrueBranch->instrs().size());
@@ -347,6 +349,10 @@ struct BuiltinFn {
  */
 static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"dateParts", BuiltinFn{[](size_t n) { return n == 9; }, vm::Builtin::dateParts, false}},
+    {"dateToParts",
+     BuiltinFn{[](size_t n) { return n == 3 || n == 4; }, vm::Builtin::dateToParts, false}},
+    {"isoDateToParts",
+     BuiltinFn{[](size_t n) { return n == 3 || n == 4; }, vm::Builtin::isoDateToParts, false}},
     {"datePartsWeekYear",
      BuiltinFn{[](size_t n) { return n == 9; }, vm::Builtin::datePartsWeekYear, false}},
     {"split", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::split, false}},
@@ -356,6 +362,12 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"ksToString", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::ksToString, false}},
     {"ks", BuiltinFn{[](size_t n) { return n > 2; }, vm::Builtin::newKs, false}},
     {"abs", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::abs, false}},
+    {"ceil", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::ceil, false}},
+    {"floor", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::floor, false}},
+    {"exp", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::exp, false}},
+    {"ln", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::ln, false}},
+    {"log10", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::log10, false}},
+    {"sqrt", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::sqrt, false}},
     {"addToArray", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::addToArray, true}},
     {"addToSet", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::addToSet, true}},
     {"doubleDoubleSum",
@@ -386,6 +398,13 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"sinh", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::sinh, false}},
     {"tan", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::tan, false}},
     {"tanh", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::tanh, false}},
+    {"concat", BuiltinFn{[](size_t n) { return n > 0; }, vm::Builtin::concat, false}},
+    {"isMember", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::isMember, false}},
+    {"indexOfBytes",
+     BuiltinFn{[](size_t n) { return n == 3 || n == 4; }, vm::Builtin::indexOfBytes, false}},
+    {"indexOfCP",
+     BuiltinFn{[](size_t n) { return n == 3 || n == 4; }, vm::Builtin::indexOfCP, false}},
+    {"isTimezone", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::isTimezone, false}},
 };
 
 /**
@@ -424,6 +443,7 @@ static stdx::unordered_map<std::string, InstrFn> kInstrFunctions = {
     {"isBinData",
      InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendIsBinData, false}},
     {"isDate", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendIsDate, false}},
+    {"isNaN", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendIsNaN, false}},
     {"sum", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendSum, true}},
     {"min", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendMin, true}},
     {"max", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendMax, true}},
@@ -620,9 +640,10 @@ std::unique_ptr<vm::CodeFragment> EFail::compile(CompileCtx& ctx) const {
     auto code = std::make_unique<vm::CodeFragment>();
 
     code->appendConstVal(value::TypeTags::NumberInt64,
-                         value::bitcastFrom(static_cast<int64_t>(_code)));
+                         value::bitcastFrom<int64_t>(static_cast<int64_t>(_code)));
 
-    code->appendConstVal(value::TypeTags::StringBig, value::bitcastFrom(_message.c_str()));
+    code->appendConstVal(value::TypeTags::StringBig,
+                         value::bitcastFrom<const char*>(_message.c_str()));
 
     code->appendFail();
 

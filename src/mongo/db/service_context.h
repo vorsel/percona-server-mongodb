@@ -602,21 +602,35 @@ public:
 
 private:
     /**
-     * A synchronized unique_ptr wrapper to avoid setters racing with getters.
+     * A synchronized owning pointer to avoid setters racing with getters.
+     * This only guarantees that getters receive a coherent value, and
+     * not that the pointer is still valid.
+     *
+     * The kernel of operations is `set` and and `get`, others ops are sugar.
      */
     template <typename T>
     class SyncUnique {
     public:
         SyncUnique() = default;
-        explicit SyncUnique(std::unique_ptr<T> p) : _ptr(std::move(p)) {}
+        explicit SyncUnique(std::unique_ptr<T> p) {
+            set(std::move(p));
+        }
+
+        ~SyncUnique() {
+            set(nullptr);
+        }
 
         SyncUnique& operator=(std::unique_ptr<T> p) {
-            _ptr->swap(p);
+            set(std::move(p));
             return *this;
         }
 
+        void set(std::unique_ptr<T> p) {
+            delete _ptr.swap(p.release());
+        }
+
         T* get() const {
-            return _ptr->get();
+            return _ptr.load();
         }
 
         T* operator->() const {
@@ -628,11 +642,11 @@ private:
         }
 
         explicit operator bool() const {
-            return static_cast<bool>(**_ptr);
+            return static_cast<bool>(get());
         }
 
     private:
-        mutable synchronized_value<std::unique_ptr<T>, RawSynchronizedValueMutexPolicy> _ptr;
+        AtomicWord<T*> _ptr{nullptr};
     };
 
     class ClientObserverHolder {

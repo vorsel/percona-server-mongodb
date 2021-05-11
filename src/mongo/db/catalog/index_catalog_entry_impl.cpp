@@ -76,7 +76,7 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
           DurableCatalog::get(opCtx)->getIndexPrefix(opCtx, _catalogId, _descriptor->indexName())) {
 
     _descriptor->_entry = this;
-    _isReady = _catalogIsReady(opCtx);
+    _isReady = isReadyInMySnapshot(opCtx);
 
     {
         stdx::lock_guard<Latch> lk(_indexMultikeyPathsMutex);
@@ -131,7 +131,7 @@ bool IndexCatalogEntryImpl::isReady(OperationContext* opCtx) const {
     // out-of-sync index catalog entries.  To fix this, we uassert if we detect that the
     // in-memory catalog is out-of-sync with the on-disk catalog.
     if (opCtx->inMultiDocumentTransaction()) {
-        if (!_catalogIsPresent(opCtx) || _catalogIsReady(opCtx) != _isReady) {
+        if (!isPresentInMySnapshot(opCtx) || isReadyInMySnapshot(opCtx) != _isReady) {
             uasserted(ErrorCodes::SnapshotUnavailable,
                       str::stream() << "Unable to read from a snapshot due to pending collection"
                                        " catalog changes; please retry the operation.");
@@ -139,7 +139,7 @@ bool IndexCatalogEntryImpl::isReady(OperationContext* opCtx) const {
     }
 
     if (kDebugBuild)
-        invariant(_isReady == _catalogIsReady(opCtx));
+        invariant(_isReady == isReadyInMySnapshot(opCtx));
     return _isReady;
 }
 
@@ -170,7 +170,7 @@ void IndexCatalogEntryImpl::setIsReady(bool newIsReady) {
 }
 
 void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
-                                        const Collection* collection,
+                                        const CollectionPtr& collection,
                                         const KeyStringSet& multikeyMetadataKeys,
                                         const MultikeyPaths& multikeyPaths) {
     // An index can either track path-level multikey information in the catalog or as metadata keys
@@ -256,7 +256,7 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
 }
 
 Status IndexCatalogEntryImpl::_setMultikeyInMultiDocumentTransaction(
-    OperationContext* opCtx, const Collection* collection, const MultikeyPaths& multikeyPaths) {
+    OperationContext* opCtx, const CollectionPtr& collection, const MultikeyPaths& multikeyPaths) {
     // If we are inside a multi-document transaction, we write the on-disk multikey update in a
     // separate transaction so that it will not generate prepare conflicts with other operations
     // that try to set the multikey flag. In general, it should always be safe to update the
@@ -270,7 +270,7 @@ Status IndexCatalogEntryImpl::_setMultikeyInMultiDocumentTransaction(
     // If the index is not visible within the side transaction, the index may have been created,
     // but not committed, in the parent transaction. Therefore, we abandon the side transaction
     // and set the multikey flag in the parent transaction.
-    if (!_catalogIsPresent(opCtx)) {
+    if (!isPresentInMySnapshot(opCtx)) {
         return {ErrorCodes::SnapshotUnavailable, "index not visible in side transaction"};
     }
 
@@ -325,11 +325,11 @@ NamespaceString IndexCatalogEntryImpl::getNSSFromCatalog(OperationContext* opCtx
     return DurableCatalog::get(opCtx)->getEntry(_catalogId).nss;
 }
 
-bool IndexCatalogEntryImpl::_catalogIsReady(OperationContext* opCtx) const {
+bool IndexCatalogEntryImpl::isReadyInMySnapshot(OperationContext* opCtx) const {
     return DurableCatalog::get(opCtx)->isIndexReady(opCtx, _catalogId, _descriptor->indexName());
 }
 
-bool IndexCatalogEntryImpl::_catalogIsPresent(OperationContext* opCtx) const {
+bool IndexCatalogEntryImpl::isPresentInMySnapshot(OperationContext* opCtx) const {
     return DurableCatalog::get(opCtx)->isIndexPresent(opCtx, _catalogId, _descriptor->indexName());
 }
 
@@ -340,7 +340,7 @@ bool IndexCatalogEntryImpl::_catalogIsMultikey(OperationContext* opCtx,
 }
 
 void IndexCatalogEntryImpl::_catalogSetMultikey(OperationContext* opCtx,
-                                                const Collection* collection,
+                                                const CollectionPtr& collection,
                                                 const MultikeyPaths& multikeyPaths) {
     // It's possible that the index type (e.g. ascending/descending index) supports tracking
     // path-level multikey information, but this particular index doesn't.
@@ -370,7 +370,7 @@ void IndexCatalogEntryImpl::_catalogSetMultikey(OperationContext* opCtx,
                     "Index set to multi key, clearing query plan cache",
                     "namespace"_attr = collection->ns(),
                     "keyPattern"_attr = _descriptor->keyPattern());
-        CollectionQueryInfo::get(collection).clearQueryCache(collection);
+        CollectionQueryInfo::get(collection).clearQueryCacheForSetMultikey(collection);
     }
 
     opCtx->recoveryUnit()->onCommit([this](boost::optional<Timestamp>) {

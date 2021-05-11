@@ -51,24 +51,22 @@
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/snapshot.h"
+#include "mongo/db/yieldable.h"
 #include "mongo/logv2/log_attr.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/util/decorable.h"
 
 namespace mongo {
+
 class CappedCallback;
-class ExtentManager;
+class CollectionPtr;
 class IndexCatalog;
 class IndexCatalogEntry;
-class IndexDescriptor;
-class DatabaseImpl;
 class MatchExpression;
 class OpDebug;
 class OperationContext;
 class RecordCursor;
-class UpdateDriver;
-class UpdateRequest;
 
 /**
  * Holds information update an update operation.
@@ -162,7 +160,7 @@ private:
  */
 class SharedCollectionDecorations : public Decorable<SharedCollectionDecorations> {};
 
-class Collection : public Decorable<Collection> {
+class Collection : public DecorableCopyable<Collection> {
 public:
     enum class StoreDeletedDoc { Off, On };
 
@@ -240,8 +238,10 @@ public:
          *
          * -Anything else indicates a well formed validator. The MatchExpression will maintain
          * pointers into _validatorDoc.
+         *
+         * Note: this is shared state across cloned Collection instances
          */
-        StatusWithMatchExpression filter = {nullptr};
+        StatusWith<std::shared_ptr<MatchExpression>> filter = {nullptr};
     };
 
     /**
@@ -251,6 +251,12 @@ public:
 
     Collection() = default;
     virtual ~Collection() = default;
+
+    /**
+     * Clones this Collection instance. Some members are deep copied and some are shallow copied.
+     * This should only be be called from the CollectionCatalog when it needs a writable collection.
+     */
+    virtual std::shared_ptr<Collection> clone() const = 0;
 
     /**
      * Fetches the shared state across Collection instances for the a collection. Returns an object
@@ -522,6 +528,11 @@ public:
                                   const int scale = 1) const = 0;
 
     /**
+     * Returns the number of unused, free bytes used by all indexes on disk.
+     */
+    virtual uint64_t getIndexFreeStorageBytes(OperationContext* const opCtx) const = 0;
+
+    /**
      * If return value is not boost::none, reads with majority read concern using an older snapshot
      * must error.
      */
@@ -552,6 +563,7 @@ public:
      */
     virtual std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makePlanExecutor(
         OperationContext* opCtx,
+        const CollectionPtr& yieldableCollection,
         PlanYieldPolicy::YieldPolicy yieldPolicy,
         ScanDirection scanDirection,
         boost::optional<RecordId> resumeAfterRecordId = boost::none) const = 0;
@@ -575,5 +587,80 @@ public:
         return logv2::multipleAttrs(col.ns(), col.uuid());
     }
 };
+
+/**
+ * Smart-pointer'esque type to handle yielding of Collection lock that may invalidate pointers when
+ * resuming. CollectionPtr will re-load the Collection from the Catalog when restoring from a yield
+ * that dropped locks. The yield and restore behavior can be disabled by constructing this type from
+ * a writable Collection or by specifying NoYieldTag.
+ */
+class CollectionPtr : public Yieldable {
+public:
+    static CollectionPtr null;
+
+    // Function for the implementation on how we load a new Collection pointer when restoring from
+    // yield
+    using RestoreFn = std::function<const Collection*(OperationContext*, CollectionUUID)>;
+
+    CollectionPtr();
+
+    // Creates a Yieldable CollectionPtr that reloads the Collection pointer from the catalog when
+    // restoring from yield
+    CollectionPtr(OperationContext* opCtx, const Collection* collection, RestoreFn restoreFn);
+
+    // Creates non-yieldable CollectionPtr, performing yield/restore will be a no-op.
+    struct NoYieldTag {};
+    CollectionPtr(const Collection* collection, NoYieldTag);
+    CollectionPtr(Collection* collection);
+
+    CollectionPtr(const CollectionPtr&) = delete;
+    CollectionPtr(CollectionPtr&&);
+    ~CollectionPtr();
+
+    CollectionPtr& operator=(const CollectionPtr&) = delete;
+    CollectionPtr& operator=(CollectionPtr&&);
+
+    explicit operator bool() const {
+        return static_cast<bool>(_collection);
+    }
+
+    bool operator==(const CollectionPtr& other) const {
+        return get() == other.get();
+    }
+    bool operator!=(const CollectionPtr& other) const {
+        return !operator==(other);
+    }
+    const Collection* operator->() const {
+        return _collection;
+    }
+    const Collection* get() const {
+        return _collection;
+    }
+
+    void reset() {
+        *this = CollectionPtr();
+    }
+
+    void yield() const override;
+    void restore() const override;
+
+    friend std::ostream& operator<<(std::ostream& os, const CollectionPtr& coll);
+
+private:
+    bool _canYield() const;
+
+    // These members needs to be mutable so the yield/restore interface can be const. We don't want
+    // yield/restore to require a non-const instance when it otherwise could be const.
+    mutable const Collection* _collection;
+    mutable OptionalCollectionUUID _yieldedUUID;
+
+    OperationContext* _opCtx;
+    RestoreFn _restoreFn;
+};
+
+inline std::ostream& operator<<(std::ostream& os, const CollectionPtr& coll) {
+    os << coll.get();
+    return os;
+}
 
 }  // namespace mongo

@@ -115,7 +115,7 @@ void BranchStage::open(bool reOpen) {
         value::releaseValue(tag, val);
     }
     if (tag == value::TypeTags::Boolean) {
-        if (val) {
+        if (value::bitcastTo<bool>(val)) {
             _activeBranch = 0;
             _children[0]->open(reOpen && _thenOpened);
             _thenOpened = true;
@@ -181,9 +181,7 @@ const SpecificStats* BranchStage::getSpecificStats() const {
 }
 
 std::vector<DebugPrinter::Block> BranchStage::debugPrint() const {
-    std::vector<DebugPrinter::Block> ret;
-    DebugPrinter::addKeyword(ret, "branch");
-
+    auto ret = PlanStage::debugPrint();
     ret.emplace_back("{`");
     DebugPrinter::addBlocks(ret, _filter->debugPrint());
     ret.emplace_back("`}");

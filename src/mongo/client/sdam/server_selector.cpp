@@ -255,8 +255,7 @@ bool SdamServerSelector::recencyFilter(const ReadPreferenceSetting& readPref,
     bool result = true;
 
     if (!readPref.minClusterTime.isNull()) {
-        result =
-            result && (s->getOpTime() && s->getOpTime()->getTimestamp() >= readPref.minClusterTime);
+        result = (s->getOpTime() && s->getOpTime()->getTimestamp() >= readPref.minClusterTime);
     }
 
     if (readPref.maxStalenessSeconds.count()) {
@@ -310,7 +309,7 @@ void LatencyWindow::filterServers(std::vector<ServerDescriptionPtr>* servers) {
                    servers->end());
 }
 
-bool LatencyWindow::isWithinWindow(IsMasterRTT latency) {
+bool LatencyWindow::isWithinWindow(HelloRTT latency) {
     return lower <= latency && latency <= upper;
 }
 }  // namespace mongo::sdam

@@ -1,9 +1,12 @@
 /**
  * Tests the behavior of quiesce mode on mongos, which is entered during shutdown.
  * During quiesce mode, existing operations are allowed to continue and new operations are
- * accepted. However, isMaster requests return a ShutdownInProgress error, so that clients can
+ * accepted. However, hello requests return a ShutdownInProgress error, so that clients can
  * begin re-routing operations.
- * @tags: [requires_fcv_47]
+ * @tags: [
+ *   requires_fcv_47,
+ *   live_record_incompatible,
+ * ]
  */
 
 (function() {
@@ -30,9 +33,9 @@ function checkRemainingQuiesceTime(res) {
     assert(res.hasOwnProperty("remainingQuiesceTimeMillis"), res);
 }
 
-function runAwaitableIsMaster(topologyVersionField) {
+function runAwaitableHello(topologyVersionField) {
     let res = assert.commandFailedWithCode(db.runCommand({
-        isMaster: 1,
+        hello: 1,
         topologyVersion: topologyVersionField,
         maxAwaitTimeMS: 99999999,
     }),
@@ -67,14 +70,13 @@ let insertCmdFailPoint = configureFailPoint(mongodPrimary, "hangAfterCollectionI
 let insertCmd = startParallelShell(runInsert, mongodPrimary.port);
 insertCmdFailPoint.wait();
 
-jsTestLog("Create a hanging isMaster via mongos.");
-res = assert.commandWorked(mongos.adminCommand({isMaster: 1}));
+jsTestLog("Create a hanging hello via mongos.");
+res = assert.commandWorked(mongos.adminCommand({hello: 1}));
 assert(res.hasOwnProperty("topologyVersion"), res);
 let topologyVersionField = res.topologyVersion;
-let isMasterFailPoint = configureFailPoint(mongos, "waitForIsMasterResponse");
-let isMaster =
-    startParallelShell(funWithArgs(runAwaitableIsMaster, topologyVersionField), mongos.port);
-isMasterFailPoint.wait();
+let helloFailPoint = configureFailPoint(mongos, "waitForHelloResponse");
+let hello = startParallelShell(funWithArgs(runAwaitableHello, topologyVersionField), mongos.port);
+helloFailPoint.wait();
 assert.eq(1, mongos.getDB("admin").serverStatus().connections.awaitingTopologyChanges);
 
 jsTestLog("Transition mongos to quiesce mode.");
@@ -83,12 +85,11 @@ let quiesceModeFailPoint = configureFailPoint(mongos, "hangDuringQuiesceMode");
 st.stopMongos(0 /* mongos index */, undefined /* opts */, {waitpid: false});
 quiesceModeFailPoint.wait();
 
-jsTestLog("The waiting isMaster returns a ShutdownInProgress error.");
-isMaster();
+jsTestLog("The waiting hello returns a ShutdownInProgress error.");
+hello();
 
-jsTestLog("New isMaster command returns a ShutdownInProgress error.");
-res =
-    assert.commandFailedWithCode(mongos.adminCommand({isMaster: 1}), ErrorCodes.ShutdownInProgress);
+jsTestLog("New hello command returns a ShutdownInProgress error.");
+res = assert.commandFailedWithCode(mongos.adminCommand({hello: 1}), ErrorCodes.ShutdownInProgress);
 
 checkTopologyVersion(res, topologyVersionField);
 checkRemainingQuiesceTime(res);

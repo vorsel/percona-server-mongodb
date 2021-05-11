@@ -27,13 +27,18 @@
  *    it in the license file.
  */
 
+#include <bitset>
+#include <fmt/format.h>
+
 #include "mongo/unittest/unittest.h"
 
+#include "mongo/util/ctype.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/str.h"
 
 namespace mongo::str {
 
+using namespace fmt::literals;
 using std::string;
 
 TEST(StringUtilsTest, Basic) {
@@ -70,7 +75,7 @@ void assertCmp(int expected, StringData s1, StringData s2, bool lexOnly = false)
 }
 
 TEST(StringUtilsTest, Simple2) {
-    ASSERT(!isdigit((char)255));
+    ASSERT(!ctype::isDigit((char)255));
 
     assertCmp(0, "a", "a");
     assertCmp(-1, "a", "aa");
@@ -305,6 +310,19 @@ TEST(StringUtilsTest, UTF8SafeTruncation) {
     ASSERT_EQUALS(UTF8SafeTruncation("\U0001033c\U0001033c"_sd, 6), "\U0001033c"_sd);
     ASSERT_EQUALS(UTF8SafeTruncation("\U0001033c\U0001033c"_sd, 7), "\U0001033c"_sd);
     ASSERT_EQUALS(UTF8SafeTruncation("\U0001033c\U0001033c"_sd, 8), "\U0001033c\U0001033c"_sd);
+}
+
+TEST(StringUtilsTest, GetCodePointLength) {
+    for (int i = 0x0; i < 0x100; ++i) {
+        size_t n = 0;
+        for (std::bitset<8> bs(i); n < bs.size() && bs[7 - n]; ++n) {
+        }
+        if (n == 1)
+            continue;  // Avoid the invariant on 0b10xx'xxxx continuation bytes.
+        if (n == 0)
+            n = 1;  // 7-bit single byte code point.
+        ASSERT_EQUALS(getCodePointLength(static_cast<char>(i)), n) << " i:0x{:02x}"_format(i);
+    }
 }
 
 }  // namespace mongo::str

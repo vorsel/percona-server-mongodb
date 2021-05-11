@@ -156,7 +156,7 @@ struct Cloner::Fun {
                 collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
                 uassert(28594,
                         str::stream() << "Collection " << nss << " dropped while cloning",
-                        collection != nullptr);
+                        collection);
             }
 
             BSONObj tmp = i.nextSafe();
@@ -287,7 +287,7 @@ void Cloner::_copyIndexes(OperationContext* opCtx,
     if (from_indexes.empty())
         return;
 
-    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+    CollectionWriter collection(opCtx, nss);
     invariant(collection, str::stream() << "Missing collection " << nss << " (Cloner)");
 
     auto indexCatalog = collection->getIndexCatalog();
@@ -297,12 +297,11 @@ void Cloner::_copyIndexes(OperationContext* opCtx,
         return;
     }
 
-    auto collUUID = collection->uuid();
     auto fromMigrate = false;
     writeConflictRetry(opCtx, "_copyIndexes", nss.ns(), [&] {
         WriteUnitOfWork wunit(opCtx);
         IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
-            opCtx, collUUID, indexesToBuild, fromMigrate);
+            opCtx, collection, indexesToBuild, fromMigrate);
         wunit.commit();
     });
 }
@@ -367,7 +366,7 @@ Status Cloner::_createCollectionsForDb(
             opCtx->checkForInterrupt();
             WriteUnitOfWork wunit(opCtx);
 
-            const Collection* collection =
+            CollectionPtr collection =
                 CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
             if (collection) {
                 if (!params.shardedColl) {

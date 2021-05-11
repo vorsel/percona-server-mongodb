@@ -36,58 +36,72 @@
 namespace mongo {
 
 /**
- * A decoration on the Session object used to track exhaust isMaster metrics.
+ * A decoration on the Session object used to track exhaust metrics. We are
+ * tracking metrics for "hello" and "isMaster/ismaster" separately while we
+ * support both commands. This allows us insight into which command is being
+ * used until we decide to remove support for isMaster completely.
  */
-class InExhaustIsMaster {
+class InExhaustHello {
 public:
-    InExhaustIsMaster() = default;
+    InExhaustHello() = default;
 
-    InExhaustIsMaster(const InExhaustIsMaster&) = delete;
-    InExhaustIsMaster& operator=(const InExhaustIsMaster&) = delete;
-    InExhaustIsMaster(InExhaustIsMaster&&) = delete;
-    InExhaustIsMaster& operator=(InExhaustIsMaster&&) = delete;
+    InExhaustHello(const InExhaustHello&) = delete;
+    InExhaustHello& operator=(const InExhaustHello&) = delete;
+    InExhaustHello(InExhaustHello&&) = delete;
+    InExhaustHello& operator=(InExhaustHello&&) = delete;
 
-    static InExhaustIsMaster* get(transport::Session* session);
-    void setInExhaustIsMaster(bool inExhaustIsMaster);
+    static InExhaustHello* get(transport::Session* session);
+    void setInExhaust(bool inExhaust, StringData commandName);
     bool getInExhaustIsMaster() const;
-    ~InExhaustIsMaster();
+    bool getInExhaustHello() const;
+    ~InExhaustHello();
 
 private:
     bool _inExhaustIsMaster = false;
+    bool _inExhaustHello = false;
 };
 
 /**
- * Container for awaitable isMaster statistics.
+ * Container for awaitable hello and isMaster statistics. We are tracking
+ * metrics for "hello" and "isMaster/ismaster" separately while we support
+ * both commands. This allows us insight into which command is being used
+ * until we decide to remove support for isMaster completely.
  */
-class IsMasterMetrics {
-    IsMasterMetrics(const IsMasterMetrics&) = delete;
-    IsMasterMetrics& operator=(const IsMasterMetrics&) = delete;
-    IsMasterMetrics(IsMasterMetrics&&) = delete;
-    IsMasterMetrics& operator=(IsMasterMetrics&&) = delete;
+class HelloMetrics {
+    HelloMetrics(const HelloMetrics&) = delete;
+    HelloMetrics& operator=(const HelloMetrics&) = delete;
+    HelloMetrics(HelloMetrics&&) = delete;
+    HelloMetrics& operator=(HelloMetrics&&) = delete;
 
 public:
-    IsMasterMetrics() = default;
+    HelloMetrics() = default;
 
-    static IsMasterMetrics* get(ServiceContext* service);
-    static IsMasterMetrics* get(OperationContext* opCtx);
+    static HelloMetrics* get(ServiceContext* service);
+    static HelloMetrics* get(OperationContext* opCtx);
 
     size_t getNumExhaustIsMaster() const;
+    size_t getNumExhaustHello() const;
 
     size_t getNumAwaitingTopologyChanges() const;
     void incrementNumAwaitingTopologyChanges();
     void decrementNumAwaitingTopologyChanges();
 
     void resetNumAwaitingTopologyChanges();
-    friend InExhaustIsMaster;
+    friend InExhaustHello;
 
 private:
     void incrementNumExhaustIsMaster();
     void decrementNumExhaustIsMaster();
 
+    void incrementNumExhaustHello();
+    void decrementNumExhaustHello();
+
     // The number of clients currently waiting in isMaster for a topology change.
     AtomicWord<size_t> _connectionsAwaitingTopologyChanges{0};
     // The number of connections whose last request was an isMaster with exhaustAllowed.
     AtomicWord<size_t> _exhaustIsMasterConnections{0};
+    // The number of connections whose last request was a hello with exhaustAllowed.
+    AtomicWord<size_t> _exhaustHelloConnections{0};
 };
 
 }  // namespace mongo

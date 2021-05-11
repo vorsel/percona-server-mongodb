@@ -1449,7 +1449,8 @@ RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
                                          OpTime(),                   // prevWriteOpTimeInTransaction
                                          boost::none,                // preImageOpTime
                                          boost::none,                // postImageOpTime
-                                         boost::none);  // ShardId of resharding recipient
+                                         boost::none,   // ShardId of resharding recipient
+                                         boost::none);  // _id
     ASSERT_OK(_insertOplogEntry(partialApplyOpsOplogEntry.toBSON()));
     ops.push_back(std::make_pair(partialApplyOpsOplogEntry.toBSON(), insertOp2.second));
 
@@ -1481,7 +1482,8 @@ RollbackImplTest::_setUpUnpreparedTransactionForCountTest(UUID collId) {
                                         partialApplyOpsOpTime,      // prevWriteOpTimeInTransaction
                                         boost::none,                // preImageOpTime
                                         boost::none,                // postImageOpTime
-                                        boost::none);  // ShardId of resharding recipient
+                                        boost::none,   // ShardId of resharding recipient
+                                        boost::none);  // _id
     ASSERT_OK(_insertOplogEntry(commitApplyOpsOplogEntry.toBSON()));
     ops.push_back(std::make_pair(commitApplyOpsOplogEntry.toBSON(), insertOp3.second));
 
@@ -1729,19 +1731,11 @@ TEST_F(RollbackImplObserverInfoTest, NamespacesForOpsExtractsNamespacesOfCollMod
 }
 
 TEST_F(RollbackImplObserverInfoTest, NamespacesForOpsFailsOnUnsupportedOplogEntry) {
-    // 'convertToCapped' is not supported in rollback.
-    auto convertToCappedOp =
-        makeCommandOp(Timestamp(2, 2), boost::none, "test.$cmd", BSON("convertToCapped" << 1), 2);
-
-    auto status =
-        _rollback->_namespacesForOp_forTest(OplogEntry(convertToCappedOp.first)).getStatus();
-    ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status);
-
     // 'emptycapped' is not supported in rollback.
     auto emptycappedOp =
         makeCommandOp(Timestamp(2, 2), boost::none, "test.$cmd", BSON("emptycapped" << 1), 2);
 
-    status = _rollback->_namespacesForOp_forTest(OplogEntry(emptycappedOp.first)).getStatus();
+    auto status = _rollback->_namespacesForOp_forTest(OplogEntry(emptycappedOp.first)).getStatus();
     ASSERT_EQUALS(ErrorCodes::UnrecoverableRollbackError, status);
 }
 

@@ -25,6 +25,8 @@ const latest = "latest";
 function runStandaloneTest(downgradeVersion) {
     jsTestLog("Running standalone test with 'downgradeVersion': " + downgradeVersion);
     const downgradeFCV = binVersionToFCV(downgradeVersion);
+    const unsupportedOldFCV = (parseFloat(downgradeFCV) - 1).toFixed(1);
+    const unsupportedFutureFCV = (parseFloat(latestFCV) + 0.1).toFixed(1);
 
     let conn;
     let adminDB;
@@ -38,9 +40,17 @@ function runStandaloneTest(downgradeVersion) {
 
     jsTestLog("EXPECTED TO FAIL: featureCompatibilityVersion cannot be set to an invalid value");
     assert.commandFailed(adminDB.runCommand({setFeatureCompatibilityVersion: 5}));
-    assert.commandFailed(adminDB.runCommand({setFeatureCompatibilityVersion: "3.2"}));
-    assert.commandFailed(adminDB.runCommand({setFeatureCompatibilityVersion: "4.8"}));
-    assert.commandFailed(adminDB.runCommand({setFeatureCompatibilityVersion: "3.4"}));
+    assert.commandFailed(
+        adminDB.runCommand({setFeatureCompatibilityVersion: unsupportedOldFCV.toString()}));
+    assert.commandFailed(
+        adminDB.runCommand({setFeatureCompatibilityVersion: unsupportedFutureFCV.toString()}));
+    if (numVersionsSinceLastLTS > 2) {
+        // We do not support upgrading/downgrading to FCV's newer than last-lts but older than
+        // last-continuous.
+        const unsupportedFCV = (parseFloat(lastContinuousFCV) - 0.1).toFixed(1);
+        assert.commandFailed(
+            adminDB.runCommand({setFeatureCompatibilityVersion: unsupportedFCV.toString()}));
+    }
 
     jsTestLog("EXPECTED TO FAIL: setFeatureCompatibilityVersion rejects unknown fields.");
     assert.commandFailed(
@@ -69,8 +79,8 @@ function runStandaloneTest(downgradeVersion) {
                 {setFeatureCompatibilityVersion: downgradeFCV, downgradeOnDiskChanges: false}),
             ErrorCodes.IllegalOperation);
     } else {
-        jsTestLog(
-            "Test that setFeatureCompatibilityVersion succeeds with downgradeOnDiskChanges parameter when FCV is last-continuous");
+        jsTestLog("Test that setFeatureCompatibilityVersion succeeds with downgradeOnDiskChanges " +
+                  "parameter when FCV is last-continuous");
         assert.commandWorked(adminDB.runCommand(
             {setFeatureCompatibilityVersion: downgradeFCV, downgradeOnDiskChanges: true}));
         checkFCV(adminDB, downgradeFCV);
@@ -132,18 +142,37 @@ function runStandaloneTest(downgradeVersion) {
     checkFCV(adminDB, downgradeFCV);
 
     // setFeatureCompatibilityVersion does not support upgrading/downgrading between last-lts and
-    // last-continuous FCV.
+    // last-continuous FCV by default. Upgrading from last-lts to last-continuous is allowed if
+    // fromConfigServer is set to true.
     if (lastContinuousFCV !== lastLTSFCV) {
         if (downgradeFCV === lastContinuousFCV) {
             // Attempt to downgrade FCV from last-continuous to last-lts.
             assert.commandFailedWithCode(
-                adminDB.runCommand({setFeatureCompatibilityVersion: lastLTSFCV}),
-                ErrorCodes.IllegalOperation);
+                adminDB.runCommand({setFeatureCompatibilityVersion: lastLTSFCV}), 5147403);
+            // Downgrading from last-continuous to last-lts is not allowed even with
+            // fromConfigServer: true.
+            assert.commandFailedWithCode(
+                adminDB.runCommand(
+                    {setFeatureCompatibilityVersion: lastLTSFCV, fromConfigServer: true}),
+                5147403);
         } else {
             // Attempt to upgrade FCV from last-lts to last-continuous.
             assert.commandFailedWithCode(
-                adminDB.runCommand({setFeatureCompatibilityVersion: lastContinuousFCV}),
-                ErrorCodes.IllegalOperation);
+                adminDB.runCommand({setFeatureCompatibilityVersion: lastContinuousFCV}), 5147403);
+
+            assert.commandFailedWithCode(
+                adminDB.runCommand(
+                    {setFeatureCompatibilityVersion: lastContinuousFCV, fromConfigServer: false}),
+                5147403);
+            assert.commandWorked(adminDB.runCommand(
+                {setFeatureCompatibilityVersion: lastContinuousFCV, fromConfigServer: true}));
+            checkFCV(adminDB, lastContinuousFCV);
+
+            // Reset the FCV back to last-lts.
+            assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: latestFCV}));
+            checkFCV(adminDB, latestFCV);
+            assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
+            checkFCV(adminDB, lastLTSFCV);
         }
     }
 
@@ -210,12 +239,12 @@ function runStandaloneTest(downgradeVersion) {
     MongoRunner.stopMongod(conn);
 
     // A 'latest' binary mongod started with --shardsvr and clean data files defaults to
-    // 'downgradeFCV'.
+    // lastLTSFCV.
     conn = MongoRunner.runMongod({dbpath: dbpath, binVersion: latest, shardsvr: ""});
     assert.neq(
         null, conn, "mongod was unable to start up with version=" + latest + " and no data files");
     adminDB = conn.getDB("admin");
-    checkFCV(adminDB, downgradeFCV);
+    checkFCV(adminDB, lastLTSFCV);
     MongoRunner.stopMongod(conn);
 }
 
@@ -289,8 +318,17 @@ function runReplicaSetTest(downgradeVersion) {
 
     // Downgrading the FCV should fail if a previous upgrade has not yet completed.
     assert.commandFailedWithCode(
-        primary.adminCommand({setFeatureCompatibilityVersion: downgradeFCV}),
-        ErrorCodes.IllegalOperation);
+        primary.adminCommand({setFeatureCompatibilityVersion: downgradeFCV}), 5147403);
+
+    if (downgradeFCV === lastLTSFCV && lastLTSFCV !== lastContinuousFCV) {
+        // Upgrading to last-continuous should fail if we are in the middle of upgrading to latest.
+        assert.commandFailedWithCode(
+            primary.adminCommand({setFeatureCompatibilityVersion: lastContinuousFCV}), 5147403);
+        assert.commandFailedWithCode(
+            primary.adminCommand(
+                {setFeatureCompatibilityVersion: lastContinuousFCV, fromConfigServer: true}),
+            5147403);
+    }
 
     // Because the failed upgrade command left the primary in an intermediary state, complete the
     // upgrade.
@@ -305,7 +343,7 @@ function runReplicaSetTest(downgradeVersion) {
 
     // Upgrading the FCV should fail if a previous downgrade has not yet completed.
     assert.commandFailedWithCode(primary.adminCommand({setFeatureCompatibilityVersion: latestFCV}),
-                                 ErrorCodes.IllegalOperation);
+                                 5147403);
 
     if (lastContinuousFCV !== lastLTSFCV) {
         // We will fail if we have not yet completed a downgrade and attempt to downgrade to a
@@ -314,10 +352,36 @@ function runReplicaSetTest(downgradeVersion) {
             setFeatureCompatibilityVersion: downgradeFCV === lastContinuousFCV ? lastLTSFCV
                                                                                : lastContinuousFCV
         }),
-                                     ErrorCodes.IllegalOperation);
+                                     5147403);
     }
     // Complete the downgrade.
     assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: downgradeFCV}));
+
+    if (downgradeFCV === lastLTSFCV && lastContinuousFCV !== lastLTSFCV) {
+        // The command should fail because wtimeout expires before a majority responds.
+        stopServerReplication(secondary);
+        res = primary.adminCommand({
+            setFeatureCompatibilityVersion: lastContinuousFCV,
+            fromConfigServer: true,
+            writeConcern: {wtimeout: 1000}
+        });
+        assert.eq(0, res.ok);
+        assert.commandFailedWithCode(res, ErrorCodes.WriteConcernFailed);
+        restartServerReplication(secondary);
+
+        // Upgrading the FCV to latest should fail if a previous upgrade to lastContinuous has not
+        // yet completed.
+        assert.commandFailedWithCode(
+            primary.adminCommand({setFeatureCompatibilityVersion: latestFCV}), 5147403);
+
+        // Complete the upgrade to last-continuous.
+        assert.commandWorked(primary.adminCommand(
+            {setFeatureCompatibilityVersion: lastContinuousFCV, fromConfigServer: true}));
+
+        // Reset the FCV back to last-lts.
+        assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: latestFCV}));
+        assert.commandWorked(primary.adminCommand({setFeatureCompatibilityVersion: lastLTSFCV}));
+    }
 
     secondary = rst.add({binVersion: downgradeVersion});
     secondaryAdminDB = secondary.getDB("admin");
@@ -375,6 +439,9 @@ function runReplicaSetTest(downgradeVersion) {
 function runShardingTest(downgradeVersion) {
     jsTestLog("Running sharding test with 'downgradeVersion': " + downgradeVersion);
     const downgradeFCV = binVersionToFCV(downgradeVersion);
+    const unsupportedOldFCV = (parseFloat(downgradeFCV) - 1).toFixed(1);
+    const unsupportedFutureFCV = (parseFloat(latestFCV) + 0.1).toFixed(1);
+
     let st;
     let mongosAdminDB;
     let configPrimaryAdminDB;
@@ -395,8 +462,10 @@ function runShardingTest(downgradeVersion) {
     jsTestLog(
         "EXPECTED TO FAIL: featureCompatibilityVersion cannot be set to invalid value on mongos");
     assert.commandFailed(mongosAdminDB.runCommand({setFeatureCompatibilityVersion: 5}));
-    assert.commandFailed(mongosAdminDB.runCommand({setFeatureCompatibilityVersion: "3.2"}));
-    assert.commandFailed(mongosAdminDB.runCommand({setFeatureCompatibilityVersion: "4.8"}));
+    assert.commandFailed(
+        mongosAdminDB.runCommand({setFeatureCompatibilityVersion: unsupportedOldFCV.toString()}));
+    assert.commandFailed(mongosAdminDB.runCommand(
+        {setFeatureCompatibilityVersion: unsupportedFutureFCV.toString()}));
 
     jsTestLog("EXPECTED TO FAIL: setFeatureCompatibilityVersion rejects unknown fields on mongos");
     assert.commandFailed(
@@ -439,7 +508,7 @@ function runShardingTest(downgradeVersion) {
     checkFCV(configPrimaryAdminDB, downgradeFCV);
     checkFCV(shardPrimaryAdminDB, downgradeFCV);
 
-    // A 'latest' binary replica set started as a shard server defaults to 'downgradeFCV'.
+    // A 'latest' binary replica set started as a shard server defaults to 'lastLTSFCV'.
     let latestShard = new ReplSetTest({
         name: "latestShard",
         nodes: [{binVersion: latest}, {binVersion: latest}],
@@ -449,7 +518,7 @@ function runShardingTest(downgradeVersion) {
     latestShard.startSet();
     latestShard.initiate();
     let latestShardPrimaryAdminDB = latestShard.getPrimary().getDB("admin");
-    checkFCV(latestShardPrimaryAdminDB, downgradeFCV);
+    checkFCV(latestShardPrimaryAdminDB, lastLTSFCV);
     assert.commandWorked(mongosAdminDB.runCommand({addShard: latestShard.getURL()}));
     checkFCV(latestShardPrimaryAdminDB, downgradeFCV);
 
@@ -489,12 +558,13 @@ function runShardingTest(downgradeVersion) {
     downgradedShard.stopSet();
 }
 
-runStandaloneTest('last-continuous');
 runStandaloneTest('last-lts');
-
-runReplicaSetTest('last-continuous');
 runReplicaSetTest('last-lts');
-
-runShardingTest('last-continuous');
 runShardingTest('last-lts');
+
+if (lastLTSFCV != lastContinuousFCV) {
+    runStandaloneTest('last-continuous');
+    runReplicaSetTest('last-continuous');
+    runShardingTest('last-continuous');
+}
 })();

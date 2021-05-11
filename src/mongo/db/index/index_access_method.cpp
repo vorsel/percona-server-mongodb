@@ -121,7 +121,7 @@ AbstractIndexAccessMethod::AbstractIndexAccessMethod(IndexCatalogEntry* btreeSta
 
 // Find the keys for obj, put them in the tree pointing to loc.
 Status AbstractIndexAccessMethod::insert(OperationContext* opCtx,
-                                         const Collection* coll,
+                                         const CollectionPtr& coll,
                                          const BSONObj& obj,
                                          const RecordId& loc,
                                          const InsertDeleteOptions& options,
@@ -158,7 +158,7 @@ Status AbstractIndexAccessMethod::insert(OperationContext* opCtx,
 
 Status AbstractIndexAccessMethod::insertKeysAndUpdateMultikeyPaths(
     OperationContext* opCtx,
-    const Collection* coll,
+    const CollectionPtr& coll,
     const KeyStringSet& keys,
     const KeyStringSet& multikeyMetadataKeys,
     const MultikeyPaths& multikeyPaths,
@@ -185,7 +185,7 @@ Status AbstractIndexAccessMethod::insertKeysAndUpdateMultikeyPaths(
 }
 
 Status AbstractIndexAccessMethod::insertKeys(OperationContext* opCtx,
-                                             const Collection* coll,
+                                             const CollectionPtr& coll,
                                              const KeyStringSet& keys,
                                              const RecordId& loc,
                                              const InsertDeleteOptions& options,
@@ -332,6 +332,10 @@ long long AbstractIndexAccessMethod::getSpaceUsedBytes(OperationContext* opCtx) 
     return _newInterface->getSpaceUsedBytes(opCtx);
 }
 
+long long AbstractIndexAccessMethod::getFreeStorageBytes(OperationContext* opCtx) const {
+    return _newInterface->getFreeStorageBytes(opCtx);
+}
+
 pair<KeyStringSet, KeyStringSet> AbstractIndexAccessMethod::setDifference(
     const KeyStringSet& left, const KeyStringSet& right) {
     // Two iterators to traverse the two sets in sorted order.
@@ -422,7 +426,7 @@ void AbstractIndexAccessMethod::prepareUpdate(OperationContext* opCtx,
 }
 
 Status AbstractIndexAccessMethod::update(OperationContext* opCtx,
-                                         const Collection* coll,
+                                         const CollectionPtr& coll,
                                          const UpdateTicket& ticket,
                                          int64_t* numInserted,
                                          int64_t* numDeleted) {
@@ -444,7 +448,7 @@ Status AbstractIndexAccessMethod::update(OperationContext* opCtx,
     }
 
     // Add all new data keys into the index.
-    for (const auto keyString : ticket.added) {
+    for (const auto& keyString : ticket.added) {
         Status status = _newInterface->insert(opCtx, keyString, ticket.dupsAllowed);
         if (!status.isOK())
             return status;
@@ -482,6 +486,10 @@ public:
                   const RecordId& loc,
                   const InsertDeleteOptions& options) final;
 
+    void addToSorter(const KeyString::Value& keyString) final {
+        _sorter->add(keyString, mongo::NullValue());
+    }
+
     const MultikeyPaths& getMultikeyPaths() const final;
 
     bool isMultikey() const final;
@@ -494,9 +502,7 @@ public:
 
     int64_t getKeysInserted() const final;
 
-    Sorter::PersistedState getPersistedSorterState() const final;
-
-    void persistDataForShutdown() final;
+    Sorter::PersistedState persistDataForShutdown() final;
 
 private:
     void _insertMultikeyMetadataKeysIntoSorter();
@@ -627,13 +633,9 @@ int64_t AbstractIndexAccessMethod::BulkBuilderImpl::getKeysInserted() const {
 }
 
 AbstractIndexAccessMethod::BulkBuilder::Sorter::PersistedState
-AbstractIndexAccessMethod::BulkBuilderImpl::getPersistedSorterState() const {
-    return _sorter->getPersistedState();
-}
-
-void AbstractIndexAccessMethod::BulkBuilderImpl::persistDataForShutdown() {
+AbstractIndexAccessMethod::BulkBuilderImpl::persistDataForShutdown() {
     _insertMultikeyMetadataKeysIntoSorter();
-    _sorter->persistDataForShutdown();
+    return _sorter->persistDataForShutdown();
 }
 
 void AbstractIndexAccessMethod::BulkBuilderImpl::_insertMultikeyMetadataKeysIntoSorter() {
@@ -694,6 +696,25 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
     for (int64_t i = 0; it->more(); i++) {
         opCtx->checkForInterrupt();
 
+        hangIndexBuildDuringBulkLoadPhase.executeIf(
+            [opCtx, i, &indexName = _descriptor->indexName()](const BSONObj& data) {
+                LOGV2(4924400,
+                      "Hanging index build during bulk load phase due to "
+                      "'hangIndexBuildDuringBulkLoadPhase' failpoint",
+                      "iteration"_attr = i,
+                      "index"_attr = indexName);
+
+                hangIndexBuildDuringBulkLoadPhase.pauseWhileSet(opCtx);
+            },
+            [i, &indexName = _descriptor->indexName()](const BSONObj& data) {
+                auto indexNames = data.getObjectField("indexNames");
+                return i == data["iteration"].numberLong() &&
+                    std::any_of(
+                           indexNames.begin(), indexNames.end(), [&indexName](const auto& elem) {
+                               return indexName == elem.String();
+                           });
+            });
+
         // Get the next datum and add it to the builder.
         BulkBuilder::Sorter::Data data = it->next();
 
@@ -705,10 +726,10 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
             if (cmpData < 0) {
                 LOGV2_FATAL_NOTRACE(
                     31171,
-                    "expected the next key{data_first} to be greater than or equal to the "
-                    "previous key{previousKey}",
-                    "data_first"_attr = data.first.toString(),
-                    "previousKey"_attr = previousKey.toString());
+                    "Expected the next key to be greater than or equal to the previous key",
+                    "nextKey"_attr = data.first.toString(),
+                    "previousKey"_attr = previousKey.toString(),
+                    "index"_attr = _descriptor->indexName());
             }
         }
 
@@ -721,17 +742,6 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
             }
             continue;
         }
-
-        hangIndexBuildDuringBulkLoadPhase.executeIf(
-            [opCtx, i](const BSONObj& data) {
-                LOGV2(4924400,
-                      "Hanging index build during bulk load phase due to "
-                      "'hangIndexBuildDuringBulkLoadPhase' failpoint",
-                      "iteration"_attr = i);
-
-                hangIndexBuildDuringBulkLoadPhase.pauseWhileSet(opCtx);
-            },
-            [i](const BSONObj& data) { return i == data["iteration"].numberLong(); });
 
         WriteUnitOfWork wunit(opCtx);
         Status status = builder->addKey(data.first);
@@ -773,7 +783,7 @@ Status AbstractIndexAccessMethod::commitBulk(OperationContext* opCtx,
 }
 
 void AbstractIndexAccessMethod::setIndexIsMultikey(OperationContext* opCtx,
-                                                   const Collection* collection,
+                                                   const CollectionPtr& collection,
                                                    KeyStringSet multikeyMetadataKeys,
                                                    MultikeyPaths paths) {
     _indexCatalogEntry->setMultikey(opCtx, collection, multikeyMetadataKeys, paths);
@@ -835,6 +845,12 @@ bool AbstractIndexAccessMethod::shouldMarkIndexAsMultikey(
     return numberOfKeys > 1 || isMultikeyFromPaths(multikeyPaths);
 }
 
+std::unique_ptr<SortedDataBuilderInterface> AbstractIndexAccessMethod::makeBulkBuilder(
+    OperationContext* opCtx, bool dupsAllowed) {
+    return std::unique_ptr<SortedDataBuilderInterface>(
+        _newInterface->getBulkBuilder(opCtx, dupsAllowed));
+}
+
 SortedDataInterface* AbstractIndexAccessMethod::getSortedDataInterface() const {
     return _newInterface.get();
 }
@@ -845,7 +861,8 @@ std::shared_ptr<Ident> AbstractIndexAccessMethod::getSharedIdent() const {
 
 /**
  * Generates a new file name on each call using a static, atomic and monotonically increasing
- * number.
+ * number. Each name is suffixed with a random number generated at startup, to prevent name
+ * collisions when the index build external sort files are preserved across restarts.
  *
  * Each user of the Sorter must implement this function to ensure that all temporary files that the
  * Sorter instances produce are uniquely identified using a unique file name extension with separate
@@ -854,7 +871,9 @@ std::shared_ptr<Ident> AbstractIndexAccessMethod::getSharedIdent() const {
  */
 std::string nextFileName() {
     static AtomicWord<unsigned> indexAccessMethodFileCounter;
-    return "extsort-index." + std::to_string(indexAccessMethodFileCounter.fetchAndAdd(1));
+    static const int64_t randomSuffix = SecureRandom().nextInt64();
+    return str::stream() << "extsort-index." << indexAccessMethodFileCounter.fetchAndAdd(1) << '-'
+                         << randomSuffix;
 }
 
 Status AbstractIndexAccessMethod::_handleDuplicateKey(OperationContext* opCtx,

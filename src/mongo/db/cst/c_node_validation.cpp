@@ -34,8 +34,11 @@
 
 #include "mongo/base/status.h"
 #include "mongo/bson/bson_depth.h"
+#include "mongo/db/cst/c_node.h"
 #include "mongo/db/cst/c_node_validation.h"
 #include "mongo/db/cst/path.h"
+#include "mongo/db/matcher/matcher_type_set.h"
+#include "mongo/db/pipeline/field_path.h"
 #include "mongo/db/pipeline/variable_validation.h"
 #include "mongo/db/query/util/make_data_structure.h"
 #include "mongo/stdx/variant.h"
@@ -80,7 +83,7 @@ StatusWith<IsInclusion> processAdditionalFieldsInclusionConfirmed(const Iter& it
                 return processAdditionalFieldsInclusionConfirmed(std::next(iter), isEnd);
             else
                 return Status{ErrorCodes::FailedToParse,
-                              "$project containing inclusion and/or computed fields must "
+                              "project containing inclusion and/or computed fields must "
                               "contain no exclusion fields"};
         }
     } else {
@@ -97,7 +100,7 @@ StatusWith<IsInclusion> processAdditionalFieldsExclusionConfirmed(const Iter& it
         } else {
             if (isInclusionField(iter->second))
                 return Status{ErrorCodes::FailedToParse,
-                              "$project containing exclusion fields must contain no "
+                              "project containing exclusion fields must contain no "
                               "inclusion and/or computed fields"};
             else
                 return processAdditionalFieldsExclusionConfirmed(std::next(iter), isEnd);
@@ -159,7 +162,7 @@ auto validateNotPrefix(const std::vector<StringData>& potentialPrefixOne,
         if (potentialPrefixOne[n] != potentialPrefixTwo[n])
             return Status::OK();
     return Status{ErrorCodes::FailedToParse,
-                  "paths appearing in $project conflict because one is a prefix of the other: "s +
+                  "paths appearing in project conflict because one is a prefix of the other: "s +
                       path::vectorToString(potentialPrefixOne) + " & " +
                       path::vectorToString(potentialPrefixTwo)};
 }
@@ -189,7 +192,7 @@ auto validateNotRedundantOrPrefixConflicting(const std::vector<StringData>& curr
         return Status::OK();
     } else {
         return Status{ErrorCodes::FailedToParse,
-                      "path appears more than once in $project: "s +
+                      "path appears more than once in project: "s +
                           path::vectorToString(currentPath)};
     }
 }
@@ -203,7 +206,8 @@ Status addPathsFromTreeToSet(const CNode::ObjectChildren& children,
         // like '{"a.b": 1}'.
         auto currentPath = previousPath;
         if (auto&& fieldname = stdx::get_if<FieldnamePath>(&child.first))
-            for (auto&& component : stdx::get<ProjectionPath>(*fieldname).components)
+            for (auto&& component :
+                 stdx::visit([](auto&& fn) -> auto&& { return fn.components; }, *fieldname))
                 currentPath.emplace_back(component);
         // Or add a translaiton of _id if we have a key for that.
         else
@@ -251,6 +255,55 @@ Status addPathsFromTreeToSet(const CNode::ObjectChildren& children,
     return Status::OK();
 }
 
+template <typename T>
+Status validateNumericType(T num) {
+    auto valueAsInt = BSON("" << num).firstElement().parseIntegerElementToInt();
+    if (!valueAsInt.isOK() || valueAsInt.getValue() == 0 ||
+        !isValidBSONType(valueAsInt.getValue())) {
+        if constexpr (std::is_same_v<std::decay_t<T>, UserDecimal>) {
+            return Status{ErrorCodes::FailedToParse,
+                          str::stream() << "invalid numerical type code: " << num.toString()
+                                        << " provided as argument"};
+        } else {
+            return Status{ErrorCodes::FailedToParse,
+                          str::stream()
+                              << "invalid numerical type code: " << num << " provided as argument"};
+        }
+    }
+    return Status::OK();
+}
+
+Status validateSingleType(const CNode& element) {
+    return stdx::visit(
+        visit_helper::Overloaded{
+            [&](const UserDouble& dbl) { return validateNumericType(dbl); },
+            [&](const UserInt& num) { return validateNumericType(num); },
+            [&](const UserLong& lng) { return validateNumericType(lng); },
+            [&](const UserDecimal& dc) { return validateNumericType(dc); },
+            [&](const UserString& st) {
+                if (st == MatcherTypeSet::kMatchesAllNumbersAlias) {
+                    return Status::OK();
+                }
+                auto optValue = findBSONTypeAlias(st);
+                if (!optValue) {
+                    // The string "missing" can be returned from the $type agg expression, but is
+                    // not valid for use in the $type match expression predicate. Return a special
+                    // error message for this case.
+                    if (st == StringData{typeName(BSONType::EOO)}) {
+                        return Status{
+                            ErrorCodes::FailedToParse,
+                            "unknown type name alias 'missing' (to query for "
+                            "non-existence of a field, use {$exists:false}) provided as argument"};
+                    }
+                    return Status{ErrorCodes::FailedToParse,
+                                  str::stream() << "unknown type name alias: '" << st
+                                                << "' provided as argument"};
+                }
+                return Status::OK();
+            },
+            [&](auto &&) -> Status { MONGO_UNREACHABLE; }},
+        element.payload);
+}
 }  // namespace
 
 StatusWith<IsInclusion> validateProjectionAsInclusionOrExclusion(const CNode& projects) {
@@ -297,7 +350,6 @@ Status validateVariableNameAndPathSuffix(const std::vector<std::string>& nameAnd
     return Status::OK();
 }
 
-
 StatusWith<IsPositional> validateProjectionPathAsNormalOrPositional(
     const std::vector<std::string>& components) {
     if (components.size() > BSONDepth::getMaxAllowableDepth())
@@ -315,4 +367,27 @@ StatusWith<IsPositional> validateProjectionPathAsNormalOrPositional(
     return isPositional;
 }
 
+Status validateSortPath(const std::vector<std::string>& pathComponents) {
+    try {
+        for (auto&& component : pathComponents) {
+            FieldPath::uassertValidFieldName(component);
+        }
+    } catch (AssertionException& ae) {
+        return Status{ae.code(), ae.reason()};
+    }
+    return Status::OK();
+}
+
+Status validateTypeOperatorArgument(const CNode& types) {
+    // If the CNode is an array, we need to validate all of the types within it.
+    if (auto&& children = stdx::get_if<CNode::ArrayChildren>(&types.payload)) {
+        for (auto&& child : (*children)) {
+            if (auto status = validateSingleType(child); !status.isOK()) {
+                return status;
+            }
+        }
+        return Status::OK();
+    }
+    return validateSingleType(types);
+}
 }  // namespace mongo::c_node_validation

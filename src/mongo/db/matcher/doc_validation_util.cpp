@@ -32,15 +32,14 @@
 namespace mongo::doc_validation_error {
 std::unique_ptr<MatchExpression::ErrorAnnotation> createAnnotation(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const std::string& operatorName,
-    const BSONObj& annotation) {
+    const std::string& tag,
+    BSONObj annotation) {
     if (expCtx->isParsingCollectionValidator) {
-        return std::make_unique<MatchExpression::ErrorAnnotation>(operatorName, annotation);
+        return std::make_unique<MatchExpression::ErrorAnnotation>(tag, std::move(annotation));
     } else {
         return nullptr;
     }
 }
-
 std::unique_ptr<MatchExpression::ErrorAnnotation> createAnnotation(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     MatchExpression::ErrorAnnotation::Mode mode) {
@@ -58,5 +57,17 @@ void annotateTreeToIgnoreForErrorDetails(const boost::intrusive_ptr<ExpressionCo
     for (const auto childExpr : *expr) {
         annotateTreeToIgnoreForErrorDetails(expCtx, childExpr);
     }
+}
+
+unsigned int computeMaxAllowedValidationErrorDepth() {
+    // The default number of levels a generated error must be below the configured depth to be
+    // considered valid.
+    static constexpr auto kDefaultOffset = 10u;
+    // Only use 'kDefaultOffset' if the configured depth is greater than it. The validation error
+    // response will always allow at least 'BSONDepth::kBSONDepthParameterFloor' levels of nesting.
+    return BSONDepth::getMaxAllowableDepth() > kDefaultOffset
+        ? std::max(BSONDepth::getMaxAllowableDepth() - kDefaultOffset,
+                   static_cast<uint32_t>(BSONDepth::kBSONDepthParameterFloor))
+        : BSONDepth::kBSONDepthParameterFloor;
 }
 }  // namespace mongo::doc_validation_error

@@ -14,13 +14,11 @@ APIs
 ARG
 ARGS
 ASM
-ASYNC
 Addr
 Ailamaki
 Alakuijala
 Alexandrescu's
 Alloc
-Async
 AsyncOp
 Athanassoulis
 Athlon
@@ -325,7 +323,6 @@ RCS
 RDNOLOCK
 RDONLY
 READONLY
-REBALANCE
 RECNO
 REF's
 REFs
@@ -343,7 +340,6 @@ RXB
 Radu
 ReadFile
 Readonly
-Rebalance
 RedHat
 Redistributions
 Refactor
@@ -499,8 +495,6 @@ asm
 aspell
 assertfmt
 async
-asyncopp
-asyncops
 atomicity
 autocommit
 autoconf
@@ -704,12 +698,14 @@ dll
 dlopen
 dlsym
 dmalloc
+dmb
 dmsg
 doxgen
 doxygen
 drealloc
 ds
 dsb
+dsbs
 dsk
 dsrc
 dst
@@ -900,6 +896,9 @@ isalpha
 iscntrl
 isdigit
 isgraph
+ish
+ishld
+ishst
 islocked
 islower
 ispo
@@ -1178,7 +1177,6 @@ readunlock
 readv
 realloc
 rebalance
-rebalanced
 rebalancing
 recno
 recnos
@@ -1231,6 +1229,7 @@ setstr
 setv
 setvbuf
 sfence
+shareability
 signalled
 sii
 sizeof
@@ -1276,6 +1275,7 @@ struct
 structs
 su
 subdirectory
+subget
 subgetraw
 subgets
 subinit
@@ -1312,6 +1312,7 @@ timestamp
 timestamped
 timestamps
 tinfo
+tlb
 tmp
 todo
 tokenizer

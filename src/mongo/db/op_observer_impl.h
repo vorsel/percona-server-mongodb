@@ -118,7 +118,7 @@ public:
                              const boost::optional<repl::OpTime> prevWriteOpTimeInTransaction,
                              const boost::optional<OplogSlot> slot) final;
     void onCreateCollection(OperationContext* opCtx,
-                            const Collection* coll,
+                            const CollectionPtr& coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
                             const BSONObj& idIndex,
@@ -160,6 +160,14 @@ public:
                             OptionalCollectionUUID dropTargetUUID,
                             std::uint64_t numRecords,
                             bool stayTemp) final;
+    void onImportCollection(OperationContext* opCtx,
+                            const UUID& importUUID,
+                            const NamespaceString& nss,
+                            long long numRecords,
+                            long long dataSize,
+                            const BSONObj& catalogEntry,
+                            const BSONObj& storageMetadata,
+                            bool isDryRun) final;
     void onApplyOps(OperationContext* opCtx,
                     const std::string& dbName,
                     const BSONObj& applyOpCmd) final;
@@ -223,7 +231,7 @@ private:
     virtual void shardAnnotateOplogEntry(OperationContext* opCtx,
                                          const NamespaceString nss,
                                          const BSONObj& doc,
-                                         repl::ReplOperation& op) {}
+                                         repl::DurableReplOperation& op) {}
 };
 
 extern const OperationContext::Decoration<boost::optional<OpObserverImpl::DocumentKey>>

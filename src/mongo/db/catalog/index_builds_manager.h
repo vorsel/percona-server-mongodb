@@ -44,6 +44,7 @@
 namespace mongo {
 
 class Collection;
+class CollectionPtr;
 class OperationContext;
 class ServiceContext;
 
@@ -97,12 +98,12 @@ public:
      * Runs the scanning/insertion phase of the index build..
      */
     Status startBuildingIndex(OperationContext* opCtx,
-                              const Collection* collection,
+                              const CollectionPtr& collection,
                               const UUID& buildUUID,
                               boost::optional<RecordId> resumeAfterRecordId = boost::none);
 
     Status resumeBuildingIndexFromBulkLoadPhase(OperationContext* opCtx,
-                                                const Collection* collection,
+                                                const CollectionPtr& collection,
                                                 const UUID& buildUUID);
 
     /**
@@ -112,7 +113,10 @@ public:
      * Returns the number of records and the size of the data iterated over.
      */
     StatusWith<std::pair<long long, long long>> startBuildingIndexForRecovery(
-        OperationContext* opCtx, const Collection* coll, const UUID& buildUUID, RepairData repair);
+        OperationContext* opCtx,
+        const CollectionPtr& coll,
+        const UUID& buildUUID,
+        RepairData repair);
 
     /**
      * Document inserts observed during the scanning/insertion phase of an index build are not
@@ -129,13 +133,13 @@ public:
      */
     Status retrySkippedRecords(OperationContext* opCtx,
                                const UUID& buildUUID,
-                               const Collection* collection);
+                               const CollectionPtr& collection);
 
     /**
      * Runs the index constraint violation checking phase of the index build..
      */
     Status checkIndexConstraintViolations(OperationContext* opCtx,
-                                          const Collection* collection,
+                                          const CollectionPtr& collection,
                                           const UUID& buildUUID);
 
     /**
@@ -164,23 +168,16 @@ public:
      * Signals the index build to be aborted without being cleaned up and returns without waiting
      * for it to stop. Does nothing if the index build has already been cleared away.
      *
+     * Writes the current state of the index build to disk if the specified index build is a
+     * two-phase hybrid index build and resumable index builds are supported.
+     *
      * Returns true if a build existed to be signaled, as opposed to having already finished and
-     * been cleared away, or not having yet started..
+     * been cleared away, or not having yet started.
      */
-    bool abortIndexBuildWithoutCleanupForRollback(OperationContext* opCtx,
-                                                  const Collection* collection,
-                                                  const UUID& buildUUID,
-                                                  bool isResumable);
-
-    /**
-     * The same as abortIndexBuildWithoutCleanupForRollback above, but additionally writes the
-     * current state of the index build to disk if the specified index build is a two-phase hybrid
-     * index build and resumable index builds are supported.
-     */
-    bool abortIndexBuildWithoutCleanupForShutdown(OperationContext* opCtx,
-                                                  const Collection* collection,
-                                                  const UUID& buildUUID,
-                                                  bool isResumable);
+    bool abortIndexBuildWithoutCleanup(OperationContext* opCtx,
+                                       const CollectionPtr& collection,
+                                       const UUID& buildUUID,
+                                       bool isResumable);
 
     /**
      * Returns true if the index build supports background writes while building an index. This is
@@ -192,17 +189,6 @@ public:
      * Checks via invariant that the manager has no index builds presently.
      */
     void verifyNoIndexBuilds_forTestOnly();
-
-    /**
-     * Returns the information to resume each resumable index build that was aborted for rollback.
-     */
-    std::vector<ResumeIndexInfo> getResumeInfos() const;
-
-    /**
-     * Clears the vector that was used to store the information to resume each resumable index
-     * build after rollback.
-     */
-    void clearResumeInfos();
 
 private:
     /**
@@ -221,9 +207,6 @@ private:
     // Map of index builders by build UUID. Allows access to the builders so that actions can be
     // taken on and information passed to and from index builds.
     std::map<UUID, std::unique_ptr<MultiIndexBlock>> _builders;
-
-    // The information to resume each resumable index build that was aborted for rollback.
-    std::vector<ResumeIndexInfo> _resumeInfos;
 
     /**
      * Deletes record containing duplicate keys and insert it into a local lost and found collection

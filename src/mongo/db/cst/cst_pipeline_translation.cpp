@@ -58,6 +58,8 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/expression_trigonometric.h"
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/pipeline/variable_validation.h"
+#include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/util/make_data_structure.h"
 #include "mongo/util/intrusive_counter.h"
 #include "mongo/util/visit_helper.h"
@@ -65,7 +67,6 @@
 namespace mongo::cst_pipeline_translation {
 namespace {
 Value translateLiteralToValue(const CNode& cst);
-
 /**
  * Walk a literal array payload and produce a Value. This function is necessary because Aggregation
  * Expression literals are required to be collapsed into Values inside ExpressionConst but
@@ -113,43 +114,52 @@ Value translateLiteralToValue(const CNode& cst) {
 
 /**
  * Walk a literal array payload and produce an ExpressionArray.
+ *
+ * Caller must ensure the ExpressionContext outlives the result.
  */
 auto translateLiteralArray(const CNode::ArrayChildren& array,
-                           const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+                           ExpressionContext* expCtx,
+                           const VariablesParseState& vps) {
     auto expressions = std::vector<boost::intrusive_ptr<Expression>>{};
     static_cast<void>(std::transform(
         array.begin(), array.end(), std::back_inserter(expressions), [&](auto&& elem) {
-            return translateExpression(elem, expCtx);
+            return translateExpression(elem, expCtx, vps);
         }));
-    return ExpressionArray::create(expCtx.get(), std::move(expressions));
+    return ExpressionArray::create(expCtx, std::move(expressions));
 }
 
 /**
  * Walk a literal object payload and produce an ExpressionObject.
+ *
+ * Caller must ensure the ExpressionContext outlives the result.
  */
 auto translateLiteralObject(const CNode::ObjectChildren& object,
-                            const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+                            ExpressionContext* expCtx,
+                            const VariablesParseState& vps) {
     auto fields = std::vector<std::pair<std::string, boost::intrusive_ptr<Expression>>>{};
     static_cast<void>(
         std::transform(object.begin(), object.end(), std::back_inserter(fields), [&](auto&& field) {
             return std::pair{std::string{stdx::get<UserFieldname>(field.first)},
-                             translateExpression(field.second, expCtx)};
+                             translateExpression(field.second, expCtx, vps)};
         }));
-    return ExpressionObject::create(expCtx.get(), std::move(fields));
+    return ExpressionObject::create(expCtx, std::move(fields));
 }
 
 /**
  * Walk an agg function/operator object payload and produce an ExpressionVector.
+ *
+ * Caller must ensure the ExpressionContext outlives the result.
  */
 auto transformInputExpression(const CNode::ObjectChildren& object,
-                              const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+                              ExpressionContext* expCtx,
+                              const VariablesParseState& vps) {
     auto expressions = std::vector<boost::intrusive_ptr<Expression>>{};
     stdx::visit(
         visit_helper::Overloaded{
             [&](const CNode::ArrayChildren& array) {
                 static_cast<void>(std::transform(
                     array.begin(), array.end(), std::back_inserter(expressions), [&](auto&& elem) {
-                        return translateExpression(elem, expCtx);
+                        return translateExpression(elem, expCtx, vps);
                     }));
             },
             [&](const CNode::ObjectChildren& object) {
@@ -157,10 +167,12 @@ auto transformInputExpression(const CNode::ObjectChildren& object,
                     object.begin(),
                     object.end(),
                     std::back_inserter(expressions),
-                    [&](auto&& elem) { return translateExpression(elem.second, expCtx); }));
+                    [&](auto&& elem) { return translateExpression(elem.second, expCtx, vps); }));
             },
             // Everything else is a literal.
-            [&](auto&&) { expressions.push_back(translateExpression(object[0].second, expCtx)); }},
+            [&](auto&&) {
+                expressions.push_back(translateExpression(object[0].second, expCtx, vps));
+            }},
         object[0].second.payload);
     return expressions;
 }
@@ -179,120 +191,149 @@ bool verifyFieldnames(const std::vector<CNode::Fieldname>& expected,
     return true;
 }
 
-auto translateMeta(const CNode::ObjectChildren& object,
-                   const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+/**
+ * Walk an agg function/operator object payload and produce an ExpressionMeta.
+ *
+ * Caller must ensure the ExpressionContext outlives the result.
+ */
+auto translateMeta(const CNode::ObjectChildren& object, ExpressionContext* expCtx) {
     switch (stdx::get<KeyValue>(object[0].second.payload)) {
         case KeyValue::geoNearDistance:
-            return make_intrusive<ExpressionMeta>(expCtx.get(),
-                                                  DocumentMetadataFields::kGeoNearDist);
+            return make_intrusive<ExpressionMeta>(expCtx, DocumentMetadataFields::kGeoNearDist);
         case KeyValue::geoNearPoint:
-            return make_intrusive<ExpressionMeta>(expCtx.get(),
-                                                  DocumentMetadataFields::kGeoNearPoint);
+            return make_intrusive<ExpressionMeta>(expCtx, DocumentMetadataFields::kGeoNearPoint);
         case KeyValue::indexKey:
-            return make_intrusive<ExpressionMeta>(expCtx.get(), DocumentMetadataFields::kIndexKey);
+            return make_intrusive<ExpressionMeta>(expCtx, DocumentMetadataFields::kIndexKey);
         case KeyValue::randVal:
-            return make_intrusive<ExpressionMeta>(expCtx.get(), DocumentMetadataFields::kRandVal);
+            return make_intrusive<ExpressionMeta>(expCtx, DocumentMetadataFields::kRandVal);
         case KeyValue::recordId:
-            return make_intrusive<ExpressionMeta>(expCtx.get(), DocumentMetadataFields::kRecordId);
+            return make_intrusive<ExpressionMeta>(expCtx, DocumentMetadataFields::kRecordId);
         case KeyValue::searchHighlights:
-            return make_intrusive<ExpressionMeta>(expCtx.get(),
+            return make_intrusive<ExpressionMeta>(expCtx,
                                                   DocumentMetadataFields::kSearchHighlights);
         case KeyValue::searchScore:
-            return make_intrusive<ExpressionMeta>(expCtx.get(),
-                                                  DocumentMetadataFields::kSearchScore);
+            return make_intrusive<ExpressionMeta>(expCtx, DocumentMetadataFields::kSearchScore);
         case KeyValue::sortKey:
-            return make_intrusive<ExpressionMeta>(expCtx.get(), DocumentMetadataFields::kSortKey);
+            return make_intrusive<ExpressionMeta>(expCtx, DocumentMetadataFields::kSortKey);
         case KeyValue::textScore:
-            return make_intrusive<ExpressionMeta>(expCtx.get(), DocumentMetadataFields::kTextScore);
+            return make_intrusive<ExpressionMeta>(expCtx, DocumentMetadataFields::kTextScore);
         default:
             MONGO_UNREACHABLE;
     }
 }
 
+auto translateFilter(const CNode::ObjectChildren& object,
+                     ExpressionContext* expCtx,
+                     const VariablesParseState& vps) {
+    // $filter's syntax guarantees that it's payload is ObjectChildren
+    auto&& children = stdx::get<CNode::ObjectChildren>(object[0].second.payload);
+    auto&& inputElem = children[0].second;
+    auto&& asElem = children[1].second;
+    auto&& condElem = children[2].second;
+    // The cond expression has a different VPS, where the variable the user gives in the "as"
+    // argument is defined.
+    auto vpsSub = VariablesParseState{vps};
+    auto varName = [&]() -> std::string {
+        if (auto x = stdx::get_if<UserString>(&asElem.payload)) {
+            return *x;
+        }
+        return "this"s;
+    }();
+    variableValidation::validateNameForUserWrite(varName);
+    auto varId = vpsSub.defineVariable(varName);
+    return make_intrusive<ExpressionFilter>(expCtx,
+                                            std::move(varName),
+                                            varId,
+                                            translateExpression(inputElem, expCtx, vps),
+                                            translateExpression(condElem, expCtx, vpsSub));
+}
+
 /**
  * Walk an agg function/operator object payload and produce an Expression.
+ *
+ * Caller must ensure the ExpressionContext outlives the result.
  */
-boost::intrusive_ptr<Expression> translateFunctionObject(
-    const CNode::ObjectChildren& object, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+boost::intrusive_ptr<Expression> translateFunctionObject(const CNode::ObjectChildren& object,
+                                                         ExpressionContext* expCtx,
+                                                         const VariablesParseState& vps) {
     // Constants require using Value instead of Expression to build the tree in agg.
     if (stdx::get<KeyFieldname>(object[0].first) == KeyFieldname::constExpr ||
         stdx::get<KeyFieldname>(object[0].first) == KeyFieldname::literal)
-        return make_intrusive<ExpressionConstant>(expCtx.get(),
+        return make_intrusive<ExpressionConstant>(expCtx,
                                                   translateLiteralToValue(object[0].second));
     // Meta is an exception since it has no Expression children but rather an enum member.
     if (stdx::get<KeyFieldname>(object[0].first) == KeyFieldname::meta)
         return translateMeta(object, expCtx);
-
-    auto expressions = transformInputExpression(object, expCtx);
+    // Filter is an exception because its Expression children need to be given particular variable
+    // states before they are translated.
+    if (stdx::get<KeyFieldname>(object[0].first) == KeyFieldname::filter)
+        return translateFilter(object, expCtx, vps);
+    auto expressions = transformInputExpression(object, expCtx, vps);
     switch (stdx::get<KeyFieldname>(object[0].first)) {
         case KeyFieldname::add:
-            return make_intrusive<ExpressionAdd>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionAdd>(expCtx, std::move(expressions));
         case KeyFieldname::atan2:
-            return make_intrusive<ExpressionArcTangent2>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionArcTangent2>(expCtx, std::move(expressions));
         case KeyFieldname::andExpr:
-            return make_intrusive<ExpressionAnd>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionAnd>(expCtx, std::move(expressions));
         case KeyFieldname::orExpr:
-            return make_intrusive<ExpressionOr>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionOr>(expCtx, std::move(expressions));
         case KeyFieldname::notExpr:
-            return make_intrusive<ExpressionNot>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionNot>(expCtx, std::move(expressions));
         case KeyFieldname::cmp:
             return make_intrusive<ExpressionCompare>(
-                expCtx.get(), ExpressionCompare::CMP, std::move(expressions));
+                expCtx, ExpressionCompare::CMP, std::move(expressions));
         case KeyFieldname::eq:
             return make_intrusive<ExpressionCompare>(
-                expCtx.get(), ExpressionCompare::EQ, std::move(expressions));
+                expCtx, ExpressionCompare::EQ, std::move(expressions));
         case KeyFieldname::gt:
             return make_intrusive<ExpressionCompare>(
-                expCtx.get(), ExpressionCompare::GT, std::move(expressions));
+                expCtx, ExpressionCompare::GT, std::move(expressions));
         case KeyFieldname::gte:
             return make_intrusive<ExpressionCompare>(
-                expCtx.get(), ExpressionCompare::GTE, std::move(expressions));
+                expCtx, ExpressionCompare::GTE, std::move(expressions));
         case KeyFieldname::lt:
             return make_intrusive<ExpressionCompare>(
-                expCtx.get(), ExpressionCompare::LT, std::move(expressions));
+                expCtx, ExpressionCompare::LT, std::move(expressions));
         case KeyFieldname::lte:
             return make_intrusive<ExpressionCompare>(
-                expCtx.get(), ExpressionCompare::LTE, std::move(expressions));
+                expCtx, ExpressionCompare::LTE, std::move(expressions));
         case KeyFieldname::ne:
             return make_intrusive<ExpressionCompare>(
-                expCtx.get(), ExpressionCompare::NE, std::move(expressions));
+                expCtx, ExpressionCompare::NE, std::move(expressions));
         case KeyFieldname::convert:
             dassert(verifyFieldnames({KeyFieldname::inputArg,
                                       KeyFieldname::toArg,
                                       KeyFieldname::onErrorArg,
                                       KeyFieldname::onNullArg},
                                      object[0].second.objectChildren()));
-            return make_intrusive<ExpressionConvert>(expCtx.get(),
+            return make_intrusive<ExpressionConvert>(expCtx,
                                                      std::move(expressions[0]),
                                                      std::move(expressions[1]),
                                                      std::move(expressions[2]),
                                                      std::move(expressions[3]));
         case KeyFieldname::toBool:
-            return ExpressionConvert::create(
-                expCtx.get(), std::move(expressions[0]), BSONType::Bool);
+            return ExpressionConvert::create(expCtx, std::move(expressions[0]), BSONType::Bool);
         case KeyFieldname::toDate:
-            return ExpressionConvert::create(
-                expCtx.get(), std::move(expressions[0]), BSONType::Date);
+            return ExpressionConvert::create(expCtx, std::move(expressions[0]), BSONType::Date);
         case KeyFieldname::toDecimal:
             return ExpressionConvert::create(
-                expCtx.get(), std::move(expressions[0]), BSONType::NumberDecimal);
+                expCtx, std::move(expressions[0]), BSONType::NumberDecimal);
         case KeyFieldname::toDouble:
             return ExpressionConvert::create(
-                expCtx.get(), std::move(expressions[0]), BSONType::NumberDouble);
+                expCtx, std::move(expressions[0]), BSONType::NumberDouble);
         case KeyFieldname::toInt:
             return ExpressionConvert::create(
-                expCtx.get(), std::move(expressions[0]), BSONType::NumberInt);
+                expCtx, std::move(expressions[0]), BSONType::NumberInt);
         case KeyFieldname::toLong:
             return ExpressionConvert::create(
-                expCtx.get(), std::move(expressions[0]), BSONType::NumberLong);
+                expCtx, std::move(expressions[0]), BSONType::NumberLong);
         case KeyFieldname::toObjectId:
-            return ExpressionConvert::create(
-                expCtx.get(), std::move(expressions[0]), BSONType::jstOID);
+            return ExpressionConvert::create(expCtx, std::move(expressions[0]), BSONType::jstOID);
         case KeyFieldname::toString:
-            return ExpressionConvert::create(
-                expCtx.get(), std::move(expressions[0]), BSONType::String);
+            return ExpressionConvert::create(expCtx, std::move(expressions[0]), BSONType::String);
         case KeyFieldname::concat:
-            return make_intrusive<ExpressionConcat>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionConcat>(expCtx, std::move(expressions));
         case KeyFieldname::dateFromString:
             dassert(verifyFieldnames({KeyFieldname::dateStringArg,
                                       KeyFieldname::formatArg,
@@ -300,7 +341,7 @@ boost::intrusive_ptr<Expression> translateFunctionObject(
                                       KeyFieldname::onErrorArg,
                                       KeyFieldname::onNullArg},
                                      object[0].second.objectChildren()));
-            return make_intrusive<ExpressionDateFromString>(expCtx.get(),
+            return make_intrusive<ExpressionDateFromString>(expCtx,
                                                             std::move(expressions[0]),
                                                             std::move(expressions[1]),
                                                             std::move(expressions[2]),
@@ -312,20 +353,20 @@ boost::intrusive_ptr<Expression> translateFunctionObject(
                                       KeyFieldname::timezoneArg,
                                       KeyFieldname::onNullArg},
                                      object[0].second.objectChildren()));
-            return make_intrusive<ExpressionDateToString>(expCtx.get(),
+            return make_intrusive<ExpressionDateToString>(expCtx,
                                                           std::move(expressions[0]),
                                                           std::move(expressions[1]),
                                                           std::move(expressions[2]),
                                                           std::move(expressions[3]));
         case KeyFieldname::indexOfBytes:
-            return make_intrusive<ExpressionIndexOfBytes>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionIndexOfBytes>(expCtx, std::move(expressions));
         case KeyFieldname::indexOfCP:
-            return make_intrusive<ExpressionIndexOfCP>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionIndexOfCP>(expCtx, std::move(expressions));
         case KeyFieldname::replaceOne:
             dassert(verifyFieldnames(
                 {KeyFieldname::inputArg, KeyFieldname::findArg, KeyFieldname::replacementArg},
                 object[0].second.objectChildren()));
-            return make_intrusive<ExpressionReplaceOne>(expCtx.get(),
+            return make_intrusive<ExpressionReplaceOne>(expCtx,
                                                         std::move(expressions[0]),
                                                         std::move(expressions[1]),
                                                         std::move(expressions[2]));
@@ -333,7 +374,7 @@ boost::intrusive_ptr<Expression> translateFunctionObject(
             dassert(verifyFieldnames(
                 {KeyFieldname::inputArg, KeyFieldname::findArg, KeyFieldname::replacementArg},
                 object[0].second.objectChildren()));
-            return make_intrusive<ExpressionReplaceAll>(expCtx.get(),
+            return make_intrusive<ExpressionReplaceAll>(expCtx,
                                                         std::move(expressions[0]),
                                                         std::move(expressions[1]),
                                                         std::move(expressions[2]));
@@ -341,7 +382,7 @@ boost::intrusive_ptr<Expression> translateFunctionObject(
             dassert(verifyFieldnames(
                 {KeyFieldname::inputArg, KeyFieldname::regexArg, KeyFieldname::optionsArg},
                 object[0].second.objectChildren()));
-            return make_intrusive<ExpressionRegexFind>(expCtx.get(),
+            return make_intrusive<ExpressionRegexFind>(expCtx,
                                                        std::move(expressions[0]),
                                                        std::move(expressions[1]),
                                                        std::move(expressions[2]),
@@ -350,7 +391,7 @@ boost::intrusive_ptr<Expression> translateFunctionObject(
             dassert(verifyFieldnames(
                 {KeyFieldname::inputArg, KeyFieldname::regexArg, KeyFieldname::optionsArg},
                 object[0].second.objectChildren()));
-            return make_intrusive<ExpressionRegexFindAll>(expCtx.get(),
+            return make_intrusive<ExpressionRegexFindAll>(expCtx,
                                                           std::move(expressions[0]),
                                                           std::move(expressions[1]),
                                                           std::move(expressions[2]),
@@ -359,7 +400,7 @@ boost::intrusive_ptr<Expression> translateFunctionObject(
             dassert(verifyFieldnames(
                 {KeyFieldname::inputArg, KeyFieldname::regexArg, KeyFieldname::optionsArg},
                 object[0].second.objectChildren()));
-            return make_intrusive<ExpressionRegexMatch>(expCtx.get(),
+            return make_intrusive<ExpressionRegexMatch>(expCtx,
                                                         std::move(expressions[0]),
                                                         std::move(expressions[1]),
                                                         std::move(expressions[2]),
@@ -367,7 +408,7 @@ boost::intrusive_ptr<Expression> translateFunctionObject(
         case KeyFieldname::ltrim:
             dassert(verifyFieldnames({KeyFieldname::inputArg, KeyFieldname::charsArg},
                                      object[0].second.objectChildren()));
-            return make_intrusive<ExpressionTrim>(expCtx.get(),
+            return make_intrusive<ExpressionTrim>(expCtx,
                                                   ExpressionTrim::TrimType::kLeft,
                                                   "$ltrim",
                                                   std::move(expressions[0]),
@@ -375,7 +416,7 @@ boost::intrusive_ptr<Expression> translateFunctionObject(
         case KeyFieldname::rtrim:
             dassert(verifyFieldnames({KeyFieldname::inputArg, KeyFieldname::charsArg},
                                      object[0].second.objectChildren()));
-            return make_intrusive<ExpressionTrim>(expCtx.get(),
+            return make_intrusive<ExpressionTrim>(expCtx,
                                                   ExpressionTrim::TrimType::kRight,
                                                   "$rtrim",
                                                   std::move(expressions[0]),
@@ -383,109 +424,220 @@ boost::intrusive_ptr<Expression> translateFunctionObject(
         case KeyFieldname::trim:
             dassert(verifyFieldnames({KeyFieldname::inputArg, KeyFieldname::charsArg},
                                      object[0].second.objectChildren()));
-            return make_intrusive<ExpressionTrim>(expCtx.get(),
+            return make_intrusive<ExpressionTrim>(expCtx,
                                                   ExpressionTrim::TrimType::kBoth,
                                                   "$trim",
                                                   std::move(expressions[0]),
                                                   std::move(expressions[1]));
         case KeyFieldname::slice:
-            return make_intrusive<ExpressionSlice>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionSlice>(expCtx, std::move(expressions));
         case KeyFieldname::split:
-            return make_intrusive<ExpressionSplit>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionSplit>(expCtx, std::move(expressions));
         case KeyFieldname::strcasecmp:
-            return make_intrusive<ExpressionStrcasecmp>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionStrcasecmp>(expCtx, std::move(expressions));
         case KeyFieldname::strLenCP:
-            return make_intrusive<ExpressionStrLenCP>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionStrLenCP>(expCtx, std::move(expressions));
         case KeyFieldname::strLenBytes:
-            return make_intrusive<ExpressionStrLenBytes>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionStrLenBytes>(expCtx, std::move(expressions));
         case KeyFieldname::substr:
         case KeyFieldname::substrBytes:
-            return make_intrusive<ExpressionSubstrBytes>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionSubstrBytes>(expCtx, std::move(expressions));
         case KeyFieldname::substrCP:
-            return make_intrusive<ExpressionSubstrCP>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionSubstrCP>(expCtx, std::move(expressions));
         case KeyFieldname::toLower:
-            return make_intrusive<ExpressionToLower>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionToLower>(expCtx, std::move(expressions));
         case KeyFieldname::toUpper:
-            return make_intrusive<ExpressionToUpper>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionToUpper>(expCtx, std::move(expressions));
         case KeyFieldname::type:
-            return make_intrusive<ExpressionType>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionType>(expCtx, std::move(expressions));
         case KeyFieldname::abs:
-            return make_intrusive<ExpressionAbs>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionAbs>(expCtx, std::move(expressions));
         case KeyFieldname::ceil:
-            return make_intrusive<ExpressionCeil>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionCeil>(expCtx, std::move(expressions));
         case KeyFieldname::divide:
-            return make_intrusive<ExpressionDivide>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionDivide>(expCtx, std::move(expressions));
         case KeyFieldname::exponent:
-            return make_intrusive<ExpressionExp>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionExp>(expCtx, std::move(expressions));
         case KeyFieldname::floor:
-            return make_intrusive<ExpressionFloor>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionFloor>(expCtx, std::move(expressions));
         case KeyFieldname::ln:
-            return make_intrusive<ExpressionLn>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionLn>(expCtx, std::move(expressions));
         case KeyFieldname::log:
-            return make_intrusive<ExpressionLog>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionLog>(expCtx, std::move(expressions));
         case KeyFieldname::logten:
-            return make_intrusive<ExpressionLog10>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionLog10>(expCtx, std::move(expressions));
         case KeyFieldname::mod:
-            return make_intrusive<ExpressionMod>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionMod>(expCtx, std::move(expressions));
         case KeyFieldname::multiply:
-            return make_intrusive<ExpressionMultiply>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionMultiply>(expCtx, std::move(expressions));
         case KeyFieldname::pow:
-            return make_intrusive<ExpressionPow>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionPow>(expCtx, std::move(expressions));
         case KeyFieldname::round:
-            return make_intrusive<ExpressionRound>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionRound>(expCtx, std::move(expressions));
         case KeyFieldname::sqrt:
-            return make_intrusive<ExpressionSqrt>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionSqrt>(expCtx, std::move(expressions));
         case KeyFieldname::subtract:
-            return make_intrusive<ExpressionSubtract>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionSubtract>(expCtx, std::move(expressions));
         case KeyFieldname::trunc:
-            return make_intrusive<ExpressionTrunc>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionTrunc>(expCtx, std::move(expressions));
         case KeyFieldname::allElementsTrue:
-            return make_intrusive<ExpressionAllElementsTrue>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionAllElementsTrue>(expCtx, std::move(expressions));
         case KeyFieldname::anyElementTrue:
-            return make_intrusive<ExpressionAnyElementTrue>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionAnyElementTrue>(expCtx, std::move(expressions));
         case KeyFieldname::setDifference:
-            return make_intrusive<ExpressionSetDifference>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionSetDifference>(expCtx, std::move(expressions));
         case KeyFieldname::setEquals:
-            return make_intrusive<ExpressionSetEquals>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionSetEquals>(expCtx, std::move(expressions));
         case KeyFieldname::setIntersection:
-            return make_intrusive<ExpressionSetIntersection>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionSetIntersection>(expCtx, std::move(expressions));
         case KeyFieldname::setIsSubset:
-            return make_intrusive<ExpressionSetIsSubset>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionSetIsSubset>(expCtx, std::move(expressions));
         case KeyFieldname::setUnion:
-            return make_intrusive<ExpressionSetUnion>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionSetUnion>(expCtx, std::move(expressions));
         case KeyFieldname::sin:
-            return make_intrusive<ExpressionSine>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionSine>(expCtx, std::move(expressions));
         case KeyFieldname::cos:
-            return make_intrusive<ExpressionCosine>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionCosine>(expCtx, std::move(expressions));
         case KeyFieldname::tan:
-            return make_intrusive<ExpressionTangent>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionTangent>(expCtx, std::move(expressions));
         case KeyFieldname::sinh:
-            return make_intrusive<ExpressionHyperbolicSine>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionHyperbolicSine>(expCtx, std::move(expressions));
         case KeyFieldname::cosh:
-            return make_intrusive<ExpressionHyperbolicCosine>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionHyperbolicCosine>(expCtx, std::move(expressions));
         case KeyFieldname::tanh:
-            return make_intrusive<ExpressionHyperbolicTangent>(expCtx.get(),
-                                                               std::move(expressions));
+            return make_intrusive<ExpressionHyperbolicTangent>(expCtx, std::move(expressions));
         case KeyFieldname::asin:
-            return make_intrusive<ExpressionArcSine>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionArcSine>(expCtx, std::move(expressions));
         case KeyFieldname::acos:
-            return make_intrusive<ExpressionArcCosine>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionArcCosine>(expCtx, std::move(expressions));
         case KeyFieldname::atan:
-            return make_intrusive<ExpressionArcTangent>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionArcTangent>(expCtx, std::move(expressions));
         case KeyFieldname::asinh:
-            return make_intrusive<ExpressionHyperbolicArcSine>(expCtx.get(),
-                                                               std::move(expressions));
+            return make_intrusive<ExpressionHyperbolicArcSine>(expCtx, std::move(expressions));
         case KeyFieldname::acosh:
-            return make_intrusive<ExpressionHyperbolicArcCosine>(expCtx.get(),
-                                                                 std::move(expressions));
+            return make_intrusive<ExpressionHyperbolicArcCosine>(expCtx, std::move(expressions));
         case KeyFieldname::atanh:
-            return make_intrusive<ExpressionHyperbolicArcTangent>(expCtx.get(),
-                                                                  std::move(expressions));
+            return make_intrusive<ExpressionHyperbolicArcTangent>(expCtx, std::move(expressions));
         case KeyFieldname::degreesToRadians:
-            return make_intrusive<ExpressionDegreesToRadians>(expCtx.get(), std::move(expressions));
+            return make_intrusive<ExpressionDegreesToRadians>(expCtx, std::move(expressions));
         case KeyFieldname::radiansToDegrees:
-            return make_intrusive<ExpressionRadiansToDegrees>(expCtx.get(), std::move(expressions));
-
+            return make_intrusive<ExpressionRadiansToDegrees>(expCtx, std::move(expressions));
+        case KeyFieldname::dateToParts:
+            dassert(verifyFieldnames(
+                {KeyFieldname::dateArg, KeyFieldname::timezoneArg, KeyFieldname::iso8601Arg},
+                object[0].second.objectChildren()));
+            return make_intrusive<ExpressionDateToParts>(expCtx,
+                                                         std::move(expressions[0]),
+                                                         std::move(expressions[1]),
+                                                         std::move(expressions[2]));
+        case KeyFieldname::dateFromParts:
+            if (stdx::get<KeyFieldname>(object[0].second.objectChildren().front().first) ==
+                KeyFieldname::yearArg) {
+                return make_intrusive<ExpressionDateFromParts>(expCtx,
+                                                               std::move(expressions[0]),
+                                                               std::move(expressions[1]),
+                                                               std::move(expressions[2]),
+                                                               std::move(expressions[3]),
+                                                               std::move(expressions[4]),
+                                                               std::move(expressions[5]),
+                                                               std::move(expressions[6]),
+                                                               nullptr,
+                                                               nullptr,
+                                                               nullptr,
+                                                               std::move(expressions[7]));
+            } else {
+                return make_intrusive<ExpressionDateFromParts>(expCtx,
+                                                               nullptr,
+                                                               nullptr,
+                                                               nullptr,
+                                                               std::move(expressions[3]),
+                                                               std::move(expressions[4]),
+                                                               std::move(expressions[5]),
+                                                               std::move(expressions[6]),
+                                                               std::move(expressions[0]),
+                                                               std::move(expressions[1]),
+                                                               std::move(expressions[2]),
+                                                               std::move(expressions[7]));
+            }
+        case KeyFieldname::dayOfMonth:
+            return make_intrusive<ExpressionDayOfMonth>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::dayOfWeek:
+            return make_intrusive<ExpressionDayOfWeek>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::dayOfYear:
+            return make_intrusive<ExpressionDayOfYear>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::hour:
+            return make_intrusive<ExpressionHour>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::isoDayOfWeek:
+            return make_intrusive<ExpressionIsoDayOfWeek>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::isoWeek:
+            return make_intrusive<ExpressionIsoWeek>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::isoWeekYear:
+            return make_intrusive<ExpressionIsoWeekYear>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::minute:
+            return make_intrusive<ExpressionMinute>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::millisecond:
+            return make_intrusive<ExpressionMillisecond>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::month:
+            return make_intrusive<ExpressionMonth>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::second:
+            return make_intrusive<ExpressionSecond>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::week:
+            return make_intrusive<ExpressionWeek>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::year:
+            return make_intrusive<ExpressionYear>(
+                expCtx,
+                std::move(expressions[0]),
+                (expressions.size() == 2) ? std::move(expressions[1]) : nullptr);
+        case KeyFieldname::arrayElemAt:
+            return make_intrusive<ExpressionArrayElemAt>(expCtx, std::move(expressions));
+        case KeyFieldname::arrayToObject:
+            return make_intrusive<ExpressionArrayToObject>(expCtx, std::move(expressions));
+        case KeyFieldname::concatArrays:
+            return make_intrusive<ExpressionConcatArrays>(expCtx, std::move(expressions));
+        case KeyFieldname::in:
+            return make_intrusive<ExpressionIn>(expCtx, std::move(expressions));
+        case KeyFieldname::indexOfArray:
+            return make_intrusive<ExpressionIndexOfArray>(expCtx, std::move(expressions));
+        case KeyFieldname::isArray:
+            return make_intrusive<ExpressionIsArray>(expCtx, std::move(expressions));
+        case KeyFieldname::first:
+            return make_intrusive<ExpressionFirst>(expCtx, std::move(expressions));
         default:
             MONGO_UNREACHABLE;
     }
@@ -494,11 +646,13 @@ boost::intrusive_ptr<Expression> translateFunctionObject(
 /**
  * Walk a compound projection CNode payload (CompoundInclusionKey or CompoundExclusionKey) and
  * produce a sequence of paths and optional expressions.
+ *
+ * Caller must ensure the ExpressionContext outlives the result.
  */
 template <typename CompoundPayload>
 auto translateCompoundProjection(const CompoundPayload& payload,
                                  const std::vector<StringData>& path,
-                                 const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+                                 ExpressionContext* expCtx) {
     auto resultPaths =
         std::vector<std::pair<FieldPath, boost::optional<boost::intrusive_ptr<Expression>>>>{};
     auto translateProjectionObject =
@@ -519,8 +673,9 @@ auto translateCompoundProjection(const CompoundPayload& payload,
                 resultPaths.emplace_back(path::vectorToString(currentPath), boost::none);
             // Everything else is an agg expression to translate.
             else
-                resultPaths.emplace_back(path::vectorToString(currentPath),
-                                         translateExpression(child.second, expCtx));
+                resultPaths.emplace_back(
+                    path::vectorToString(currentPath),
+                    translateExpression(child.second, expCtx, expCtx->variablesParseState));
         }
     };
     translateProjectionObject(translateProjectionObject, payload.obj->objectChildren(), path);
@@ -542,7 +697,7 @@ auto translateProjectInclusion(const CNode& cst,
         sawId = sawId || CNode::fieldnameIsId(name);
         // If we see a key fieldname, make sure it's _id.
         const auto path = CNode::fieldnameIsId(name)
-            ? make_vector<StringData>("_id"_sd)
+            ? makeVector<StringData>("_id"_sd)
             : std::vector<StringData>{
                   stdx::get<ProjectionPath>(stdx::get<FieldnamePath>(name)).components.begin(),
                   stdx::get<ProjectionPath>(stdx::get<FieldnamePath>(name)).components.end()};
@@ -551,7 +706,7 @@ auto translateProjectInclusion(const CNode& cst,
                 case ProjectionType::inclusion:
                     if (auto payload = stdx::get_if<CompoundInclusionKey>(&child.payload))
                         for (auto&& [compoundPath, expr] :
-                             translateCompoundProjection(*payload, path, expCtx))
+                             translateCompoundProjection(*payload, path, expCtx.get()))
                             if (expr)
                                 executor->getRoot()->addExpressionForPath(std::move(compoundPath),
                                                                           std::move(*expr));
@@ -572,8 +727,9 @@ auto translateProjectInclusion(const CNode& cst,
             }
         else
             // This is a computed projection.
-            executor->getRoot()->addExpressionForPath(FieldPath{path::vectorToString(path)},
-                                                      translateExpression(child, expCtx));
+            executor->getRoot()->addExpressionForPath(
+                FieldPath{path::vectorToString(path)},
+                translateExpression(child, expCtx.get(), expCtx->variablesParseState));
     }
 
     // If we didn't see _id we need to add it in manually for inclusion.
@@ -596,7 +752,7 @@ auto translateProjectExclusion(const CNode& cst,
     for (auto&& [name, child] : cst.objectChildren()) {
         // If we see a key fieldname, make sure it's _id.
         const auto path = CNode::fieldnameIsId(name)
-            ? make_vector<StringData>("_id"_sd)
+            ? makeVector<StringData>("_id"_sd)
             : std::vector<StringData>{
                   stdx::get<ProjectionPath>(stdx::get<FieldnamePath>(name)).components.begin(),
                   stdx::get<ProjectionPath>(stdx::get<FieldnamePath>(name)).components.end()};
@@ -609,7 +765,7 @@ auto translateProjectExclusion(const CNode& cst,
                 case ProjectionType::exclusion:
                     if (auto payload = stdx::get_if<CompoundExclusionKey>(&child.payload))
                         for (auto&& [compoundPath, unused] :
-                             translateCompoundProjection(*payload, path, expCtx))
+                             translateCompoundProjection(*payload, path, expCtx.get()))
                             executor->getRoot()->addProjectionForPath(std::move(compoundPath));
                     else
                         executor->getRoot()->addProjectionForPath(
@@ -629,27 +785,10 @@ auto translateProjectExclusion(const CNode& cst,
 }
 
 /**
- * Cast a CNode payload to a UserLong.
- */
-auto translateNumToLong(const CNode& cst) {
-    return stdx::visit(
-        visit_helper::Overloaded{
-            [](const UserDouble& userDouble) {
-                return (BSON("" << userDouble).firstElement()).safeNumberLong();
-            },
-            [](const UserInt& userInt) {
-                return (BSON("" << userInt).firstElement()).safeNumberLong();
-            },
-            [](const UserLong& userLong) { return userLong; },
-            [](auto &&) -> UserLong { MONGO_UNREACHABLE }},
-        cst.payload);
-}
-
-/**
  * Walk a skip stage object CNode and produce a DocumentSourceSkip.
  */
 auto translateSkip(const CNode& cst, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    UserLong nToSkip = translateNumToLong(cst);
+    UserLong nToSkip = cst.numberLong();
     return DocumentSourceSkip::create(expCtx, nToSkip);
 }
 
@@ -657,7 +796,7 @@ auto translateSkip(const CNode& cst, const boost::intrusive_ptr<ExpressionContex
  * Unwrap a limit stage CNode and produce a DocumentSourceLimit.
  */
 auto translateLimit(const CNode& cst, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    UserLong limit = translateNumToLong(cst);
+    UserLong limit = cst.numberLong();
     return DocumentSourceLimit::create(expCtx, limit);
 }
 
@@ -665,14 +804,15 @@ auto translateLimit(const CNode& cst, const boost::intrusive_ptr<ExpressionConte
  * Unwrap a sample stage CNode and produce a DocumentSourceSample.
  */
 auto translateSample(const CNode& cst, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    return DocumentSourceSample::create(expCtx, translateNumToLong(cst.objectChildren()[0].second));
+    return DocumentSourceSample::create(expCtx, cst.objectChildren()[0].second.numberLong());
 }
 
 /**
  * Unwrap a match stage CNode and produce a DocumentSourceMatch.
  */
 auto translateMatch(const CNode& cst, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
-    auto matchExpr = cst_match_translation::translateMatchExpression(cst, expCtx);
+    auto matchExpr =
+        cst_match_translation::translateMatchExpression(cst, expCtx, ExtensionsCallbackNoop{});
     return make_intrusive<DocumentSourceMatch>(std::move(matchExpr), expCtx);
 }
 
@@ -703,21 +843,24 @@ boost::intrusive_ptr<DocumentSource> translateSource(
 
 /**
  * Walk an expression CNode and produce an agg Expression.
+ *
+ * Caller must ensure the ExpressionContext outlives the result.
  */
-boost::intrusive_ptr<Expression> translateExpression(
-    const CNode& cst, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+boost::intrusive_ptr<Expression> translateExpression(const CNode& cst,
+                                                     ExpressionContext* expCtx,
+                                                     const VariablesParseState& vps) {
     return stdx::visit(
         visit_helper::Overloaded{
             // When we're not inside an agg operator/function, this is a non-leaf literal.
             [&](const CNode::ArrayChildren& array) -> boost::intrusive_ptr<Expression> {
-                return translateLiteralArray(array, expCtx);
+                return translateLiteralArray(array, expCtx, vps);
             },
             // This is either a literal object or an agg operator/function.
             [&](const CNode::ObjectChildren& object) -> boost::intrusive_ptr<Expression> {
                 if (!object.empty() && stdx::holds_alternative<KeyFieldname>(object[0].first))
-                    return translateFunctionObject(object, expCtx);
+                    return translateFunctionObject(object, expCtx, vps);
                 else
-                    return translateLiteralObject(object, expCtx);
+                    return translateLiteralObject(object, expCtx, vps);
             },
             // If a key occurs outside a particular agg operator/function, it was misplaced.
             [](const KeyValue& keyValue) -> boost::intrusive_ptr<Expression> {
@@ -732,23 +875,20 @@ boost::intrusive_ptr<Expression> translateExpression(
             [](const NonZeroKey&) -> boost::intrusive_ptr<Expression> { MONGO_UNREACHABLE; },
             [&](const ValuePath& vp) -> boost::intrusive_ptr<Expression> {
                 return stdx::visit(
-                    visit_helper::Overloaded{[&](const AggregationPath& ap) {
-                                                 return ExpressionFieldPath::createPathFromString(
-                                                     expCtx.get(),
-                                                     path::vectorToString(ap.components),
-                                                     expCtx->variablesParseState);
-                                             },
-                                             [&](const AggregationVariablePath& avp) {
-                                                 return ExpressionFieldPath::createVarFromString(
-                                                     expCtx.get(),
-                                                     path::vectorToString(avp.components),
-                                                     expCtx->variablesParseState);
-                                             }},
+                    visit_helper::Overloaded{
+                        [&](const AggregationPath& ap) {
+                            return ExpressionFieldPath::createPathFromString(
+                                expCtx, path::vectorToString(ap.components), vps);
+                        },
+                        [&](const AggregationVariablePath& avp) {
+                            return ExpressionFieldPath::createVarFromString(
+                                expCtx, path::vectorToString(avp.components), vps);
+                        }},
                     vp);
             },
             // Everything else is a literal leaf.
             [&](auto &&) -> boost::intrusive_ptr<Expression> {
-                return ExpressionConstant::create(expCtx.get(), translateLiteralLeaf(cst));
+                return ExpressionConstant::create(expCtx, translateLiteralLeaf(cst));
             }},
         cst.payload);
 }

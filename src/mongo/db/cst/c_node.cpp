@@ -34,6 +34,7 @@
 #include "mongo/util/visit_helper.h"
 
 #include <iterator>
+#include <limits>
 #include <numeric>
 #include <type_traits>
 
@@ -59,14 +60,17 @@ auto printFieldname(const CNode::Fieldname& fieldname) {
             [](const UserFieldname& user) { return "<UserFieldname "s + user + ">"; },
             [](const FieldnamePath& path) {
                 return stdx::visit(
-                    visit_helper::Overloaded{[&](const ProjectionPath& projPath) {
-                                                 return "<ProjectionPath "s +
-                                                     path::vectorToString(projPath) + ">";
-                                             },
-                                             [&](const PositionalProjectionPath& posProjPath) {
-                                                 return "<PositionalionProjectionPath "s +
-                                                     path::vectorToString(posProjPath) + ">";
-                                             }},
+                    visit_helper::Overloaded{
+                        [&](const ProjectionPath& projPath) {
+                            return "<ProjectionPath "s + path::vectorToString(projPath) + ">";
+                        },
+                        [&](const PositionalProjectionPath& posProjPath) {
+                            return "<PositionalProjectionPath "s +
+                                path::vectorToString(posProjPath) + ">";
+                        },
+                        [&](const SortPath& sortPath) {
+                            return "<SortPath "s + path::vectorToString(sortPath) + ">";
+                        }},
                     path);
             }},
         fieldname);
@@ -116,14 +120,14 @@ auto printValue(const T& payload) {
             [](const UserString& userString) { return "<UserString "s + userString + ">"; },
             [](const UserBinary& userBinary) {
                 return "<UserBinary "s + typeName(userBinary.type) + ", " +
-                    hexblob::encode(userBinary.data, userBinary.length) + ">";
+                    hexblob::encode(userBinary.data, std::max(userBinary.length, 0)) + ">";
             },
             [](const UserUndefined& userUndefined) { return "<UserUndefined>"s; },
             [](const UserObjectId& userObjectId) {
                 return "<UserObjectId "s + userObjectId.toString() + ">";
             },
             [](const UserBoolean& userBoolean) {
-                return "<UserBoolean "s + std::to_string(userBoolean) + ">";
+                return "<UserBoolean "s + (userBoolean ? "true" : "false") + ">";
             },
             [](const UserDate& userDate) {
                 return "<UserDate "s +
@@ -274,6 +278,56 @@ std::pair<BSONObj, bool> CNode::toBsonWithArrayIndicator() const {
             [this](auto&&) {
                 return std::pair{BSON("" << printValue(payload)), false};
             }},
+        payload);
+}
+
+bool CNode::isNumber() const {
+    // TODO SERVER-51204: Factor out this logic instead of reimplementing the one in BSONElement.
+    return stdx::visit(
+        visit_helper::Overloaded{
+            [](const UserLong&) { return true; },
+            [](const UserDouble&) { return true; },
+            [](const UserDecimal&) { return true; },
+            [](const UserInt&) { return true; },
+            [](auto&&) { return false; },
+        },
+        payload);
+}
+
+int CNode::numberInt() const {
+    // BSONElement has no safeNumberInt, so use CNode::numberLong which uses
+    // BSONElement::safeNumberLong. We don't want to use BSONElement::numberInt because it has
+    // undefined behavior for certain inputs (for one example, NaN).
+
+    // safeNumberLong returns the LLONG_MIN/LLONG_MAX when the original value is too big/small
+    // for a long long, so imitate that behavior here for int.
+
+    // TODO SERVER-51204: Factor out this type conversion instead of depending on BSON.
+    long long val = numberLong();
+    constexpr int max = std::numeric_limits<int>::max();
+    constexpr int min = std::numeric_limits<int>::min();
+    if (val > static_cast<long long>(max))
+        return max;
+    if (val < static_cast<long long>(min))
+        return min;
+    return static_cast<long long>(val);
+}
+
+long long CNode::numberLong() const {
+    // TODO SERVER-51204: Factor out this type conversion instead of depending on BSON.
+    return stdx::visit(
+        visit_helper::Overloaded{
+            [](const UserDouble& userDouble) {
+                return (BSON("" << userDouble).firstElement()).safeNumberLong();
+            },
+            [](const UserInt& userInt) {
+                return (BSON("" << userInt).firstElement()).safeNumberLong();
+            },
+            [](const UserLong& userLong) { return userLong; },
+            [](const UserDecimal& userDecimal) {
+                return (BSON("" << userDecimal).firstElement()).safeNumberLong();
+            },
+            [](auto &&) -> UserLong { MONGO_UNREACHABLE }},
         payload);
 }
 

@@ -142,7 +142,7 @@ void DocumentSourceCursor::loadBatch() {
                             ->checkCanServeReadsFor(pExpCtx->opCtx, _exec->nss(), true));
     }
 
-    _exec->restoreState();
+    _exec->restoreState(autoColl ? &autoColl->getCollection() : nullptr);
 
     try {
         ON_BLOCK_EXIT([this] { recordPlanSummaryStats(); });
@@ -195,7 +195,7 @@ void DocumentSourceCursor::_updateOplogTimestamp() {
 
 void DocumentSourceCursor::recordPlanSummaryStats() {
     invariant(_exec);
-    _exec->getSummaryStats(&_planSummaryStats);
+    _exec->getPlanExplainer().getSummaryStats(&_planSummaryStats);
 }
 
 Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity> verbosity) const {
@@ -226,7 +226,7 @@ Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity>
                                collection,
                                verbosity.get(),
                                _execStatus,
-                               _winningPlanTrialStats.get(),
+                               _winningPlanTrialStats,
                                BSONObj(),
                                &explainStatsBuilder);
     }
@@ -285,7 +285,7 @@ DocumentSourceCursor::~DocumentSourceCursor() {
 }
 
 DocumentSourceCursor::DocumentSourceCursor(
-    const Collection* collection,
+    const CollectionPtr& collection,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
     const intrusive_ptr<ExpressionContext>& pCtx,
     CursorType cursorType,
@@ -300,13 +300,15 @@ DocumentSourceCursor::DocumentSourceCursor(
     // Later code in the DocumentSourceCursor lifecycle expects that '_exec' is in a saved state.
     _exec->saveState();
 
-    _planSummary = _exec->getPlanSummary();
+    auto&& explainer = _exec->getPlanExplainer();
+    _planSummary = explainer.getPlanSummary();
     recordPlanSummaryStats();
 
     if (pExpCtx->explain) {
         // It's safe to access the executor even if we don't have the collection lock since we're
         // just going to call getStats() on it.
-        _winningPlanTrialStats = Explain::getWinningPlanTrialStats(_exec.get());
+        _winningPlanTrialStats =
+            explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
     }
 
     if (collection) {
@@ -316,7 +318,7 @@ DocumentSourceCursor::DocumentSourceCursor(
 }
 
 intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
-    const Collection* collection,
+    const CollectionPtr& collection,
     std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
     const intrusive_ptr<ExpressionContext>& pExpCtx,
     CursorType cursorType,

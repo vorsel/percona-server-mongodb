@@ -846,6 +846,9 @@ Status TopologyCoordinator::prepareHeartbeatResponseV1(Date_t now,
         return Status::OK();
     }
 
+    response->setElectable(
+        !_getMyUnelectableReason(now, StartElectionReasonEnum::kElectionTimeout));
+
     const long long v = _rsConfig.getConfigVersion();
     const long long t = _rsConfig.getConfigTerm();
     response->setConfigVersion(v);
@@ -936,11 +939,9 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
     invariant(hbStats.getLastHeartbeatStartDate() != Date_t());
     const bool isUnauthorized = (hbResponse.getStatus().code() == ErrorCodes::Unauthorized) ||
         (hbResponse.getStatus().code() == ErrorCodes::AuthenticationFailed);
-    const bool isInvalid = hbResponse.getStatus().code() == ErrorCodes::InvalidReplicaSetConfig;
 
-    // Replication of auth changes can cause temporary auth failures, and a temporary DNS outage can
-    // make a node return InvalidReplicaSetConfig if it can't find itself in the config.
-    if (hbResponse.isOK() || isUnauthorized || isInvalid) {
+    // Replication of auth changes can cause temporary auth failures.
+    if (hbResponse.isOK() || isUnauthorized) {
         hbStats.hit(networkRoundTripTime);
     } else {
         hbStats.miss();
@@ -1346,8 +1347,7 @@ void TopologyCoordinator::setMyLastDurableOpTimeAndWallTime(OpTimeAndWallTime op
 }
 
 StatusWith<bool> TopologyCoordinator::setLastOptime(const UpdatePositionArgs::UpdateInfo& args,
-                                                    Date_t now,
-                                                    long long* configVersion) {
+                                                    Date_t now) {
     if (_selfIndex == -1) {
         // Ignore updates when we're in state REMOVED.
         return Status(ErrorCodes::NotPrimaryOrSecondary,
@@ -2332,6 +2332,9 @@ TopologyCoordinator::UnelectableReasonMask TopologyCoordinator::_getUnelectableR
     }
     if (hbData.getState() != MemberState::RS_SECONDARY) {
         result |= NotSecondary;
+    }
+    if (hbData.up() && hbData.isUnelectable()) {
+        result |= StepDownPeriodActive;
     }
     invariant(result || memberConfig.isElectable());
     return result;

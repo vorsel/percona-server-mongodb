@@ -44,35 +44,67 @@
     ENUMIFY(asin)                \
     ENUMIFY(asinh)               \
     ENUMIFY(atan)                \
+    ENUMIFY(arrayElemAt)         \
+    ENUMIFY(arrayToObject)       \
+    ENUMIFY(asArg)               \
     ENUMIFY(atan2)               \
     ENUMIFY(atanh)               \
+    ENUMIFY(caseSensitive)       \
     ENUMIFY(ceil)                \
     ENUMIFY(charsArg)            \
     ENUMIFY(cmp)                 \
     ENUMIFY(collArg)             \
+    ENUMIFY(commentExpr)         \
     ENUMIFY(concat)              \
+    ENUMIFY(concatArrays)        \
+    ENUMIFY(condArg)             \
     ENUMIFY(constExpr)           \
     ENUMIFY(convert)             \
     ENUMIFY(cos)                 \
     ENUMIFY(cosh)                \
     ENUMIFY(dateArg)             \
+    ENUMIFY(dateFromParts)       \
     ENUMIFY(dateFromString)      \
     ENUMIFY(dateStringArg)       \
+    ENUMIFY(dateToParts)         \
     ENUMIFY(dateToString)        \
+    ENUMIFY(dayArg)              \
+    ENUMIFY(dayOfMonth)          \
+    ENUMIFY(dayOfWeek)           \
+    ENUMIFY(dayOfYear)           \
     ENUMIFY(degreesToRadians)    \
+    ENUMIFY(diacriticSensitive)  \
     ENUMIFY(divide)              \
+    ENUMIFY(elemMatch)           \
     ENUMIFY(eq)                  \
+    ENUMIFY(existsExpr)          \
     ENUMIFY(exponent)            \
+    ENUMIFY(expr)                \
     ENUMIFY(findArg)             \
+    ENUMIFY(filter)              \
+    ENUMIFY(first)               \
     ENUMIFY(floor)               \
     ENUMIFY(formatArg)           \
     ENUMIFY(gt)                  \
     ENUMIFY(gte)                 \
+    ENUMIFY(hour)                \
+    ENUMIFY(hourArg)             \
     ENUMIFY(id)                  \
+    ENUMIFY(in)                  \
+    ENUMIFY(indexOfArray)        \
     ENUMIFY(indexOfBytes)        \
     ENUMIFY(indexOfCP)           \
     ENUMIFY(inhibitOptimization) \
     ENUMIFY(inputArg)            \
+    ENUMIFY(isArray)             \
+    ENUMIFY(iso8601Arg)          \
+    ENUMIFY(isoDayOfWeek)        \
+    ENUMIFY(isoDayOfWeekArg)     \
+    ENUMIFY(isoWeek)             \
+    ENUMIFY(isoWeekArg)          \
+    ENUMIFY(isoWeekYear)         \
+    ENUMIFY(isoWeekYearArg)      \
+    ENUMIFY(language)            \
     ENUMIFY(limit)               \
     ENUMIFY(literal)             \
     ENUMIFY(ln)                  \
@@ -82,8 +114,15 @@
     ENUMIFY(lte)                 \
     ENUMIFY(ltrim)               \
     ENUMIFY(match)               \
+    ENUMIFY(matchMod)            \
     ENUMIFY(meta)                \
+    ENUMIFY(millisecond)         \
+    ENUMIFY(millisecondArg)      \
+    ENUMIFY(minute)              \
+    ENUMIFY(minuteArg)           \
     ENUMIFY(mod)                 \
+    ENUMIFY(month)               \
+    ENUMIFY(monthArg)            \
     ENUMIFY(multiply)            \
     ENUMIFY(ne)                  \
     ENUMIFY(norExpr)             \
@@ -102,11 +141,14 @@
     ENUMIFY(regexFindAll)        \
     ENUMIFY(regexMatch)          \
     ENUMIFY(replaceAll)          \
-    ENUMIFY(replaceOne)          \
     ENUMIFY(replacementArg)      \
+    ENUMIFY(replaceOne)          \
     ENUMIFY(round)               \
     ENUMIFY(rtrim)               \
     ENUMIFY(sample)              \
+    ENUMIFY(search)              \
+    ENUMIFY(second)              \
+    ENUMIFY(secondArg)           \
     ENUMIFY(setDifference)       \
     ENUMIFY(setEquals)           \
     ENUMIFY(setIntersection)     \
@@ -119,15 +161,16 @@
     ENUMIFY(slice)               \
     ENUMIFY(split)               \
     ENUMIFY(sqrt)                \
+    ENUMIFY(strcasecmp)          \
     ENUMIFY(strLenBytes)         \
     ENUMIFY(strLenCP)            \
-    ENUMIFY(strcasecmp)          \
     ENUMIFY(substr)              \
     ENUMIFY(substrBytes)         \
     ENUMIFY(substrCP)            \
     ENUMIFY(subtract)            \
     ENUMIFY(tan)                 \
     ENUMIFY(tanh)                \
+    ENUMIFY(text)                \
     ENUMIFY(timezoneArg)         \
     ENUMIFY(toArg)               \
     ENUMIFY(toBool)              \
@@ -143,7 +186,11 @@
     ENUMIFY(trim)                \
     ENUMIFY(trunc)               \
     ENUMIFY(type)                \
-    ENUMIFY(unionWith)
+    ENUMIFY(unionWith)           \
+    ENUMIFY(week)                \
+    ENUMIFY(where)               \
+    ENUMIFY(year)                \
+    ENUMIFY(yearArg)
 
 MAKE_PRINTABLE_ENUM(KeyFieldname, KEYFIELDNAMES);
 MAKE_PRINTABLE_ENUM_STRING_ARRAY(key_fieldname, KeyFieldname, KEYFIELDNAMES);

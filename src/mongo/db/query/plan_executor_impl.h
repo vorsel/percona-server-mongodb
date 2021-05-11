@@ -59,7 +59,7 @@ public:
                      std::unique_ptr<QuerySolution> qs,
                      std::unique_ptr<CanonicalQuery> cq,
                      const boost::intrusive_ptr<ExpressionContext>& expCtx,
-                     const Collection* collection,
+                     const CollectionPtr& collection,
                      NamespaceString nss,
                      PlanYieldPolicy::YieldPolicy yieldPolicy);
 
@@ -68,7 +68,7 @@ public:
     const NamespaceString& nss() const final;
     OperationContext* getOpCtx() const final;
     void saveState() final;
-    void restoreState() final;
+    void restoreState(const RestoreContext& context) final;
     void detachFromOperationContext() final;
     void reattachToOperationContext(OperationContext* opCtx) final;
     ExecState getNextDocument(Document* objOut, RecordId* dlOut) final;
@@ -87,16 +87,14 @@ public:
     Timestamp getLatestOplogTimestamp() const final;
     BSONObj getPostBatchResumeToken() const final;
     LockPolicy lockPolicy() const final;
-    std::string getPlanSummary() const final;
-    void getSummaryStats(PlanSummaryStats* statsOut) const final;
-    BSONObj getStats() const final;
+    const PlanExplainer& getPlanExplainer() const final;
 
     /**
      * Same as restoreState() but without the logic to retry if a WriteConflictException is thrown.
      *
      * This is only public for PlanYieldPolicy. DO NOT CALL ANYWHERE ELSE.
      */
-    void restoreStateWithoutRetrying();
+    void restoreStateWithoutRetrying(const RestoreContext& context, const Yieldable* yieldable);
 
     /**
      * Return a pointer to this executor's MultiPlanStage, or nullptr if it does not have one.
@@ -148,6 +146,7 @@ private:
     std::unique_ptr<WorkingSet> _workingSet;
     std::unique_ptr<QuerySolution> _qs;
     std::unique_ptr<PlanStage> _root;
+    std::unique_ptr<PlanExplainer> _planExplainer;
 
     // If _killStatus has a non-OK value, then we have been killed and the value represents the
     // reason for the kill.

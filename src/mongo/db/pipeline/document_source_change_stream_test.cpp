@@ -387,7 +387,8 @@ public:
                                 prevOpTime,      // optime of previous write within same transaction
                                 preImageOpTime,  // pre-image optime
                                 boost::none,     // post-image optime
-                                boost::none);    // ShardId of resharding recipient
+                                boost::none,     // ShardId of resharding recipient
+                                boost::none);    // _id
     }
 
     /**
@@ -865,13 +866,13 @@ TEST_F(ChangeStreamStageTest, TransformRemoveFields) {
         {DSChangeStream::kOperationTypeField, DSChangeStream::kUpdateOpType},
         {DSChangeStream::kClusterTimeField, kDefaultTs},
         {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
-        {DSChangeStream::kDocumentKeyField, D{{{"_id", 1}, {"x", 2}}}},
+        {DSChangeStream::kDocumentKeyField, Document{{"_id", 1}, {"x", 2}}},
         {
             "updateDescription",
-            D{{"updatedFields", D{}}, {"removedFields", vector<V>{V("y"_sd)}}},
+            D{{"updatedFields", D{}}, {"removedFields", {"y"_sd}}},
         }};
     checkTransformation(removeField, expectedRemoveField);
-}
+}  // namespace
 
 TEST_F(ChangeStreamStageTest, TransformReplace) {
     BSONObj o = BSON("_id" << 1 << "x" << 2 << "y" << 1);
@@ -1223,7 +1224,8 @@ TEST_F(ChangeStreamStageTest, CommitCommandReturnsOperationsFromPreparedTransact
                          applyOpsOpTime,  // optime of previous write within same transaction
                          boost::none,     // pre-image optime
                          boost::none,     // post-image optime
-                         boost::none);    // ShardId of resharding recipient
+                         boost::none,     // ShardId of resharding recipient
+                         boost::none);    // _id
 
     // When the DocumentSourceChangeStreamTransform sees the "commitTransaction" oplog entry, we
     // expect it to return the insert op within our 'preparedApplyOps' oplog entry.
@@ -1421,7 +1423,8 @@ TEST_F(ChangeStreamStageTest, PreparedTransactionWithMultipleOplogEntries) {
                          applyOpsOpTime2,  // optime of previous write within same transaction
                          boost::none,      // pre-image optime
                          boost::none,      // post-image optime
-                         boost::none);     // ShardId of resharding recipient
+                         boost::none,      // ShardId of resharding recipient
+                         boost::none);     // _id
 
     // We do not use the checkTransformation() pattern that other tests use since we expect multiple
     // documents to be returned from one applyOps.
@@ -2014,10 +2017,10 @@ TEST_F(ChangeStreamStageDBTest, TransformRemoveFields) {
         {DSChangeStream::kOperationTypeField, DSChangeStream::kUpdateOpType},
         {DSChangeStream::kClusterTimeField, kDefaultTs},
         {DSChangeStream::kNamespaceField, D{{"db", nss.db()}, {"coll", nss.coll()}}},
-        {DSChangeStream::kDocumentKeyField, D{{{"_id", 1}, {"x", 2}}}},
+        {DSChangeStream::kDocumentKeyField, D{{"_id", 1}, {"x", 2}}},
         {
             "updateDescription",
-            D{{"updatedFields", D{}}, {"removedFields", vector<V>{V("y"_sd)}}},
+            D{{"updatedFields", D{}}, {"removedFields", {"y"_sd}}},
         }};
     checkTransformation(removeField, expectedRemoveField);
 }

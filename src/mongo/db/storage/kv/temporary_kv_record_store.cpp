@@ -54,7 +54,7 @@ void TemporaryKVRecordStore::finalizeTemporaryTable(OperationContext* opCtx,
     // This function is added as an onCommit() handler in certain places, at which point it is not
     // possible to get a WriteConflictException. We're only concerned when calling this function in
     // a WriteUnitOfWork that can still be rolled back.
-    if (opCtx->recoveryUnit()->inActiveTxn()) {
+    if (opCtx->recoveryUnit()->isActive()) {
         opCtx->recoveryUnit()->onRollback([this]() { _recordStoreHasBeenFinalized = false; });
     }
 
@@ -65,7 +65,7 @@ void TemporaryKVRecordStore::finalizeTemporaryTable(OperationContext* opCtx,
     // destructed while we're using it.
     invariant(opCtx->lockState()->isReadLocked());
 
-    auto status = _kvEngine->dropIdent(opCtx, opCtx->recoveryUnit(), _rs->getIdent());
+    auto status = _kvEngine->dropIdent(opCtx->recoveryUnit(), _rs->getIdent());
 
     if (!status.isOK()) {
         LOGV2_ERROR(4841503, "Failed to drop temporary table", "ident"_attr = _rs->getIdent());

@@ -1431,7 +1431,6 @@ TEST_F(ReplCoordTest, UpdatePositionArgsAdvancesWallTimes) {
     ASSERT_TRUE(repl->getMemberState().primary());
 
     // Catch up the secondaries using only replSetUpdatePosition.
-    long long configVersion = repl->getConfig().getConfigVersion();
     UpdatePositionArgs updatePositionArgs;
 
     Date_t memberOneAppliedWallTime = Date_t() + Seconds(3);
@@ -1444,20 +1443,22 @@ TEST_F(ReplCoordTest, UpdatePositionArgsAdvancesWallTimes) {
         << 1 << UpdatePositionArgs::kUpdateArrayFieldName
         << BSON_ARRAY(
                BSON(UpdatePositionArgs::kConfigVersionFieldName
-                    << configVersion << UpdatePositionArgs::kMemberIdFieldName << 1
+                    << repl->getConfig().getConfigVersion()
+                    << UpdatePositionArgs::kMemberIdFieldName << 1
                     << UpdatePositionArgs::kAppliedOpTimeFieldName << opTime2.asOpTime().toBSON()
                     << UpdatePositionArgs::kAppliedWallTimeFieldName << memberOneAppliedWallTime
                     << UpdatePositionArgs::kDurableOpTimeFieldName << opTime2.asOpTime().toBSON()
                     << UpdatePositionArgs::kDurableWallTimeFieldName << memberOneDurableWallTime)
                << BSON(UpdatePositionArgs::kConfigVersionFieldName
-                       << configVersion << UpdatePositionArgs::kMemberIdFieldName << 2
+                       << repl->getConfig().getConfigVersion()
+                       << UpdatePositionArgs::kMemberIdFieldName << 2
                        << UpdatePositionArgs::kAppliedOpTimeFieldName << opTime2.asOpTime().toBSON()
                        << UpdatePositionArgs::kAppliedWallTimeFieldName << memberTwoAppliedWallTime
                        << UpdatePositionArgs::kDurableOpTimeFieldName << opTime2.asOpTime().toBSON()
                        << UpdatePositionArgs::kDurableWallTimeFieldName
                        << memberTwoDurableWallTime)))));
 
-    ASSERT_OK(repl->processReplSetUpdatePosition(updatePositionArgs, &configVersion));
+    ASSERT_OK(repl->processReplSetUpdatePosition(updatePositionArgs));
 
     // Make sure wall times are propagated through processReplSetUpdatePosition
     auto memberDataVector = repl->getMemberData();
@@ -1720,7 +1721,6 @@ TEST_F(StepDownTest, StepDownCanCompleteBasedOnReplSetUpdatePositionAlone) {
     ASSERT_TRUE(repl->getMemberState().primary());
 
     // Catch up one of the secondaries using only replSetUpdatePosition.
-    long long configVersion = repl->getConfig().getConfigVersion();
     UpdatePositionArgs updatePositionArgs;
 
     ASSERT_OK(updatePositionArgs.initialize(BSON(
@@ -1728,7 +1728,8 @@ TEST_F(StepDownTest, StepDownCanCompleteBasedOnReplSetUpdatePositionAlone) {
         << 1 << UpdatePositionArgs::kUpdateArrayFieldName
         << BSON_ARRAY(
                BSON(UpdatePositionArgs::kConfigVersionFieldName
-                    << configVersion << UpdatePositionArgs::kMemberIdFieldName << 1
+                    << repl->getConfig().getConfigVersion()
+                    << UpdatePositionArgs::kMemberIdFieldName << 1
                     << UpdatePositionArgs::kAppliedOpTimeFieldName << opTime2.asOpTime().toBSON()
                     << UpdatePositionArgs::kAppliedWallTimeFieldName
                     << Date_t() + Seconds(opTime2.asOpTime().getSecs())
@@ -1736,7 +1737,8 @@ TEST_F(StepDownTest, StepDownCanCompleteBasedOnReplSetUpdatePositionAlone) {
                     << UpdatePositionArgs::kDurableWallTimeFieldName
                     << Date_t() + Seconds(opTime2.asOpTime().getSecs()))
                << BSON(UpdatePositionArgs::kConfigVersionFieldName
-                       << configVersion << UpdatePositionArgs::kMemberIdFieldName << 2
+                       << repl->getConfig().getConfigVersion()
+                       << UpdatePositionArgs::kMemberIdFieldName << 2
                        << UpdatePositionArgs::kAppliedOpTimeFieldName << opTime1.asOpTime().toBSON()
                        << UpdatePositionArgs::kAppliedWallTimeFieldName
                        << Date_t() + Seconds(opTime1.asOpTime().getSecs())
@@ -1744,7 +1746,7 @@ TEST_F(StepDownTest, StepDownCanCompleteBasedOnReplSetUpdatePositionAlone) {
                        << UpdatePositionArgs::kDurableWallTimeFieldName
                        << Date_t() + Seconds(opTime1.asOpTime().getSecs()))))));
 
-    ASSERT_OK(repl->processReplSetUpdatePosition(updatePositionArgs, &configVersion));
+    ASSERT_OK(repl->processReplSetUpdatePosition(updatePositionArgs));
 
     // Verify that stepDown completes successfully.
     ASSERT_OK(*result.second.get());
@@ -1856,7 +1858,6 @@ TEST_F(StepDownTestWithUnelectableNode,
     // Use replSetUpdatePosition to catch up the first secondary, which is not electable.
     // This will yield a majority at the primary's opTime, so the waiter will be woken up,
     // but stepDown will not be able to complete.
-    long long configVersion = repl->getConfig().getConfigVersion();
     UpdatePositionArgs catchupFirstSecondary;
 
     ASSERT_OK(catchupFirstSecondary.initialize(BSON(
@@ -1864,7 +1865,8 @@ TEST_F(StepDownTestWithUnelectableNode,
         << 1 << UpdatePositionArgs::kUpdateArrayFieldName
         << BSON_ARRAY(
                BSON(UpdatePositionArgs::kConfigVersionFieldName
-                    << configVersion << UpdatePositionArgs::kMemberIdFieldName << 1
+                    << repl->getConfig().getConfigVersion()
+                    << UpdatePositionArgs::kMemberIdFieldName << 1
                     << UpdatePositionArgs::kAppliedOpTimeFieldName << opTime2.asOpTime().toBSON()
                     << UpdatePositionArgs::kAppliedWallTimeFieldName
                     << Date_t() + Seconds(opTime2.asOpTime().getSecs())
@@ -1872,7 +1874,8 @@ TEST_F(StepDownTestWithUnelectableNode,
                     << UpdatePositionArgs::kDurableWallTimeFieldName
                     << Date_t() + Seconds(opTime2.asOpTime().getSecs()))
                << BSON(UpdatePositionArgs::kConfigVersionFieldName
-                       << configVersion << UpdatePositionArgs::kMemberIdFieldName << 2
+                       << repl->getConfig().getConfigVersion()
+                       << UpdatePositionArgs::kMemberIdFieldName << 2
                        << UpdatePositionArgs::kAppliedOpTimeFieldName << opTime1.asOpTime().toBSON()
                        << UpdatePositionArgs::kAppliedWallTimeFieldName
                        << Date_t() + Seconds(opTime1.asOpTime().getSecs())
@@ -1880,7 +1883,7 @@ TEST_F(StepDownTestWithUnelectableNode,
                        << UpdatePositionArgs::kDurableWallTimeFieldName
                        << Date_t() + Seconds(opTime1.asOpTime().getSecs()))))));
 
-    ASSERT_OK(repl->processReplSetUpdatePosition(catchupFirstSecondary, &configVersion));
+    ASSERT_OK(repl->processReplSetUpdatePosition(catchupFirstSecondary));
 
     // The primary has still not been able to finish stepping down.
     ASSERT_TRUE(repl->getMemberState().primary());
@@ -1894,7 +1897,8 @@ TEST_F(StepDownTestWithUnelectableNode,
         << 1 << UpdatePositionArgs::kUpdateArrayFieldName
         << BSON_ARRAY(
                BSON(UpdatePositionArgs::kConfigVersionFieldName
-                    << configVersion << UpdatePositionArgs::kMemberIdFieldName << 1
+                    << repl->getConfig().getConfigVersion()
+                    << UpdatePositionArgs::kMemberIdFieldName << 1
                     << UpdatePositionArgs::kAppliedOpTimeFieldName << opTime2.asOpTime().toBSON()
                     << UpdatePositionArgs::kAppliedWallTimeFieldName
                     << Date_t() + Seconds(opTime2.asOpTime().getSecs())
@@ -1902,7 +1906,8 @@ TEST_F(StepDownTestWithUnelectableNode,
                     << UpdatePositionArgs::kDurableWallTimeFieldName
                     << Date_t() + Seconds(opTime2.asOpTime().getSecs()))
                << BSON(UpdatePositionArgs::kConfigVersionFieldName
-                       << configVersion << UpdatePositionArgs::kMemberIdFieldName << 2
+                       << repl->getConfig().getConfigVersion()
+                       << UpdatePositionArgs::kMemberIdFieldName << 2
                        << UpdatePositionArgs::kAppliedOpTimeFieldName << opTime2.asOpTime().toBSON()
                        << UpdatePositionArgs::kAppliedWallTimeFieldName
                        << Date_t() + Seconds(opTime2.asOpTime().getSecs())
@@ -1910,7 +1915,7 @@ TEST_F(StepDownTestWithUnelectableNode,
                        << UpdatePositionArgs::kDurableWallTimeFieldName
                        << Date_t() + Seconds(opTime2.asOpTime().getSecs()))))));
 
-    ASSERT_OK(repl->processReplSetUpdatePosition(catchupOtherSecondary, &configVersion));
+    ASSERT_OK(repl->processReplSetUpdatePosition(catchupOtherSecondary));
 
     // Verify that stepDown completes successfully.
     ASSERT_OK(*result.second.get());
@@ -3247,9 +3252,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnStepDown) {
 
     auto opCtx = makeOperationContext();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -3289,14 +3294,14 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnStepDown) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before triggering a stepdown.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     // A topology change should cause the server to respond to the waiting IsMasterResponse.
     getReplCoord()->stepDown(opCtx.get(), true, Milliseconds(0), Milliseconds(1000));
     ASSERT_TRUE(getTopoCoord().getMemberState().secondary());
     getIsMasterThread.join();
 }
 
-TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceMode) {
+TEST_F(ReplCoordTest, HelloReturnsErrorOnEnteringQuiesceMode) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -3310,9 +3315,9 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceMode) {
     auto opCtx = makeOperationContext();
     auto currentTopologyVersion = getTopoCoord().getTopologyVersion();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     stdx::thread getIsMasterThread([&] {
         auto maxAwaitTime = Milliseconds(5000);
@@ -3325,7 +3330,7 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceMode) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before entering quiesce mode.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     ASSERT(getReplCoord()->enterQuiesceModeIfSecondary(Milliseconds(0)));
     ASSERT_EQUALS(currentTopologyVersion.getCounter() + 1,
                   getTopoCoord().getTopologyVersion().getCounter());
@@ -3710,9 +3715,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsErrorOnHorizonChange) {
     auto deadline = getNet()->now() + maxAwaitTime;
     auto opCtx = makeOperationContext();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -3725,7 +3730,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsErrorOnHorizonChange) {
     });
 
     // Ensure that the isMaster request is waiting before doing a reconfig.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     BSONObjBuilder garbage;
     ReplSetReconfigArgs args;
     // Use force to bypass the oplog commitment check, which we're not worried about testing here.
@@ -3771,7 +3776,7 @@ TEST_F(ReplCoordTest, NonAwaitableIsMasterReturnsNoConfigsOnNodeWithUninitialize
     ASSERT_FALSE(response->isConfigSet());
 }
 
-TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfig) {
+TEST_F(ReplCoordTest, AwaitableHelloOnNodeWithUninitializedConfig) {
     init("mySet");
     start(HostAndPort("node1", 12345));
     auto opCtx = makeOperationContext();
@@ -3806,9 +3811,9 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfig) {
     ASSERT_TRUE(isMasterReturned.load());
     getNet()->exitNetwork();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     deadline = getNet()->now() + maxAwaitTime;
     stdx::thread awaitIsMasterInitiate([&] {
@@ -3824,7 +3829,7 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfig) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before initiating.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     BSONObjBuilder result;
     auto status =
@@ -3916,9 +3921,9 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigInvalidHoriz
     ASSERT_FALSE(initialResponse->isSecondary());
     ASSERT_FALSE(initialResponse->isConfigSet());
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     stdx::thread awaitIsMasterInitiate([&] {
         const auto topologyVersion = getTopoCoord().getTopologyVersion();
@@ -3929,7 +3934,7 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigInvalidHoriz
     });
 
     // Ensure that the isMaster request has started waiting before initiating.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     // Call replSetInitiate with no horizon configured. This should return an error to the isMaster
     // request that is currently waiting on a horizonParam that doesn't exit in the config.
@@ -3957,9 +3962,9 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigSpecifiedHor
     const std::string horizonSniName = "horizon.com";
     const auto horizonParam = SplitHorizon::Parameters(horizonSniName);
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     const std::string horizonOneSniName = "horizon1.com";
     const auto horizonOne = SplitHorizon::Parameters(horizonOneSniName);
@@ -3978,7 +3983,7 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigSpecifiedHor
         ASSERT_TRUE(response->isConfigSet());
     });
 
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     // Call replSetInitiate with a horizon configured.
     BSONObjBuilder result;
@@ -4344,9 +4349,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
     auto deadline = net->now() + maxAwaitTime;
     auto opCtx = makeOperationContext();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     stdx::thread getIsMasterWaitingForRemovedNodeThread([&] {
         const auto topologyVersion = getTopoCoord().getTopologyVersion();
@@ -4363,7 +4368,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before triggering a reconfig.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     enterNetwork();
     ASSERT_TRUE(net->hasReadyRequests());
@@ -4408,7 +4413,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
             AssertionException,
             ErrorCodes::SplitHorizonChange);
     });
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
 
     const auto newHorizonNodeOne = "newhorizon.com:100";
     const auto newHorizonNodeTwo = "newhorizon.com:200";
@@ -4491,9 +4496,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionTimeout) {
     auto expectedCounter = currentTopologyVersion.getCounter() + 1;
     auto opCtx = makeOperationContext();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -4510,7 +4515,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionTimeout) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before triggering an election timeout.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     getNet()->enterNetwork();
     // Primary steps down after not receiving a response within the election timeout.
     getNet()->advanceTime(electionTimeoutDate);
@@ -4556,9 +4561,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
     ASSERT_TRUE(response->isSecondary());
     ASSERT_FALSE(response->hasPrimary());
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -4595,7 +4600,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before finishing the election.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
     ASSERT_NOT_EQUALS(Date_t(), electionTimeoutWhen);
     LOGV2(21505,
@@ -4603,7 +4608,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
           "electionTimeoutWhen"_attr = electionTimeoutWhen);
     simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTimeoutWhen, opCtx.get());
 
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
     signalDrainComplete(opCtx.get());
     ASSERT(getReplCoord()->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
 
@@ -4647,12 +4652,12 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
     ASSERT_TRUE(response->isSecondary());
     ASSERT_FALSE(response->hasPrimary());
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
     auto hangAfterReconfigFailPoint =
         globalFailPointRegistry().find("hangAfterReconfigOnDrainComplete");
 
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -4704,7 +4709,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before finishing the election.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
     ASSERT_NOT_EQUALS(Date_t(), electionTimeoutWhen);
     LOGV2(4508104,
@@ -4712,7 +4717,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
           "electionTimeoutWhen"_attr = electionTimeoutWhen);
     simulateSuccessfulV1ElectionWithoutExitingDrainMode(electionTimeoutWhen, opCtx.get());
 
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 2);
     signalDrainComplete(opCtx.get());
     ASSERT(getReplCoord()->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
 
@@ -4922,7 +4927,7 @@ TEST_F(ReplCoordTest, DoNotProcessSelfWhenUpdatePositionContainsInfoAboutSelf) {
                                 << UpdatePositionArgs::kAppliedWallTimeFieldName
                                 << Date_t() + Seconds(time2.getSecs()))))));
 
-    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args, nullptr));
+    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args));
     ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
                   getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
 }
@@ -4971,7 +4976,7 @@ TEST_F(ReplCoordTest, ProcessUpdatePositionWhenItsConfigVersionIsDifferent) {
 
     auto opCtx = makeOperationContext();
 
-    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args, nullptr));
+    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args));
     ASSERT_OK(getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
 }
 
@@ -5020,8 +5025,7 @@ TEST_F(ReplCoordTest, DoNotProcessUpdatePositionOfMembersWhoseIdsAreNotInTheConf
     auto opCtx = makeOperationContext();
 
 
-    ASSERT_EQUALS(ErrorCodes::NodeNotFound,
-                  getReplCoord()->processReplSetUpdatePosition(args, nullptr));
+    ASSERT_EQUALS(ErrorCodes::NodeNotFound, getReplCoord()->processReplSetUpdatePosition(args));
     ASSERT_EQUALS(ErrorCodes::WriteConcernFailed,
                   getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
 }
@@ -5084,7 +5088,7 @@ TEST_F(ReplCoordTest,
     auto opCtx = makeOperationContext();
 
 
-    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args, nullptr));
+    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args));
     ASSERT_OK(getReplCoord()->awaitReplication(opCtx.get(), time2, writeConcern).status);
 
     writeConcern.wNumNodes = 3;
@@ -5140,9 +5144,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfig) {
     auto expectedCounter = currentTopologyVersion.getCounter() + 1;
     auto opCtx = makeOperationContext();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -5160,7 +5164,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfig) {
     });
 
     // Ensure that awaitIsMasterResponse() is called before triggering a reconfig.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     // Do a reconfig to add a third node to the replica set. A reconfig should cause the server to
     // respond to the waiting IsMasterResponse.
@@ -5291,9 +5295,9 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfigOnSecondary) 
     auto expectedCounter = currentTopologyVersion.getCounter() + 1;
     auto opCtx = makeOperationContext();
 
-    auto waitForIsMasterFailPoint = globalFailPointRegistry().find("waitForIsMasterResponse");
-    auto timesEnteredFailPoint = waitForIsMasterFailPoint->setMode(FailPoint::alwaysOn, 0);
-    ON_BLOCK_EXIT([&] { waitForIsMasterFailPoint->setMode(FailPoint::off, 0); });
+    auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
+    auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
+    ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
@@ -5312,7 +5316,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfigOnSecondary) 
     });
 
     // Ensure that awaitIsMasterResponse() is called before triggering a reconfig.
-    waitForIsMasterFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
+    waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     // Do a reconfig to remove a node from the replica set. A reconfig should cause the server to
     // respond to the waiting isMaster request.
@@ -7145,7 +7149,7 @@ TEST_F(ReplCoordTest, StepDownWhenHandleLivenessTimeoutMarksAMajorityOfVotingNod
                        << UpdatePositionArgs::kDurableWallTimeFieldName
                        << Date_t() + Seconds(startingOpTime.getSecs()))))));
 
-    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args, nullptr));
+    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args));
     // Become PRIMARY.
     simulateSuccessfulV1Election();
 
@@ -7174,7 +7178,7 @@ TEST_F(ReplCoordTest, StepDownWhenHandleLivenessTimeoutMarksAMajorityOfVotingNod
     const Date_t startDate = getNet()->now();
     getNet()->enterNetwork();
     getNet()->runUntil(startDate + Milliseconds(100));
-    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args1, nullptr));
+    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args1));
 
     // Confirm that the node remains PRIMARY after the other two nodes are marked DOWN.
     getNet()->runUntil(startDate + Milliseconds(2080));
@@ -7219,7 +7223,7 @@ TEST_F(ReplCoordTest, StepDownWhenHandleLivenessTimeoutMarksAMajorityOfVotingNod
                            << UpdatePositionArgs::kAppliedOpTimeFieldName << startingOpTime.toBSON()
                            << UpdatePositionArgs::kAppliedWallTimeFieldName
                            << Date_t() + Seconds(startingOpTime.getSecs()))))));
-    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args2, nullptr));
+    ASSERT_OK(getReplCoord()->processReplSetUpdatePosition(args2));
 
     hbArgs.setSetName("mySet");
     hbArgs.setConfigVersion(2);

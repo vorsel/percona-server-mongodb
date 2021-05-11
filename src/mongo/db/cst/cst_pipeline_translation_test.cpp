@@ -27,6 +27,7 @@
  *    it in the license file.
  */
 
+#include "mongo/db/cst/path.h"
 #include "mongo/platform/basic.h"
 
 #include <boost/intrusive_ptr.hpp>
@@ -48,7 +49,7 @@
 #include "mongo/db/pipeline/document_source_single_document_transformation.h"
 #include "mongo/db/pipeline/document_source_skip.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
-#include "mongo/db/query/sort_pattern.h"
+#include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/util/make_data_structure.h"
 #include "mongo/unittest/unittest.h"
 
@@ -59,31 +60,6 @@ using namespace std::string_literals;
 auto getExpCtx() {
     auto nss = NamespaceString{"db", "coll"};
     return boost::intrusive_ptr<ExpressionContextForTest>{new ExpressionContextForTest(nss)};
-}
-
-void assertSortPatternsEQ(SortPattern correct, SortPattern fromTest) {
-    for (size_t i = 0; i < correct.size(); ++i) {
-        ASSERT_EQ(correct[i].isAscending, fromTest[i].isAscending);
-        if (correct[i].fieldPath) {
-            if (fromTest[i].fieldPath) {
-                ASSERT_EQ(correct[i].fieldPath->fullPath(), fromTest[i].fieldPath->fullPath());
-            } else {
-                FAIL("Pattern missing fieldpath");
-            }
-        } else if (fromTest[i].fieldPath) {
-            FAIL("Pattern incorrectly had fieldpath");
-        }
-        if (correct[i].expression) {
-            if (fromTest[i].expression)
-                ASSERT_EQ(correct[i].expression->serialize(false).toString(),
-                          fromTest[i].expression->serialize(false).toString());
-            else {
-                FAIL("Pattern missing expression");
-            }
-        } else if (fromTest[i].expression) {
-            FAIL("Pattern incorrectly had expression");
-        }
-    }
 }
 
 TEST(CstPipelineTranslationTest, TranslatesEmpty) {
@@ -124,7 +100,7 @@ TEST(CstPipelineTranslationTest, TranslatesOneFieldInclusionProjectionStage) {
     const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
         {KeyFieldname::projectInclusion,
          CNode{CNode::ObjectChildren{
-             {ProjectionPath{make_vector<std::string>("a")}, CNode{KeyValue::trueKey}}}}}}}}};
+             {ProjectionPath{makeVector<std::string>("a")}, CNode{KeyValue::trueKey}}}}}}}}};
     auto pipeline = cst_pipeline_translation::translatePipeline(cst, getExpCtx());
     auto& sources = pipeline->getSources();
     ASSERT_EQ(1u, sources.size());
@@ -141,8 +117,8 @@ TEST(CstPipelineTranslationTest, TranslatesMultifieldInclusionProjection) {
         {KeyFieldname::projectInclusion,
          CNode{CNode::ObjectChildren{
              {KeyFieldname::id, CNode{KeyValue::trueKey}},
-             {ProjectionPath{make_vector<std::string>("a")}, CNode{NonZeroKey{7}}},
-             {ProjectionPath{make_vector<std::string>("b")},
+             {ProjectionPath{makeVector<std::string>("a")}, CNode{NonZeroKey{7}}},
+             {ProjectionPath{makeVector<std::string>("b")},
               CNode{NonZeroKey{-99999999999ll}}}}}}}}}};
     auto pipeline = cst_pipeline_translation::translatePipeline(cst, getExpCtx());
     auto& sources = pipeline->getSources();
@@ -166,16 +142,16 @@ TEST(CstPipelineTranslationTest, TranslatesCompoundObjectInclusionProjection) {
     const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
         {KeyFieldname::projectInclusion,
          CNode{CNode::ObjectChildren{
-             {ProjectionPath{make_vector<std::string>("a")},
+             {ProjectionPath{makeVector<std::string>("a")},
               CNode{CompoundInclusionKey{CNode{CNode::ObjectChildren{
-                  {{ProjectionPath{make_vector<std::string>("b")},
+                  {{ProjectionPath{makeVector<std::string>("b")},
                     CNode{CNode::ObjectChildren{
-                        {{ProjectionPath{make_vector<std::string>("c")}, CNode{KeyValue::trueKey}},
-                         {ProjectionPath{make_vector<std::string>("d")},
+                        {{ProjectionPath{makeVector<std::string>("c")}, CNode{KeyValue::trueKey}},
+                         {ProjectionPath{makeVector<std::string>("d")},
                           CNode{CNode{NonZeroKey{88}}}},
-                         {ProjectionPath{make_vector<std::string>("e")},
+                         {ProjectionPath{makeVector<std::string>("e")},
                           CNode{
-                              CNode::ObjectChildren{{{ProjectionPath{make_vector<std::string>("f")},
+                              CNode::ObjectChildren{{{ProjectionPath{makeVector<std::string>("f")},
                                                       CNode{NonZeroKey{-3ll}}}}}}}}}}}}}}}}}}}}}}}};
     auto pipeline = cst_pipeline_translation::translatePipeline(cst, getExpCtx());
     auto& sources = pipeline->getSources();
@@ -193,7 +169,7 @@ TEST(CstPipelineTranslationTest, TranslatesMultiComponentPathInclusionProjection
     const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
         {KeyFieldname::projectInclusion,
          CNode{CNode::ObjectChildren{
-             {ProjectionPath{make_vector<std::string>("a.b.c.d")}, CNode{KeyValue::trueKey}}}}}}}}};
+             {ProjectionPath{makeVector<std::string>("a.b.c.d")}, CNode{KeyValue::trueKey}}}}}}}}};
     auto pipeline = cst_pipeline_translation::translatePipeline(cst, getExpCtx());
     auto& sources = pipeline->getSources();
     ASSERT_EQ(1u, sources.size());
@@ -209,7 +185,7 @@ TEST(CstPipelineTranslationTest, TranslatesOneFieldExclusionProjectionStage) {
     const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
         {KeyFieldname::projectExclusion,
          CNode{CNode::ObjectChildren{
-             {ProjectionPath{make_vector<std::string>("a")}, CNode{KeyValue::falseKey}}}}}}}}};
+             {ProjectionPath{makeVector<std::string>("a")}, CNode{KeyValue::falseKey}}}}}}}}};
     auto pipeline = cst_pipeline_translation::translatePipeline(cst, getExpCtx());
     auto& sources = pipeline->getSources();
     ASSERT_EQ(1u, sources.size());
@@ -226,9 +202,8 @@ TEST(CstPipelineTranslationTest, TranslatesMultifieldExclusionProjection) {
         {KeyFieldname::projectExclusion,
          CNode{CNode::ObjectChildren{
              {KeyFieldname::id, CNode{KeyValue::falseKey}},
-             {ProjectionPath{make_vector<std::string>("a")}, CNode{KeyValue::doubleZeroKey}},
-             {ProjectionPath{make_vector<std::string>("b")},
-              CNode{KeyValue::decimalZeroKey}}}}}}}}};
+             {ProjectionPath{makeVector<std::string>("a")}, CNode{KeyValue::doubleZeroKey}},
+             {ProjectionPath{makeVector<std::string>("b")}, CNode{KeyValue::decimalZeroKey}}}}}}}}};
     auto pipeline = cst_pipeline_translation::translatePipeline(cst, getExpCtx());
     auto& sources = pipeline->getSources();
     ASSERT_EQ(1u, sources.size());
@@ -251,16 +226,16 @@ TEST(CstPipelineTranslationTest, TranslatesCompoundObjectExclusionProjection) {
     const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
         {KeyFieldname::projectExclusion,
          CNode{CNode::ObjectChildren{
-             {ProjectionPath{make_vector<std::string>("a")},
+             {ProjectionPath{makeVector<std::string>("a")},
               CNode{CompoundExclusionKey{CNode{CNode::ObjectChildren{
-                  {{ProjectionPath{make_vector<std::string>("b")},
+                  {{ProjectionPath{makeVector<std::string>("b")},
                     CNode{CNode::ObjectChildren{
-                        {{ProjectionPath{make_vector<std::string>("c")}, CNode{KeyValue::falseKey}},
-                         {ProjectionPath{make_vector<std::string>("d")},
+                        {{ProjectionPath{makeVector<std::string>("c")}, CNode{KeyValue::falseKey}},
+                         {ProjectionPath{makeVector<std::string>("d")},
                           CNode{CNode{NonZeroKey{0}}}},
-                         {ProjectionPath{make_vector<std::string>("e")},
+                         {ProjectionPath{makeVector<std::string>("e")},
                           CNode{
-                              CNode::ObjectChildren{{{ProjectionPath{make_vector<std::string>("f")},
+                              CNode::ObjectChildren{{{ProjectionPath{makeVector<std::string>("f")},
                                                       CNode{NonZeroKey{0ll}}}}}}}}}}}}}}}}}}}}}}}};
     auto pipeline = cst_pipeline_translation::translatePipeline(cst, getExpCtx());
     auto& sources = pipeline->getSources();
@@ -276,10 +251,10 @@ TEST(CstPipelineTranslationTest, TranslatesCompoundObjectExclusionProjection) {
 TEST(CstPipelineTranslationTest, TranslatesMultiComponentPathExclusionProjectionStage) {
     const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
         {KeyFieldname::projectExclusion,
-         CNode{CNode::ObjectChildren{{ProjectionPath{make_vector<std::string>("a.b")},
+         CNode{CNode::ObjectChildren{{ProjectionPath{makeVector<std::string>("a.b")},
 
                                       CNode{CompoundExclusionKey{CNode{CNode::ObjectChildren{
-                                          {ProjectionPath{make_vector<std::string>("c.d")},
+                                          {ProjectionPath{makeVector<std::string>("c.d")},
                                            CNode{KeyValue::falseKey}}}}}}}}}}}}}};
     auto pipeline = cst_pipeline_translation::translatePipeline(cst, getExpCtx());
     auto& sources = pipeline->getSources();
@@ -296,11 +271,11 @@ TEST(CstPipelineTranslationTest, TranslatesComputedProjection) {
     const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
         {KeyFieldname::projectInclusion,
          CNode{CNode::ObjectChildren{
-             {ProjectionPath{make_vector<std::string>("a")},
+             {ProjectionPath{makeVector<std::string>("a")},
               CNode{CNode::ObjectChildren{
                   {KeyFieldname::atan2,
                    CNode{CNode::ArrayChildren{CNode{UserInt{1}}, CNode{UserInt{0}}}}}}}},
-             {ProjectionPath{make_vector<std::string>("b")},
+             {ProjectionPath{makeVector<std::string>("b")},
               CNode{
                   CNode::ObjectChildren{{KeyFieldname::add,
                                          CNode{CNode::ArrayChildren{CNode{UserInt{1}},
@@ -327,11 +302,11 @@ TEST(CstPipelineTranslationTest, TranslatesComputedInclusionMixedProjectionStage
     const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
         {KeyFieldname::projectInclusion,
          CNode{CNode::ObjectChildren{
-             {ProjectionPath{make_vector<std::string>("a")},
+             {ProjectionPath{makeVector<std::string>("a")},
               CNode{CNode::ObjectChildren{
                   {KeyFieldname::add,
                    CNode{CNode::ArrayChildren{CNode{UserLong{0ll}}, CNode{UserInt{1}}}}}}}},
-             {ProjectionPath{make_vector<std::string>("b")},
+             {ProjectionPath{makeVector<std::string>("b")},
               CNode{NonZeroKey{Decimal128{590.095}}}}}}}}}}};
     auto pipeline = cst_pipeline_translation::translatePipeline(cst, getExpCtx());
     auto& sources = pipeline->getSources();
@@ -350,10 +325,10 @@ TEST(CstPipelineTranslationTest, TranslatesMultiComponentPathMixedProjectionStag
     const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
         {KeyFieldname::projectInclusion,
          CNode{CNode::ObjectChildren{
-             {ProjectionPath{make_vector<std::string>("a.b")},
+             {ProjectionPath{makeVector<std::string>("a.b")},
               CNode{CompoundInclusionKey{CNode{CNode::ObjectChildren{
-                  {ProjectionPath{make_vector<std::string>("c.d")}, CNode{NonZeroKey{1}}},
-                  {ProjectionPath{make_vector<std::string>("e.f")},
+                  {ProjectionPath{makeVector<std::string>("c.d")}, CNode{NonZeroKey{1}}},
+                  {ProjectionPath{makeVector<std::string>("e.f")},
                    CNode{
                        CNode::ObjectChildren{{KeyFieldname::atan2,
                                               CNode{CNode::ArrayChildren{
@@ -390,15 +365,15 @@ TEST(CstPipelineTranslationTest, TranslatesMultipleProjectionStages) {
         CNode{CNode::ObjectChildren{
             {KeyFieldname::projectInclusion,
              CNode{CNode::ObjectChildren{
-                 {ProjectionPath{make_vector<std::string>("a")}, CNode{KeyValue::trueKey}}}}}}},
+                 {ProjectionPath{makeVector<std::string>("a")}, CNode{KeyValue::trueKey}}}}}}},
         CNode{CNode::ObjectChildren{
             {KeyFieldname::projectExclusion,
              CNode{CNode::ObjectChildren{
-                 {ProjectionPath{make_vector<std::string>("b")}, CNode{KeyValue::falseKey}}}}}}},
+                 {ProjectionPath{makeVector<std::string>("b")}, CNode{KeyValue::falseKey}}}}}}},
         CNode{
             CNode::ObjectChildren{{KeyFieldname::projectInclusion,
                                    CNode{CNode::ObjectChildren{
-                                       {ProjectionPath{make_vector<std::string>("c")},
+                                       {ProjectionPath{makeVector<std::string>("c")},
                                         CNode{CNode::ObjectChildren{
                                             {KeyFieldname::add,
                                              CNode{CNode::ArrayChildren{
@@ -454,14 +429,14 @@ TEST(CstPipelineTranslationTest, TranslatesMultipleProjectionStagesWithAndOrNot)
         CNode{CNode::ObjectChildren{
             {KeyFieldname::projectInclusion,
              CNode{CNode::ObjectChildren{
-                 {ProjectionPath{make_vector<std::string>("a")},
+                 {ProjectionPath{makeVector<std::string>("a")},
                   CNode{CNode::ObjectChildren{
                       {KeyFieldname::notExpr,
                        CNode{CNode::ArrayChildren{CNode{UserInt{0}}}}}}}}}}}}},
         CNode{
             CNode::ObjectChildren{{KeyFieldname::projectInclusion,
                                    CNode{CNode::ObjectChildren{
-                                       {ProjectionPath{make_vector<std::string>("c")},
+                                       {ProjectionPath{makeVector<std::string>("c")},
                                         CNode{CNode::ObjectChildren{
                                             {KeyFieldname::andExpr,
                                              CNode{CNode::ArrayChildren{
@@ -503,7 +478,7 @@ TEST(CstPipelineTranslationTest, TranslatesComputedProjectionWithAndOr) {
     const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
         {KeyFieldname::projectInclusion,
          CNode{CNode::ObjectChildren{
-             {ProjectionPath{make_vector<std::string>("a")},
+             {ProjectionPath{makeVector<std::string>("a")},
               CNode{CNode::ObjectChildren{
                   {KeyFieldname::andExpr,
                    CNode{CNode::ArrayChildren{
@@ -512,7 +487,7 @@ TEST(CstPipelineTranslationTest, TranslatesComputedProjectionWithAndOr) {
                            {KeyFieldname::add,
                             CNode{CNode::ArrayChildren{CNode{UserInt{1}},
                                                        CNode{UserInt{0}}}}}}}}}}}}},
-             {ProjectionPath{make_vector<std::string>("b")},
+             {ProjectionPath{makeVector<std::string>("b")},
               CNode{
                   CNode::ObjectChildren{{KeyFieldname::orExpr,
                                          CNode{CNode::ArrayChildren{CNode{UserInt{1}},
@@ -699,7 +674,9 @@ TEST(CstPipelineTranslationTest, TranslatesCmpExpression) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::cmp,
          CNode{CNode::ArrayChildren{CNode{UserLong{1}}, CNode{UserDouble{2.5}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT(dynamic_cast<ExpressionCompare*>(expr.get()));
     ASSERT_EQ(ExpressionCompare::CmpOp::CMP, dynamic_cast<ExpressionCompare*>(expr.get())->getOp());
 }
@@ -708,7 +685,10 @@ TEST(CstPipelineTranslationTest, TranslatesEqExpression) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::eq,
          CNode{CNode::ArrayChildren{CNode{UserLong{1}}, CNode{UserDouble{2.5}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    cst_pipeline_translation::translateExpression(cst, expCtx.get(), expCtx->variablesParseState);
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT(dynamic_cast<ExpressionCompare*>(expr.get()));
     ASSERT_EQ(ExpressionCompare::CmpOp::EQ, dynamic_cast<ExpressionCompare*>(expr.get())->getOp());
 }
@@ -717,7 +697,9 @@ TEST(CstPipelineTranslationTest, TranslatesGtExpression) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::gt,
          CNode{CNode::ArrayChildren{CNode{UserLong{1}}, CNode{UserDouble{2.5}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT(dynamic_cast<ExpressionCompare*>(expr.get()));
     ASSERT_EQ(ExpressionCompare::CmpOp::GT, dynamic_cast<ExpressionCompare*>(expr.get())->getOp());
 }
@@ -726,7 +708,9 @@ TEST(CstPipelineTranslationTest, TranslatesGteExpression) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::gte,
          CNode{CNode::ArrayChildren{CNode{UserLong{1}}, CNode{UserDouble{2.5}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT(dynamic_cast<ExpressionCompare*>(expr.get()));
     ASSERT_EQ(ExpressionCompare::CmpOp::GTE, dynamic_cast<ExpressionCompare*>(expr.get())->getOp());
 }
@@ -735,7 +719,9 @@ TEST(CstPipelineTranslationTest, TranslatesLtExpression) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::lt,
          CNode{CNode::ArrayChildren{CNode{UserLong{1}}, CNode{UserDouble{2.5}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT(dynamic_cast<ExpressionCompare*>(expr.get()));
     ASSERT_EQ(ExpressionCompare::CmpOp::LT, dynamic_cast<ExpressionCompare*>(expr.get())->getOp());
 }
@@ -744,7 +730,9 @@ TEST(CstPipelineTranslationTest, TranslatesLteExpression) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::lte,
          CNode{CNode::ArrayChildren{CNode{UserLong{1}}, CNode{UserDouble{2.5}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT(dynamic_cast<ExpressionCompare*>(expr.get()));
     ASSERT_EQ(ExpressionCompare::CmpOp::LTE, dynamic_cast<ExpressionCompare*>(expr.get())->getOp());
 }
@@ -753,7 +741,9 @@ TEST(CstPipelineTranslationTest, TranslatesNeExpression) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::ne,
          CNode{CNode::ArrayChildren{CNode{UserLong{1}}, CNode{UserDouble{2.5}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT(dynamic_cast<ExpressionCompare*>(expr.get()));
     ASSERT_EQ(ExpressionCompare::CmpOp::NE, dynamic_cast<ExpressionCompare*>(expr.get())->getOp());
 }
@@ -768,7 +758,7 @@ TEST(CstPipelineTranslationTest, TranslatesProjectionWithConvert) {
     const auto cst = CNode{CNode::ArrayChildren{CNode{CNode::ObjectChildren{
         {KeyFieldname::projectInclusion,
          CNode{CNode::ObjectChildren{
-             {ProjectionPath{make_vector<std::string>("a")},
+             {ProjectionPath{makeVector<std::string>("a")},
               CNode{CNode::ObjectChildren{
                   {KeyFieldname::convert,
                    CNode{CNode::ObjectChildren{
@@ -776,7 +766,7 @@ TEST(CstPipelineTranslationTest, TranslatesProjectionWithConvert) {
                        {KeyFieldname::toArg, CNode{UserString{"bool"}}},
                        {KeyFieldname::onErrorArg, CNode{KeyValue::absentKey}},
                        {KeyFieldname::onNullArg, CNode{KeyValue::absentKey}}}}}}}},
-             {ProjectionPath{make_vector<std::string>("b")},
+             {ProjectionPath{makeVector<std::string>("b")},
               CNode{CNode::ObjectChildren{
                   {KeyFieldname::convert,
                    CNode{CNode::ObjectChildren{
@@ -813,7 +803,9 @@ TEST(CstPipelineTranslationTest, TranslatesConvertExpression) {
                                      {KeyFieldname::toArg, CNode{UserString{"bool"}}},
                                      {KeyFieldname::onErrorArg, CNode{KeyValue::absentKey}},
                                      {KeyFieldname::onNullArg, CNode{UserInt{1}}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson(
             "{$convert: {input: {$const: 'true'}, to: {$const: 'bool'}, onNull: {$const: 1}}}")) ==
@@ -822,7 +814,9 @@ TEST(CstPipelineTranslationTest, TranslatesConvertExpression) {
 
 TEST(CstPipelineTranslationTest, TranslatesToBoolExpression) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::toBool, CNode{UserInt{0}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$convert: {input: {$const: 0}, to: {$const: 'bool'}}}")) ==
         expr->serialize(false)));
@@ -830,7 +824,9 @@ TEST(CstPipelineTranslationTest, TranslatesToBoolExpression) {
 
 TEST(CstPipelineTranslationTest, TranslatesToDateExpression) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::toDate, CNode{UserLong{0}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$convert: {input: {$const: 0}, to: {$const: 'date'}}}")) ==
         expr->serialize(false)));
@@ -839,7 +835,9 @@ TEST(CstPipelineTranslationTest, TranslatesToDateExpression) {
 TEST(CstPipelineTranslationTest, TranslatesToDecimalExpression) {
     const auto cst =
         CNode{CNode::ObjectChildren{{KeyFieldname::toDecimal, CNode{UserDouble{2.02}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$convert: {input: {$const: 2.02}, to: {$const: 'decimal'}}}")) ==
         expr->serialize(false)));
@@ -848,7 +846,9 @@ TEST(CstPipelineTranslationTest, TranslatesToDecimalExpression) {
 TEST(CstPipelineTranslationTest, TranslatesToDoubleExpression) {
     const auto cst =
         CNode{CNode::ObjectChildren{{KeyFieldname::toDouble, CNode{UserString{"5.5"}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$convert: {input: {$const: '5.5'}, to: {$const: 'double'}}}")) ==
         expr->serialize(false)));
@@ -856,7 +856,9 @@ TEST(CstPipelineTranslationTest, TranslatesToDoubleExpression) {
 
 TEST(CstPipelineTranslationTest, TranslatesToIntExpression) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::toInt, CNode{UserBoolean{true}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$convert: {input: {$const: true}, to: {$const: 'int'}}}")) ==
         expr->serialize(false)));
@@ -864,7 +866,9 @@ TEST(CstPipelineTranslationTest, TranslatesToIntExpression) {
 
 TEST(CstPipelineTranslationTest, TranslatesToLongExpression) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::toLong, CNode{UserDecimal{1.0}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$convert: {input: {$const: 1.0}, to: {$const: 'long'}}}")) ==
         expr->serialize(false)));
@@ -872,8 +876,10 @@ TEST(CstPipelineTranslationTest, TranslatesToLongExpression) {
 
 TEST(CstPipelineTranslationTest, TranslatesToObjectIdExpression) {
     const auto cst = CNode{CNode::ObjectChildren{
-        {KeyFieldname::toObjectId, CNode{AggregationPath{make_vector<std::string>("_id"s)}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+        {KeyFieldname::toObjectId, CNode{AggregationPath{makeVector<std::string>("_id"s)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$convert: {input: '$_id', to: {$const: 'objectId'}}}")) ==
         expr->serialize(false)));
@@ -882,7 +888,9 @@ TEST(CstPipelineTranslationTest, TranslatesToObjectIdExpression) {
 TEST(CstPipelineTranslationTest, TranslatesToStringExpression) {
     const auto cst =
         CNode{CNode::ObjectChildren{{KeyFieldname::toString, CNode{UserBoolean{true}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$convert: {input: {$const: true}, to: {$const: 'string'}}}")) ==
         expr->serialize(false)));
@@ -890,33 +898,51 @@ TEST(CstPipelineTranslationTest, TranslatesToStringExpression) {
 
 TEST(CstPipelineTranslationTest, TranslatesTypeExpression) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::type, CNode{UserLong{1}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT(dynamic_cast<ExpressionType*>(expr.get()));
 }
 
-
 TEST(CstPipelineTranslationTest, AbsConstantTranslation) {
     auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::abs, CNode{UserInt{-1}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$abs: [{$const: -1}]}")) ==
                                            expr->serialize(false)));
     cst = CNode{CNode::ObjectChildren{{KeyFieldname::abs, CNode{UserDouble{-1.534}}}}};
-    expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$abs: [{$const: -1.534}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, AbsVariableTransation) {
     const auto cst = CNode{CNode::ObjectChildren{
-        {KeyFieldname::abs, CNode{AggregationPath{make_vector<std::string>("foo")}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+        {KeyFieldname::abs, CNode{AggregationPath{makeVector<std::string>("foo")}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$abs: [\"$foo\"]}")) ==
+                                           expr->serialize(false)));
+}
+
+TEST(CstPipelineTranslationTest, AbsSingletonArrayTranslation) {
+    auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::abs, CNode{CNode::ArrayChildren{CNode{UserInt{-1}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$abs: [{$const: -1}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, CeilTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::ceil, CNode{UserDouble{1.578}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$ceil: [{$const: 1.578}]}")) ==
                                            expr->serialize(false)));
 }
@@ -924,27 +950,35 @@ TEST(CstPipelineTranslationTest, DivideTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::divide,
          CNode{CNode::ArrayChildren{CNode{UserDouble{1.5}}, CNode{UserDouble{1}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$divide: [{$const: 1.5}, {$const: 1}]}")) == expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, ExpTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::exponent, CNode{UserDouble{1.5}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$exp: [{$const: 1.5}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, FloorTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::floor, CNode{UserDouble{1.5}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$floor: [{$const: 1.5}]}")) ==
                                            expr->serialize(false)));
 }
 TEST(CstPipelineTranslationTest, LnTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::ln, CNode{UserDouble{1.5}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$ln: [{$const: 1.5}]}")) ==
                                            expr->serialize(false)));
 }
@@ -953,14 +987,18 @@ TEST(CstPipelineTranslationTest, LogTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::log,
          CNode{CNode::ArrayChildren{CNode{UserDouble{1.5}}, CNode{UserDouble{10}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$log: [{$const: 1.5}, {$const: 10}]}")) == expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, LogTenTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::logten, CNode{UserDouble{1.5}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$log10: [{$const: 1.5}]}")) ==
                                            expr->serialize(false)));
 }
@@ -969,7 +1007,9 @@ TEST(CstPipelineTranslationTest, ModTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::mod,
          CNode{CNode::ArrayChildren{CNode{UserDouble{15}}, CNode{UserDouble{10}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$mod: [{$const: 15}, {$const: 10}]}")) == expr->serialize(false)));
 }
@@ -979,7 +1019,9 @@ TEST(CstPipelineTranslationTest, MultiplyTranslationTest) {
         {KeyFieldname::multiply,
          CNode{CNode::ArrayChildren{
              CNode{UserDouble{15}}, CNode{UserDouble{10}}, CNode{UserDouble{2}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$multiply: [{$const: 15}, {$const: 10}, {$const: 2}]}")) ==
         expr->serialize(false)));
@@ -989,13 +1031,16 @@ TEST(CstPipelineTranslationTest, PowTranslationTest) {
     auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::pow,
          CNode{CNode::ArrayChildren{CNode{UserDouble{5}}, CNode{UserDouble{2}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$pow: [{$const: 5}, {$const: 2}]}")) ==
                                            expr->serialize(false)));
     cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::pow,
          CNode{CNode::ArrayChildren{CNode{UserDouble{5.846}}, CNode{UserDouble{2.846}}}}}}};
-    expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$pow: [{$const: 5.846}, {$const: 2.846}]}")) == expr->serialize(false)));
 }
@@ -1004,14 +1049,18 @@ TEST(CstPipelineTranslationTest, RoundTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::round,
          CNode{CNode::ArrayChildren{CNode{UserDouble{1.5786}}, CNode{UserDouble{2}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$round: [{$const: 1.5786}, {$const: 2}]}")) == expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, SqrtTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::sqrt, CNode{UserDouble{144}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$sqrt: [{$const: 144}]}")) ==
                                            expr->serialize(false)));
 }
@@ -1020,7 +1069,9 @@ TEST(CstPipelineTranslationTest, SubtractTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::subtract,
          CNode{CNode::ArrayChildren{CNode{UserDouble{1.5786}}, CNode{UserDouble{2}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$subtract: [{$const: 1.5786}, {$const: 2}]}")) == expr->serialize(false)));
 }
@@ -1029,7 +1080,9 @@ TEST(CstPipelineTranslationTest, TruncTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::trunc,
          CNode{CNode::ArrayChildren{CNode{UserDouble{1.5786}}, CNode{UserDouble{2}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$trunc: [{$const: 1.5786}, {$const: 2}]}")) == expr->serialize(false)));
 }
@@ -1040,7 +1093,9 @@ TEST(CstPipelineTranslationTest, TranslatesReplaceOneExpression) {
          CNode{CNode::ObjectChildren{{KeyFieldname::inputArg, CNode{UserString{"Antonio"}}},
                                      {KeyFieldname::findArg, CNode{UserString{"Ant"}}},
                                      {KeyFieldname::replacementArg, CNode{UserString{"T"}}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$replaceOne: {input: {$const: 'Antonio'}, find: {$const: 'Ant'}, "
                        "replacement: {$const: 'T'}}}")) == expr->serialize(false)));
@@ -1053,7 +1108,9 @@ TEST(CstPipelineTranslationTest, TranslatesReplaceAllExpression) {
              {KeyFieldname::inputArg, CNode{UserString{"10gen"}}},
              {KeyFieldname::findArg, CNode{UserString{"10gen"}}},
              {KeyFieldname::replacementArg, CNode{UserString{"MongoDB"}}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$replaceAll: {input: {$const: '10gen'}, find: {$const: '10gen'}, "
                        "replacement: {$const: 'MongoDB'}}}")) == expr->serialize(false)));
@@ -1064,7 +1121,9 @@ TEST(CstPipelineTranslationTest, TranslatesTrimExpression) {
         {KeyFieldname::trim,
          CNode{CNode::ObjectChildren{{KeyFieldname::inputArg, CNode{UserString{"    10gen"}}},
                                      {KeyFieldname::charsArg, CNode{UserString{"ge"}}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$trim: {input: {$const: '    10gen'}, chars: {$const: 'ge'}}}")) ==
         expr->serialize(false)));
@@ -1075,7 +1134,9 @@ TEST(CstPipelineTranslationTest, TranslatesTrimWithoutCharsExpression) {
         {KeyFieldname::trim,
          CNode{CNode::ObjectChildren{{KeyFieldname::inputArg, CNode{UserString{"    10gen "}}},
                                      {KeyFieldname::charsArg, CNode{KeyValue::absentKey}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$trim: {input: {$const: '    10gen '}}}")) == expr->serialize(false)));
 }
@@ -1085,7 +1146,9 @@ TEST(CstPipelineTranslationTest, TranslatesLtrimExpression) {
         {KeyFieldname::ltrim,
          CNode{CNode::ObjectChildren{{KeyFieldname::inputArg, CNode{UserString{"    10gen"}}},
                                      {KeyFieldname::charsArg, CNode{UserString{"ge"}}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$ltrim: {input: {$const: '    10gen'}, chars: {$const: 'ge'}}}")) ==
         expr->serialize(false)));
@@ -1096,7 +1159,9 @@ TEST(CstPipelineTranslationTest, TranslatesRtrimExpression) {
         {KeyFieldname::rtrim,
          CNode{CNode::ObjectChildren{{KeyFieldname::inputArg, CNode{UserString{"10gen "}}},
                                      {KeyFieldname::charsArg, CNode{UserString{"ge"}}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$rtrim: {input: {$const: '10gen '}, chars: {$const: 'ge'}}}")) ==
         expr->serialize(false)));
@@ -1107,7 +1172,9 @@ TEST(CstPipelineTranslationTest, TranslatesConcatExpression) {
         {KeyFieldname::concat,
          CNode{CNode::ArrayChildren{
              CNode{UserString{"abc"}}, CNode{UserString{"def"}}, CNode{UserString{"1x5"}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$concat: [{$const: 'abc'}, {$const: 'def'}, {$const: '1x5'}]}")) ==
         expr->serialize(false)));
@@ -1117,12 +1184,14 @@ TEST(CstPipelineTranslationTest, TranslatesDateToStringExpression) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::dateToString,
          CNode{CNode::ObjectChildren{
-             {KeyFieldname::dateArg, CNode{AggregationPath{make_vector<std::string>("date")}}},
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
              {KeyFieldname::formatArg, CNode{UserString{"%Y-%m-%d"}}},
              {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
              {KeyFieldname::onNullArg, CNode{UserString{"8/10/20"}}},
          }}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(
             fromjson("{$dateToString: {date: \"$date\", format: {$const: \"%Y-%m-%d\"}, timezone: "
@@ -1141,7 +1210,9 @@ TEST(CstPipelineTranslationTest, TranslatesDateFromStringExpression) {
              {KeyFieldname::onErrorArg, CNode{KeyValue::absentKey}},
              {KeyFieldname::onNullArg, CNode{KeyValue::absentKey}},
          }}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$dateFromString: {dateString: {$const: \"'2017-02-08T12:10:40.787'\"}, "
                        "format: {$const: \"America/New_York\"}}}")) == expr->serialize(false)))
@@ -1152,7 +1223,9 @@ TEST(CstPipelineTranslationTest, TranslatesIndexOfCP) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::indexOfCP,
          CNode{CNode::ArrayChildren{CNode{UserString{"ABC"}}, CNode{UserString{"B"}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$indexOfCP: [{$const: \"ABC\"}, {$const: \"B\"}]}")) ==
         expr->serialize(false)))
@@ -1163,7 +1236,9 @@ TEST(CstPipelineTranslationTest, TranslatesIndexOfBytes) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::indexOfBytes,
          CNode{CNode::ArrayChildren{CNode{UserString{"ABC"}}, CNode{UserString{"B"}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$indexOfBytes: [{$const: \"ABC\"}, {$const: \"B\"}]}")) ==
         expr->serialize(false)))
@@ -1174,7 +1249,9 @@ TEST(CstPipelineTranslationTest, TranslatesSplit) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::split,
          CNode{CNode::ArrayChildren{CNode{UserString{"sapalaiat"}}, CNode{UserString{"a"}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$split: [{$const: \"sapalaiat\"}, {$const: \"a\"}]}")) ==
         expr->serialize(false)))
@@ -1184,7 +1261,9 @@ TEST(CstPipelineTranslationTest, TranslatesSplit) {
 TEST(CstPipelineTranslationTest, TranslatesStrLenBytes) {
     const auto cst =
         CNode{CNode::ObjectChildren{{KeyFieldname::strLenBytes, CNode{UserString{"four"}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$strLenBytes: [{$const: \"four\"}]}")) == expr->serialize(false)))
         << expr->serialize(false);
@@ -1193,7 +1272,9 @@ TEST(CstPipelineTranslationTest, TranslatesStrLenBytes) {
 TEST(CstPipelineTranslationTest, TranslatesStrLenCP) {
     const auto cst =
         CNode{CNode::ObjectChildren{{KeyFieldname::strLenCP, CNode{UserString{"four"}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$strLenCP: [{$const: \"four\"}]}")) ==
                                            expr->serialize(false)))
         << expr->serialize(false);
@@ -1203,7 +1284,9 @@ TEST(CstPipelineTranslationTest, TranslatesStrCaseCmp) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::strcasecmp,
          CNode{CNode::ArrayChildren{CNode{UserString{"100"}}, CNode{UserString{"2"}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$strcasecmp: [{$const: \"100\"}, {$const: \"2\"}]}")) ==
         expr->serialize(false)))
@@ -1215,7 +1298,9 @@ TEST(CstPipelineTranslationTest, DesugarsSubstrToSubstrBytes) {
         {KeyFieldname::substr,
          CNode{CNode::ArrayChildren{
              CNode{UserString{"abc"}}, CNode{UserInt{0}}, CNode{UserString{"a"}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$substrBytes: [{$const: \"abc\"}, {$const: 0}, {$const: \"a\"}]}")) ==
         expr->serialize(false)))
@@ -1227,7 +1312,9 @@ TEST(CstPipelineTranslationTest, TranslatesSubstrBytes) {
         {KeyFieldname::substrBytes,
          CNode{CNode::ArrayChildren{
              CNode{UserString{"abc"}}, CNode{UserInt{0}}, CNode{UserString{"a"}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$substrBytes: [{$const: \"abc\"}, {$const: 0}, {$const: \"a\"}]}")) ==
         expr->serialize(false)))
@@ -1239,7 +1326,9 @@ TEST(CstPipelineTranslationTest, TranslatesSubstrCP) {
         {KeyFieldname::substrCP,
          CNode{CNode::ArrayChildren{
              CNode{UserString{"abc"}}, CNode{UserInt{0}}, CNode{UserString{"a"}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$substrCP: [{$const: \"abc\"}, {$const: 0}, {$const: \"a\"}]}")) ==
         expr->serialize(false)))
@@ -1249,7 +1338,9 @@ TEST(CstPipelineTranslationTest, TranslatesSubstrCP) {
 TEST(CstPipelineTranslationTest, TranslatesToLower) {
     const auto cst =
         CNode{CNode::ObjectChildren{{KeyFieldname::toLower, CNode{UserString{"ABC"}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$toLower: [{$const: \"ABC\"}]}")) ==
                                            expr->serialize(false)))
         << expr->serialize(false);
@@ -1258,7 +1349,9 @@ TEST(CstPipelineTranslationTest, TranslatesToLower) {
 TEST(CstPipelineTranslationTest, TranslatesToUpper) {
     const auto cst =
         CNode{CNode::ObjectChildren{{KeyFieldname::toUpper, CNode{UserString{"EZ as 123"}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$toUpper: [{$const: \"EZ as 123\"}]}")) == expr->serialize(false)))
         << expr->serialize(false);
@@ -1272,7 +1365,9 @@ TEST(CstPipelineTranslationTest, TranslatesRegexFind) {
                                          {KeyFieldname::regexArg, CNode{UserRegex{".*", "i"}}},
                                          {KeyFieldname::optionsArg, CNode{KeyValue::absentKey}},
                                      }}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$regexFind: {input: {$const: \"aeiou\"}, regex: {$const: /.*/i}}}")) ==
         expr->serialize(false)))
@@ -1287,7 +1382,9 @@ TEST(CstPipelineTranslationTest, TranslatesRegexFindAll) {
                                          {KeyFieldname::regexArg, CNode{UserRegex{".*", "i"}}},
                                          {KeyFieldname::optionsArg, CNode{KeyValue::absentKey}},
                                      }}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$regexFindAll: {input: {$const: \"aeiou\"}, regex: {$const: /.*/i}}}")) ==
         expr->serialize(false)))
@@ -1302,7 +1399,9 @@ TEST(CstPipelineTranslationTest, TranslatesRegexMatch) {
                                          {KeyFieldname::regexArg, CNode{UserRegex{".*", "i"}}},
                                          {KeyFieldname::optionsArg, CNode{KeyValue::absentKey}},
                                      }}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$regexMatch: {input: {$const: \"aeiou\"}, regex: {$const: /.*/i}}}")) ==
         expr->serialize(false)))
@@ -1316,7 +1415,9 @@ TEST(CstPipelineTranslationTest, TranslatesSlice) {
              CNode{CNode::ArrayChildren{CNode{UserInt{1}}, CNode{UserInt{2}}, CNode{UserInt{3}}}},
              CNode{UserInt{-2}},
          }}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$slice: [[{$const: 1}, {$const: 2}, {$const: 3}], {$const: -2}]}")) ==
         expr->serialize(false)))
@@ -1325,7 +1426,9 @@ TEST(CstPipelineTranslationTest, TranslatesSlice) {
 
 TEST(CstPipelineTranslationTest, TranslatesMeta) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::meta, CNode{KeyValue::textScore}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$meta: \"textScore\"}")) ==
                                            expr->serialize(false)))
         << expr->serialize(false);
@@ -1334,83 +1437,33 @@ TEST(CstPipelineTranslationTest, TranslatesMeta) {
 TEST(CstPipelineTranslationTest, RecognizesSingleDollarAsNonConst) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::trunc,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("val")}},
-                                    CNode{AggregationPath{make_vector<std::string>("places")}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("val")}},
+                                    CNode{AggregationPath{makeVector<std::string>("places")}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$trunc: [\"$val\", \"$places\"]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, RecognizesDoubleDollarAsNonConst) {
     const auto cst = CNode{CNode::ObjectChildren{
-        {KeyFieldname::toDate, CNode{AggregationVariablePath{make_vector<std::string>("NOW")}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+        {KeyFieldname::toDate, CNode{AggregationVariablePath{makeVector<std::string>("NOW")}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$convert: {input: \"$$NOW\", to: {$const: 'date'}}}")) ==
         expr->serialize(false)));
 }
 
-TEST(CstSortTranslationTest, BasicSortGeneratesCorrectSortPattern) {
-    const auto cst =
-        CNode{CNode::ObjectChildren{{UserFieldname{"val"}, CNode{KeyValue::intOneKey}}}};
-    auto expCtx = getExpCtx();
-    auto pattern = cst_sort_translation::translateSortSpec(cst, expCtx);
-    auto correctPattern = SortPattern(fromjson("{val: 1}"), expCtx);
-    assertSortPatternsEQ(correctPattern, pattern);
-}
-
-TEST(CstSortTranslationTest, MultiplePartSortGeneratesCorrectSortPattern) {
-    {
-        const auto cst =
-            CNode{CNode::ObjectChildren{{UserFieldname{"val"}, CNode{KeyValue::intOneKey}},
-                                        {UserFieldname{"test"}, CNode{KeyValue::intNegOneKey}}}};
-        auto expCtx = getExpCtx();
-        auto pattern = cst_sort_translation::translateSortSpec(cst, expCtx);
-        auto correctPattern = SortPattern(fromjson("{val: 1, test: -1}"), expCtx);
-        assertSortPatternsEQ(correctPattern, pattern);
-    }
-    {
-        const auto cst =
-            CNode{CNode::ObjectChildren{{UserFieldname{"val"}, CNode{KeyValue::doubleOneKey}},
-                                        {UserFieldname{"test"}, CNode{KeyValue::intNegOneKey}},
-                                        {UserFieldname{"third"}, CNode{KeyValue::longNegOneKey}}}};
-        auto expCtx = getExpCtx();
-        auto pattern = cst_sort_translation::translateSortSpec(cst, expCtx);
-        auto correctPattern = SortPattern(fromjson("{val: 1, test: -1, third: -1}"), expCtx);
-        assertSortPatternsEQ(correctPattern, pattern);
-    }
-}
-
-TEST(CstSortTranslationTest, SortWithMetaGeneratesCorrectSortPattern) {
-    {
-        const auto cst = CNode{CNode::ObjectChildren{
-            {UserFieldname{"val"},
-             CNode{
-                 CNode::ObjectChildren{{KeyFieldname::meta, CNode{KeyValue::randVal}}},
-             }}}};
-        auto expCtx = getExpCtx();
-        auto pattern = cst_sort_translation::translateSortSpec(cst, expCtx);
-        auto correctPattern = SortPattern(fromjson("{val: {$meta: \"randVal\"}}"), expCtx);
-        assertSortPatternsEQ(correctPattern, pattern);
-    }
-    {
-        const auto cst = CNode{CNode::ObjectChildren{
-            {UserFieldname{"val"},
-             CNode{
-                 CNode::ObjectChildren{{KeyFieldname::meta, CNode{KeyValue::textScore}}},
-             }}}};
-        auto expCtx = getExpCtx();
-        auto pattern = cst_sort_translation::translateSortSpec(cst, expCtx);
-        auto correctPattern = SortPattern(fromjson("{val: {$meta: \"textScore\"}}"), expCtx);
-        assertSortPatternsEQ(correctPattern, pattern);
-    }
-}
-
 TEST(CstPipelineTranslationTest, AllElementsTrueTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::allElementsTrue,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$allElementsTrue: [\"$set\"]}")) ==
                                            expr->serialize(false)));
 }
@@ -1418,8 +1471,10 @@ TEST(CstPipelineTranslationTest, AllElementsTrueTest) {
 TEST(CstPipelineTranslationTest, AnyElementsTrueTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::anyElementTrue,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$anyElementTrue: [\"$set\"]}")) ==
                                            expr->serialize(false)));
 }
@@ -1427,9 +1482,11 @@ TEST(CstPipelineTranslationTest, AnyElementsTrueTest) {
 TEST(CstPipelineTranslationTest, SetDifferenceTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::setDifference,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set2"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set2"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$setDifference: [\"$set\", \"$set2\"]}")) == expr->serialize(false)));
 }
@@ -1437,9 +1494,11 @@ TEST(CstPipelineTranslationTest, SetDifferenceTest) {
 TEST(CstPipelineTranslationTest, SetEqualsTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::setEquals,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set2"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set2"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$setEquals: [\"$set\", \"$set2\"]}")) ==
                                            expr->serialize(false)));
 }
@@ -1447,10 +1506,12 @@ TEST(CstPipelineTranslationTest, SetEqualsTest) {
 TEST(CstPipelineTranslationTest, SetIntersectionTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::setIntersection,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set2"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set3"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set2"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set3"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$setIntersection: [\"$set\", \"$set2\", \"$set3\"]}")) ==
         expr->serialize(false)));
@@ -1459,9 +1520,11 @@ TEST(CstPipelineTranslationTest, SetIntersectionTest) {
 TEST(CstPipelineTranslationTest, SetIsSubsetTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::setIsSubset,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set2"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set2"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$setIsSubset: [\"$set\", \"$set2\"]}")) == expr->serialize(false)));
 }
@@ -1469,10 +1532,12 @@ TEST(CstPipelineTranslationTest, SetIsSubsetTest) {
 TEST(CstPipelineTranslationTest, SetUnionTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::setUnion,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set2"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set3"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set2"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set3"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$setUnion: [\"$set\", \"$set2\", \"$set3\"]}")) ==
         expr->serialize(false)));
@@ -1480,84 +1545,108 @@ TEST(CstPipelineTranslationTest, SetUnionTest) {
 
 TEST(CstPipelineTranslationTest, SinTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::sin, CNode{UserDouble{0.927}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$sin: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, CosTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::cos, CNode{UserDouble{0.927}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$cos: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, TanTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::tan, CNode{UserDouble{0.927}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$tan: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, SinhTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::sinh, CNode{UserDouble{0.927}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$sinh: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, CoshTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::cosh, CNode{UserDouble{0.927}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$cosh: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, TanhTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::tanh, CNode{UserDouble{0.927}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$tanh: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, AsinTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::asin, CNode{UserDouble{0.927}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$asin: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, AcosTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::acos, CNode{UserDouble{0.927}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$acos: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, AtanTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::atan, CNode{UserDouble{0.927}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$atan: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, AsinhTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::asinh, CNode{UserDouble{0.927}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$asinh: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, AcoshTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::acosh, CNode{UserDouble{0.927}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$acosh: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
 }
 
 TEST(CstPipelineTranslationTest, AtanhTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{{KeyFieldname::atanh, CNode{UserDouble{0.927}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$atanh: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
 }
@@ -1565,7 +1654,9 @@ TEST(CstPipelineTranslationTest, AtanhTranslationTest) {
 TEST(CstPipelineTranslationTest, DegreesToRadiansTranslationTest) {
     const auto cst =
         CNode{CNode::ObjectChildren{{KeyFieldname::degreesToRadians, CNode{UserInt{30}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$degreesToRadians: [{$const: 30}]}")) ==
                                            expr->serialize(false)));
 }
@@ -1574,7 +1665,9 @@ TEST(CstPipelineTranslationTest, RadiansToDegreesTranslationTest) {
     const auto cst =
         CNode{CNode::ObjectChildren{{KeyFieldname::radiansToDegrees,
                                      CNode{UserDecimal{"0.9272952180016122324285124629224290"}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$radiansToDegrees: [{$const: "
                        "NumberDecimal(\"0.9272952180016122324285124629224290\")}]}")) ==
@@ -1584,9 +1677,584 @@ TEST(CstPipelineTranslationTest, RadiansToDegreesTranslationTest) {
 TEST(CstPipelineTranslationTest, SinArrayTranslationTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::sin, CNode{CNode::ArrayChildren{CNode{UserDouble{0.927}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$sin: [{$const: 0.927}]}")) ==
                                            expr->serialize(false)));
+}
+
+TEST(CstPipelineTranslationTest, TranslatesDateToPartsExpression) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::dateToParts,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+             {KeyFieldname::iso8601Arg, CNode{UserBoolean{false}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$dateToParts: {date: \"$date\", timezone: "
+                       "{$const: \"America/New_York\"}, iso8601: {$const: false}}}")) ==
+        expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesDateFromPartsExpressionNonIso) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::dateFromParts,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::yearArg, CNode{AggregationPath{makeVector<std::string>("year")}}},
+             {KeyFieldname::monthArg, CNode{AggregationPath{makeVector<std::string>("month")}}},
+             {KeyFieldname::dayArg, CNode{AggregationPath{makeVector<std::string>("day")}}},
+             {KeyFieldname::hourArg, CNode{AggregationPath{makeVector<std::string>("hour")}}},
+             {KeyFieldname::minuteArg, CNode{AggregationPath{makeVector<std::string>("minute")}}},
+             {KeyFieldname::secondArg, CNode{AggregationPath{makeVector<std::string>("second")}}},
+             {KeyFieldname::millisecondArg,
+              CNode{AggregationPath{makeVector<std::string>("millisecond")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$dateFromParts: {year: \"$year\", month: \"$month\", day: \"$day\", "
+                       "hour: \"$hour\", minute: \"$minute\", second: \"$second\","
+                       "millisecond: \"$millisecond\",  timezone: "
+                       "{$const: \"America/New_York\"}}}")) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesDateFromPartsExpressionIso) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::dateFromParts,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::isoWeekYearArg,
+              CNode{AggregationPath{makeVector<std::string>("isoWeekYear")}}},
+             {KeyFieldname::isoWeekArg, CNode{AggregationPath{makeVector<std::string>("isoWeek")}}},
+             {KeyFieldname::isoDayOfWeekArg,
+              CNode{AggregationPath{makeVector<std::string>("isoDayOfWeek")}}},
+             {KeyFieldname::hourArg, CNode{AggregationPath{makeVector<std::string>("hour")}}},
+             {KeyFieldname::minuteArg, CNode{AggregationPath{makeVector<std::string>("minute")}}},
+             {KeyFieldname::secondArg, CNode{AggregationPath{makeVector<std::string>("second")}}},
+             {KeyFieldname::millisecondArg,
+              CNode{AggregationPath{makeVector<std::string>("millisecond")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$dateFromParts: {hour: \"$hour\", minute: \"$minute\","
+                       "second: \"$second\", millisecond: \"$millisecond\","
+                       "isoWeekYear: \"$isoWeekYear\", isoWeek: \"$isoWeek\","
+                       "isoDayOfWeek: \"$isoDayOfWeek\", timezone: "
+                       "{$const: \"America/New_York\"}}}")) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesDayOfMonthExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::dayOfMonth,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$dayOfMonth: {date: \"$date\", timezone: "
+                       "{$const: \"America/New_York\"}}}")) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesDayOfMonthExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::dayOfMonth, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$dayOfMonth" << BSON(
+                       "date" << BSON("$const" << Date_t::fromMillisSinceEpoch(12345678))))) ==
+        expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesDayOfWeekExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::dayOfWeek,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$dayOfWeek: {date: \"$date\", timezone: "
+                       "{$const: \"America/New_York\"}}}")) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesDayOfWeekExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::dayOfWeek, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$dayOfWeek" << BSON("date" << BSON("$const" << Date_t::fromMillisSinceEpoch(
+                                                           12345678))))) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesDayOfYearExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::dayOfYear,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$dayOfYear: {date: \"$date\", timezone: "
+                       "{$const: \"America/New_York\"}}}")) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesDayOfYearExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::dayOfYear, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$dayOfYear" << BSON("date" << BSON("$const" << Date_t::fromMillisSinceEpoch(
+                                                           12345678))))) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesHourExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::hour,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$hour: {date: \"$date\", timezone: "
+                                                          "{$const: \"America/New_York\"}}}")) ==
+                                           expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesHourExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::hour, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$hour" << BSON("date" << BSON("$const" << Date_t::fromMillisSinceEpoch(
+                                                      12345678))))) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesIsoDayOfWeekExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::isoDayOfWeek,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$isoDayOfWeek: {date: \"$date\", timezone: "
+                       "{$const: \"America/New_York\"}}}")) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesIsoDayOfWeekExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::isoDayOfWeek, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$isoDayOfWeek"
+                   << BSON("date" << BSON("$const" << Date_t::fromMillisSinceEpoch(12345678))))) ==
+        expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesIsoWeekExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::isoWeek,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$isoWeek: {date: \"$date\", timezone: "
+                                                          "{$const: \"America/New_York\"}}}")) ==
+                                           expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesIsoWeekExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::isoWeek, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$isoWeek" << BSON("date" << BSON("$const" << Date_t::fromMillisSinceEpoch(
+                                                         12345678))))) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesIsoWeekYearExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::isoWeekYear,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$isoWeekYear: {date: \"$date\", timezone: "
+                       "{$const: \"America/New_York\"}}}")) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesIsoWeekYearExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::isoWeekYear, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$isoWeekYear" << BSON(
+                       "date" << BSON("$const" << Date_t::fromMillisSinceEpoch(12345678))))) ==
+        expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesMillisecondExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::millisecond,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$millisecond: {date: \"$date\", timezone: "
+                       "{$const: \"America/New_York\"}}}")) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesMillisecondExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::millisecond, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$millisecond" << BSON(
+                       "date" << BSON("$const" << Date_t::fromMillisSinceEpoch(12345678))))) ==
+        expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesMinuteExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::minute,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$minute: {date: \"$date\", timezone: "
+                                                          "{$const: \"America/New_York\"}}}")) ==
+                                           expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesMinuteExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::minute, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$minute" << BSON("date" << BSON("$const" << Date_t::fromMillisSinceEpoch(
+                                                        12345678))))) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesMonthExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::month,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$month: {date: \"$date\", timezone: "
+                                                          "{$const: \"America/New_York\"}}}")) ==
+                                           expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesMonthExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::month, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$month" << BSON("date" << BSON("$const" << Date_t::fromMillisSinceEpoch(
+                                                       12345678))))) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesSecondExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::second,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$second: {date: \"$date\", timezone: "
+                                                          "{$const: \"America/New_York\"}}}")) ==
+                                           expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesSecondExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::second, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$second" << BSON("date" << BSON("$const" << Date_t::fromMillisSinceEpoch(
+                                                        12345678))))) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesWeekExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::week,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$week: {date: \"$date\", timezone: "
+                                                          "{$const: \"America/New_York\"}}}")) ==
+                                           expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesWeekExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::week, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$week" << BSON("date" << BSON("$const" << Date_t::fromMillisSinceEpoch(
+                                                      12345678))))) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesYearExpressionArgsDoc) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::year,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::dateArg, CNode{AggregationPath{makeVector<std::string>("date")}}},
+             {KeyFieldname::timezoneArg, CNode{UserString{"America/New_York"}}},
+         }}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$year: {date: \"$date\", timezone: "
+                                                          "{$const: \"America/New_York\"}}}")) ==
+                                           expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, TranslatesYearExpressionArgsExpr) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::year, CNode{UserDate{Date_t::fromMillisSinceEpoch(12345678)}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(BSON("$year" << BSON("date" << BSON("$const" << Date_t::fromMillisSinceEpoch(
+                                                      12345678))))) == expr->serialize(false)))
+        << expr->serialize(false);
+}
+
+TEST(CstPipelineTranslationTest, ArrayElemAtTranslationTest) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::arrayElemAt,
+         CNode{CNode::ArrayChildren{
+             CNode{CNode::ArrayChildren{CNode{UserInt{0}}, CNode{UserInt{1}}, CNode{UserInt{42}}}},
+             CNode{UserInt{2}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson(
+            "{$arrayElemAt: [ [{$const: 0}, {$const: 1}, {$const: 42}], {$const: 2} ]}")) ==
+        expr->serialize(false)));
+}
+
+TEST(CstPipelineTranslationTest, ArrayToObjectTranslationTest) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::arrayToObject,
+         CNode{CNode::ArrayChildren{
+             CNode{CNode::ArrayChildren{CNode{UserInt{0}}, CNode{UserInt{1}}}},
+             CNode{CNode::ArrayChildren{CNode{UserInt{42}}, CNode{UserInt{2}}}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson(
+            "{$arrayToObject: [ [{$const: 0}, {$const: 1}], [{$const: 42}, {$const: 2}] ]}")) ==
+        expr->serialize(false)));
+}
+
+TEST(CstPipelineTranslationTest, ConcatArraysTranslationTest) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::concatArrays,
+         CNode{CNode::ArrayChildren{
+             CNode{CNode::ArrayChildren{CNode{UserInt{0}}, CNode{UserInt{1}}}},
+             CNode{CNode::ArrayChildren{CNode{UserInt{42}}, CNode{UserInt{2}}}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson(
+            "{$concatArrays: [ [{$const: 0}, {$const: 1}], [{$const: 42}, {$const: 2}] ]}")) ==
+        expr->serialize(false)));
+}
+
+TEST(CstPipelineTranslationTest, FilterTranslationTest) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::filter,
+         CNode{CNode::ObjectChildren{
+             {KeyFieldname::inputArg,
+              CNode{CNode::ArrayChildren{CNode{UserInt{42}}, CNode{UserInt{2}}}}},
+             {KeyFieldname::asArg, CNode{UserString{"myVar"}}},
+             {KeyFieldname::condArg,
+              CNode{CNode::ObjectChildren{
+                  {KeyFieldname::gt,
+                   CNode{CNode::ArrayChildren{
+                       CNode{AggregationVariablePath{makeVector<std::string>("myVar")}},
+                       CNode{UserDouble{2.5}}}}}}}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$filter: { input: [ {$const: 42}, {$const: 2}  ], as: \"myVar\","
+                       "cond: { $gt: [\"$$myVar\", {$const: 2.5}] }}}")) ==
+        expr->serialize(false)));
+}
+
+TEST(CstPipelineTranslationTest, InTranslationTest) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::in,
+         CNode{CNode::ArrayChildren{
+             CNode{UserInt{1}},
+             CNode{CNode::ArrayChildren{CNode{UserInt{1}}, CNode{UserInt{2}}}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = mongo::cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$in: [ {$const: 1}, [ {$const: 1}, {$const: 2} ] ]}")) ==
+        expr->serialize(false)));
+}
+
+TEST(CstPipelineTranslationTest, IndexOfArrayTranslationTest) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::indexOfArray,
+         CNode{
+             CNode::ArrayChildren{CNode{CNode::ArrayChildren{CNode{UserInt{1}}, CNode{UserInt{2}}}},
+                                  CNode{UserInt{1}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = mongo::cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$indexOfArray: [ [ {$const: 1}, {$const: 2} ], {$const: 1}]}")) ==
+        expr->serialize(false)));
+}
+
+TEST(CstPipelineTranslationTest, FirstTranslationTest) {
+    const auto cst = CNode{CNode::ObjectChildren{
+        {KeyFieldname::first, CNode{CNode::ArrayChildren{CNode{UserInt{1}}, CNode{UserInt{2}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr = mongo::cst_pipeline_translation::translateExpression(
+        cst, expCtx.get(), expCtx->variablesParseState);
+    ASSERT_TRUE(ValueComparator().evaluate(
+        Value(fromjson("{$first: [ {$const: 1}, {$const: 2} ]}")) == expr->serialize(false)));
+}
+
+TEST(CstPipelineTranslationTest, IsArrayTranslationTest) {
+    {
+        const auto cst = CNode{CNode::ObjectChildren{
+            {KeyFieldname::isArray, CNode{CNode::ArrayChildren{CNode{UserInt{1}}}}}}};
+        auto expCtx = getExpCtx();
+        auto expr = mongo::cst_pipeline_translation::translateExpression(
+            cst, expCtx.get(), expCtx->variablesParseState);
+        ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$isArray: [{$const: 1}] }")) ==
+                                               expr->serialize(false)));
+    }
+    {
+        const auto cst = CNode{CNode::ObjectChildren{
+            {KeyFieldname::isArray,
+             CNode{CNode::ArrayChildren{CNode{CNode::ArrayChildren{CNode{UserInt{1}}}}}}}}};
+        auto expCtx = getExpCtx();
+        auto expr = mongo::cst_pipeline_translation::translateExpression(
+            cst, expCtx.get(), expCtx->variablesParseState);
+        ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$isArray: [[{$const: 1}]] }")) ==
+                                               expr->serialize(false)));
+    }
+    {
+        const auto cst = CNode{CNode::ObjectChildren{
+            {KeyFieldname::isArray, CNode{AggregationPath{makeVector<std::string>("myPath")}}}}};
+        auto expCtx = getExpCtx();
+        auto expr = mongo::cst_pipeline_translation::translateExpression(
+            cst, expCtx.get(), expCtx->variablesParseState);
+        ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$isArray: [\"$myPath\"] }")) ==
+                                               expr->serialize(false)));
+    }
 }
 }  // namespace
 }  // namespace mongo

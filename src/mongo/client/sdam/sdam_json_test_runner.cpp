@@ -85,10 +85,10 @@ public:
             const auto bsonIsMaster = pair[1].Obj();
 
             if (bsonIsMaster.nFields() == 0) {
-                _isMasterResponses.push_back(IsMasterOutcome(address, BSONObj(), "network error"));
+                _isMasterResponses.push_back(HelloOutcome(address, BSONObj(), "network error"));
             } else {
                 _isMasterResponses.push_back(
-                    IsMasterOutcome(address, bsonIsMaster, duration_cast<IsMasterRTT>(kLatency)));
+                    HelloOutcome(address, bsonIsMaster, duration_cast<HelloRTT>(kLatency)));
             }
         }
         _topologyOutcome = phase["outcome"].Obj();
@@ -418,7 +418,7 @@ private:
 
     MongoURI _testUri;
     int _phaseNum;
-    std::vector<IsMasterOutcome> _isMasterResponses;
+    std::vector<HelloOutcome> _isMasterResponses;
     BSONObj _topologyOutcome;
 };
 
@@ -569,7 +569,7 @@ public:
             LOGV2(20209, "### Failed Test Results ###");
         }
 
-        for (const auto result : results) {
+        for (const auto& result : results) {
             auto file = result.file;
             auto testName = result.name;
             auto phaseResults = result.phaseResults;

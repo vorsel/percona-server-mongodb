@@ -47,6 +47,114 @@ namespace {
 const ServiceContext::Decoration<CollectionCatalog> getCatalog =
     ServiceContext::declareDecoration<CollectionCatalog>();
 
+/**
+ * Decoration on OperationContext to store cloned Collections until they are committed or rolled
+ * back TODO SERVER-51236: This should be merged with UncommittedCollections
+ */
+class UncommittedWritableCollections {
+public:
+    using CommitFn = std::function<void(boost::optional<Timestamp>)>;
+
+    /**
+     * Lookup of Collection by UUID
+     */
+    Collection* lookup(CollectionUUID uuid) const {
+        auto it = std::find_if(_collections.begin(), _collections.end(), [uuid](auto&& entry) {
+            if (!entry.collection)
+                return false;
+            return entry.collection->uuid() == uuid;
+        });
+        if (it == _collections.end())
+            return nullptr;
+        return it->collection.get();
+    }
+
+    /**
+     * Lookup of Collection by NamespaceString. The boolean indicates if something was found, if
+     * this is a drop the Collection pointer may be nullptr
+     */
+    std::pair<bool, Collection*> lookup(const NamespaceString& nss) const {
+        auto it = std::find_if(_collections.begin(), _collections.end(), [&nss](auto&& entry) {
+            return entry.nss == nss;
+        });
+        if (it == _collections.end())
+            return {false, nullptr};
+        return {true, it->collection.get()};
+    }
+
+    /**
+     * Manage the lifetime of uncommitted writable collection
+     */
+    void insert(std::shared_ptr<Collection> collection) {
+        auto nss = collection->ns();
+        _collections.push_back(Entry{std::move(collection), std::move(nss)});
+    }
+
+    /**
+     * Manage an uncommitted rename, the provided commit handler will execute under the same
+     * critical section under which the rename is committed into the catalog
+     */
+    void rename(const Collection* collection, const NamespaceString& from, CommitFn commitHandler) {
+        auto it =
+            std::find_if(_collections.begin(), _collections.end(), [collection](auto&& entry) {
+                return entry.collection.get() == collection;
+            });
+        if (it == _collections.end())
+            return;
+        it->nss = collection->ns();
+        it->commitHandlers.push_back(std::move(commitHandler));
+        _collections.push_back(Entry{nullptr, from});
+    }
+
+    /**
+     * Remove a managed collection. Return the shared_ptr and all installed commit handlers
+     */
+    std::pair<std::shared_ptr<Collection>, std::vector<CommitFn>> remove(Collection* collection) {
+        auto it =
+            std::find_if(_collections.begin(), _collections.end(), [collection](auto&& entry) {
+                return entry.collection.get() == collection;
+            });
+        if (it == _collections.end())
+            return {nullptr, {}};
+        auto coll = std::move(it->collection);
+        auto commitHandlers = std::move(it->commitHandlers);
+        _collections.erase(it);
+        return {std::move(coll), std::move(commitHandlers)};
+    }
+
+    /**
+     * Remove managed collection by namespace
+     */
+    void remove(const NamespaceString& nss) {
+        auto it = std::find_if(_collections.begin(), _collections.end(), [&nss](auto&& entry) {
+            return entry.nss == nss;
+        });
+        if (it != _collections.end())
+            _collections.erase(it);
+    }
+
+private:
+    struct Entry {
+        // Storage for the actual collection
+        std::shared_ptr<Collection> collection;
+
+        // Store namespace separately in case this is a pending drop of the collection
+        NamespaceString nss;
+
+        // Extra commit handlers to run under the same catalog lock where we install the collection
+        // into the catalog
+        std::vector<CommitFn> commitHandlers;
+    };
+
+    // Store entries in vector, we will do linear search to find what we're looking for but it will
+    // be very few entries so it should be fine.
+    std::vector<Entry> _collections;
+};
+
+const OperationContext::Decoration<UncommittedWritableCollections>
+    getUncommittedWritableCollections =
+        OperationContext::declareDecoration<UncommittedWritableCollections>();
+
 class FinishDropCollectionChange : public RecoveryUnit::Change {
 public:
     FinishDropCollectionChange(CollectionCatalog* catalog,
@@ -70,10 +178,11 @@ private:
 
 }  // namespace
 
-CollectionCatalog::iterator::iterator(StringData dbName,
+CollectionCatalog::iterator::iterator(OperationContext* opCtx,
+                                      StringData dbName,
                                       uint64_t genNum,
                                       const CollectionCatalog& catalog)
-    : _dbName(dbName), _genNum(genNum), _catalog(&catalog) {
+    : _opCtx(opCtx), _dbName(dbName), _genNum(genNum), _catalog(&catalog) {
     auto minUuid = UUID::parse("00000000-0000-0000-0000-000000000000").getValue();
 
     stdx::lock_guard<Latch> lock(_catalog->_catalogLock);
@@ -89,18 +198,21 @@ CollectionCatalog::iterator::iterator(StringData dbName,
     }
 }
 
-CollectionCatalog::iterator::iterator(std::map<std::pair<std::string, CollectionUUID>,
-                                               std::shared_ptr<Collection>>::const_iterator mapIter)
-    : _mapIter(mapIter) {}
+CollectionCatalog::iterator::iterator(OperationContext* opCtx,
+                                      std::map<std::pair<std::string, CollectionUUID>,
+                                               std::shared_ptr<Collection>>::const_iterator mapIter,
+                                      uint64_t genNum,
+                                      const CollectionCatalog& catalog)
+    : _opCtx(opCtx), _genNum(genNum), _mapIter(mapIter), _catalog(&catalog) {}
 
 CollectionCatalog::iterator::value_type CollectionCatalog::iterator::operator*() {
     stdx::lock_guard<Latch> lock(_catalog->_catalogLock);
     _repositionIfNeeded();
     if (_exhausted()) {
-        return _nullCollection;
+        return CollectionPtr();
     }
 
-    return _mapIter->second.get();
+    return {_opCtx, _mapIter->second.get(), LookupCollectionForYieldRestore()};
 }
 
 Collection* CollectionCatalog::iterator::getWritableCollection(OperationContext* opCtx,
@@ -208,32 +320,47 @@ void CollectionCatalog::setCollectionNamespace(OperationContext* opCtx,
     // manager locks) are held. The purpose of this function is ensure that we write to the
     // Collection's namespace string under '_catalogLock'.
     invariant(coll);
-    stdx::lock_guard<Latch> lock(_catalogLock);
-
     coll->setNs(toCollection);
 
-    _collections[toCollection] = _collections[fromCollection];
-    _collections.erase(fromCollection);
+    auto& uncommittedWritableCollections = getUncommittedWritableCollections(opCtx);
+    uncommittedWritableCollections.rename(
+        coll,
+        fromCollection,
+        [this, coll, fromCollection, toCollection](boost::optional<Timestamp> commitTime) {
+            _collections.erase(fromCollection);
 
-    ResourceId oldRid = ResourceId(RESOURCE_COLLECTION, fromCollection.ns());
-    ResourceId newRid = ResourceId(RESOURCE_COLLECTION, toCollection.ns());
+            ResourceId oldRid = ResourceId(RESOURCE_COLLECTION, fromCollection.ns());
+            ResourceId newRid = ResourceId(RESOURCE_COLLECTION, toCollection.ns());
 
-    removeResource(oldRid, fromCollection.ns());
-    addResource(newRid, toCollection.ns());
+            removeResource(oldRid, fromCollection.ns());
+            addResource(newRid, toCollection.ns());
 
-    opCtx->recoveryUnit()->onRollback([this, coll, fromCollection, toCollection] {
-        stdx::lock_guard<Latch> lock(_catalogLock);
-        coll->setNs(fromCollection);
+            // Ban reading from this collection on committed reads on snapshots before now.
+            if (commitTime) {
+                coll->setMinimumVisibleSnapshot(commitTime.get());
+            }
+        });
 
-        _collections[fromCollection] = _collections[toCollection];
-        _collections.erase(toCollection);
+    class RenameChange : public RecoveryUnit::Change {
+    public:
+        RenameChange(UncommittedWritableCollections& uncommittedWritableCollections,
+                     const NamespaceString& from)
+            : _uncommittedWritableCollections(uncommittedWritableCollections), _from(from) {}
 
-        ResourceId oldRid = ResourceId(RESOURCE_COLLECTION, fromCollection.ns());
-        ResourceId newRid = ResourceId(RESOURCE_COLLECTION, toCollection.ns());
+        void commit(boost::optional<Timestamp> timestamp) override {
+            _uncommittedWritableCollections.remove(_from);
+        }
+        void rollback() override {
+            _uncommittedWritableCollections.remove(_from);
+        }
 
-        removeResource(newRid, toCollection.ns());
-        addResource(oldRid, fromCollection.ns());
-    });
+    private:
+        UncommittedWritableCollections& _uncommittedWritableCollections;
+        NamespaceString _from;
+    };
+
+    opCtx->recoveryUnit()->registerChange(
+        std::make_unique<RenameChange>(uncommittedWritableCollections, fromCollection));
 }
 
 void CollectionCatalog::onCloseDatabase(OperationContext* opCtx, std::string dbName) {
@@ -277,9 +404,13 @@ std::shared_ptr<const Collection> CollectionCatalog::lookupCollectionByUUIDForRe
 Collection* CollectionCatalog::lookupCollectionByUUIDForMetadataWrite(OperationContext* opCtx,
                                                                       LifetimeMode mode,
                                                                       CollectionUUID uuid) {
-    if (mode == LifetimeMode::kManagedInWriteUnitOfWork) {
-        // Placeholder to invariant if not in wuow
-        opCtx->recoveryUnit()->onCommit([](boost::optional<Timestamp>) {});
+    if (mode == LifetimeMode::kInplace) {
+        return const_cast<Collection*>(lookupCollectionByUUID(opCtx, uuid).get());
+    }
+
+    auto& uncommittedWritableCollections = getUncommittedWritableCollections(opCtx);
+    if (auto coll = uncommittedWritableCollections.lookup(uuid)) {
+        return coll;
     }
 
     if (auto coll = UncommittedCollections::getForTxn(opCtx, uuid)) {
@@ -287,25 +418,56 @@ Collection* CollectionCatalog::lookupCollectionByUUIDForMetadataWrite(OperationC
         return coll.get();
     }
 
-    stdx::lock_guard<Latch> lock(_catalogLock);
-    auto coll = _lookupCollectionByUUID(lock, uuid);
-    if (coll && coll->isCommitted()) {
-        invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_X));
-        return coll.get();
+    std::shared_ptr<Collection> coll;
+    {
+        stdx::lock_guard<Latch> lock(_catalogLock);
+        coll = _lookupCollectionByUUID(lock, uuid);
+
+        if (!coll || !coll->isCommitted())
+            return nullptr;
     }
 
-    return nullptr;
+    if (coll->ns().isOplog())
+        return coll.get();
+
+    invariant(opCtx->lockState()->isCollectionLockedForMode(coll->ns(), MODE_X));
+    auto cloned = coll->clone();
+    uncommittedWritableCollections.insert(cloned);
+
+    if (mode == LifetimeMode::kManagedInWriteUnitOfWork) {
+        opCtx->recoveryUnit()->onCommit(
+            [this, &uncommittedWritableCollections, clonedPtr = cloned.get()](
+                boost::optional<Timestamp> commitTime) {
+                auto [collection, commitHandlers] =
+                    uncommittedWritableCollections.remove(clonedPtr);
+                if (collection) {
+                    _commitWritableClone(std::move(collection), commitTime, commitHandlers);
+                }
+            });
+        opCtx->recoveryUnit()->onRollback([&uncommittedWritableCollections, cloned]() {
+            uncommittedWritableCollections.remove(cloned.get());
+        });
+    }
+
+    return cloned.get();
 }
 
-const Collection* CollectionCatalog::lookupCollectionByUUID(OperationContext* opCtx,
-                                                            CollectionUUID uuid) const {
+CollectionPtr CollectionCatalog::lookupCollectionByUUID(OperationContext* opCtx,
+                                                        CollectionUUID uuid) const {
+    auto& uncommittedWritableCollections = getUncommittedWritableCollections(opCtx);
+    if (auto coll = uncommittedWritableCollections.lookup(uuid)) {
+        return coll;
+    }
+
     if (auto coll = UncommittedCollections::getForTxn(opCtx, uuid)) {
-        return coll.get();
+        return {opCtx, coll.get(), LookupCollectionForYieldRestore()};
     }
 
     stdx::lock_guard<Latch> lock(_catalogLock);
     auto coll = _lookupCollectionByUUID(lock, uuid);
-    return (coll && coll->isCommitted()) ? coll.get() : nullptr;
+    return (coll && coll->isCommitted())
+        ? CollectionPtr(opCtx, coll.get(), LookupCollectionForYieldRestore())
+        : CollectionPtr();
 }
 
 void CollectionCatalog::makeCollectionVisible(CollectionUUID uuid) {
@@ -340,9 +502,14 @@ std::shared_ptr<const Collection> CollectionCatalog::lookupCollectionByNamespace
 
 Collection* CollectionCatalog::lookupCollectionByNamespaceForMetadataWrite(
     OperationContext* opCtx, LifetimeMode mode, const NamespaceString& nss) {
-    if (mode == LifetimeMode::kManagedInWriteUnitOfWork) {
-        // Placeholder to invariant if not in wuow
-        opCtx->recoveryUnit()->onCommit([](boost::optional<Timestamp>) {});
+    if (mode == LifetimeMode::kInplace || nss.isOplog()) {
+        return const_cast<Collection*>(lookupCollectionByNamespace(opCtx, nss).get());
+    }
+
+    auto& uncommittedWritableCollections = getUncommittedWritableCollections(opCtx);
+    auto [found, uncommittedPtr] = uncommittedWritableCollections.lookup(nss);
+    if (found) {
+        return uncommittedPtr;
     }
 
     if (auto coll = UncommittedCollections::getForTxn(opCtx, nss)) {
@@ -350,31 +517,64 @@ Collection* CollectionCatalog::lookupCollectionByNamespaceForMetadataWrite(
         return coll.get();
     }
 
-    stdx::lock_guard<Latch> lock(_catalogLock);
-    auto it = _collections.find(nss);
-    auto coll = (it == _collections.end() ? nullptr : it->second);
-    if (coll && coll->isCommitted()) {
-        invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
-        return coll.get();
+    std::shared_ptr<Collection> coll;
+    {
+        stdx::lock_guard<Latch> lock(_catalogLock);
+        auto it = _collections.find(nss);
+        coll = (it == _collections.end() ? nullptr : it->second);
+
+        if (!coll || !coll->isCommitted())
+            return nullptr;
     }
 
-    return nullptr;
+    invariant(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_X));
+    auto cloned = coll->clone();
+    uncommittedWritableCollections.insert(cloned);
+
+    if (mode == LifetimeMode::kManagedInWriteUnitOfWork) {
+        opCtx->recoveryUnit()->onCommit(
+            [this, &uncommittedWritableCollections, clonedPtr = cloned.get()](
+                boost::optional<Timestamp> commitTime) {
+                auto [collection, commitHandlers] =
+                    uncommittedWritableCollections.remove(clonedPtr);
+                if (collection) {
+                    _commitWritableClone(std::move(collection), commitTime, commitHandlers);
+                }
+            });
+        opCtx->recoveryUnit()->onRollback([&uncommittedWritableCollections, cloned]() {
+            uncommittedWritableCollections.remove(cloned.get());
+        });
+    }
+
+    return cloned.get();
 }
 
-const Collection* CollectionCatalog::lookupCollectionByNamespace(OperationContext* opCtx,
-                                                                 const NamespaceString& nss) const {
+CollectionPtr CollectionCatalog::lookupCollectionByNamespace(OperationContext* opCtx,
+                                                             const NamespaceString& nss) const {
+    auto& uncommittedWritableCollections = getUncommittedWritableCollections(opCtx);
+    auto [found, uncommittedPtr] = uncommittedWritableCollections.lookup(nss);
+    if (found) {
+        return uncommittedPtr;
+    }
+
     if (auto coll = UncommittedCollections::getForTxn(opCtx, nss)) {
-        return coll.get();
+        return {opCtx, coll.get(), LookupCollectionForYieldRestore()};
     }
 
     stdx::lock_guard<Latch> lock(_catalogLock);
     auto it = _collections.find(nss);
     auto coll = (it == _collections.end() ? nullptr : it->second);
-    return (coll && coll->isCommitted()) ? coll.get() : nullptr;
+    return (coll && coll->isCommitted())
+        ? CollectionPtr(opCtx, coll.get(), LookupCollectionForYieldRestore())
+        : nullptr;
 }
 
 boost::optional<NamespaceString> CollectionCatalog::lookupNSSByUUID(OperationContext* opCtx,
                                                                     CollectionUUID uuid) const {
+    auto& uncommittedWritableCollections = getUncommittedWritableCollections(opCtx);
+    if (auto coll = uncommittedWritableCollections.lookup(uuid)) {
+        return coll->ns();
+    }
     if (auto coll = UncommittedCollections::getForTxn(opCtx, uuid)) {
         return coll->ns();
     }
@@ -400,6 +600,13 @@ boost::optional<NamespaceString> CollectionCatalog::lookupNSSByUUID(OperationCon
 
 boost::optional<CollectionUUID> CollectionCatalog::lookupUUIDByNSS(
     OperationContext* opCtx, const NamespaceString& nss) const {
+    auto& uncommittedWritableCollections = getUncommittedWritableCollections(opCtx);
+    auto [found, uncommittedPtr] = uncommittedWritableCollections.lookup(nss);
+    if (found) {
+        invariant(uncommittedPtr);
+        return uncommittedPtr->uuid();
+    }
+
     if (auto coll = UncommittedCollections::getForTxn(opCtx, nss)) {
         return coll->uuid();
     }
@@ -563,7 +770,8 @@ void CollectionCatalog::registerCollection(CollectionUUID uuid, std::shared_ptr<
     addResource(collRid, ns.ns());
 }
 
-std::shared_ptr<Collection> CollectionCatalog::deregisterCollection(CollectionUUID uuid) {
+std::shared_ptr<Collection> CollectionCatalog::deregisterCollection(OperationContext* opCtx,
+                                                                    CollectionUUID uuid) {
     stdx::lock_guard<Latch> lock(_catalogLock);
 
     invariant(_catalog.find(uuid) != _catalog.end());
@@ -582,6 +790,10 @@ std::shared_ptr<Collection> CollectionCatalog::deregisterCollection(CollectionUU
     _orderedCollections.erase(dbIdPair);
     _collections.erase(ns);
     _catalog.erase(uuid);
+    auto& uncommittedWritableCollections = getUncommittedWritableCollections(opCtx);
+    if (auto writableColl = uncommittedWritableCollections.lookup(uuid)) {
+        uncommittedWritableCollections.remove(writableColl);
+    }
 
     coll->onDeregisterFromCatalog();
 
@@ -589,7 +801,7 @@ std::shared_ptr<Collection> CollectionCatalog::deregisterCollection(CollectionUU
     removeResource(collRid, ns.ns());
 
     // Removal from an ordered map will invalidate iterators and potentially references to the
-    // references to the erased element.
+    // erased element.
     _generationNumber++;
 
     return coll;
@@ -626,12 +838,12 @@ void CollectionCatalog::deregisterAllCollections() {
     _generationNumber++;
 }
 
-CollectionCatalog::iterator CollectionCatalog::begin(StringData db) const {
-    return iterator(db, _generationNumber, *this);
+CollectionCatalog::iterator CollectionCatalog::begin(OperationContext* opCtx, StringData db) const {
+    return iterator(opCtx, db, _generationNumber, *this);
 }
 
-CollectionCatalog::iterator CollectionCatalog::end() const {
-    return iterator(_orderedCollections.end());
+CollectionCatalog::iterator CollectionCatalog::end(OperationContext* opCtx) const {
+    return iterator(opCtx, _orderedCollections.end(), _generationNumber, *this);
 }
 
 boost::optional<std::string> CollectionCatalog::lookupResourceName(const ResourceId& rid) {
@@ -691,12 +903,38 @@ void CollectionCatalog::addResource(const ResourceId& rid, const std::string& en
     namespaces.insert(entry);
 }
 
-void CollectionCatalog::commitUnmanagedClone(Collection* collection) {
-    // TODO SERVER-50145
+void CollectionCatalog::_commitWritableClone(
+    std::shared_ptr<Collection> cloned,
+    boost::optional<Timestamp> commitTime,
+    const std::vector<std::function<void(boost::optional<Timestamp>)>>& commitHandlers) {
+    stdx::lock_guard<Latch> lock(_catalogLock);
+
+    _collections[cloned->ns()] = cloned;
+    _catalog[cloned->uuid()] = cloned;
+    auto dbIdPair = std::make_pair(cloned->ns().db().toString(), cloned->uuid());
+    _orderedCollections[dbIdPair] = cloned;
+
+    for (auto&& commitHandler : commitHandlers) {
+        commitHandler(commitTime);
+    }
 }
 
-void CollectionCatalog::discardUnmanagedClone(Collection* collection) {
-    // TODO SERVER-50145
+void CollectionCatalog::commitUnmanagedClone(OperationContext* opCtx, Collection* collection) {
+    auto& uncommittedWritableCollections = getUncommittedWritableCollections(opCtx);
+    auto [cloned, commitHandlers] = uncommittedWritableCollections.remove(collection);
+    if (cloned) {
+        _commitWritableClone(std::move(cloned), boost::none, commitHandlers);
+    }
+}
+
+void CollectionCatalog::discardUnmanagedClone(OperationContext* opCtx, Collection* collection) {
+    auto& uncommittedWritableCollections = getUncommittedWritableCollections(opCtx);
+    uncommittedWritableCollections.remove(collection);
+}
+
+const Collection* LookupCollectionForYieldRestore::operator()(OperationContext* opCtx,
+                                                              CollectionUUID uuid) const {
+    return CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid).get();
 }
 
 }  // namespace mongo

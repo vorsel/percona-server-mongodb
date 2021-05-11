@@ -164,7 +164,7 @@ TEST_F(WiredTigerKVEngineRepairTest, OrphanedDataFilesCanBeRecovered) {
     boost::filesystem::rename(*dataFilePath, tmpFile, err);
     ASSERT(!err) << err.message();
 
-    ASSERT_OK(_engine->dropIdent(opCtxPtr.get(), opCtxPtr.get()->recoveryUnit(), ident));
+    ASSERT_OK(_engine->dropIdent(opCtxPtr.get()->recoveryUnit(), ident));
 
     // The data file is moved back in place so that it becomes an "orphan" of the storage
     // engine and the restoration process can be tested.
@@ -207,7 +207,7 @@ TEST_F(WiredTigerKVEngineRepairTest, UnrecoverableOrphanedDataFilesAreRebuilt) {
 
     ASSERT(boost::filesystem::exists(*dataFilePath));
 
-    ASSERT_OK(_engine->dropIdent(opCtxPtr.get(), opCtxPtr.get()->recoveryUnit(), ident));
+    ASSERT_OK(_engine->dropIdent(opCtxPtr.get()->recoveryUnit(), ident));
 
 #ifdef _WIN32
     auto status =
@@ -343,6 +343,52 @@ TEST_F(WiredTigerKVEngineTest, TestOplogTruncation) {
     assertPinnedMovesSoon(Timestamp(40, 1));
 
     checkpointer->shutdown({ErrorCodes::ShutdownInProgress, "Test finished"});
+}
+
+TEST_F(WiredTigerKVEngineTest, IdentDrop) {
+#ifdef _WIN32
+    // TODO SERVER-51595: to re-enable this test on Windows.
+    return;
+#endif
+
+    auto opCtxPtr = makeOperationContext();
+
+    NamespaceString nss("a.b");
+    std::string ident = "collection-1234";
+    CollectionOptions defaultCollectionOptions;
+
+    std::unique_ptr<RecordStore> rs;
+    ASSERT_OK(
+        _engine->createRecordStore(opCtxPtr.get(), nss.ns(), ident, defaultCollectionOptions));
+
+    const boost::optional<boost::filesystem::path> dataFilePath =
+        _engine->getDataFilePathForIdent(ident);
+    ASSERT(dataFilePath);
+    ASSERT(boost::filesystem::exists(*dataFilePath));
+
+    _engine->dropIdentForImport(opCtxPtr.get(), ident);
+    ASSERT(boost::filesystem::exists(*dataFilePath));
+
+    // Because the underlying file was not removed, it will be renamed out of the way by WiredTiger
+    // when creating a new table with the same ident.
+    ASSERT_OK(
+        _engine->createRecordStore(opCtxPtr.get(), nss.ns(), ident, defaultCollectionOptions));
+
+    const boost::filesystem::path renamedFilePath = dataFilePath->generic_string() + ".1";
+    ASSERT(boost::filesystem::exists(*dataFilePath));
+    ASSERT(boost::filesystem::exists(renamedFilePath));
+
+    ASSERT_OK(_engine->dropIdent(opCtxPtr.get()->recoveryUnit(), ident));
+
+    // WiredTiger drops files asynchronously.
+    for (size_t check = 0; check < 30; check++) {
+        if (!boost::filesystem::exists(*dataFilePath))
+            break;
+        sleepsecs(1);
+    }
+
+    ASSERT(!boost::filesystem::exists(*dataFilePath));
+    ASSERT(boost::filesystem::exists(renamedFilePath));
 }
 
 std::unique_ptr<KVHarnessHelper> makeHelper() {

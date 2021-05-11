@@ -131,7 +131,7 @@ public:
     void setMyHeartbeatMessage(const std::string&) final;
 
     OpTime getMyLastAppliedOpTime() const final;
-    OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const final;
+    OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime(bool rollbackSafe = false) const final;
 
     OpTime getMyLastDurableOpTime() const final;
     OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const final;
@@ -200,7 +200,7 @@ public:
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) final;
 
-    Status processReplSetUpdatePosition(const UpdatePositionArgs&, long long*) final;
+    Status processReplSetUpdatePosition(const UpdatePositionArgs&) final;
 
     std::vector<HostAndPort> getHostsWrittenTo(const OpTime&, bool) final;
 

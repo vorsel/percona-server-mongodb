@@ -301,10 +301,10 @@ public:
             // We drop and re-acquire these locks every document because md5'ing is expensive
             unique_ptr<AutoGetCollectionForReadCommand> ctx(
                 new AutoGetCollectionForReadCommand(opCtx, nss));
-            const Collection* coll = ctx->getCollection();
+            const CollectionPtr& coll = ctx->getCollection();
 
             auto exec = uassertStatusOK(getExecutor(opCtx,
-                                                    coll,
+                                                    &coll,
                                                     std::move(cq),
                                                     PlanYieldPolicy::YieldPolicy::YIELD_MANUAL,
                                                     QueryPlannerParams::NO_TABLE_SCAN));
@@ -389,7 +389,7 @@ public:
                     }
 
                     // Now that we have the lock again, we can restore the PlanExecutor.
-                    exec->restoreState();
+                    exec->restoreState(&ctx->getCollection());
                 }
             } catch (DBException& exception) {
                 exception.addContext("Executor error during filemd5 command");

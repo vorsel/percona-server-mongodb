@@ -80,7 +80,7 @@ public:
                                   << "unique" << true);
 
         auto collection = std::make_unique<CollectionMock>(NamespaceString(ns));
-        IndexDescriptor desc(collection.get(), "", spec);
+        IndexDescriptor desc("", spec);
         invariant(desc.isIdIndex());
 
         KVPrefix prefix = KVPrefix::kNotPrefixed;
@@ -112,7 +112,7 @@ public:
 
         auto collection = std::make_unique<CollectionMock>(NamespaceString(ns));
 
-        IndexDescriptor& desc = _descriptors.emplace_back(collection.get(), "", spec);
+        IndexDescriptor& desc = _descriptors.emplace_back("", spec);
 
         KVPrefix prefix = KVPrefix::kNotPrefixed;
         StatusWith<std::string> result = WiredTigerIndex::generateCreateString(
@@ -182,17 +182,17 @@ TEST(WiredTigerStandardIndexText, CursorInActiveTxnAfterNext) {
         auto res = cursor->seek(makeKeyStringForSeek(sdi.get(), BSONObj(), true, true));
         ASSERT(res);
 
-        ASSERT_TRUE(ru->inActiveTxn());
+        ASSERT_TRUE(ru->isActive());
 
         // Committing a WriteUnitOfWork will end the current transaction.
         WriteUnitOfWork wuow(opCtx.get());
-        ASSERT_TRUE(ru->inActiveTxn());
+        ASSERT_TRUE(ru->isActive());
         wuow.commit();
-        ASSERT_FALSE(ru->inActiveTxn());
+        ASSERT_FALSE(ru->isActive());
 
         // If a cursor is used after a WUOW commits, it should implicitly start a new transaction.
         ASSERT(cursor->next());
-        ASSERT_TRUE(ru->inActiveTxn());
+        ASSERT_TRUE(ru->isActive());
     }
 }
 
@@ -229,18 +229,18 @@ TEST(WiredTigerStandardIndexText, CursorInActiveTxnAfterSeek) {
         bool inclusive = true;
         auto seekKs = makeKeyStringForSeek(sdi.get(), BSON("" << 1), forward, inclusive);
         ASSERT(cursor->seek(seekKs));
-        ASSERT_TRUE(ru->inActiveTxn());
+        ASSERT_TRUE(ru->isActive());
 
         // Committing a WriteUnitOfWork will end the current transaction.
         WriteUnitOfWork wuow(opCtx.get());
-        ASSERT_TRUE(ru->inActiveTxn());
+        ASSERT_TRUE(ru->isActive());
         wuow.commit();
-        ASSERT_FALSE(ru->inActiveTxn());
+        ASSERT_FALSE(ru->isActive());
 
         // If a cursor is used after a WUOW commits, it should implicitly start a new
         // transaction.
         ASSERT(cursor->seek(seekKs));
-        ASSERT_TRUE(ru->inActiveTxn());
+        ASSERT_TRUE(ru->isActive());
     }
 }
 
@@ -277,18 +277,18 @@ TEST(WiredTigerStandardIndexText, CursorInActiveTxnAfterSeekExact) {
         auto seekKs = makeKeyString(sdi.get(), BSON("" << 1));
 
         ASSERT(cursor->seekExact(seekKs));
-        ASSERT_TRUE(ru->inActiveTxn());
+        ASSERT_TRUE(ru->isActive());
 
         // Committing a WriteUnitOfWork will end the current transaction.
         WriteUnitOfWork wuow(opCtx.get());
-        ASSERT_TRUE(ru->inActiveTxn());
+        ASSERT_TRUE(ru->isActive());
         wuow.commit();
-        ASSERT_FALSE(ru->inActiveTxn());
+        ASSERT_FALSE(ru->isActive());
 
         // If a cursor is used after a WUOW commits, it should implicitly start a new
         // transaction.
         ASSERT(cursor->seekExact(seekKs));
-        ASSERT_TRUE(ru->inActiveTxn());
+        ASSERT_TRUE(ru->isActive());
     }
 }
 

@@ -237,6 +237,7 @@ public:
     void reset(NamespaceString nss) const {
         ::mongo::writeConflictRetry(_opCtx, "deleteAll", nss.ns(), [&] {
             _opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoTimestamp);
+            _opCtx->recoveryUnit()->abandonSnapshot();
             AutoGetCollection collRaii(_opCtx, nss, LockMode::MODE_X);
 
             if (collRaii) {
@@ -260,7 +261,7 @@ public:
         });
     }
 
-    void insertDocument(const Collection* coll, const InsertStatement& stmt) {
+    void insertDocument(const CollectionPtr& coll, const InsertStatement& stmt) {
         // Insert some documents.
         OpDebug* const nullOpDebug = nullptr;
         const bool fromMigrate = false;
@@ -306,7 +307,7 @@ public:
         abortOnExit.dismiss();
     }
 
-    std::int32_t itCount(const Collection* coll) {
+    std::int32_t itCount(const CollectionPtr& coll) {
         std::uint64_t ret = 0;
         auto cursor = coll->getRecordStore()->getCursor(_opCtx);
         while (cursor->next() != boost::none) {
@@ -316,7 +317,7 @@ public:
         return ret;
     }
 
-    BSONObj findOne(const Collection* coll) {
+    BSONObj findOne(const CollectionPtr& coll) {
         auto optRecord = coll->getRecordStore()->getCursor(_opCtx)->next();
         if (optRecord == boost::none) {
             // Print a stack trace to help disambiguate which `findOne` failed.
@@ -385,7 +386,7 @@ public:
                                            const Timestamp& ts,
                                            const repl::MinValidDocument& expectedDoc) {
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-        const Collection* coll = autoColl.getCollection();
+        const CollectionPtr& coll = autoColl.getCollection();
 
         OneOffRead oor(_opCtx, ts);
 
@@ -405,7 +406,7 @@ public:
             << ". Expected: " << expectedDoc.toBSON() << ". Found: " << doc.toBSON();
     }
 
-    void assertDocumentAtTimestamp(const Collection* coll,
+    void assertDocumentAtTimestamp(const CollectionPtr& coll,
                                    const Timestamp& ts,
                                    const BSONObj& expectedDoc) {
         OneOffRead oor(_opCtx, ts);
@@ -421,7 +422,7 @@ public:
         }
     }
 
-    void assertFilteredDocumentAtTimestamp(const Collection* coll,
+    void assertFilteredDocumentAtTimestamp(const CollectionPtr& coll,
                                            const BSONObj& query,
                                            const Timestamp& ts,
                                            boost::optional<const BSONObj&> expectedDoc) {
@@ -656,9 +657,9 @@ public:
         std::stringstream ss;
 
         ss << "[ ";
-        for (const auto multikeyComponents : multikeyPaths) {
+        for (const auto& multikeyComponents : multikeyPaths) {
             ss << "[ ";
-            for (const auto multikeyComponent : multikeyComponents) {
+            for (const auto& multikeyComponent : multikeyComponents) {
                 ss << multikeyComponent << " ";
             }
             ss << "] ";
@@ -669,7 +670,7 @@ public:
     }
 
     void assertMultikeyPaths(OperationContext* opCtx,
-                             const Collection* collection,
+                             const CollectionPtr& collection,
                              StringData indexName,
                              Timestamp ts,
                              bool shouldBeMultikey,
@@ -1207,10 +1208,10 @@ public:
 
         {
             AutoGetCollectionForReadCommand autoColl1(_opCtx, nss1);
-            auto coll1 = autoColl1.getCollection();
+            const auto& coll1 = autoColl1.getCollection();
             ASSERT(coll1);
             AutoGetCollectionForReadCommand autoColl2(_opCtx, nss2);
-            auto coll2 = autoColl2.getCollection();
+            const auto& coll2 = autoColl2.getCollection();
             ASSERT(coll2);
 
             assertDocumentAtTimestamp(coll1, pastTs, BSONObj());
@@ -1354,12 +1355,19 @@ public:
         repl::UnreplicatedWritesBlock uwb(_opCtx);
 
         NamespaceString nss("unittests.SecondarySetWildcardIndexMultikeyOnInsert");
-        reset(nss);
-        UUID uuid = UUID::gen();
-        {
+        // Use a capped collection to prevent the batch applier from grouping insert operations
+        // together in the same WUOW. This test attempts to apply operations out of order, but the
+        // storage engine does not allow an operation to set out-of-order timestamps in the same
+        // WUOW.
+        ASSERT_OK(createCollection(
+            _opCtx,
+            nss.db().toString(),
+            BSON("create" << nss.coll() << "capped" << true << "size" << 1 * 1024 * 1024)));
+        auto uuid = [&]() {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-            uuid = autoColl.getCollection()->uuid();
-        }
+            return autoColl.getCollection()->uuid();
+        }();
+
         auto indexName = "a_1";
         auto indexSpec = BSON("name" << indexName << "key" << BSON("$**" << 1) << "v"
                                      << static_cast<int>(kIndexVersion));
@@ -1387,7 +1395,11 @@ public:
                       << "i"
                       << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc2));
 
-        // Coerce oplog application to apply op2 before op1.
+        // Coerce oplog application to apply op2 before op1. This does not guarantee the actual
+        // order of application however, because the oplog applier applies these operations in
+        // parallel across several threads. The test accepts the possibility of a false negative
+        // (test passes when it should fail) in favor of occasionally finding a true positive (test
+        // fails as intended).
         std::vector<repl::OplogEntry> ops = {op0, op2, op1};
 
         DoNothingOplogApplierObserver observer;
@@ -1485,7 +1497,11 @@ public:
                       << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc2
                       << "o2" << BSON("_id" << 0)));
 
-        // Coerce oplog application to apply op2 before op1.
+        // Coerce oplog application to apply op2 before op1. This does not guarantee the actual
+        // order of application however, because the oplog applier applies these operations in
+        // parallel across several threads. The test accepts the possibility of a false negative
+        // (test passes when it should fail) in favor of occasionally finding a true positive (test
+        // fails as intended).
         std::vector<repl::OplogEntry> ops = {op0, op2, op1};
 
         DoNothingOplogApplierObserver observer;
@@ -1618,9 +1634,8 @@ public:
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
 
-        // It is not valid to read the multikey state earlier than the 'minimumVisibleTimestamp',
-        // so at least assert that it has been updated due to the index creation.
-        ASSERT_GT(autoColl.getCollection()->getMinimumVisibleSnapshot().get(),
+        // Ensure minimumVisible has not been updated due to the index creation.
+        ASSERT_LT(autoColl.getCollection()->getMinimumVisibleSnapshot().get(),
                   pastTime.asTimestamp());
 
         // Reading the multikey state before 'insertTime0' is not valid or reliable to test. If the
@@ -1762,7 +1777,7 @@ public:
         txnParticipant.stashTransactionResources(_opCtx);
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-        auto coll = autoColl.getCollection();
+        const auto& coll = autoColl.getCollection();
 
         // Make sure the transaction committed and its writes were timestamped correctly.
         assertDocumentAtTimestamp(coll, presentTs, BSONObj());
@@ -2436,8 +2451,7 @@ public:
         // Assert that the index build is removed from config.system.indexBuilds collection after
         // completion.
         {
-            AutoGetCollectionForRead autoColl(_opCtx, NamespaceString::kIndexBuildEntryNamespace);
-            auto collection = autoColl.getCollection();
+            AutoGetCollectionForRead collection(_opCtx, NamespaceString::kIndexBuildEntryNamespace);
             ASSERT_TRUE(collection);
 
             // At the commitIndexBuild entry time, the index build be still be present in the
@@ -2445,12 +2459,12 @@ public:
             {
                 OneOffRead oor(_opCtx, indexBComplete);
                 // Fails if the collection is empty.
-                findOne(collection);
+                findOne(collection.getCollection());
             }
 
             // After the index build has finished, we should not see the doc in the indexBuilds
             // collection.
-            ASSERT_EQUALS(0, itCount(collection));
+            ASSERT_EQUALS(0, itCount(collection.getCollection()));
         }
     }
 };
@@ -2662,8 +2676,7 @@ public:
         // Assert that the index build is removed from config.system.indexBuilds collection after
         // completion.
         {
-            AutoGetCollectionForRead autoColl(_opCtx, NamespaceString::kIndexBuildEntryNamespace);
-            auto collection = autoColl.getCollection();
+            AutoGetCollectionForRead collection(_opCtx, NamespaceString::kIndexBuildEntryNamespace);
             ASSERT_TRUE(collection);
 
             // At the commitIndexBuild entry time, the index build be still be present in the
@@ -2671,12 +2684,12 @@ public:
             {
                 OneOffRead oor(_opCtx, indexAbortTs);
                 // Fails if the collection is empty.
-                findOne(collection);
+                findOne(collection.getCollection());
             }
 
             // After the index build has finished, we should not see the doc in the indexBuilds
             // collection.
-            ASSERT_EQUALS(0, itCount(collection));
+            ASSERT_EQUALS(0, itCount(collection.getCollection()));
         }
     }
 };
@@ -3189,13 +3202,12 @@ public:
 
         {
             // Sanity check everything exists.
-            AutoGetCollectionForReadCommand autoColl(_opCtx, nss);
-            auto coll = autoColl.getCollection();
+            AutoGetCollectionForReadCommand coll(_opCtx, nss);
             ASSERT(coll);
 
             const auto currentTime = _clock->getTime();
             const auto presentTs = currentTime.clusterTime().asTimestamp();
-            assertDocumentAtTimestamp(coll, presentTs, doc);
+            assertDocumentAtTimestamp(coll.getCollection(), presentTs, doc);
         }
 
         // Simulate a scenario where the node is a primary, but does not accept writes. This is
@@ -3415,8 +3427,7 @@ public:
         reset(nss);
         UUID ui = UUID::gen();
         {
-            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-            auto coll = autoColl.getCollection();
+            AutoGetCollection coll(_opCtx, nss, LockMode::MODE_IX);
             ASSERT(coll);
             ui = coll->uuid();
         }
@@ -3452,7 +3463,7 @@ public:
 
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, commitEntryTs, BSONObj());
@@ -3518,7 +3529,7 @@ public:
         assertNoStartOpTime();
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, commitEntryTs, doc);
@@ -3578,7 +3589,7 @@ public:
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
             const BSONObj query1 = BSON("_id" << 1);
             const BSONObj query2 = BSON("_id" << 2);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
 
             // Collection should be empty until commit, at which point both documents
             // should show up.
@@ -3676,7 +3687,7 @@ public:
         const auto commitFilter = BSON("ts" << commitEntryTs);
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, firstOplogEntryTs, BSONObj());
@@ -3716,7 +3727,7 @@ public:
         txnParticipant.stashTransactionResources(_opCtx);
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, firstOplogEntryTs, BSONObj());
@@ -3764,7 +3775,7 @@ public:
         txnParticipant.stashTransactionResources(_opCtx);
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, firstOplogEntryTs, BSONObj());
@@ -3916,8 +3927,7 @@ public:
 
             UUID ui = UUID::gen();
             {
-                AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-                auto coll = autoColl.getCollection();
+                AutoGetCollection coll(_opCtx, nss, LockMode::MODE_IX);
                 ASSERT(coll);
                 ui = coll->uuid();
             }
@@ -3975,7 +3985,7 @@ public:
 
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, prepareTs, BSONObj());
             assertDocumentAtTimestamp(coll, commitEntryTs, BSONObj());
 
@@ -4029,7 +4039,7 @@ public:
         txnParticipant.stashTransactionResources(_opCtx);
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, prepareTs, BSONObj());
@@ -4077,7 +4087,7 @@ public:
 
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IS);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, prepareTs, BSONObj());
             assertDocumentAtTimestamp(coll, abortEntryTs, BSONObj());
 
@@ -4127,7 +4137,7 @@ public:
         txnParticipant.stashTransactionResources(_opCtx);
         {
             AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
-            auto coll = autoColl.getCollection();
+            const auto& coll = autoColl.getCollection();
             assertDocumentAtTimestamp(coll, presentTs, BSONObj());
             assertDocumentAtTimestamp(coll, beforeTxnTs, BSONObj());
             assertDocumentAtTimestamp(coll, prepareTs, BSONObj());

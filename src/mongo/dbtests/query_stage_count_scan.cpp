@@ -89,7 +89,7 @@ public:
         return countWorks;
     }
 
-    const Collection* getCollection() {
+    CollectionPtr getCollection() {
         return CollectionCatalog::get(&_opCtx).lookupCollectionByNamespace(&_opCtx, ns());
     }
 
@@ -336,7 +336,8 @@ public:
         static_cast<PlanStage*>(&count)->saveState();
 
         // Recover from yield
-        static_cast<PlanStage*>(&count)->restoreState();
+        auto coll = getCollection();
+        static_cast<PlanStage*>(&count)->restoreState(&coll);
 
         // finish counting
         while (PlanStage::IS_EOF != countState) {
@@ -391,7 +392,8 @@ public:
         remove(BSON("a" << GTE << 5));
 
         // Recover from yield
-        static_cast<PlanStage*>(&count)->restoreState();
+        auto coll = getCollection();
+        static_cast<PlanStage*>(&count)->restoreState(&coll);
 
         // finish counting
         while (PlanStage::IS_EOF != countState) {
@@ -449,7 +451,8 @@ public:
         insert(BSON("a" << 6.5));
 
         // Recover from yield
-        static_cast<PlanStage*>(&count)->restoreState();
+        auto coll = getCollection();
+        static_cast<PlanStage*>(&count)->restoreState(&coll);
 
         // finish counting
         while (PlanStage::IS_EOF != countState) {
@@ -569,7 +572,8 @@ public:
         remove(BSON("a" << 1 << "b" << 5));
 
         // Recover from yield
-        static_cast<PlanStage*>(&count)->restoreState();
+        auto coll = getCollection();
+        static_cast<PlanStage*>(&count)->restoreState(&coll);
 
         // finish counting
         while (PlanStage::IS_EOF != countState) {

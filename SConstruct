@@ -43,7 +43,6 @@ SCons.Node.FS.File.release_target_info = release_target_info_noop
 from buildscripts import utils
 from buildscripts import moduleconfig
 
-import libdeps
 import psutil
 
 scons_invocation = '{} {}'.format(sys.executable, ' '.join(sys.argv))
@@ -106,10 +105,10 @@ SetOption('random', 1)
 #
 
 add_option('ninja',
-    choices=['stable', 'next', 'disabled'],
+    choices=['enabled', 'disabled'],
     default='disabled',
     nargs='?',
-    const='stable',
+    const='enabled',
     type='choice',
     help='Enable the build.ninja generator tool stable or canary version',
 )
@@ -469,6 +468,13 @@ add_option('link-model',
     choices=link_model_choices,
     default='auto',
     help='Select the linking model for the project',
+    type='choice'
+)
+
+add_option('linker',
+    choices=['auto', 'gold', 'lld', 'bfd'],
+    default='auto',
+    help='Specify the type of linker to use.',
     type='choice'
 )
 
@@ -1120,7 +1126,7 @@ envDict = dict(BUILD_ROOT=buildDir,
 # user has opted into the next gen tools, add our experimental tool
 # directory into the default toolpath, ahead of whatever is already in
 # there so it overrides it.
-if get_option('build-tools') == 'next' or get_option('ninja') == 'next':
+if get_option('build-tools') == 'next':
     SCons.Tool.DefaultToolpath.insert(0, os.path.abspath('site_scons/site_tools/next'))
 
 env = Environment(variables=env_vars, **envDict)
@@ -1274,7 +1280,7 @@ def CheckForProcessor(context, which_arch):
         ret = run_compile_check(which_arch)
         context.Message('Checking if target processor is %s ' % which_arch)
         context.Result(ret)
-        return ret;
+        return ret
 
     for k in list(processor_macros.keys()):
         ret = run_compile_check(k)
@@ -1338,40 +1344,25 @@ def CheckForCXXLink(context):
     context.Result(ret)
     return ret
 
-detectConf = Configure(detectEnv, help=False, custom_tests = {
+detectSystem = Configure(detectEnv, help=False, custom_tests = {
     'CheckForToolchain' : CheckForToolchain,
     'CheckForProcessor': CheckForProcessor,
     'CheckForOS': CheckForOS,
-    'CheckForCXXLink': CheckForCXXLink,
 })
 
-if not detectConf.CheckCC():
-    env.ConfError(
-        "C compiler {0} doesn't work",
-        detectEnv['CC'])
-
-if not detectConf.CheckCXX():
-    env.ConfError(
-        "C++ compiler {0} doesn't work",
-        detectEnv['CXX'])
-
-if not detectConf.CheckForCXXLink():
-    env.ConfError(
-        "C++ compiler {0} can't link C++ programs",
-        detectEnv['CXX'])
 
 toolchain_search_sequence = [ "GCC", "clang" ]
 if mongo_platform.is_running_os('windows'):
     toolchain_search_sequence = [ 'MSVC', 'clang', 'GCC' ]
 for candidate_toolchain in toolchain_search_sequence:
-    if detectConf.CheckForToolchain(candidate_toolchain, "C++", "CXX", ".cpp"):
+    if detectSystem.CheckForToolchain(candidate_toolchain, "C++", "CXX", ".cpp"):
         detected_toolchain = candidate_toolchain
         break
 
 if not detected_toolchain:
     env.ConfError("Couldn't identify the C++ compiler")
 
-if not detectConf.CheckForToolchain(detected_toolchain, "C", "CC", ".c"):
+if not detectSystem.CheckForToolchain(detected_toolchain, "C", "CC", ".c"):
     env.ConfError("C compiler does not match identified C++ compiler")
 
 # Now that we've detected the toolchain, we add methods to the env
@@ -1390,20 +1381,23 @@ env.AddMethod(get_toolchain_name, 'ToolchainName')
 env.AddMethod(is_toolchain, 'ToolchainIs')
 
 if env['TARGET_ARCH']:
-    if not detectConf.CheckForProcessor(env['TARGET_ARCH']):
+    if not detectSystem.CheckForProcessor(env['TARGET_ARCH']):
         env.ConfError("Could not detect processor specified in TARGET_ARCH variable")
 else:
-    detected_processor = detectConf.CheckForProcessor(None)
+    detected_processor = detectSystem.CheckForProcessor(None)
     if not detected_processor:
         env.ConfError("Failed to detect a supported target architecture")
     env['TARGET_ARCH'] = detected_processor
 
 if env['TARGET_OS'] not in os_macros:
     print("No special config for [{0}] which probably means it won't work".format(env['TARGET_OS']))
-elif not detectConf.CheckForOS(env['TARGET_OS']):
+elif not detectSystem.CheckForOS(env['TARGET_OS']):
     env.ConfError("TARGET_OS ({0}) is not supported by compiler", env['TARGET_OS'])
 
-detectConf.Finish()
+detectSystem.Finish()
+
+
+
 
 env['CC_VERSION'] = mongo_toolchain.get_toolchain_ver(env, 'CC')
 env['CXX_VERSION'] = mongo_toolchain.get_toolchain_ver(env, 'CXX')
@@ -1500,6 +1494,10 @@ env['BUILDERS']['SharedArchive'] = SCons.Builder.Builder(
     suffix='$SHARSUFFIX',
     src_suffix=env['BUILDERS']['SharedLibrary'].src_suffix,
 )
+
+# Teach builders how to build idl files
+for builder in ['SharedObject', 'StaticObject']:
+    env['BUILDERS'][builder].add_src_builder("Idlc")
 
 if link_model.startswith("dynamic"):
 
@@ -1748,10 +1746,29 @@ if env['_LIBDEPS'] == '$_LIBDEPS_OBJS':
     # command but instead runs a function.
     env["BUILDERS"]["StaticLibrary"].action = SCons.Action.Action(write_uuid_to_file, "Generating placeholder library $TARGET")
 
-libdeps.setup_environment(
-    env,
-    emitting_shared=(link_model.startswith("dynamic")),
-    linting=get_option('libdeps-linting'))
+libdeps_typeinfo = False
+
+if get_option('build-tools') == 'next':
+    import libdeps_next as libdeps
+
+    if (has_option('sanitize') and 'undefined' in get_option('sanitize')
+        and env.ToolchainIs('clang', 'gcc')
+        and (env.TargetOSIs('posix') and not env.TargetOSIs('darwin'))):
+
+        libdeps_typeinfo = True
+
+    libdeps.setup_environment(
+        env,
+        emitting_shared=(link_model.startswith("dynamic")),
+        linting=get_option('libdeps-linting'),
+        sanitize_typeinfo=libdeps_typeinfo)
+else:
+    import libdeps
+
+    libdeps.setup_environment(
+        env,
+        emitting_shared=(link_model.startswith("dynamic")),
+        linting=get_option('libdeps-linting'))
 
 # Both the abidw tool and the thin archive tool must be loaded after
 # libdeps, so that the scanners they inject can see the library
@@ -1797,8 +1814,8 @@ elif env.TargetOSIs('windows'):
 
 def init_no_global_add_flags(env, start_flag, end_flag):
     """ Helper function for init_no_global_libdeps_tag_expand"""
-    env.AppendUnique(LIBDEPS_PREFIX_FLAGS=[start_flag])
-    env.PrependUnique(LIBDEPS_POSTFIX_FLAGS=[end_flag])
+    env['LIBDEPS_PREFIX_FLAGS']=[start_flag]
+    env['LIBDEPS_POSTFIX_FLAGS']=[end_flag]
     if env.TargetOSIs('linux', 'freebsd', 'openbsd'):
         env.AppendUnique(
             LIBDEPS_SWITCH_FLAGS=[{
@@ -1826,6 +1843,8 @@ def init_no_global_libdeps_tag_expand(source, target, env, for_signature):
                 env.AppendUnique(SHLINKFLAGS=[start_flag])
             else:
                 init_no_global_add_flags(env, start_flag, end_flag)
+        else:
+            init_no_global_add_flags(env, "", "")
 
     else:
         start_flag = env.get('LINK_WHOLE_ARCHIVE_LIB_START', '')
@@ -1837,7 +1856,8 @@ def init_no_global_libdeps_tag_expand(source, target, env, for_signature):
         # at link time.
         if "init-no-global-side-effects" not in env.get(libdeps.Constants.LibdepsTags, []):
             init_no_global_add_flags(env, start_flag, end_flag)
-
+        else:
+            init_no_global_add_flags(env, "", "")
     return []
 
 env['LIBDEPS_TAG_EXPANSIONS'].append(init_no_global_libdeps_tag_expand)
@@ -2520,6 +2540,61 @@ def doConfigure(myenv):
     def AddToSHLINKFLAGSIfSupported(env, flag):
         return AddFlagIfSupported(env, 'C', '.c', flag, True, SHLINKFLAGS=[flag])
 
+    if myenv.ToolchainIs('gcc', 'clang'):
+        # This tells clang/gcc to use the gold linker if it is available - we prefer the gold linker
+        # because it is much faster. Don't use it if the user has already configured another linker
+        # selection manually.
+        if any(flag.startswith('-fuse-ld=') for flag in env['LINKFLAGS']):
+            myenv.FatalError(f"Use the '--linker' option instead of modifying the LINKFLAGS directly.")
+
+        linker_ld = get_option('linker')
+        if linker_ld == 'auto':
+            # lld has problems with separate debug info on some platforms. See:
+            # - https://bugzilla.mozilla.org/show_bug.cgi?id=1485556
+            # - https://bugzilla.mozilla.org/show_bug.cgi?id=1485556
+            #
+            # lld also apparently has problems with symbol resolution
+            # in some esoteric configurations that apply for us when
+            # using --link-model=dynamic mode, so disable lld there
+            # too. See:
+            # - https://bugs.llvm.org/show_bug.cgi?id=46676
+            #
+            # We should revisit all of these issues the next time we upgrade our clang minimum.
+            if get_option('separate-debug') == 'off' and get_option('link-model') != 'dynamic':
+                if not AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=lld'):
+                    AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
+            else:
+                AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
+        elif link_model.startswith("dynamic") and linker_ld == 'bfd':
+            # BFD is not supported due to issues with it causing warnings from some of
+            # the third party libraries that mongodb is linked with:
+            # https://jira.mongodb.org/browse/SERVER-49465
+            myenv.FatalError(f"Linker {linker_ld} is not supported with dynamic link model builds.")
+        else:
+            if not AddToLINKFLAGSIfSupported(myenv, f'-fuse-ld={linker_ld}'):
+                myenv.FatalError(f"Linker {linker_ld} could not be configured.")
+
+    detectCompiler = Configure(myenv, help=False, custom_tests = {
+        'CheckForCXXLink': CheckForCXXLink,
+    })
+
+    if not detectCompiler.CheckCC():
+        env.ConfError(
+            "C compiler {0} doesn't work",
+            detectEnv['CC'])
+
+    if not detectCompiler.CheckCXX():
+        env.ConfError(
+            "C++ compiler {0} doesn't work",
+            detectEnv['CXX'])
+
+    if not detectCompiler.CheckForCXXLink():
+        env.ConfError(
+            "C++ compiler {0} can't link C++ programs",
+            detectEnv['CXX'])
+
+    detectCompiler.Finish()
+
 
     if myenv.ToolchainIs('clang', 'gcc'):
         # This warning was added in g++-4.8.
@@ -3178,29 +3253,9 @@ def doConfigure(myenv):
         #
         myenv.Append( CCFLAGS=["/Zc:inline"])
 
+
+
     if myenv.ToolchainIs('gcc', 'clang'):
-        # This tells clang/gcc to use the gold linker if it is available - we prefer the gold linker
-        # because it is much faster. Don't use it if the user has already configured another linker
-        # selection manually.
-        if not any(flag.startswith('-fuse-ld=') for flag in env['LINKFLAGS']):
-
-            # lld has problems with separate debug info on some platforms. See:
-            # - https://bugzilla.mozilla.org/show_bug.cgi?id=1485556
-            # - https://bugzilla.mozilla.org/show_bug.cgi?id=1485556
-            #
-            # lld also apparently has problems with symbol resolution
-            # in some esoteric configurations that apply for us when
-            # using --link-model=dynamic mode, so disable lld there
-            # too. See:
-            # - https://bugs.llvm.org/show_bug.cgi?id=46676
-            #
-            # We should revisit all of these issues the next time we upgrade our clang minimum.
-            if get_option('separate-debug') == 'off' and get_option('link-model') != 'dynamic':
-                if not AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=lld'):
-                    AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
-            else:
-                AddToLINKFLAGSIfSupported(myenv, '-fuse-ld=gold')
-
         # Usually, --gdb-index is too expensive in big static binaries, but for dynamic
         # builds it works well.
         if link_model.startswith("dynamic"):
@@ -3663,6 +3718,10 @@ def doConfigure(myenv):
     if use_system_version_of_library("libunwind"):
         conf.FindSysLibDep("unwind", ["unwind"])
 
+    if use_libunwind:
+        if not conf.CheckLib("lzma"):
+            myenv.ConfError("Cannot find system library 'lzma' required for use with libunwind")
+
     if use_system_version_of_library("intel_decimal128"):
         conf.FindSysLibDep("intel_decimal128", ["bid"])
 
@@ -4015,22 +4074,18 @@ elif env.ToolchainIs("gcc"):
 
 # Now that we are done with configure checks, enable ccache and
 # icecream if requested.
-if get_option('build-tools') == 'next' or get_option('ninja') == 'next':
-    if 'CCACHE' in env and env['CCACHE']:
-        ccache = Tool('ccache')
-        if not ccache.exists(env):
-            env.FatalError(f"Failed to load ccache tool with CCACHE={env['CCACHE']}")
-        ccache(env)
-    if 'ICECC' in env and env['ICECC']:
-        env['ICECREAM_VERBOSE'] = env.Verbose()
-        env['ICECREAM_TARGET_DIR'] = '$BUILD_ROOT/scons/icecream'
-        icecream = Tool('icecream')
-        if not icecream.exists(env):
-            env.FatalError(f"Failed to load icecream tool with ICECC={env['ICECC']}")
-        icecream(env)
-else:
-    env.Tool('ccache')
-    env.Tool('icecream')
+if 'CCACHE' in env and env['CCACHE']:
+    ccache = Tool('ccache')
+    if not ccache.exists(env):
+        env.FatalError(f"Failed to load ccache tool with CCACHE={env['CCACHE']}")
+    ccache(env)
+if 'ICECC' in env and env['ICECC']:
+    env['ICECREAM_VERBOSE'] = env.Verbose()
+    env['ICECREAM_TARGET_DIR'] = '$BUILD_ROOT/scons/icecream'
+    icecream = Tool('icecream')
+    if not icecream.exists(env):
+        env.FatalError(f"Failed to load icecream tool with ICECC={env['ICECC']}")
+    icecream(env)
 
 # Defaults for SCons provided flags. SetOption only sets the option to our value
 # if the user did not provide it. So for any flag here if it's explicitly passed
@@ -4085,34 +4140,66 @@ if get_option('ninja') != 'disabled':
             env.FatalError("Use of ccache is mandatory with --ninja and icecream older than 1.2. You are running {}.".format(env['ICECREAM_VERSION']))
 
     ninja_builder = Tool("ninja")
-    if get_option('build-tools') == 'next' or get_option('ninja') == 'next':
-        env["NINJA_BUILDDIR"] = env.Dir("$BUILD_DIR/ninja")
-        ninja_builder.generate(env)
+    env["NINJA_BUILDDIR"] = env.Dir("$BUILD_DIR/ninja")
+    ninja_builder.generate(env)
 
-        ninjaConf = Configure(env, help=False, custom_tests = {
-            'CheckNinjaCompdbExpand': env.CheckNinjaCompdbExpand,
-        })
-        env['NINJA_COMPDB_EXPAND'] = ninjaConf.CheckNinjaCompdbExpand()
-        ninjaConf.Finish()
+    ninjaConf = Configure(env, help=False, custom_tests = {
+        'CheckNinjaCompdbExpand': env.CheckNinjaCompdbExpand,
+    })
+    env['NINJA_COMPDB_EXPAND'] = ninjaConf.CheckNinjaCompdbExpand()
+    ninjaConf.Finish()
 
-        # TODO: API for getting the sconscripts programmatically
-        # exists upstream: https://github.com/SCons/scons/issues/3625
-        def ninja_generate_deps(env, target, source, for_signature):
-            dependencies = env.Flatten([
-                'SConstruct',
-                glob(os.path.join('src', '**', 'SConscript'), recursive=True),
-                glob(os.path.join(os.path.expanduser('~/.scons/'), '**', '*.py'), recursive=True),
-                glob(os.path.join('site_scons', '**', '*.py'), recursive=True),
-                glob(os.path.join('buildscripts', '**', '*.py'), recursive=True),
-                glob(os.path.join('src/third_party/scons-*', '**', '*.py'), recursive=True),
-                glob(os.path.join('src/mongo/db/modules', '**', '*.py'), recursive=True),
-            ])
+    # TODO: API for getting the sconscripts programmatically
+    # exists upstream: https://github.com/SCons/scons/issues/3625
+    def ninja_generate_deps(env, target, source, for_signature):
+        dependencies = env.Flatten([
+            'SConstruct',
+            glob(os.path.join('src', '**', 'SConscript'), recursive=True),
+            glob(os.path.join(os.path.expanduser('~/.scons/'), '**', '*.py'), recursive=True),
+            glob(os.path.join('site_scons', '**', '*.py'), recursive=True),
+            glob(os.path.join('buildscripts', '**', '*.py'), recursive=True),
+            glob(os.path.join('src/third_party/scons-*', '**', '*.py'), recursive=True),
+            glob(os.path.join('src/mongo/db/modules', '**', '*.py'), recursive=True),
+        ])
 
-            return dependencies
+        return dependencies
 
-        env['NINJA_REGENERATE_DEPS'] = ninja_generate_deps
-    else:
-        ninja_builder.generate(env)
+    env['NINJA_REGENERATE_DEPS'] = ninja_generate_deps
+
+    if libdeps_typeinfo and get_option('build-tools') == 'next':
+        # ninja will not handle the list action libdeps creates so in order for
+        # to build ubsan with ninja, we need to undo the list action and then
+        # create a special rule to handle the shlink typeinfo checks. If ninja is
+        # updated to handle list actions correctly, this whole section can go away.
+        base_action = env['BUILDERS']['SharedLibrary'].action
+        base_action.list[:] = base_action.list[:-2]
+
+        # Now we rewrite the command and set it up as a rule for ninja shlinks. We are
+        # cramming this all into a single command for ninja, so it is broken apart with
+        # commentation for each part.
+        env.NinjaRule(
+            "SHLINK",
+            libdeps.get_typeinfo_link_command().format(
+                ninjalink="$env$SHLINK @$out.rsp && ",
+                ldpath="",
+                target="${out}",
+                libdeps_tags="printenv",
+                tag='libdeps-cyclic-typeinfo'
+            ),
+            description="Linking $out",
+            deps=None,
+            pool="local_pool",
+            use_depfile=False,
+            use_response_file=True)
+
+        provider = env.NinjaGenResponseFileProvider(
+            "SHLINK",
+            "$SHLINK",
+            custom_env={
+                "TYPEINFO_TAGS":"'$LIBDEPS_TAGS'",
+                "LD_LIBRARY_PATH":"'$_LIBDEPS_LD_PATH'"})
+        env.NinjaRuleMapping("${SHLINKCOM}", provider)
+        env.NinjaRuleMapping(env["SHLINKCOM"], provider)
 
     # idlc.py has the ability to print it's implicit dependencies
     # while generating, Ninja can consume these prints using the
@@ -4129,15 +4216,9 @@ if get_option('ninja') != 'disabled':
     )
 
     def get_idlc_command(env, node, action, targets, sources, executor=None):
-        if get_option('build-tools') == 'next' or get_option('ninja') == 'next':
-            _, variables, _ = env.NinjaGetGenericShellCommand(node, action, targets, sources, executor=executor)
-        else:
-            _, variables = env.NinjaGetShellCommand(node, action, targets, sources, executor=executor)
+        _, variables, _ = env.NinjaGetGenericShellCommand(node, action, targets, sources, executor=executor)
         variables["msvc_deps_prefix"] = "import file:"
-        if get_option('build-tools') == 'next' or get_option('ninja') == 'next':
-            return "IDLC", variables, env.subst(env['IDLC']).split()
-        else:
-            return "IDLC", variables
+        return "IDLC", variables, env.subst(env['IDLC']).split()
 
     env.NinjaRuleMapping("$IDLCCOM", get_idlc_command)
     env.NinjaRuleMapping(env["IDLCCOM"], get_idlc_command)
@@ -4820,3 +4901,8 @@ env.NoCache(env.FindInstalledFiles())
 # because SCons wants it to be a particular object.
 for i, s in enumerate(BUILD_TARGETS):
     BUILD_TARGETS[i] = env.subst(s)
+
+# Do any final checks the Libdeps linter may need to do once all
+# SConscripts have been read but before building begins.
+if get_option('build-tools') == 'next':
+    libdeps.LibdepLinter(env).final_checks()

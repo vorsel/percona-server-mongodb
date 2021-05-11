@@ -47,6 +47,21 @@
 #      "refreshing" : true,                                 // optional
 #      "lastRefreshedCollectionVersion" : Timestamp(1, 0),  // optional
 #      "enterCriticalSectionCounter" : 4                    // optional
+#      "reshardingFields": {                                // optional
+#          "uuid" : UUID,
+#          "state" : CoordinatorState<kInitialized>,
+#          // Only populated if this collection is the original sharded collection.
+#          "donorFields" : {
+#              "reshardingKey" : {
+#                  "_notTheID" : 1
+#              }
+#          },
+#          // Only populated if this collection is the temporary resharding collection
+#          "recipientFields" : {
+#              "fetchTimestamp" : Timestamp(3, 4),
+#              "originalNamespace" : "foo.bar",
+#          }
+#       }
 #   }
 #
 
@@ -57,10 +72,11 @@ imports:
     - "mongo/idl/basic_types.idl"
     - "mongo/db/keypattern.idl"
     - "mongo/s/chunk_version.idl"
+    - "mongo/s/resharding/type_collection_fields.idl"
 
 structs:
     ShardCollectionTypeBase:
-        description: "Represents the layout and contents of documents contained in the shard 
+        description: "Represents the layout and contents of documents contained in the shard
                       server's config.collections collection."
         fields:
             _id:
@@ -74,7 +90,7 @@ structs:
                 optional: true
             epoch:
                 type: objectid
-                description: "Uniquely identifies this instance of the collection, in case of 
+                description: "Uniquely identifies this instance of the collection, in case of
                               drop/create or shard key refine."
                 optional: false
             key:
@@ -85,7 +101,7 @@ structs:
             defaultCollation:
                 type: object_owned
                 default: BSONObj()
-                description: "Optional collection default collation. If empty, implies simple 
+                description: "Optional collection default collation. If empty, implies simple
                               collation."
                 optional: false
             unique:
@@ -94,20 +110,27 @@ structs:
                 optional: false
             refreshing:
                 type: bool
-                description: "Set by primaries and used by shard secondaries to safely refresh chunk 
-                              metadata. Indicates whether the chunks collection is current being 
-                              updated, which means read results won't provide a complete view of the 
+                description: "Set by primaries and used by shard secondaries to safely refresh chunk
+                              metadata. Indicates whether the chunks collection is current being
+                              updated, which means read results won't provide a complete view of the
                               chunk metadata."
                 optional: true
             lastRefreshedCollectionVersion:
                 type: ChunkVersionLegacy
-                description: "Set by primaries and used by shard secondaries to safely refresh chunk 
-                              metadata. Indicates the collection version of the last complete chunk 
-                              metadata refresh, and is used to indicate if a refresh occurred if the 
-                              value is different than when the caller last checked -- because 
+                description: "Set by primaries and used by shard secondaries to safely refresh chunk
+                              metadata. Indicates the collection version of the last complete chunk
+                              metadata refresh, and is used to indicate if a refresh occurred if the
+                              value is different than when the caller last checked -- because
                               'refreshing' will be false both before and after a refresh occurs."
                 optional: true
             enterCriticalSectionCounter:
                 type: int
                 description: "Currently just an OpObserver signal, thus otherwise ignored."
                 optional: true
+            reshardingFields:
+                description: "Resharding-related fields. Only set when this collection is either the
+                              original collection undergoing a resharding operation or this
+                              collection is the temporary resharding collection."
+                type: TypeCollectionReshardingFields
+                optional: true
+

@@ -32,6 +32,7 @@
 #include <map>
 #include <string>
 
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/platform/mutex.h"
@@ -43,8 +44,45 @@ namespace mongo {
  */
 class ResourceConsumption {
 public:
+    ResourceConsumption();
+
     static ResourceConsumption& get(OperationContext* opCtx);
     static ResourceConsumption& get(ServiceContext* svcCtx);
+
+    struct ReadMetrics {
+        void add(const ReadMetrics& other) {
+            docBytesRead += other.docBytesRead;
+            docUnitsRead += other.docUnitsRead;
+            idxEntryBytesRead += other.idxEntryBytesRead;
+            idxEntryUnitsRead += other.idxEntryUnitsRead;
+            keysSorted += other.keysSorted;
+            docUnitsReturned += other.docUnitsReturned;
+        }
+
+        ReadMetrics operator+(const ReadMetrics& other) const {
+            ReadMetrics copy = *this;
+            copy.add(other);
+            return copy;
+        }
+
+        ReadMetrics& operator+=(const ReadMetrics& other) {
+            add(other);
+            return *this;
+        }
+
+        // Number of document bytes read
+        long long docBytesRead;
+        // Number of document units read
+        long long docUnitsRead;
+        // Number of index entry bytes read
+        long long idxEntryBytesRead;
+        // Number of index entries units read
+        long long idxEntryUnitsRead;
+        // Number of keys sorted for query operations
+        long long keysSorted;
+        // Number of document units returned by a query
+        long long docUnitsReturned;
+    };
 
     /**
      * Metrics maintains a set of resource consumption metrics.
@@ -54,11 +92,55 @@ public:
         /**
          * Adds other Metrics to this one.
          */
-        void add(const Metrics& other){};
+        void add(const Metrics& other) {
+            primaryMetrics += other.primaryMetrics;
+            secondaryMetrics += other.secondaryMetrics;
+            cpuMillis += other.cpuMillis;
+            docBytesWritten += other.docBytesWritten;
+            docUnitsWritten += other.docUnitsWritten;
+            idxEntryBytesWritten += other.idxEntryBytesWritten;
+            idxEntryUnitsWritten += other.idxEntryUnitsWritten;
+        };
+
         Metrics& operator+=(const Metrics& other) {
             add(other);
             return *this;
         }
+
+        // Read metrics recorded for queries processed while this node was primary
+        ReadMetrics primaryMetrics;
+        // Read metrics recorded for queries processed while this node was secondary
+        ReadMetrics secondaryMetrics;
+        // Amount of CPU time consumed by an operation in milliseconds
+        long long cpuMillis;
+        // Number of document bytes written
+        long long docBytesWritten;
+        // Number of document units written
+        long long docUnitsWritten;
+        // Number of index entry bytes written
+        long long idxEntryBytesWritten;
+        // Number of index entry units written
+        long long idxEntryUnitsWritten;
+
+        /**
+         * Reports all metrics on a BSONObjectBuilder. The generated object has nested fields to
+         * represent the stucture of the data members on this class.
+         */
+        void toBson(BSONObjBuilder* builder) const;
+
+        /**
+         * Reports metrics on a BSONObjectBuilder. This forms a flat object by merging
+         * primaryMetrics and secondaryMetrics and promotes their members to top-level fields. All
+         * fields are reported.
+         */
+        void toFlatBsonAllFields(BSONObjBuilder* builder) const;
+
+        /**
+         * Reports metrics on a BSONObjectBuilder. This forms a flat object by merging
+         * primaryMetrics and secondaryMetrics and promotes their members to top-level fields. Only
+         * non-zero fields are reported.
+         */
+        void toFlatBsonNonZeroFields(BSONObjBuilder* builder) const;
     };
 
     /**
@@ -70,12 +152,13 @@ public:
         static MetricsCollector& get(OperationContext* opCtx);
 
         /**
-         * When called, resource consumption metrics should be recorded and added to the global
-         * structure.
+         * When called, resource consumption metrics should be recorded for this operation.
          */
-        void beginScopedCollecting() {
+        void beginScopedCollecting(const std::string& dbName) {
             invariant(!isInScope());
+            _dbName = dbName;
             _collecting = ScopedCollectionState::kInScopeCollecting;
+            _hasCollectedMetrics = true;
         }
 
         /**
@@ -108,10 +191,11 @@ public:
         }
 
         /**
-         * Set the database name associated with these metrics.
+         * Returns whether or not a ScopedMetricsCollector is currently collecting or was collecting
+         * metrics at any point for this operation.
          */
-        void setDbName(const std::string& dbName) {
-            _dbName = dbName;
+        bool hasCollectedMetrics() const {
+            return _hasCollectedMetrics;
         }
 
         const std::string& getDbName() const {
@@ -132,7 +216,60 @@ public:
             return _metrics;
         }
 
+        void reset() {
+            invariant(!isInScope());
+            _metrics = {};
+            _dbName = {};
+            _hasCollectedMetrics = false;
+        }
+
+        /**
+         * This should be called once per document read with the number of bytes read for that
+         * document. This is replication-state aware and increments the metric based on the current
+         * replication state. This is a no-op when metrics collection is disabled on this operation.
+         */
+        void incrementOneDocRead(OperationContext* opCtx, size_t docBytesRead);
+
+        /**
+         * This should be called once per index entry read with the number of bytes read for that
+         * entry. This is replication-state aware and increments the metric based on the current
+         * replication state. This is a no-op when metrics collection is disabled on this operation.
+         */
+        void incrementOneIdxEntryRead(OperationContext* opCtx, size_t idxEntryBytesRead);
+
+        void incrementKeysSorted(OperationContext* opCtx, size_t keysSorted);
+        void incrementDocUnitsReturned(OperationContext* opCtx, size_t docUnitsReturned);
+
+        /**
+         * This should be called once per document written with the number of bytes written for that
+         * document. This increments the metric independent of replication state, and only when
+         * metrics collection is enabled for this operation.
+         */
+        void incrementOneDocWritten(size_t docBytesWritten);
+
+        /**
+         * This should be called once per index entry written with the number of bytes written for
+         * that entry. This increments the metric independent of replication state, and only when
+         * metrics collection is enabled for this operation.
+         */
+        void incrementOneIdxEntryWritten(size_t idxEntryBytesWritten);
+
+        void incrementCpuMillis(size_t cpuMillis);
+
     private:
+        /**
+         * Update the current replication state's ReadMetrics if this operation is currently
+         * collecting metrics.
+         */
+        using ReadMetricsFunc = std::function<void(ReadMetrics& readMetrics)>;
+        void _updateReadMetrics(OperationContext* opCtx, ReadMetricsFunc&& updateFunc);
+
+        /**
+         * Helper function that calls the Func when this collector is currently collecting metrics.
+         */
+        template <typename Func>
+        void _doIfCollecting(Func&& func);
+
         /**
          * Represents the ScopedMetricsCollector state.
          */
@@ -145,18 +282,23 @@ public:
             kInScopeCollecting
         };
         ScopedCollectionState _collecting = ScopedCollectionState::kInactive;
+        bool _hasCollectedMetrics = false;
         std::string _dbName;
         Metrics _metrics;
     };
 
     /**
      * When instantiated with commandCollectsMetrics=true, enables operation resource consumption
-     * collection. When destructed, appends collected metrics to the global structure.
+     * collection. When destructed, appends collected metrics to the global structure, if metrics
+     * aggregation is enabled.
      */
     class ScopedMetricsCollector {
     public:
-        ScopedMetricsCollector(OperationContext* opCtx, bool commandCollectsMetrics);
-        ScopedMetricsCollector(OperationContext* opCtx) : ScopedMetricsCollector(opCtx, true) {}
+        ScopedMetricsCollector(OperationContext* opCtx,
+                               const std::string& dbName,
+                               bool commandCollectsMetrics);
+        ScopedMetricsCollector(OperationContext* opCtx, const std::string& dbName)
+            : ScopedMetricsCollector(opCtx, dbName, true) {}
         ~ScopedMetricsCollector();
 
     private:
@@ -176,6 +318,16 @@ public:
     }
 
     /**
+     * Returns true if resource consumption metrics should be collected per-operation.
+     */
+    static bool isMetricsCollectionEnabled();
+
+    /**
+     * Returns true if resource consumption metrics should be aggregated globally.
+     */
+    static bool isMetricsAggregationEnabled();
+
+    /**
      * Adds a MetricsCollector's Metrics to an existing Metrics object in the map, keyed by
      * database name. If no Metrics exist for the database, the value is initialized with the
      * provided MetricsCollector's Metrics.
@@ -189,6 +341,12 @@ public:
      */
     using MetricsMap = std::map<std::string, Metrics>;
     MetricsMap getMetrics() const;
+
+    /**
+     * Returns the Metrics map and then clears the contents. This attempts to swap and return the
+     * metrics map rather than making a full copy like getMetrics.
+     */
+    MetricsMap getAndClearMetrics();
 
 private:
     // Protects _metrics

@@ -118,6 +118,8 @@ public:
 
     virtual long long getSpaceUsedBytes(OperationContext* opCtx) const;
 
+    virtual long long getFreeStorageBytes(OperationContext* opCtx) const;
+
     virtual Status initAsEmpty(OperationContext* opCtx);
 
     Status compact(OperationContext* opCtx) override;
@@ -163,7 +165,7 @@ protected:
                           bool dupsAllowed) = 0;
 
     void setKey(WT_CURSOR* cursor, const WT_ITEM* item);
-    void getKey(WT_CURSOR* cursor, WT_ITEM* key);
+    void getKey(OperationContext* opCtx, WT_CURSOR* cursor, WT_ITEM* key);
 
     /*
      * Determines the data format version from application metadata and verifies compatibility.

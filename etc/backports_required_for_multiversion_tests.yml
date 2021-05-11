@@ -32,8 +32,8 @@ all:
     test_file: jstests/core/apply_ops_system_dot_views.js
   - ticket: SERVER-48614
     test_file: jstests/core/wildcard_index_partial_index.js
-  - ticket: SERVER-48993
-    test_file: jstests/core/explode_for_sort_collation.js
+  - ticket: SERVER-51120
+    test_file: jstests/core/merge_sort_collation.js
   - ticket: SERVER-48525
     test_file: jstests/core/txns/no_writes_to_config_transactions_with_prepared_transaction.js
   - ticket: SERVER-47810
@@ -78,6 +78,30 @@ all:
     test_file: jstests/replsets/read_operations_during_step_up.js
   - ticket: SERVER-50320
     test_file: jstests/replsets/change_sync_source_in_initial_sync.js
+  - ticket: SERVER-50415
+    test_file: jstests/sharding/awaitable_isMaster_primary_failures.js
+  - ticket: SERVER-50420
+    test_file: jstests/replsets/server_status_repl_is_writable_primary.js
+  - ticket: SERVER-51262
+    test_file: jstests/replsets/read_operations_during_rollback.js
+  - ticket: SERVER-51262
+    test_file: jstests/replsets/transactions_on_secondaries_not_allowed.js
+  - ticket: SERVER-43904
+    test_file: jstests/replsets/election_handoff_skips_unelectable_nodes.js
+  - ticket: SERVER-51259
+    test_file: jstests/replsets/awaitable_ismaster_errors_on_horizon_change.js
+  - ticket: SERVER-51259
+    test_file: jstests/replsets/awaitable_ismaster_fcv_change.js
+  - ticket: SERVER-51259
+    test_file: jstests/replsets/awaitable_ismaster_metrics_on_state_change.js
+  - ticket: SERVER-51259
+    test_file: jstests/replsets/awaitable_ismaster_on_nodes_with_invalid_configs.js
+  - ticket: SERVER-51259
+    test_file: jstests/replsets/awaitable_ismaster_stepdown_stepup.js
+  - ticket: SERVER-51259
+    test_file: jstests/replsets/quiesce_mode.js
+  - ticket: SERVER-51259
+    test_file: jstests/sharding/mongos_quiesce_mode.js
 
 # Tests that should only be excluded from particular suites should be listed under that suite.
 suites:

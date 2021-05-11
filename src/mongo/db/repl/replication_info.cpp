@@ -61,18 +61,17 @@
 #include "mongo/executor/network_interface.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
-#include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/transport/ismaster_metrics.h"
 #include "mongo/util/decimal_counter.h"
 #include "mongo/util/fail_point.h"
 
 namespace mongo {
 
-// Hangs in the beginning of each isMaster command when set.
-MONGO_FAIL_POINT_DEFINE(waitInIsMaster);
-// Awaitable isMaster requests with the proper topologyVersions will sleep for maxAwaitTimeMS on
+// Hangs in the beginning of each hello command when set.
+MONGO_FAIL_POINT_DEFINE(waitInHello);
+// Awaitable hello requests with the proper topologyVersions will sleep for maxAwaitTimeMS on
 // standalones. This failpoint will hang right before doing this sleep when set.
-MONGO_FAIL_POINT_DEFINE(hangWaitingForIsMasterResponseOnStandalone);
+MONGO_FAIL_POINT_DEFINE(hangWaitingForHelloResponseOnStandalone);
 
 using std::list;
 using std::string;
@@ -83,13 +82,12 @@ namespace repl {
 namespace {
 
 constexpr auto kHelloString = "hello"_sd;
-// Aliases for the hello command in order to provide backwards compatibility.
 constexpr auto kCamelCaseIsMasterString = "isMaster"_sd;
 constexpr auto kLowerCaseIsMasterString = "ismaster"_sd;
 
 void appendPrimaryOnlyServiceInfo(ServiceContext* serviceContext, BSONObjBuilder* result) {
     auto registry = PrimaryOnlyServiceRegistry::get(serviceContext);
-    registry->reportServiceInfo(result);
+    registry->reportServiceInfoForServerStatus(result);
 }
 
 /**
@@ -137,13 +135,13 @@ TopologyVersion appendReplicationInfo(OperationContext* opCtx,
         // maxAwaitTimeMS.
         invariant(maxAwaitTimeMS);
 
-        IsMasterMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
-        ON_BLOCK_EXIT([&] { IsMasterMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges(); });
-        if (MONGO_unlikely(hangWaitingForIsMasterResponseOnStandalone.shouldFail())) {
+        HelloMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
+        ON_BLOCK_EXIT([&] { HelloMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges(); });
+        if (MONGO_unlikely(hangWaitingForHelloResponseOnStandalone.shouldFail())) {
             // Used in tests that wait for this failpoint to be entered to guarantee that the
             // request is waiting and metrics have been updated.
-            LOGV2(31462, "Hanging due to hangWaitingForIsMasterResponseOnStandalone failpoint.");
-            hangWaitingForIsMasterResponseOnStandalone.pauseWhileSet(opCtx);
+            LOGV2(31462, "Hanging due to hangWaitingForHelloResponseOnStandalone failpoint.");
+            hangWaitingForHelloResponseOnStandalone.pauseWhileSet(opCtx);
         }
         opCtx->sleepFor(Milliseconds(*maxAwaitTimeMS));
     }
@@ -174,12 +172,10 @@ public:
         bool appendReplicationProcess = configElement.numberInt() > 0;
 
         BSONObjBuilder result;
-        // TODO SERVER-50219: Change useLegacyResponseFields to false once the serverStatus changes
-        // to remove master-slave terminology are merged.
         appendReplicationInfo(opCtx,
                               &result,
                               appendReplicationProcess,
-                              true /* useLegacyResponseFields */,
+                              false /* useLegacyResponseFields */,
                               boost::none /* clientTopologyVersion */,
                               boost::none /* maxAwaitTimeMS */);
 
@@ -239,11 +235,9 @@ public:
     }
 } oplogInfoServerStatus;
 
-class CmdHello final : public BasicCommandWithReplyBuilderInterface {
+class CmdHello : public BasicCommandWithReplyBuilderInterface {
 public:
-    CmdHello()
-        : BasicCommandWithReplyBuilderInterface(
-              kHelloString, {kCamelCaseIsMasterString, kLowerCaseIsMasterString}) {}
+    CmdHello() : CmdHello(kHelloString, {}) {}
 
     const std::set<std::string>& apiVersions() const {
         return kApiVersions1;
@@ -276,7 +270,7 @@ public:
                              rpc::ReplyBuilderInterface* replyBuilder) final {
         CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
 
-        waitInIsMaster.pauseWhileSet(opCtx);
+        waitInHello.pauseWhileSet(opCtx);
 
         /* currently request to arbiter is (somewhat arbitrarily) an ismaster request that is not
            authenticated.
@@ -284,11 +278,6 @@ public:
         if (cmdObj["forShell"].trueValue()) {
             LastError::get(opCtx->getClient()).disable();
         }
-
-        // Parse the command name, which should be one of the following: hello, isMaster, or
-        // ismaster. If the command is "hello", we must attach an "isWritablePrimary" response field
-        // instead of "ismaster" and "secondaryDelaySecs" response field instead of "slaveDelay".
-        bool useLegacyResponseFields = (cmdObj.firstElementFieldNameStringData() != kHelloString);
 
         transport::Session::TagMask sessionTagsToSet = 0;
         transport::Session::TagMask sessionTagsToUnset = 0;
@@ -299,33 +288,11 @@ public:
             sessionTagsToSet |= transport::Session::kKeepOpen;
         }
 
-        auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx->getClient());
-        bool seenIsMaster = clientMetadataIsMasterState.hasSeenIsMaster();
-
-        if (!seenIsMaster) {
-            clientMetadataIsMasterState.setSeenIsMaster();
-        }
-
-        BSONElement element = cmdObj[kMetadataDocumentName];
-        if (!element.eoo()) {
-            if (seenIsMaster) {
-                uasserted(ErrorCodes::ClientMetadataCannotBeMutated,
-                          "The client metadata document may only be sent in the first isMaster");
-            }
-
-            auto parsedClientMetadata = uassertStatusOK(ClientMetadata::parse(element));
-
-            invariant(parsedClientMetadata);
-
-            parsedClientMetadata->logClientMetadata(opCtx->getClient());
-
-            clientMetadataIsMasterState.setClientMetadata(opCtx->getClient(),
-                                                          std::move(parsedClientMetadata));
-        }
-
-        if (!seenIsMaster) {
-            auto sniName = opCtx->getClient()->getSniNameForSession();
-            SplitHorizon::setParameters(opCtx->getClient(), std::move(sniName));
+        auto client = opCtx->getClient();
+        if (ClientMetadata::tryFinalize(client)) {
+            // If we are the first hello, then set split horizon parameters.
+            auto sniName = client->getSniNameForSession();
+            SplitHorizon::setParameters(client, std::move(sniName));
         }
 
         // Parse the optional 'internalClient' field. This is provided by incoming connections from
@@ -434,7 +401,7 @@ public:
 
         auto result = replyBuilder->getBodyBuilder();
         auto currentTopologyVersion = appendReplicationInfo(
-            opCtx, &result, 0, useLegacyResponseFields, clientTopologyVersion, maxAwaitTimeMS);
+            opCtx, &result, 0, useLegacyResponseFields(), clientTopologyVersion, maxAwaitTimeMS);
 
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             const int configServerModeNumber = 2;
@@ -472,15 +439,15 @@ public:
         saslMechanismRegistry.advertiseMechanismNamesForUser(opCtx, cmdObj, &result);
 
         if (opCtx->isExhaust()) {
-            LOGV2_DEBUG(23905, 3, "Using exhaust for isMaster protocol");
+            LOGV2_DEBUG(23905, 3, "Using exhaust for isMaster or hello protocol");
 
             uassert(51756,
-                    "An isMaster request with exhaust must specify 'maxAwaitTimeMS'",
+                    "An isMaster or hello request with exhaust must specify 'maxAwaitTimeMS'",
                     maxAwaitTimeMSField);
             invariant(clientTopologyVersion);
 
-            InExhaustIsMaster::get(opCtx->getClient()->session().get())
-                ->setInExhaustIsMaster(true /* inExhaustIsMaster */);
+            InExhaustHello::get(opCtx->getClient()->session().get())
+                ->setInExhaust(true /* inExhaust */, getName());
 
             if (clientTopologyVersion->getProcessId() == currentTopologyVersion.getProcessId() &&
                 clientTopologyVersion->getCounter() == currentTopologyVersion.getCounter()) {
@@ -506,7 +473,35 @@ public:
 
         return true;
     }
+
+protected:
+    CmdHello(const StringData cmdName, const std::initializer_list<StringData>& alias)
+        : BasicCommandWithReplyBuilderInterface(cmdName, alias) {}
+
+    virtual bool useLegacyResponseFields() {
+        return false;
+    }
+
 } cmdhello;
+
+class CmdIsMaster : public CmdHello {
+public:
+    CmdIsMaster() : CmdHello(kCamelCaseIsMasterString, {kLowerCaseIsMasterString}) {}
+
+    std::string help() const override {
+        return "Check if this server is primary for a replica set\n"
+               "{ isMaster : 1 }";
+    }
+
+protected:
+    // Parse the command name, which should be one of the following: hello, isMaster, or
+    // ismaster. If the command is "hello", we must attach an "isWritablePrimary" response field
+    // instead of "ismaster" and "secondaryDelaySecs" response field instead of "slaveDelay".
+    bool useLegacyResponseFields() override {
+        return true;
+    }
+
+} cmdIsMaster;
 
 OpCounterServerStatusSection replOpCounterServerStatusSection("opcountersRepl", &replOpCounters);
 

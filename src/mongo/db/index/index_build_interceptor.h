@@ -37,6 +37,7 @@
 #include "mongo/db/index/skipped_record_tracker.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/storage/temporary_record_store.h"
+#include "mongo/db/yieldable.h"
 #include "mongo/platform/atomic_word.h"
 
 namespace mongo {
@@ -132,7 +133,7 @@ public:
      * following the last inserted record from a previous call to drainWritesIntoIndex.
      */
     Status drainWritesIntoIndex(OperationContext* opCtx,
-                                const Collection* coll,
+                                const CollectionPtr& coll,
                                 const InsertDeleteOptions& options,
                                 TrackDuplicates trackDups,
                                 DrainYieldPolicy drainYieldPolicy);
@@ -150,7 +151,7 @@ public:
      * successful, keys are written directly to the index. Unsuccessful key generation or writes
      * will return errors.
      */
-    Status retrySkippedRecords(OperationContext* opCtx, const Collection* collection);
+    Status retrySkippedRecords(OperationContext* opCtx, const CollectionPtr& collection);
 
     /**
      * Returns 'true' if there are no visible records remaining to be applied from the side writes
@@ -179,7 +180,7 @@ private:
 
     void _initializeMultiKeyPaths(IndexCatalogEntry* entry);
     Status _applyWrite(OperationContext* opCtx,
-                       const Collection* coll,
+                       const CollectionPtr& coll,
                        const BSONObj& doc,
                        const InsertDeleteOptions& options,
                        TrackDuplicates trackDups,
@@ -189,7 +190,11 @@ private:
     /**
      * Yield lock manager locks and abandon the current storage engine snapshot.
      */
-    void _yield(OperationContext* opCtx);
+    void _yield(OperationContext* opCtx, const Yieldable* yieldable);
+
+    void _checkDrainPhaseFailPoint(OperationContext* opCtx,
+                                   FailPoint* fp,
+                                   long long iteration) const;
 
     // The entry for the index that is being built.
     IndexCatalogEntry* _indexCatalogEntry;
@@ -210,7 +215,13 @@ private:
     // additional fields that have to be referenced in commit/rollback handlers, this counter should
     // be moved to a new IndexBuildsInterceptor::InternalState structure that will be managed as a
     // shared resource.
-    std::shared_ptr<AtomicWord<long long>> _sideWritesCounter;
+    std::shared_ptr<AtomicWord<long long>> _sideWritesCounter =
+        std::make_shared<AtomicWord<long long>>(0);
+
+    // Whether to skip the check the the number of writes applied is equal to the number of writes
+    // recorded. Resumable index builds to not preserve these counts, so we skip this check for
+    // index builds that were resumed.
+    const bool _skipNumAppliedCheck = false;
 
     mutable Mutex _multikeyPathMutex =
         MONGO_MAKE_LATCH("IndexBuildInterceptor::_multikeyPathMutex");

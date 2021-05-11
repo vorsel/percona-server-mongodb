@@ -50,22 +50,22 @@ std::pair<value::TypeTags, value::Value> genericNumericCompare(value::TypeTags l
             case value::TypeTags::NumberInt32: {
                 auto result = op(value::numericCast<int32_t>(lhsTag, lhsValue),
                                  value::numericCast<int32_t>(rhsTag, rhsValue));
-                return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+                return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
             }
             case value::TypeTags::NumberInt64: {
                 auto result = op(value::numericCast<int64_t>(lhsTag, lhsValue),
                                  value::numericCast<int64_t>(rhsTag, rhsValue));
-                return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+                return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
             }
             case value::TypeTags::NumberDouble: {
                 auto result = op(value::numericCast<double>(lhsTag, lhsValue),
                                  value::numericCast<double>(rhsTag, rhsValue));
-                return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+                return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
             }
             case value::TypeTags::NumberDecimal: {
                 auto result = op(value::numericCast<Decimal128>(lhsTag, lhsValue),
                                  value::numericCast<Decimal128>(rhsTag, rhsValue));
-                return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+                return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
             }
             default:
                 MONGO_UNREACHABLE;
@@ -74,27 +74,27 @@ std::pair<value::TypeTags, value::Value> genericNumericCompare(value::TypeTags l
         auto lhsStr = getStringView(lhsTag, lhsValue);
         auto rhsStr = getStringView(rhsTag, rhsValue);
         auto result = op(lhsStr.compare(rhsStr), 0);
-        return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
     } else if (lhsTag == value::TypeTags::Date && rhsTag == value::TypeTags::Date) {
         auto result = op(value::bitcastTo<int64_t>(lhsValue), value::bitcastTo<int64_t>(rhsValue));
-        return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
     } else if (lhsTag == value::TypeTags::Timestamp && rhsTag == value::TypeTags::Timestamp) {
         auto result =
             op(value::bitcastTo<uint64_t>(lhsValue), value::bitcastTo<uint64_t>(rhsValue));
-        return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
     } else if (lhsTag == value::TypeTags::Boolean && rhsTag == value::TypeTags::Boolean) {
-        auto result = op(lhsValue != 0, rhsValue != 0);
-        return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+        auto result = op(value::bitcastTo<bool>(lhsValue), value::bitcastTo<bool>(rhsValue));
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
     } else if (lhsTag == value::TypeTags::Null && rhsTag == value::TypeTags::Null) {
         // This is where Mongo differs from SQL.
         auto result = op(0, 0);
-        return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
     } else if ((value::isArray(lhsTag) && value::isArray(rhsTag)) ||
                (value::isObject(lhsTag) && value::isObject(rhsTag))) {
         auto [tag, val] = value::compareValue(lhsTag, lhsValue, rhsTag, rhsValue);
         if (tag == value::TypeTags::NumberInt32) {
             auto result = op(value::bitcastTo<int32_t>(val), 0);
-            return {value::TypeTags::Boolean, value::bitcastFrom(result)};
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
         }
     }
 
@@ -150,6 +150,7 @@ struct Instruction {
         isNumber,
         isBinData,
         isDate,
+        isNaN,
         typeMatch,
 
         function,
@@ -174,12 +175,20 @@ enum class Builtin : uint8_t {
     split,
     regexMatch,
     dateParts,
+    dateToParts,
+    isoDateToParts,
     datePartsWeekYear,
     dropFields,
     newObj,
-    ksToString,       // KeyString to string
-    newKs,            // new KeyString
-    abs,              // absolute value
+    ksToString,  // KeyString to string
+    newKs,       // new KeyString
+    abs,         // absolute value
+    ceil,
+    floor,
+    exp,
+    ln,
+    log10,
+    sqrt,
     addToArray,       // agg function to append to an array
     addToSet,         // agg function to append to a set
     doubleDoubleSum,  // special double summation
@@ -190,6 +199,7 @@ enum class Builtin : uint8_t {
     toUpper,
     toLower,
     coerceToString,
+    concat,
     acos,
     acosh,
     asin,
@@ -205,6 +215,10 @@ enum class Builtin : uint8_t {
     sinh,
     tan,
     tanh,
+    isMember,
+    indexOfBytes,
+    indexOfCP,
+    isTimezone,
 };
 
 class CodeFragment {
@@ -279,6 +293,7 @@ public:
     void appendIsNumber();
     void appendIsBinData();
     void appendIsDate();
+    void appendIsNaN();
     void appendTypeMatch(uint32_t typeMask);
     void appendFunction(Builtin f, uint8_t arity);
     void appendJump(int jumpOffset);
@@ -357,14 +372,29 @@ private:
                                                                value::Value rhsValue);
     std::tuple<bool, value::TypeTags, value::Value> genericAbs(value::TypeTags operandTag,
                                                                value::Value operandValue);
+    std::tuple<bool, value::TypeTags, value::Value> genericCeil(value::TypeTags operandTag,
+                                                                value::Value operandValue);
+    std::tuple<bool, value::TypeTags, value::Value> genericFloor(value::TypeTags operandTag,
+                                                                 value::Value operandValue);
+    std::tuple<bool, value::TypeTags, value::Value> genericExp(value::TypeTags operandTag,
+                                                               value::Value operandValue);
+    std::tuple<bool, value::TypeTags, value::Value> genericLn(value::TypeTags operandTag,
+                                                              value::Value operandValue);
+    std::tuple<bool, value::TypeTags, value::Value> genericLog10(value::TypeTags operandTag,
+                                                                 value::Value operandValue);
+    std::tuple<bool, value::TypeTags, value::Value> genericSqrt(value::TypeTags operandTag,
+                                                                value::Value operandValue);
     std::tuple<bool, value::TypeTags, value::Value> genericNot(value::TypeTags tag,
                                                                value::Value value);
+    std::pair<value::TypeTags, value::Value> genericIsMember(value::TypeTags lhsTag,
+                                                             value::Value lhsValue,
+                                                             value::TypeTags rhsTag,
+                                                             value::Value rhsValue);
     std::tuple<bool, value::TypeTags, value::Value> genericNumConvert(value::TypeTags lhsTag,
                                                                       value::Value lhsValue,
                                                                       value::TypeTags rhsTag);
     std::pair<value::TypeTags, value::Value> genericNumConvertToPreciseInt64(value::TypeTags lhsTag,
                                                                              value::Value lhsValue);
-
     template <typename Op>
     std::pair<value::TypeTags, value::Value> genericCompare(value::TypeTags lhsTag,
                                                             value::Value lhsValue,
@@ -463,12 +493,20 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinSplit(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDate(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDateWeekYear(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDateToParts(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinIsoDateToParts(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinRegexMatch(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDropFields(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinNewObj(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinKeyStringToString(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinNewKeyString(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinAbs(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinCeil(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinFloor(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinExp(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinLn(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinLog10(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinSqrt(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinAddToArray(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinAddToSet(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDoubleDoubleSum(uint8_t arity);
@@ -494,7 +532,11 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinSinh(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinTan(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinTanh(uint8_t arity);
-
+    std::tuple<bool, value::TypeTags, value::Value> builtinConcat(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinIsMember(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinIndexOfBytes(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinIndexOfCP(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinIsTimezone(uint8_t arity);
     std::tuple<bool, value::TypeTags, value::Value> dispatchBuiltin(Builtin f, uint8_t arity);
 
     std::tuple<bool, value::TypeTags, value::Value> getFromStack(size_t offset) {

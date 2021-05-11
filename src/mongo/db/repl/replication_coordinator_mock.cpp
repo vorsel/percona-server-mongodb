@@ -274,9 +274,12 @@ void ReplicationCoordinatorMock::resetMyLastOpTimes() {
     _myLastDurableWallTime = Date_t();
 }
 
-OpTimeAndWallTime ReplicationCoordinatorMock::getMyLastAppliedOpTimeAndWallTime() const {
+OpTimeAndWallTime ReplicationCoordinatorMock::getMyLastAppliedOpTimeAndWallTime(
+    bool rollbackSafe) const {
     stdx::lock_guard<Mutex> lk(_mutex);
-
+    if (rollbackSafe && _memberState.rollback()) {
+        return {};
+    }
     return {_myLastAppliedOpTime, _myLastAppliedWallTime};
 }
 
@@ -439,8 +442,7 @@ Status ReplicationCoordinatorMock::processReplSetInitiate(OperationContext* opCt
     return Status::OK();
 }
 
-Status ReplicationCoordinatorMock::processReplSetUpdatePosition(const UpdatePositionArgs& updates,
-                                                                long long* configVersion) {
+Status ReplicationCoordinatorMock::processReplSetUpdatePosition(const UpdatePositionArgs& updates) {
     // TODO
     return Status::OK();
 }
@@ -650,7 +652,12 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorMock::awaitIsMaste
     response->setReplSetVersion(config.getConfigVersion());
     response->setIsMaster(true);
     response->setIsSecondary(false);
-    response->setMe(config.getMemberAt(0).getHostAndPort());
+    if (config.getNumMembers() > 0) {
+        response->setMe(config.getMemberAt(0).getHostAndPort());
+    } else {
+        response->setMe(HostAndPort::parseThrowing("localhost:27017"));
+    }
+
     response->setElectionId(OID::gen());
     response->setTopologyVersion(TopologyVersion(repl::instanceId, 0));
     return response;

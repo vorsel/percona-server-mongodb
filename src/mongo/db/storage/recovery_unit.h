@@ -230,6 +230,16 @@ public:
     virtual void preallocateSnapshot() {}
 
     /**
+     * Like preallocateSnapshot() above but also indicates that the snapshot will be used for
+     * reading the oplog.
+     *
+     * StorageEngines may not implement this in which case it works like preallocateSnapshot.
+     */
+    virtual void preallocateSnapshotForOplogRead() {
+        preallocateSnapshot();
+    }
+
+    /**
      * Obtains a majority committed snapshot. Snapshots should still be separately acquired and
      * newer committed snapshots should be used if available whenever implementations would normally
      * change snapshots.
@@ -387,6 +397,12 @@ public:
     }
 
     /**
+     * Refreshes a read transaction by starting a new one at the same read timestamp and then ending
+     * the current one.
+     */
+    virtual void refreshSnapshot() {}
+
+    /**
      * The ReadSource indicates which external or provided timestamp to read from for future
      * transactions.
      */
@@ -465,10 +481,21 @@ public:
     };
 
     /**
-     * Indicates whether a unit of work is active. Will be true after beginUnitOfWork
-     * is called and before either commitUnitOfWork or abortUnitOfWork gets called.
+     * Indicates whether the RecoveryUnit has an open snapshot. A snapshot can be opened inside or
+     * outside of a WriteUnitOfWork.
      */
-    virtual bool inActiveTxn() const = 0;
+    virtual bool isActive() const {
+        return _isActive();
+    };
+
+    /**
+     * When called, the WriteUnitOfWork ignores the multi timestamp constraint for the remainder of
+     * the WriteUnitOfWork, where if within a WriteUnitOfWork multiple timestamps are set, the first
+     * timestamp must be set prior to any writes.
+     *
+     * Must be reset when the WriteUnitOfWork is either committed or rolled back.
+     */
+    virtual void ignoreAllMultiTimestampConstraints(){};
 
     /**
      * Registers a callback to be called prior to a WriteUnitOfWork committing the storage

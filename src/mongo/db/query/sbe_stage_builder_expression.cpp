@@ -32,6 +32,7 @@
 #include "mongo/db/query/sbe_stage_builder_expression.h"
 #include "mongo/db/query/util/make_data_structure.h"
 
+#include "mongo/base/string_data.h"
 #include "mongo/db/exec/sbe/stages/branch.h"
 #include "mongo/db/exec/sbe/stages/co_scan.h"
 #include "mongo/db/exec/sbe/stages/filter.h"
@@ -46,6 +47,7 @@
 #include "mongo/db/pipeline/expression_visitor.h"
 #include "mongo/db/pipeline/expression_walker.h"
 #include "mongo/db/query/projection_parser.h"
+#include "mongo/db/query/sbe_stage_builder_helpers.h"
 #include "mongo/util/str.h"
 
 namespace mongo::stage_builder {
@@ -98,6 +100,15 @@ struct ExpressionVisitorContext {
             : savedTraverseStage(std::move(traverseStage)),
               savedRelevantSlots(relevantSlots),
               nextBranchResultSlot(nextBranchResultSlot) {}
+    };
+
+    struct FilterExpressionEvalFrame {
+        std::unique_ptr<sbe::PlanStage> traverseStage;
+        sbe::value::SlotVector relevantSlots;
+
+        FilterExpressionEvalFrame(std::unique_ptr<sbe::PlanStage> traverseStage,
+                                  const sbe::value::SlotVector& relevantSlots)
+            : traverseStage(std::move(traverseStage)), relevantSlots(relevantSlots) {}
     };
 
     ExpressionVisitorContext(std::unique_ptr<sbe::PlanStage> inputStage,
@@ -177,7 +188,6 @@ struct ExpressionVisitorContext {
         pushExpr(sbe::makeE<sbe::EVariable>(unionStageResultSlot), std::move(stage));
     }
 
-
     std::unique_ptr<sbe::EExpression> popExpr() {
         auto expr = std::move(exprs.top());
         exprs.pop();
@@ -212,7 +222,7 @@ struct ExpressionVisitorContext {
 
         auto shortCircuitVal = (logicOp == sbe::EPrimBinary::logicOr);
         auto shortCircuitExpr = sbe::makeE<sbe::EConstant>(
-            sbe::value::TypeTags::Boolean, sbe::value::bitcastFrom(shortCircuitVal));
+            sbe::value::TypeTags::Boolean, sbe::value::bitcastFrom<bool>(shortCircuitVal));
         traverseStage = sbe::makeProjectStage(
             sbe::makeS<sbe::LimitSkipStage>(
                 sbe::makeS<sbe::CoScanStage>(planNodeId), 1, boost::none, planNodeId),
@@ -281,7 +291,10 @@ struct ExpressionVisitorContext {
     std::map<Variables::Id, sbe::value::SlotId> environment;
     std::stack<VarsFrame> varsFrameStack;
 
+    // TODO SERVER-51356: Replace these stacks with single stack of evaluation frames.
+    std::stack<FilterExpressionEvalFrame> filterExpressionEvalFrameStack;
     std::stack<LogicalExpressionEvalFrame> logicalExpressionEvalFrameStack;
+
     // See the comment above the generateExpression() declaration for an explanation of the
     // 'relevantSlots' list.
     sbe::value::SlotVector* relevantSlots;
@@ -399,19 +412,6 @@ std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> generateTraverse(
 }
 
 /**
- * Generates an EExpression that checks if the input expression is null or missing.
- */
-std::unique_ptr<sbe::EExpression> generateNullOrMissing(const sbe::FrameId frameId,
-                                                        const sbe::value::SlotId slotId) {
-    sbe::EVariable var{frameId, slotId};
-    return sbe::makeE<sbe::EPrimBinary>(
-        sbe::EPrimBinary::logicOr,
-        sbe::makeE<sbe::EPrimUnary>(sbe::EPrimUnary::logicNot,
-                                    sbe::makeE<sbe::EFunction>("exists", sbe::makeEs(var.clone()))),
-        sbe::makeE<sbe::EFunction>("isNull", sbe::makeEs(var.clone())));
-}
-
-/**
  * Generates an EExpression that converts the input to upper or lower case.
  */
 void generateStringCaseConversionExpression(ExpressionVisitorContext* _context,
@@ -429,7 +429,7 @@ void generateStringCaseConversionExpression(ExpressionVisitorContext* _context,
                          getBSONTypeMask(sbe::value::TypeTags::Date) |
                          getBSONTypeMask(sbe::value::TypeTags::Timestamp));
     auto checkValidTypeExpr = sbe::makeE<sbe::ETypeMatch>(inputRef.clone(), typeMask);
-    auto checkNullorMissing = generateNullOrMissing(frameId, 0);
+    auto checkNullorMissing = generateNullOrMissing(inputRef);
     auto [emptyStrTag, emptyStrVal] = sbe::value::makeNewString("");
 
     auto caseConversionExpr = sbe::makeE<sbe::EIf>(
@@ -447,6 +447,64 @@ void generateStringCaseConversionExpression(ExpressionVisitorContext* _context,
                              std::move(caseConversionExpr));
     _context->pushExpr(
         sbe::makeE<sbe::ELocalBind>(frameId, std::move(str), std::move(totalCaseConversionExpr)));
+}
+
+/**
+ * Generates an EExpression that checks if the input expression is not a string, _assuming that
+ * it has already been verified to be neither null nor missing.
+ */
+std::unique_ptr<sbe::EExpression> generateNonStringCheck(const sbe::EVariable& var) {
+    return sbe::makeE<sbe::EPrimUnary>(
+        sbe::EPrimUnary::logicNot,
+        sbe::makeE<sbe::EFunction>("isString", sbe::makeEs(var.clone())));
+}
+
+/**
+ * Generates an EExpression that checks whether the input expression is null, missing, or
+ * unable to be converted to the type NumberInt32.
+ */
+std::unique_ptr<sbe::EExpression> generateNullishOrNotRepresentableInt32Check(
+    const sbe::EVariable& var) {
+    auto numericConvert32 =
+        sbe::makeE<sbe::ENumericConvert>(var.clone(), sbe::value::TypeTags::NumberInt32);
+    return sbe::makeE<sbe::EPrimBinary>(
+        sbe::EPrimBinary::logicOr,
+        generateNullOrMissing(var),
+        sbe::makeE<sbe::EPrimUnary>(
+            sbe::EPrimUnary::logicNot,
+            sbe::makeE<sbe::EFunction>("exists", sbe::makeEs(std::move(numericConvert32)))));
+}
+
+std::unique_ptr<sbe::EExpression> makeNot(std::unique_ptr<sbe::EExpression> e) {
+    return sbe::makeE<sbe::EPrimUnary>(sbe::EPrimUnary::logicNot, std::move(e));
+}
+
+void buildArrayAccessByConstantIndex(ExpressionVisitorContext* context,
+                                     const std::string& exprName,
+                                     int32_t index) {
+    context->ensureArity(1);
+
+    auto array = context->popExpr();
+
+    auto frameId = context->frameIdGenerator->generate();
+    auto binds = sbe::makeEs(std::move(array));
+    sbe::EVariable arrayRef{frameId, 0};
+
+    auto indexExpr = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                sbe::value::bitcastFrom<int32_t>(index));
+    auto argumentIsNotArray =
+        makeNot(sbe::makeE<sbe::EFunction>("isArray", sbe::makeEs(arrayRef.clone())));
+    auto resultExpr = buildMultiBranchConditional(
+        CaseValuePair{generateNullOrMissing(arrayRef),
+                      sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+        CaseValuePair{std::move(argumentIsNotArray),
+                      sbe::makeE<sbe::EFail>(ErrorCodes::Error{5126704},
+                                             exprName + " argument must be an array")},
+        sbe::makeE<sbe::EFunction>("getElement",
+                                   sbe::makeEs(arrayRef.clone(), std::move(indexExpr))));
+
+    context->pushExpr(
+        sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(resultExpr)));
 }
 
 class ExpressionPreVisitor final : public ExpressionVisitor {
@@ -654,7 +712,21 @@ public:
     void visit(ExpressionDivide* expr) final {}
     void visit(ExpressionExp* expr) final {}
     void visit(ExpressionFieldPath* expr) final {}
-    void visit(ExpressionFilter* expr) final {}
+    void visit(ExpressionFilter* expr) final {
+        // This visitor executes after visiting the expression that will evaluate to the array for
+        // filtering and before visiting the filter condition expression.
+        auto variableId = expr->getVariableId();
+        invariant(_context->environment.find(variableId) == _context->environment.end());
+
+        auto currentElementSlot = _context->slotIdGenerator->generate();
+        _context->environment.insert({variableId, currentElementSlot});
+
+        // Temporarily reset 'traverseStage' with limit 1/coscan tree to prevent from being
+        // rewritten by filter predicate's generated sub-tree.
+        _context->filterExpressionEvalFrameStack.emplace(std::move(_context->traverseStage),
+                                                         *_context->relevantSlots);
+        _context->traverseStage = makeLimitCoScanTree(_context->planNodeId);
+    }
     void visit(ExpressionFloor* expr) final {}
     void visit(ExpressionIfNull* expr) final {}
     void visit(ExpressionIn* expr) final {}
@@ -952,16 +1024,16 @@ public:
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
-        auto checkNullOrEmpty = generateNullOrMissing(frameId, 0);
-
-        auto absExpr = sbe::makeE<sbe::EIf>(
-            std::move(checkNullOrEmpty),
-            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0),
-            sbe::makeE<sbe::EIf>(
-                sbe::makeE<sbe::EFunction>("isNumber", sbe::makeEs(inputRef.clone())),
-                sbe::makeE<sbe::EFunction>("abs", sbe::makeEs(inputRef.clone())),
-                sbe::makeE<sbe::EFail>(ErrorCodes::Error{4822870},
-                                       "$abs only supports numeric types, not string")));
+        auto absExpr = buildMultiBranchConditional(
+            CaseValuePair{generateNullOrMissing(inputRef),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{generateNonNumericCheck(inputRef),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{4903700},
+                                                 "$abs only supports numeric types")},
+            CaseValuePair{generateLongLongMinCheck(inputRef),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{4903701},
+                                                 "can't take $abs of long long min")},
+            sbe::makeE<sbe::EFunction>("abs", sbe::makeEs(inputRef.clone())));
 
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(absExpr)));
@@ -971,7 +1043,6 @@ public:
         size_t arity = expr->getChildren().size();
         _context->ensureArity(arity);
         auto frameId = _context->frameIdGenerator->generate();
-
 
         auto generateNotNumberOrDate = [frameId](const sbe::value::SlotId slotId) {
             sbe::EVariable var{frameId, slotId};
@@ -1018,19 +1089,26 @@ public:
                 sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(addExpr)));
         } else {
             std::vector<std::unique_ptr<sbe::EExpression>> binds;
-            for (size_t i = 0; i < arity; i++) {
-                binds.push_back(_context->popExpr());
-            }
-            std::reverse(std::begin(binds), std::end(binds));
-
+            std::vector<std::unique_ptr<sbe::EExpression>> argVars;
             std::vector<std::unique_ptr<sbe::EExpression>> checkExprsNull;
             std::vector<std::unique_ptr<sbe::EExpression>> checkExprsNotNumberOrDate;
-            std::vector<std::unique_ptr<sbe::EExpression>> argVars;
-            for (size_t idx = 0; idx < arity; idx++) {
+            binds.reserve(arity);
+            argVars.reserve(arity);
+            checkExprsNull.reserve(arity);
+            checkExprsNotNumberOrDate.reserve(arity);
+            for (size_t idx = 0; idx < arity; ++idx) {
+                binds.push_back(_context->popExpr());
+                argVars.push_back(sbe::makeE<sbe::EVariable>(frameId, idx));
+
                 checkExprsNull.push_back(generateNullOrMissing(frameId, idx));
                 checkExprsNotNumberOrDate.push_back(generateNotNumberOrDate(idx));
-                argVars.push_back(sbe::makeE<sbe::EVariable>(frameId, idx));
             }
+
+            // At this point 'binds' vector contains arguments of $add expression in the reversed
+            // order. We need to reverse it back to perform summation in the right order below.
+            // Summation in different order can lead to different result because of accumulated
+            // precision errors from floating point types.
+            std::reverse(std::begin(binds), std::end(binds));
 
             using iter_t = std::vector<std::unique_ptr<sbe::EExpression>>::iterator;
             auto checkNullAllArguments =
@@ -1076,13 +1154,60 @@ public:
         unsupportedExpression(expr->getOpName());
     }
     void visit(ExpressionArrayElemAt* expr) final {
-        unsupportedExpression(expr->getOpName());
+        _context->ensureArity(2);
+
+        auto index = _context->popExpr();
+        auto array = _context->popExpr();
+
+        auto frameId = _context->frameIdGenerator->generate();
+        auto binds = sbe::makeEs(std::move(array), std::move(index));
+        sbe::EVariable arrayRef{frameId, 0};
+        sbe::EVariable indexRef{frameId, 1};
+
+        auto int32Index = [&]() {
+            auto convertedIndex = sbe::makeE<sbe::ENumericConvert>(
+                indexRef.clone(), sbe::value::TypeTags::NumberInt32);
+            auto frameId = _context->frameIdGenerator->generate();
+            auto binds = sbe::makeEs(std::move(convertedIndex));
+            sbe::EVariable convertedIndexRef{frameId, 0};
+
+            auto inExpression = sbe::makeE<sbe::EIf>(
+                sbe::makeE<sbe::EFunction>("exists", sbe::makeEs(convertedIndexRef.clone())),
+                convertedIndexRef.clone(),
+                sbe::makeE<sbe::EFail>(
+                    ErrorCodes::Error{5126703},
+                    "$arrayElemAt second argument cannot be represented as a 32-bit integer"));
+
+            return sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(inExpression));
+        }();
+
+        auto anyOfArgumentsIsNullish =
+            sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::logicOr,
+                                         generateNullOrMissing(arrayRef),
+                                         generateNullOrMissing(indexRef));
+        auto firstArgumentIsNotArray =
+            makeNot(sbe::makeE<sbe::EFunction>("isArray", sbe::makeEs(arrayRef.clone())));
+        auto secondArgumentIsNotNumeric = generateNonNumericCheck(indexRef);
+        auto arrayElemAtExpr = buildMultiBranchConditional(
+            CaseValuePair{std::move(anyOfArgumentsIsNullish),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{std::move(firstArgumentIsNotArray),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{5126701},
+                                                 "$arrayElemAt first argument must be an array")},
+            CaseValuePair{std::move(secondArgumentIsNotNumeric),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{5126702},
+                                                 "$arrayElemAt second argument must be a number")},
+            sbe::makeE<sbe::EFunction>("getElement",
+                                       sbe::makeEs(arrayRef.clone(), std::move(int32Index))));
+
+        _context->pushExpr(
+            sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(arrayElemAtExpr)));
     }
     void visit(ExpressionFirst* expr) final {
-        unsupportedExpression(expr->getOpName());
+        buildArrayAccessByConstantIndex(_context, expr->getOpName(), 0);
     }
     void visit(ExpressionLast* expr) final {
-        unsupportedExpression(expr->getOpName());
+        buildArrayAccessByConstantIndex(_context, expr->getOpName(), -1);
     }
     void visit(ExpressionObjectToArray* expr) final {
         unsupportedExpression(expr->getOpName());
@@ -1101,23 +1226,37 @@ public:
         auto binds = sbe::makeEs(_context->popExpr());
         sbe::EVariable inputRef(frameId, 0);
 
-        auto bsonSizeExpr = sbe::makeE<sbe::EIf>(
-            generateNullOrMissing(frameId, 0),
-            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0),
-            sbe::makeE<sbe::EIf>(
-                sbe::makeE<sbe::EFunction>("isObject", sbe::makeEs(inputRef.clone())),
-                sbe::makeE<sbe::EFunction>("bsonSize", sbe::makeEs(inputRef.clone())),
-                sbe::makeE<sbe::EFail>(ErrorCodes::Error{5043001},
-                                       "$bsonSize requires a document input")));
+        auto bsonSizeExpr = buildMultiBranchConditional(
+            CaseValuePair{generateNullOrMissing(inputRef),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{generateNonObjectCheck(inputRef),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{5043001},
+                                                 "$bsonSize requires a document input")},
+            sbe::makeE<sbe::EFunction>("bsonSize", sbe::makeEs(inputRef.clone())));
 
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(bsonSizeExpr)));
     }
     void visit(ExpressionCeil* expr) final {
-        unsupportedExpression(expr->getOpName());
+        auto frameId = _context->frameIdGenerator->generate();
+        auto binds = sbe::makeEs(_context->popExpr());
+        sbe::EVariable inputRef(frameId, 0);
+
+        auto ceilExpr = buildMultiBranchConditional(
+            CaseValuePair{generateNullOrMissing(inputRef),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{generateNonNumericCheck(inputRef),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{4903702},
+                                                 "$ceil only supports numeric types")},
+            sbe::makeE<sbe::EFunction>("ceil", sbe::makeEs(inputRef.clone())));
+
+        _context->pushExpr(
+            sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(ceilExpr)));
     }
     void visit(ExpressionCoerceToBool* expr) final {
-        unsupportedExpression("$coerceToBool");
+        // Since $coerceToBool is internal-only and there are not yet any input expressions that
+        // generate an ExpressionCoerceToBool expression, we will leave it as unreachable for now.
+        MONGO_UNREACHABLE;
     }
     void visit(ExpressionCompare* expr) final {
         _context->ensureArity(2);
@@ -1160,7 +1299,8 @@ public:
             : sbe::makeE<sbe::EPrimBinary>(
                   comparisonOperator,
                   std::move(cmp3w),
-                  sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 0));
+                  sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                             sbe::value::bitcastFrom<int32_t>(0)));
 
         // If either operand evaluates to "Nothing," then the entire operation expressed by 'cmp'
         // will also evaluate to "Nothing." MQL comparisons, however, treat "Nothing" as if it is a
@@ -1177,9 +1317,57 @@ public:
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(operands), std::move(cmpWithFallback)));
     }
+
     void visit(ExpressionConcat* expr) final {
-        unsupportedExpression(expr->getOpName());
+        auto arity = expr->getChildren().size();
+        _context->ensureArity(arity);
+        auto frameId = _context->frameIdGenerator->generate();
+
+        std::vector<std::unique_ptr<sbe::EExpression>> binds;
+        std::vector<std::unique_ptr<sbe::EExpression>> checkNullArg;
+        std::vector<std::unique_ptr<sbe::EExpression>> checkStringArg;
+        std::vector<std::unique_ptr<sbe::EExpression>> argVars;
+        sbe::value::SlotId slot{0};
+        for (size_t idx = 0; idx < arity; ++idx, ++slot) {
+            sbe::EVariable var(frameId, slot);
+            binds.push_back(_context->popExpr());
+            checkNullArg.push_back(generateNullOrMissing(frameId, slot));
+            checkStringArg.push_back(
+                sbe::makeE<sbe::EFunction>("isString", sbe::makeEs(var.clone())));
+            argVars.push_back(var.clone());
+        }
+        std::reverse(std::begin(binds), std::end(binds));
+
+        using iter_t = std::vector<std::unique_ptr<sbe::EExpression>>::iterator;
+        auto checkNullAnyArgument =
+            std::accumulate(std::move_iterator<iter_t>(checkNullArg.begin() + 1),
+                            std::move_iterator<iter_t>(checkNullArg.end()),
+                            std::move(checkNullArg.front()),
+                            [](auto&& acc, auto&& ex) {
+                                return sbe::makeE<sbe::EPrimBinary>(
+                                    sbe::EPrimBinary::logicOr, std::move(acc), std::move(ex));
+                            });
+
+        auto checkStringAllArguments =
+            std::accumulate(std::move_iterator<iter_t>(checkStringArg.begin() + 1),
+                            std::move_iterator<iter_t>(checkStringArg.end()),
+                            std::move(checkStringArg.front()),
+                            [](auto&& acc, auto&& ex) {
+                                return sbe::makeE<sbe::EPrimBinary>(
+                                    sbe::EPrimBinary::logicAnd, std::move(acc), std::move(ex));
+                            });
+        auto concatExpr = sbe::makeE<sbe::EIf>(
+            std::move(checkNullAnyArgument),
+            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0),
+            sbe::makeE<sbe::EIf>(std::move(checkStringAllArguments),
+                                 sbe::makeE<sbe::EFunction>("concat", std::move(argVars)),
+                                 sbe::makeE<sbe::EFail>(ErrorCodes::Error{5073001},
+                                                        "$concat supports only strings")));
+
+        _context->pushExpr(
+            sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(concatExpr)));
     }
+
     void visit(ExpressionConcatArrays* expr) final {
         unsupportedExpression(expr->getOpName());
     }
@@ -1250,11 +1438,13 @@ public:
                         sbe::makeE<sbe::EPrimBinary>(
                             sbe::EPrimBinary::greaterEq,
                             var.clone(),
-                            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, lower)),
+                            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                       sbe::value::bitcastFrom<int32_t>(lower))),
                         sbe::makeE<sbe::EPrimBinary>(
                             sbe::EPrimBinary::lessEq,
                             var.clone(),
-                            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, upper))),
+                            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                       sbe::value::bitcastFrom<int32_t>(upper)))),
                     sbe::makeE<sbe::EFail>(ErrorCodes::Error{4848972}, errMsg));
             };
 
@@ -1321,7 +1511,8 @@ public:
         std::vector<std::unique_ptr<sbe::EExpression>> operands;
         if (isIsoWeekYear) {
             if (!eIsoWeekYear) {
-                eIsoWeekYear = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1970);
+                eIsoWeekYear = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                          sbe::value::bitcastFrom<int32_t>(1970));
                 operands.push_back(std::move(eIsoWeekYear));
             } else {
                 boundChecks.push_back(boundedCheck(yearRef, 1, 9999, "isoWeekYear"));
@@ -1329,7 +1520,8 @@ public:
                     std::move(eIsoWeekYear), _context->frameIdGenerator, "isoWeekYear"));
             }
             if (!eIsoWeek) {
-                eIsoWeek = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1);
+                eIsoWeek = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                      sbe::value::bitcastFrom<int32_t>(1));
                 operands.push_back(std::move(eIsoWeek));
             } else {
                 boundChecks.push_back(boundedCheck(monthRef, minInt16, maxInt16, "isoWeek"));
@@ -1337,7 +1529,8 @@ public:
                     std::move(eIsoWeek), _context->frameIdGenerator, "isoWeek"));
             }
             if (!eIsoDayOfWeek) {
-                eIsoDayOfWeek = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1);
+                eIsoDayOfWeek = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                           sbe::value::bitcastFrom<int32_t>(1));
                 operands.push_back(std::move(eIsoDayOfWeek));
             } else {
                 boundChecks.push_back(boundedCheck(dayRef, minInt16, maxInt16, "isoDayOfWeek"));
@@ -1347,7 +1540,8 @@ public:
         } else {
             // The regular year/month/day case.
             if (!eYear) {
-                eYear = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1970);
+                eYear = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                   sbe::value::bitcastFrom<int32_t>(1970));
                 operands.push_back(std::move(eYear));
             } else {
                 boundChecks.push_back(boundedCheck(yearRef, 1, 9999, "year"));
@@ -1355,7 +1549,8 @@ public:
                     fieldConversionBinding(std::move(eYear), _context->frameIdGenerator, "year"));
             }
             if (!eMonth) {
-                eMonth = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1);
+                eMonth = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                    sbe::value::bitcastFrom<int32_t>(1));
                 operands.push_back(std::move(eMonth));
             } else {
                 boundChecks.push_back(boundedCheck(monthRef, minInt16, maxInt16, "month"));
@@ -1363,7 +1558,8 @@ public:
                     fieldConversionBinding(std::move(eMonth), _context->frameIdGenerator, "month"));
             }
             if (!eDay) {
-                eDay = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 1);
+                eDay = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                  sbe::value::bitcastFrom<int32_t>(1));
                 operands.push_back(std::move(eDay));
             } else {
                 boundChecks.push_back(boundedCheck(dayRef, minInt16, maxInt16, "day"));
@@ -1372,7 +1568,8 @@ public:
             }
         }
         if (!eHour) {
-            eHour = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 0);
+            eHour = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                               sbe::value::bitcastFrom<int32_t>(0));
             operands.push_back(std::move(eHour));
         } else {
             boundChecks.push_back(boundedCheck(hourRef, minInt16, maxInt16, "hour"));
@@ -1380,7 +1577,8 @@ public:
                 fieldConversionBinding(std::move(eHour), _context->frameIdGenerator, "hour"));
         }
         if (!eMinute) {
-            eMinute = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 0);
+            eMinute = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                 sbe::value::bitcastFrom<int32_t>(0));
             operands.push_back(std::move(eMinute));
         } else {
             boundChecks.push_back(boundedCheck(minRef, minInt16, maxInt16, "minute"));
@@ -1388,7 +1586,8 @@ public:
                 fieldConversionBinding(std::move(eMinute), _context->frameIdGenerator, "minute"));
         }
         if (!eSecond) {
-            eSecond = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 0);
+            eSecond = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                 sbe::value::bitcastFrom<int32_t>(0));
             operands.push_back(std::move(eSecond));
         } else {
             // MQL doesn't place bound restrictions on the second field, because seconds carry over
@@ -1397,7 +1596,8 @@ public:
                 fieldConversionBinding(std::move(eSecond), _context->frameIdGenerator, "second"));
         }
         if (!eMillisecond) {
-            eMillisecond = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32, 0);
+            eMillisecond = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
+                                                      sbe::value::bitcastFrom<int32_t>(0));
             operands.push_back(std::move(eMillisecond));
         } else {
             // MQL doesn't enforce bound restrictions on millisecond fields because milliseconds
@@ -1427,14 +1627,14 @@ public:
         // are necessary after the initial conversion computation because we need have the outer let
         // binding evaluate to null if any field is null.
         auto nullExprs =
-            make_vector<std::unique_ptr<sbe::EExpression>>(generateNullOrMissing(frameId, 7),
-                                                           generateNullOrMissing(frameId, 6),
-                                                           generateNullOrMissing(frameId, 5),
-                                                           generateNullOrMissing(frameId, 4),
-                                                           generateNullOrMissing(frameId, 3),
-                                                           generateNullOrMissing(frameId, 2),
-                                                           generateNullOrMissing(frameId, 1),
-                                                           generateNullOrMissing(frameId, 0));
+            makeVector<std::unique_ptr<sbe::EExpression>>(generateNullOrMissing(frameId, 7),
+                                                          generateNullOrMissing(frameId, 6),
+                                                          generateNullOrMissing(frameId, 5),
+                                                          generateNullOrMissing(frameId, 4),
+                                                          generateNullOrMissing(frameId, 3),
+                                                          generateNullOrMissing(frameId, 2),
+                                                          generateNullOrMissing(frameId, 1),
+                                                          generateNullOrMissing(frameId, 0));
 
         using iter_t = std::vector<std::unique_ptr<sbe::EExpression>>::iterator;
         auto checkPartsForNull =
@@ -1485,17 +1685,163 @@ public:
         _context->pushExpr(sbe::makeE<sbe::ELocalBind>(
             frameId, std::move(operands), std::move(computeDateOrNull)));
     }
+
     void visit(ExpressionDateToParts* expr) final {
-        unsupportedExpression("$dateFromString");
+        auto frameId = _context->frameIdGenerator->generate();
+        auto children = expr->getChildren();
+        std::unique_ptr<sbe::EExpression> date, timezone, isoflag;
+        std::unique_ptr<sbe::EExpression> totalExprDateToParts;
+        std::vector<std::unique_ptr<sbe::EExpression>> args;
+        std::vector<std::unique_ptr<sbe::EExpression>> isoargs;
+        std::vector<std::unique_ptr<sbe::EExpression>> operands;
+        sbe::EVariable dateRef(frameId, 0);
+        sbe::EVariable timezoneRef(frameId, 1);
+        sbe::EVariable isoflagRef(frameId, 2);
+
+        // Initialize arguments with values from stack or default values.
+        if (children[2]) {
+            isoflag = _context->popExpr();
+        } else {
+            isoflag = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean, false);
+        }
+        if (children[1]) {
+            timezone = _context->popExpr();
+        } else {
+            auto [utcTag, utcVal] = sbe::value::makeNewString("UTC");
+            timezone = sbe::makeE<sbe::EConstant>(utcTag, utcVal);
+        }
+        if (children[0]) {
+            date = _context->popExpr();
+        } else {
+            _context->pushExpr(sbe::makeE<sbe::EFail>(ErrorCodes::Error{4997700},
+                                                      "$dateToParts must include a date"));
+            return;
+        }
+
+        // Add timezoneDB to arguments.
+        args.push_back(
+            sbe::makeE<sbe::EVariable>(_context->runtimeEnvironment->getSlot("timeZoneDB"_sd)));
+        isoargs.push_back(
+            sbe::makeE<sbe::EVariable>(_context->runtimeEnvironment->getSlot("timeZoneDB"_sd)));
+
+        // Add date to arguments.
+        uint32_t dateTypeMask = (getBSONTypeMask(sbe::value::TypeTags::Date) |
+                                 getBSONTypeMask(sbe::value::TypeTags::Timestamp) |
+                                 getBSONTypeMask(sbe::value::TypeTags::ObjectId) |
+                                 getBSONTypeMask(sbe::value::TypeTags::bsonObjectId));
+        operands.push_back(std::move(date));
+        args.push_back(dateRef.clone());
+        isoargs.push_back(dateRef.clone());
+
+        // Add timezone to arguments.
+        operands.push_back(std::move(timezone));
+        args.push_back(timezoneRef.clone());
+        isoargs.push_back(timezoneRef.clone());
+
+        // Add iso8601 to arguments.
+        uint32_t isoTypeMask = getBSONTypeMask(sbe::value::TypeTags::Boolean);
+        operands.push_back(std::move(isoflag));
+        args.push_back(isoflagRef.clone());
+        isoargs.push_back(isoflagRef.clone());
+
+        // Determine whether to call dateToParts or isoDateToParts.
+        auto checkIsoflagValue = buildMultiBranchConditional(
+            CaseValuePair{sbe::makeE<sbe::EPrimBinary>(
+                              sbe::EPrimBinary::eq,
+                              isoflagRef.clone(),
+                              sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean, false)),
+                          sbe::makeE<sbe::EFunction>("dateToParts", std::move(args))},
+            sbe::makeE<sbe::EFunction>("isoDateToParts", std::move(isoargs)));
+
+        // Check that each argument exists, is not null, and is the correct type.
+        auto totalDateToPartsFunc = buildMultiBranchConditional(
+            CaseValuePair{generateNullOrMissing(frameId, 1),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{
+                sbe::makeE<sbe::EPrimUnary>(
+                    sbe::EPrimUnary::logicNot,
+                    sbe::makeE<sbe::EFunction>("isString", sbe::makeEs(timezoneRef.clone()))),
+                sbe::makeE<sbe::EFail>(ErrorCodes::Error{4997701},
+                                       "$dateToParts timezone must be a string")},
+            CaseValuePair{
+                sbe::makeE<sbe::EPrimUnary>(
+                    sbe::EPrimUnary::logicNot,
+                    sbe::makeE<sbe::EFunction>(
+                        "isTimezone",
+                        sbe::makeEs(sbe::makeE<sbe::EVariable>(
+                                        _context->runtimeEnvironment->getSlot("timeZoneDB"_sd)),
+                                    timezoneRef.clone()))),
+                sbe::makeE<sbe::EFail>(ErrorCodes::Error{4997704},
+                                       "$dateToParts timezone must be a valid timezone")},
+            CaseValuePair{generateNullOrMissing(frameId, 2),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{sbe::makeE<sbe::EPrimUnary>(
+                              sbe::EPrimUnary::logicNot,
+                              sbe::makeE<sbe::ETypeMatch>(isoflagRef.clone(), isoTypeMask)),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{4997702},
+                                                 "$dateToParts iso8601 must be a boolean")},
+            CaseValuePair{generateNullOrMissing(frameId, 0),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{
+                sbe::makeE<sbe::EPrimUnary>(
+                    sbe::EPrimUnary::logicNot,
+                    sbe::makeE<sbe::ETypeMatch>(dateRef.clone(), dateTypeMask)),
+                sbe::makeE<sbe::EFail>(ErrorCodes::Error{4997703},
+                                       "$dateToParts date must have the format of a date")},
+            std::move(checkIsoflagValue));
+        _context->pushExpr(sbe::makeE<sbe::ELocalBind>(
+            frameId, std::move(operands), std::move(totalDateToPartsFunc)));
     }
     void visit(ExpressionDateToString* expr) final {
         unsupportedExpression("$dateFromString");
     }
     void visit(ExpressionDivide* expr) final {
-        unsupportedExpression(expr->getOpName());
+        _context->ensureArity(2);
+
+        auto rhs = _context->popExpr();
+        auto lhs = _context->popExpr();
+
+        auto frameId = _context->frameIdGenerator->generate();
+        auto binds = sbe::makeEs(std::move(lhs), std::move(rhs));
+        sbe::EVariable lhsRef{frameId, 0};
+        sbe::EVariable rhsRef{frameId, 1};
+
+        auto checkIsNumber = sbe::makeE<sbe::EPrimBinary>(
+            sbe::EPrimBinary::logicAnd,
+            sbe::makeE<sbe::EFunction>("isNumber", sbe::makeEs(lhsRef.clone())),
+            sbe::makeE<sbe::EFunction>("isNumber", sbe::makeEs(rhsRef.clone())));
+
+        auto checkIsNullOrMissing = sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::logicOr,
+                                                                 generateNullOrMissing(lhsRef),
+                                                                 generateNullOrMissing(rhsRef));
+
+        auto divideExpr = buildMultiBranchConditional(
+            CaseValuePair{std::move(checkIsNullOrMissing),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{std::move(checkIsNumber),
+                          sbe::makeE<sbe::EPrimBinary>(
+                              sbe::EPrimBinary::div, lhsRef.clone(), rhsRef.clone())},
+            sbe::makeE<sbe::EFail>(ErrorCodes::Error{5073101},
+                                   "$divide only supports numeric types"));
+
+        _context->pushExpr(
+            sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(divideExpr)));
     }
     void visit(ExpressionExp* expr) final {
-        unsupportedExpression(expr->getOpName());
+        auto frameId = _context->frameIdGenerator->generate();
+        auto binds = sbe::makeEs(_context->popExpr());
+        sbe::EVariable inputRef(frameId, 0);
+
+        auto expExpr = buildMultiBranchConditional(
+            CaseValuePair{generateNullOrMissing(inputRef),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{generateNonNumericCheck(inputRef),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{4903703},
+                                                 "$exp only supports numeric types")},
+            sbe::makeE<sbe::EFunction>("exp", sbe::makeEs(inputRef.clone())));
+
+        _context->pushExpr(
+            sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(expExpr)));
     }
     void visit(ExpressionFieldPath* expr) final {
         if (expr->getVariableId() == Variables::kRemoveId) {
@@ -1533,10 +1879,157 @@ public:
         _context->relevantSlots->push_back(outputSlot);
     }
     void visit(ExpressionFilter* expr) final {
-        unsupportedExpression("$filter");
+        _context->ensureArity(2);
+
+        auto filterPredicate = _context->popExpr();
+        auto input = _context->popExpr();
+
+        // Extract 'traverseStage' generated for filter predicate.
+        auto filterTraverseStage = std::move(_context->traverseStage);
+
+        // Restore old value of 'traverseStage' and 'relevantSlots' after filter predicate tree
+        // was built.
+        auto& filterPredicateEvalFrame = _context->filterExpressionEvalFrameStack.top();
+        _context->traverseStage = std::move(filterPredicateEvalFrame.traverseStage);
+        *_context->relevantSlots = filterPredicateEvalFrame.relevantSlots;
+        _context->filterExpressionEvalFrameStack.pop();
+
+        // Filter predicate of $filter expression expects current array element to be stored in the
+        // specific variable. We already allocated slot for it in the "in" visitor, now we just need
+        // to retrieve it from the environment.
+        // This slot will be used in the traverse stage twice - to store the input array and to
+        // store current element in this array.
+        auto currentElementVariable = expr->getVariableId();
+        invariant(_context->environment.count(currentElementVariable));
+        auto inputArraySlot = _context->environment.at(currentElementVariable);
+
+        // We no longer need this mapping because filter predicate which expects it was already
+        // compiled.
+        _context->environment.erase(currentElementVariable);
+
+        // Construct 'from' branch of traverse stage. SBE tree stored in 'fromBranch' variable looks
+        // like this:
+        //
+        // project inputIsNotNullishSlot = !(isNull(inputArraySlot) || !exists(inputArraySlot))
+        // project inputArraySlot = (
+        //   let inputRef = input
+        //   in
+        //       if isArray(inputRef) || isNull(inputRef) || !exists(inputRef)
+        //         inputRef
+        //       else
+        //         fail()
+        // )
+        // _context->traverseStage
+        auto frameId = _context->frameIdGenerator->generate();
+        auto binds = sbe::makeEs(std::move(input));
+        sbe::EVariable inputRef(frameId, 0);
+
+        auto inputIsArrayOrNullish = sbe::makeE<sbe::EPrimBinary>(
+            sbe::EPrimBinary::logicOr,
+            generateNullOrMissing(inputRef),
+            sbe::makeE<sbe::EFunction>("isArray", sbe::makeEs(inputRef.clone())));
+        auto checkInputArrayType =
+            sbe::makeE<sbe::EIf>(std::move(inputIsArrayOrNullish),
+                                 inputRef.clone(),
+                                 sbe::makeE<sbe::EFail>(ErrorCodes::Error{5073201},
+                                                        "input to $filter must be an array"));
+        auto inputArray =
+            sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(checkInputArrayType));
+
+        sbe::EVariable inputArrayVariable{inputArraySlot};
+        auto projectInputArray = sbe::makeProjectStage(std::move(_context->traverseStage),
+                                                       _context->planNodeId,
+                                                       inputArraySlot,
+                                                       std::move(inputArray));
+
+        auto inputIsNotNullish = makeNot(generateNullOrMissing(inputArrayVariable));
+        auto inputIsNotNullishSlot = _context->slotIdGenerator->generate();
+        auto fromBranch = sbe::makeProjectStage(std::move(projectInputArray),
+                                                _context->planNodeId,
+                                                inputIsNotNullishSlot,
+                                                std::move(inputIsNotNullish));
+
+        // Construct 'in' branch of traverse stage. SBE tree stored in 'inBranch' variable looks
+        // like this:
+        //
+        // cfilter Variable{inputIsNotNullishSlot}
+        // filter filterPredicate
+        // filterTraverseStage
+        //
+        // Filter predicate can return non-boolean values. To fix this, we generate expression to
+        // coerce it to bool type.
+        frameId = _context->frameIdGenerator->generate();
+        auto boolFilterPredicate =
+            sbe::makeE<sbe::ELocalBind>(frameId,
+                                        sbe::makeEs(std::move(filterPredicate)),
+                                        generateCoerceToBoolExpression(sbe::EVariable{frameId, 0}));
+        auto filterWithPredicate = sbe::makeS<sbe::FilterStage<false>>(
+            std::move(filterTraverseStage), std::move(boolFilterPredicate), _context->planNodeId);
+
+        // If input array is null or missing, we do not evaluate filter predicate and return EOF.
+        auto innerBranch =
+            sbe::makeS<sbe::FilterStage<true>>(std::move(filterWithPredicate),
+                                               sbe::makeE<sbe::EVariable>(inputIsNotNullishSlot),
+                                               _context->planNodeId);
+
+        // Relevant slots from the _context->traverseStage might be used in the traverse 'in' branch
+        // by filter predicate through path expressions and variables. We need to pass them
+        // explicitly as correlated to traverse 'from' branch.
+        auto outerCorrelatedSlots = *_context->relevantSlots;
+
+        // Add all variables from the environment.
+        for (const auto& item : _context->environment) {
+            outerCorrelatedSlots.push_back(item.second);
+        }
+
+        // inputIsNotNullishSlot is used explicitly by cfilter stage added on top of traverse 'in'
+        // branch.
+        outerCorrelatedSlots.push_back(inputIsNotNullishSlot);
+
+        // Construct traverse stage with the following slots:
+        // * inputArraySlot - slot containing input array of $filter expression
+        // * filteredArraySlot - slot containing the array with items on which filter predicate has
+        //   evaluated to true
+        // * inputArraySlot - slot where 'in' branch of traverse stage stores current array
+        //   element if it satisfies the filter predicate
+        auto filteredArraySlot = _context->slotIdGenerator->generate();
+        auto traverseStage =
+            sbe::makeS<sbe::TraverseStage>(std::move(fromBranch),
+                                           std::move(innerBranch),
+                                           inputArraySlot /* inField */,
+                                           filteredArraySlot /* outField */,
+                                           inputArraySlot /* outFieldInner */,
+                                           std::move(outerCorrelatedSlots) /* outerCorrelated */,
+                                           nullptr /* foldExpr */,
+                                           nullptr /* finalExpr */,
+                                           _context->planNodeId,
+                                           1 /* nestedArraysDepth */);
+
+        // If input array is null or missing, 'in' stage of traverse will return EOF. In this case
+        // traverse sets output slot (filteredArraySlot) to Nothing. We replace it with Null to
+        // match $filter expression behaviour.
+        auto result = sbe::makeE<sbe::EFunction>(
+            "fillEmpty",
+            sbe::makeEs(sbe::makeE<sbe::EVariable>(filteredArraySlot),
+                        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)));
+
+        _context->pushExpr(std::move(result), std::move(traverseStage));
     }
     void visit(ExpressionFloor* expr) final {
-        unsupportedExpression(expr->getOpName());
+        auto frameId = _context->frameIdGenerator->generate();
+        auto binds = sbe::makeEs(_context->popExpr());
+        sbe::EVariable inputRef(frameId, 0);
+
+        auto floorExpr = buildMultiBranchConditional(
+            CaseValuePair{generateNullOrMissing(inputRef),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{generateNonNumericCheck(inputRef),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{4903704},
+                                                 "$floor only supports numeric types")},
+            sbe::makeE<sbe::EFunction>("floor", sbe::makeEs(inputRef.clone())));
+
+        _context->pushExpr(
+            sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(floorExpr)));
     }
     void visit(ExpressionIfNull* expr) final {
         _context->ensureArity(2);
@@ -1561,11 +2054,13 @@ public:
     void visit(ExpressionIndexOfArray* expr) final {
         unsupportedExpression(expr->getOpName());
     }
+
     void visit(ExpressionIndexOfBytes* expr) final {
-        unsupportedExpression(expr->getOpName());
+        visitIndexOfFunction(expr, _context, "indexOfBytes");
     }
+
     void visit(ExpressionIndexOfCP* expr) final {
-        unsupportedExpression(expr->getOpName());
+        visitIndexOfFunction(expr, _context, "indexOfCP");
     }
     void visit(ExpressionIsNumber* expr) final {
         auto frameId = _context->frameIdGenerator->generate();
@@ -1575,7 +2070,8 @@ public:
         auto exprIsNum = sbe::makeE<sbe::EIf>(
             sbe::makeE<sbe::EFunction>("exists", sbe::makeEs(inputRef.clone())),
             sbe::makeE<sbe::EFunction>("isNumber", sbe::makeEs(inputRef.clone())),
-            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean, false));
+            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean,
+                                       sbe::value::bitcastFrom<bool>(false)));
 
         _context->pushExpr(
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(exprIsNum)));
@@ -1607,13 +2103,55 @@ public:
         // The AST parser already enforces scope rules.
     }
     void visit(ExpressionLn* expr) final {
-        unsupportedExpression(expr->getOpName());
+        auto frameId = _context->frameIdGenerator->generate();
+        auto binds = sbe::makeEs(_context->popExpr());
+        sbe::EVariable inputRef(frameId, 0);
+
+        auto lnExpr = buildMultiBranchConditional(
+            CaseValuePair{generateNullOrMissing(inputRef),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{generateNonNumericCheck(inputRef),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{4903705},
+                                                 "$ln only supports numeric types")},
+            // Note: In MQL, $ln on a NumberDecimal NaN historically evaluates to a NumberDouble
+            // NaN.
+            CaseValuePair{generateNaNCheck(inputRef),
+                          sbe::makeE<sbe::ENumericConvert>(inputRef.clone(),
+                                                           sbe::value::TypeTags::NumberDouble)},
+            CaseValuePair{generateNonPositiveCheck(inputRef),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{4903706},
+                                                 "$ln's argument must be a positive number")},
+            sbe::makeE<sbe::EFunction>("ln", sbe::makeEs(inputRef.clone())));
+
+        _context->pushExpr(
+            sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(lnExpr)));
     }
     void visit(ExpressionLog* expr) final {
         unsupportedExpression(expr->getOpName());
     }
     void visit(ExpressionLog10* expr) final {
-        unsupportedExpression(expr->getOpName());
+        auto frameId = _context->frameIdGenerator->generate();
+        auto binds = sbe::makeEs(_context->popExpr());
+        sbe::EVariable inputRef(frameId, 0);
+
+        auto log10Expr = buildMultiBranchConditional(
+            CaseValuePair{generateNullOrMissing(inputRef),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{generateNonNumericCheck(inputRef),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{4903707},
+                                                 "$log10 only supports numeric types")},
+            // Note: In MQL, $log10 on a NumberDecimal NaN historically evaluates to a NumberDouble
+            // NaN.
+            CaseValuePair{generateNaNCheck(inputRef),
+                          sbe::makeE<sbe::ENumericConvert>(inputRef.clone(),
+                                                           sbe::value::TypeTags::NumberDouble)},
+            CaseValuePair{generateNonPositiveCheck(inputRef),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{4903708},
+                                                 "$log10's argument must be a positive number")},
+            sbe::makeE<sbe::EFunction>("log10", sbe::makeEs(inputRef.clone())));
+
+        _context->pushExpr(
+            sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(log10Expr)));
     }
     void visit(ExpressionMap* expr) final {
         unsupportedExpression("$map");
@@ -1625,7 +2163,72 @@ public:
         unsupportedExpression(expr->getOpName());
     }
     void visit(ExpressionMultiply* expr) final {
-        unsupportedExpression(expr->getOpName());
+        auto arity = expr->getChildren().size();
+        _context->ensureArity(arity);
+        auto frameId = _context->frameIdGenerator->generate();
+
+        std::vector<std::unique_ptr<sbe::EExpression>> binds;
+        std::vector<std::unique_ptr<sbe::EExpression>> variables;
+        std::vector<std::unique_ptr<sbe::EExpression>> checkExprsNull;
+        std::vector<std::unique_ptr<sbe::EExpression>> checkExprsNumber;
+        binds.reserve(arity);
+        variables.reserve(arity);
+        checkExprsNull.reserve(arity);
+        checkExprsNumber.reserve(arity);
+        sbe::value::SlotId slot{0};
+        for (size_t idx = 0; idx < arity; ++idx, ++slot) {
+            binds.push_back(_context->popExpr());
+            sbe::EVariable currentVariable{frameId, slot};
+            variables.push_back(currentVariable.clone());
+
+            checkExprsNull.push_back(generateNullOrMissing(currentVariable));
+            checkExprsNumber.push_back(
+                sbe::makeE<sbe::EFunction>("isNumber", sbe::makeEs(currentVariable.clone())));
+        }
+
+        // At this point 'binds' vector contains arguments of $multiply expression in the reversed
+        // order. We need to reverse it back to perform multiplication in the right order below.
+        // Multiplication in different order can lead to different result because of accumulated
+        // precision errors from floating point types.
+        std::reverse(std::begin(binds), std::end(binds));
+
+        using iter_t = std::vector<std::unique_ptr<sbe::EExpression>>::iterator;
+        auto checkNullAnyArgument =
+            std::accumulate(std::move_iterator<iter_t>(checkExprsNull.begin() + 1),
+                            std::move_iterator<iter_t>(checkExprsNull.end()),
+                            std::move(checkExprsNull.front()),
+                            [](auto&& acc, auto&& ex) {
+                                return sbe::makeE<sbe::EPrimBinary>(
+                                    sbe::EPrimBinary::logicOr, std::move(acc), std::move(ex));
+                            });
+
+        auto checkNumberAllArguments =
+            std::accumulate(std::move_iterator<iter_t>(checkExprsNumber.begin() + 1),
+                            std::move_iterator<iter_t>(checkExprsNumber.end()),
+                            std::move(checkExprsNumber.front()),
+                            [](auto&& acc, auto&& ex) {
+                                return sbe::makeE<sbe::EPrimBinary>(
+                                    sbe::EPrimBinary::logicAnd, std::move(acc), std::move(ex));
+                            });
+
+        auto multiplication =
+            std::accumulate(std::move_iterator<iter_t>(variables.begin() + 1),
+                            std::move_iterator<iter_t>(variables.end()),
+                            std::move(variables.front()),
+                            [](auto&& acc, auto&& ex) {
+                                return sbe::makeE<sbe::EPrimBinary>(
+                                    sbe::EPrimBinary::mul, std::move(acc), std::move(ex));
+                            });
+
+        auto multiplyExpr = buildMultiBranchConditional(
+            CaseValuePair{std::move(checkNullAnyArgument),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{std::move(checkNumberAllArguments), std::move(multiplication)},
+            sbe::makeE<sbe::EFail>(ErrorCodes::Error{5073102},
+                                   "only numbers are allowed in an $multiply expression"));
+
+        _context->pushExpr(
+            sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(multiplyExpr)));
     }
     void visit(ExpressionNot* expr) final {
         auto frameId = _context->frameIdGenerator->generate();
@@ -1692,7 +2295,24 @@ public:
         unsupportedExpression(expr->getOpName());
     }
     void visit(ExpressionSqrt* expr) final {
-        unsupportedExpression(expr->getOpName());
+        auto frameId = _context->frameIdGenerator->generate();
+        auto binds = sbe::makeEs(_context->popExpr());
+        sbe::EVariable inputRef(frameId, 0);
+
+        auto lnExpr = buildMultiBranchConditional(
+            CaseValuePair{generateNullOrMissing(inputRef),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{generateNonNumericCheck(inputRef),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{4903709},
+                                                 "$sqrt only supports numeric types")},
+            CaseValuePair{
+                generateNegativeCheck(inputRef),
+                sbe::makeE<sbe::EFail>(ErrorCodes::Error{4903710},
+                                       "$sqrt's argument must be greater than or equal to 0")},
+            sbe::makeE<sbe::EFunction>("sqrt", sbe::makeEs(inputRef.clone())));
+
+        _context->pushExpr(
+            sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(lnExpr)));
     }
     void visit(ExpressionStrcasecmp* expr) final {
         unsupportedExpression(expr->getOpName());
@@ -1900,9 +2520,9 @@ private:
         if (expr->getChildren().size() == 0) {
             // Empty $and and $or always evaluate to their logical operator's identity value: true
             // and false, respectively.
-            bool logicIdentityVal = (logicOp == sbe::EPrimBinary::logicAnd);
+            auto logicIdentityVal = (logicOp == sbe::EPrimBinary::logicAnd);
             _context->pushExpr(sbe::makeE<sbe::EConstant>(
-                sbe::value::TypeTags::Boolean, sbe::value::bitcastFrom(logicIdentityVal)));
+                sbe::value::TypeTags::Boolean, sbe::value::bitcastFrom<bool>(logicIdentityVal)));
             return;
         } else if (expr->getChildren().size() == 1) {
             // No need for short circuiting logic in a singleton $and/$or. Just execute the branch
@@ -2013,12 +2633,12 @@ private:
                 lowerCmp,
                 inputRef.clone(),
                 sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberDouble,
-                                           sbe::value::bitcastFrom(lowerBound.bound))),
+                                           sbe::value::bitcastFrom<double>(lowerBound.bound))),
             sbe::makeE<sbe::EPrimBinary>(
                 upperCmp,
                 inputRef.clone(),
                 sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberDouble,
-                                           sbe::value::bitcastFrom(upperBound.bound))));
+                                           sbe::value::bitcastFrom<double>(upperBound.bound))));
 
         auto genericTrignomentricExpr = sbe::makeE<sbe::EIf>(
             generateNullOrMissing(frameId, 0),
@@ -2041,6 +2661,121 @@ private:
 
         _context->pushExpr(sbe::makeE<sbe::ELocalBind>(
             frameId, std::move(binds), std::move(genericTrignomentricExpr)));
+    }
+
+    /*
+     * Generates an EExpression that returns an index for $indexOfBytes or $indexOfCP.
+     */
+    void visitIndexOfFunction(Expression* expr,
+                              ExpressionVisitorContext* _context,
+                              const std::string& indexOfFunction) {
+        auto frameId = _context->frameIdGenerator->generate();
+        auto children = expr->getChildren();
+        auto operandSize = children.size() <= 3 ? 3 : 4;
+        std::vector<std::unique_ptr<sbe::EExpression>> operands(operandSize);
+        std::vector<std::unique_ptr<sbe::EExpression>> bindings;
+        sbe::EVariable strRef(frameId, 0);
+        sbe::EVariable substrRef(frameId, 1);
+        boost::optional<sbe::EVariable> startIndexRef;
+        boost::optional<sbe::EVariable> endIndexRef;
+
+        // Get arguments from stack.
+        switch (children.size()) {
+            case 2: {
+                operands[2] = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
+                                                         sbe::value::bitcastFrom<int64_t>(0));
+                operands[1] = _context->popExpr();
+                operands[0] = _context->popExpr();
+                startIndexRef.emplace(frameId, 2);
+                break;
+            }
+            case 3: {
+                operands[2] = _context->popExpr();
+                operands[1] = _context->popExpr();
+                operands[0] = _context->popExpr();
+                startIndexRef.emplace(frameId, 2);
+                break;
+            }
+            case 4: {
+                operands[3] = _context->popExpr();
+                operands[2] = _context->popExpr();
+                operands[1] = _context->popExpr();
+                operands[0] = _context->popExpr();
+                startIndexRef.emplace(frameId, 2);
+                endIndexRef.emplace(frameId, 3);
+                break;
+            }
+            default:
+                MONGO_UNREACHABLE;
+        }
+
+        // Add string and substring operands.
+        bindings.push_back(strRef.clone());
+        bindings.push_back(substrRef.clone());
+
+        // Add start index operand.
+        if (startIndexRef) {
+            auto numericConvert64 = sbe::makeE<sbe::ENumericConvert>(
+                startIndexRef->clone(), sbe::value::TypeTags::NumberInt64);
+            auto checkValidStartIndex = buildMultiBranchConditional(
+                CaseValuePair{generateNullishOrNotRepresentableInt32Check(*startIndexRef),
+                              sbe::makeE<sbe::EFail>(
+                                  ErrorCodes::Error{5075303},
+                                  str::stream() << "$" << indexOfFunction
+                                                << " start index must resolve to a number")},
+                CaseValuePair{generateNegativeCheck(*startIndexRef),
+                              sbe::makeE<sbe::EFail>(ErrorCodes::Error{5075304},
+                                                     str::stream()
+                                                         << "$" << indexOfFunction
+                                                         << " start index must be positive")},
+                std::move(numericConvert64));
+            bindings.push_back(std::move(checkValidStartIndex));
+        }
+        // Add end index operand.
+        if (endIndexRef) {
+            auto numericConvert64 = sbe::makeE<sbe::ENumericConvert>(
+                endIndexRef->clone(), sbe::value::TypeTags::NumberInt64);
+            auto checkValidEndIndex = buildMultiBranchConditional(
+                CaseValuePair{generateNullishOrNotRepresentableInt32Check(*endIndexRef),
+                              sbe::makeE<sbe::EFail>(ErrorCodes::Error{5075305},
+                                                     str::stream()
+                                                         << "$" << indexOfFunction
+                                                         << " end index must resolve to a number")},
+                CaseValuePair{generateNegativeCheck(*endIndexRef),
+                              sbe::makeE<sbe::EFail>(ErrorCodes::Error{5075306},
+                                                     str::stream()
+                                                         << "$" << indexOfFunction
+                                                         << " end index must be positive")},
+                std::move(numericConvert64));
+            bindings.push_back(std::move(checkValidEndIndex));
+        }
+
+        // Check if string or substring are null or missing before calling indexOfFunction.
+        auto checkStringNullOrMissing = generateNullOrMissing(frameId, 0);
+        auto checkSubstringNullOrMissing = generateNullOrMissing(frameId, 1);
+        auto exprIndexOfFunction = sbe::makeE<sbe::EFunction>(indexOfFunction, std::move(bindings));
+
+        auto totalExprIndexOfFunction = buildMultiBranchConditional(
+            CaseValuePair{std::move(checkStringNullOrMissing),
+                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{generateNonStringCheck(strRef),
+                          sbe::makeE<sbe::EFail>(
+                              ErrorCodes::Error{5075300},
+                              str::stream() << "$" << indexOfFunction
+                                            << " string must resolve to a string or null")},
+            CaseValuePair{std::move(checkSubstringNullOrMissing),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{5075301},
+                                                 str::stream()
+                                                     << "$" << indexOfFunction
+                                                     << " substring must resolve to a string")},
+            CaseValuePair{generateNonStringCheck(substrRef),
+                          sbe::makeE<sbe::EFail>(ErrorCodes::Error{5075302},
+                                                 str::stream()
+                                                     << "$" << indexOfFunction
+                                                     << " substring must resolve to a string")},
+            std::move(exprIndexOfFunction));
+        _context->pushExpr(sbe::makeE<sbe::ELocalBind>(
+            frameId, std::move(operands), std::move(totalExprIndexOfFunction)));
     }
 
     void unsupportedExpression(const char* op) const {
@@ -2086,7 +2821,8 @@ std::unique_ptr<sbe::EExpression> generateCoerceToBoolExpression(sbe::EVariable 
             sbe::EPrimBinary::neq,
             sbe::makeE<sbe::EPrimBinary>(
                 sbe::EPrimBinary::cmp3w, branchRef.clone(), std::move(valExpr)),
-            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 0));
+            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
+                                       sbe::value::bitcastFrom<int64_t>(0)));
     };
 
     // If any of these are false, the branch is considered false for the purposes of the
@@ -2095,10 +2831,10 @@ std::unique_ptr<sbe::EExpression> generateCoerceToBoolExpression(sbe::EVariable 
     auto checkNotNull = sbe::makeE<sbe::EPrimUnary>(
         sbe::EPrimUnary::logicNot,
         sbe::makeE<sbe::EFunction>("isNull", sbe::makeEs(branchRef.clone())));
-    auto checkNotFalse =
-        makeNeqCheck(sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean, false));
-    auto checkNotZero =
-        makeNeqCheck(sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 0));
+    auto checkNotFalse = makeNeqCheck(sbe::makeE<sbe::EConstant>(
+        sbe::value::TypeTags::Boolean, sbe::value::bitcastFrom<bool>(false)));
+    auto checkNotZero = makeNeqCheck(sbe::makeE<sbe::EConstant>(
+        sbe::value::TypeTags::NumberInt64, sbe::value::bitcastFrom<int64_t>(0)));
 
     return sbe::makeE<sbe::EPrimBinary>(
         sbe::EPrimBinary::logicAnd,

@@ -105,7 +105,7 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
             createCollection(opCtx, fcvNss.db().toString(), BSON("create" << fcvNss.coll())));
     }
 
-    const Collection* fcvColl = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+    const CollectionPtr& fcvColl = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
         opCtx, NamespaceString::kServerConfigurationNamespace);
     invariant(fcvColl);
 
@@ -115,12 +115,13 @@ Status restoreMissingFeatureCompatibilityVersionDocument(OperationContext* opCtx
                           fcvColl,
                           BSON("_id" << FeatureCompatibilityVersionParser::kParameterName),
                           featureCompatibilityVersion)) {
+        // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
         LOGV2(21000,
               "Re-creating featureCompatibilityVersion document that was deleted. Creating new "
               "document with version "
-              "{FeatureCompatibilityVersionParser_kVersion44}.",
+              "{FeatureCompatibilityVersionParser_kLastLTS}.",
               "Re-creating featureCompatibilityVersion document that was deleted",
-              "version"_attr = FeatureCompatibilityVersionParser::kVersion44);
+              "version"_attr = FeatureCompatibilityVersionParser::kLastLTS);
 
         FeatureCompatibilityVersionDocument fcvDoc;
         // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
@@ -323,7 +324,7 @@ bool hasReplSetConfigDoc(OperationContext* opCtx) {
 void assertCappedOplog(OperationContext* opCtx, Database* db) {
     const NamespaceString oplogNss(NamespaceString::kRsOplogNamespace);
     invariant(opCtx->lockState()->isDbLockedForMode(oplogNss.db(), MODE_IS));
-    const Collection* oplogCollection =
+    const CollectionPtr& oplogCollection =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, oplogNss);
     if (oplogCollection && !oplogCollection->isCapped()) {
         LOGV2_FATAL_NOTRACE(
@@ -436,7 +437,7 @@ void setReplSetMemberInStandaloneMode(OperationContext* opCtx) {
     }
 
     invariant(opCtx->lockState()->isW());
-    const Collection* collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+    CollectionPtr collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
         opCtx, NamespaceString::kSystemReplSetNamespace);
     if (collection && !collection->isEmpty(opCtx)) {
         setReplSetMemberInStandaloneMode(opCtx->getServiceContext(), true);

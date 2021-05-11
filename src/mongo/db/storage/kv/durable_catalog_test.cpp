@@ -63,26 +63,7 @@ public:
         CatalogTestFixture::setUp();
 
         _nss = NamespaceString("unittests.durable_catalog");
-
-        {
-            Lock::DBLock dbLk(operationContext(), _nss.db(), MODE_IX);
-            Lock::CollectionLock collLk(operationContext(), _nss, MODE_IX);
-
-            WriteUnitOfWork wuow(operationContext());
-            const bool allocateDefaultSpace = true;
-            CollectionOptions options;
-            options.uuid = UUID::gen();
-            auto swColl = getCatalog()->createCollection(
-                operationContext(), _nss, options, allocateDefaultSpace);
-            ASSERT_OK(swColl.getStatus());
-            std::pair<RecordId, std::unique_ptr<RecordStore>> coll = std::move(swColl.getValue());
-            _catalogId = coll.first;
-            std::shared_ptr<Collection> collection =
-                std::make_shared<CollectionMock>(_nss, _catalogId);
-            CollectionCatalog::get(operationContext())
-                .registerCollection(options.uuid.get(), std::move(collection));
-            wuow.commit();
-        }
+        _catalogId = createCollection(_nss);
     }
 
     NamespaceString ns() {
@@ -97,14 +78,39 @@ public:
         return _catalogId;
     }
 
+    RecordId createCollection(const NamespaceString& nss) {
+        Lock::DBLock dbLk(operationContext(), nss.db(), MODE_IX);
+        Lock::CollectionLock collLk(operationContext(), nss, MODE_IX);
+
+        WriteUnitOfWork wuow(operationContext());
+
+        const bool allocateDefaultSpace = true;
+        CollectionOptions options;
+        options.uuid = UUID::gen();
+
+        auto swColl =
+            getCatalog()->createCollection(operationContext(), nss, options, allocateDefaultSpace);
+        ASSERT_OK(swColl.getStatus());
+
+        std::pair<RecordId, std::unique_ptr<RecordStore>> coll = std::move(swColl.getValue());
+        RecordId catalogId = coll.first;
+
+        std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss, catalogId);
+        CollectionCatalog::get(operationContext())
+            .registerCollection(options.uuid.get(), std::move(collection));
+
+        wuow.commit();
+
+        return catalogId;
+    }
+
     std::string createIndex(BSONObj keyPattern,
                             std::string indexType = IndexNames::BTREE,
                             bool twoPhase = false) {
         std::string indexName = "idx" + std::to_string(numIndexesCreated);
 
         auto collection = std::make_unique<CollectionMock>(_nss);
-        IndexDescriptor desc(collection.get(),
-                             indexType,
+        IndexDescriptor desc(indexType,
                              BSON("v" << 1 << "key" << keyPattern << "name" << indexName));
 
         {
@@ -129,14 +135,33 @@ public:
         ASSERT(match);
     }
 
+    StatusWith<DurableCatalog::ImportResult> importCollectionTest(const NamespaceString& nss,
+                                                                  const BSONObj& metadata) {
+        Lock::DBLock dbLock(operationContext(), nss.db(), MODE_IX);
+        Lock::CollectionLock collLock(operationContext(), nss, MODE_X);
+
+        WriteUnitOfWork wuow(operationContext());
+        auto res = getCatalog()
+                       ->importCollection(operationContext(),
+                                          nss,
+                                          metadata,
+                                          BSON("storage"
+                                               << "metadata"),
+                                          DurableCatalog::ImportCollectionUUIDOption::kGenerateNew);
+        if (res.isOK()) {
+            wuow.commit();
+        }
+        return res;
+    }
+
 private:
     std::string dumpMultikeyPaths(const MultikeyPaths& multikeyPaths) {
         std::stringstream ss;
 
         ss << "[ ";
-        for (const auto multikeyComponents : multikeyPaths) {
+        for (const auto& multikeyComponents : multikeyPaths) {
             ss << "[ ";
-            for (const auto multikeyComponent : multikeyComponents) {
+            for (const auto& multikeyComponent : multikeyComponents) {
                 ss << multikeyComponent << " ";
             }
             ss << "] ";
@@ -444,6 +469,136 @@ DEATH_TEST_REGEX_F(DurableCatalogTest,
 
     WriteUnitOfWork wuow(operationContext());
     catalog->setIndexIsMultikey(operationContext(), getCatalogId(), indexName, {{0U}, {0U}});
+}
+
+TEST_F(DurableCatalogTest, ImportCollection) {
+    // Import should fail if the namespace already exists.
+    ASSERT_THROWS_CODE(
+        importCollectionTest(ns(), {}), AssertionException, ErrorCodes::NamespaceExists);
+
+    const auto nss = NamespaceString("unittest.import");
+
+    // Import should fail with empty metadata.
+    ASSERT_THROWS_CODE(importCollectionTest(nss, {}), AssertionException, ErrorCodes::BadValue);
+
+    BSONCollectionCatalogEntry::MetaData md;
+
+    md.ns = nss.ns();
+
+    CollectionOptions optionsWithUUID;
+    optionsWithUUID.uuid = UUID::gen();
+    md.options = optionsWithUUID;
+
+    BSONCollectionCatalogEntry::IndexMetaData indexMetaData;
+    indexMetaData.spec = BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
+                                  << "_id_");
+    indexMetaData.ready = true;
+    md.indexes.push_back(indexMetaData);
+
+    auto mdObj = md.toBSON();
+    const auto ident = "collection-7-1792004489479993697";
+    const auto idxIdent = "index-8-1792004489479993697";
+    auto idxIdentObj = BSON("_id_" << idxIdent);
+
+    // Import should fail with missing "md" field.
+    ASSERT_THROWS_CODE(
+        importCollectionTest(
+            nss, BSON("idxIdent" << idxIdentObj << "ns" << nss.ns() << "ident" << ident)),
+        AssertionException,
+        ErrorCodes::BadValue);
+
+    // Import should fail with missing "idxIdent" field.
+    ASSERT_THROWS_CODE(
+        importCollectionTest(nss, BSON("md" << mdObj << "ns" << nss.ns() << "ident" << ident)),
+        AssertionException,
+        ErrorCodes::BadValue);
+
+    // Import should fail with missing "ident" field.
+    ASSERT_THROWS_CODE(
+        importCollectionTest(nss,
+                             BSON("md" << mdObj << "idxIdent" << idxIdentObj << "ns" << nss.ns())),
+        AssertionException,
+        ErrorCodes::BadValue);
+
+    // Import should success with validate inputs.
+    auto swImportResult = importCollectionTest(
+        nss,
+        BSON("md" << mdObj << "idxIdent" << idxIdentObj << "ns" << nss.ns() << "ident" << ident));
+    ASSERT_OK(swImportResult.getStatus());
+    DurableCatalog::ImportResult importResult = std::move(swImportResult.getValue());
+
+    // Validate the catalog entry for the imported collection.
+    auto entry = getCatalog()->getEntry(importResult.catalogId);
+    ASSERT_EQ(entry.nss, nss);
+    ASSERT_EQ(entry.ident, ident);
+    ASSERT_EQ(getCatalog()->getIndexIdent(operationContext(), importResult.catalogId, "_id_"),
+              idxIdent);
+
+    // Test that a collection UUID is generated for import.
+    ASSERT_NE(optionsWithUUID.uuid.get(), importResult.uuid);
+    // Substitute in the generated UUID and check that the rest of fields in the catalog entry
+    // match.
+    md.options.uuid = importResult.uuid;
+    ASSERT_BSONOBJ_EQ(getCatalog()->getCatalogEntry(operationContext(), importResult.catalogId),
+                      BSON("md" << md.toBSON() << "idxIdent" << idxIdentObj << "ns" << nss.ns()
+                                << "ident" << ident));
+}
+
+TEST_F(DurableCatalogTest, IdentSuffixUsesRand) {
+    const std::string rand = "0000000000000000000";
+    getCatalog()->setRand_forTest(rand);
+
+    const NamespaceString nss = NamespaceString("a.b");
+
+    RecordId catalogId = createCollection(nss);
+    ASSERT(StringData(getCatalog()->getEntry(catalogId).ident).endsWith(rand));
+    ASSERT_EQUALS(getCatalog()->getRand_forTest(), rand);
+}
+
+TEST_F(DurableCatalogTest, ImportCollectionRandConflict) {
+    const std::string rand = "0000000000000000000";
+    getCatalog()->setRand_forTest(rand);
+
+    {
+        // Import a collection with the 'rand' suffix as part of the ident. This will force 'rand'
+        // to be changed in the durable catalog internals.
+        const auto nss = NamespaceString("unittest.import");
+        BSONCollectionCatalogEntry::MetaData md;
+        md.ns = nss.ns();
+
+        CollectionOptions optionsWithUUID;
+        optionsWithUUID.uuid = UUID::gen();
+        md.options = optionsWithUUID;
+
+        BSONCollectionCatalogEntry::IndexMetaData indexMetaData;
+        indexMetaData.spec = BSON("v" << 2 << "key" << BSON("_id" << 1) << "name"
+                                      << "_id_");
+        indexMetaData.ready = true;
+        md.indexes.push_back(indexMetaData);
+
+        auto mdObj = md.toBSON();
+        const auto ident = "collection-0-" + rand;
+        const auto idxIdent = "index-0-" + rand;
+        auto idxIdentObj = BSON("_id_" << idxIdent);
+
+        auto swImportResult =
+            importCollectionTest(nss,
+                                 BSON("md" << mdObj << "idxIdent" << idxIdentObj << "ns" << nss.ns()
+                                           << "ident" << ident));
+        ASSERT_OK(swImportResult.getStatus());
+    }
+
+    ASSERT_NOT_EQUALS(getCatalog()->getRand_forTest(), rand);
+
+    {
+        // Check that a newly created collection doesn't use 'rand' as the suffix in the ident.
+        const NamespaceString nss = NamespaceString("a.b");
+
+        RecordId catalogId = createCollection(nss);
+        ASSERT(!StringData(getCatalog()->getEntry(catalogId).ident).endsWith(rand));
+    }
+
+    ASSERT_NOT_EQUALS(getCatalog()->getRand_forTest(), rand);
 }
 
 }  // namespace

@@ -468,6 +468,13 @@ int64_t WiredTigerUtil::getIdentSize(WT_SESSION* s, const std::string& uri) {
     return result.getValue();
 }
 
+int64_t WiredTigerUtil::getIdentReuseSize(WT_SESSION* s, const std::string& uri) {
+    auto result = WiredTigerUtil::getStatisticsValue(
+        s, "statistics:" + uri, "statistics=(fast)", WT_STAT_DSRC_BLOCK_REUSE_BYTES);
+    uassertStatusOK(result.getStatus());
+    return result.getValue();
+}
+
 size_t WiredTigerUtil::getCacheSizeMB(double requestedCacheSizeGB) {
     double cacheSizeMB;
     const double kMaxSizeCacheMB = 10 * 1000 * 1000;
@@ -895,6 +902,51 @@ Status WiredTigerUtil::exportTableToBSON(WT_SESSION* session,
         delete it->second;
     }
     return Status::OK();
+}
+
+StatusWith<std::string> WiredTigerUtil::generateImportString(const StringData& ident,
+                                                             const BSONObj& storageMetadata) {
+    if (!storageMetadata.hasField(ident)) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "Missing the storage metadata for ident " << ident << " in "
+                                    << redact(storageMetadata));
+    }
+
+    if (storageMetadata.getField(ident).type() != BSONType::Object) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "The storage metadata for ident " << ident
+                                    << " is not of type object but is of type "
+                                    << storageMetadata.getField(ident).type() << " in "
+                                    << redact(storageMetadata));
+    }
+
+    const BSONObj& identMd = storageMetadata.getField(ident).Obj();
+    if (!identMd.hasField("tableMetadata") || !identMd.hasField("fileMetadata")) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream()
+                          << "The storage metadata for ident " << ident
+                          << " is missing either the 'tableMetadata' or 'fileMetadata' field in "
+                          << redact(storageMetadata));
+    }
+
+    const BSONElement tableMetadata = identMd.getField("tableMetadata");
+    const BSONElement fileMetadata = identMd.getField("fileMetadata");
+
+    if (tableMetadata.type() != BSONType::String || fileMetadata.type() != BSONType::String) {
+        return Status(ErrorCodes::FailedToParse,
+                      str::stream() << "The storage metadata for ident " << ident
+                                    << " is not of type string for either the 'tableMetadata' or "
+                                       "'fileMetadata' field in "
+                                    << redact(storageMetadata));
+    }
+
+    std::stringstream ss;
+    ss << tableMetadata.String();
+    ss << ",import=(enabled=true,repair=false,file_metadata=(";
+    ss << fileMetadata.String();
+    ss << "))";
+
+    return StatusWith<std::string>(ss.str());
 }
 
 void WiredTigerUtil::appendSnapshotWindowSettings(WiredTigerKVEngine* engine,

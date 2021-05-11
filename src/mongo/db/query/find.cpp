@@ -82,7 +82,7 @@ MONGO_FAIL_POINT_DEFINE(failReceivedGetmore);
 MONGO_FAIL_POINT_DEFINE(legacyGetMoreWaitWithCursor)
 
 bool shouldSaveCursor(OperationContext* opCtx,
-                      const Collection* collection,
+                      const CollectionPtr& collection,
                       PlanExecutor::ExecState finalState,
                       PlanExecutor* exec) {
     const QueryRequest& qr = exec->getCanonicalQuery()->getQueryRequest();
@@ -121,7 +121,7 @@ void beginQueryOp(OperationContext* opCtx,
 }
 
 void endQueryOp(OperationContext* opCtx,
-                const Collection* collection,
+                const CollectionPtr& collection,
                 const PlanExecutor& exec,
                 long long numResults,
                 CursorId cursorId) {
@@ -134,7 +134,8 @@ void endQueryOp(OperationContext* opCtx,
 
     // Fill out CurOp based on explain summary statistics.
     PlanSummaryStats summaryStats;
-    exec.getSummaryStats(&summaryStats);
+    auto&& explainer = exec.getPlanExplainer();
+    explainer.getSummaryStats(&summaryStats);
     curOp->debug().setPlanSummaryMetrics(summaryStats);
 
     if (collection) {
@@ -142,7 +143,8 @@ void endQueryOp(OperationContext* opCtx,
     }
 
     if (curOp->shouldDBProfile(opCtx)) {
-        curOp->debug().execStats = exec.getStats();
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+        curOp->debug().execStats = std::move(stats);
     }
 }
 
@@ -181,7 +183,9 @@ void generateBatch(int ntoreturn,
             (*numResults)++;
         }
     } catch (DBException& exception) {
-        LOGV2_ERROR(20918, "getMore executor error", "stats"_attr = redact(exec->getStats()));
+        auto&& explainer = exec->getPlanExplainer();
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+        LOGV2_ERROR(20918, "getMore executor error", "stats"_attr = redact(stats));
         exception.addContext("Executor error during OP_GET_MORE");
         throw;
     }
@@ -228,11 +232,7 @@ Message getMore(OperationContext* opCtx,
 
     const NamespaceString nss(ns);
 
-    ResourceConsumption::ScopedMetricsCollector scopedMetrics(opCtx);
-    if (ResourceConsumption::shouldCollectMetricsForDatabase(nss.db())) {
-        auto& opMetrics = ResourceConsumption::MetricsCollector::get(opCtx);
-        opMetrics.setDbName(nss.db().toString());
-    }
+    ResourceConsumption::ScopedMetricsCollector scopedMetrics(opCtx, nss.db().toString());
 
     // Cursors come in one of two flavors:
     //
@@ -410,9 +410,9 @@ Message getMore(OperationContext* opCtx,
 
     PlanExecutor* exec = cursorPin->getExecutor();
     exec->reattachToOperationContext(opCtx);
-    exec->restoreState();
+    exec->restoreState(readLock ? &readLock->getCollection() : nullptr);
 
-    auto planSummary = exec->getPlanSummary();
+    auto planSummary = exec->getPlanExplainer().getPlanSummary();
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
         curOp.setPlanSummary_inlock(planSummary);
@@ -448,7 +448,7 @@ Message getMore(OperationContext* opCtx,
     // these values we need to take a diff of the pre-execution and post-execution metrics, as they
     // accumulate over the course of a cursor's lifetime.
     PlanSummaryStats preExecutionStats;
-    exec->getSummaryStats(&preExecutionStats);
+    exec->getPlanExplainer().getSummaryStats(&preExecutionStats);
     if (MONGO_unlikely(waitWithPinnedCursorDuringGetMoreBatch.shouldFail())) {
         CurOpFailpointHelpers::waitWhileFailPointEnabled(&waitWithPinnedCursorDuringGetMoreBatch,
                                                          opCtx,
@@ -476,7 +476,7 @@ Message getMore(OperationContext* opCtx,
 
         // Reacquiring locks.
         readLock.emplace(opCtx, nss);
-        exec->restoreState();
+        exec->restoreState(&readLock->getCollection());
 
         // We woke up because either the timed_wait expired, or there was more data. Either way,
         // attempt to generate another batch of results.
@@ -484,7 +484,8 @@ Message getMore(OperationContext* opCtx,
     }
 
     PlanSummaryStats postExecutionStats;
-    exec->getSummaryStats(&postExecutionStats);
+    auto&& explainer = exec->getPlanExplainer();
+    explainer.getSummaryStats(&postExecutionStats);
     postExecutionStats.totalKeysExamined -= preExecutionStats.totalKeysExamined;
     postExecutionStats.totalDocsExamined -= preExecutionStats.totalDocsExamined;
     curOp.debug().setPlanSummaryMetrics(postExecutionStats);
@@ -496,7 +497,9 @@ Message getMore(OperationContext* opCtx,
     // cost.
     if (cursorPin->getExecutor()->lockPolicy() != PlanExecutor::LockPolicy::kLocksInternally &&
         curOp.shouldDBProfile(opCtx)) {
-        curOp.debug().execStats = exec->getStats();
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+
+        curOp.debug().execStats = std::move(stats);
     }
 
     // Our two possible ClientCursorPin cleanup paths are:
@@ -573,11 +576,7 @@ bool runQuery(OperationContext* opCtx,
             nss.isValid());
     invariant(!nss.isCommand());
 
-    ResourceConsumption::ScopedMetricsCollector scopedMetrics(opCtx);
-    if (ResourceConsumption::shouldCollectMetricsForDatabase(nss.db())) {
-        auto& opMetrics = ResourceConsumption::MetricsCollector::get(opCtx);
-        opMetrics.setDbName(nss.db().toString());
-    }
+    ResourceConsumption::ScopedMetricsCollector scopedMetrics(opCtx, nss.db().toString());
 
     // Set CurOp information.
     const auto upconvertedQuery = upconvertQueryEntry(q.query, nss, q.ntoreturn, q.ntoskip);
@@ -605,8 +604,8 @@ bool runQuery(OperationContext* opCtx,
     LOGV2_DEBUG(20914, 2, "Running query", "query"_attr = redact(cq->toStringShort()));
 
     // Parse, canonicalize, plan, transcribe, and get a plan executor.
-    AutoGetCollectionForReadCommand ctx(opCtx, nss, AutoGetCollectionViewMode::kViewsForbidden);
-    const Collection* const collection = ctx.getCollection();
+    AutoGetCollectionForReadCommand collection(
+        opCtx, nss, AutoGetCollectionViewMode::kViewsForbidden);
     const QueryRequest& qr = cq->getQueryRequest();
 
     opCtx->setExhaust(qr.isExhaust());
@@ -625,7 +624,8 @@ bool runQuery(OperationContext* opCtx,
     // Get the execution plan for the query.
     constexpr auto verbosity = ExplainOptions::Verbosity::kExecAllPlans;
     expCtx->explain = qr.isExplain() ? boost::make_optional(verbosity) : boost::none;
-    auto exec = uassertStatusOK(getExecutorLegacyFind(opCtx, collection, std::move(cq)));
+    auto exec =
+        uassertStatusOK(getExecutorLegacyFind(opCtx, &collection.getCollection(), std::move(cq)));
 
     // If it's actually an explain, do the explain and return rather than falling through
     // to the normal query execution loop.
@@ -634,7 +634,8 @@ bool runQuery(OperationContext* opCtx,
         bb.skip(sizeof(QueryResult::Value));
 
         BSONObjBuilder explainBob;
-        Explain::explainStages(exec.get(), collection, verbosity, BSONObj(), &explainBob);
+        Explain::explainStages(
+            exec.get(), collection.getCollection(), verbosity, BSONObj(), &explainBob);
 
         // Add the resulting object to the return buffer.
         BSONObj explainObj = explainBob.obj();
@@ -680,7 +681,7 @@ bool runQuery(OperationContext* opCtx,
     // Get summary info about which plan the executor is using.
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        curOp.setPlanSummary_inlock(exec->getPlanSummary());
+        curOp.setPlanSummary_inlock(exec->getPlanExplainer().getPlanSummary());
     }
 
     try {
@@ -708,10 +709,12 @@ bool runQuery(OperationContext* opCtx,
             }
         }
     } catch (DBException& exception) {
+        auto&& explainer = exec->getPlanExplainer();
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
         LOGV2_ERROR(20919,
                     "Plan executor error during find",
                     "error"_attr = redact(exception.toStatus()),
-                    "stats"_attr = redact(exec->getStats()));
+                    "stats"_attr = redact(stats));
 
         exception.addContext("Executor error during find");
         throw;
@@ -721,7 +724,7 @@ bool runQuery(OperationContext* opCtx,
     // this cursorid later.
     long long ccId = 0;
 
-    if (shouldSaveCursor(opCtx, collection, state, exec.get())) {
+    if (shouldSaveCursor(opCtx, collection.getCollection(), state, exec.get())) {
         // We won't use the executor until it's getMore'd.
         exec->saveState();
         exec->detachFromOperationContext();
@@ -763,11 +766,15 @@ bool runQuery(OperationContext* opCtx,
             pinnedCursor.getCursor()->setLeftoverMaxTimeMicros(opCtx->getRemainingMaxTimeMicros());
         }
 
-        endQueryOp(opCtx, collection, *pinnedCursor.getCursor()->getExecutor(), numResults, ccId);
+        endQueryOp(opCtx,
+                   collection.getCollection(),
+                   *pinnedCursor.getCursor()->getExecutor(),
+                   numResults,
+                   ccId);
     } else {
         LOGV2_DEBUG(
             20917, 5, "Not caching executor but returning results", "numResults"_attr = numResults);
-        endQueryOp(opCtx, collection, *exec, numResults, ccId);
+        endQueryOp(opCtx, collection.getCollection(), *exec, numResults, ccId);
     }
 
     // Fill out the output buffer's header.

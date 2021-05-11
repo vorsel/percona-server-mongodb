@@ -59,6 +59,10 @@ public:
                                      StringData ident,
                                      const CollectionOptions& options);
 
+    virtual Status importRecordStore(OperationContext* opCtx,
+                                     StringData ident,
+                                     const BSONObj& storageMetadata);
+
     virtual std::unique_ptr<mongo::RecordStore> getRecordStore(OperationContext* opCtx,
                                                                StringData ns,
                                                                StringData ident,
@@ -71,6 +75,10 @@ public:
                                              const CollectionOptions& collOptions,
                                              StringData ident,
                                              const IndexDescriptor* desc);
+
+    virtual Status importSortedDataInterface(OperationContext* opCtx,
+                                             StringData ident,
+                                             const BSONObj& storageMetadata);
 
     virtual Status dropGroupedSortedDataInterface(OperationContext* opCtx, StringData ident) {
         return Status::OK();
@@ -85,7 +93,9 @@ public:
 
     virtual void endBackup(OperationContext* opCtx) {}
 
-    virtual Status dropIdent(OperationContext* opCtx, mongo::RecoveryUnit* ru, StringData ident);
+    virtual Status dropIdent(mongo::RecoveryUnit* ru, StringData ident);
+
+    virtual void dropIdentForImport(OperationContext* opCtx, StringData ident) {}
 
     virtual bool supportsDirectoryPerDB() const {
         return false;  // Not persistant so no Directories

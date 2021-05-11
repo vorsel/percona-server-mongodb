@@ -91,6 +91,7 @@ class UUID {
     friend class RecipientForgetMigration;
     friend class RecipientSyncData;
     friend class ReshardingDonorDocument;
+    friend class ReshardingOplogSourceId;
     friend class ResumeIndexInfo;
     friend class ResumeTokenInternal;
     friend class ShardCollectionTypeBase;
@@ -98,8 +99,11 @@ class UUID {
     friend class ShardsvrRenameCollection;
     friend class TenantMigrationDonorDocument;
     friend class TenantMigrationRecipientDocument;
+    friend class TypeCollectionRecipientFields;
     friend class TypeCollectionReshardingFields;
     friend class VoteCommitIndexBuild;
+    friend class ImportCollectionOplogEntry;
+    friend class VoteCommitImportCollection;
 
 
 public:

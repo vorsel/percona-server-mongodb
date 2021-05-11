@@ -31,8 +31,12 @@
 
 #include "mongo/base/error_extra_info.h"
 #include "mongo/db/matcher/expression.h"
+#include "mongo/db/query/query_knobs_gen.h"
 
 namespace mongo::doc_validation_error {
+// The default maximum allowed size for a single doc validation error.
+constexpr static int kDefaultMaxDocValidationErrorSize = 12 * 1024 * 1024;
+
 /**
  * Represents information about a document validation error.
  */
@@ -40,7 +44,9 @@ class DocumentValidationFailureInfo final : public ErrorExtraInfo {
 public:
     static constexpr auto code = ErrorCodes::DocumentValidationFailure;
     static std::shared_ptr<const ErrorExtraInfo> parse(const BSONObj& obj);
-    explicit DocumentValidationFailureInfo(const BSONObj& err) : _details(err.getOwned()) {}
+    explicit DocumentValidationFailureInfo(const BSONObj& err) : _details(err.getOwned()) {
+        invariant(!err.isEmpty());
+    }
     const BSONObj& getDetails() const;
     void serialize(BSONObjBuilder* bob) const override;
 
@@ -53,5 +59,9 @@ private:
  * reference to a BSONObj corresponding to the document that failed to match against the validator
  * expression, returns a BSONObj that describes why 'doc' failed to match against 'validatorExpr'.
  */
-BSONObj generateError(const MatchExpression& validatorExpr, const BSONObj& doc);
+BSONObj generateError(
+    const MatchExpression& validatorExpr,
+    const BSONObj& doc,
+    int maxDocValidationErrorSize = kDefaultMaxDocValidationErrorSize,
+    int maxConsideredValues = internalQueryMaxDocValidationErrorConsideredValues.load());
 }  // namespace mongo::doc_validation_error

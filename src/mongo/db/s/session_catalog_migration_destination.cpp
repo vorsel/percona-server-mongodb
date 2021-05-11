@@ -288,7 +288,7 @@ ProcessOplogResult processSessionOplog(const BSONObj& oplogBSON,
                 sessionTxnRecord.setLastWriteOpTime(oplogOpTime);
                 sessionTxnRecord.setLastWriteDate(oplogEntry.getWallClockTime());
                 // We do not migrate transaction oplog entries so don't set the txn state.
-                txnParticipant.onMigrateCompletedOnPrimary(opCtx, {stmtId}, sessionTxnRecord);
+                txnParticipant.onRetryableWriteCloningCompleted(opCtx, {stmtId}, sessionTxnRecord);
             }
 
             wunit.commit();
@@ -430,10 +430,6 @@ void SessionCatalogMigrationDestination::_retrieveSessionStateFromSource(Service
         for (BSONArrayIteratorSorted oplogIter(oplogArray); oplogIter.more();) {
             try {
                 lastResult = processSessionOplog(oplogIter.next().Obj(), lastResult);
-            } catch (const ExceptionFor<ErrorCodes::ConfigurationInProgress>&) {
-                // This means that the server has a newer txnNumber than the oplog being
-                // migrated, so just skip it
-                continue;
             } catch (const ExceptionFor<ErrorCodes::TransactionTooOld>&) {
                 // This means that the server has a newer txnNumber than the oplog being
                 // migrated, so just skip it

@@ -95,8 +95,9 @@ Status validateDBNameForWindows(StringData dbname) {
         "con",  "prn",  "aux",  "nul",  "com1", "com2", "com3", "com4", "com5", "com6", "com7",
         "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"};
 
-    std::string lower(dbname.toString());
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    std::string lower{dbname};
+    std::transform(
+        lower.begin(), lower.end(), lower.begin(), [](char c) { return ctype::toLower(c); });
 
     if (std::count(windowsReservedNames.begin(), windowsReservedNames.end(), lower))
         return Status(ErrorCodes::BadValue,
@@ -172,12 +173,16 @@ void DatabaseImpl::init(OperationContext* const opCtx) const {
 
     auto& catalog = CollectionCatalog::get(opCtx);
     for (const auto& uuid : catalog.getAllCollectionUUIDsFromDb(_name)) {
-        auto collection = catalog.lookupCollectionByUUIDForMetadataWrite(
-            opCtx, CollectionCatalog::LifetimeMode::kInplace, uuid);
+        CollectionWriter collection(
+            opCtx,
+            uuid,
+            opCtx->lockState()->isW() ? CollectionCatalog::LifetimeMode::kInplace
+                                      : CollectionCatalog::LifetimeMode::kManagedInWriteUnitOfWork);
         invariant(collection);
         // If this is called from the repair path, the collection is already initialized.
-        if (!collection->isInitialized())
-            collection->init(opCtx);
+        if (!collection->isInitialized()) {
+            collection.getWritableCollection()->init(opCtx);
+        }
     }
 
     // When in repair mode, record stores are not loaded. Thus the ViewsCatalog cannot be reloaded.
@@ -204,7 +209,7 @@ void DatabaseImpl::init(OperationContext* const opCtx) const {
 void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) const {
     invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IX));
 
-    CollectionCatalog::CollectionInfoFn callback = [&](const Collection* collection) {
+    CollectionCatalog::CollectionInfoFn callback = [&](const CollectionPtr& collection) {
         try {
             WriteUnitOfWork wuow(opCtx);
             Status status = dropCollection(opCtx, collection->ns(), {});
@@ -227,7 +232,7 @@ void DatabaseImpl::clearTmpCollections(OperationContext* opCtx) const {
         return true;
     };
 
-    CollectionCatalog::CollectionInfoFn predicate = [&](const Collection* collection) {
+    CollectionCatalog::CollectionInfoFn predicate = [&](const CollectionPtr& collection) {
         return DurableCatalog::get(opCtx)
             ->getCollectionOptions(opCtx, collection->getCatalogId())
             .temp;
@@ -254,22 +259,26 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
     long long objects = 0;
     long long size = 0;
     long long storageSize = 0;
+    long long freeStorageSize = 0;
     long long indexes = 0;
     long long indexSize = 0;
+    long long indexFreeStorageSize = 0;
 
     invariant(opCtx->lockState()->isDbLockedForMode(name(), MODE_IS));
 
     catalog::forEachCollectionFromDb(
-        opCtx, name(), MODE_IS, [&](const Collection* collection) -> bool {
+        opCtx, name(), MODE_IS, [&](const CollectionPtr& collection) -> bool {
             nCollections += 1;
             objects += collection->numRecords(opCtx);
             size += collection->dataSize(opCtx);
 
             BSONObjBuilder temp;
             storageSize += collection->getRecordStore()->storageSize(opCtx, &temp);
+            freeStorageSize += collection->getRecordStore()->freeStorageSize(opCtx);
 
             indexes += collection->getIndexCatalog()->numIndexesTotal(opCtx);
             indexSize += collection->getIndexSize(opCtx);
+            indexFreeStorageSize += collection->getIndexFreeStorageBytes(opCtx);
 
             return true;
         });
@@ -282,9 +291,12 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
     output->append("avgObjSize", objects == 0 ? 0 : double(size) / double(objects));
     output->appendNumber("dataSize", size / scale);
     output->appendNumber("storageSize", storageSize / scale);
+    output->appendNumber("freeStorageSize", freeStorageSize / scale);
     output->appendNumber("indexes", indexes);
     output->appendNumber("indexSize", indexSize / scale);
+    output->appendNumber("indexFreeStorageSize", indexFreeStorageSize / scale);
     output->appendNumber("totalSize", (storageSize + indexSize) / scale);
+    output->appendNumber("totalFreeStorageSize", (freeStorageSize + indexFreeStorageSize) / scale);
     output->appendNumber("scaleFactor", scale);
 
     if (!opCtx->getServiceContext()->getStorageEngine()->isEphemeral()) {
@@ -338,7 +350,8 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx,
                               "turn off profiling before dropping system.profile collection");
         } else if (!(nss.isSystemDotViews() || nss.isHealthlog() ||
                      nss == NamespaceString::kLogicalSessionsNamespace ||
-                     nss == NamespaceString::kSystemKeysNamespace)) {
+                     nss == NamespaceString::kSystemKeysNamespace ||
+                     nss.isTemporaryReshardingCollection())) {
             return Status(ErrorCodes::IllegalOperation,
                           str::stream() << "can't drop system collection " << nss);
         }
@@ -490,7 +503,7 @@ void DatabaseImpl::_dropCollectionIndexes(OperationContext* opCtx,
 
 Status DatabaseImpl::_finishDropCollection(OperationContext* opCtx,
                                            const NamespaceString& nss,
-                                           const Collection* collection) const {
+                                           const CollectionPtr& collection) const {
     UUID uuid = collection->uuid();
     LOGV2(20318,
           "Finishing collection drop for {namespace} ({uuid}).",
@@ -503,7 +516,7 @@ Status DatabaseImpl::_finishDropCollection(OperationContext* opCtx,
     if (!status.isOK())
         return status;
 
-    auto removedColl = CollectionCatalog::get(opCtx).deregisterCollection(uuid);
+    auto removedColl = CollectionCatalog::get(opCtx).deregisterCollection(opCtx, uuid);
     opCtx->recoveryUnit()->registerChange(
         CollectionCatalog::get(opCtx).makeFinishDropCollectionChange(std::move(removedColl), uuid));
 
@@ -552,20 +565,13 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
     auto writableCollection = collToRename.getWritableCollection();
     CollectionCatalog::get(opCtx).setCollectionNamespace(opCtx, writableCollection, fromNss, toNss);
 
-    opCtx->recoveryUnit()->onCommit([writableCollection](auto commitTime) {
-        // Ban reading from this collection on committed reads on snapshots before now.
-        if (commitTime) {
-            writableCollection->setMinimumVisibleSnapshot(commitTime.get());
-        }
-    });
-
     return status;
 }
 
 void DatabaseImpl::_checkCanCreateCollection(OperationContext* opCtx,
                                              const NamespaceString& nss,
                                              const CollectionOptions& options) const {
-    if (CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss) != nullptr) {
+    if (CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)) {
         if (options.isView()) {
             uasserted(17399,
                       str::stream()
@@ -601,14 +607,18 @@ Status DatabaseImpl::createView(OperationContext* opCtx,
     NamespaceString viewOnNss(viewName.db(), options.viewOn);
     _checkCanCreateCollection(opCtx, viewName, options);
 
-    audit::logCreateCollection(&cc(), viewName.toString());
+    BSONArray pipeline(options.pipeline);
+    auto status = Status::OK();
+    if (viewName.isOplog()) {
+        status = {ErrorCodes::InvalidNamespace,
+                  str::stream() << "invalid namespace name for a view: " + viewName.toString()};
+    } else {
+        status = ViewCatalog::get(this)->createView(
+            opCtx, viewName, viewOnNss, pipeline, options.collation);
+    }
 
-    if (viewName.isOplog())
-        return Status(ErrorCodes::InvalidNamespace,
-                      str::stream() << "invalid namespace name for a view: " + viewName.toString());
-
-    return ViewCatalog::get(this)->createView(
-        opCtx, viewName, viewOnNss, BSONArray(options.pipeline), options.collation);
+    audit::logCreateView(&cc(), viewName.toString(), viewOnNss.toString(), pipeline, status.code());
+    return status;
 }
 
 Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
@@ -738,7 +748,8 @@ Collection* DatabaseImpl::createCollection(OperationContext* opCtx,
     // storage timestamps.  This way both primary and any secondaries will see the index created
     // after the collection is created.
     if (canAcceptWrites && createIdIndex && nss.isSystem()) {
-        createSystemIndexes(opCtx, collection);
+        CollectionWriter collWriter(collection);
+        createSystemIndexes(opCtx, collWriter);
     }
 
     return collection;
@@ -819,7 +830,7 @@ void DatabaseImpl::checkForIdIndexesAndDropPendingCollections(OperationContext* 
         if (nss.isSystem())
             continue;
 
-        const Collection* coll =
+        const CollectionPtr& coll =
             CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
         if (!coll)
             continue;
@@ -878,11 +889,11 @@ Status DatabaseImpl::userCreateNS(OperationContext* opCtx,
             new ExpressionContext(opCtx, std::move(collator), nss));
 
         // If the feature compatibility version is not kLatest, and we are validating features as
-        // master, ban the use of new agg features introduced in kLatest to prevent them from being
+        // primary, ban the use of new agg features introduced in kLatest to prevent them from being
         // persisted in the catalog.
         // (Generic FCV reference): This FCV check should exist across LTS binary versions.
         ServerGlobalParams::FeatureCompatibility::Version fcv;
-        if (serverGlobalParams.validateFeaturesAsMaster.load() &&
+        if (serverGlobalParams.validateFeaturesAsPrimary.load() &&
             serverGlobalParams.featureCompatibility.isLessThan(
                 ServerGlobalParams::FeatureCompatibility::kLatest, &fcv)) {
             expCtx->maxFeatureCompatibilityVersion = fcv;

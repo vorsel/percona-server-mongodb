@@ -110,6 +110,9 @@ ERROR_ID_SERVER_PARAMETER_INVALID_ATTR = "ID0066"
 ERROR_ID_SERVER_PARAMETER_REQUIRED_ATTR = "ID0067"
 ERROR_ID_SERVER_PARAMETER_INVALID_METHOD_OVERRIDE = "ID0068"
 ERROR_ID_NON_CONST_GETTER_IN_IMMUTABLE_STRUCT = "ID0069"
+ERROR_ID_FEATURE_FLAG_DEFAULT_TRUE_MISSING_VERSION = "ID0070"
+ERROR_ID_FEATURE_FLAG_DEFAULT_FALSE_HAS_VERSION = "ID0071"
+ERROR_ID_INVALID_REPLY_TYPE = "ID0072"
 
 
 class IDLError(Exception):
@@ -803,6 +806,29 @@ class ParserContext(object):
         # pylint: disable=invalid-name
         self._add_error(location, ERROR_ID_MISSING_SHORT_NAME_WITH_SINGLE_NAME,
                         ("Missing 'short_name' required with 'single_name' value '%s'") % (name))
+
+    def add_feature_flag_default_true_missing_version(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about a default flag with a default value of true but no version."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_FEATURE_FLAG_DEFAULT_TRUE_MISSING_VERSION,
+                        ("Missing 'version' required for feature flag that defaults to true"))
+
+    def add_feature_flag_default_false_has_version(self, location):
+        # type: (common.SourceLocation) -> None
+        """Add an error about a default flag with a default value of false but has a version."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_FEATURE_FLAG_DEFAULT_FALSE_HAS_VERSION,
+            ("The 'version' attribute is not allowed for feature flag that defaults to false"))
+
+    def add_reply_type_invalid_type(self, location, command_name, reply_type_name):
+        # type: (common.SourceLocation, str, str) -> None
+        """Add an error about a command whose reply_type refers to an unknown type."""
+        # pylint: disable=invalid-name
+        self._add_error(
+            location, ERROR_ID_INVALID_REPLY_TYPE,
+            ("Command '%s' has invalid reply_type '%s'" % (command_name, reply_type_name)))
 
 
 def _assert_unique_error_messages():

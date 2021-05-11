@@ -1,28 +1,28 @@
-// Tests the waitInIsMaster failpoint.
+// Tests the waitInHello failpoint.
 // @tags: [requires_replication]
 (function() {
 "use strict";
 load("jstests/libs/fail_point_util.js");
 
 function runTest(conn) {
-    function runIsMasterCommand() {
+    function runHelloCommand() {
         const now = new Date();
-        assert.commandWorked(db.runCommand({isMaster: 1}));
-        const isMasterDuration = new Date() - now;
-        assert.gte(isMasterDuration, 100);
+        assert.commandWorked(db.runCommand({hello: 1}));
+        const helloDuration = new Date() - now;
+        assert.gte(helloDuration, 100);
     }
 
-    // Do a find to make sure that the shell has finished running isMaster while establishing its
+    // Do a find to make sure that the shell has finished running hello while establishing its
     // initial connection.
     assert.eq(0, conn.getDB("test").c.find().itcount());
 
-    // Use a skip of 1, since the parallel shell runs isMaster when it starts.
-    const isMasterFailpoint = configureFailPoint(conn, "waitInIsMaster", {}, {skip: 1});
-    const awaitIsMaster = startParallelShell(runIsMasterCommand, conn.port);
-    isMasterFailpoint.wait();
+    // Use a skip of 1, since the parallel shell runs hello when it starts.
+    const helloFailpoint = configureFailPoint(conn, "waitInHello", {}, {skip: 1});
+    const awaitHello = startParallelShell(runHelloCommand, conn.port);
+    helloFailpoint.wait();
     sleep(100);
-    isMasterFailpoint.off();
-    awaitIsMaster();
+    helloFailpoint.off();
+    awaitHello();
 }
 
 const standalone = MongoRunner.runMongod({});

@@ -50,12 +50,17 @@ const StringMap<ParserGen::token_type> reservedKeyFieldnameLookup = {
     {"$_internalInhibitOptimization", ParserGen::token::STAGE_INHIBIT_OPTIMIZATION},
     {"$limit", ParserGen::token::STAGE_LIMIT},
     {"$project", ParserGen::token::STAGE_PROJECT},
+    {"$match", ParserGen::token::STAGE_MATCH},
     {"$sample", ParserGen::token::STAGE_SAMPLE},
     {"size", ParserGen::token::ARG_SIZE},
     {"$skip", ParserGen::token::STAGE_SKIP},
     {"$unionWith", ParserGen::token::STAGE_UNION_WITH},
     {"coll", ParserGen::token::ARG_COLL},
     {"pipeline", ParserGen::token::ARG_PIPELINE},
+    // Pathless match operators
+    {"$expr", ParserGen::token::EXPR},
+    {"$text", ParserGen::token::TEXT},
+    {"$where", ParserGen::token::WHERE},
     // Expressions
     {"$abs", ParserGen::token::ABS},
     {"$acos", ParserGen::token::ACOS},
@@ -79,6 +84,7 @@ const StringMap<ParserGen::token_type> reservedKeyFieldnameLookup = {
     {"$dateToString", ParserGen::token::DATE_TO_STRING},
     {"$degreesToRadians", ParserGen::token::DEGREES_TO_RADIANS},
     {"$divide", ParserGen::token::DIVIDE},
+    {"$elemMatch", ParserGen::token::ELEM_MATCH},
     {"$eq", ParserGen::token::EQ},
     {"$exp", ParserGen::token::EXPONENT},
     {"$floor", ParserGen::token::FLOOR},
@@ -149,6 +155,8 @@ const StringMap<ParserGen::token_type> reservedKeyFieldnameLookup = {
     {"$type", ParserGen::token::TYPE},
     {"chars", ParserGen::token::ARG_CHARS},
     {"date", ParserGen::token::ARG_DATE},
+    {"$comment", ParserGen::token::COMMENT},
+    {"$exists", ParserGen::token::EXISTS},
     {"dateString", ParserGen::token::ARG_DATE_STRING},
     {"find", ParserGen::token::ARG_FIND},
     {"format", ParserGen::token::ARG_FORMAT},
@@ -168,7 +176,47 @@ const StringMap<ParserGen::token_type> reservedKeyFieldnameLookup = {
     {"$setUnion", ParserGen::token::SET_UNION},
     {"timezone", ParserGen::token::ARG_TIMEZONE},
     {"to", ParserGen::token::ARG_TO},
-};
+    {"minute", ParserGen::token::ARG_MINUTE},
+    {"second", ParserGen::token::ARG_SECOND},
+    {"millisecond", ParserGen::token::ARG_MILLISECOND},
+    {"day", ParserGen::token::ARG_DAY},
+    {"isoDayOfWeek", ParserGen::token::ARG_ISO_DAY_OF_WEEK},
+    {"isoWeek", ParserGen::token::ARG_ISO_WEEK},
+    {"isoWeekYear", ParserGen::token::ARG_ISO_WEEK_YEAR},
+    {"iso8601", ParserGen::token::ARG_ISO_8601},
+    {"month", ParserGen::token::ARG_MONTH},
+    {"year", ParserGen::token::ARG_YEAR},
+    {"hour", ParserGen::token::ARG_HOUR},
+    {"$dateFromParts", ParserGen::token::DATE_FROM_PARTS},
+    {"$dateToParts", ParserGen::token::DATE_TO_PARTS},
+    {"$dayOfMonth", ParserGen::token::DAY_OF_MONTH},
+    {"$dayOfWeek", ParserGen::token::DAY_OF_WEEK},
+    {"$dayOfYear", ParserGen::token::DAY_OF_YEAR},
+    {"$hour", ParserGen::token::HOUR},
+    {"$isoDayOfWeek", ParserGen::token::ISO_DAY_OF_WEEK},
+    {"$isoWeek", ParserGen::token::ISO_WEEK},
+    {"$isoWeekYear", ParserGen::token::ISO_WEEK_YEAR},
+    {"$millisecond", ParserGen::token::MILLISECOND},
+    {"$minute", ParserGen::token::MINUTE},
+    {"$month", ParserGen::token::MONTH},
+    {"$second", ParserGen::token::SECOND},
+    {"$week", ParserGen::token::WEEK},
+    {"$year", ParserGen::token::YEAR},
+    {"$search", ParserGen::token::ARG_SEARCH},
+    {"$language", ParserGen::token::ARG_LANGUAGE},
+    {"$caseSensitive", ParserGen::token::ARG_CASE_SENSITIVE},
+    {"$diacriticSensitive", ParserGen::token::ARG_DIACRITIC_SENSITIVE},
+    {"$mod", ParserGen::token::MOD},
+    {"$arrayElemAt", ParserGen::token::ARRAY_ELEM_AT},
+    {"$arrayToObject", ParserGen::token::ARRAY_TO_OBJECT},
+    {"$concatArrays", ParserGen::token::CONCAT_ARRAYS},
+    {"$filter", ParserGen::token::FILTER},
+    {"$first", ParserGen::token::FIRST},
+    {"$in", ParserGen::token::IN_},
+    {"$indexOfArray", ParserGen::token::INDEX_OF_ARRAY},
+    {"$isArray", ParserGen::token::IS_ARRAY},
+    {"as", ParserGen::token::ARG_AS},
+    {"cond", ParserGen::token::ARG_COND}};
 
 // Mapping of reserved key values to BSON token. Any key which is not included in this map is
 // assumed to be a user value.
@@ -202,14 +250,17 @@ void BSONLexer::sortObjTokens() {
     };
 
     auto currentPosition = _position;
-    if (_tokens[currentPosition].type_get() != static_cast<int>(ParserGen::token::START_OBJECT)) {
+    // Ensure that we've just entered an object - i.e. that the previous token was a START_OBJECT.
+    // Otherwise, this function is a no-op.
+    if (currentPosition < 1 ||
+        _tokens[currentPosition - 1].type_get() !=
+            static_cast<int>(ParserGen::token::START_OBJECT)) {
         return;
     }
 
     std::list<TokenElement> sortedTokenPairs;
-    // Increment to get to the first token after the START_OBJECT. We will sort tokens until the
-    // matching END_OBJECT is found.
-    currentPosition++;
+    // We've just entered an object (i.e. the previous token was a start object). We will sort
+    // tokens until the matching END_OBJECT is found.
     while (_tokens[currentPosition].type_get() != static_cast<int>(ParserGen::token::END_OBJECT)) {
         invariant(size_t(currentPosition) < _tokens.size());
 
@@ -241,10 +292,10 @@ void BSONLexer::sortObjTokens() {
     }
     sortedTokenPairs.sort(TokenElementCompare());
 
-    // _position is at the initial START_OBJECT, and currentPosition is at its matching
-    // END_OBJECT. We need to flatten the sorted list of KV pairs to get the correct order of
-    // tokens.
-    auto replacePosition = _position + 1;
+    // _position is at the token immediately following the initial START_OBJECT, and currentPosition
+    // is at the matching END_OBJECT. We need to flatten the sorted list of KV pairs to get the
+    // correct order of tokens.
+    auto replacePosition = _position;
     for (auto&& [key, rhsTokens] : sortedTokenPairs) {
         _tokens[replacePosition].clear();
         _tokens[replacePosition++].move(key);
@@ -422,7 +473,9 @@ BSONLexer::BSONLexer(BSONObj obj, ParserGen::token_type startingToken) {
         this,
         startingToken == ParserGen::token::START_PIPELINE
             ? "pipeline"
-            : (startingToken == ParserGen::token::START_SORT ? "sort" : "filter")};
+            : (startingToken == ParserGen::token::START_SORT
+                   ? "sort"
+                   : (startingToken == ParserGen::token::START_PROJECT ? "project" : "filter"))};
     pushToken("start", startingToken);
 
     // If 'obj' is representing a pipeline, each element is a stage with the fieldname being the

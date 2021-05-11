@@ -220,7 +220,7 @@ Status renameCollectionAndDropTarget(OperationContext* opCtx,
                                      OptionalCollectionUUID uuid,
                                      NamespaceString source,
                                      NamespaceString target,
-                                     const Collection* targetColl,
+                                     const CollectionPtr& targetColl,
                                      RenameCollectionOptions options,
                                      repl::OpTime renameOpTimeFromApplyOps) {
     return writeConflictRetry(opCtx, "renameCollection", target.ns(), [&] {
@@ -560,7 +560,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
           "temporaryCollection"_attr = tmpName,
           "sourceCollection"_attr = source);
 
-    const Collection* tmpColl = nullptr;
+    Collection* tmpColl = nullptr;
     {
         auto collectionOptions =
             DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, sourceColl->getCatalogId());
@@ -626,8 +626,9 @@ Status renameBetweenDBs(OperationContext* opCtx,
             WriteUnitOfWork wunit(opCtx);
             auto fromMigrate = false;
             try {
+                CollectionWriter tmpCollWriter(tmpColl);
                 IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
-                    opCtx, tmpColl->uuid(), indexesToCopy, fromMigrate);
+                    opCtx, tmpCollWriter, indexesToCopy, fromMigrate);
             } catch (DBException& ex) {
                 return ex.toStatus();
             }
@@ -642,6 +643,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
     {
         NamespaceStringOrUUID tmpCollUUID =
             NamespaceStringOrUUID(std::string(tmpName.db()), tmpColl->uuid());
+        tmpColl = nullptr;
         statsTracker.reset();
 
         // Copy over all the data from source collection to temporary collection. For this we can
@@ -650,8 +652,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
         targetDBLock.reset();
 
         AutoGetCollection autoTmpColl(opCtx, tmpCollUUID, MODE_IX);
-        tmpColl = autoTmpColl.getCollection();
-        if (!tmpColl) {
+        if (!autoTmpColl) {
             return Status(ErrorCodes::NamespaceNotFound,
                           str::stream() << "Temporary collection '" << tmpName
                                         << "' was removed while renaming collection across DBs");
@@ -664,19 +665,25 @@ Status renameBetweenDBs(OperationContext* opCtx,
             // Cursor is left one past the end of the batch inside writeConflictRetry.
             auto beginBatchId = record->id;
             Status status = writeConflictRetry(opCtx, "renameCollection", tmpName.ns(), [&] {
-                WriteUnitOfWork wunit(opCtx);
                 // Need to reset cursor if it gets a WCE midway through.
                 if (!record || (beginBatchId != record->id)) {
                     record = cursor->seekExact(beginBatchId);
                 }
                 for (int i = 0; record && (i < internalInsertMaxBatchSize.load()); i++) {
+                    WriteUnitOfWork wunit(opCtx);
                     const InsertStatement stmt(record->data.releaseToBson());
                     OpDebug* const opDebug = nullptr;
-                    auto status = tmpColl->insertDocument(opCtx, stmt, opDebug, true);
+                    auto status = autoTmpColl->insertDocument(opCtx, stmt, opDebug, true);
                     if (!status.isOK()) {
                         return status;
                     }
                     record = cursor->next();
+
+                    // Used to make sure that a WCE can be handled by this logic without data loss.
+                    if (MONGO_unlikely(writeConflictInRenameCollCopyToTmp.shouldFail())) {
+                        throw WriteConflictException();
+                    }
+                    wunit.commit();
                 }
 
                 // Time to yield; make a safe copy of the current record before releasing our
@@ -690,11 +697,6 @@ Status renameBetweenDBs(OperationContext* opCtx,
                     writeConflictRetry(
                         opCtx, "retryRestoreCursor", ns, [&cursor] { cursor->restore(); });
                 });
-                // Used to make sure that a WCE can be handled by this logic without data loss.
-                if (MONGO_unlikely(writeConflictInRenameCollCopyToTmp.shouldFail())) {
-                    throw WriteConflictException();
-                }
-                wunit.commit();
                 return Status::OK();
             });
             if (!status.isOK())
@@ -892,11 +894,10 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
                       str::stream() << "Cannot rename collection to the oplog");
     }
 
-    const Collection* const sourceColl =
-        AutoGetCollectionForRead(opCtx, sourceNss, AutoGetCollectionViewMode::kViewsPermitted)
-            .getCollection();
+    AutoGetCollectionForRead sourceColl(
+        opCtx, sourceNss, AutoGetCollectionViewMode::kViewsPermitted);
 
-    if (sourceNss.isDropPendingNamespace() || sourceColl == nullptr) {
+    if (sourceNss.isDropPendingNamespace() || !sourceColl) {
         boost::optional<NamespaceString> dropTargetNss;
 
         if (options.dropTarget)

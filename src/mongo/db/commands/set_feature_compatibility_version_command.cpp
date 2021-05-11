@@ -58,6 +58,7 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/database_version_helpers.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
@@ -92,62 +93,6 @@ void deletePersistedDefaultRWConcernDocument(OperationContext* opCtx) {
         return deleteOp.serialize({});
     }());
     uassertStatusOK(getStatusFromWriteCommandReply(commandResponse->getCommandReply()));
-}
-
-Status validateDowngradeRequest(FeatureCompatibilityParams::Version actualVersion,
-                                FeatureCompatibilityParams::Version requestedVersion) {
-    if (actualVersion == FeatureCompatibilityParams::kUpgradingFromLastLTSToLatest ||
-        actualVersion == FeatureCompatibilityParams::kUpgradingFromLastContinuousToLatest) {
-        return Status(ErrorCodes::IllegalOperation,
-                      "cannot downgrade featureCompatibilityVersion while a previous "
-                      "featureCompatibilityVersion upgrade has not completed.");
-    }
-
-    const auto lastLTSFCV = FeatureCompatibilityParams::kLastLTS;
-    const auto lastContFCV = FeatureCompatibilityParams::kLastContinuous;
-    if (lastLTSFCV == lastContFCV) {
-        return Status::OK();
-    }
-
-    if ((requestedVersion == lastLTSFCV &&
-         actualVersion == FeatureCompatibilityParams::kDowngradingFromLatestToLastContinuous) ||
-        (requestedVersion == lastContFCV &&
-         actualVersion == FeatureCompatibilityParams::kDowngradingFromLatestToLastLTS)) {
-        return Status(ErrorCodes::IllegalOperation,
-                      str::stream()
-                          << "cannot downgrade featureCompatibilityVersion to "
-                          << FCVP::toString(requestedVersion)
-                          << " while a previous featureCompatibilityVersion downgrade to a "
-                             "different target version has not yet completed.");
-    }
-
-    // We don't support upgrading/downgrading between last-lts and last-continuous FCV.
-    if ((requestedVersion == lastLTSFCV && actualVersion == lastContFCV) ||
-        (requestedVersion == lastContFCV && actualVersion == lastLTSFCV)) {
-        return Status(ErrorCodes::IllegalOperation,
-                      str::stream() << "cannot set featureCompatibilityVersion to "
-                                    << FCVP::toString(requestedVersion)
-                                    << " while in featureCompatibilityVersion "
-                                    << FCVP::toString(actualVersion) << ".");
-    }
-
-    return Status::OK();
-}
-
-Status validateUpgradeRequest(FeatureCompatibilityParams::Version actualVersion,
-                              FeatureCompatibilityParams::Version requestedVersion) {
-    if (actualVersion == FeatureCompatibilityParams::kDowngradingFromLatestToLastLTS ||
-        actualVersion == FeatureCompatibilityParams::kDowngradingFromLatestToLastContinuous) {
-        return Status(ErrorCodes::IllegalOperation,
-                      str::stream() << "cannot initiate featureCompatibilityVersion upgrade to "
-                                    << FCVP::kLatest
-                                    << " while a previous featureCompatibilityVersion downgrade to "
-                                    << FCVP::kLastLTS << " or " << FCVP::kLastContinuous
-                                    << " has not completed. Finish downgrade then upgrade to "
-                                    << FCVP::kLatest);
-    }
-
-    return Status::OK();
 }
 
 /**
@@ -243,9 +188,9 @@ public:
         const auto requestedVersionString = FCVP::serializeVersion(requestedVersion);
         FeatureCompatibilityParams::Version actualVersion =
             serverGlobalParams.featureCompatibility.getVersion();
-
         if (request.getDowngradeOnDiskChanges() &&
-            requestedVersion != FeatureCompatibilityParams::kLastContinuous) {
+            (requestedVersion != FeatureCompatibilityParams::kLastContinuous ||
+             actualVersion < requestedVersion)) {
             std::stringstream downgradeOnDiskErrorSS;
             downgradeOnDiskErrorSS
                 << "cannot set featureCompatibilityVersion to " << requestedVersionString
@@ -255,18 +200,20 @@ public:
             uasserted(ErrorCodes::IllegalOperation, downgradeOnDiskErrorSS.str());
         }
 
-        if (requestedVersion == FeatureCompatibilityParams::kLatest) {
-            uassertStatusOK(validateUpgradeRequest(actualVersion, requestedVersion));
-            if (actualVersion == FeatureCompatibilityParams::kLatest) {
-                // Set the client's last opTime to the system last opTime so no-ops wait for
-                // writeConcern.
-                repl::ReplClientInfo::forClient(opCtx->getClient())
-                    .setLastOpToSystemLastOpTime(opCtx);
-                return true;
-            }
+        if (actualVersion == requestedVersion) {
+            // Set the client's last opTime to the system last opTime so no-ops wait for
+            // writeConcern.
+            repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
+            return true;
+        }
 
-            FeatureCompatibilityVersion::setTargetUpgradeFrom(opCtx, actualVersion);
+        auto isFromConfigServer = request.getFromConfigServer().value_or(false);
+        FeatureCompatibilityVersion::validateSetFeatureCompatibilityVersionRequest(
+            actualVersion, requestedVersion, isFromConfigServer);
 
+        if (actualVersion < requestedVersion) {
+            FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
+                opCtx, actualVersion, requestedVersion, isFromConfigServer);
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
                 // global IX or X locks. This ensures that either
@@ -297,20 +244,13 @@ public:
             }
 
             hangWhileUpgrading.pauseWhileSet(opCtx);
-            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
-        } else if (requestedVersion == FeatureCompatibilityParams::kLastLTS ||
-                   requestedVersion == FeatureCompatibilityParams::kLastContinuous) {
-            uassertStatusOK(validateDowngradeRequest(actualVersion, requestedVersion));
-
-            if (actualVersion == FeatureCompatibilityParams::kLastLTS ||
-                actualVersion == FeatureCompatibilityParams::kLastContinuous) {
-                // Set the client's last opTime to the system last opTime so no-ops wait for
-                // writeConcern.
-                repl::ReplClientInfo::forClient(opCtx->getClient())
-                    .setLastOpToSystemLastOpTime(opCtx);
-                return true;
-            }
-
+            // Completed transition to requestedVersion.
+            FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
+                opCtx,
+                serverGlobalParams.featureCompatibility.getVersion(),
+                requestedVersion,
+                isFromConfigServer);
+        } else {
             auto replCoord = repl::ReplicationCoordinator::get(opCtx);
             const bool isReplSet =
                 replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
@@ -336,7 +276,8 @@ public:
                 "nodes");
             LOGV2(4637905, "The current replica set config has been propagated to all nodes.");
 
-            FeatureCompatibilityVersion::setTargetDowngrade(opCtx, requestedVersion);
+            FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
+                opCtx, actualVersion, requestedVersion, isFromConfigServer);
 
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
@@ -369,7 +310,12 @@ public:
             }
 
             hangWhileDowngrading.pauseWhileSet(opCtx);
-            FeatureCompatibilityVersion::unsetTargetUpgradeOrDowngrade(opCtx, requestedVersion);
+            // Completed transition to requestedVersion.
+            FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
+                opCtx,
+                serverGlobalParams.featureCompatibility.getVersion(),
+                requestedVersion,
+                isFromConfigServer);
 
             if (request.getDowngradeOnDiskChanges()) {
                 invariant(requestedVersion == FeatureCompatibilityParams::kLastContinuous);

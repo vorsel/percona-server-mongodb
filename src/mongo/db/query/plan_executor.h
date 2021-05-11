@@ -34,8 +34,10 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/update_result.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/plan_explainer.h"
 #include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/plan_yield_policy.h"
+#include "mongo/db/query/restore_context.h"
 
 namespace mongo {
 
@@ -179,6 +181,10 @@ public:
      * Restores the state saved by a saveState() call. When this method returns successfully, the
      * execution tree can once again be executed via work().
      *
+     * RestoreContext is a context containing external state needed by plan stages to be able to
+     * restore into a valid state. The RequiresCollectionStage requires a valid CollectionPtr for
+     * example.
+     *
      * Throws a UserException if the state cannot be successfully restored (e.g. a collection was
      * dropped or the position of a capped cursor was lost during a yield). If restore fails, it is
      * only safe to call dispose(), detachFromOperationContext(), or the destructor.
@@ -187,7 +193,7 @@ public:
      * WriteConflictException is encountered. If the time limit is exceeded during this retry
      * process, throws ErrorCodes::MaxTimeMSExpired.
      */
-    virtual void restoreState() = 0;
+    virtual void restoreState(const RestoreContext& context) = 0;
 
     /**
      * Detaches from the OperationContext and releases any storage-engine state.
@@ -328,30 +334,14 @@ public:
     virtual LockPolicy lockPolicy() const = 0;
 
     /**
-     * Returns a short string, suitable for the logs, which summarizes the execution plan.
-     */
-    virtual std::string getPlanSummary() const = 0;
-
-    /**
-     * Fills out 'statsOut' with summary stats collected during the execution of the PlanExecutor.
-     * This is a lightweight alternative which is useful when operations want to request a summary
-     * of the available debug information without generating complete explain output.
-     *
-     * The summary stats are consumed by debug mechanisms such as the profiler and the slow query
-     * log.
-     */
-    virtual void getSummaryStats(PlanSummaryStats* statsOut) const = 0;
-
-    /**
-     * Serializes any execution stats tracked by this executor to BSON, for debugging. The format of
-     * these stats are opaque to the caller, and different implementations may choose to provide
-     * different stats.
+     * Returns a PlanExplainer instance to generate plan details and execution stats tracked by this
+     * executor.
      *
      * Implementations must be able to successfully generate and return stats even if the
      * PlanExecutor has issued a query-fatal exception and the executor cannot be used for further
      * query execution.
      */
-    virtual BSONObj getStats() const = 0;
+    virtual const PlanExplainer& getPlanExplainer() const = 0;
 };
 
 }  // namespace mongo

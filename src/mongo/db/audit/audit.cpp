@@ -823,6 +823,28 @@ namespace audit {
         _auditEvent(client, "createCollection", params);
     }
 
+    void logCreateView(Client* client,
+                       StringData nsname,
+                       StringData viewOn,
+                       BSONArray pipeline,
+                       ErrorCodes::Error code) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("ns" << nsname << "viewOn" << viewOn << "pipeline" << pipeline);
+        _auditEvent(client, "createView", params, code);
+    }
+
+    void logImportCollection(Client* client, StringData nsname) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("ns" << nsname);
+        _auditEvent(client, "importCollection", params);
+    }
+
     void logCreateDatabase(Client* client,
                            StringData nsname) {
         if (!_auditLog) {

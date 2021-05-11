@@ -31,19 +31,36 @@
 
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/recipient_document_gen.h"
+#include "mongo/db/s/resharding/resharding_oplog_fetcher.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
 
 namespace mongo {
-constexpr StringData kReshardingRecipientServiceName = "ReshardingRecipientService"_sd;
+
+namespace resharding {
+
+/**
+ * Creates the temporary resharding collection locally by loading the collection options and
+ * collection indexes from the original collection's primary and MinKey owning chunk shards,
+ * respectively.
+ */
+void createTemporaryReshardingCollectionLocally(OperationContext* opCtx,
+                                                const NamespaceString& reshardingNss,
+                                                Timestamp fetchTimestamp);
+
+}  // namespace resharding
 
 class ReshardingRecipientService final : public repl::PrimaryOnlyService {
 public:
+    static constexpr StringData kServiceName = "ReshardingRecipientService"_sd;
+
     explicit ReshardingRecipientService(ServiceContext* serviceContext)
         : PrimaryOnlyService(serviceContext) {}
     ~ReshardingRecipientService() = default;
 
+    class RecipientStateMachine;
+
     StringData getServiceName() const override {
-        return kReshardingRecipientServiceName;
+        return kServiceName;
     }
 
     NamespaceString getStateDocumentsNS() const override {
@@ -63,24 +80,42 @@ public:
  * Represents the current state of a resharding recipient operation on this shard. This class
  * drives state transitions and updates to underlying on-disk metadata.
  */
-class RecipientStateMachine final
+class ReshardingRecipientService::RecipientStateMachine final
     : public repl::PrimaryOnlyService::TypedInstance<RecipientStateMachine> {
 public:
     explicit RecipientStateMachine(const BSONObj& recipientDoc);
 
-    SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept override;
+    ~RecipientStateMachine();
 
-    void interrupt(Status status) override{};
+    void run(std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept override;
+
+    void interrupt(Status status) override;
+
+    /**
+     * Returns a Future that will be resolved when all work associated with this Instance has
+     * completed running.
+     */
+    SharedSemiFuture<void> getCompletionFuture() const {
+        return _completionPromise.getFuture();
+    }
+
+    /**
+     * TODO(SERVER-51021) Report ReshardingRecipientService Instances in currentOp().
+     */
+    boost::optional<BSONObj> reportForCurrentOp(
+        MongoProcessInterface::CurrentOpConnectionsMode connMode,
+        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept final {
+        return boost::none;
+    }
 
     void onReshardingFieldsChanges(
         boost::optional<TypeCollectionReshardingFields> reshardingFields);
 
 private:
     // The following functions correspond to the actions to take at a particular recipient state.
-    void _createTemporaryReshardingCollectionThenTransitionToInitialized();
+    void _transitionToCreatingTemporaryReshardingCollection();
 
-    ExecutorFuture<void> _awaitAllDonorsPreparedToDonateThenTransitionToCloning(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+    void _createTemporaryReshardingCollectionThenTransitionToCloning();
 
     void _cloneThenTransitionToApplying();
 
@@ -94,11 +129,17 @@ private:
 
     void _renameTemporaryReshardingCollectionThenDeleteLocalState();
 
+    void _fulfillAllDonorsPreparedToDonate(Timestamp);
+
     // Transitions the state on-disk and in-memory to 'endState'.
-    void _transitionState(RecipientStateEnum endState);
+    void _transitionState(RecipientStateEnum endState,
+                          boost::optional<Timestamp> fetchTimestamp = boost::none);
 
     // Transitions the state on-disk and in-memory to kError.
     void _transitionStateToError(const Status& status);
+
+    // Inserts 'doc' on-disk and sets '_replacementDoc' in-memory.
+    void _insertRecipientDocument(const ReshardingRecipientDocument& doc);
 
     // Updates the recipient document on-disk and in-memory with the 'replacementDoc.'
     void _updateRecipientDocument(ReshardingRecipientDocument&& replacementDoc);
@@ -107,16 +148,19 @@ private:
     // config.localReshardingOperations.recipient.
     ReshardingRecipientDocument _recipientDoc;
 
+    // The id both for the resharding operation and for the primary-only-service instance.
+    const UUID _id;
+
+    // Protects the promises below
+    Mutex _mutex = MONGO_MAKE_LATCH("ReshardingRecipient::_mutex");
+
     // Each promise below corresponds to a state on the recipient state machine. They are listed in
     // ascending order, such that the first promise below will be the first promise fulfilled.
-    SharedPromise<void> _allDonorsPreparedToDonate;
-
     SharedPromise<void> _allDonorsMirroring;
 
     SharedPromise<void> _coordinatorHasCommitted;
 
-    // The id both for the resharding operation and for the primary-only-service instance.
-    const UUID _id;
+    SharedPromise<void> _completionPromise;
 };
 
 }  // namespace mongo

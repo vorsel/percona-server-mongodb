@@ -281,7 +281,7 @@ bool handleError(OperationContext* opCtx,
 }
 
 void insertDocuments(OperationContext* opCtx,
-                     const Collection* collection,
+                     const CollectionPtr& collection,
                      std::vector<InsertStatement>::iterator begin,
                      std::vector<InsertStatement>::iterator end,
                      bool fromMigrate) {
@@ -336,7 +336,7 @@ void insertDocuments(OperationContext* opCtx,
  * they only allow one operation at a time because they enforce insertion order with a MODE_X
  * collection lock, which we cannot hold in transactions.
  */
-Status checkIfTransactionOnCappedColl(OperationContext* opCtx, const Collection* collection) {
+Status checkIfTransactionOnCappedColl(OperationContext* opCtx, const CollectionPtr& collection) {
     if (opCtx->inMultiDocumentTransaction() && collection->isCapped()) {
         return {ErrorCodes::OperationNotSupportedInTransaction,
                 str::stream() << "Collection '" << collection->ns()
@@ -649,7 +649,7 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
         makeCollection(opCtx, ns);
     }
 
-    if (auto coll = collection->getCollection()) {
+    if (const auto& coll = collection->getCollection()) {
         // Transactions are not allowed to operate on capped collections.
         uassertStatusOK(checkIfTransactionOnCappedColl(opCtx, coll));
     }
@@ -665,24 +665,29 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
 
     assertCanWrite_inlock(opCtx, ns);
 
-    auto exec = uassertStatusOK(getExecutorUpdate(
-        &curOp.debug(), collection->getCollection(), &parsedUpdate, boost::none /* verbosity */));
+    auto exec = uassertStatusOK(
+        getExecutorUpdate(&curOp.debug(),
+                          collection ? &collection->getCollection() : &CollectionPtr::null,
+                          &parsedUpdate,
+                          boost::none /* verbosity */));
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanSummary());
+        CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanExplainer().getPlanSummary());
     }
 
     auto updateResult = exec->executeUpdate();
 
     PlanSummaryStats summary;
-    exec->getSummaryStats(&summary);
-    if (auto coll = collection->getCollection()) {
+    auto&& explainer = exec->getPlanExplainer();
+    explainer.getSummaryStats(&summary);
+    if (const auto& coll = collection->getCollection()) {
         CollectionQueryInfo::get(coll).notifyOfQuery(opCtx, coll, summary);
     }
 
     if (curOp.shouldDBProfile(opCtx)) {
-        curOp.debug().execStats = exec->getStats();
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+        curOp.debug().execStats = std::move(stats);
     }
 
     recordUpdateResultInOpDebug(updateResult, &curOp.debug());
@@ -903,25 +908,27 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
         &hangWithLockDuringBatchRemove, opCtx, "hangWithLockDuringBatchRemove");
 
     auto exec = uassertStatusOK(getExecutorDelete(
-        &curOp.debug(), collection.getCollection(), &parsedDelete, boost::none /* verbosity */));
+        &curOp.debug(), &collection.getCollection(), &parsedDelete, boost::none /* verbosity */));
 
     {
         stdx::lock_guard<Client> lk(*opCtx->getClient());
-        CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanSummary());
+        CurOp::get(opCtx)->setPlanSummary_inlock(exec->getPlanExplainer().getPlanSummary());
     }
 
     auto nDeleted = exec->executeDelete();
     curOp.debug().additiveMetrics.ndeleted = nDeleted;
 
     PlanSummaryStats summary;
-    exec->getSummaryStats(&summary);
-    if (auto coll = collection.getCollection()) {
+    auto&& explainer = exec->getPlanExplainer();
+    explainer.getSummaryStats(&summary);
+    if (const auto& coll = collection.getCollection()) {
         CollectionQueryInfo::get(coll).notifyOfQuery(opCtx, coll, summary);
     }
     curOp.debug().setPlanSummaryMetrics(summary);
 
     if (curOp.shouldDBProfile(opCtx)) {
-        curOp.debug().execStats = exec->getStats();
+        auto&& [stats, _] = explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+        curOp.debug().execStats = std::move(stats);
     }
 
     LastError::get(opCtx->getClient()).recordDelete(nDeleted);

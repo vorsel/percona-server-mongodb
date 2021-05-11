@@ -971,7 +971,7 @@ void rollbackDropIndexes(OperationContext* opCtx,
     invariant(nss);
     Lock::DBLock dbLock(opCtx, nss->db(), MODE_IX);
     Lock::CollectionLock collLock(opCtx, *nss, MODE_X);
-    const Collection* collection =
+    CollectionPtr collection =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, *nss);
 
     // If we cannot find the collection, we skip over dropping the index.
@@ -1016,7 +1016,7 @@ void rollbackDropIndexes(OperationContext* opCtx,
  */
 void dropCollection(OperationContext* opCtx,
                     NamespaceString nss,
-                    const Collection* collection,
+                    const CollectionPtr& collection,
                     Database* db) {
     if (RollbackImpl::shouldCreateDataFiles()) {
         RemoveSaver removeSaver("rollback", "", collection->uuid().toString());
@@ -1033,7 +1033,7 @@ void dropCollection(OperationContext* opCtx,
         // Performs a collection scan and writes all documents in the collection to disk
         // in order to keep an archive of items that were rolled back.
         auto exec = InternalPlanner::collectionScan(
-            opCtx, nss.toString(), collection, PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+            opCtx, nss.toString(), &collection, PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
         PlanExecutor::ExecState execState;
         try {
             BSONObj curObj;
@@ -1499,7 +1499,7 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
             Database* db = dbLock.getDb();
             if (db) {
-                const Collection* collection =
+                CollectionPtr collection =
                     CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
                 dropCollection(opCtx, *nss, collection, db);
                 LOGV2_DEBUG(21698,

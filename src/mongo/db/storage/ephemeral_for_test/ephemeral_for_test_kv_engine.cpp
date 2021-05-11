@@ -75,6 +75,14 @@ Status KVEngine::createRecordStore(OperationContext* opCtx,
     return Status::OK();
 }
 
+Status KVEngine::importRecordStore(OperationContext* opCtx,
+                                   StringData ident,
+                                   const BSONObj& storageMetadata) {
+    stdx::lock_guard lock(_identsLock);
+    _idents[ident.toString()] = true;
+    return Status::OK();
+}
+
 std::unique_ptr<mongo::RecordStore> KVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
                                                                        StringData ident) {
     std::unique_ptr<mongo::RecordStore> recordStore =
@@ -131,6 +139,14 @@ Status KVEngine::createSortedDataInterface(OperationContext* opCtx,
     return Status::OK();  // I don't think we actually need to do anything here
 }
 
+Status KVEngine::importSortedDataInterface(OperationContext* opCtx,
+                                           StringData ident,
+                                           const BSONObj& storageMetadata) {
+    stdx::lock_guard lock(_identsLock);
+    _idents[ident.toString()] = false;
+    return Status::OK();
+}
+
 std::unique_ptr<mongo::SortedDataInterface> KVEngine::getSortedDataInterface(
     OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) {
     {
@@ -143,9 +159,7 @@ std::unique_ptr<mongo::SortedDataInterface> KVEngine::getSortedDataInterface(
         return std::make_unique<SortedDataInterfaceStandard>(opCtx, ident, desc);
 }
 
-Status KVEngine::dropIdent(OperationContext* unusedOpCtx,
-                           mongo::RecoveryUnit* ru,
-                           StringData ident) {
+Status KVEngine::dropIdent(mongo::RecoveryUnit* ru, StringData ident) {
     Status dropStatus = Status::OK();
     stdx::unique_lock lock(_identsLock);
     if (_idents.count(ident.toString()) > 0) {
@@ -155,7 +169,7 @@ Status KVEngine::dropIdent(OperationContext* unusedOpCtx,
         lock.unlock();
         if (isRecordStore) {  // ident is RecordStore.
             CollectionOptions s;
-            auto rs = getRecordStore(/*unused*/ unusedOpCtx, ""_sd, ident, s);
+            auto rs = getRecordStore(/*opCtx=*/nullptr, ""_sd, ident, s);
             dropStatus =
                 checked_cast<RecordStore*>(rs.get())->truncateWithoutUpdatingCount(ru).getStatus();
         } else {  // ident is SortedDataInterface.

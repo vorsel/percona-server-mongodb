@@ -39,6 +39,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/import_collection_oplog_entry_gen.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
@@ -53,6 +54,7 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/roll_back_local_operations.h"
 #include "mongo/db/repl/storage_interface.h"
+#include "mongo/db/repl/tenant_migration_donor_util.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/s/shard_identity_rollback_notifier.h"
 #include "mongo/db/s/type_shard_identity.h"
@@ -414,7 +416,6 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
                 break;
             }
             case OplogEntry::CommandType::kDbCheck:
-            case OplogEntry::CommandType::kConvertToCapped:
             case OplogEntry::CommandType::kEmptyCapped: {
                 // These commands do not need to be supported by rollback. 'convertToCapped' should
                 // always be converted to lower level DDL operations, and 'emptycapped' is a
@@ -426,6 +427,7 @@ StatusWith<std::set<NamespaceString>> RollbackImpl::_namespacesForOp(const Oplog
             }
             case OplogEntry::CommandType::kCreate:
             case OplogEntry::CommandType::kDrop:
+            case OplogEntry::CommandType::kImportCollection:
             case OplogEntry::CommandType::kCreateIndexes:
             case OplogEntry::CommandType::kDropIndexes:
             case OplogEntry::CommandType::kStartIndexBuild:
@@ -550,6 +552,8 @@ void RollbackImpl::_runPhaseFromAbortToReconstructPreparedTxns(
     // rollback.
     _correctRecordStoreCounts(opCtx);
 
+    tenant_migration_donor::recoverTenantMigrationAccessBlockers(opCtx);
+
     // Reconstruct prepared transactions after counts have been adjusted. Since prepared
     // transactions were aborted (i.e. the in-memory counts were rolled-back) before computing
     // collection counts, reconstruct the prepared transactions now, adding on any additional counts
@@ -603,12 +607,12 @@ void RollbackImpl::_correctRecordStoreCounts(OperationContext* opCtx) {
                   "Scanning collection to fix collection count",
                   "namespace"_attr = nss.ns(),
                   "uuid"_attr = uuid.toString());
-            AutoGetCollectionForRead autoCollToScan(opCtx, nss);
-            auto collToScan = autoCollToScan.getCollection();
-            invariant(coll == collToScan,
+            AutoGetCollectionForRead collToScan(opCtx, nss);
+            invariant(coll == collToScan.getCollection(),
                       str::stream() << "Catalog returned invalid collection: " << nss.ns() << " ("
                                     << uuid.toString() << ")");
             auto exec = collToScan->makePlanExecutor(opCtx,
+                                                     collToScan.getCollection(),
                                                      PlanYieldPolicy::YieldPolicy::INTERRUPT_ONLY,
                                                      Collection::ScanDirection::kForward);
             long long countFromScan = 0;
@@ -863,6 +867,22 @@ Status RollbackImpl::_processRollbackOp(OperationContext* opCtx, const OplogEntr
             _countDiffs.erase(oplogEntry.getUuid().get());
             _pendingDrops.erase(oplogEntry.getUuid().get());
             _newCounts.erase(oplogEntry.getUuid().get());
+        } else if (oplogEntry.getCommandType() == OplogEntry::CommandType::kImportCollection) {
+            auto importEntry = mongo::ImportCollectionOplogEntry::parse(
+                IDLParserErrorContext("importCollectionOplogEntry"), oplogEntry.getObject());
+            // Nothing to roll back if this is a dryRun.
+            if (!importEntry.getDryRun()) {
+                const auto& catalogEntry = importEntry.getCatalogEntry();
+                auto importTargetUUID =
+                    invariant(UUID::parse(catalogEntry["md"]["options"]["uuid"]),
+                              str::stream() << "Oplog entry to roll back is unexpectedly missing "
+                                               "import collection UUID: "
+                                            << redact(oplogEntry.toBSON()));
+                // If we roll back an import, then we do not need to change the size of that uuid.
+                _countDiffs.erase(importTargetUUID);
+                _pendingDrops.erase(importTargetUUID);
+                _newCounts.erase(importTargetUUID);
+            }
         } else if (oplogEntry.getCommandType() == OplogEntry::CommandType::kDrop) {
             // If we roll back a collection drop, parse the o2 field for the collection count for
             // use later by _findRecordStoreCounts().

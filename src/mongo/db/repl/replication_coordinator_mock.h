@@ -149,7 +149,7 @@ public:
 
     virtual void setMyHeartbeatMessage(const std::string& msg);
 
-    virtual OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const;
+    virtual OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime(bool rollbackSafe) const;
     virtual OpTime getMyLastAppliedOpTime() const;
 
     virtual OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const;
@@ -229,8 +229,7 @@ public:
                                           const BSONObj& configObj,
                                           BSONObjBuilder* resultObj);
 
-    virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates,
-                                                long long* configVersion);
+    virtual Status processReplSetUpdatePosition(const UpdatePositionArgs& updates);
 
     virtual bool buildsIndexes();
 

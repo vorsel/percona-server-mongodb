@@ -217,7 +217,7 @@ private:
     T _payload;
 };
 
-class FreeMonNetworkInterfaceMock : public FreeMonNetworkInterface {
+class FreeMonNetworkInterfaceMock final : public FreeMonNetworkInterface {
 public:
     struct Options {
         // If sync = true, then execute the callback immediately and the subsequent future chain
@@ -241,7 +241,6 @@ public:
     explicit FreeMonNetworkInterfaceMock(executor::ThreadPoolTaskExecutor* threadPool,
                                          Options options)
         : _threadPool(threadPool), _options(options), _countdownMetrics(0) {}
-    ~FreeMonNetworkInterfaceMock() final = default;
 
     Future<FreeMonRegistrationResponse> sendRegistrationAsync(
         const FreeMonRegistrationRequest& req) final {
@@ -251,7 +250,7 @@ public:
 
         auto pf = makePromiseFuture<FreeMonRegistrationResponse>();
         if (_options.doSync) {
-            pf.promise.setFromStatusWith(doRegister(req));
+            pf.promise.setFrom(doRegister(req));
         } else {
             auto swSchedule = _threadPool->scheduleWork(
                 [sharedPromise = std::move(pf.promise), req, this](
@@ -297,7 +296,7 @@ public:
 
         auto pf = makePromiseFuture<FreeMonMetricsResponse>();
         if (_options.doSync) {
-            pf.promise.setFromStatusWith(doMetrics(req));
+            pf.promise.setFrom(doMetrics(req));
         } else {
             auto swSchedule = _threadPool->scheduleWork(
                 [sharedPromise = std::move(pf.promise), req, this](

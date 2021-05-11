@@ -505,7 +505,7 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
         const auto& toRemove = it;
         LOGV2(22251, "Dropping unknown ident", "ident"_attr = toRemove);
         WriteUnitOfWork wuow(opCtx);
-        fassert(40591, _engine->dropIdent(opCtx, opCtx->recoveryUnit(), toRemove));
+        fassert(40591, _engine->dropIdent(opCtx->recoveryUnit(), toRemove));
         wuow.commit();
     }
 
@@ -637,7 +637,7 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
                       "namespace"_attr = coll,
                       "index"_attr = indexName);
                 // Ensure the `ident` is dropped while we have the `indexIdent` value.
-                fassert(50713, _engine->dropIdent(opCtx, opCtx->recoveryUnit(), indexIdent));
+                fassert(50713, _engine->dropIdent(opCtx->recoveryUnit(), indexIdent));
                 indexesToDrop.push_back(indexName);
                 continue;
             }
@@ -663,7 +663,7 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
     for (auto&& temp : internalIdentsToDrop) {
         LOGV2(22257, "Dropping internal ident", "ident"_attr = temp);
         WriteUnitOfWork wuow(opCtx);
-        fassert(51067, _engine->dropIdent(opCtx, opCtx->recoveryUnit(), temp));
+        fassert(51067, _engine->dropIdent(opCtx->recoveryUnit(), temp));
         wuow.commit();
     }
 
@@ -796,7 +796,7 @@ Status StorageEngineImpl::_dropCollectionsNoTimestamp(OperationContext* opCtx,
             firstError = result;
         }
 
-        auto removedColl = CollectionCatalog::get(opCtx).deregisterCollection(coll->uuid());
+        auto removedColl = CollectionCatalog::get(opCtx).deregisterCollection(opCtx, coll->uuid());
         opCtx->recoveryUnit()->registerChange(
             CollectionCatalog::get(opCtx).makeFinishDropCollectionChange(std::move(removedColl),
                                                                          coll->uuid()));
@@ -882,7 +882,7 @@ Status StorageEngineImpl::repairRecordStore(OperationContext* opCtx,
     // After repairing, re-initialize the collection with a valid RecordStore.
     auto& collectionCatalog = CollectionCatalog::get(getGlobalServiceContext());
     auto uuid = collectionCatalog.lookupUUIDByNSS(opCtx, nss).get();
-    collectionCatalog.deregisterCollection(uuid);
+    collectionCatalog.deregisterCollection(opCtx, uuid);
     _initCollection(opCtx, catalogId, nss, false);
 
     return status;
@@ -979,7 +979,7 @@ StatusWith<Timestamp> StorageEngineImpl::recoverToStableTimestamp(OperationConte
         return swTimestamp;
     }
 
-    catalog::openCatalog(opCtx, state);
+    catalog::openCatalog(opCtx, state, swTimestamp.getValue());
 
     LOGV2(22259,
           "recoverToStableTimestamp successful",
@@ -1061,8 +1061,9 @@ void StorageEngineImpl::_dumpCatalog(OperationContext* opCtx) {
 
 void StorageEngineImpl::addDropPendingIdent(const Timestamp& dropTimestamp,
                                             const NamespaceString& nss,
-                                            std::shared_ptr<Ident> ident) {
-    _dropPendingIdentReaper.addDropPendingIdent(dropTimestamp, nss, ident);
+                                            std::shared_ptr<Ident> ident,
+                                            const DropIdentCallback& onDrop) {
+    _dropPendingIdentReaper.addDropPendingIdent(dropTimestamp, nss, ident, onDrop);
 }
 
 void StorageEngineImpl::checkpoint() {
@@ -1215,7 +1216,7 @@ void StorageEngineImpl::TimestampMonitor::removeListener(TimestampListener* list
 int64_t StorageEngineImpl::sizeOnDiskForDb(OperationContext* opCtx, StringData dbName) {
     int64_t size = 0;
 
-    catalog::forEachCollectionFromDb(opCtx, dbName, MODE_IS, [&](const Collection* collection) {
+    catalog::forEachCollectionFromDb(opCtx, dbName, MODE_IS, [&](const CollectionPtr& collection) {
         size += collection->getRecordStore()->storageSize(opCtx);
 
         std::vector<std::string> indexNames;

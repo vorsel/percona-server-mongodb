@@ -53,7 +53,7 @@ namespace mongo {
 MONGO_FAIL_POINT_DEFINE(hangDropCollectionBeforeLockAcquisition);
 MONGO_FAIL_POINT_DEFINE(hangDuringDropCollection);
 
-Status _checkNssAndReplState(OperationContext* opCtx, const Collection* coll) {
+Status _checkNssAndReplState(OperationContext* opCtx, const CollectionPtr& coll) {
     if (!coll) {
         return Status(ErrorCodes::NamespaceNotFound, "ns not found");
     }
@@ -134,7 +134,7 @@ Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
     // which may have changed when we released the collection lock temporarily.
     opCtx->recoveryUnit()->abandonSnapshot();
 
-    const Collection* coll =
+    CollectionPtr coll =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, startingNss);
     Status status = _checkNssAndReplState(opCtx, coll);
     if (!status.isOK()) {
@@ -185,8 +185,7 @@ Status _abortIndexBuildsAndDropCollection(OperationContext* opCtx,
         // disk state, which may have changed when we released the collection lock temporarily.
         opCtx->recoveryUnit()->abandonSnapshot();
 
-        const Collection* coll =
-            CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, collectionUUID);
+        coll = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, collectionUUID);
         status = _checkNssAndReplState(opCtx, coll);
         if (!status.isOK()) {
             return status;
@@ -237,7 +236,7 @@ Status _dropCollection(OperationContext* opCtx,
                        DropCollectionSystemCollectionMode systemCollectionMode,
                        BSONObjBuilder& result) {
     Lock::CollectionLock collLock(opCtx, collectionName, MODE_X);
-    const Collection* coll =
+    const CollectionPtr& coll =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collectionName);
     Status status = _checkNssAndReplState(opCtx, coll);
     if (!status.isOK()) {
@@ -300,8 +299,9 @@ Status dropCollection(OperationContext* opCtx,
                     return Status(ErrorCodes::NamespaceNotFound, "ns not found");
                 }
 
-                const Collection* coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
-                    opCtx, collectionName);
+                const CollectionPtr& coll =
+                    CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx,
+                                                                              collectionName);
 
                 if (!coll) {
                     return _dropView(opCtx, db, collectionName, result);
@@ -337,7 +337,7 @@ Status dropCollectionForApplyOps(OperationContext* opCtx,
             return Status(ErrorCodes::NamespaceNotFound, "ns not found");
         }
 
-        const Collection* coll =
+        const CollectionPtr& coll =
             CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, collectionName);
 
         BSONObjBuilder unusedBuilder;

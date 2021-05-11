@@ -100,7 +100,7 @@ public:
         return _database;
     }
 
-    const Collection* getCollection() const {
+    const CollectionPtr& getCollection() const {
         invariant(_collection);
         return _collection;
     }
@@ -177,7 +177,7 @@ private:
      * validated, but a cross database collection rename will interrupt validation. If the locks
      * cannot be re-acquired, throws the error.
      *
-     * Throws if validation cannot continue.
+     * Throws an interruption exception if validation cannot continue.
      *
      * After locks are reacquired:
      *     - Check if the database exists.
@@ -188,9 +188,8 @@ private:
 
     /**
      * Saves and restores the open cursors to release snapshots and minimize cache pressure for
-     * foreground validation.
-     *
-     * This cannot be called for background validation or we risk losing our PIT view of the data.
+     * validation.  For background validation, also refreshes the snapshot by starting a new storage
+     * transaction.
      */
     void _yieldCursors(OperationContext* opCtx);
 
@@ -199,12 +198,13 @@ private:
     RepairMode _repairMode;
     OptionalCollectionUUID _uuid;
 
+    boost::optional<ShouldNotConflictWithSecondaryBatchApplicationBlock> _noPBWM;
     boost::optional<Lock::GlobalLock> _globalLock;
     boost::optional<AutoGetDb> _databaseLock;
     boost::optional<Lock::CollectionLock> _collectionLock;
 
     Database* _database;
-    const Collection* _collection;
+    CollectionPtr _collection;
 
     // Stores the indexes that are going to be validated. When validate yields periodically we'll
     // use this list to determine if validation should abort when an existing index that was

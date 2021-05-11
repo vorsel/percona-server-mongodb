@@ -42,6 +42,7 @@
 #include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
+#include "mongo/db/s/resharding_txn_cloner.h"
 #include "mongo/db/s/resharding_util.h"
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -173,6 +174,33 @@ private:
     const ShardKeyPattern _shardKeyPattern = ShardKeyPattern(BSON("x"
                                                                   << "hashed"));
 };
+
+// Confirm the highest minFetchTimestamp is properly computed.
+TEST(ReshardingUtilTest, HighestMinFetchTimestampSucceeds) {
+    std::vector<DonorShardEntry> donorShards{
+        makeDonorShard(ShardId("s0"), DonorStateEnum::kDonating, Timestamp(10, 2)),
+        makeDonorShard(ShardId("s1"), DonorStateEnum::kDonating, Timestamp(10, 3)),
+        makeDonorShard(ShardId("s2"), DonorStateEnum::kDonating, Timestamp(10, 1))};
+    auto highestMinFetchTimestamp = getHighestMinFetchTimestamp(donorShards);
+    ASSERT_EQ(Timestamp(10, 3), highestMinFetchTimestamp);
+}
+
+TEST(ReshardingUtilTest, HighestMinFetchTimestampThrowsWhenDonorMissingTimestamp) {
+    std::vector<DonorShardEntry> donorShards{
+        makeDonorShard(ShardId("s0"), DonorStateEnum::kDonating, Timestamp(10, 3)),
+        makeDonorShard(ShardId("s1"), DonorStateEnum::kDonating),
+        makeDonorShard(ShardId("s2"), DonorStateEnum::kDonating, Timestamp(10, 2))};
+    ASSERT_THROWS_CODE(getHighestMinFetchTimestamp(donorShards), DBException, 4957300);
+}
+
+TEST(ReshardingUtilTest, HighestMinFetchTimestampSucceedsWithDonorStateGTkDonating) {
+    std::vector<DonorShardEntry> donorShards{
+        makeDonorShard(ShardId("s0"), DonorStateEnum::kMirroring, Timestamp(10, 2)),
+        makeDonorShard(ShardId("s1"), DonorStateEnum::kDonating, Timestamp(10, 3)),
+        makeDonorShard(ShardId("s2"), DonorStateEnum::kDonating, Timestamp(10, 1))};
+    auto highestMinFetchTimestamp = getHighestMinFetchTimestamp(donorShards);
+    ASSERT_EQ(Timestamp(10, 3), highestMinFetchTimestamp);
+}
 
 // Validate resharded chunks tests.
 
@@ -460,7 +488,7 @@ TEST_F(ReshardingAggTest, OplogPipelineBasicCRUDOnly) {
     expCtx->ns = localOplogBufferNss();
     expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(mockResults);
 
-    auto pipeline = createAggForReshardingOplogBuffer(expCtx, boost::none);
+    auto pipeline = createAggForReshardingOplogBuffer(expCtx, boost::none, false);
 
     // Mock non-lookup collection document source.
     auto mockSource = DocumentSourceMock::createForTest(mockResults, expCtx);
@@ -496,7 +524,7 @@ TEST_F(ReshardingAggTest, OplogPipelineWithResumeToken) {
     expCtx->ns = localOplogBufferNss();
     expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(mockResults);
 
-    auto pipeline = createAggForReshardingOplogBuffer(expCtx, getOplogId(insertOplog));
+    auto pipeline = createAggForReshardingOplogBuffer(expCtx, getOplogId(insertOplog), false);
 
     // Mock non-lookup collection document source.
     auto mockSource = DocumentSourceMock::createForTest(mockResults, expCtx);
@@ -538,7 +566,7 @@ TEST_F(ReshardingAggTest, OplogPipelineWithResumeTokenClusterTimeNotEqualTs) {
     expCtx->ns = localOplogBufferNss();
     expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(mockResults);
 
-    auto pipeline = createAggForReshardingOplogBuffer(expCtx, getOplogId(insertOplog));
+    auto pipeline = createAggForReshardingOplogBuffer(expCtx, getOplogId(insertOplog), false);
 
     // Mock non-lookup collection document source.
     auto mockSource = DocumentSourceMock::createForTest(mockResults, expCtx);
@@ -569,7 +597,7 @@ TEST_F(ReshardingAggTest, OplogPipelineWithPostImage) {
     expCtx->ns = localOplogBufferNss();
     expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(mockResults);
 
-    auto pipeline = createAggForReshardingOplogBuffer(expCtx, boost::none);
+    auto pipeline = createAggForReshardingOplogBuffer(expCtx, boost::none, false);
 
     // Mock non-lookup collection document source.
     auto mockSource = DocumentSourceMock::createForTest(mockResults, expCtx);
@@ -610,7 +638,7 @@ TEST_F(ReshardingAggTest, OplogPipelineWithLargeBSONPostImage) {
     expCtx->ns = localOplogBufferNss();
     expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(mockResults);
 
-    auto pipeline = createAggForReshardingOplogBuffer(expCtx, boost::none);
+    auto pipeline = createAggForReshardingOplogBuffer(expCtx, boost::none, false);
 
     // Mock non-lookup collection document source.
     auto mockSource = DocumentSourceMock::createForTest(mockResults, expCtx);
@@ -651,7 +679,7 @@ TEST_F(ReshardingAggTest, OplogPipelineResumeAfterPostImage) {
     expCtx->ns = localOplogBufferNss();
     expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(mockResults);
 
-    auto pipeline = createAggForReshardingOplogBuffer(expCtx, getOplogId(postImageOplog));
+    auto pipeline = createAggForReshardingOplogBuffer(expCtx, getOplogId(postImageOplog), false);
 
     // Mock non-lookup collection document source.
     auto mockSource = DocumentSourceMock::createForTest(mockResults, expCtx);
@@ -683,7 +711,7 @@ TEST_F(ReshardingAggTest, OplogPipelineWithPreImage) {
     expCtx->ns = localOplogBufferNss();
     expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(mockResults);
 
-    auto pipeline = createAggForReshardingOplogBuffer(expCtx, boost::none);
+    auto pipeline = createAggForReshardingOplogBuffer(expCtx, boost::none, false);
 
     // Mock non-lookup collection document source.
     auto mockSource = DocumentSourceMock::createForTest(mockResults, expCtx);
@@ -724,7 +752,7 @@ TEST_F(ReshardingAggTest, OplogPipelineWithPreAndPostImage) {
     expCtx->ns = localOplogBufferNss();
     expCtx->mongoProcessInterface = std::make_shared<MockMongoInterface>(mockResults);
 
-    auto pipeline = createAggForReshardingOplogBuffer(expCtx, boost::none);
+    auto pipeline = createAggForReshardingOplogBuffer(expCtx, boost::none, false);
 
     // Mock non-lookup collection document source.
     auto mockSource = DocumentSourceMock::createForTest(mockResults, expCtx);
@@ -1071,7 +1099,9 @@ class ReshardingTxnCloningPipelineTest : public AggregationContextFixture {
 
 protected:
     std::pair<std::deque<DocumentSource::GetNextResult>, std::deque<SessionTxnRecord>>
-    makeTransactions(size_t numTransactions, std::function<Timestamp(size_t)> getTimestamp) {
+    makeTransactions(size_t numTransactions,
+                     std::function<Timestamp(size_t)> getTimestamp,
+                     bool includeMultiDocTransaction = false) {
         std::deque<DocumentSource::GetNextResult> mockResults;
         std::deque<SessionTxnRecord>
             expectedTransactions;  // this will hold the expected result for this test
@@ -1080,6 +1110,14 @@ protected:
                 makeLogicalSessionIdForTest(), 0, repl::OpTime(getTimestamp(i), 0), Date_t());
             mockResults.emplace_back(Document(transaction.toBSON()));
             expectedTransactions.emplace_back(transaction);
+        }
+        if (includeMultiDocTransaction) {
+            auto transaction = SessionTxnRecord(makeLogicalSessionIdForTest(),
+                                                0,
+                                                repl::OpTime(getTimestamp(numTransactions), 0),
+                                                Date_t());
+            transaction.setState(DurableTxnStateEnum::kInProgress);
+            mockResults.emplace_back(Document(transaction.toBSON()));
         }
         std::sort(expectedTransactions.begin(),
                   expectedTransactions.end(),
@@ -1160,6 +1198,15 @@ TEST_F(ReshardingTxnCloningPipelineTest, TxnPipelineAfterID) {
     expectedTransactions.erase(expectedTransactions.begin(), middleTransaction + 1);
 
     auto pipeline = constructPipeline(mockResults, Timestamp::max(), middleTransactionSessionId);
+
+    ASSERT(pipelineMatchesDeque(pipeline, expectedTransactions));
+}
+
+TEST_F(ReshardingTxnCloningPipelineTest, TxnPipelineOnlyRetryableWrites) {
+    auto [mockResults, expectedTransactions] =
+        makeTransactions(10, [](size_t) { return Timestamp::min(); }, true);
+
+    auto pipeline = constructPipeline(mockResults, Timestamp::max(), boost::none);
 
     ASSERT(pipelineMatchesDeque(pipeline, expectedTransactions));
 }

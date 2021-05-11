@@ -154,6 +154,15 @@ public:
                                     const std::vector<std::string>& filter);
 
     /**
+     * Creates an import configuration string suitable for the 'config' parameter in
+     * WT_SESSION::create() given the storage engines metadata retrieved during the export.
+     *
+     * Returns the FailedToParse status if the storage engine metadata object is malformed.
+     */
+    static StatusWith<std::string> generateImportString(const StringData& ident,
+                                                        const BSONObj& storageMetadata);
+
+    /**
      * Appends information about the storage engine's currently available snapshots and the settings
      * that affect that window of maintained history.
      *
@@ -219,6 +228,12 @@ public:
                                                   int statisticsKey);
 
     static int64_t getIdentSize(WT_SESSION* s, const std::string& uri);
+
+    /**
+     * Returns the bytes available for reuse for an ident. This is the amount of allocated space on
+     * disk that is not storing any data.
+     */
+    static int64_t getIdentReuseSize(WT_SESSION* s, const std::string& uri);
 
 
     /**

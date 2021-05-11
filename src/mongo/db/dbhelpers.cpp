@@ -44,7 +44,6 @@
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_request.h"
-#include "mongo/db/ops/update_result.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/query/query_planner.h"
@@ -61,7 +60,7 @@ using std::unique_ptr;
    set your db SavedContext first
 */
 bool Helpers::findOne(OperationContext* opCtx,
-                      const Collection* collection,
+                      const CollectionPtr& collection,
                       const BSONObj& query,
                       BSONObj& result,
                       bool requireIndex) {
@@ -76,7 +75,7 @@ bool Helpers::findOne(OperationContext* opCtx,
    set your db SavedContext first
 */
 RecordId Helpers::findOne(OperationContext* opCtx,
-                          const Collection* collection,
+                          const CollectionPtr& collection,
                           const BSONObj& query,
                           bool requireIndex) {
     if (!collection)
@@ -88,7 +87,7 @@ RecordId Helpers::findOne(OperationContext* opCtx,
 }
 
 RecordId Helpers::findOne(OperationContext* opCtx,
-                          const Collection* collection,
+                          const CollectionPtr& collection,
                           std::unique_ptr<QueryRequest> qr,
                           bool requireIndex) {
     if (!collection)
@@ -109,7 +108,7 @@ RecordId Helpers::findOne(OperationContext* opCtx,
 
     size_t options = requireIndex ? QueryPlannerParams::NO_TABLE_SCAN : QueryPlannerParams::DEFAULT;
     auto exec = uassertStatusOK(getExecutor(
-        opCtx, collection, std::move(cq), PlanYieldPolicy::YieldPolicy::NO_YIELD, options));
+        opCtx, &collection, std::move(cq), PlanYieldPolicy::YieldPolicy::NO_YIELD, options));
 
     PlanExecutor::ExecState state;
     BSONObj obj;
@@ -130,7 +129,7 @@ bool Helpers::findById(OperationContext* opCtx,
     invariant(database);
 
     // TODO ForRead?
-    const Collection* collection =
+    CollectionPtr collection =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, NamespaceString(ns));
     if (!collection) {
         return false;
@@ -156,7 +155,7 @@ bool Helpers::findById(OperationContext* opCtx,
 }
 
 RecordId Helpers::findById(OperationContext* opCtx,
-                           const Collection* collection,
+                           const CollectionPtr& collection,
                            const BSONObj& idquery) {
     verify(collection);
     const IndexCatalog* catalog = collection->getIndexCatalog();
@@ -167,10 +166,11 @@ RecordId Helpers::findById(OperationContext* opCtx,
 
 // Acquires necessary locks to read the collection with the given namespace. If this is an oplog
 // read, use AutoGetOplog for simplified locking.
-const Collection* getCollectionForRead(OperationContext* opCtx,
-                                       const NamespaceString& ns,
-                                       boost::optional<AutoGetCollectionForReadCommand>& autoColl,
-                                       boost::optional<AutoGetOplog>& autoOplog) {
+const CollectionPtr& getCollectionForRead(
+    OperationContext* opCtx,
+    const NamespaceString& ns,
+    boost::optional<AutoGetCollectionForReadCommand>& autoColl,
+    boost::optional<AutoGetOplog>& autoOplog) {
     if (ns.isOplog()) {
         // Simplify locking rules for oplog collection.
         autoOplog.emplace(opCtx, OplogAccessMode::kRead);
@@ -184,10 +184,10 @@ const Collection* getCollectionForRead(OperationContext* opCtx,
 bool Helpers::getSingleton(OperationContext* opCtx, const char* ns, BSONObj& result) {
     boost::optional<AutoGetCollectionForReadCommand> autoColl;
     boost::optional<AutoGetOplog> autoOplog;
-    auto collection = getCollectionForRead(opCtx, NamespaceString(ns), autoColl, autoOplog);
+    const auto& collection = getCollectionForRead(opCtx, NamespaceString(ns), autoColl, autoOplog);
 
     auto exec = InternalPlanner::collectionScan(
-        opCtx, ns, collection, PlanYieldPolicy::YieldPolicy::NO_YIELD);
+        opCtx, ns, &collection, PlanYieldPolicy::YieldPolicy::NO_YIELD);
     PlanExecutor::ExecState state = exec->getNext(&result, nullptr);
 
     CurOp::get(opCtx)->done();
@@ -206,10 +206,10 @@ bool Helpers::getSingleton(OperationContext* opCtx, const char* ns, BSONObj& res
 bool Helpers::getLast(OperationContext* opCtx, const char* ns, BSONObj& result) {
     boost::optional<AutoGetCollectionForReadCommand> autoColl;
     boost::optional<AutoGetOplog> autoOplog;
-    auto collection = getCollectionForRead(opCtx, NamespaceString(ns), autoColl, autoOplog);
+    const auto& collection = getCollectionForRead(opCtx, NamespaceString(ns), autoColl, autoOplog);
 
     auto exec = InternalPlanner::collectionScan(
-        opCtx, ns, collection, PlanYieldPolicy::YieldPolicy::NO_YIELD, InternalPlanner::BACKWARD);
+        opCtx, ns, &collection, PlanYieldPolicy::YieldPolicy::NO_YIELD, InternalPlanner::BACKWARD);
     PlanExecutor::ExecState state = exec->getNext(&result, nullptr);
 
     // Non-yielding collection scans from InternalPlanner will never error.
@@ -223,21 +223,21 @@ bool Helpers::getLast(OperationContext* opCtx, const char* ns, BSONObj& result) 
     return false;
 }
 
-void Helpers::upsert(OperationContext* opCtx,
-                     const string& ns,
-                     const BSONObj& o,
-                     bool fromMigrate) {
+UpdateResult Helpers::upsert(OperationContext* opCtx,
+                             const string& ns,
+                             const BSONObj& o,
+                             bool fromMigrate) {
     BSONElement e = o["_id"];
     verify(e.type());
     BSONObj id = e.wrap();
-    upsert(opCtx, ns, id, o, fromMigrate);
+    return upsert(opCtx, ns, id, o, fromMigrate);
 }
 
-void Helpers::upsert(OperationContext* opCtx,
-                     const string& ns,
-                     const BSONObj& filter,
-                     const BSONObj& updateMod,
-                     bool fromMigrate) {
+UpdateResult Helpers::upsert(OperationContext* opCtx,
+                             const string& ns,
+                             const BSONObj& filter,
+                             const BSONObj& updateMod,
+                             bool fromMigrate) {
     OldClientContext context(opCtx, ns);
 
     const NamespaceString requestNs(ns);
@@ -250,7 +250,7 @@ void Helpers::upsert(OperationContext* opCtx,
     request.setFromMigration(fromMigrate);
     request.setYieldPolicy(PlanYieldPolicy::YieldPolicy::NO_YIELD);
 
-    ::mongo::update(opCtx, context.db(), request);
+    return ::mongo::update(opCtx, context.db(), request);
 }
 
 void Helpers::update(OperationContext* opCtx,
@@ -306,7 +306,7 @@ BSONObj Helpers::inferKeyPattern(const BSONObj& o) {
 void Helpers::emptyCollection(OperationContext* opCtx, const NamespaceString& nss) {
     OldClientContext context(opCtx, nss.ns());
     repl::UnreplicatedWritesBlock uwb(opCtx);
-    const Collection* collection = context.db()
+    CollectionPtr collection = context.db()
         ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)
         : nullptr;
     deleteObjects(opCtx, collection, nss, BSONObj(), false);

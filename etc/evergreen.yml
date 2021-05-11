@@ -194,6 +194,9 @@ variables:
   setup_task:
   - func: "apply compile expansions"
   - func: "set task expansion macros"
+    # NOTE: To disable the compile bypass feature, comment out the next line.
+  - func: "bypass compile and fetch binaries"
+  - func: "update bypass expansions"
   teardown_task:
   - func: "attach scons logs"
   - func: "attach report"
@@ -239,7 +242,6 @@ variables:
   setup_group:
   - func: "kill processes"
   - func: "cleanup environment"
-  - func: "clear OOM messages"
   - command: manifest.load
   - func: "git get project"
   - func: "get all modified patch files"
@@ -249,9 +251,6 @@ variables:
   - func: "set up virtualenv"
   - func: "upload pip requirements"
   - func: "configure evergreen api credentials"
-  # NOTE: To disable the compile bypass feature, comment out the next line.
-  - func: "bypass compile and fetch binaries"
-  - func: "update bypass expansions"
   - func: "get buildnumber"
   - func: "set up credentials"
   - func: "use WiredTiger develop" # noop if ${use_wt_develop} is not "true"
@@ -259,7 +258,6 @@ variables:
   - func: "generate compile expansions"
   teardown_group:
   - func: "umount shared scons directory"
-  - func: "print OOM messages"
   - func: "cleanup environment"
   timeout:
   - func: "run hang analyzer"
@@ -768,12 +766,12 @@ functions:
         set -o errexit
 
         cat <<EOF > notary_env.sh
-        export NOTARY_TOKEN=${signing_auth_token_48}
+        export NOTARY_TOKEN=${signing_auth_token_49}
         export BARQUE_USERNAME=${barque_user}
         export BARQUE_API_KEY=${barque_api_key}
         EOF
 
-        echo "${signing_auth_token_48}" > signing_auth_token
+        echo "${signing_auth_token_49}" > signing_auth_token
 
   "set up remote credentials": &set_up_remote_credentials
     command: shell.exec
@@ -850,7 +848,6 @@ functions:
   "upload debugsymbols": &upload_debugsymbols
     command: s3.put
     params:
-      optional: true
       aws_key: ${aws_key}
       aws_secret: ${aws_secret}
       local_file: src/mongo-debugsymbols.${ext|tgz}
@@ -1034,6 +1031,7 @@ functions:
         $python buildscripts/evergreen_resmoke_job_count.py \
           --taskName ${task_name}                           \
           --buildVariant ${build_variant}                   \
+          --distro ${distro_id}                             \
           --jobFactor ${resmoke_jobs_factor|1}              \
           --jobsMax ${resmoke_jobs_max|0}                   \
           --outFile resmoke_jobs_expansion.yml
@@ -1202,7 +1200,7 @@ functions:
 
           python_loc=$(which ${python|/opt/mongodbtoolchain/v3/bin/python3})
           venv_dir="${workdir}/venv"
-          if command -V cygpath; then
+          if which cygpath; then
             # Sad note: We have to use the Windows path instead of the posix path here.
             # Otherwise, virtualenv may mistakenly resolve paths relative to c:\cygdrive.
             # Creating a virtualenv in cygwin with 'python -m venv', will not work correctly
@@ -1358,7 +1356,7 @@ functions:
           --edition $edition                                 \
           --platform $platform                               \
           --architecture $architecture                       \
-          --useLatest 4.4
+          --useLatest 4.4 4.7 4.8
 
   "execute resmoke tests": &execute_resmoke_tests
     command: shell.exec
@@ -1814,7 +1812,7 @@ functions:
 
           ${activate_virtualenv}
           export MYPY="$(
-            if command -V cygpath 2>/dev/null; then
+            if which cygpath 2>/dev/null; then
                 PATH+=":$(cypath "${workdir}")/venv_3/Scripts"
             else
                 PATH+=":${workdir}/venv_3/bin"
@@ -2337,7 +2335,8 @@ functions:
         local_file: jstests.tgz
         remote_file: ${project}/${build_variant}/${revision}/jstestfuzz/${task_id}-${execution}.tgz
         bucket: mciuploads
-        permissions: public-read
+        permissions: private
+        visibility: signed
         content_type: ${content_type|application/gzip}
         display_name: Generated Tests - Execution ${execution}
 
@@ -2751,6 +2750,11 @@ functions:
       working_dir: src
       script: |
        set -o verbose
+
+       if [ -z "${instance_id}" ]; then
+        exit 0
+       fi
+
        ${activate_virtualenv}
         $python buildscripts/powercycle_operations.py tarEC2Artifacts
 
@@ -2760,6 +2764,10 @@ functions:
       shell: bash
       working_dir: src
       script: |
+        if [ -z "${instance_id}" ]; then
+          exit 0
+        fi
+
         ${activate_virtualenv}
         $python buildscripts/powercycle_operations.py copyEC2Artifacts
 
@@ -2789,6 +2797,10 @@ functions:
       shell: bash
       working_dir: src
       script: |
+        if [ -z "${instance_id}" ]; then
+          exit 0
+        fi
+
         ${activate_virtualenv}
         $python buildscripts/powercycle_operations.py gatherRemoteEventLogs
 
@@ -2798,6 +2810,10 @@ functions:
       shell: bash
       working_dir: "src"
       script: |
+        if [ -z "${instance_id}" ]; then
+          exit 0
+        fi
+
         ${activate_virtualenv}
         $python buildscripts/powercycle_operations.py gatherRemoteMongoCoredumps
 
@@ -2807,6 +2823,10 @@ functions:
       shell: bash
       working_dir: "src"
       script: |
+        if [ -z "${instance_id}" ]; then
+          exit 0
+        fi
+
         ${activate_virtualenv}
         $python buildscripts/powercycle_operations.py copyRemoteMongoCoredumps
 
@@ -2900,50 +2920,6 @@ functions:
   "save local client logs":
     - *tar_local_client_logs
     - *archive_local_client_logs
-
-  ### Clear and print OOM messages ###
-  "clear OOM messages":
-      command: shell.exec
-      params:
-        system_log: true
-        script: |
-
-          ulimit -a
-          # Clear the dmesg ring buffer. The "post" phase will check dmesg for OOM messages.
-          ${set_sudo}
-          $sudo dmesg -c > /dev/null 2>&1
-          if [ $? -eq 0 ]; then
-            echo "Cleared the dmesg ring buffer"
-          else
-            echo "Could not clear the dmesg ring buffer"
-          fi
-
-  "print OOM messages":
-    # Print out any Out of Memory killed process messages.
-    command: shell.exec
-    params:
-      system_log: true
-      working_dir: src # Temporary files created in src will be cleaned up in "pre".
-      script: |
-        ${set_sudo}
-        # Use dmesg -T option, if supported, to display timestamps.
-        dmesg=dmesg
-        $sudo dmesg -T > /dev/null 2>&1
-        if [ $? -eq 0 ]; then
-          dmesg="dmesg -T"
-        fi
-        $sudo $dmesg 2> /dev/null > dmesg.txt
-        if [ $? -ne 0 ]; then
-          echo "Cannot check for OOM (Out of memory) killed processes on this platform"
-          exit 0
-        fi
-        grep -iE '(Out of memory|OOM[- ]killer|Killed process)' dmesg.txt > oom.txt
-        if [ -s oom.txt ]; then
-          echo "OOM (Out of memory) killed processes detected"
-          cat oom.txt
-        else
-          echo "No OOM (Out of memory) killed processes detected"
-        fi
 
   ### Cleanup after the watchdog FUSE testing ###
   "cleanup FUSE watchdog":
@@ -3459,7 +3435,6 @@ pre:
   - func: "kill processes"
   - func: "cleanup environment"
   - func: "set task expansion macros"
-  - func: "clear OOM messages"
 
 # Post task steps
 post:
@@ -3478,7 +3453,6 @@ post:
   - func: "save disk statistics"
   - func: "save system resource information"
   - func: "save UndoDB recordings"
-  - func: "print OOM messages"
   - func: "umount shared scons directory"
   - func: "cleanup FUSE watchdog"
   - func: "cleanup environment"
@@ -3574,7 +3548,8 @@ tasks:
         local_file: artifacts.tgz
         remote_file: ${project}/${build_variant}/${revision}/artifacts/${build_id}.tgz
         bucket: mciuploads
-        permissions: public-read
+        permissions: private
+        visibility: signed
         content_type: application/tar
         display_name: Artifacts
 
@@ -3594,7 +3569,7 @@ tasks:
         task_install_action:
             default
         task_compile_flags: >-
-          --ninja=next
+          --ninja
         targets:
           build.ninja
     - command: shell.exec
@@ -3647,7 +3622,7 @@ tasks:
           # This could probably be accelerated with gnu parallel
           /opt/mongodbtoolchain/v3/bin/clang-tidy \
             -p ./compile_commands.json \
-            --checks="-*,bugprone-unused-raii,bugprone-use-after-move" \
+            --checks="-*,bugprone-unused-raii,bugprone-use-after-move,readability-const-return-type,readability-avoid-const-params-in-decls" \
             -warnings-as-errors="*" \
             $(jq -r '.[] | .file' compile_commands.json | \
             grep src/mongo | \
@@ -3685,7 +3660,8 @@ tasks:
         local_file: "src/fuzzertests-runtime.tgz"
         remote_file: "${project}/libfuzzer-tests/${build_variant}/${revision}/libfuzzer-tests.tgz"
         bucket: mciuploads
-        permissions: public-read
+        permissions: private
+        visibility: signed
         content_type: application/tar
         display_name: "LibFuzzer Tests"
 
@@ -4305,6 +4281,17 @@ tasks:
   - func: "run tests"
     vars:
       resmoke_args: --suites=benchmarks_sharding
+      resmoke_jobs_max: 1
+  - func: "send benchmark results"
+
+- <<: *benchmark_template
+  name: benchmarks_cst
+  tags: ["benchmarks"]
+  commands:
+  - func: "do benchmark setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=benchmarks_cst
       resmoke_jobs_max: 1
   - func: "send benchmark results"
 
@@ -5905,7 +5892,7 @@ tasks:
       fallback_num_sub_suites: 1
 
 - name: causally_consistent_hedged_reads_jscore_passthrough_gen
-  tags: ["causally_consistent"]
+  tags: ["causally_consistent", "sharding", "jscore"]
   depends_on:
     - name: jsCore
   commands:
@@ -6015,7 +6002,7 @@ tasks:
 
 - <<: *task_template
   name: replica_sets_multi_stmt_txn_kill_primary_jscore_passthrough
-  tags: ["replica_sets", "non_maj_read"]
+  tags: ["replica_sets", "non_maj_read", "non_live_record"]
   depends_on:
   - name: jsCore
   commands:
@@ -6070,7 +6057,7 @@ tasks:
 
 - <<: *task_template
   name: replica_sets_kill_primary_jscore_passthrough
-  tags: ["replica_sets", "large", "non_maj_read"]
+  tags: ["replica_sets", "large", "non_maj_read", "non_live_record"]
   depends_on:
   - name: jsCore
   commands:
@@ -6092,7 +6079,7 @@ tasks:
 
 - <<: *task_template
   name: replica_sets_kill_secondaries_jscore_passthrough
-  tags: ["replica_sets", "san", "large"]
+  tags: ["replica_sets", "san", "large", "non_live_record"]
   depends_on:
   - name: jsCore
   commands:
@@ -6103,7 +6090,7 @@ tasks:
 
 - <<: *task_template
   name: mongosTest
-  tags: ["misc_js", "non_read_maj"]
+  tags: ["misc_js", "non_read_maj", "non_live_record"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6144,6 +6131,16 @@ tasks:
       resmoke_args: --storageEngine=wiredTiger
       use_large_distro: "true"
       fallback_num_sub_suites: 12
+
+# Only run hot_backups tests for hot_backups variant.
+- name: noPassthroughHotBackups_gen
+  commands:
+    - func: "generate resmoke tasks"
+      vars:
+        suite: no_passthrough
+        resmoke_args: --storageEngine=wiredTiger src/mongo/db/modules/*/jstests/hot_backups/*.js
+        use_large_distro: "true"
+        fallback_num_sub_suites: 12
 
 - name: noPassthroughWithMongod_gen
   tags: ["misc_js"]
@@ -6399,7 +6396,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_replication_causal_consistency
-  tags: ["concurrency", "repl", "large"]
+  tags: ["concurrency", "repl", "large", "non_live_record"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6529,7 +6526,7 @@ tasks:
       resmoke_jobs_max: 1
 
 - name: concurrency_sharded_causal_consistency_gen
-  tags: ["concurrency"]
+  tags: ["concurrency", "non_live_record"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -6540,7 +6537,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_causal_consistency_and_balancer
-  tags: ["concurrency", "large"]
+  tags: ["concurrency", "large", "non_live_record"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6840,38 +6837,15 @@ tasks:
       fallback_num_sub_suites: 15
 
 - <<: *task_template
-  name: replica_sets_multiversion
+  name: replica_sets_multiversion_gen
   tags: ["random_multiversion_ds"]
   commands:
-  - func: "git get project"
-  - func: "do setup"
-  - func: "do multiversion setup"
-  - command: shell.exec
-    params:
-      working_dir: src
-      script: |
-        set -o errexit
-        set -o verbose
-
-        ${activate_virtualenv}
-        $python buildscripts/evergreen_gen_multiversion_tests.py generate-exclude-tags --task-path-suffix=/data/multiversion --output=multiversion_exclude_tags.yml
-
-  - command: s3.put
-    params:
-      aws_key: ${aws_key}
-      aws_secret: ${aws_secret}
-      local_file: multiversion_exclude_tags.yml
-      remote_file: ${project}/${build_variant}/${revision}/exclude_tags/${task_name}-${build_id}.tgz
-      bucket: mciuploads
-      permissions: public-read
-      content_type: atext-plain
-      display_name: Multiversion Exclude Tags - Execution ${execution}
-      optional: true
-
-  - func: "run tests"
+  - func: "generate randomized multiversion tasks"
     vars:
-      task_path_suffix: /data/multiversion
-      resmoke_args: --suites=replica_sets_multiversion --storageEngine=wiredTiger
+      resmoke_args: --storageEngine=wiredTiger --tagFile=generated_resmoke_config/multiversion_exclude_tags.yml
+      fallback_num_sub_suites: 8
+      use_multiversion: /data/multiversion
+      suite: replica_sets_multiversion
 
 - <<: *task_template
   name: sasl
@@ -6929,7 +6903,7 @@ tasks:
       fallback_num_sub_suites: 32
 
 - name: sharding_csrs_continuous_config_stepdown_gen
-  tags: ["sharding", "common", "csrs"]
+  tags: ["sharding", "common", "csrs", "non_live_record"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -6976,7 +6950,7 @@ tasks:
       fallback_num_sub_suites: 31
 
 - name: sharding_auth_audit_gen
-  tags: ["auth", "audit"]
+  tags: ["auth", "audit", "non_live_record"]
   depends_on:
   - name: sharding_auth_gen
   commands:
@@ -7518,6 +7492,39 @@ tasks:
   - func: "do setup"
   - func: "run idl tests"
 
+- name: blackduck_scanner
+  patchable: false
+  commands:
+  - func: "do non-compile setup"
+  - command: shell.exec
+    type: setup
+    params:
+      working_dir: src
+      silent: true
+      script: |
+        # Create the Evergreen API credentials
+        cat > .restconfig.json <<END_OF_CREDS
+        {
+        "baseurl": "${blackduck_url}",
+        "username": "${blackduck_username}",
+        "password": "${blackduck_password}",
+        "debug": false,
+        "insecure" : false
+        }
+        END_OF_CREDS
+  - command: shell.exec
+    type: test
+    params:
+      working_dir: src/
+      script: |
+        set -o errexit
+        set -o verbose
+
+        # activate the virtualenv if it has been set up
+        ${activate_virtualenv}
+
+        python buildscripts/blackduck_hub.py -v scan_and_report --build_logger=mci.buildlogger --build_logger_task_id=${task_id} --report_file=report.json
+
 - name: tla_plus
   commands:
   - func: "do non-compile setup"
@@ -7823,7 +7830,7 @@ tasks:
           mv distsrc.${ext|tgz} mongodb-src-${src_suffix}.${ext|tar.gz} || true
           /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-${push_name}-${push_arch}-${suffix}.msi || true
 
-          /usr/local/bin/notary-client.py --key-name "server-4.8" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz} mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+          /usr/local/bin/notary-client.py --key-name "server-4.9" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz} mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}
 
     # Put the binaries tarball/zipfile
     - command: s3.put
@@ -8661,7 +8668,7 @@ buildvariants:
     scons_cache_mode: all
     test_flags: --excludeWithAnyTags=requires_http_client
     target_resmoke_time: 15
-    max_sub_suites: 3
+    max_sub_suites: 5
     num_scons_link_jobs_available: 0.99
   tasks:
   - name: compile_parallel_TG
@@ -9182,7 +9189,7 @@ buildvariants:
   - name: .integration !.audit
     distros:
     - ubuntu1804-zseries-build
-  - name: .jscore .common !.auth !.sbe
+  - name: .jscore .common !.auth
   - name: jsCore_op_query
   - name: .read_write_concern
   - name: replica_sets
@@ -9551,7 +9558,7 @@ buildvariants:
     push_name: linux
     push_arch: x86_64-amazon2
     compile_flags: --ssl MONGO_DISTMOD=amazon2 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-    multiversion_platform: amazon
+    multiversion_platform: amazon2
     multiversion_edition: targeted
     has_packages: true
     packager_script: packager.py
@@ -9602,6 +9609,16 @@ buildvariants:
   stepback: false
   tasks:
   - name: lint_fuzzer_sanity_all
+
+- name: security-daily-cron
+  modules:
+  - enterprise
+  display_name: "~ Security Daily Cron"
+  run_on:
+  - rhel80-small
+  stepback: false
+  tasks:
+  - name: blackduck_scanner
 
 ###########################################
 #         Windows buildvariants           #
@@ -9689,7 +9706,7 @@ buildvariants:
     multiversion_edition: enterprise
     jstestfuzz_num_generated_files: 35
     target_resmoke_time: 20
-    max_sub_suites: 3
+    max_sub_suites: 5
     large_distro_name: windows-64-vs2019-large
     push_path: windows
     push_bucket: downloads.10gen.com
@@ -9699,8 +9716,8 @@ buildvariants:
   - name: compile_TG
     distros:
     - windows-64-vs2019-large
-  - name: burn_in_tests_gen
-  - name: buildscripts_test
+  # - name: burn_in_tests_gen
+  # - name: buildscripts_test
   - name: noPassthrough_gen
   - name: server_discovery_and_monitoring_json_test_TG
   - name: server_selection_json_test_TG
@@ -10213,7 +10230,7 @@ buildvariants:
     jstestfuzz_num_generated_files: 40
     jstestfuzz_concurrent_num_files: 10
     target_resmoke_time: 10
-    max_sub_suites: 3
+    max_sub_suites: 5
     large_distro_name: rhel62-large
     burn_in_tag_buildvariants: enterprise-rhel-62-64-bit-majority-read-concern-off enterprise-rhel-62-64-bit-inmem linux-64-duroff enterprise-rhel-62-64-bit-multiversion
     num_scons_link_jobs_available: 0.99
@@ -10266,6 +10283,112 @@ buildvariants:
   - name: .jstestfuzz !.flow_control  # Flow control jstestfuzz take longer.
   - name: libunwind_tests
   - name: multiversion_sanity_check_gen
+  - name: mqlrun
+  - name: .multi_shard
+  - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
+  - name: tenant_migration_jscore_passthrough_gen
+  - name: multiversion_gen
+  - name: .query_fuzzer
+  - name: .random_multiversion_ds
+  - name: .read_write_concern .large
+    distros:
+    - rhel62-large
+  - name: .read_write_concern !.large
+  - name: .replica_sets !.encrypt !.auth
+    distros:
+    - rhel62-large
+  - name: replica_sets_reconfig_jscore_passthrough_gen
+  - name: replica_sets_reconfig_jscore_stepdown_passthrough
+    distros:
+    - rhel62-large
+  - name: replica_sets_reconfig_kill_primary_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: retryable_writes_jscore_passthrough_gen
+  - name: retryable_writes_jscore_stepdown_passthrough
+    distros:
+    - rhel62-large
+  - name: .read_only
+  - name: .rollbackfuzzer
+  - name: sasl
+  - name: search
+  - name: search_auth
+  - name: search_ssl
+  - name: session_jscore_passthrough
+  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
+  - name: .sharding .txns
+  - name: .sharding .common
+  - name: snmp
+  - name: .stitch
+  - name: .updatefuzzer
+  - name: secondary_reads_passthrough_gen
+  - name: server_discovery_and_monitoring_json_test_TG
+  - name: server_selection_json_test_TG
+    distros:
+    - rhel62-large
+  - name: cst_jscore_passthrough
+
+- name: enterprise-rhel-62-64-bit-dynamic-disabled-feature-flags
+  display_name: "~ Shared Library Enterprise RHEL 6.2 (disabled feature flags)"
+  batchtime: 60 # 1 hour
+  stepback: false
+  modules:
+  - enterprise
+  run_on:
+  - rhel62-small
+  expansions: &enterprise-rhel-62-64-bit-dynamic-disabled-feature-flags-expansions
+    additional_package_targets: archive-mongocryptd archive-mongocryptd-debug archive-mh archive-mh-debug
+    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --link-model=dynamic
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
+    has_packages: false
+    scons_cache_scope: shared
+    scons_cache_mode: all
+    jstestfuzz_num_generated_files: 40
+    jstestfuzz_concurrent_num_files: 10
+    target_resmoke_time: 10
+    max_sub_suites: 5
+    large_distro_name: rhel62-large
+    burn_in_tag_buildvariants: enterprise-rhel-62-64-bit-majority-read-concern-off enterprise-rhel-62-64-bit-inmem linux-64-duroff enterprise-rhel-62-64-bit-multiversion
+    num_scons_link_jobs_available: 0.99
+    test_flags: >-
+        --mongodSetParameters="{featureFlagTimeSeriesCollection: true}"
+  tasks:
+  - name: compile_parallel_TG
+    distros:
+      - rhel62-large
+  - name: unittests_parallel_TG
+    distros:
+      - rhel62-large
+  - name: dbtest_parallel_TG
+    distros:
+    - rhel62-large
+  - name: .aggfuzzer
+  - name: .aggregation
+  - name: audit
+  - name: .auth
+  - name: unittest_shell_hang_analyzer_gen
+  - name: .causally_consistent !.sharding
+  - name: .change_streams
+  - name: .misc_js
+  - name: .concurrency !.large !.ubsan !.no_txns !.debug_only
+  - name: .concurrency .large !.ubsan !.no_txns !.debug_only
+    distros:
+    - rhel62-large
+  - name: disk_wiredtiger
+  - name: .encrypt
+  - name: idl_tests
+  - name: initial_sync_fuzzer_gen
+  - name: .integration
+    distros:
+    - rhel62-large
+  - name: .jscore .common
+  - name: jsCore_minimum_batch_size
+  - name: jsCore_op_query
+  - name: jsCore_txns_large_txns_format
+  - name: jsonSchema
+  - name: .jstestfuzz !.flow_control  # Flow control jstestfuzz take longer.
+  - name: libunwind_tests
   - name: mqlrun
   - name: .multi_shard
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
@@ -10528,7 +10651,7 @@ buildvariants:
   - rhel62-small
   expansions: &enterprise-rhel-62-64-bit-multiversion
     test_flags: >-
-      --excludeWithAnyTags=requires_fcv_47,multiversion_incompatible
+      --excludeWithAnyTags=requires_fcv_47,requires_fcv_48,requires_fcv_49,multiversion_incompatible
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
       --ssl
@@ -10689,8 +10812,33 @@ buildvariants:
   - name: .replica_sets .common
   - name: .concurrency .common !.large
   - name: .concurrency .common .large
+  - name: sharding_jscore_passthrough
     distros:
     - rhel62-large
+
+- name: rhel-62-64-bit-nossl
+  display_name: "RHEL 6.2 Shared Library (No SSL)"
+  run_on:
+  - rhel62-small
+  batchtime: 1440 # 1 day
+  expansions:
+    compile_flags: >-
+      -j$(grep -c ^processor /proc/cpuinfo)
+      --ssl=off
+      --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+      MONGO_DISTMOD=rhel62
+      --link-model=dynamic
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
+    scons_cache_scope: shared
+    build_mongoreplay: false
+    large_distro_name: rhel62-large
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - rhel62-large
+  - name: jsCore
+
 
 - name: enterprise-rhel-62-64-bit-coverage
   display_name: "~ Enterprise RHEL 6.2 DEBUG Code Coverage"
@@ -11013,7 +11161,7 @@ buildvariants:
   tasks:
   - name: compile_all_run_unittests_TG
   - name: jsCore
-  - name: noPassthrough_gen
+  - name: noPassthroughHotBackups_gen
 
 - <<: *enterprise-rhel-70-64-bit-template
   name: enterprise-rhel-70-64-bit-no-libunwind
@@ -11481,7 +11629,7 @@ buildvariants:
   - name: .integration !.audit
     distros:
     - rhel72-zseries-build
-  - name: .jscore .common !.auth !.sbe
+  - name: .jscore .common !.auth
   - name: jsCore_op_query
   - name: .read_write_concern
   - name: replica_sets
@@ -11553,7 +11701,7 @@ buildvariants:
   - name: .integration !.audit !.sharded
     distros:
     - rhel67-zseries-build
-  - name: .jscore .common !.sbe
+  - name: .jscore .common
   - name: jsCore_minimum_batch_size
   - name: replica_sets_jscore_passthrough
   - name: sasl
@@ -11807,7 +11955,7 @@ buildvariants:
   - name: .integration !.audit
     distros:
     - suse12-zseries-build
-  - name: .jscore .common !.auth !.sbe
+  - name: .jscore .common !.auth
   - name: jsCore_op_query
   - name: .read_write_concern
   - name: replica_sets
@@ -12372,7 +12520,7 @@ buildvariants:
   - name: .integration !.audit
     distros:
     - rhel72-zseries-build
-  - name: .jscore .common !.decimal !.sbe
+  - name: .jscore .common !.decimal
   - name: jsCore_op_query
   - name: .read_write_concern !.durable_history
   - name: replica_sets
@@ -12787,7 +12935,7 @@ buildvariants:
 - name: live-record
   display_name: "~ RHEL 6.2 Shared Library (with UndoDB live-record)"
   batchtime: 1440 # 1 day
-  stepback: true
+  stepback: false
   modules:
   - enterprise
   run_on:
@@ -12804,39 +12952,50 @@ buildvariants:
     large_distro_name: rhel62-large
     num_scons_link_jobs_available: 0.99
     record_with: --recordWith /opt/undodb5/bin/live-record
-    exec_timeout_secs: 14400 # 4 hours
-    test_flags: --excludeWithAnyTags=requires_fast_memory
+    resmoke_jobs_factor: 0.3
+    exec_timeout_secs: 28800 # 8 hours
+    test_flags: --excludeWithAnyTags=requires_fast_memory,live_record_incompatible
   tasks:
   - name: compile_without_package_TG
+#  - name: .aggfuzzer
+#  - name: .aggregation
+#  - name: audit
+#  - name: .auth !.multiversion !.non_live_record
+#  - name: .causally_consistent !.sharding
+#  - name: .change_streams
+#  - name: .misc_js !.non_live_record
+#  - name: .concurrency !.ubsan !.no_txns !.debug_only !.stepdowns !.non_live_record
+#  - name: .encrypt
+#  - name: initial_sync_fuzzer_gen
   - name: .jscore .common
-  - name: jsCore_minimum_batch_size
-  - name: jsCore_op_query
-  - name: replica_sets_multi_stmt_txn_jscore_passthrough
-  - name: replica_sets_large_txns_format_jscore_passthrough
-  - name: sharded_collections_causally_consistent_jscore_txns_passthrough
-  - name: sharded_jscore_op_query_txns
-  - name: sharded_jscore_txns
-  - name: sharded_jscore_txns_sharded_collections
-  - name: sharding_jscore_passthrough
-  - name: sharding_jscore_op_query_passthrough
-  - name: aggregation
-  - name: aggregation_auth
-  - name: aggregation_disabled_optimization
-  - name: aggregation_ese
-  - name: aggregation_ese_gcm
-  - name: aggregation_facet_unwind_passthrough
-  - name: aggregation_slot_based_execution
-  - name: .auth .gle
-  - name: .jscore .encrypt
-  - name: noPassthroughWithMongod_gen
-  - name: parallel_compatibility
-  - name: serial_run
-  - name: session_jscore_passthrough
-  - name: .aggfuzzer
-  - name: query_fuzzer_standalone_gen
-  - name: update_fuzzer_gen
-  - name: jstestfuzz_gen
-  - name: jstestfuzz_interrupt_gen
+#  - name: jsCore_minimum_batch_size
+#  - name: jsCore_op_query
+#  - name: jsCore_txns_large_txns_format
+#  - name: jsonSchema
+#  - name: .jstestfuzz !.flow_control !.stepdowns !.causal
+#  - name: multiversion_sanity_check_gen
+#  - name: mqlrun
+#  - name: .multi_shard
+#  - name: tenant_migration_jscore_passthrough_gen
+#  - name: .query_fuzzer
+#  - name: .read_write_concern
+#  - name: .replica_sets !.encrypt !.auth !.non_live_record
+#  - name: replica_sets_reconfig_jscore_passthrough_gen
+#  - name: replica_sets_reconfig_jscore_stepdown_passthrough
+#  - name: retryable_writes_jscore_passthrough_gen
+#  - name: retryable_writes_jscore_stepdown_passthrough
+#  - name: .read_only
+#  - name: .rollbackfuzzer
+#  - name: sasl
+#  - name: search
+#  - name: search_auth
+#  - name: search_ssl
+#  - name: session_jscore_passthrough
+#  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
+#  - name: .sharding .txns
+#  - name: .sharding .common !.non_live_record
+#  - name: snmp
+#  - name: .updatefuzzer
 
 - <<: *enterprise-rhel-62-64-bit-dynamic-required-template
   name: rhel-62-64-bit-dynamic-visibility-test

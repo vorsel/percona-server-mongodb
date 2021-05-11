@@ -48,14 +48,16 @@ namespace {
 
 auto getExpCtx() {
     auto nss = NamespaceString{"db", "coll"};
-    return boost::intrusive_ptr<ExpressionContextForTest>{new ExpressionContextForTest(nss)};
+    return ExpressionContextForTest(nss);
 }
 
 TEST(CstPipelineTranslationTest, AllElementsTrueTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::allElementsTrue,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr =
+        cst_pipeline_translation::translateExpression(cst, &expCtx, expCtx.variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$allElementsTrue: [\"$set\"]}")) ==
                                            expr->serialize(false)));
 }
@@ -63,8 +65,10 @@ TEST(CstPipelineTranslationTest, AllElementsTrueTest) {
 TEST(CstPipelineTranslationTest, AnyElementsTrueTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::anyElementTrue,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr =
+        cst_pipeline_translation::translateExpression(cst, &expCtx, expCtx.variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$anyElementTrue: [\"$set\"]}")) ==
                                            expr->serialize(false)));
 }
@@ -72,9 +76,11 @@ TEST(CstPipelineTranslationTest, AnyElementsTrueTest) {
 TEST(CstPipelineTranslationTest, SetDifferenceTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::setDifference,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set2"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set2"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr =
+        cst_pipeline_translation::translateExpression(cst, &expCtx, expCtx.variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$setDifference: [\"$set\", \"$set2\"]}")) == expr->serialize(false)));
 }
@@ -82,9 +88,11 @@ TEST(CstPipelineTranslationTest, SetDifferenceTest) {
 TEST(CstPipelineTranslationTest, SetEqualsTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::setEquals,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set2"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set2"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr =
+        cst_pipeline_translation::translateExpression(cst, &expCtx, expCtx.variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(Value(fromjson("{$setEquals: [\"$set\", \"$set2\"]}")) ==
                                            expr->serialize(false)));
 }
@@ -92,10 +100,12 @@ TEST(CstPipelineTranslationTest, SetEqualsTest) {
 TEST(CstPipelineTranslationTest, SetIntersectionTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::setIntersection,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set2"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set3"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set2"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set3"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr =
+        cst_pipeline_translation::translateExpression(cst, &expCtx, expCtx.variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$setIntersection: [\"$set\", \"$set2\", \"$set3\"]}")) ==
         expr->serialize(false)));
@@ -104,9 +114,11 @@ TEST(CstPipelineTranslationTest, SetIntersectionTest) {
 TEST(CstPipelineTranslationTest, SetIsSubsetTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::setIsSubset,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set2"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set2"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr =
+        cst_pipeline_translation::translateExpression(cst, &expCtx, expCtx.variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$setIsSubset: [\"$set\", \"$set2\"]}")) == expr->serialize(false)));
 }
@@ -114,10 +126,12 @@ TEST(CstPipelineTranslationTest, SetIsSubsetTest) {
 TEST(CstPipelineTranslationTest, SetUnionTest) {
     const auto cst = CNode{CNode::ObjectChildren{
         {KeyFieldname::setUnion,
-         CNode{CNode::ArrayChildren{CNode{AggregationPath{make_vector<std::string>("set"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set2"s)}},
-                                    CNode{AggregationPath{make_vector<std::string>("set3"s)}}}}}}};
-    auto expr = cst_pipeline_translation::translateExpression(cst, getExpCtx());
+         CNode{CNode::ArrayChildren{CNode{AggregationPath{makeVector<std::string>("set"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set2"s)}},
+                                    CNode{AggregationPath{makeVector<std::string>("set3"s)}}}}}}};
+    auto expCtx = getExpCtx();
+    auto expr =
+        cst_pipeline_translation::translateExpression(cst, &expCtx, expCtx.variablesParseState);
     ASSERT_TRUE(ValueComparator().evaluate(
         Value(fromjson("{$setUnion: [\"$set\", \"$set2\", \"$set3\"]}")) ==
         expr->serialize(false)));

@@ -93,7 +93,8 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
         prevWriteOpTimeInTransaction,  // optime of previous write within same transaction
         boost::none,                   // pre-image optime
         boost::none,                   // post-image optime
-        boost::none);                  // ShardId of resharding recipient
+        boost::none,                   // ShardId of resharding recipient
+        boost::none);                  // _id
 }
 
 class OpObserverMock : public OpObserverNoop {
@@ -2704,7 +2705,7 @@ TEST_F(TransactionsMetricsTest, ReportStashedResources) {
 
     auto sessionCheckout = checkOutSession();
 
-    // Create a ClientMetadata object and set it on ClientMetadataIsMasterState.
+    // Create a ClientMetadata object and set it.
     BSONObjBuilder builder;
     ASSERT_OK(ClientMetadata::serializePrivate("driverName",
                                                "driverVersion",
@@ -2716,9 +2717,7 @@ TEST_F(TransactionsMetricsTest, ReportStashedResources) {
                                                &builder));
     auto obj = builder.obj();
     auto clientMetadata = ClientMetadata::parse(obj["client"]);
-    auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx()->getClient());
-    clientMetadataIsMasterState.setClientMetadata(opCtx()->getClient(),
-                                                  std::move(clientMetadata.getValue()));
+    ClientMetadata::setAndFinalize(opCtx()->getClient(), std::move(clientMetadata.getValue()));
 
     repl::ReadConcernArgs readConcernArgs;
     ASSERT_OK(
@@ -2948,12 +2947,10 @@ BSONObj constructClientMetadata(StringData appName) {
 }  // namespace
 
 TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponStash) {
-    // Create a ClientMetadata object and set it on ClientMetadataIsMasterState.
+    // Create a ClientMetadata object and set it.
     auto obj = constructClientMetadata("appName");
     auto clientMetadata = ClientMetadata::parse(obj["client"]);
-    auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx()->getClient());
-    clientMetadataIsMasterState.setClientMetadata(opCtx()->getClient(),
-                                                  std::move(clientMetadata.getValue()));
+    ClientMetadata::setAndFinalize(opCtx()->getClient(), std::move(clientMetadata.getValue()));
 
     auto sessionCheckout = checkOutSession();
     auto txnParticipant = TransactionParticipant::get(opCtx());
@@ -2972,8 +2969,7 @@ TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponStash) {
     // Create another ClientMetadata object.
     auto newObj = constructClientMetadata("newAppName");
     auto newClientMetadata = ClientMetadata::parse(newObj["client"]);
-    clientMetadataIsMasterState.setClientMetadata(opCtx()->getClient(),
-                                                  std::move(newClientMetadata.getValue()));
+    ClientMetadata::setAndFinalize(opCtx()->getClient(), std::move(newClientMetadata.getValue()));
 
     txnParticipant.unstashTransactionResources(opCtx(), "insert");
     txnParticipant.stashTransactionResources(opCtx());
@@ -2985,12 +2981,10 @@ TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponStash) {
 }
 
 TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponCommit) {
-    // Create a ClientMetadata object and set it on ClientMetadataIsMasterState.
+    // Create a ClientMetadata object and set it.
     auto obj = constructClientMetadata("appName");
     auto clientMetadata = ClientMetadata::parse(obj["client"]);
-    auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx()->getClient());
-    clientMetadataIsMasterState.setClientMetadata(opCtx()->getClient(),
-                                                  std::move(clientMetadata.getValue()));
+    ClientMetadata::setAndFinalize(opCtx()->getClient(), std::move(clientMetadata.getValue()));
 
     auto sessionCheckout = checkOutSession();
     auto txnParticipant = TransactionParticipant::get(opCtx());
@@ -3008,13 +3002,10 @@ TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponCommit) {
 }
 
 TEST_F(TransactionsMetricsTest, LastClientInfoShouldUpdateUponAbort) {
-    // Create a ClientMetadata object and set it on ClientMetadataIsMasterState.
+    // Create a ClientMetadata object and set it.
     auto obj = constructClientMetadata("appName");
     auto clientMetadata = ClientMetadata::parse(obj["client"]);
-
-    auto& clientMetadataIsMasterState = ClientMetadataIsMasterState::get(opCtx()->getClient());
-    clientMetadataIsMasterState.setClientMetadata(opCtx()->getClient(),
-                                                  std::move(clientMetadata.getValue()));
+    ClientMetadata::setAndFinalize(opCtx()->getClient(), std::move(clientMetadata.getValue()));
 
     auto sessionCheckout = checkOutSession();
     auto txnParticipant = TransactionParticipant::get(opCtx());

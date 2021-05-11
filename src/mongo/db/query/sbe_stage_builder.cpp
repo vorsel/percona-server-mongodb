@@ -62,7 +62,7 @@ std::unique_ptr<sbe::RuntimeEnvironment> makeRuntimeEnvironment(
     // Register an unowned global timezone database for datetime expression evaluation.
     env->registerSlot("timeZoneDB"_sd,
                       sbe::value::TypeTags::timeZoneDB,
-                      sbe::value::bitcastFrom(getTimeZoneDatabase(opCtx)),
+                      sbe::value::bitcastFrom<const TimeZoneDatabase*>(getTimeZoneDatabase(opCtx)),
                       false,
                       slotIdGenerator);
     return env;
@@ -102,15 +102,23 @@ std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::buildCollScan(
 std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::buildIndexScan(
     const QuerySolutionNode* root) {
     auto ixn = static_cast<const IndexScanNode*>(root);
-    auto [slot, stage] = generateIndexScan(_opCtx,
-                                           _collection,
-                                           ixn,
-                                           _returnKeySlot,
-                                           &_slotIdGenerator,
-                                           &_spoolIdGenerator,
-                                           _yieldPolicy,
-                                           _data.trialRunProgressTracker.get());
-    _data.recordIdSlot = slot;
+    auto [recordIdSlot, indexKeySlots, stage] =
+        generateIndexScan(_opCtx,
+                          _collection,
+                          ixn,
+                          _returnKeySlot,
+                          _indexKeysToInclude.value_or(sbe::IndexKeysInclusionSet{}),
+                          &_slotIdGenerator,
+                          &_spoolIdGenerator,
+                          _yieldPolicy,
+                          _data.trialRunProgressTracker.get());
+
+    _data.recordIdSlot = recordIdSlot;
+
+    if (_indexKeysToInclude) {
+        _indexKeySlots = std::move(indexKeySlots);
+    }
+
     return std::move(stage);
 }
 
@@ -261,7 +269,8 @@ std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::buildSort(const QuerySolu
                 sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::cmp3w,
                                              sbe::makeE<sbe::EVariable>(innerVar),
                                              sbe::makeE<sbe::EVariable>(resultVar)),
-                sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 0)),
+                sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
+                                           sbe::value::bitcastFrom<int64_t>(0))),
             sbe::makeE<sbe::EVariable>(innerVar),
             sbe::makeE<sbe::EVariable>(resultVar));
 
@@ -324,6 +333,8 @@ std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::buildProjectionSimple(
     sbe::value::SlotMap<std::unique_ptr<sbe::EExpression>> projections;
     sbe::value::SlotVector fieldSlots;
 
+    invariant(_data.resultSlot);
+
     for (const auto& field : pn->proj.getRequiredFields()) {
         fieldSlots.push_back(_slotIdGenerator.generate());
         projections.emplace(
@@ -342,6 +353,62 @@ std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::buildProjectionSimple(
                                          std::vector<std::string>{},
                                          pn->proj.getRequiredFields(),
                                          fieldSlots,
+                                         true,
+                                         false,
+                                         root->nodeId());
+}
+
+std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::buildProjectionCovered(
+    const QuerySolutionNode* root) {
+    using namespace std::literals;
+
+    auto pn = static_cast<const ProjectionNodeCovered*>(root);
+    invariant(pn->proj.isSimple());
+
+    // For now, we only support ProjectionNodeCovered when its child is an IndexScanNode.
+    uassert(5037301,
+            str::stream() << "Can't build exec tree for node: " << root->toString(),
+            pn->children[0]->getType() == STAGE_IXSCAN);
+
+    // If we're pulling data out of one index we can pre-compute the indices of the fields
+    // in the key that we pull data from and avoid looking up the field name each time.
+    invariant(!_indexKeysToInclude);
+    _indexKeysToInclude.emplace();
+    ON_BLOCK_EXIT([&] { _indexKeysToInclude.reset(); });
+
+    std::vector<std::string> keyFieldNames;
+    StringSet requiredFields = {pn->proj.getRequiredFields().begin(),
+                                pn->proj.getRequiredFields().end()};
+
+    // pn->coveredKeyObj is the "index.keyPattern" from the IndexScanNode or DistinctNode. This
+    // lists all the fields that the index can provide, not the fields that the projection wants.
+    // requiredFields lists all of the fields that the projection wants. Since this is a covered
+    // projection, we're guaranteed that pn->coveredKeyObj contains all of the fields that the
+    // projection wants.
+    size_t i = 0;
+    for (auto&& elt : pn->coveredKeyObj) {
+        if (requiredFields.count(elt.fieldNameStringData())) {
+            _indexKeysToInclude->set(i);
+            keyFieldNames.push_back(elt.fieldName());
+        }
+
+        ++i;
+    }
+
+    auto inputStage = build(pn->children[0]);
+
+    // Assert that the index scan produced values for this covered projection
+    invariant(_indexKeySlots);
+    ON_BLOCK_EXIT([&] { _indexKeySlots.reset(); });
+
+    _data.resultSlot = _slotIdGenerator.generate();
+
+    return sbe::makeS<sbe::MakeObjStage>(std::move(inputStage),
+                                         *_data.resultSlot,
+                                         boost::none,
+                                         std::vector<std::string>{},
+                                         std::move(keyFieldNames),
+                                         std::move(*_indexKeySlots),
                                          true,
                                          false,
                                          root->nodeId());
@@ -592,8 +659,8 @@ std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::makeUnionForTailableCollS
     invariant(anchorBranchSlots.size() == resumeBranchSlots.size());
 
     // A vector of the output slots for each union branch.
-    auto branchSlots = make_vector<sbe::value::SlotVector>(std::move(anchorBranchSlots),
-                                                           std::move(resumeBranchSlots));
+    auto branchSlots = makeVector<sbe::value::SlotVector>(std::move(anchorBranchSlots),
+                                                          std::move(resumeBranchSlots));
 
     _data.resultSlot = _slotIdGenerator.generate();
     _data.recordIdSlot = _slotIdGenerator.generate();
@@ -605,7 +672,7 @@ std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::makeUnionForTailableCollS
 
     // Branch output slots become the input slots to the union.
     auto unionStage =
-        sbe::makeS<sbe::UnionStage>(make_vector<std::unique_ptr<sbe::PlanStage>>(
+        sbe::makeS<sbe::UnionStage>(makeVector<std::unique_ptr<sbe::PlanStage>>(
                                         std::move(anchorBranch), std::move(resumeBranch)),
                                     branchSlots,
                                     unionOutputSlots,
@@ -631,6 +698,7 @@ std::unique_ptr<sbe::PlanStage> SlotBasedStageBuilder::build(const QuerySolution
             {STAGE_SORT_KEY_GENERATOR, std::mem_fn(&SlotBasedStageBuilder::buildSortKeyGeneraror)},
             {STAGE_PROJECTION_SIMPLE, std::mem_fn(&SlotBasedStageBuilder::buildProjectionSimple)},
             {STAGE_PROJECTION_DEFAULT, std::mem_fn(&SlotBasedStageBuilder::buildProjectionDefault)},
+            {STAGE_PROJECTION_COVERED, std::mem_fn(&SlotBasedStageBuilder::buildProjectionCovered)},
             {STAGE_OR, &SlotBasedStageBuilder::buildOr},
             {STAGE_TEXT, &SlotBasedStageBuilder::buildText},
             {STAGE_RETURN_KEY, &SlotBasedStageBuilder::buildReturnKey}};

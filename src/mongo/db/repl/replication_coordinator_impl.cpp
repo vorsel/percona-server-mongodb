@@ -119,11 +119,11 @@ MONGO_FAIL_POINT_DEFINE(stepdownHangBeforeRSTLEnqueue);
 // Fail setMaintenanceMode with ErrorCodes::NotSecondary to simulate a concurrent election.
 MONGO_FAIL_POINT_DEFINE(setMaintenanceModeFailsWithNotSecondary);
 MONGO_FAIL_POINT_DEFINE(forceSyncSourceRetryWaitForInitialSync);
-// Signals that an isMaster request has started waiting.
-MONGO_FAIL_POINT_DEFINE(waitForIsMasterResponse);
-// Will cause an isMaster request to hang as it starts waiting.
-MONGO_FAIL_POINT_DEFINE(hangWhileWaitingForIsMasterResponse);
-// Will cause an isMaster request to hang after it times out waiting for a topology change.
+// Signals that a hello request has started waiting.
+MONGO_FAIL_POINT_DEFINE(waitForHelloResponse);
+// Will cause a hello request to hang as it starts waiting.
+MONGO_FAIL_POINT_DEFINE(hangWhileWaitingForHelloResponse);
+// Will cause a hello request to hang after it times out waiting for a topology change.
 MONGO_FAIL_POINT_DEFINE(hangAfterWaitingForTopologyChangeTimesOut);
 MONGO_FAIL_POINT_DEFINE(skipDurableTimestampUpdates);
 // Skip sending heartbeats to pre-check that a quorum is available before a reconfig.
@@ -416,6 +416,7 @@ void ReplicationCoordinatorImpl::appendConnectionStats(executor::ConnectionPoolS
 
 bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
     OperationContext* opCtx, LastStorageEngineShutdownState lastStorageEngineShutdownState) {
+    LOGV2_DEBUG(4280500, 1, "Attempting to create internal replication collections");
     // Create necessary replication collections to guarantee that if a checkpoint sees data after
     // initial sync has completed, it also sees these collections.
     fassert(50708, _replicationProcess->getConsistencyMarkers()->createInternalCollections(opCtx));
@@ -428,6 +429,7 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
 
     fassert(51240, _externalState->createLocalLastVoteCollection(opCtx));
 
+    LOGV2_DEBUG(4280501, 1, "Attempting to load local voted for document");
     StatusWith<LastVote> lastVote = _externalState->loadLocalLastVoteDocument(opCtx);
     if (!lastVote.isOK()) {
         LOGV2_FATAL_NOTRACE(40367,
@@ -444,6 +446,7 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
         _topCoord->loadLastVote(lastVote.getValue());
     }
 
+    LOGV2_DEBUG(4280502, 1, "Searching for local Rollback ID document");
     // Check that we have a local Rollback ID. If we do not have one, create one.
     auto status = _replicationProcess->refreshRollbackID(opCtx);
     if (!status.isOK()) {
@@ -462,6 +465,7 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
         fassert(501402, _replicationProcess->incrementRollbackID(opCtx));
     }
 
+    LOGV2_DEBUG(4280503, 1, "Attempting to load local replica set configuration document");
     StatusWith<BSONObj> cfg = _externalState->loadLocalConfigDocument(opCtx);
     if (!cfg.isOK()) {
         LOGV2(21313,
@@ -498,10 +502,16 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
             "config"_attr = cfg.getValue());
     }
 
+    LOGV2_DEBUG(
+        4280504, 1, "Cleaning up any partially applied oplog batches & reading last op from oplog");
     // Read the last op from the oplog after cleaning up any partially applied batches.
     const auto stableTimestamp = boost::none;
     _replicationProcess->getReplicationRecovery()->recoverFromOplog(opCtx, stableTimestamp);
+    LOGV2_DEBUG(4280505,
+                1,
+                "Creating any necessary TenantMigrationAccessBlockers for unfinished migrations");
     tenant_migration_donor::recoverTenantMigrationAccessBlockers(opCtx);
+    LOGV2_DEBUG(4280506, 1, "Reconstructing prepared transactions");
     reconstructPreparedTransactions(opCtx, OplogApplication::Mode::kRecovering);
 
     const auto lastOpTimeAndWallTimeResult = _externalState->loadLastOpTimeAndWallTime(opCtx);
@@ -520,6 +530,7 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
     stdx::lock_guard<Latch> lk(_mutex);
     _finishLoadLocalConfigCbh = std::move(handle.getValue());
 
+    LOGV2_DEBUG(4280507, 1, "Loaded replica set config, scheduled callback to set local config");
     return false;
 }
 
@@ -548,6 +559,8 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         return;
     }
 
+    LOGV2_DEBUG(
+        4280508, 1, "Attempting to set local replica set config; validating config for startup");
     StatusWith<int> myIndex =
         validateConfigForStartUp(_externalState.get(), localConfig, getServiceContext());
     if (!myIndex.isOK()) {
@@ -588,6 +601,7 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
                       "commandLineSetName"_attr = _settings.ourSetName());
         myIndex = StatusWith<int>(-1);
     }
+    LOGV2_DEBUG(4280509, 1, "Local configuration validated for startup");
 
     if (serverGlobalParams.enableMajorityReadConcern && localConfig.getNumMembers() == 3 &&
         localConfig.getNumDataBearingMembers() == 2) {
@@ -672,6 +686,9 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
 
     // Set our last applied and durable optimes to the top of the oplog, if we have one.
     if (!lastOpTime.isNull()) {
+        LOGV2_DEBUG(4280510,
+                    1,
+                    "Setting this node's last applied and durable opTimes to the top of the oplog");
         bool isRollbackAllowed = false;
         _setMyLastAppliedOpTimeAndWallTime(lock, lastOpTimeAndWallTime, isRollbackAllowed);
         _setMyLastDurableOpTimeAndWallTime(lock, lastOpTimeAndWallTime, isRollbackAllowed);
@@ -692,6 +709,7 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         _externalState->startThreads();
         _startDataReplication(opCtx.get());
     }
+    LOGV2_DEBUG(4280511, 1, "Set local replica set config");
 }
 
 void ReplicationCoordinatorImpl::_stopDataReplication(OperationContext* opCtx) {
@@ -729,6 +747,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
     const auto needsInitialSync =
         lastOpTime.isNull() || _externalState->isInitialSyncFlagSet(opCtx);
     if (!needsInitialSync) {
+        LOGV2_DEBUG(4280512, 1, "No initial sync required. Attempting to begin steady replication");
         // Start steady replication, since we already have data.
         // ReplSetConfig has been installed, so it's either in STARTUP2 or REMOVED.
         auto memberState = getMemberState();
@@ -741,6 +760,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
         return;
     }
 
+    LOGV2_DEBUG(4280513, 1, "Initial sync required. Attempting to start initial sync...");
     // Do initial sync.
     if (!_externalState->getTaskExecutor()) {
         LOGV2(21323, "Not running initial sync during test");
@@ -817,6 +837,7 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
         // InitialSyncer::startup() must be called outside lock because it uses features (eg.
         // setting the initial sync flag) which depend on the ReplicationCoordinatorImpl.
         uassertStatusOK(initialSyncerCopy->startup(opCtx, numInitialSyncAttempts.load()));
+        LOGV2_DEBUG(4280514, 1, "Initial sync started");
     } catch (const DBException& e) {
         auto status = e.toStatus();
         LOGV2(21327,
@@ -1413,8 +1434,12 @@ OpTime ReplicationCoordinatorImpl::getMyLastAppliedOpTime() const {
     return _getMyLastAppliedOpTime_inlock();
 }
 
-OpTimeAndWallTime ReplicationCoordinatorImpl::getMyLastAppliedOpTimeAndWallTime() const {
+OpTimeAndWallTime ReplicationCoordinatorImpl::getMyLastAppliedOpTimeAndWallTime(
+    bool rollbackSafe) const {
     stdx::lock_guard<Latch> lock(_mutex);
+    if (rollbackSafe && _getMemberState_inlock().rollback()) {
+        return {};
+    }
     return _getMyLastAppliedOpTimeAndWallTime_inlock();
 }
 
@@ -1723,8 +1748,7 @@ Status ReplicationCoordinatorImpl::setLastDurableOptime_forTest(long long cfgVer
 
     const UpdatePositionArgs::UpdateInfo update(
         OpTime(), Date_t(), opTime, wallTime, cfgVer, memberId);
-    long long configVersion;
-    const auto status = _setLastOptime(lock, update, &configVersion);
+    const auto status = _setLastOptime(lock, update);
     return status;
 }
 
@@ -1741,15 +1765,13 @@ Status ReplicationCoordinatorImpl::setLastAppliedOptime_forTest(long long cfgVer
 
     const UpdatePositionArgs::UpdateInfo update(
         opTime, wallTime, OpTime(), Date_t(), cfgVer, memberId);
-    long long configVersion;
-    const auto status = _setLastOptime(lock, update, &configVersion);
+    const auto status = _setLastOptime(lock, update);
     return status;
 }
 
 Status ReplicationCoordinatorImpl::_setLastOptime(WithLock lk,
-                                                  const UpdatePositionArgs::UpdateInfo& args,
-                                                  long long* configVersion) {
-    auto result = _topCoord->setLastOptime(args, _replExecutor->now(), configVersion);
+                                                  const UpdatePositionArgs::UpdateInfo& args) {
+    auto result = _topCoord->setLastOptime(args, _replExecutor->now());
     if (!result.isOK())
         return result.getStatus();
     const bool advancedOpTime = result.getValue();
@@ -2248,17 +2270,17 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMaste
     invariant(deadline);
     const TopologyVersion topologyVersion = _topCoord->getTopologyVersion();
 
-    IsMasterMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
+    HelloMetrics::get(opCtx)->incrementNumAwaitingTopologyChanges();
     lk.unlock();
 
-    if (MONGO_unlikely(waitForIsMasterResponse.shouldFail())) {
+    if (MONGO_unlikely(waitForHelloResponse.shouldFail())) {
         // Used in tests that wait for this failpoint to be entered before triggering a topology
         // change.
-        LOGV2(31464, "waitForIsMasterResponse failpoint enabled");
+        LOGV2(31464, "waitForHelloResponse failpoint enabled");
     }
-    if (MONGO_unlikely(hangWhileWaitingForIsMasterResponse.shouldFail())) {
-        LOGV2(21341, "Hanging due to hangWhileWaitingForIsMasterResponse failpoint");
-        hangWhileWaitingForIsMasterResponse.pauseWhileSet(opCtx);
+    if (MONGO_unlikely(hangWhileWaitingForHelloResponse.shouldFail())) {
+        LOGV2(21341, "Hanging due to hangWhileWaitingForHelloResponse failpoint");
+        hangWhileWaitingForHelloResponse.pauseWhileSet(opCtx);
     }
 
     // Wait for a topology change with timeout set to deadline.
@@ -2282,7 +2304,7 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorImpl::awaitIsMaste
         // Return an IsMasterResponse with the current topology version on timeout when waiting for
         // a topology change.
         stdx::lock_guard lk(_mutex);
-        IsMasterMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges();
+        HelloMetrics::get(opCtx)->decrementNumAwaitingTopologyChanges();
         // A topology change has not occured within the deadline so horizonString is still a good
         // indicator of whether we have a valid config.
         const bool hasValidConfig = horizonString != boost::none;
@@ -2303,7 +2325,7 @@ StatusWith<OpTime> ReplicationCoordinatorImpl::getLatestWriteOpTime(OperationCon
     if (!canAcceptNonLocalWrites()) {
         return {ErrorCodes::NotWritablePrimary, "Not primary so can't get latest write optime"};
     }
-    auto oplog = LocalOplogInfo::get(opCtx)->getCollection();
+    const auto& oplog = LocalOplogInfo::get(opCtx)->getCollection();
     if (!oplog) {
         return {ErrorCodes::NamespaceNotFound, "oplog collection does not exist"};
     }
@@ -2836,7 +2858,7 @@ bool ReplicationCoordinatorImpl::canAcceptWritesFor_UNSAFE(OperationContext* opC
         if (!ns->isOplog()) {
             return true;
         }
-    } else if (auto oplogCollection = LocalOplogInfo::get(opCtx)->getCollection()) {
+    } else if (const auto& oplogCollection = LocalOplogInfo::get(opCtx)->getCollection()) {
         auto uuid = nsOrUUID.uuid();
         invariant(uuid, nsOrUUID.toString());
         if (oplogCollection->uuid() != *uuid) {
@@ -3926,7 +3948,7 @@ void ReplicationCoordinatorImpl::_errorOnPromisesIfHorizonChanged(WithLock lk,
                                "Received a reconfig that changed the horizon mappings."});
         }
         _sniToValidConfigPromiseMap.clear();
-        IsMasterMetrics::get(opCtx)->resetNumAwaitingTopologyChanges();
+        HelloMetrics::get(opCtx)->resetNumAwaitingTopologyChanges();
     }
 
     if (oldIndex >= 0 && newIndex >= 0) {
@@ -3940,7 +3962,7 @@ void ReplicationCoordinatorImpl::_errorOnPromisesIfHorizonChanged(WithLock lk,
                                    "Received a reconfig that changed the horizon mappings."});
             }
             _createHorizonTopologyChangePromiseMapping(lk);
-            IsMasterMetrics::get(opCtx)->resetNumAwaitingTopologyChanges();
+            HelloMetrics::get(opCtx)->resetNumAwaitingTopologyChanges();
         }
     }
 }
@@ -3987,7 +4009,7 @@ void ReplicationCoordinatorImpl::_fulfillTopologyChangePromise(WithLock lock) {
         }
         _sniToValidConfigPromiseMap.clear();
     }
-    IsMasterMetrics::get(getGlobalServiceContext())->resetNumAwaitingTopologyChanges();
+    HelloMetrics::get(getGlobalServiceContext())->resetNumAwaitingTopologyChanges();
 
     if (_inQuiesceMode) {
         // No more isMaster requests will wait for a topology change, so clear _horizonToPromiseMap.
@@ -4035,7 +4057,7 @@ ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock l
         // _canAcceptNonLocalWrites should already be set.
         invariant(!_readWriteAbility->canAcceptNonLocalWrites(lk));
 
-        serverGlobalParams.validateFeaturesAsMaster.store(false);
+        serverGlobalParams.validateFeaturesAsPrimary.store(false);
         result = (newState.removed() || newState.rollback()) ? kActionRollbackOrRemoved
                                                              : kActionSteppedDown;
     } else {
@@ -4365,71 +4387,67 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
     _rsConfig = newConfig;
     _protVersion.store(_rsConfig.getProtocolVersion());
 
-    // Warn if running --nojournal and writeConcernMajorityJournalDefault = true
+    // Warn if using the in-memory (ephemeral) storage engine or running running --nojournal with
+    // writeConcernMajorityJournalDefault=true.
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
-    if (storageEngine && !storageEngine->isDurable() &&
-        (newConfig.getWriteConcernMajorityShouldJournal() &&
-         (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
-        LOGV2_OPTIONS(21369, {logv2::LogTag::kStartupWarnings}, "");
-        LOGV2_OPTIONS(
-            21370,
-            {logv2::LogTag::kStartupWarnings},
-            "** WARNING: This replica set node is running without journaling enabled but the ");
-        LOGV2_OPTIONS(
-            21371,
-            {logv2::LogTag::kStartupWarnings},
-            "**          writeConcernMajorityJournalDefault option to the replica set config ");
-        LOGV2_OPTIONS(21372,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          is set to true. The writeConcernMajorityJournalDefault ");
-        LOGV2_OPTIONS(21373,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          option to the replica set config must be set to false ");
-        LOGV2_OPTIONS(21374,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          or w:majority write concerns will never complete.");
-        LOGV2_OPTIONS(
-            21375,
-            {logv2::LogTag::kStartupWarnings},
-            "**          In addition, this node's memory consumption may increase until all");
-        LOGV2_OPTIONS(21376,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          available free RAM is exhausted.");
-        LOGV2_OPTIONS(21377, {logv2::LogTag::kStartupWarnings}, "");
-    }
-
-    // Warn if using the in-memory (ephemeral) storage engine with
-    // writeConcernMajorityJournalDefault = true
-    if (storageEngine && storageEngine->isEphemeral() &&
-        (newConfig.getWriteConcernMajorityShouldJournal() &&
-         (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal()))) {
-        LOGV2_OPTIONS(21378, {logv2::LogTag::kStartupWarnings}, "");
-        LOGV2_OPTIONS(
-            21379,
-            {logv2::LogTag::kStartupWarnings},
-            "** WARNING: This replica set node is using in-memory (ephemeral) storage with the");
-        LOGV2_OPTIONS(
-            21380,
-            {logv2::LogTag::kStartupWarnings},
-            "**          writeConcernMajorityJournalDefault option to the replica set config ");
-        LOGV2_OPTIONS(
-            21381,
-            {logv2::LogTag::kStartupWarnings},
-            "**          set to true. The writeConcernMajorityJournalDefault option to the ");
-        LOGV2_OPTIONS(21382,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          replica set config must be set to false ");
-        LOGV2_OPTIONS(21383,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          or w:majority write concerns will never complete.");
-        LOGV2_OPTIONS(
-            21384,
-            {logv2::LogTag::kStartupWarnings},
-            "**          In addition, this node's memory consumption may increase until all");
-        LOGV2_OPTIONS(21385,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          available free RAM is exhausted.");
-        LOGV2_OPTIONS(21386, {logv2::LogTag::kStartupWarnings}, "");
+    if (storageEngine && newConfig.getWriteConcernMajorityShouldJournal() &&
+        (!oldConfig.isInitialized() || !oldConfig.getWriteConcernMajorityShouldJournal())) {
+        if (storageEngine->isEphemeral()) {
+            LOGV2_OPTIONS(21378, {logv2::LogTag::kStartupWarnings}, "");
+            LOGV2_OPTIONS(21379,
+                          {logv2::LogTag::kStartupWarnings},
+                          "** WARNING: This replica set node is using in-memory (ephemeral) "
+                          "storage with the");
+            LOGV2_OPTIONS(
+                21380,
+                {logv2::LogTag::kStartupWarnings},
+                "**          writeConcernMajorityJournalDefault option to the replica set config ");
+            LOGV2_OPTIONS(
+                21381,
+                {logv2::LogTag::kStartupWarnings},
+                "**          set to true. The writeConcernMajorityJournalDefault option to the ");
+            LOGV2_OPTIONS(21382,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          replica set config must be set to false ");
+            LOGV2_OPTIONS(21383,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          or w:majority write concerns will never complete.");
+            LOGV2_OPTIONS(
+                21384,
+                {logv2::LogTag::kStartupWarnings},
+                "**          In addition, this node's memory consumption may increase until all");
+            LOGV2_OPTIONS(21385,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          available free RAM is exhausted.");
+            LOGV2_OPTIONS(21386, {logv2::LogTag::kStartupWarnings}, "");
+        } else if (!storageEngine->isDurable()) {
+            LOGV2_OPTIONS(21369, {logv2::LogTag::kStartupWarnings}, "");
+            LOGV2_OPTIONS(
+                21370,
+                {logv2::LogTag::kStartupWarnings},
+                "** WARNING: This replica set node is running without journaling enabled but the ");
+            LOGV2_OPTIONS(
+                21371,
+                {logv2::LogTag::kStartupWarnings},
+                "**          writeConcernMajorityJournalDefault option to the replica set config ");
+            LOGV2_OPTIONS(21372,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          is set to true. The writeConcernMajorityJournalDefault ");
+            LOGV2_OPTIONS(21373,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          option to the replica set config must be set to false ");
+            LOGV2_OPTIONS(21374,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          or w:majority write concerns will never complete.");
+            LOGV2_OPTIONS(
+                21375,
+                {logv2::LogTag::kStartupWarnings},
+                "**          In addition, this node's memory consumption may increase until all");
+            LOGV2_OPTIONS(21376,
+                          {logv2::LogTag::kStartupWarnings},
+                          "**          available free RAM is exhausted.");
+            LOGV2_OPTIONS(21377, {logv2::LogTag::kStartupWarnings}, "");
+        }
     }
 
     // Since the ReplSetConfig always has a WriteConcernOptions, the only way to know if it has been
@@ -4447,6 +4465,29 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
                       {logv2::LogTag::kStartupWarnings},
                       "**          cluster-wide default writeConcern.");
         LOGV2_OPTIONS(21391, {logv2::LogTag::kStartupWarnings}, "");
+    }
+
+    // Emit a warning at startup if there are IP addresses in the SplitHorizon field of the
+    // replset config.
+    std::vector<std::string> offendingConfigs;
+    for (const MemberConfig& member : oldConfig.members()) {
+        // Check that no horizon mappings contain IP addresses
+        for (auto& mapping : member.getHorizonMappings()) {
+            // Emit a startup warning for any SplitHorizon mapping that can be parsed as
+            // a valid CIDR range, except for the default horizon.
+            if (mapping.first != SplitHorizon::kDefaultHorizon &&
+                CIDR::parse(mapping.second.host()).isOK()) {
+                offendingConfigs.emplace_back(str::stream() << mapping.second.host() << ":"
+                                                            << mapping.second.port());
+            }
+        }
+    }
+    if (!offendingConfigs.empty()) {
+        LOGV2_WARNING_OPTIONS(4907900,
+                              {logv2::LogTag::kStartupWarnings},
+                              "Found split horizon configuration using IP "
+                              "address(es), which is disallowed.",
+                              "offendingConfigs"_attr = offendingConfigs);
     }
 
     // If the SplitHorizon has changed, reply to all waiting isMasters with an error.
@@ -4523,15 +4564,14 @@ void ReplicationCoordinatorImpl::_wakeReadyWaiters(WithLock lk, boost::optional<
         opTime);
 }
 
-Status ReplicationCoordinatorImpl::processReplSetUpdatePosition(const UpdatePositionArgs& updates,
-                                                                long long* configVersion) {
+Status ReplicationCoordinatorImpl::processReplSetUpdatePosition(const UpdatePositionArgs& updates) {
     stdx::unique_lock<Latch> lock(_mutex);
     Status status = Status::OK();
     bool somethingChanged = false;
     for (UpdatePositionArgs::UpdateIterator update = updates.updatesBegin();
          update != updates.updatesEnd();
          ++update) {
-        status = _setLastOptime(lock, *update, configVersion);
+        status = _setLastOptime(lock, *update);
         if (!status.isOK()) {
             break;
         }

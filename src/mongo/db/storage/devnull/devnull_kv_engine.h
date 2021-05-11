@@ -78,9 +78,11 @@ public:
     virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
         OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
 
-    virtual Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) {
+    virtual Status dropIdent(RecoveryUnit* ru, StringData ident) {
         return Status::OK();
     }
+
+    virtual void dropIdentForImport(OperationContext* opCtx, StringData ident) {}
 
     virtual bool supportsDirectoryPerDB() const {
         return false;

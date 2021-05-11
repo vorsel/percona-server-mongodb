@@ -36,16 +36,55 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/s/resharding/coordinator_document_gen.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/resharded_chunk_gen.h"
 #include "mongo/s/shard_id.h"
+#include "mongo/s/write_ops/batched_command_request.h"
 
 namespace mongo {
 
 constexpr auto kReshardingOplogPrePostImageOps = "prePostImageOps"_sd;
+
+/**
+ * Emplaces the 'fetchTimestamp' onto the ClassWithFetchTimestamp if the timestamp has been
+ * emplaced inside the boost::optional.
+ */
+template <class ClassWithFetchTimestamp>
+void emplaceFetchTimestampIfExists(ClassWithFetchTimestamp& c,
+                                   boost::optional<Timestamp> fetchTimestamp) {
+    if (!fetchTimestamp) {
+        return;
+    }
+
+    invariant(!fetchTimestamp->isNull());
+
+    if (auto alreadyExistingFetchTimestamp = c.getFetchTimestamp()) {
+        invariant(fetchTimestamp == alreadyExistingFetchTimestamp);
+    }
+
+    FetchTimestamp fetchTimestampStruct;
+    fetchTimestampStruct.setFetchTimestamp(std::move(fetchTimestamp));
+    c.setFetchTimestampStruct(std::move(fetchTimestampStruct));
+}
+
+/**
+ * Helper method to construct a DonorShardEntry with the fields specified.
+ */
+DonorShardEntry makeDonorShard(ShardId shardId,
+                               DonorStateEnum donorState,
+                               boost::optional<Timestamp> minFetchTimestamp = boost::none);
+
+/**
+ * Helper method to construct a RecipientShardEntry with the fields specified.
+ */
+RecipientShardEntry makeRecipientShard(
+    ShardId shardId,
+    RecipientStateEnum recipientState,
+    boost::optional<Timestamp> strictConsistencyTimestamp = boost::none);
 
 /**
  * Gets the UUID for 'nss' from the 'cm'
@@ -55,15 +94,33 @@ constexpr auto kReshardingOplogPrePostImageOps = "prePostImageOps"_sd;
 UUID getCollectionUUIDFromChunkManger(const NamespaceString& nss, const ChunkManager& cm);
 
 /**
- * Constructs the temporary resharding collection's namespace provided the original collection's
- * namespace and chunk manager.
+ * Assembles the namespace string for the temporary resharding collection based on the source
+ * namespace components.
  *
  *      <db>.system.resharding.<existing collection's UUID>
- *
- * Note: throws if the original collection does not have a UUID.
  */
-NamespaceString constructTemporaryReshardingNss(const NamespaceString& originalNss,
-                                                const ChunkManager& cm);
+NamespaceString constructTemporaryReshardingNss(StringData db, const UUID& sourceUuid);
+
+/**
+ * Constructs a BatchedCommandRequest with batch type 'Insert'.
+ */
+BatchedCommandRequest buildInsertOp(const NamespaceString& nss, std::vector<BSONObj> docs);
+
+/**
+ * Constructs a BatchedCommandRequest with batch type 'Update'.
+ */
+BatchedCommandRequest buildUpdateOp(const NamespaceString& nss,
+                                    const BSONObj& query,
+                                    const BSONObj& update,
+                                    bool upsert,
+                                    bool multi);
+
+/**
+ * Constructs a BatchedCommandRequest with batch type 'Delete'.
+ */
+BatchedCommandRequest buildDeleteOp(const NamespaceString& nss,
+                                    const BSONObj& query,
+                                    bool multiDelete);
 
 /**
  * Sends _flushRoutingTableCacheUpdatesWithWriteConcern to a list of shards. Throws if one of the
@@ -90,6 +147,13 @@ void validateReshardedChunks(const std::vector<mongo::BSONObj>& chunks,
                              const KeyPattern& keyPattern);
 
 /**
+ * Selects the highest minFetchTimestamp from the list of donors.
+ *
+ * Throws if not every donor has a minFetchTimestamp.
+ */
+Timestamp getHighestMinFetchTimestamp(const std::vector<DonorShardEntry>& donorShards);
+
+/**
  * Asserts that there is not an overlap in the zone ranges.
  */
 void checkForOverlappingZones(std::vector<TagsType>& zones);
@@ -106,27 +170,14 @@ void validateZones(const std::vector<mongo::BSONObj>& zones,
  * Create pipeline stages for iterating the buffered copy of the donor oplog and link together the
  * oplog entries with their preImage/postImage oplog. Note that caller is responsible for making
  * sure that the donorOplogNS is properly resolved and ns is set in the expCtx.
+ *
+ * If doAttachDocumentCursor is false, the caller will need to manually set the initial stage of the
+ * pipeline with a source. This is mostly useful for testing.
  */
 std::unique_ptr<Pipeline, PipelineDeleter> createAggForReshardingOplogBuffer(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const boost::optional<ReshardingDonorOplogId>& resumeToken);
-
-/**
- * Create pipeline stages for iterating donor config.transactions.  The pipeline has these stages:
- * pipeline: [
- *      {$match: {_id: {$gt: <startAfter>}}},
- *      {$sort: {_id: 1}},
- *      {$match: {"lastWriteOpTime.ts": {$lt: <fetchTimestamp>}}},
- * ],
- * Note that the caller is responsible for making sure that the transactions ns is set in the
- * expCtx.
- *
- * fetchTimestamp never isNull()
- */
-std::unique_ptr<Pipeline, PipelineDeleter> createConfigTxnCloningPipelineForResharding(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    Timestamp fetchTimestamp,
-    boost::optional<LogicalSessionId> startAfter);
+    const boost::optional<ReshardingDonorOplogId>& resumeToken,
+    bool doAttachDocumentCursor);
 
 /**
  * Creates a view on the oplog that facilitates the specialized oplog tailing a resharding
@@ -153,7 +204,8 @@ std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForReshard
  */
 boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
                                               const NamespaceString& sourceNss,
-                                              BSONObj fullDocument);
+                                              const BSONObj& fullDocument);
+
 /**
  * Creates pipeline for filtering collection data matching the recipient shard.
  */
@@ -162,5 +214,22 @@ std::unique_ptr<Pipeline, PipelineDeleter> createAggForCollectionCloning(
     const ShardKeyPattern& newShardKeyPattern,
     const NamespaceString& sourceNss,
     const ShardId& recipientShard);
+
+/**
+ * Sentinel oplog format:
+ * {
+ *   op: "n",
+ *   ns: "<database>.<collection>",
+ *   ui: <existingUUID>,
+ *   destinedRecipient: <recipientShardId>,
+ *   o: {msg: "Writes to <database>.<collection> is temporarily blocked for resharding"},
+ *   o2: {type: "reshardFinalOp", reshardingUUID: <reshardingUUID>},
+ *   fromMigrate: true,
+ * }
+ */
+bool isFinalOplog(const repl::OplogEntry& oplog);
+bool isFinalOplog(const repl::OplogEntry& oplog, UUID reshardingUUID);
+
+NamespaceString getLocalOplogBufferNamespace(UUID reshardingUUID, ShardId donorShardId);
 
 }  // namespace mongo

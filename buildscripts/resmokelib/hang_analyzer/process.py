@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from distutils import spawn  # pylint: disable=no-name-in-module
+from datetime import datetime
 
 import psutil
 
@@ -17,6 +18,8 @@ _IS_WINDOWS = (sys.platform == "win32")
 if _IS_WINDOWS:
     import win32event
     import win32api
+
+PROCS_TIMEOUT_SECS = 60
 
 
 def call(args, logger):
@@ -130,15 +133,32 @@ def resume_process(logger, pname, pid):
         logger.error("Process not found: %s", err.msg)
 
 
-def kill_processes(logger, processes):
-    """Kill processes with SIGKILL."""
-    logger.info("Starting to kill processes. Logs should be ignored from this point.")
+def teardown_processes(logger, processes, dump_pids):
+    """Kill processes with SIGKILL or SIGABRT."""
+    logger.info("Starting to kill or abort processes. Logs should be ignored from this point.")
     for pinfo in processes:
         for pid in pinfo.pidv:
             try:
                 proc = psutil.Process(pid)
-                logger.info("Killing process %s with pid %d", pinfo.name, pid)
-                proc.kill()
+                if pid in dump_pids:
+                    logger.info("Aborting process %s with pid %d", pinfo.name, pid)
+                    proc.send_signal(signal.SIGABRT)
+                    # Sometimes a SIGABRT doesn't actually dump until the process is continued.
+                    proc.resume()
+                else:
+                    logger.info("Killing process %s with pid %d", pinfo.name, pid)
+                    proc.kill()
             except psutil.NoSuchProcess:
                 # Process has already terminated.
                 pass
+    _await_cores(dump_pids, logger)
+
+
+def _await_cores(dump_pids, logger):
+    start_time = datetime.now()
+    for pid in dump_pids:
+        while not os.path.exists(dump_pids[pid]):
+            time.sleep(5)  # How long a mongod usually takes to core dump.
+            if (datetime.now() - start_time).total_seconds() > PROCS_TIMEOUT_SECS:
+                logger.error("Timed out while awaiting process.")
+                return

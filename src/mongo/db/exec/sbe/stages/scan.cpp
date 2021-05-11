@@ -178,7 +178,7 @@ void ScanStage::open(bool reOpen) {
         _openCallback(_opCtx, _coll->getCollection(), reOpen);
     }
 
-    if (auto collection = _coll->getCollection()) {
+    if (const auto& collection = _coll->getCollection()) {
         if (_seekKeyAccessor) {
             auto [tag, val] = _seekKeyAccessor->getViewOfValue();
             const auto msgTag = tag;
@@ -280,16 +280,11 @@ const SpecificStats* ScanStage::getSpecificStats() const {
 }
 
 std::vector<DebugPrinter::Block> ScanStage::debugPrint() const {
-    std::vector<DebugPrinter::Block> ret;
+    auto ret = PlanStage::debugPrint();
 
     if (_seekKeySlot) {
-        DebugPrinter::addKeyword(ret, "seek");
-
         DebugPrinter::addIdentifier(ret, _seekKeySlot.get());
-    } else {
-        DebugPrinter::addKeyword(ret, "scan");
     }
-
 
     if (_recordSlot) {
         DebugPrinter::addIdentifier(ret, _recordSlot.get());
@@ -453,7 +448,7 @@ void ParallelScanStage::open(bool reOpen) {
     uassertStatusOK(repl::ReplicationCoordinator::get(_opCtx)->checkCanServeReadsFor(
         _opCtx, _coll->getNss(), true));
 
-    auto collection = _coll->getCollection();
+    const auto& collection = _coll->getCollection();
 
     if (collection) {
         {
@@ -582,8 +577,7 @@ const SpecificStats* ParallelScanStage::getSpecificStats() const {
 }
 
 std::vector<DebugPrinter::Block> ParallelScanStage::debugPrint() const {
-    std::vector<DebugPrinter::Block> ret;
-    DebugPrinter::addKeyword(ret, "pscan");
+    auto ret = PlanStage::debugPrint();
 
     if (_recordSlot) {
         DebugPrinter::addIdentifier(ret, _recordSlot.get());

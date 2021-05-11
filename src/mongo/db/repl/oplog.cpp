@@ -54,6 +54,7 @@
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/drop_database.h"
 #include "mongo/db/catalog/drop_indexes.h"
+#include "mongo/db/catalog/import_collection_oplog_entry_gen.h"
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/client.h"
@@ -117,6 +118,7 @@ namespace {
 
 using namespace fmt::literals;
 
+MONGO_FAIL_POINT_DEFINE(addDestinedRecipient);
 MONGO_FAIL_POINT_DEFINE(sleepBetweenInsertOpTimeGenerationAndLogOp);
 
 // Failpoint to block after a write and its oplog entry have been written to the storage engine and
@@ -141,7 +143,34 @@ void abortIndexBuilds(OperationContext* opCtx,
     }
 }
 
+void applyImportCollectionDefault(OperationContext* opCtx,
+                                  const UUID& importUUID,
+                                  const NamespaceString& nss,
+                                  long long numRecords,
+                                  long long dataSize,
+                                  const BSONObj& catalogEntry,
+                                  const BSONObj& storageMetadata,
+                                  bool isDryRun,
+                                  OplogApplication::Mode mode) {
+    LOGV2_FATAL_NOTRACE(5114200,
+                        "Applying importCollection is not supported with MongoDB Community "
+                        "Edition, please use MongoDB Enterprise Edition",
+                        "importUUID"_attr = importUUID,
+                        "nss"_attr = nss,
+                        "numRecords"_attr = numRecords,
+                        "dataSize"_attr = dataSize,
+                        "catalogEntry"_attr = redact(catalogEntry),
+                        "storageMetadata"_attr = redact(storageMetadata),
+                        "isDryRun"_attr = isDryRun);
+}
+
 }  // namespace
+
+ApplyImportCollectionFn applyImportCollection = applyImportCollectionDefault;
+
+void registerApplyImportCollectionFn(ApplyImportCollectionFn func) {
+    applyImportCollection = func;
+}
 
 void setOplogCollectionName(ServiceContext* service) {
     LocalOplogInfo::get(service)->setOplogCollectionName(service);
@@ -213,7 +242,7 @@ void _logOpsInner(OperationContext* opCtx,
                   const NamespaceString& nss,
                   std::vector<Record>* records,
                   const std::vector<Timestamp>& timestamps,
-                  const Collection* oplogCollection,
+                  const CollectionPtr& oplogCollection,
                   OpTime finalOpTime,
                   Date_t wallTime) {
     auto replCoord = ReplicationCoordinator::get(opCtx);
@@ -285,6 +314,10 @@ void _logOpsInner(OperationContext* opCtx,
 }
 
 OpTime logOp(OperationContext* opCtx, MutableOplogEntry* oplogEntry) {
+    addDestinedRecipient.execute([&](const BSONObj& data) {
+        auto recipient = data["destinedRecipient"].String();
+        oplogEntry->setDestinedRecipient(boost::make_optional<ShardId>({recipient}));
+    });
     // All collections should have UUIDs now, so all insert, update, and delete oplog entries should
     // also have uuids. Some no-op (n) and command (c) entries may still elide the uuid field.
     invariant(oplogEntry->getUuid() || oplogEntry->getOpType() == OpTypeEnum::kNoop ||
@@ -307,6 +340,11 @@ OpTime logOp(OperationContext* opCtx, MutableOplogEntry* oplogEntry) {
     const auto& recipientInfo = tenantMigrationRecipientInfo(opCtx);
     if (recipientInfo) {
         oplogEntry->setFromTenantMigration(recipientInfo->uuid);
+    }
+
+    // TODO SERVER-51301 to remove this block.
+    if (oplogEntry->getOpType() == repl::OpTypeEnum::kNoop) {
+        opCtx->recoveryUnit()->ignoreAllMultiTimestampConstraints();
     }
 
     // Use OplogAccessMode::kLogOp to avoid recursive locking.
@@ -333,7 +371,7 @@ OpTime logOp(OperationContext* opCtx, MutableOplogEntry* oplogEntry) {
         oplogEntry->setOpTime(slot);
     }
 
-    auto oplog = oplogInfo->getCollection();
+    const auto& oplog = oplogInfo->getCollection();
     auto wallClockTime = oplogEntry->getWallClockTime();
 
     auto bsonOplogEntry = oplogEntry->toBSON();
@@ -393,6 +431,11 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
         }
         oplogEntry.setObject(begin[i].doc);
         oplogEntry.setOpTime(insertStatementOplogSlot);
+        oplogEntry.setDestinedRecipient(getDestinedRecipient(opCtx, nss, begin[i].doc));
+        addDestinedRecipient.execute([&](const BSONObj& data) {
+            auto recipient = data["destinedRecipient"].String();
+            oplogEntry.setDestinedRecipient(boost::make_optional<ShardId>({recipient}));
+        });
 
         OplogLink oplogLink;
         if (i > 0)
@@ -425,7 +468,7 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
     invariant(!opTimes.empty());
     auto lastOpTime = opTimes.back();
     invariant(!lastOpTime.isNull());
-    auto oplog = oplogInfo->getCollection();
+    const auto& oplog = oplogInfo->getCollection();
     auto wallClockTime = oplogEntryTemplate->getWallClockTime();
     _logOpsInner(opCtx, nss, &records, timestamps, oplog, lastOpTime, wallClockTime);
     wuow.commit();
@@ -536,7 +579,7 @@ void createOplog(OperationContext* opCtx,
     const ReplSettings& replSettings = ReplicationCoordinator::get(opCtx)->getSettings();
 
     OldClientContext ctx(opCtx, oplogCollectionName.ns());
-    const Collection* collection =
+    CollectionPtr collection =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, oplogCollectionName);
 
     if (collection) {
@@ -877,6 +920,22 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
               opCtx, entry.getNss().db().toString(), entry.getUuid(), entry.getObject(), opTime);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::NamespaceExists}}},
+    {"importCollection",
+     {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
+          auto importEntry = mongo::ImportCollectionOplogEntry::parse(
+              IDLParserErrorContext("importCollectionOplogEntry"), entry.getObject());
+          applyImportCollection(opCtx,
+                                importEntry.getImportUUID(),
+                                importEntry.getImportCollection(),
+                                importEntry.getNumRecords(),
+                                importEntry.getDataSize(),
+                                importEntry.getCatalogEntry(),
+                                importEntry.getStorageMetadata(),
+                                importEntry.getDryRun(),
+                                mode);
+          return Status::OK();
+      },
+      {ErrorCodes::NamespaceExists}}},
     {"applyOps",
      {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
          return entry.shouldPrepare() ? applyPrepareTransaction(opCtx, entry, mode)
@@ -981,7 +1040,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
     }
 
     NamespaceString requestNss;
-    const Collection* collection = nullptr;
+    CollectionPtr collection = nullptr;
     if (auto uuid = op.getUuid()) {
         CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
         collection = catalog.lookupCollectionByUUID(opCtx, uuid.get());
@@ -1271,43 +1330,17 @@ Status applyOperation_inlock(OperationContext* opCtx,
             request.setNamespaceString(requestNss);
             request.setQuery(updateCriteria);
             auto updateMod = write_ops::UpdateModification::parseFromOplogEntry(o);
-            if (updateMod.type() == write_ops::UpdateModification::Type::kDelta) {
-                // We may only use delta oplog entries when in FCV 4.7 or in the "downgrading to
-                // 4.4" state. The latter case can happen when a $v:2 update is logged in the
-                // window between the oplog entry which sets the target FCV to 4.4 (putting the
-                // node in a "downgrading state") and the entry which removes the target FCV
-                // (putting the node in a "downgraded" state).
-                //
-                // However, we should not allow user-run applyOps to log $v:2 updates while the FCV
-                // is in the "downgrading to 4.4" state. If we did so, it would be possible for the
-                // following sequence of events to happen:
-                //
-                // (Thread A): Begins {setFCV: "4.4"} command, which sets the target version to
-                // 4.4. The server is now in a "downgrading" state.
-                //
-                // (Thread A) Takes MODE_S lock and then immediately drops it. It will proceed on
-                // the assumption that no new commands will perform 4.4-incompatible writes.
-                //
-                // (Thread B) Runs applyOps, checks the FCV, and sees that the server is in a
-                // downgrading state. It continues on the $v:2 oplog entry code path.
-                //
-                // (Thread A) setFCV command completes. The server is now in FCV 4.4.
-                //
-                // (Thread B) The applyOps completes, and a $v:2 oplog entry is logged.
-                //
-                // This would mean that a 4.4-incompatible write is performed after the FCV is set
-                // to 4.4, which is illegal.
-                const auto fcvVersion = serverGlobalParams.featureCompatibility.getVersion();
-                const bool fromApplyOpsCmd = mode == OplogApplication::Mode::kApplyOpsCmd;
 
-                uassert(4773100,
-                        "Delta oplog entries may not be used in FCV below 4.7",
-                        fcvVersion ==
-                                ServerGlobalParams::FeatureCompatibility::Version::kVersion47 ||
-                            (!fromApplyOpsCmd &&
-                             fcvVersion ==
-                                 ServerGlobalParams::FeatureCompatibility::Version::
-                                     kDowngradingFrom47To44));
+            // TODO SERVER-51075: Remove FCV checks for $v:2 delta oplog entries.
+            if (updateMod.type() == write_ops::UpdateModification::Type::kDelta) {
+                // If we are validating features as primary, only allow $v:2 delta entries if we are
+                // at FCV 4.7 or newer to prevent them from being written to the oplog.
+                if (serverGlobalParams.validateFeaturesAsPrimary.load()) {
+                    uassert(4773100,
+                            "Delta oplog entries may not be used in FCV below 4.7",
+                            serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+                                ServerGlobalParams::FeatureCompatibility::Version::kVersion47));
+                }
             }
 
             request.setUpdateModification(std::move(updateMod));
@@ -1679,9 +1712,9 @@ Status applyCommand_inlock(OperationContext* opCtx,
                 // an index may not have been built on a secondary when a command dropping it
                 // comes in.
                 //
-                // TODO(SERVER-46550): We should be able to enforce constraints on "dropDatabase"
-                // once we're no longer able to create databases on the primary without an oplog
-                // entry.
+                // We can never enforce constraints on "dropDatabase" because a database is an
+                // ephemeral entity that can be created or destroyed (if no collections exist)
+                // without an oplog entry.
                 if ((mode == OplogApplication::Mode::kSecondary &&
                      oplogApplicationEnforcesSteadyStateConstraints &&
                      status.code() != ErrorCodes::IndexNotFound && op->first != "dropDatabase") ||
@@ -1754,14 +1787,14 @@ void acquireOplogCollectionForLogging(OperationContext* opCtx) {
     }
 }
 
-void establishOplogCollectionForLogging(OperationContext* opCtx, const Collection* oplog) {
+void establishOplogCollectionForLogging(OperationContext* opCtx, const CollectionPtr& oplog) {
     invariant(opCtx->lockState()->isW());
     invariant(oplog);
     LocalOplogInfo::get(opCtx)->setCollection(oplog);
 }
 
 void signalOplogWaiters() {
-    auto oplog = LocalOplogInfo::get(getGlobalServiceContext())->getCollection();
+    const auto& oplog = LocalOplogInfo::get(getGlobalServiceContext())->getCollection();
     if (oplog) {
         oplog->getCappedCallback()->notifyCappedWaitersIfNeeded();
     }

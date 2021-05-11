@@ -43,9 +43,9 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
-#include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -67,13 +67,19 @@ void profile(OperationContext* opCtx, NetworkOp op) {
             opCtx, lockerInfo.stats, opCtx->lockState()->getFlowControlStats(), b);
     }
 
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    if (metricsCollector.hasCollectedMetrics()) {
+        BSONObjBuilder metricsBuilder = b.subobjStart("operationMetrics");
+        const auto& metrics = metricsCollector.getMetrics();
+        metrics.toFlatBsonAllFields(&metricsBuilder);
+        metricsBuilder.done();
+    }
+
     b.appendDate("ts", jsTime());
     b.append("client", opCtx->getClient()->clientAddress());
 
-    const auto& clientMetadata =
-        ClientMetadataIsMasterState::get(opCtx->getClient()).getClientMetadata();
-    if (clientMetadata) {
-        auto appName = clientMetadata.get().getApplicationName();
+    if (auto clientMetadata = ClientMetadata::get(opCtx->getClient())) {
+        auto appName = clientMetadata->getApplicationName();
         if (!appName.empty()) {
             b.append("appName", appName);
         }
@@ -130,8 +136,7 @@ void profile(OperationContext* opCtx, NetworkOp op) {
         EnforcePrepareConflictsBlock enforcePrepare(opCtx);
 
         uassertStatusOK(createProfileCollection(opCtx, db));
-        const Collection* const coll =
-            CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, dbProfilingNS);
+        auto coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, dbProfilingNS);
 
         invariant(!opCtx->shouldParticipateInFlowControl());
         WriteUnitOfWork wuow(opCtx);
@@ -160,7 +165,7 @@ Status createProfileCollection(OperationContext* opCtx, Database* db) {
     // collection creation would endlessly throw errors because the collection exists: must check
     // and see the collection exists in order to break free.
     return writeConflictRetry(opCtx, "createProfileCollection", dbProfilingNS.ns(), [&] {
-        const Collection* const collection =
+        const CollectionPtr collection =
             CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, dbProfilingNS);
         if (collection) {
             if (!collection->isCapped()) {

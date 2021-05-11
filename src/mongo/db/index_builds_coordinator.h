@@ -416,7 +416,7 @@ public:
      * Throws exception on error.
      */
     static void createIndexesOnEmptyCollection(OperationContext* opCtx,
-                                               UUID collectionUUID,
+                                               CollectionWriter& collection,
                                                const std::vector<BSONObj>& specs,
                                                bool fromMigrate);
 
@@ -434,7 +434,7 @@ public:
      * This function throws on error. Expects caller to have exclusive access to `collection`.
      */
     static std::vector<BSONObj> prepareSpecListForCreate(OperationContext* opCtx,
-                                                         const Collection* collection,
+                                                         const CollectionPtr& collection,
                                                          const NamespaceString& nss,
                                                          const std::vector<BSONObj>& indexSpecs);
 
@@ -451,7 +451,7 @@ public:
      * This function throws on error.
      */
     static std::vector<BSONObj> normalizeIndexSpecs(OperationContext* opCtx,
-                                                    const Collection* collection,
+                                                    const CollectionPtr& collection,
                                                     const std::vector<BSONObj>& indexSpecs);
 
     /**
@@ -461,19 +461,7 @@ public:
      *
      * Expects a lock to be held by the caller, so that 'collection' is safe to use.
      */
-    static int getNumIndexesTotal(OperationContext* opCtx, const Collection* collection);
-
-
-    /**
-     * Sets the index build action 'signal' for the index build pointed by 'replState'. Also, it
-     * cancels if there is any active remote 'voteCommitIndexBuild' command request callback handle
-     * for this index build.
-     */
-    virtual void setSignalAndCancelVoteRequestCbkIfActive(
-        WithLock ReplIndexBuildStateLk,
-        OperationContext* opCtx,
-        std::shared_ptr<ReplIndexBuildState> replState,
-        IndexBuildAction signal) = 0;
+    static int getNumIndexesTotal(OperationContext* opCtx, const CollectionPtr& collection);
 
     bool supportsResumableIndexBuilds() const;
 
@@ -597,7 +585,7 @@ protected:
      * Cleans up a single-phase index build after a failure.
      */
     void _cleanUpSinglePhaseAfterFailure(OperationContext* opCtx,
-                                         const Collection* collection,
+                                         const CollectionPtr& collection,
                                          std::shared_ptr<ReplIndexBuildState> replState,
                                          const IndexBuildOptions& indexBuildOptions,
                                          const Status& status);
@@ -606,19 +594,11 @@ protected:
      * Cleans up a two-phase index build after a failure.
      */
     void _cleanUpTwoPhaseAfterFailure(OperationContext* opCtx,
-                                      const Collection* collection,
+                                      const CollectionPtr& collection,
                                       std::shared_ptr<ReplIndexBuildState> replState,
                                       const IndexBuildOptions& indexBuildOptions,
                                       const Status& status);
 
-    /**
-     * Attempt to abort an index build. Returns a flag indicating how the caller should proceed.
-     */
-    enum class TryAbortResult { kRetry, kAlreadyAborted, kNotAborted, kContinueAbort };
-    TryAbortResult _tryAbort(OperationContext* opCtx,
-                             std::shared_ptr<ReplIndexBuildState> replState,
-                             IndexBuildAction signalAction,
-                             std::string reason);
     /**
      * Performs last steps of aborting an index build.
      */
@@ -631,7 +611,7 @@ protected:
                             Status reason);
     void _completeAbortForShutdown(OperationContext* opCtx,
                                    std::shared_ptr<ReplIndexBuildState> replState,
-                                   const Collection* collection);
+                                   const CollectionPtr& collection);
 
     /**
      * Waits for the last optime before the interceptors were installed on the node to be majority
@@ -661,7 +641,7 @@ protected:
      */
     void _insertSortedKeysIntoIndexForResume(OperationContext* opCtx,
                                              std::shared_ptr<ReplIndexBuildState> replState);
-    const Collection* _setUpForScanCollectionAndInsertSortedKeysIntoIndex(
+    CollectionPtr _setUpForScanCollectionAndInsertSortedKeysIntoIndex(
         OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState);
 
     /**
@@ -729,9 +709,6 @@ protected:
         OperationContext* opCtx,
         std::shared_ptr<ReplIndexBuildState> replState,
         const IndexBuildOptions& indexBuildOptions) = 0;
-
-    std::string _indexBuildActionToString(IndexBuildAction action);
-
 
     /**
      * Third phase is catching up on all the writes that occurred during the first two phases.

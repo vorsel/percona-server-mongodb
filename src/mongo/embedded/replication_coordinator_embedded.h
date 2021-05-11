@@ -139,7 +139,8 @@ public:
     void setMyHeartbeatMessage(const std::string&) override;
 
     repl::OpTime getMyLastAppliedOpTime() const override;
-    repl::OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime() const override;
+    repl::OpTimeAndWallTime getMyLastAppliedOpTimeAndWallTime(
+        bool rollbackSafe = false) const override;
 
     repl::OpTime getMyLastDurableOpTime() const override;
     repl::OpTimeAndWallTime getMyLastDurableOpTimeAndWallTime() const override;
@@ -207,7 +208,7 @@ public:
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) override;
 
-    Status processReplSetUpdatePosition(const repl::UpdatePositionArgs&, long long*) override;
+    Status processReplSetUpdatePosition(const repl::UpdatePositionArgs&) override;
 
     std::vector<HostAndPort> getHostsWrittenTo(const repl::OpTime&, bool) override;
 

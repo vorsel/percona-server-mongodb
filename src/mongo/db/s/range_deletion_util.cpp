@@ -83,7 +83,7 @@ MONGO_FAIL_POINT_DEFINE(throwInternalErrorInDeleteRange);
  * enqueued for deletion.
  */
 bool collectionUuidHasChanged(const NamespaceString& nss,
-                              const Collection* currentCollection,
+                              const CollectionPtr& currentCollection,
                               UUID expectedCollectionUuid) {
 
     if (!currentCollection) {
@@ -121,11 +121,11 @@ bool collectionUuidHasChanged(const NamespaceString& nss,
  * the range failed.
  */
 StatusWith<int> deleteNextBatch(OperationContext* opCtx,
-                                const Collection* collection,
+                                const CollectionPtr& collection,
                                 BSONObj const& keyPattern,
                                 ChunkRange const& range,
                                 int numDocsToRemovePerBatch) {
-    invariant(collection != nullptr);
+    invariant(collection);
 
     auto const& nss = collection->ns();
 
@@ -182,7 +182,7 @@ StatusWith<int> deleteNextBatch(OperationContext* opCtx,
     }
 
     auto exec = InternalPlanner::deleteWithIndexScan(opCtx,
-                                                     collection,
+                                                     &collection,
                                                      std::move(deleteStageParams),
                                                      descriptor,
                                                      min,
@@ -212,6 +212,9 @@ StatusWith<int> deleteNextBatch(OperationContext* opCtx,
         try {
             state = exec->getNext(&deletedObj, nullptr);
         } catch (const DBException& ex) {
+            auto&& explainer = exec->getPlanExplainer();
+            auto&& [stats, _] =
+                explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
             LOGV2_WARNING(23776,
                           "Cursor error while trying to delete {min} to {max} in {namespace}, "
                           "stats: {stats}, error: {error}",
@@ -219,7 +222,7 @@ StatusWith<int> deleteNextBatch(OperationContext* opCtx,
                           "min"_attr = redact(min),
                           "max"_attr = redact(max),
                           "namespace"_attr = nss,
-                          "stats"_attr = redact(exec->getStats()),
+                          "stats"_attr = redact(stats),
                           "error"_attr = redact(ex.toStatus()));
             throw;
         }
@@ -303,18 +306,21 @@ ExecutorFuture<void> deleteRangeInBatches(const std::shared_ptr<executor::TaskEx
                        ensureRangeDeletionTaskStillExists(opCtx, *migrationId);
                    }
 
-                   AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-                   auto* const collection = autoColl.getCollection();
+                   AutoGetCollection collection(opCtx, nss, MODE_IX);
 
                    // Ensure the collection exists and has not been dropped or dropped and
                    // recreated.
-                   uassert(ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist,
-                           "Collection has been dropped since enqueuing this range "
-                           "deletion task. No need to delete documents.",
-                           !collectionUuidHasChanged(nss, collection, collectionUuid));
+                   uassert(
+                       ErrorCodes::RangeDeletionAbandonedBecauseCollectionWithUUIDDoesNotExist,
+                       "Collection has been dropped since enqueuing this range "
+                       "deletion task. No need to delete documents.",
+                       !collectionUuidHasChanged(nss, collection.getCollection(), collectionUuid));
 
-                   auto numDeleted = uassertStatusOK(deleteNextBatch(
-                       opCtx, collection, keyPattern, range, numDocsToRemovePerBatch));
+                   auto numDeleted = uassertStatusOK(deleteNextBatch(opCtx,
+                                                                     collection.getCollection(),
+                                                                     keyPattern,
+                                                                     range,
+                                                                     numDocsToRemovePerBatch));
 
                    LOGV2_DEBUG(
                        23769,

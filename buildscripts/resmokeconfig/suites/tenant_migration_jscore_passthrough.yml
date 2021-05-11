@@ -67,7 +67,7 @@ executor:
         load('jstests/libs/override_methods/inject_tenant_prefix.js');
       global_vars:
         TestData: &TestData
-          dbPrefix: "tenantMigrationDbPrefix"
+          tenantId: "tenantMigrationTenantId"
           # TODO (SERVER-50494): Implement proxy's retry logic for batch write commands.
           disableBatchWrites: true
       readMode: commands
@@ -83,19 +83,21 @@ executor:
   - class: CheckReplDBHash
   - class: ValidateCollections
   - class: CleanEveryN
-    # TODO (SERVER-49204): The ContinuousTenantMigration hook reuses TestData.dbPrefix hook for all
+    # TODO (SERVER-49204): The ContinuousTenantMigration hook reuses TestData.tenantId hook for all
     # migrations. Therefore, it needs to run the donorForgetMigration command after each migration
     # (i.e. test) in order to make the subsequent migration not conflict with the one run by the
     # previous test. Until we have the donorForgetMigration command, we need to specify n: 1 to
     # clear the in-memory and persisted state for each migration.
     n: 1
   fixture:
-    class: ReplicaSetFixture
+    class: TenantMigrationFixture
     mongod_options:
       set_parameters:
         enableTestCommands: 1
         enableTenantMigrations: true
-        failpoint.skipSendingRecipientSyncDataCommand:
-          mode: alwaysOn
-    num_nodes: 3
+        # TODO SERVER-51734: Remove the failpoint 'returnResponseOkForRecipientSyncDataCmd'.
+        failpoint.returnResponseOkForRecipientSyncDataCmd:
+            mode: alwaysOn
+    num_replica_sets: 2
+    num_nodes_per_replica_set: 3
     use_replica_set_connection_string: true

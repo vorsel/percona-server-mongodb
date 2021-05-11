@@ -169,6 +169,10 @@ public:
                                     const CollectionOptions& options,
                                     KVPrefix prefix) override;
 
+    Status importRecordStore(OperationContext* opCtx,
+                             StringData ident,
+                             const BSONObj& storageMetadata) override;
+
     std::unique_ptr<RecordStore> getGroupedRecordStore(OperationContext* opCtx,
                                                        StringData ns,
                                                        StringData ident,
@@ -181,6 +185,10 @@ public:
                                             const IndexDescriptor* desc,
                                             KVPrefix prefix) override;
 
+    Status importSortedDataInterface(OperationContext* opCtx,
+                                     StringData ident,
+                                     const BSONObj& storageMetadata) override;
+
     /**
      * Drops the specified ident for resumable index builds.
      */
@@ -191,7 +199,9 @@ public:
                                                                        const IndexDescriptor* desc,
                                                                        KVPrefix prefix) override;
 
-    Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) override;
+    Status dropIdent(RecoveryUnit* ru, StringData ident) override;
+
+    void dropIdentForImport(OperationContext* opCtx, StringData ident) override;
 
     void keydbDropDatabase(const std::string& db) override;
 
@@ -484,7 +494,6 @@ private:
     std::string _rsOptions;
     std::string _indexOptions;
 
-    mutable Mutex _dropAllQueuesMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::_dropAllQueuesMutex");
     mutable Mutex _identToDropMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::_identToDropMutex");
     std::list<std::string> _identToDrop;
 

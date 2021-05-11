@@ -2,7 +2,7 @@
  * Tests that the donor retries its steps until success, or it gets an error that should lead to
  * an abort decision.
  *
- * @tags: [requires_fcv_47, incompatible_with_eft]
+ * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft]
  */
 
 (function() {
@@ -13,12 +13,12 @@ load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
 load("jstests/replsets/libs/tenant_migration_util.js");
 
-const kDBPrefix = "testDb";
+const kTenantId = "testTenantId";
 let testNum = 0;
 const kConfigDonorsNS = "config.tenantMigrationDonors";
 
-function makeDbPrefix() {
-    return kDBPrefix + testNum++;
+function makeTenantId() {
+    return kTenantId + testNum++;
 }
 
 /**
@@ -38,7 +38,7 @@ function testMigrationAbortsOnRecipientSyncDataCmdError(
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(migrationId),
         recipientConnString: recipientRst.getURL(),
-        dbPrefix: kDBPrefix + makeDbPrefix(),
+        tenantId: kTenantId + makeTenantId(),
         readPreference: {mode: "primary"},
     };
 
@@ -63,7 +63,9 @@ function testMigrationAbortsOnRecipientSyncDataCmdError(
     fp.off();
 
     migrationThread.join();
-    assert.commandFailedWithCode(migrationThread.returnData(), ErrorCodes.TenantMigrationAborted);
+    const res = assert.commandWorked(migrationThread.returnData());
+    assert.eq(res.state, "aborted");
+    assert.eq(res.abortReason.code, errorCode);
 
     return migrationId;
 }
@@ -85,7 +87,7 @@ function testMigrationAbortsOnRecipientForgetMigrationCmdError(donorRst, recipie
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(migrationId),
         recipientConnString: recipientRst.getURL(),
-        dbPrefix: makeDbPrefix(),
+        tenantId: makeTenantId(),
         readPreference: {mode: "primary"},
     };
 
@@ -117,8 +119,17 @@ function testMigrationAbortsOnRecipientForgetMigrationCmdError(donorRst, recipie
 
 const donorRst = new ReplSetTest(
     {nodes: 1, name: "donorRst", nodeOptions: {setParameter: {enableTenantMigrations: true}}});
-const recipientRst = new ReplSetTest(
-    {nodes: 1, name: "recipientRst", nodeOptions: {setParameter: {enableTenantMigrations: true}}});
+const recipientRst = new ReplSetTest({
+    nodes: 1,
+    name: "recipientRst",
+    nodeOptions: {
+        setParameter: {
+            enableTenantMigrations: true,
+            // TODO SERVER-51734: Remove the failpoint 'returnResponseOkForRecipientSyncDataCmd'.
+            'failpoint.returnResponseOkForRecipientSyncDataCmd': tojson({mode: 'alwaysOn'})
+        }
+    }
+});
 
 donorRst.startSet();
 donorRst.initiate();
@@ -207,7 +218,7 @@ const kWriteErrorTimeMS = 50;
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(migrationId),
         recipientConnString: recipientRst.getURL(),
-        dbPrefix: makeDbPrefix(),
+        tenantId: makeTenantId(),
         readPreference: {mode: "primary"},
     };
 
@@ -238,7 +249,7 @@ const kWriteErrorTimeMS = 50;
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(migrationId),
         recipientConnString: recipientRst.getURL(),
-        dbPrefix: kDBPrefix + "RetryOnStateDocUpdateError",
+        tenantId: kTenantId + "RetryOnStateDocUpdateError",
         readPreference: {mode: "primary"},
     };
 
@@ -250,22 +261,19 @@ const kWriteErrorTimeMS = 50;
                                 },
                                 {skip: Math.floor(Math.random() * kTotalStateDocUpdates)});
 
-    let startMigrationThread =
-        new Thread(TenantMigrationUtil.startMigration, donorPrimary.host, migrationOpts);
-    let forgetMigrationThread = new Thread(
-        TenantMigrationUtil.forgetMigration, donorPrimary.host, migrationOpts.migrationIdString);
-    startMigrationThread.start();
-    forgetMigrationThread.start();
+    let migrationThread = new Thread((donorPrimaryHost, migrationOpts) => {
+        load("jstests/replsets/libs/tenant_migration_util.js");
+        assert.commandWorked(TenantMigrationUtil.startMigration(donorPrimaryHost, migrationOpts));
+        assert.commandWorked(
+            TenantMigrationUtil.forgetMigration(donorPrimaryHost, migrationOpts.migrationIdString));
+    }, donorPrimary.host, migrationOpts);
+    migrationThread.start();
 
     // Make the update keep failing for some time.
     fp.wait();
     sleep(kWriteErrorTimeMS);
     fp.off();
-
-    startMigrationThread.join();
-    forgetMigrationThread.join();
-    assert.commandWorked(startMigrationThread.returnData());
-    assert.commandWorked(forgetMigrationThread.returnData());
+    migrationThread.join();
 
     const configDonorsColl = donorPrimary.getCollection(kConfigDonorsNS);
     const donorStateDoc = configDonorsColl.findOne({_id: migrationId});

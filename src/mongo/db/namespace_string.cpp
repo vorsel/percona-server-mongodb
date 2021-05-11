@@ -102,6 +102,8 @@ const NamespaceString NamespaceString::kConfigSettingsNamespace(NamespaceString:
 const NamespaceString NamespaceString::kVectorClockNamespace(NamespaceString::kConfigDb,
                                                              "vectorClock");
 
+const NamespaceString NamespaceString::kReshardingApplierProgressNamespace(
+    NamespaceString::kConfigDb, "localReshardingOperations.recipient.progress_applier");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
@@ -126,6 +128,8 @@ bool NamespaceString::isLegalClientSystemNS() const {
             return true;
         if (coll() == kIndexBuildEntryNamespace.coll())
             return true;
+        if (coll().find(".system.resharding.") != std::string::npos)
+            return true;
     } else if (db() == kLocalDb) {
         if (coll() == kSystemReplSetNamespace.coll())
             return true;
@@ -140,7 +144,6 @@ bool NamespaceString::isLegalClientSystemNS() const {
     if (coll() == kSystemDotViewsCollectionName)
         return true;
     if (isTemporaryReshardingCollection()) {
-        // Permit integration testing on resharding collections.
         return true;
     }
 

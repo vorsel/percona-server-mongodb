@@ -42,7 +42,6 @@ enums:
         values:
             kUnused: "unused"
             kInitializing: "initializing"
-            kInitialized: "initialized"
             kPreparingToDonate: "preparing-to-donate"
             kCloning: "cloning"
             kMirroring: "mirroring"
@@ -69,8 +68,7 @@ enums:
         type: string
         values:
             kUnused: "unused"
-            kInitializing: "initializing"
-            kInitialized: "initialized"
+            kCreatingCollection: "creating-collection"
             kCloning: "cloning"
             kApplying: "applying"
             kSteadyState: "steady-state"
@@ -95,7 +93,7 @@ structs:
                 type: uuid
                 description: "The UUID of the original collection being resharded."
             reshardingKey:
-                type: object
+                type: object_owned
                 description: "The index specification document to use as the new shard key."
 
     MinFetchTimestamp:

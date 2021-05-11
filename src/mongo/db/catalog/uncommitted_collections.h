@@ -69,8 +69,10 @@ public:
         return std::weak_ptr<UncommittedCollectionsMap>(_resourcesPtr);
     }
 
-    std::shared_ptr<UncommittedCollectionsMap> shareResources() {
-        return _resourcesPtr;
+    std::shared_ptr<UncommittedCollectionsMap> releaseResources() {
+        auto ret = std::move(_resourcesPtr);
+        _resourcesPtr = std::make_shared<UncommittedCollectionsMap>();
+        return ret;
     }
 
     void receiveResources(std::shared_ptr<UncommittedCollectionsMap> resources) {
@@ -101,7 +103,7 @@ public:
      * entries for the collection identified by `uuid` to UncommittedCollections. This function
      * assumes `commit` has previously been called for `uuid`.
      */
-    static void rollback(ServiceContext* svcCtx,
+    static void rollback(OperationContext* opCtx,
                          CollectionUUID uuid,
                          UncommittedCollectionsMap* map);
 

@@ -293,6 +293,17 @@ void WiredTigerRecoveryUnit::assertInActiveTxn() const {
                 "currentState"_attr = _getState());
 }
 
+void WiredTigerRecoveryUnit::setTxnModified() {
+    if (_multiTimestampConstraintTracker.isTxnModified) {
+        return;
+    }
+
+    _multiTimestampConstraintTracker.isTxnModified = true;
+    if (!_lastTimestampSet) {
+        _multiTimestampConstraintTracker.txnHasNonTimestampedWrite = true;
+    }
+}
+
 boost::optional<int64_t> WiredTigerRecoveryUnit::getOplogVisibilityTs() {
     if (!_isOplogReader) {
         return boost::none;
@@ -334,8 +345,66 @@ void WiredTigerRecoveryUnit::preallocateSnapshot() {
     getSession();
 }
 
+void WiredTigerRecoveryUnit::preallocateSnapshotForOplogRead() {
+    // Indicate that we are an oplog reader before opening the snapshot
+    setIsOplogReader();
+    preallocateSnapshot();
+}
+
+void WiredTigerRecoveryUnit::refreshSnapshot() {
+    // First, start a new transaction at the same timestamp as the current one.  Then end the
+    // current transaction.  This overlap will prevent WT from cleaning up history required to serve
+    // the read timestamp.
+
+    // Currently, this code only works for kNoOverlap or kNoTimestamp.
+    invariant(_timestampReadSource == ReadSource::kNoOverlap ||
+              _timestampReadSource == ReadSource::kNoTimestamp);
+    invariant(_isActive());
+    invariant(!_inUnitOfWork());
+    invariant(!_noEvictionAfterRollback);
+
+    auto newSession = _sessionCache->getSession();
+    WiredTigerBeginTxnBlock txnOpen(newSession->getSession(),
+                                    _prepareConflictBehavior,
+                                    _roundUpPreparedTimestamps,
+                                    RoundUpReadTimestamp::kNoRoundForce);
+    if (_timestampReadSource != ReadSource::kNoTimestamp) {
+        auto status = txnOpen.setReadSnapshot(_readAtTimestamp);
+        fassert(5035300, status);
+    }
+    txnOpen.done();
+
+    // Now end the previous transaction.
+    auto wtSession = _session->getSession();
+    auto wtRet = wtSession->rollback_transaction(wtSession, nullptr);
+    invariantWTOK(wtRet);
+    LOGV2_DEBUG(5035301,
+                3,
+                "WT begin_transaction & rollback_transaction",
+                "snapshotId"_attr = getSnapshotId().toNumber());
+
+    _session = std::move(newSession);
+}
+
 void WiredTigerRecoveryUnit::_txnClose(bool commit) {
     invariant(_isActive(), toString(_getState()));
+
+    if (!_multiTimestampConstraintTracker.ignoreAllMultiTimestampConstraints &&
+        _multiTimestampConstraintTracker.txnHasNonTimestampedWrite &&
+        _multiTimestampConstraintTracker.timestampOrder.size() >= 2) {
+        // The first write in this transaction was not timestamped. Other writes have used at least
+        // two different timestamps. This violates the multi timestamp constraint where if a
+        // transaction sets multiple timestamps, the first timestamp must be set prior to any
+        // writes. Vice-versa, if a transaction writes a document before setting a timestamp, it
+        // must not set multiple timestamps.
+        LOGV2_FATAL(
+            4877100,
+            "Multi timestamp constraint violated. Transactions setting multiple timestamps "
+            "must set the first timestamp prior to any writes.",
+            "numTimestampsUsed"_attr = _multiTimestampConstraintTracker.timestampOrder.size(),
+            "lastSetTimestamp"_attr = _multiTimestampConstraintTracker.timestampOrder.top());
+    }
+
     WT_SESSION* s = _session->getSession();
     if (_timer) {
         const int transactionTime = _timer->millis();
@@ -416,7 +485,7 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
     // transaction on a RecoveryUnit to call setTimestamp() and another to call
     // setCommitTimestamp().
     _lastTimestampSet = boost::none;
-
+    _multiTimestampConstraintTracker = MultiTimestampConstraintTracker();
     _prepareTimestamp = Timestamp();
     _durableTimestamp = Timestamp();
     _catalogConflictTimestamp = Timestamp();
@@ -696,6 +765,16 @@ Timestamp WiredTigerRecoveryUnit::_getTransactionReadTimestamp(WT_SESSION* sessi
     return Timestamp(read_timestamp);
 }
 
+void WiredTigerRecoveryUnit::_updateMultiTimestampConstraint(Timestamp timestamp) {
+    std::stack<Timestamp>& timestampOrder = _multiTimestampConstraintTracker.timestampOrder;
+    if (!timestampOrder.empty() && timestampOrder.top() == timestamp) {
+        // We're still on the same timestamp.
+        return;
+    }
+
+    timestampOrder.push(timestamp);
+}
+
 Status WiredTigerRecoveryUnit::setTimestamp(Timestamp timestamp) {
     _ensureSession();
     LOGV2_DEBUG(22415,
@@ -713,6 +792,7 @@ Status WiredTigerRecoveryUnit::setTimestamp(Timestamp timestamp) {
                             << " cannot be older than read timestamp "
                             << _readAtTimestamp.toString());
 
+    _updateMultiTimestampConstraint(timestamp);
     _lastTimestampSet = timestamp;
 
     // Starts the WT transaction associated with this session.

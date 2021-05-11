@@ -178,7 +178,7 @@ void IndexScanStage::open(bool reOpen) {
     _open = true;
     _firstGetNext = true;
 
-    if (auto collection = _coll->getCollection()) {
+    if (const auto& collection = _coll->getCollection()) {
         auto indexCatalog = collection->getIndexCatalog();
         auto indexDesc = indexCatalog->findIndexByName(_opCtx, _indexName);
         if (indexDesc) {
@@ -270,7 +270,7 @@ PlanState IndexScanStage::getNext() {
 
     if (_recordAccessor) {
         _recordAccessor->reset(value::TypeTags::ksValue,
-                               value::bitcastFrom(&_nextRecord->keyString));
+                               value::bitcastFrom<KeyString::Value*>(&_nextRecord->keyString));
     }
 
     if (_recordIdAccessor) {
@@ -314,19 +314,15 @@ const SpecificStats* IndexScanStage::getSpecificStats() const {
 }
 
 std::vector<DebugPrinter::Block> IndexScanStage::debugPrint() const {
-    std::vector<DebugPrinter::Block> ret;
+    auto ret = PlanStage::debugPrint();
 
     if (_seekKeySlotLow) {
-        DebugPrinter::addKeyword(ret, "ixseek");
 
         DebugPrinter::addIdentifier(ret, _seekKeySlotLow.get());
         if (_seekKeySlotHi) {
             DebugPrinter::addIdentifier(ret, _seekKeySlotHi.get());
         }
-    } else {
-        DebugPrinter::addKeyword(ret, "ixscan");
     }
-
     if (_recordSlot) {
         DebugPrinter::addIdentifier(ret, _recordSlot.get());
     }

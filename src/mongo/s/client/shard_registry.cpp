@@ -107,10 +107,15 @@ void ShardRegistry::init(ServiceContext* service) {
     _cache =
         std::make_unique<Cache>(_cacheMutex, _service, _threadPool, lookupFn, 1 /* cacheSize */);
 
+    LOGV2_DEBUG(5123000,
+                1,
+                "Initializing ShardRegistry",
+                "configServers"_attr = _initConfigServerCS.toString());
     {
         stdx::lock_guard<Latch> lk(_mutex);
         _configShardData = ShardRegistryData::createWithConfigShardOnly(
             _shardFactory->createShard(kConfigServerShardId, _initConfigServerCS));
+        _latestConnStrings[_initConfigServerCS.getSetName()] = _initConfigServerCS;
     }
 
     _isInitialized.store(true);
@@ -189,6 +194,7 @@ ShardRegistry::Cache::LookupResult ShardRegistry::_lookup(OperationContext* opCt
 
         auto name = shard->getConnString().getSetName();
         ReplicaSetMonitor::remove(name);
+        _removeReplicaSet(name);
         for (auto& callback : _shardRemovalHooks) {
             // Run callbacks asynchronously.
             // TODO SERVER-50906: Consider running these callbacks synchronously.
@@ -370,23 +376,46 @@ ShardRegistry::_getLatestConnStrings() const {
     return {{_latestConnStrings.begin(), _latestConnStrings.end()}, _rsmIncrement.load()};
 }
 
-void ShardRegistry::updateReplSetHosts(const ConnectionString& newConnString) {
-    invariant(newConnString.type() == ConnectionString::SET ||
-              newConnString.type() == ConnectionString::CUSTOM);  // For dbtests
+void ShardRegistry::_removeReplicaSet(const std::string& setName) {
+    stdx::lock_guard<Latch> lk(_mutex);
+    _latestConnStrings.erase(setName);
+}
+
+void ShardRegistry::updateReplSetHosts(const ConnectionString& givenConnString,
+                                       ConnectionStringUpdateType updateType) {
+    invariant(givenConnString.type() == ConnectionString::SET ||
+              givenConnString.type() == ConnectionString::CUSTOM);  // For dbtests
+
+    auto setName = givenConnString.getSetName();
 
     stdx::lock_guard<Latch> lk(_mutex);
-    if (auto shard = _configShardData.findByRSName(newConnString.getSetName())) {
+
+    ConnectionString newConnString = (updateType == ConnectionStringUpdateType::kPossible &&
+                                      _latestConnStrings.find(setName) != _latestConnStrings.end())
+        ? _latestConnStrings[setName].makeUnionWith(givenConnString)
+        : givenConnString;
+
+    LOGV2_DEBUG(5123001,
+                1,
+                "Updating ShardRegistry connection string",
+                "updateType"_attr =
+                    updateType == ConnectionStringUpdateType::kPossible ? "possible" : "confirmed",
+                "currentConnString"_attr = _latestConnStrings[setName].toString(),
+                "givenConnString"_attr = givenConnString.toString(),
+                "newConnString"_attr = newConnString.toString());
+
+    _latestConnStrings[setName] = newConnString;
+
+    if (auto shard = _configShardData.findByRSName(setName)) {
         auto newData = ShardRegistryData::createFromExisting(
             _configShardData, newConnString, _shardFactory.get());
         _configShardData = newData;
 
     } else {
-        // Stash the new connection string and bump the RSM increment.
-        _latestConnStrings[newConnString.getSetName()] = newConnString;
         auto value = _rsmIncrement.addAndFetch(1);
         LOGV2_DEBUG(4620252,
                     2,
-                    "ShardRegistry stashed new connection string",
+                    "Incrementing the RSM timestamp after receiving updated connection string",
                     "newConnString"_attr = newConnString,
                     "newRSMIncrement"_attr = value);
     }
@@ -599,7 +628,7 @@ std::shared_ptr<Shard> ShardRegistry::_getShardForRSNameNoReload(const std::stri
 
 ShardRegistryData ShardRegistryData::createWithConfigShardOnly(std::shared_ptr<Shard> configShard) {
     ShardRegistryData data;
-    data._addShard(configShard, true);
+    data._addShard(configShard);
     return data;
 }
 
@@ -666,7 +695,7 @@ std::pair<ShardRegistryData, Timestamp> ShardRegistryData::createFromCatalogClie
         auto shard = shardFactory->createShard(std::move(std::get<0>(shardInfo)),
                                                std::move(std::get<1>(shardInfo)));
 
-        data._addShard(std::move(shard), false);
+        data._addShard(std::move(shard));
     }
     return {data, maxTopologyTime};
 }
@@ -712,7 +741,7 @@ ShardRegistryData ShardRegistryData::createFromExisting(const ShardRegistryData&
     }
     invariant(it->second);
     auto updatedShard = shardFactory->createShard(it->second->getId(), newConnString);
-    data._addShard(updatedShard, true);
+    data._addShard(updatedShard);
 
     return data;
 }
@@ -780,30 +809,16 @@ void ShardRegistryData::getAllShardIds(std::set<ShardId>& seen) const {
     }
 }
 
-void ShardRegistryData::_addShard(std::shared_ptr<Shard> shard, bool useOriginalCS) {
+void ShardRegistryData::_addShard(std::shared_ptr<Shard> shard) {
     const ShardId shardId = shard->getId();
-
-    const ConnectionString connString =
-        useOriginalCS ? shard->originalConnString() : shard->getConnString();
+    const ConnectionString connString = shard->getConnString();
 
     auto currentShard = findShard(shardId);
     if (currentShard) {
-        auto oldConnString = currentShard->originalConnString();
-
-        if (oldConnString.toString() != connString.toString()) {
-            LOGV2(22732,
-                  "Updating shard registry connection string for shard {shardId} to "
-                  "{newShardConnectionString} from {oldShardConnectionString}",
-                  "Updating shard connection string on shard registry",
-                  "shardId"_attr = currentShard->getId(),
-                  "newShardConnectionString"_attr = connString,
-                  "oldShardConnectionString"_attr = oldConnString);
-        }
-
-        for (const auto& host : oldConnString.getServers()) {
+        for (const auto& host : connString.getServers()) {
             _hostLookup.erase(host);
         }
-        _connStringLookup.erase(oldConnString);
+        _connStringLookup.erase(connString);
     }
 
     _shardIdLookup[shard->getId()] = shard;

@@ -35,6 +35,7 @@
 #include <boost/algorithm/string.hpp>
 #include <pcrecpp.h>
 
+#include "mongo/bson/oid.h"
 #include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/query/datetime/date_time_support.h"
@@ -98,6 +99,7 @@ int Instruction::stackOffset[Instruction::Tags::lastInstruction] = {
     0,  // isNumber
     0,  // isBinData
     0,  // isDate
+    0,  // isNaN
     0,  // typeMatch
 
     0,  // function is special, the stack offset is encoded in the instruction itself
@@ -320,6 +322,10 @@ void CodeFragment::appendIsDate() {
     appendSimpleInstruction(Instruction::isDate);
 }
 
+void CodeFragment::appendIsNaN() {
+    appendSimpleInstruction(Instruction::isNaN);
+}
+
 void CodeFragment::appendTypeMatch(uint32_t typeMask) {
     Instruction i;
     i.tag = Instruction::typeMatch;
@@ -411,7 +417,6 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::getField(value::TypeTa
     } else if (objTag == value::TypeTags::bsonObject) {
         auto be = value::bitcastTo<const char*>(objValue);
         auto end = be + ConstDataView(be).read<LittleEndian<uint32_t>>();
-        ;
         // Skip document length.
         be += 4;
         while (*be != 0) {
@@ -432,51 +437,92 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::getElement(value::Type
                                                                      value::Value arrValue,
                                                                      value::TypeTags idxTag,
                                                                      value::Value idxValue) {
-    if (arrTag != value::TypeTags::Array && arrTag != value::TypeTags::bsonArray) {
+    // We need to ensure that 'size_t' is wide enough to store 32-bit index.
+    static_assert(sizeof(size_t) >= sizeof(int32_t), "size_t must be at least 32-bits");
+
+    if (!value::isArray(arrTag)) {
         return {false, value::TypeTags::Nothing, 0};
     }
 
-    // Bail out if the `idx` parameter isn't a number, or if it can't be converted to a 64-bit
-    // integer, or if it's outside of the range where the `lhsTag` type can represent consecutive
-    // integers precisely.
-    auto [numTag, numVal] = genericNumConvertToPreciseInt64(idxTag, idxValue);
-    if (numTag != value::TypeTags::NumberInt64) {
+    if (idxTag != value::TypeTags::NumberInt32) {
         return {false, value::TypeTags::Nothing, 0};
     }
-    int64_t numInt64 = value::bitcastTo<int64_t>(numVal);
-    // Cast the `idx` parameter to size_t. Bail out if its negative or if it's too big for size_t.
-    if (numInt64 < 0 ||
-        (sizeof(size_t) < sizeof(int64_t) &&
-         numInt64 > static_cast<int64_t>(std::numeric_limits<size_t>::max()))) {
-        return {false, value::TypeTags::Nothing, 0};
+
+    const auto idxInt32 = value::bitcastTo<int32_t>(idxValue);
+    const bool isNegative = idxInt32 < 0;
+
+    size_t idx = 0;
+    if (isNegative) {
+        // Upcast 'idxInt32' to 'int64_t' prevent overflow during the sign change.
+        idx = static_cast<size_t>(-static_cast<int64_t>(idxInt32));
+    } else {
+        idx = static_cast<size_t>(idxInt32);
     }
-    size_t idx = static_cast<size_t>(numInt64);
 
     if (arrTag == value::TypeTags::Array) {
         // If `arr` is an SBE array, use Array::getAt() to retrieve the element at index `idx`.
-        auto [tag, val] = value::getArrayView(arrValue)->getAt(idx);
-        return {false, tag, val};
-    } else if (arrTag == value::TypeTags::bsonArray) {
-        // If `arr` is a BSON array, loop over the elements until we reach the idx-th element.
-        auto be = value::bitcastTo<const char*>(arrValue);
-        auto end = be + ConstDataView(be).read<LittleEndian<uint32_t>>();
-        // Skip document length.
-        be += 4;
-        // The field names of an array are always be 0 thru N-1 in order. Therefore we don't need to
-        // inspect the field names (aside from determining their length so we can skip over them).
-        for (size_t currentIdx = 0; *be != 0; ++currentIdx) {
-            size_t fieldNameLength = strlen(be + 1);
-            if (currentIdx == idx) {
-                auto [tag, val] = bson::convertFrom(true, be, end, fieldNameLength);
-                return {false, tag, val};
+        auto arrayView = value::getArrayView(arrValue);
+
+        size_t convertedIdx = idx;
+        if (isNegative) {
+            if (idx > arrayView->size()) {
+                return {false, value::TypeTags::Nothing, 0};
             }
-            be = bson::advance(be, fieldNameLength);
+            convertedIdx = arrayView->size() - idx;
         }
-        // If the array didn't have an element at index `idx`, return Nothing.
-        return {false, value::TypeTags::Nothing, 0};
+
+        auto [tag, val] = value::getArrayView(arrValue)->getAt(convertedIdx);
+        return {false, tag, val};
+    } else if (arrTag == value::TypeTags::bsonArray || arrTag == value::TypeTags::ArraySet) {
+        value::ArrayEnumerator enumerator(arrTag, arrValue);
+
+        if (!isNegative) {
+            // Loop through array until we meet element at position 'idx'.
+            size_t i = 0;
+            while (i < idx && !enumerator.atEnd()) {
+                i++;
+                enumerator.advance();
+            }
+            // If the array didn't have an element at index `idx`, return Nothing.
+            if (enumerator.atEnd()) {
+                return {false, value::TypeTags::Nothing, 0};
+            }
+            auto [tag, val] = enumerator.getViewOfValue();
+            return {false, tag, val};
+        }
+
+        // For negative indexes we use two pointers approach. We start two array enumerators at the
+        // distance of 'idx' and move them at the same time. Once one of the enumerators reaches the
+        // end of the array, the second one points to the element at position '-idx'.
+        //
+        // First, move one of the enumerators 'idx' elements forward.
+        size_t i = 0;
+        while (i < idx && !enumerator.atEnd()) {
+            enumerator.advance();
+            i++;
+        }
+
+        if (i != idx) {
+            // Array is too small to have an element at the requested index.
+            return {false, value::TypeTags::Nothing, 0};
+        }
+
+        // Initiate second enumerator at the start of the array. Now the distance between
+        // 'enumerator' and 'windowEndEnumerator' is exactly 'idx' elements. Move both enumerators
+        // until the first one reaches the end of the array.
+        value::ArrayEnumerator windowEndEnumerator(arrTag, arrValue);
+        while (!enumerator.atEnd() && !windowEndEnumerator.atEnd()) {
+            enumerator.advance();
+            windowEndEnumerator.advance();
+        }
+        invariant(enumerator.atEnd());
+        invariant(!windowEndEnumerator.atEnd());
+
+        auto [tag, val] = windowEndEnumerator.getViewOfValue();
+        return {false, tag, val};
     } else {
-        // Earlier in this function we bailed out if the `arrTag` wasn't Array or bsonArray, so it
-        // should be impossible to reach this point.
+        // Earlier in this function we bailed out if the `arrTag` wasn't Array, ArraySet or
+        // bsonArray, so it should be impossible to reach this point.
         MONGO_UNREACHABLE
     }
 }
@@ -494,7 +540,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::aggSum(value::TypeTags
     // Initialize the accumulator.
     if (accTag == value::TypeTags::Nothing) {
         accTag = value::TypeTags::NumberInt64;
-        accValue = 0;
+        accValue = value::bitcastFrom<int64_t>(0);
     }
 
     return genericAdd(accTag, accValue, fieldTag, fieldValue);
@@ -517,7 +563,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::aggMin(value::TypeTags
     }
 
     auto [tag, val] = genericCompare<std::less<>>(accTag, accValue, fieldTag, fieldValue);
-    if (tag == value::TypeTags::Boolean && val) {
+    if (tag == value::TypeTags::Boolean && value::bitcastTo<bool>(val)) {
         auto [tag, val] = value::copyValue(accTag, accValue);
         return {true, tag, val};
     } else {
@@ -543,7 +589,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::aggMax(value::TypeTags
     }
 
     auto [tag, val] = genericCompare<std::greater<>>(accTag, accValue, fieldTag, fieldValue);
-    if (tag == value::TypeTags::Boolean && val) {
+    if (tag == value::TypeTags::Boolean && value::bitcastTo<bool>(val)) {
         auto [tag, val] = value::copyValue(accTag, accValue);
         return {true, tag, val};
     } else {
@@ -665,7 +711,6 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDropFields(uint
     if (tagInObj == value::TypeTags::bsonObject) {
         auto be = value::bitcastTo<const char*>(valInObj);
         auto end = be + ConstDataView(be).read<LittleEndian<uint32_t>>();
-        ;
         // Skip document length.
         be += 4;
         while (*be != 0) {
@@ -793,7 +838,9 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinNewKeyString(ui
 
     kb.appendDiscriminator(static_cast<KeyString::Discriminator>(discrimNum));
 
-    return {true, value::TypeTags::ksValue, value::bitcastFrom(new KeyString::Value(kb.release()))};
+    return {true,
+            value::TypeTags::ksValue,
+            value::bitcastFrom<KeyString::Value*>(new KeyString::Value(kb.release()))};
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinAbs(uint8_t arity) {
@@ -802,6 +849,54 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinAbs(uint8_t ari
     auto [_, tagOperand, valOperand] = getFromStack(0);
 
     return genericAbs(tagOperand, valOperand);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinCeil(uint8_t arity) {
+    invariant(arity == 1);
+
+    auto [_, tagOperand, valOperand] = getFromStack(0);
+
+    return genericCeil(tagOperand, valOperand);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinFloor(uint8_t arity) {
+    invariant(arity == 1);
+
+    auto [_, tagOperand, valOperand] = getFromStack(0);
+
+    return genericFloor(tagOperand, valOperand);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinExp(uint8_t arity) {
+    invariant(arity == 1);
+
+    auto [_, tagOperand, valOperand] = getFromStack(0);
+
+    return genericExp(tagOperand, valOperand);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinLn(uint8_t arity) {
+    invariant(arity == 1);
+
+    auto [_, tagOperand, valOperand] = getFromStack(0);
+
+    return genericLn(tagOperand, valOperand);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinLog10(uint8_t arity) {
+    invariant(arity == 1);
+
+    auto [_, tagOperand, valOperand] = getFromStack(0);
+
+    return genericLog10(tagOperand, valOperand);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinSqrt(uint8_t arity) {
+    invariant(arity == 1);
+
+    auto [_, tagOperand, valOperand] = getFromStack(0);
+
+    return genericSqrt(tagOperand, valOperand);
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinAddToArray(uint8_t arity) {
@@ -874,7 +969,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinRegexMatch(uint
     auto pcreRegex = value::getPcreRegexView(valuePcreRegex);
     auto regexMatchResult = pcreRegex->PartialMatch(pcreStringView);
 
-    return {false, value::TypeTags::Boolean, regexMatchResult};
+    return {false, value::TypeTags::Boolean, value::bitcastFrom<bool>(regexMatchResult)};
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDoubleDoubleSum(uint8_t arity) {
@@ -916,7 +1011,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDoubleDoubleSum
             }
         }
         if (haveDate) {
-            return {false, value::TypeTags::Date, value::bitcastFrom(sum.toLong())};
+            return {false, value::TypeTags::Date, value::bitcastFrom<int64_t>(sum.toLong())};
         } else {
             auto [tag, val] = value::makeCopyDecimal(sum);
             return {true, tag, val};
@@ -937,27 +1032,31 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDoubleDoubleSum
         }
         if (haveDate) {
             uassert(ErrorCodes::Overflow, "date overflow in $add", sum.fitsLong());
-            return {false, value::TypeTags::Date, value::bitcastFrom(sum.getLong())};
+            return {false, value::TypeTags::Date, value::bitcastFrom<int64_t>(sum.getLong())};
         } else {
             switch (resultTag) {
                 case value::TypeTags::NumberInt32: {
                     auto result = sum.getLong();
                     if (sum.fitsLong() && result >= std::numeric_limits<int32_t>::min() &&
                         result <= std::numeric_limits<int32_t>::max()) {
-                        return {false, value::TypeTags::NumberInt32, value::bitcastFrom(result)};
+                        return {false,
+                                value::TypeTags::NumberInt32,
+                                value::bitcastFrom<int32_t>(result)};
                     }
                     // Fall through to the larger type.
                 }
                 case value::TypeTags::NumberInt64: {
                     if (sum.fitsLong()) {
-                        return {
-                            false, value::TypeTags::NumberInt64, value::bitcastFrom(sum.getLong())};
+                        return {false,
+                                value::TypeTags::NumberInt64,
+                                value::bitcastFrom<int64_t>(sum.getLong())};
                     }
                     // Fall through to the larger type.
                 }
                 case value::TypeTags::NumberDouble: {
-                    return {
-                        false, value::TypeTags::NumberDouble, value::bitcastFrom(sum.getDouble())};
+                    return {false,
+                            value::TypeTags::NumberDouble,
+                            value::bitcastFrom<double>(sum.getDouble())};
                 }
                 default:
                     MONGO_UNREACHABLE;
@@ -1020,7 +1119,7 @@ std::tuple<bool, value::TypeTags, value::Value> builtinDateHelper(
                       value::numericCast<int64_t>(typeTagMin, valueMin),
                       value::numericCast<int64_t>(typeTagSec, valueSec),
                       value::numericCast<int64_t>(typeTagMillis, valueMillis));
-    return {false, value::TypeTags::Date, date.asInt64()};
+    return {false, value::TypeTags::Date, value::bitcastFrom<int64_t>(date.asInt64())};
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDate(uint8_t arity) {
@@ -1089,6 +1188,117 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDateWeekYear(ui
         timezoneTuple);
 }
 
+TimeZone getTimezone(value::TypeTags timezoneTag,
+                     value::Value timezoneVal,
+                     TimeZoneDatabase* timezoneDB) {
+    auto timezoneStr = value::getStringView(timezoneTag, timezoneVal);
+    if (timezoneStr == "") {
+        return timezoneDB->utcZone();
+    } else {
+        return timezoneDB->getTimeZone(StringData{timezoneStr.data(), timezoneStr.size()});
+    }
+}
+
+Date_t getDate(value::TypeTags dateTag, value::Value dateVal) {
+    switch (dateTag) {
+        case value::TypeTags::Date: {
+            return Date_t::fromMillisSinceEpoch(value::bitcastTo<int64_t>(dateVal));
+        }
+        case value::TypeTags::Timestamp: {
+            return Date_t::fromMillisSinceEpoch(
+                Timestamp(value::bitcastTo<uint64_t>(dateVal)).getSecs() * 1000LL);
+        }
+        case value::TypeTags::ObjectId: {
+            auto objIdBuf = value::getObjectIdView(dateVal);
+            auto objId = OID::from(objIdBuf);
+            return objId.asDateT();
+        }
+        case value::TypeTags::bsonObjectId: {
+            auto objIdBuf = value::getRawPointerView(dateVal);
+            auto objId = OID::from(objIdBuf);
+            return objId.asDateT();
+        }
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDateToParts(uint8_t arity) {
+    auto [timezoneDBOwn, timezoneDBTag, timezoneDBVal] = getFromStack(0);
+    if (timezoneDBTag != value::TypeTags::timeZoneDB) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto timezoneDB = value::getTimeZoneDBView(timezoneDBVal);
+    auto [dateOwn, dateTag, dateVal] = getFromStack(1);
+
+    // Get timezone.
+    auto [timezoneOwn, timezoneTag, timezoneVal] = getFromStack(2);
+    if (!value::isString(timezoneTag)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    TimeZone timezone = getTimezone(timezoneTag, timezoneVal, timezoneDB);
+
+    // Get date.
+    if (dateTag != value::TypeTags::Date && dateTag != value::TypeTags::Timestamp &&
+        dateTag != value::TypeTags::ObjectId && dateTag != value::TypeTags::bsonObjectId) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    Date_t date = getDate(dateTag, dateVal);
+
+    // Get date parts.
+    auto dateParts = timezone.dateParts(date);
+    auto [dateObjTag, dateObjVal] = value::makeNewObject();
+    value::ValueGuard guard{dateObjTag, dateObjVal};
+    auto dateObj = value::getObjectView(dateObjVal);
+    dateObj->push_back("year", value::TypeTags::NumberInt32, dateParts.year);
+    dateObj->push_back("month", value::TypeTags::NumberInt32, dateParts.month);
+    dateObj->push_back("day", value::TypeTags::NumberInt32, dateParts.dayOfMonth);
+    dateObj->push_back("hour", value::TypeTags::NumberInt32, dateParts.hour);
+    dateObj->push_back("minute", value::TypeTags::NumberInt32, dateParts.minute);
+    dateObj->push_back("second", value::TypeTags::NumberInt32, dateParts.second);
+    dateObj->push_back("millisecond", value::TypeTags::NumberInt32, dateParts.millisecond);
+    guard.reset();
+    return {true, dateObjTag, dateObjVal};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinIsoDateToParts(uint8_t arity) {
+    auto [timezoneDBOwn, timezoneDBTag, timezoneDBVal] = getFromStack(0);
+    if (timezoneDBTag != value::TypeTags::timeZoneDB) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto timezoneDB = value::getTimeZoneDBView(timezoneDBVal);
+    auto [dateOwn, dateTag, dateVal] = getFromStack(1);
+
+    // Get timezone.
+    auto [timezoneOwn, timezoneTag, timezoneVal] = getFromStack(2);
+    if (!value::isString(timezoneTag)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    TimeZone timezone = getTimezone(timezoneTag, timezoneVal, timezoneDB);
+
+    // Get date.
+    if (dateTag != value::TypeTags::Date && dateTag != value::TypeTags::Timestamp &&
+        dateTag != value::TypeTags::ObjectId && dateTag != value::TypeTags::bsonObjectId) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    Date_t date = getDate(dateTag, dateVal);
+
+    // Get date parts.
+    auto dateParts = timezone.dateIso8601Parts(date);
+    auto [dateObjTag, dateObjVal] = value::makeNewObject();
+    value::ValueGuard guard{dateObjTag, dateObjVal};
+    auto dateObj = value::getObjectView(dateObjVal);
+    dateObj->push_back("isoWeekYear", value::TypeTags::NumberInt32, dateParts.year);
+    dateObj->push_back("isoWeek", value::TypeTags::NumberInt32, dateParts.weekOfYear);
+    dateObj->push_back("isoDayOfWeek", value::TypeTags::NumberInt32, dateParts.dayOfWeek);
+    dateObj->push_back("hour", value::TypeTags::NumberInt32, dateParts.hour);
+    dateObj->push_back("minute", value::TypeTags::NumberInt32, dateParts.minute);
+    dateObj->push_back("second", value::TypeTags::NumberInt32, dateParts.second);
+    dateObj->push_back("millisecond", value::TypeTags::NumberInt32, dateParts.millisecond);
+    guard.reset();
+    return {true, dateObjTag, dateObjVal};
+}
+
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinBitTestPosition(uint8_t arity) {
     invariant(arity == 3);
 
@@ -1106,14 +1316,14 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinBitTestPosition
     }
 
     auto bitPositions = value::getArrayView(maskValue);
-    auto binDataSize = value::getBSONBinDataSize(valueTag, value);
+    auto binDataSize = static_cast<int64_t>(value::getBSONBinDataSize(valueTag, value));
     auto binData = value::getBSONBinData(valueTag, value);
     auto bitTestBehavior = BitTestBehavior{value::bitcastTo<int32_t>(valueBitTestBehavior)};
 
     auto isBitSet = false;
     for (size_t idx = 0; idx < bitPositions->size(); ++idx) {
         auto [tagBitPosition, valueBitPosition] = bitPositions->getAt(idx);
-        auto bitPosition = value::bitcastTo<uint64_t>(valueBitPosition);
+        auto bitPosition = value::bitcastTo<int64_t>(valueBitPosition);
         if (bitPosition >= binDataSize * 8) {
             // If position to test is longer than the data to test against, zero-extend.
             isBitSet = false;
@@ -1141,14 +1351,14 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinBitTestPosition
                 bitTestBehavior == BitTestBehavior::AnySet)))) {
             return {false,
                     value::TypeTags::Boolean,
-                    bitTestBehavior == BitTestBehavior::AnyClear ||
-                        bitTestBehavior == BitTestBehavior::AnySet};
+                    value::bitcastFrom<bool>(bitTestBehavior == BitTestBehavior::AnyClear ||
+                                             bitTestBehavior == BitTestBehavior::AnySet)};
         }
     }
     return {false,
             value::TypeTags::Boolean,
-            bitTestBehavior == BitTestBehavior::AllSet ||
-                bitTestBehavior == BitTestBehavior::AllClear};
+            value::bitcastFrom<bool>(bitTestBehavior == BitTestBehavior::AllSet ||
+                                     bitTestBehavior == BitTestBehavior::AllClear)};
 }
 
 
@@ -1183,7 +1393,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinBitTestZero(uin
     }
     auto result =
         (value::numericCast<int64_t>(maskTag, maskValue) & value::bitcastTo<int64_t>(numVal)) == 0;
-    return {false, value::TypeTags::Boolean, result};
+    return {false, value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinBitTestMask(uint8_t arity) {
@@ -1199,7 +1409,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinBitTestMask(uin
 
     auto numMask = value::numericCast<int64_t>(maskTag, maskValue);
     auto result = (numMask & value::bitcastTo<int64_t>(numVal)) == numMask;
-    return {false, value::TypeTags::Boolean, result};
+    return {false, value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinBsonSize(uint8_t arity) {
@@ -1208,12 +1418,12 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinBsonSize(uint8_
     if (tagOperand == value::TypeTags::Object) {
         BSONObjBuilder objBuilder;
         bson::convertToBsonObj(objBuilder, value::getObjectView(valOperand));
-        auto sz = objBuilder.done().objsize();
-        return {false, value::TypeTags::NumberInt32, value::bitcastFrom(sz)};
+        int32_t sz = objBuilder.done().objsize();
+        return {false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(sz)};
     } else if (tagOperand == value::TypeTags::bsonObject) {
         auto beginObj = value::getRawPointerView(valOperand);
-        auto sz = ConstDataView(beginObj).read<LittleEndian<uint32_t>>();
-        return {false, value::TypeTags::NumberInt32, value::bitcastFrom(sz)};
+        int32_t sz = ConstDataView(beginObj).read<LittleEndian<int32_t>>();
+        return {false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(sz)};
     }
     return {false, value::TypeTags::Nothing, 0};
 }
@@ -1277,7 +1487,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinCoerceToString(
             std::string str = str::stream()
                 << TimeZoneDatabase::utcZone().formatDate(
                        kISOFormatString,
-                       Date_t::fromMillisSinceEpoch(value::bitcastTo<uint64_t>(operandVal)));
+                       Date_t::fromMillisSinceEpoch(value::bitcastTo<int64_t>(operandVal)));
             auto [strTag, strVal] = value::makeNewString(str);
             return {true, strTag, strVal};
         }
@@ -1371,6 +1581,198 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinTanh(uint8_t ar
     return genericTanh(operandTag, operandValue);
 }
 
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinConcat(uint8_t arity) {
+    StringBuilder result;
+    for (size_t idx = 0; idx < arity; ++idx) {
+        auto [_, tag, value] = getFromStack(idx);
+        if (!value::isString(tag)) {
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        result << sbe::value::getRawStringView(tag, value);
+    }
+
+    auto [strTag, strValue] = sbe::value::makeNewString(result.str());
+    return {true, strTag, strValue};
+}
+
+std::pair<value::TypeTags, value::Value> ByteCode::genericIsMember(value::TypeTags lhsTag,
+                                                                   value::Value lhsValue,
+                                                                   value::TypeTags rhsTag,
+                                                                   value::Value rhsValue) {
+    if (value::isArray(rhsTag)) {
+        switch (rhsTag) {
+            case value::TypeTags::ArraySet: {
+                auto arrSet = value::getArraySetView(rhsValue);
+                auto& values = arrSet->values();
+                return {value::TypeTags::Boolean,
+                        value::bitcastFrom<bool>(values.find({lhsTag, lhsValue}) != values.end())};
+            }
+            case value::TypeTags::Array:
+            case value::TypeTags::bsonArray: {
+                auto rhsArr = value::ArrayEnumerator{rhsTag, rhsValue};
+                while (!rhsArr.atEnd()) {
+                    auto [rhsTag, rhsVal] = rhsArr.getViewOfValue();
+                    auto [tag, val] = value::compareValue(lhsTag, lhsValue, rhsTag, rhsVal);
+                    if (tag == value::TypeTags::NumberInt32 &&
+                        value::bitcastTo<int32_t>(val) == 0) {
+                        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(true)};
+                    }
+                    rhsArr.advance();
+                }
+                return {value::TypeTags::Boolean, value::bitcastFrom<bool>(false)};
+            }
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }
+    return {value::TypeTags::Nothing, 0};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinIsMember(uint8_t arity) {
+    invariant(arity == 2);
+
+    auto [ownedInput, inputTag, inputValue] = getFromStack(0);
+    auto [ownedArr, arrTag, arrValue] = getFromStack(1);
+
+    auto [resultTag, resultVal] = genericIsMember(inputTag, inputValue, arrTag, arrValue);
+    return {false, resultTag, resultVal};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinIndexOfBytes(uint8_t arity) {
+    auto [strOwn, strTag, strVal] = getFromStack(0);
+    auto [substrOwn, substrTag, substrVal] = getFromStack(1);
+    if ((!value::isString(strTag)) || (!value::isString(substrTag))) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto str = value::getStringView(strTag, strVal);
+    auto substring = value::getStringView(substrTag, substrVal);
+    int64_t startIndex = 0, endIndex = str.size();
+
+    if (arity >= 3) {
+        auto [startOwn, startTag, startVal] = getFromStack(2);
+        if (startTag != value::TypeTags::NumberInt64) {
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        startIndex = value::bitcastTo<int64_t>(startVal);
+        // Check index is positive.
+        if (startIndex < 0) {
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        // Check for valid bounds.
+        if (static_cast<size_t>(startIndex) > str.length()) {
+            return {false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-1)};
+        }
+    }
+    if (arity >= 4) {
+        auto [endOwn, endTag, endVal] = getFromStack(3);
+        if (endTag != value::TypeTags::NumberInt64) {
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        endIndex = value::bitcastTo<int64_t>(endVal);
+        // Check index is positive.
+        if (endIndex < 0) {
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        // Check for valid bounds.
+        if (endIndex < startIndex) {
+            return {false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-1)};
+        }
+    }
+    auto index = str.substr(0, endIndex).find(substring, startIndex);
+    if (index != std::string::npos) {
+        return {false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(index)};
+    }
+    return {false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-1)};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinIndexOfCP(uint8_t arity) {
+    auto [strOwn, strTag, strVal] = getFromStack(0);
+    auto [substrOwn, substrTag, substrVal] = getFromStack(1);
+    if ((!value::isString(strTag)) || (!value::isString(substrTag))) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto str = value::getStringView(strTag, strVal);
+    auto substr = value::getStringView(substrTag, substrVal);
+    int64_t startCodePointIndex = 0, endCodePointIndexArg = str.size();
+
+    if (arity >= 3) {
+        auto [startOwn, startTag, startVal] = getFromStack(2);
+        if (startTag != value::TypeTags::NumberInt64) {
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        startCodePointIndex = value::bitcastTo<int64_t>(startVal);
+        // Check index is positive.
+        if (startCodePointIndex < 0) {
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        // Check for valid bounds.
+        if (static_cast<size_t>(startCodePointIndex) > str.length()) {
+            return {false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-1)};
+        }
+    }
+    if (arity >= 4) {
+        auto [endOwn, endTag, endVal] = getFromStack(3);
+        if (endTag != value::TypeTags::NumberInt64) {
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        endCodePointIndexArg = value::bitcastTo<int64_t>(endVal);
+        // Check index is positive.
+        if (endCodePointIndexArg < 0) {
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        // Check for valid bounds.
+        if (endCodePointIndexArg < startCodePointIndex) {
+            return {false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-1)};
+        }
+    }
+
+    // Handle edge case if both string and substring are empty strings.
+    if (startCodePointIndex == 0 && str.empty() && substr.empty()) {
+        return {true, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(0)};
+    }
+
+    // Need to get byte indexes for start and end indexes.
+    int64_t startByteIndex = 0, byteIndex = 0, codePointIndex;
+    for (codePointIndex = 0; static_cast<size_t>(byteIndex) < str.size(); codePointIndex++) {
+        if (codePointIndex == startCodePointIndex) {
+            startByteIndex = byteIndex;
+        }
+        uassert(5075307,
+                "$indexOfCP found bad UTF-8 in the input",
+                !str::isUTF8ContinuationByte(str[byteIndex]));
+        byteIndex += str::getCodePointLength(str[byteIndex]);
+    }
+
+    int64_t endCodePointIndex = std::min(codePointIndex, endCodePointIndexArg);
+    byteIndex = startByteIndex;
+    for (codePointIndex = startCodePointIndex; codePointIndex < endCodePointIndex;
+         ++codePointIndex) {
+        if (str.compare(byteIndex, substr.size(), substr) == 0) {
+            return {
+                false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(codePointIndex)};
+        }
+        byteIndex += str::getCodePointLength(str[byteIndex]);
+    }
+    return {false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-1)};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinIsTimezone(uint8_t arity) {
+    auto [timezoneDBOwn, timezoneDBTag, timezoneDBVal] = getFromStack(0);
+    if (timezoneDBTag != value::TypeTags::timeZoneDB) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto timezoneDB = value::getTimeZoneDBView(timezoneDBVal);
+    auto [timezoneOwn, timezoneTag, timezoneVal] = getFromStack(1);
+    if (!value::isString(timezoneTag)) {
+        return {false, value::TypeTags::Boolean, false};
+    }
+    auto timezoneStr = value::getStringView(timezoneTag, timezoneVal);
+    if (timezoneDB->isTimeZoneIdentifier((StringData{timezoneStr.data(), timezoneStr.size()}))) {
+        return {false, value::TypeTags::Boolean, true};
+    }
+    return {false, value::TypeTags::Boolean, false};
+}
+
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builtin f,
                                                                           uint8_t arity) {
     switch (f) {
@@ -1378,6 +1780,10 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builti
             return builtinDate(arity);
         case Builtin::datePartsWeekYear:
             return builtinDateWeekYear(arity);
+        case Builtin::dateToParts:
+            return builtinDateToParts(arity);
+        case Builtin::isoDateToParts:
+            return builtinIsoDateToParts(arity);
         case Builtin::split:
             return builtinSplit(arity);
         case Builtin::regexMatch:
@@ -1392,6 +1798,18 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builti
             return builtinNewKeyString(arity);
         case Builtin::abs:
             return builtinAbs(arity);
+        case Builtin::ceil:
+            return builtinCeil(arity);
+        case Builtin::floor:
+            return builtinFloor(arity);
+        case Builtin::exp:
+            return builtinExp(arity);
+        case Builtin::ln:
+            return builtinLn(arity);
+        case Builtin::log10:
+            return builtinLog10(arity);
+        case Builtin::sqrt:
+            return builtinSqrt(arity);
         case Builtin::addToArray:
             return builtinAddToArray(arity);
         case Builtin::addToSet:
@@ -1442,6 +1860,16 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builti
             return builtinTan(arity);
         case Builtin::tanh:
             return builtinTanh(arity);
+        case Builtin::concat:
+            return builtinConcat(arity);
+        case Builtin::isMember:
+            return builtinIsMember(arity);
+        case Builtin::indexOfBytes:
+            return builtinIndexOfBytes(arity);
+        case Builtin::indexOfCP:
+            return builtinIndexOfCP(arity);
+        case Builtin::isTimezone:
+            return builtinIsTimezone(arity);
     }
 
     MONGO_UNREACHABLE;
@@ -1629,8 +2057,8 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                 case Instruction::negate: {
                     auto [owned, tag, val] = getFromStack(0);
 
-                    auto [resultOwned, resultTag, resultVal] =
-                        genericSub(value::TypeTags::NumberInt32, 0, tag, val);
+                    auto [resultOwned, resultTag, resultVal] = genericSub(
+                        value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(0), tag, val);
 
                     topStack(resultOwned, resultTag, resultVal);
 
@@ -1930,7 +2358,9 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                 case Instruction::exists: {
                     auto [owned, tag, val] = getFromStack(0);
 
-                    topStack(false, value::TypeTags::Boolean, tag != value::TypeTags::Nothing);
+                    topStack(false,
+                             value::TypeTags::Boolean,
+                             value::bitcastFrom<bool>(tag != value::TypeTags::Nothing));
 
                     if (owned) {
                         value::releaseValue(tag, val);
@@ -1941,7 +2371,9 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     auto [owned, tag, val] = getFromStack(0);
 
                     if (tag != value::TypeTags::Nothing) {
-                        topStack(false, value::TypeTags::Boolean, tag == value::TypeTags::Null);
+                        topStack(false,
+                                 value::TypeTags::Boolean,
+                                 value::bitcastFrom<bool>(tag == value::TypeTags::Null));
                     }
 
                     if (owned) {
@@ -1953,7 +2385,9 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     auto [owned, tag, val] = getFromStack(0);
 
                     if (tag != value::TypeTags::Nothing) {
-                        topStack(false, value::TypeTags::Boolean, value::isObject(tag));
+                        topStack(false,
+                                 value::TypeTags::Boolean,
+                                 value::bitcastFrom<bool>(value::isObject(tag)));
                     }
 
                     if (owned) {
@@ -1965,7 +2399,9 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     auto [owned, tag, val] = getFromStack(0);
 
                     if (tag != value::TypeTags::Nothing) {
-                        topStack(false, value::TypeTags::Boolean, value::isArray(tag));
+                        topStack(false,
+                                 value::TypeTags::Boolean,
+                                 value::bitcastFrom<bool>(value::isArray(tag)));
                     }
 
                     if (owned) {
@@ -1977,7 +2413,9 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     auto [owned, tag, val] = getFromStack(0);
 
                     if (tag != value::TypeTags::Nothing) {
-                        topStack(false, value::TypeTags::Boolean, value::isString(tag));
+                        topStack(false,
+                                 value::TypeTags::Boolean,
+                                 value::bitcastFrom<bool>(value::isString(tag)));
                     }
 
                     if (owned) {
@@ -1989,7 +2427,9 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     auto [owned, tag, val] = getFromStack(0);
 
                     if (tag != value::TypeTags::Nothing) {
-                        topStack(false, value::TypeTags::Boolean, value::isNumber(tag));
+                        topStack(false,
+                                 value::TypeTags::Boolean,
+                                 value::bitcastFrom<bool>(value::isNumber(tag)));
                     }
 
                     if (owned) {
@@ -2001,7 +2441,9 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     auto [owned, tag, val] = getFromStack(0);
 
                     if (tag != value::TypeTags::Nothing) {
-                        topStack(false, value::TypeTags::Boolean, value::isBinData(tag));
+                        topStack(false,
+                                 value::TypeTags::Boolean,
+                                 value::bitcastFrom<bool>(value::isBinData(tag)));
                     }
 
                     if (owned) {
@@ -2013,7 +2455,23 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     auto [owned, tag, val] = getFromStack(0);
 
                     if (tag != value::TypeTags::Nothing) {
-                        topStack(false, value::TypeTags::Boolean, tag == value::TypeTags::Date);
+                        topStack(false,
+                                 value::TypeTags::Boolean,
+                                 value::bitcastFrom<bool>(tag == value::TypeTags::Date));
+                    }
+
+                    if (owned) {
+                        value::releaseValue(tag, val);
+                    }
+                    break;
+                }
+                case Instruction::isNaN: {
+                    auto [owned, tag, val] = getFromStack(0);
+
+                    if (tag != value::TypeTags::Nothing) {
+                        topStack(false,
+                                 value::TypeTags::Boolean,
+                                 value::bitcastFrom<bool>(value::isNaN(tag, val)));
                     }
 
                     if (owned) {
@@ -2029,7 +2487,8 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
 
                     if (tag != value::TypeTags::Nothing) {
                         bool matches = static_cast<bool>(getBSONTypeMask(tag) & typeMask);
-                        topStack(false, value::TypeTags::Boolean, matches);
+                        topStack(
+                            false, value::TypeTags::Boolean, value::bitcastFrom<bool>(matches));
                     }
 
                     if (owned) {
@@ -2071,7 +2530,7 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     auto [owned, tag, val] = getFromStack(0);
                     popStack();
 
-                    if (tag == value::TypeTags::Boolean && val) {
+                    if (tag == value::TypeTags::Boolean && value::bitcastTo<bool>(val)) {
                         pcPointer += jumpOffset;
                     }
 
@@ -2127,7 +2586,7 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
 bool ByteCode::runPredicate(const CodeFragment* code) {
     auto [owned, tag, val] = run(code);
 
-    bool pass = (tag == value::TypeTags::Boolean) && (val != 0);
+    bool pass = (tag == value::TypeTags::Boolean) && value::bitcastTo<bool>(val);
 
     if (owned) {
         value::releaseValue(tag, val);

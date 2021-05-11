@@ -349,7 +349,7 @@ TEST_F(OplogApplierImplTest, applyOplogEntryOrGroupedInsertsCommand) {
              << BSON("create" << nss.coll()) << "ts" << Timestamp(1, 1) << "ui" << UUID::gen());
     bool applyCmdCalled = false;
     _opObserver->onCreateCollectionFn = [&](OperationContext* opCtx,
-                                            const Collection*,
+                                            const CollectionPtr&,
                                             const NamespaceString& collNss,
                                             const CollectionOptions&,
                                             const BSONObj&) {
@@ -2444,7 +2444,8 @@ public:
                                 boost::none,    // optime of previous write within same transaction
                                 boost::none,    // pre-image optime
                                 boost::none,    // post-image optime
-                                boost::none);   // ShardId of resharding recipient
+                                boost::none,    // ShardId of resharding recipient
+                                boost::none);   // _id
     }
 
     /**
@@ -2473,7 +2474,8 @@ public:
                                 boost::none,    // optime of previous write within same transaction
                                 boost::none,    // pre-image optime
                                 boost::none,    // post-image optime
-                                boost::none);   // ShardId of resharding recipient
+                                boost::none,    // ShardId of resharding recipient
+                                boost::none);   // _id
     }
 
     void checkTxnTable(const OperationSessionInfo& sessionInfo,
@@ -3045,21 +3047,19 @@ TEST_F(IdempotencyTest, EmptyCappedNamespaceNotFound) {
     ASSERT_FALSE(autoColl.getDb());
 }
 
-TEST_F(IdempotencyTest, ConvertToCappedNamespaceNotFound) {
-    // Create a BSON "convertToCapped" command.
-    auto convertToCappedCmd = BSON("convertToCapped" << nss.coll());
+TEST_F(IdempotencyTest, UpdateTwoFields) {
+    ASSERT_OK(
+        ReplicationCoordinator::get(_opCtx.get())->setFollowerMode(MemberState::RS_RECOVERING));
 
-    // Create a "convertToCapped" oplog entry.
-    auto convertToCappedOp = makeCommandOplogEntry(nextOpTime(), nss, convertToCappedCmd);
+    ASSERT_OK(runOpInitialSync(createCollection(kUuid)));
+    ASSERT_OK(runOpInitialSync(insert(fromjson("{_id: 1, y: [0]}"))));
 
-    // Ensure that NamespaceNotFound is acceptable.
-    ASSERT_OK(runOpInitialSync(convertToCappedOp));
+    auto updateOp1 = update(1, fromjson("{$set: {x: 1}}"));
+    auto updateOp2 = update(1, fromjson("{$set: {x: 2, 'y.0': 2}}"));
+    auto updateOp3 = update(1, fromjson("{$set: {y: 3}}"));
 
-    AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
-
-    // Ensure that autoColl.getCollection() and autoColl.getDb() are both null.
-    ASSERT_FALSE(autoColl.getCollection());
-    ASSERT_FALSE(autoColl.getDb());
+    auto ops = {updateOp1, updateOp2, updateOp3};
+    testOpsAreIdempotent(ops);
 }
 
 typedef SetSteadyStateConstraints<IdempotencyTest, false>
@@ -3068,29 +3068,29 @@ typedef SetSteadyStateConstraints<IdempotencyTest, true>
     IdempotencyTestEnableSteadyStateConstraints;
 
 TEST_F(IdempotencyTestDisableSteadyStateConstraints, AcceptableErrorsRecordedInSteadyStateMode) {
-    // Create a BSON "convertToCapped" command.
-    auto convertToCappedCmd = BSON("convertToCapped" << nss.coll());
+    // Create a BSON "emptycapped" command.
+    auto emptyCappedCmd = BSON("emptycapped" << nss.coll());
 
-    // Create a "convertToCapped" oplog entry.
-    auto convertToCappedOp = makeCommandOplogEntry(nextOpTime(), nss, convertToCappedCmd);
+    // Create a "emptycapped" oplog entry.
+    auto emptyCappedOp = makeCommandOplogEntry(nextOpTime(), nss, emptyCappedCmd);
 
     // Ensure that NamespaceNotFound is "acceptable" but counted.
     int prevAcceptableError = replOpCounters.getAcceptableErrorInCommand()->load();
-    ASSERT_OK(runOpSteadyState(convertToCappedOp));
+    ASSERT_OK(runOpSteadyState(emptyCappedOp));
 
     ASSERT_EQ(1, replOpCounters.getAcceptableErrorInCommand()->load() - prevAcceptableError);
 }
 
 TEST_F(IdempotencyTestEnableSteadyStateConstraints,
        AcceptableErrorsNotAcceptableInSteadyStateMode) {
-    // Create a BSON "convertToCapped" command.
-    auto convertToCappedCmd = BSON("convertToCapped" << nss.coll());
+    // Create a BSON "emptycapped" command.
+    auto emptyCappedCmd = BSON("emptycapped" << nss.coll());
 
-    // Create a "convertToCapped" oplog entry.
-    auto convertToCappedOp = makeCommandOplogEntry(nextOpTime(), nss, convertToCappedCmd);
+    // Create a "emptyCapped" oplog entry.
+    auto emptyCappedOp = makeCommandOplogEntry(nextOpTime(), nss, emptyCappedCmd);
 
     // Ensure that NamespaceNotFound is returned.
-    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, runOpSteadyState(convertToCappedOp));
+    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound, runOpSteadyState(emptyCappedOp));
 }
 
 class IdempotencyTestTxns : public IdempotencyTest {};

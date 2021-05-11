@@ -211,7 +211,7 @@ void IdempotencyTest::testOpsAreIdempotent(std::vector<OplogEntry> ops, Sequence
 
         auto state2 = validateAllCollections();
         if (state1 != state2) {
-            FAIL(getStatesString(state1, state2, fullSequence));
+            FAIL(getStatesString(state1, state2, ops, fullSequence));
         }
     }
 }
@@ -324,11 +324,11 @@ OplogEntry IdempotencyTest::partialTxn(LogicalSessionId lsid,
                           prevOpTime);
 }
 
-std::string IdempotencyTest::computeDataHash(const Collection* collection) {
+std::string IdempotencyTest::computeDataHash(const CollectionPtr& collection) {
     auto desc = collection->getIndexCatalog()->findIdIndex(_opCtx.get());
     ASSERT_TRUE(desc);
     auto exec = InternalPlanner::indexScan(_opCtx.get(),
-                                           collection,
+                                           &collection,
                                            desc,
                                            BSONObj(),
                                            BSONObj(),
@@ -375,7 +375,7 @@ std::vector<CollectionState> IdempotencyTest::validateAllCollections() {
 CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
     auto collUUID = [&]() -> OptionalCollectionUUID {
         AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
-        if (auto collection = autoColl.getCollection()) {
+        if (const auto& collection = autoColl.getCollection()) {
             return collection->uuid();
         }
         return boost::none;
@@ -388,8 +388,7 @@ CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
     }
 
     {
-        AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
-        auto collection = autoColl.getCollection();
+        AutoGetCollectionForReadCommand collection(_opCtx.get(), nss);
 
         if (!collection) {
             // Return a mostly default initialized CollectionState struct with exists set to false
@@ -412,10 +411,9 @@ CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
         ASSERT_TRUE(validateResults.valid);
     }
 
-    AutoGetCollectionForReadCommand autoColl(_opCtx.get(), nss);
-    auto collection = autoColl.getCollection();
+    AutoGetCollectionForReadCommand collection(_opCtx.get(), nss);
 
-    std::string dataHash = computeDataHash(collection);
+    std::string dataHash = computeDataHash(collection.getCollection());
 
     auto durableCatalog = DurableCatalog::get(_opCtx.get());
     auto collectionOptions =
@@ -436,7 +434,8 @@ CollectionState IdempotencyTest::validate(const NamespaceString& nss) {
 
 std::string IdempotencyTest::getStatesString(const std::vector<CollectionState>& state1,
                                              const std::vector<CollectionState>& state2,
-                                             const std::vector<OplogEntry>& ops) {
+                                             const std::vector<OplogEntry>& state1Ops,
+                                             const std::vector<OplogEntry>& state2Ops) {
     StringBuilder sb;
     sb << "The states:\n";
     for (const auto& s : state1) {
@@ -448,7 +447,7 @@ std::string IdempotencyTest::getStatesString(const std::vector<CollectionState>&
     }
     sb << "found after applying the operations a second time, therefore breaking idempotency.\n";
     sb << "Applied ops:\n";
-    for (const auto& op : ops) {
+    for (const auto& op : state2Ops) {
         sb << op.toString() << "\n";
     }
     return sb.str();

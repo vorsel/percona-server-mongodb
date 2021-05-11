@@ -62,7 +62,7 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
     const NamespaceString& nsString = request.getNamespaceString();
     invariant(opCtx->lockState()->isCollectionLockedForMode(nsString, MODE_IX));
 
-    const Collection* collection;
+    CollectionPtr collection;
 
     // The update stage does not create its own collection.  As such, if the update is
     // an upsert, create the collection that the update stage inserts into beforehand.
@@ -93,7 +93,7 @@ UpdateResult update(OperationContext* opCtx, Database* db, const UpdateRequest& 
 
     OpDebug* const nullOpDebug = nullptr;
     auto exec = uassertStatusOK(
-        getExecutorUpdate(nullOpDebug, collection, &parsedUpdate, boost::none /* verbosity */));
+        getExecutorUpdate(nullOpDebug, &collection, &parsedUpdate, boost::none /* verbosity */));
 
     return exec->executeUpdate();
 }

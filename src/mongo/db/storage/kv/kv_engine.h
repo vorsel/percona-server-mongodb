@@ -153,6 +153,16 @@ public:
         return createRecordStore(opCtx, ns, ident, options);
     }
 
+    /**
+     * Similar to createRecordStore but this imports from an existing table with the provided ident
+     * instead of creating a new one.
+     */
+    virtual Status importRecordStore(OperationContext* opCtx,
+                                     StringData ident,
+                                     const BSONObj& storageMetadata) {
+        MONGO_UNREACHABLE;
+    }
+
     virtual Status createSortedDataInterface(OperationContext* opCtx,
                                              const CollectionOptions& collOptions,
                                              StringData ident,
@@ -177,6 +187,16 @@ public:
         return createSortedDataInterface(opCtx, collOptions, ident, desc);
     }
 
+    /**
+     * Similar to createSortedDataInterface but this imports from an existing table with the
+     * provided ident instead of creating a new one.
+     */
+    virtual Status importSortedDataInterface(OperationContext* opCtx,
+                                             StringData ident,
+                                             const BSONObj& storageMetadata) {
+        MONGO_UNREACHABLE;
+    }
+
     virtual Status dropGroupedSortedDataInterface(OperationContext* opCtx, StringData ident) = 0;
 
     virtual int64_t getIdentSize(OperationContext* opCtx, StringData ident) = 0;
@@ -188,14 +208,17 @@ public:
     virtual Status repairIdent(OperationContext* opCtx, StringData ident) = 0;
 
     /**
-     * Takes both an OperationContext and a RecoveryUnit, since most storage engines except for
-     * mobile only need the RecoveryUnit. Obtaining the RecoveryUnit from the OperationContext is
-     * not necessarily possible, since as of SERVER-44139 dropIdent can be called as part of
-     * multi-document transactions, which use the same RecoveryUnit throughout but not the same
-     * OperationContext.
-     * TODO(SERVER-45371) Remove OperationContext argument.
+     * Removes any knowledge of the ident from the storage engines metadata which includes removing
+     * the underlying files belonging to the ident. If the storage engine is unable to process the
+     * removal immediately, we enqueue it to be removed at a later time.
      */
-    virtual Status dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) = 0;
+    virtual Status dropIdent(RecoveryUnit* ru, StringData ident) = 0;
+
+    /**
+     * Removes any knowledge of the ident from the storage engines metadata without removing the
+     * underlying files belonging to the ident.
+     */
+    virtual void dropIdentForImport(OperationContext* opCtx, StringData ident) = 0;
 
     /**
      * Attempts to locate and recover a file that is "orphaned" from the storage engine's metadata,

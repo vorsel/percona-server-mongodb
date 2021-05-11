@@ -3,6 +3,7 @@
 // @tags: [cannot_create_unique_index_when_using_hashed_shard_key, requires_fastcount]
 
 // Test key uniqueness
+(function() {
 
 t = db.jstests_index8;
 t.drop();
@@ -27,8 +28,8 @@ checkIndexes = function(num) {
 checkIndexes(1);
 
 // The reIndex command is only supported in standalone mode.
-const isMaster = db.runCommand({isMaster: 1});
-const isStandalone = isMaster.msg !== "isdbgrid" && !isMaster.hasOwnProperty('setName');
+const hello = db.runCommand({hello: 1});
+const isStandalone = hello.msg !== "isdbgrid" && !hello.hasOwnProperty('setName');
 if (isStandalone) {
     assert.commandWorked(t.reIndex());
     checkIndexes(2);
@@ -69,3 +70,4 @@ assert.eq(1, t.find().sort({a: -1}).hint({a: 1}).toArray().length);
 
 assert.eq(t._indexSpec({x: 1}, true), t._indexSpec({x: 1}, [true]), "spec 1");
 assert.eq(t._indexSpec({x: 1}, "eliot"), t._indexSpec({x: 1}, ["eliot"]), "spec 2");
+})();

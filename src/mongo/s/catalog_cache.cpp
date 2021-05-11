@@ -155,18 +155,24 @@ StatusWith<ChunkManager> CatalogCache::_getCollectionRoutingInfoAt(
 
         auto collEntryFuture = _collectionCache.acquireAsync(nss, cacheConsistency);
 
-        // If the entry is in the cache return inmediately.
-        if (collEntryFuture.isReady()) {
-            setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, false);
-            return ChunkManager(dbInfo.primaryId(),
-                                dbInfo.databaseVersion(),
-                                collEntryFuture.get(opCtx),
-                                atClusterTime);
+        if (allowLocks) {
+            // When allowLocks is true we may be holding a lock, so we don't
+            // want to block the current thread: if the future is ready let's
+            // use it, otherwise return an error
+
+            if (collEntryFuture.isReady()) {
+                setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, false);
+                return ChunkManager(dbInfo.primaryId(),
+                                    dbInfo.databaseVersion(),
+                                    collEntryFuture.get(opCtx),
+                                    atClusterTime);
+            } else {
+                return Status{ErrorCodes::StaleShardVersion,
+                              "Routing info refresh did not complete"};
+            }
         }
 
-        if (allowLocks) {
-            return Status{ErrorCodes::StaleShardVersion, "Routing info refresh did not complete"};
-        }
+        // From this point we can guarantee that allowLocks is false
 
         operationBlockedBehindCatalogCacheRefresh(opCtx) = true;
 
@@ -245,8 +251,10 @@ void CatalogCache::onStaleDatabaseVersion(const StringData dbName,
                                   2,
                                   "Registering new database version",
                                   "db"_attr = dbName,
-                                  "version"_attr = version);
+                                  "version"_attr = version.toBSONForLogging());
         _databaseCache.advanceTimeInStore(dbName.toString(), version);
+    } else {
+        _databaseCache.invalidate(dbName.toString());
     }
 }
 
@@ -464,8 +472,8 @@ CatalogCache::DatabaseCache::LookupResult CatalogCache::DatabaseCache::_lookupDa
                                   1,
                                   "Refreshed cached database entry",
                                   "db"_attr = dbName,
-                                  "newDbVersion"_attr = newDbVersion,
-                                  "oldDbVersion"_attr = previousDbVersion,
+                                  "newDbVersion"_attr = newDbVersion.toBSONForLogging(),
+                                  "oldDbVersion"_attr = previousDbVersion.toBSONForLogging(),
                                   "duration"_attr = Milliseconds(t.millis()));
         return CatalogCache::DatabaseCache::LookupResult(std::move(newDb), std::move(newDbVersion));
     } catch (const DBException& ex) {
@@ -548,7 +556,7 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
                                   1,
                                   "Refreshing cached collection",
                                   "namespace"_attr = nss,
-                                  "currentVersion"_attr = previousVersion);
+                                  "currentVersion"_attr = previousVersion.toBSONForLogging());
 
         auto collectionAndChunks = _catalogCacheLoader.getChunksSince(nss, lookupVersion).get();
 
@@ -599,8 +607,8 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
                                   isIncremental || newVersion != previousVersion ? 0 : 1,
                                   "Refreshed cached collection",
                                   "namespace"_attr = nss,
-                                  "newVersion"_attr = newVersion,
-                                  "oldVersion"_attr = previousVersion,
+                                  "newVersion"_attr = newVersion.toBSONForLogging(),
+                                  "oldVersion"_attr = previousVersion.toBSONForLogging(),
                                   "duration"_attr = Milliseconds(t.millis()));
         _updateRefreshesStats(isIncremental, false);
 
@@ -639,10 +647,19 @@ ComparableDatabaseVersion ComparableDatabaseVersion::makeComparableDatabaseVersi
     return ComparableDatabaseVersion(version, _uuidDisambiguatingSequenceNumSource.fetchAndAdd(1));
 }
 
-std::string ComparableDatabaseVersion::toString() const {
-    return str::stream() << (_dbVersion ? _dbVersion->toBSON().toString() : "NONE") << "|"
-                         << _uuidDisambiguatingSequenceNum;
+BSONObj ComparableDatabaseVersion::toBSONForLogging() const {
+    BSONObjBuilder builder;
+    if (_dbVersion)
+        builder.append("dbVersion"_sd, _dbVersion->toBSON());
+    else
+        builder.append("dbVersion"_sd, "None");
+
+    builder.append("uuidDisambiguatingSequenceNum"_sd,
+                   static_cast<int64_t>(_uuidDisambiguatingSequenceNum));
+
+    return builder.obj();
 }
+
 
 bool ComparableDatabaseVersion::operator==(const ComparableDatabaseVersion& other) const {
     if (!_dbVersion && !other._dbVersion)

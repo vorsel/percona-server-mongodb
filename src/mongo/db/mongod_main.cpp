@@ -140,6 +140,9 @@
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
 #include "mongo/db/s/resharding/resharding_coordinator_service.h"
+#include "mongo/db/s/resharding/resharding_donor_service.h"
+#include "mongo/db/s/resharding/resharding_op_observer.h"
+#include "mongo/db/s/resharding/resharding_recipient_service.h"
 #include "mongo/db/s/shard_server_op_observer.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
@@ -259,7 +262,7 @@ void logStartup(OperationContext* opCtx) {
     Lock::GlobalWrite lk(opCtx);
     AutoGetOrCreateDb autoDb(opCtx, startupLogCollectionName.db(), mongo::MODE_X);
     Database* db = autoDb.getDb();
-    const Collection* collection =
+    CollectionPtr collection =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, startupLogCollectionName);
     WriteUnitOfWork wunit(opCtx);
     if (!collection) {
@@ -311,7 +314,13 @@ void registerPrimaryOnlyServices(ServiceContext* serviceContext) {
     std::vector<std::unique_ptr<repl::PrimaryOnlyService>> services;
     services.push_back(std::make_unique<TenantMigrationDonorService>(serviceContext));
     services.push_back(std::make_unique<repl::TenantMigrationRecipientService>(serviceContext));
-    services.push_back(std::make_unique<ReshardingCoordinatorService>(serviceContext));
+
+    if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+        services.push_back(std::make_unique<ReshardingCoordinatorService>(serviceContext));
+    } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        services.push_back(std::make_unique<ReshardingDonorService>(serviceContext));
+        services.push_back(std::make_unique<ReshardingRecipientService>(serviceContext));
+    }
 
     for (auto& service : services) {
         registry->registerService(std::move(service));
@@ -686,8 +695,8 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
             startTTLMonitor(serviceContext);
         }
 
-        if (replSettings.usingReplSets() || !gInternalValidateFeaturesAsMaster) {
-            serverGlobalParams.validateFeaturesAsMaster.store(false);
+        if (replSettings.usingReplSets() || !gInternalValidateFeaturesAsPrimary) {
+            serverGlobalParams.validateFeaturesAsPrimary.store(false);
         }
     }
 
@@ -1024,6 +1033,7 @@ void setUpObservers(ServiceContext* serviceContext) {
     } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
         opObserverRegistry->addObserver(std::make_unique<ConfigServerOpObserver>());
+        opObserverRegistry->addObserver(std::make_unique<ReshardingOpObserver>());
     } else {
         opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
     }
@@ -1193,7 +1203,7 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         LOGV2_OPTIONS(5093807,
                       {LogComponent::kTenantMigration},
                       "Shutting down all TenantMigrationAccessBlockers on global shutdown");
-        TenantMigrationAccessBlockerByPrefix::get(serviceContext).shutDown();
+        TenantMigrationAccessBlockerRegistry::get(serviceContext).shutDown();
 
         LOGV2_OPTIONS(5093808,
                       {LogComponent::kTenantMigration},

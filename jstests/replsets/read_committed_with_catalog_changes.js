@@ -21,10 +21,14 @@
  *  - reindex collection
  *  - compact collection
  *
- * @tags: [requires_majority_read_concern]
+ * @tags: [
+ *   requires_fcv_47,
+ *   requires_majority_read_concern,
+ * ]
  */
 
 load("jstests/libs/parallelTester.js");  // For Thread.
+load("jstests/libs/write_concern_util.js");
 
 (function() {
 "use strict";
@@ -140,8 +144,22 @@ const testCases = {
             // So, disabling index build commit quorum.
             assert.commandWorked(db.coll.createIndex({x: 1}, {}, 0));
         },
-        blockedCollections: ['coll'],
-        unblockedCollections: ['other'],
+        blockedCollections: [],
+        unblockedCollections: ['coll', 'other'],
+    },
+    collMod: {
+        prepare: function(db) {
+            // This test create indexes with majority of nodes not available for replication.
+            // So, disabling index build commit quorum.
+            assert.commandWorked(db.coll.createIndex({x: 1}, {expireAfterSeconds: 60 * 60}, 0));
+            assert.commandWorked(db.coll.insert({_id: 1, x: 1}));
+        },
+        performOp: function(db) {
+            assert.commandWorked(db.coll.runCommand(
+                'collMod', {index: {keyPattern: {x: 1}, expireAfterSeconds: 60 * 61}}));
+        },
+        blockedCollections: [],
+        unblockedCollections: ['coll'],
     },
     dropIndex: {
         prepare: function(db) {
@@ -155,8 +173,8 @@ const testCases = {
         performOp: function(db) {
             assert.commandWorked(db.coll.dropIndex({x: 1}));
         },
-        blockedCollections: ['coll'],
-        unblockedCollections: ['other'],
+        blockedCollections: [],
+        unblockedCollections: ['coll', 'other'],
     },
 
     // Remaining case is a local-only operation.
@@ -261,8 +279,7 @@ for (var testName in testCases) {
     // Return to the initial state, then stop the secondary from applying new writes to prevent
     // them from becoming committed.
     setUpInitialState();
-    assert.commandWorked(
-        secondary.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "alwaysOn"}));
+    stopServerReplication(secondary);
 
     // If the tested operation isn't replicated, do a write to the side collection before
     // performing the operation. This will ensure that the operation happens after an
@@ -303,8 +320,7 @@ for (var testName in testCases) {
 
         // Restart oplog application on the secondary and ensure the blocked collections become
         // unblocked.
-        assert.commandWorked(
-            secondary.adminCommand({configureFailPoint: "rsSyncApplyStop", mode: "off"}));
+        restartServerReplication(secondary);
         replTest.awaitReplication();
         test.blockedCollections.forEach((name) => assertReadsSucceed(mainDB[name]));
 

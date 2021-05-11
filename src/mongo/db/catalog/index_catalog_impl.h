@@ -46,17 +46,34 @@ namespace mongo {
 
 class Client;
 class Collection;
+class CollectionPtr;
 
 class IndexDescriptor;
 struct InsertDeleteOptions;
 
 /**
- * how many: 1 per Collection.
- * lifecycle: attached to a Collection.
+ * IndexCatalogImpl is stored as a member of CollectionImpl. When the Collection is cloned this is
+ * cloned with it by making shallow copies of the contained IndexCatalogEntry. The IndexCatalogEntry
+ * instances are shared across multiple Collection instances.
  */
 class IndexCatalogImpl : public IndexCatalog {
 public:
     explicit IndexCatalogImpl(Collection* collection);
+    IndexCatalogImpl(const IndexCatalogImpl& other) = default;
+
+    /**
+     * Creates a cloned IndexCatalogImpl. Will make shallow copies of IndexCatalogEntryContainers so
+     * the IndexCatalogEntry will be shared across IndexCatalogImpl instances'
+     *
+     * Must call setCollection() after cloning to set the correct Collection backpointer
+     */
+    std::unique_ptr<IndexCatalog> clone() const override;
+
+    /**
+     * Must be called after clone() to set the backpointer to the correct Collection instance.
+     * This is required due to limitations in cloned_ptr.
+     */
+    void setCollection(Collection* collection);
 
     // must be called before used
     Status init(OperationContext* opCtx) override;
@@ -221,7 +238,7 @@ public:
     // ---- modify single index
 
     void setMultikeyPaths(OperationContext* const opCtx,
-                          const Collection* coll,
+                          const CollectionPtr& coll,
                           const IndexDescriptor* desc,
                           const KeyStringSet& multikeyMetadataKeys,
                           const MultikeyPaths& multikeyPaths) const override;
@@ -235,7 +252,7 @@ public:
      * This method may throw.
      */
     Status indexRecords(OperationContext* opCtx,
-                        const Collection* coll,
+                        const CollectionPtr& coll,
                         const std::vector<BsonRecord>& bsonRecords,
                         int64_t* keysInsertedOut) override;
 
@@ -243,7 +260,7 @@ public:
      * See IndexCatalog::updateRecord
      */
     Status updateRecord(OperationContext* const opCtx,
-                        const Collection* coll,
+                        const CollectionPtr& coll,
                         const BSONObj& oldDoc,
                         const BSONObj& newDoc,
                         const RecordId& recordId,
@@ -281,7 +298,7 @@ public:
                                     InsertDeleteOptions* options) const override;
 
     void indexBuildSuccess(OperationContext* opCtx,
-                           const Collection* collection,
+                           const CollectionPtr& collection,
                            IndexCatalogEntry* index) override;
 
 private:
@@ -296,7 +313,7 @@ private:
     std::string _getAccessMethodName(const BSONObj& keyPattern) const;
 
     Status _indexKeys(OperationContext* opCtx,
-                      const Collection* coll,
+                      const CollectionPtr& coll,
                       IndexCatalogEntry* index,
                       const KeyStringSet& keys,
                       const KeyStringSet& multikeyMetadataKeys,
@@ -307,19 +324,19 @@ private:
                       int64_t* keysInsertedOut);
 
     Status _indexFilteredRecords(OperationContext* opCtx,
-                                 const Collection* coll,
+                                 const CollectionPtr& coll,
                                  IndexCatalogEntry* index,
                                  const std::vector<BsonRecord>& bsonRecords,
                                  int64_t* keysInsertedOut);
 
     Status _indexRecords(OperationContext* opCtx,
-                         const Collection* coll,
+                         const CollectionPtr& coll,
                          IndexCatalogEntry* index,
                          const std::vector<BsonRecord>& bsonRecords,
                          int64_t* keysInsertedOut);
 
     Status _updateRecord(OperationContext* const opCtx,
-                         const Collection* coll,
+                         const CollectionPtr& coll,
                          IndexCatalogEntry* index,
                          const BSONObj& oldDoc,
                          const BSONObj& newDoc,
@@ -348,7 +365,7 @@ private:
      * plugin-level transformations if appropriate, etc.
      */
     StatusWith<BSONObj> _fixIndexSpec(OperationContext* opCtx,
-                                      const Collection* collection,
+                                      const CollectionPtr& collection,
                                       const BSONObj& spec) const;
 
     Status _isSpecOk(OperationContext* opCtx, const BSONObj& spec) const;
@@ -386,7 +403,7 @@ private:
                            const std::vector<std::string>& indexNamesToDrop,
                            bool haveIdIndex);
 
-    Collection* const _collection;
+    Collection* _collection;
 
     IndexCatalogEntryContainer _readyIndexes;
     IndexCatalogEntryContainer _buildingIndexes;

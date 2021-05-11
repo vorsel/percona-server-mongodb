@@ -52,7 +52,6 @@
 
 namespace mongo {
 
-class Collection;
 class Locker;
 class OperationContext;
 class ThreadClient;
@@ -131,10 +130,6 @@ public:
 
     transport::SessionHandle session() && {
         return std::move(_session);
-    }
-
-    transport::Session::TagMask getSessionTags() const {
-        return _session ? _session->getTags() : 0;
     }
 
     std::string clientAddress(bool includePort = false) const;

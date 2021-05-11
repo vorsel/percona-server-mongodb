@@ -111,6 +111,7 @@
 #include "mongo/util/concurrency/ticketholder.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/log_and_backoff.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/quick_exit.h"
 #include "mongo/util/scopeguard.h"
@@ -2191,6 +2192,25 @@ Status WiredTigerKVEngine::createGroupedRecordStore(OperationContext* opCtx,
     return wtRCToStatus(s->create(s, uri.c_str(), config.c_str()));
 }
 
+Status WiredTigerKVEngine::importRecordStore(OperationContext* opCtx,
+                                             StringData ident,
+                                             const BSONObj& storageMetadata) {
+    _ensureIdentPath(ident);
+    WiredTigerSession session(_conn);
+
+    std::string config =
+        uassertStatusOK(WiredTigerUtil::generateImportString(ident, storageMetadata));
+
+    string uri = _uri(ident);
+    WT_SESSION* s = session.getSession();
+    LOGV2_DEBUG(5095102,
+                2,
+                "WiredTigerKVEngine::importRecordStore",
+                "uri"_attr = uri,
+                "config"_attr = config);
+    return wtRCToStatus(s->create(s, uri.c_str(), config.c_str()));
+}
+
 Status WiredTigerKVEngine::recoverOrphanedIdent(OperationContext* opCtx,
                                                 const NamespaceString& nss,
                                                 StringData ident,
@@ -2373,6 +2393,22 @@ Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* op
     return wtRCToStatus(WiredTigerIndex::Create(opCtx, _uri(ident), config));
 }
 
+Status WiredTigerKVEngine::importSortedDataInterface(OperationContext* opCtx,
+                                                     StringData ident,
+                                                     const BSONObj& storageMetadata) {
+    _ensureIdentPath(ident);
+
+    std::string config =
+        uassertStatusOK(WiredTigerUtil::generateImportString(ident, storageMetadata));
+
+    LOGV2_DEBUG(5095103,
+                2,
+                "WiredTigerKVEngine::importSortedDataInterface",
+                "ident"_attr = ident,
+                "config"_attr = config);
+    return wtRCToStatus(WiredTigerIndex::Create(opCtx, _uri(ident), config));
+}
+
 Status WiredTigerKVEngine::dropGroupedSortedDataInterface(OperationContext* opCtx,
                                                           StringData ident) {
     return wtRCToStatus(WiredTigerIndex::Drop(opCtx, _uri(ident)));
@@ -2407,7 +2443,7 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     WT_SESSION* session = wtSession.getSession();
     LOGV2_DEBUG(22337,
                 2,
-                "WiredTigerKVEngine::createTemporaryRecordStore uri: {uri} config: {config}",
+                "WiredTigerKVEngine::makeTemporaryRecordStore",
                 "uri"_attr = uri,
                 "config"_attr = config);
     uassertStatusOK(wtRCToStatus(session->create(session, uri.c_str(), config.c_str())));
@@ -2419,8 +2455,10 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     params.isCapped = false;
     params.isEphemeral = _ephemeral;
     params.cappedCallback = nullptr;
-    params.sizeStorer = _sizeStorer.get();
-    params.tracksSizeAdjustments = true;
+    // Temporary collections do not need to persist size information to the size storer.
+    params.sizeStorer = nullptr;
+    // Temporary collections do not need to reconcile collection size/counts.
+    params.tracksSizeAdjustments = false;
     params.isReadOnly = false;
 
     params.cappedMaxSize = -1;
@@ -2433,7 +2471,7 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     return std::move(rs);
 }
 
-Status WiredTigerKVEngine::dropIdent(OperationContext* opCtx, RecoveryUnit* ru, StringData ident) {
+Status WiredTigerKVEngine::dropIdent(RecoveryUnit* ru, StringData ident) {
     string uri = _uri(ident);
 
     WiredTigerRecoveryUnit* wtRu = checked_cast<WiredTigerRecoveryUnit*>(ru);
@@ -2467,6 +2505,42 @@ Status WiredTigerKVEngine::dropIdent(OperationContext* opCtx, RecoveryUnit* ru, 
 
     invariantWTOK(ret);
     return Status::OK();
+}
+
+void WiredTigerKVEngine::dropIdentForImport(OperationContext* opCtx, StringData ident) {
+    const std::string uri = _uri(ident);
+
+    WiredTigerSession session(_conn);
+
+    // Don't wait for the global checkpoint lock to be obtained in WiredTiger as it can take a
+    // substantial amount of time to be obtained if there is a concurrent checkpoint running. We
+    // will wait until we obtain exclusive access to the underlying table file though. As it isn't
+    // user visible at this stage in the import it should be readily available unless a backup
+    // cursor is open. In short, using "checkpoint_wait=false" and "lock_wait=true" means that we
+    // can potentially be waiting for a short period of time for WT_SESSION::drop() to run, but
+    // would rather get EBUSY than wait a long time for a checkpoint to complete.
+    const std::string config = "force=true,checkpoint_wait=false,lock_wait=true,remove_files=false";
+    int ret = 0;
+    size_t attempt = 0;
+    do {
+        Status status = opCtx->checkForInterruptNoAssert();
+        if (status.code() == ErrorCodes::InterruptedAtShutdown) {
+            return;
+        }
+
+        ++attempt;
+
+        ret = session.getSession()->drop(session.getSession(), uri.c_str(), config.c_str());
+        logAndBackoff(5114600,
+                      ::mongo::logv2::LogComponent::kStorage,
+                      logv2::LogSeverity::Debug(1),
+                      attempt,
+                      "WiredTiger dropping ident for import",
+                      "uri"_attr = uri,
+                      "config"_attr = config,
+                      "ret"_attr = ret);
+    } while (ret == EBUSY);
+    invariantWTOK(ret);
 }
 
 void WiredTigerKVEngine::keydbDropDatabase(const std::string& db) {

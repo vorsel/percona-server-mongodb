@@ -60,7 +60,7 @@
 namespace mongo {
 
 namespace {
-auto getViewCatalog = Database::declareDecoration<std::unique_ptr<ViewCatalog>>();
+auto getViewCatalog = Database::declareDecoration<std::shared_ptr<ViewCatalog>>();
 
 StatusWith<std::unique_ptr<CollatorInterface>> parseCollator(OperationContext* opCtx,
                                                              BSONObj collationSpec) {
@@ -72,6 +72,10 @@ StatusWith<std::unique_ptr<CollatorInterface>> parseCollator(OperationContext* o
     return CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collationSpec);
 }
 }  // namespace
+
+std::shared_ptr<ViewCatalog> ViewCatalog::getShared(const Database* db) {
+    return getViewCatalog(db);
+}
 
 ViewCatalog* ViewCatalog::get(const Database* db) {
     return getViewCatalog(db).get();
@@ -169,10 +173,6 @@ void ViewCatalog::_requireValidCatalog(WithLock) {
 }
 
 void ViewCatalog::iterate(OperationContext* opCtx, ViewIteratorCallback callback) {
-    Lock::CollectionLock systemViewsLock(
-        opCtx,
-        NamespaceString(_durable->getName(), NamespaceString::kSystemDotViewsCollectionName),
-        MODE_IS);
     stdx::lock_guard<Latch> lk(_mutex);
     _requireValidCatalog(lk);
     for (auto&& view : _viewMap) {
@@ -323,11 +323,11 @@ StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline(
                               boost::none);
 
     // If the feature compatibility version is not kLatest, and we are validating features as
-    // master, ban the use of new agg features introduced in kLatest to prevent them from being
+    // primary, ban the use of new agg features introduced in kLatest to prevent them from being
     // persisted in the catalog.
     // (Generic FCV reference): This FCV check should exist across LTS binary versions.
     ServerGlobalParams::FeatureCompatibility::Version fcv;
-    if (serverGlobalParams.validateFeaturesAsMaster.load() &&
+    if (serverGlobalParams.validateFeaturesAsPrimary.load() &&
         serverGlobalParams.featureCompatibility.isLessThan(
             ServerGlobalParams::FeatureCompatibility::kLatest, &fcv)) {
         expCtx->maxFeatureCompatibilityVersion = fcv;
@@ -521,10 +521,6 @@ std::shared_ptr<ViewDefinition> ViewCatalog::_lookup(WithLock lk,
 }
 
 std::shared_ptr<ViewDefinition> ViewCatalog::lookup(OperationContext* opCtx, StringData ns) {
-    Lock::CollectionLock systemViewsLock(
-        opCtx,
-        NamespaceString(_durable->getName(), NamespaceString::kSystemDotViewsCollectionName),
-        MODE_IS);
     stdx::lock_guard<Latch> lk(_mutex);
     if (!_valid && opCtx->getClient()->isFromUserConnection()) {
         // We want to avoid lookups on invalid collection names.
@@ -543,20 +539,12 @@ std::shared_ptr<ViewDefinition> ViewCatalog::lookup(OperationContext* opCtx, Str
 
 std::shared_ptr<ViewDefinition> ViewCatalog::lookupWithoutValidatingDurableViews(
     OperationContext* opCtx, StringData ns) {
-    Lock::CollectionLock systemViewsLock(
-        opCtx,
-        NamespaceString(_durable->getName(), NamespaceString::kSystemDotViewsCollectionName),
-        MODE_IS);
     stdx::lock_guard<Latch> lk(_mutex);
     return _lookup(lk, opCtx, ns, ViewCatalogLookupBehavior::kAllowInvalidDurableViews);
 }
 
 StatusWith<ResolvedView> ViewCatalog::resolveView(OperationContext* opCtx,
                                                   const NamespaceString& nss) {
-    Lock::CollectionLock systemViewsLock(
-        opCtx,
-        NamespaceString(_durable->getName(), NamespaceString::kSystemDotViewsCollectionName),
-        MODE_IS);
     stdx::unique_lock<Latch> lock(_mutex);
 
     _requireValidCatalog(lock);

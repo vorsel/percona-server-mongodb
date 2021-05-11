@@ -172,7 +172,7 @@ public:
     }
 
     void onCreateCollection(OperationContext* const opCtx,
-                            const Collection* coll,
+                            const CollectionPtr& coll,
                             const NamespaceString& collectionName,
                             const CollectionOptions& options,
                             const BSONObj& idIndex,
@@ -235,6 +235,26 @@ public:
         for (auto& o : _observers)
             o->onRenameCollection(
                 opCtx, fromCollection, toCollection, uuid, dropTargetUUID, numRecords, stayTemp);
+    }
+
+    void onImportCollection(OperationContext* opCtx,
+                            const UUID& importUUID,
+                            const NamespaceString& nss,
+                            long long numRecords,
+                            long long dataSize,
+                            const BSONObj& catalogEntry,
+                            const BSONObj& storageMetadata,
+                            bool isDryRun) override {
+        ReservedTimes times{opCtx};
+        for (auto& o : _observers)
+            o->onImportCollection(opCtx,
+                                  importUUID,
+                                  nss,
+                                  numRecords,
+                                  dataSize,
+                                  catalogEntry,
+                                  storageMetadata,
+                                  isDryRun);
     }
 
     repl::OpTime preRenameCollection(OperationContext* const opCtx,

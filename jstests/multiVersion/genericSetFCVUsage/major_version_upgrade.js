@@ -39,7 +39,7 @@ const versions = [
     {binVersion: '4.4', featureCompatibilityVersion: '4.4', testCollection: 'four_four'},
     {binVersion: 'last-lts', testCollection: 'last_lts'},
     {binVersion: 'last-continuous', testCollection: 'last_continuous'},
-    {binVersion: 'latest', featureCompatibilityVersion: '4.7', testCollection: 'latest'},
+    {binVersion: 'latest', featureCompatibilityVersion: latestFCV, testCollection: 'latest'},
 ];
 
 // These key patterns are considered valid for existing v:0 and v:1 indexes, but are considered
@@ -229,8 +229,10 @@ for (let i = 0; i < versions.length; i++) {
     let primary = rst.getPrimary();
 
     // Upgrade the secondary nodes first.
-    rst.upgradeSecondaries(primary, {binVersion: version.binVersion});
+    rst.upgradeSecondaries({binVersion: version.binVersion});
 
+    assert.eq(
+        primary, rst.getPrimary(), "Primary changed unexpectedly after upgrading secondaries");
     assert.neq(null,
                primary,
                `replica set was unable to start up after upgrading secondaries to version: ${

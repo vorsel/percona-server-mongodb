@@ -42,7 +42,6 @@
 
 namespace mongo {
 
-class Collection;
 class IndexCatalogEntry;
 class IndexCatalogEntryContainer;
 class OperationContext;
@@ -95,9 +94,7 @@ public:
     /**
      * infoObj is a copy of the index-describing BSONObj contained in the catalog.
      */
-    IndexDescriptor(const Collection* collection,
-                    const std::string& accessMethodName,
-                    BSONObj infoObj);
+    IndexDescriptor(const std::string& accessMethodName, BSONObj infoObj);
 
     /**
      * Returns true if the specified index version is supported, and returns false otherwise.

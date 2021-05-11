@@ -893,6 +893,16 @@ class TestParser(testcase.IDLTestcase):
                 strict: true
             """))
 
+        # Reply type
+        self.assert_parse(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                namespace: ignored
+                reply_type: foo_reply_struct
+            """))
+
     def test_command_negative(self):
         # type: () -> None
         """Negative command test cases."""
@@ -1001,6 +1011,17 @@ class TestParser(testcase.IDLTestcase):
                 fields:
                     foo: bar
             """), idl.errors.ERROR_ID_IS_COMMAND_TYPE_EXTRANEOUS)
+
+        # Reply type must be a scalar, not a mapping
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                namespace: ignored
+                reply_type:
+                    arbitrary_field: foo
+            """), idl.errors.ERROR_ID_IS_NODE_TYPE)
 
     def test_command_doc_sequence_positive(self):
         # type: () -> None
@@ -1122,6 +1143,19 @@ class TestParser(testcase.IDLTestcase):
                 - one
                 - two
             """), idl.errors.ERROR_ID_IS_NODE_TYPE_SCALAR_OR_MAPPING)
+
+    def test_feature_flag(self):
+        # type: () -> None
+        """Test feature flag."""
+
+        # Missing default
+        self.assert_parse_fail(
+            textwrap.dedent("""
+            feature_flags:
+                featureFlagToaster:
+                    description: "Make toast"
+                    cpp_varname: gToaster
+            """), idl.errors.ERROR_ID_MISSING_REQUIRED_FIELD)
 
 
 if __name__ == '__main__':

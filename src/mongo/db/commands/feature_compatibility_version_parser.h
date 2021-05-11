@@ -32,6 +32,7 @@
 #include "mongo/db/server_options.h"
 
 namespace mongo {
+using FeatureCompatibilityParams = ServerGlobalParams::FeatureCompatibility;
 
 /**
  * Helpers to parse featureCompatibilityVersion document BSON objects into
@@ -42,49 +43,76 @@ class FeatureCompatibilityVersionParser {
 public:
     static constexpr StringData kVersion44 = "4.4"_sd;
     static constexpr StringData kVersion47 = "4.7"_sd;
+    static constexpr StringData kVersion48 = "4.8"_sd;
     static constexpr StringData kVersionDowngradingFrom47To44 = "downgrading from 4.7 to 4.4"_sd;
+    static constexpr StringData kVersionDowngradingFrom48To44 = "downgrading from 4.8 to 4.4"_sd;
+    static constexpr StringData kVersionDowngradingFrom48To47 = "downgrading from 4.8 to 4.7"_sd;
     static constexpr StringData kVersionUpgradingFrom44To47 = "upgrading from 4.4 to 4.7"_sd;
+    static constexpr StringData kVersionUpgradingFrom47To48 = "upgrading from 4.7 to 4.8"_sd;
+    static constexpr StringData kVersionUpgradingFrom44To48 = "upgrading from 4.4 to 4.8"_sd;
+    static constexpr StringData kVersionDowngradingFrom49To44 = "downgrading from 4.9 to 4.4"_sd;
+    static constexpr StringData kVersionUpgradingFrom44To49 = "upgrading from 4.4 to 4.9"_sd;
+    static constexpr StringData kVersionDowngradingFrom49To48 = "downgrading from 4.9 to 4.8"_sd;
+    static constexpr StringData kVersionUpgradingFrom48To49 = "upgrading from 4.8 to 4.9"_sd;
+    static constexpr StringData kVersion49 = "4.9"_sd;
     static constexpr StringData kVersionUnset = "Unset"_sd;
 
     static constexpr StringData kParameterName = "featureCompatibilityVersion"_sd;
 
     static constexpr StringData kLastLTS = kVersion44;
-    static constexpr StringData kLastContinuous = kVersion44;
-    static constexpr StringData kLatest = kVersion47;
+    static constexpr StringData kLastContinuous = kVersion48;
+    static constexpr StringData kLatest = kVersion49;
+    static constexpr StringData kUpgradingFromLastLTSToLatest = kVersionUpgradingFrom44To49;
+    static constexpr StringData kUpgradingFromLastContinuousToLatest = kVersionUpgradingFrom48To49;
+    // kVersionUpgradingFromLastLTSToLastContinuous should assigned kVersionUnset when kLastLTS and
+    // kLastContinuous are equal.
+    static constexpr StringData kVersionUpgradingFromLastLTSToLastContinuous =
+        kVersionUpgradingFrom44To48;
+    static constexpr StringData kDowngradingFromLatestToLastLTS = kVersionDowngradingFrom49To44;
+    static constexpr StringData kDowngradingFromLatestToLastContinuous =
+        kVersionDowngradingFrom49To48;
 
-    static ServerGlobalParams::FeatureCompatibility::Version parseVersion(StringData versionString);
+    static FeatureCompatibilityParams::Version parseVersion(StringData versionString);
 
-    static StringData serializeVersion(ServerGlobalParams::FeatureCompatibility::Version version);
+    static StringData serializeVersion(FeatureCompatibilityParams::Version version);
 
-    static Status validatePreviousVersionField(
-        ServerGlobalParams::FeatureCompatibility::Version version);
+    static Status validatePreviousVersionField(FeatureCompatibilityParams::Version version);
 
     /**
      * Parses the featureCompatibilityVersion document from the server configuration collection
      * (admin.system.version), and returns the state represented by the combination of the
      * targetVersion and version.
      */
-    static StatusWith<ServerGlobalParams::FeatureCompatibility::Version> parse(
+    static StatusWith<FeatureCompatibilityParams::Version> parse(
         const BSONObj& featureCompatibilityVersionDoc);
 
     /**
      * Useful for message logging.
      */
-    static StringData toString(ServerGlobalParams::FeatureCompatibility::Version version) {
-        switch (version) {
-            case ServerGlobalParams::FeatureCompatibility::Version::kUnsetDefault44Behavior:
-                return kVersionUnset;
-            case ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44:
-                return kVersion44;
-            case ServerGlobalParams::FeatureCompatibility::Version::kUpgradingFrom44To47:
-                return kVersionUpgradingFrom44To47;
-            case ServerGlobalParams::FeatureCompatibility::Version::kDowngradingFrom47To44:
-                return kVersionDowngradingFrom47To44;
-            case ServerGlobalParams::FeatureCompatibility::Version::kVersion47:
-                return kVersion47;
-            default:
-                MONGO_UNREACHABLE;
+    static StringData toString(FeatureCompatibilityParams::Version version) {
+        if (version == FeatureCompatibilityParams::Version::kUnsetDefault44Behavior) {
+            return kVersionUnset;
+        } else if (version == FeatureCompatibilityParams::kLastLTS) {
+            return kLastLTS;
+        } else if (version == FeatureCompatibilityParams::kDowngradingFromLatestToLastLTS) {
+            return kDowngradingFromLatestToLastLTS;
+        } else if (version == FeatureCompatibilityParams::kUpgradingFromLastLTSToLastContinuous) {
+            // kUpgradingFromLastLTSToLastContinuous is only a valid FCV state when last-continuous
+            // and last-lts are not equal. Otherwise, it is set to kInvalid.
+            invariant(version != FeatureCompatibilityParams::Version::kInvalid);
+            return kVersionUpgradingFromLastLTSToLastContinuous;
+        } else if (version == FeatureCompatibilityParams::kUpgradingFromLastLTSToLatest) {
+            return kUpgradingFromLastLTSToLatest;
+        } else if (version == FeatureCompatibilityParams::kLastContinuous) {
+            return kLastContinuous;
+        } else if (version == FeatureCompatibilityParams::kDowngradingFromLatestToLastContinuous) {
+            return kDowngradingFromLatestToLastContinuous;
+        } else if (version == FeatureCompatibilityParams::kUpgradingFromLastContinuousToLatest) {
+            return kUpgradingFromLastContinuousToLatest;
+        } else if (version == FeatureCompatibilityParams::kLatest) {
+            return kLatest;
         }
+        MONGO_UNREACHABLE;
     }
 };
 

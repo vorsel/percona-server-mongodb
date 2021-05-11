@@ -94,10 +94,18 @@ Status emptyCapped(OperationContext* opCtx, const NamespaceString& collectionNam
 
     WriteUnitOfWork wuow(opCtx);
 
-    Status status = collection.getWritableCollection()->truncate(opCtx);
+    auto writableCollection = collection.getWritableCollection();
+    Status status = writableCollection->truncate(opCtx);
     if (!status.isOK()) {
         return status;
     }
+
+    opCtx->recoveryUnit()->onCommit([writableCollection](auto commitTime) {
+        // Ban reading from this collection on snapshots before now.
+        if (commitTime) {
+            writableCollection->setMinimumVisibleSnapshot(commitTime.get());
+        }
+    });
 
     const auto service = opCtx->getServiceContext();
     service->getOpObserver()->onEmptyCapped(opCtx, collection->ns(), collection->uuid());
@@ -113,7 +121,7 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
                              const NamespaceString& toNss,
                              long long size,
                              bool temp) {
-    const Collection* fromCollection =
+    CollectionPtr fromCollection =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, fromNss);
     if (!fromCollection) {
         uassert(ErrorCodes::CommandNotSupportedOnView,
@@ -152,7 +160,7 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
         uassertStatusOK(createCollection(opCtx, toNss.db().toString(), cmd.done()));
     }
 
-    const Collection* toCollection =
+    CollectionPtr toCollection =
         CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, toNss);
     invariant(toCollection);  // we created above
 
@@ -168,7 +176,7 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
     auto exec =
         InternalPlanner::collectionScan(opCtx,
                                         fromNss.ns(),
-                                        fromCollection,
+                                        &fromCollection,
                                         PlanYieldPolicy::YieldPolicy::WRITE_CONFLICT_RETRY_ONLY,
                                         InternalPlanner::FORWARD);
 
@@ -231,7 +239,7 @@ void cloneCollectionAsCapped(OperationContext* opCtx,
             // abandonSnapshot.
             exec->saveState();
             opCtx->recoveryUnit()->abandonSnapshot();
-            exec->restoreState();  // Handles any WCEs internally.
+            exec->restoreState(&fromCollection);  // Handles any WCEs internally.
         }
     }
 

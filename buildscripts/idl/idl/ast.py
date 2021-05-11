@@ -211,6 +211,7 @@ class Command(Struct):
         """Construct a command."""
         self.namespace = None  # type: str
         self.command_field = None  # type: Field
+        self.reply_type = None  # type: Field
         super(Command, self).__init__(file_name, line, column)
 
 
@@ -296,6 +297,7 @@ class ServerParameter(common.SourceLocation):
         self.test_only = False  # type: bool
         self.deprecated_name = []  # type: List[str]
         self.default = None  # type: Expression
+        self.feature_flag = False  # type : bool
 
         # Only valid if cpp_varname is specified.
         self.validator = None  # type: Validator

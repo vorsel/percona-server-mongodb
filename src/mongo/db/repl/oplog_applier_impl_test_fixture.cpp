@@ -89,7 +89,7 @@ void OplogApplierImplOpObserver::onUpdate(OperationContext* opCtx,
 }
 
 void OplogApplierImplOpObserver::onCreateCollection(OperationContext* opCtx,
-                                                    const Collection* coll,
+                                                    const CollectionPtr& coll,
                                                     const NamespaceString& collectionName,
                                                     const CollectionOptions& options,
                                                     const BSONObj& idIndex,
@@ -323,7 +323,7 @@ CollectionReader::CollectionReader(OperationContext* opCtx, const NamespaceStrin
     : _collToScan(opCtx, nss),
       _exec(InternalPlanner::collectionScan(opCtx,
                                             nss.ns(),
-                                            _collToScan.getCollection(),
+                                            &_collToScan.getCollection(),
                                             PlanYieldPolicy::YieldPolicy::NO_YIELD,
                                             InternalPlanner::FORWARD)) {}
 
@@ -371,7 +371,8 @@ OplogEntry makeOplogEntry(OpTypeEnum opType,
                       boost::none,   // optime of previous write within same transaction
                       boost::none,   // pre-image optime
                       boost::none,   // post-image optime
-                      boost::none);  // ShardId of resharding recipient
+                      boost::none,   // ShardId of resharding recipient
+                      boost::none);  // _id
 }
 
 OplogEntry makeOplogEntry(OpTypeEnum opType, NamespaceString nss, OptionalCollectionUUID uuid) {

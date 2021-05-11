@@ -317,7 +317,7 @@ boost::optional<CommitQuorumOptions> parseAndGetCommitQuorum(OperationContext* o
  * returned vector is empty after returning, no new indexes need to be built. Throws on error.
  */
 std::vector<BSONObj> resolveDefaultsAndRemoveExistingIndexes(OperationContext* opCtx,
-                                                             const Collection* collection,
+                                                             const CollectionPtr& collection,
                                                              std::vector<BSONObj> indexSpecs) {
     // Normalize the specs' collations, wildcard projections, and partial filters as applicable.
     auto normalSpecs = IndexBuildsCoordinator::normalizeIndexSpecs(opCtx, collection, indexSpecs);
@@ -339,7 +339,7 @@ void fillCommandResultWithIndexesAlreadyExistInfo(int numIndexes, BSONObjBuilder
  * Returns true, after filling in the command result, if the index creation can return early.
  */
 bool indexesAlreadyExist(OperationContext* opCtx,
-                         const Collection* collection,
+                         const CollectionPtr& collection,
                          const std::vector<BSONObj>& specs,
                          BSONObjBuilder* result) {
     auto specsCopy = resolveDefaultsAndRemoveExistingIndexes(opCtx, collection, specs);
@@ -439,7 +439,7 @@ BSONObj runCreateIndexesOnNewCollection(OperationContext* opCtx,
     // By this point, we have exclusive access to our collection, either because we created the
     // collection implicitly as part of createIndexes or because the collection was created earlier
     // in the same multi-document transaction.
-    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, ns);
+    CollectionWriter collection(opCtx, ns);
     UncommittedCollections::get(opCtx).invariantHasExclusiveAccessToCollection(opCtx,
                                                                                collection->ns());
     invariant(opCtx->inMultiDocumentTransaction() || createCollImplicitly);
@@ -449,18 +449,19 @@ BSONObj runCreateIndexesOnNewCollection(OperationContext* opCtx,
                           << " in a multi-document transaction.",
             collection->numRecords(opCtx) == 0);
 
-    const int numIndexesBefore = IndexBuildsCoordinator::getNumIndexesTotal(opCtx, collection);
+    const int numIndexesBefore =
+        IndexBuildsCoordinator::getNumIndexesTotal(opCtx, collection.get());
     auto filteredSpecs =
-        IndexBuildsCoordinator::prepareSpecListForCreate(opCtx, collection, ns, specs);
+        IndexBuildsCoordinator::prepareSpecListForCreate(opCtx, collection.get(), ns, specs);
     // It's possible for 'filteredSpecs' to be empty if we receive a createIndexes request for the
     // _id index and also create the collection implicitly. By this point, the _id index has already
     // been created, and there is no more work to be done.
     if (!filteredSpecs.empty()) {
         IndexBuildsCoordinator::createIndexesOnEmptyCollection(
-            opCtx, collection->uuid(), filteredSpecs, false);
+            opCtx, collection, filteredSpecs, false);
     }
 
-    const int numIndexesAfter = IndexBuildsCoordinator::getNumIndexesTotal(opCtx, collection);
+    const int numIndexesAfter = IndexBuildsCoordinator::getNumIndexesTotal(opCtx, collection.get());
 
     if (MONGO_unlikely(createIndexesWriteConflict.shouldFail())) {
         throw WriteConflictException();
@@ -518,12 +519,12 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
         }
 
         bool indexExists = writeConflictRetry(opCtx, "createCollectionWithIndexes", ns.ns(), [&] {
-            AutoGetCollection autoColl(opCtx, ns, MODE_IS);
-            auto collection = autoColl.getCollection();
+            AutoGetCollection collection(opCtx, ns, MODE_IS);
 
             // Before potentially taking an exclusive collection lock, check if all indexes already
             // exist while holding an intent lock.
-            if (collection && indexesAlreadyExist(opCtx, collection, specs, &result)) {
+            if (collection &&
+                indexesAlreadyExist(opCtx, collection.getCollection(), specs, &result)) {
                 repl::ReplClientInfo::forClient(opCtx->getClient())
                     .setLastOpToSystemLastOpTime(opCtx);
                 return true;

@@ -32,7 +32,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/tenant_migration_donor_cmds_gen.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/repl/tenant_migration_access_blocker_by_prefix.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_registry.h"
 #include "mongo/db/repl/tenant_migration_conflict_info.h"
 #include "mongo/db/repl/tenant_migration_state_machine_gen.h"
 #include "mongo/executor/task_executor.h"
@@ -44,20 +44,16 @@ namespace mongo {
 namespace tenant_migration_donor {
 
 /**
+ * Returns a TenantMigrationDonorDocument constructed from the given bson doc and validate the
+ * resulting doc.
+ */
+TenantMigrationDonorDocument parseDonorStateDocument(const BSONObj& doc);
+
+/**
  * Returns a task executor to be used for tenant migration donor tasks that need to run even while
  * the node is not primary, creating it if needed.
  */
 std::shared_ptr<executor::TaskExecutor> getTenantMigrationDonorExecutor();
-
-/**
- * Updates the donor's in-memory migration state to reflect the given state doc.
- */
-void onInsertOrUpdate(OperationContext* opCtx, const BSONObj& donorStateDocBson);
-
-/**
- * Removes the donor's in-memory migration state for the migration for the given database prefix.
- */
-void onDelete(OperationContext* opCtx, const std::string dbPrefix);
 
 /**
  * If the operation has read concern "snapshot" or includes afterClusterTime, and the database is
@@ -96,7 +92,7 @@ void migrationConflictHandler(OperationContext* opCtx,
                               rpc::ReplyBuilderInterface* replyBuilder) {
     checkIfCanReadOrBlock(opCtx, dbName);
 
-    auto& mtabByPrefix = TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext());
+    auto& mtabByPrefix = TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext());
 
     try {
         // callable will modify replyBuilder.
@@ -118,8 +114,8 @@ void migrationConflictHandler(OperationContext* opCtx,
         auto migrationConflictInfo = ex.extraInfo<TenantMigrationConflictInfo>();
         invariant(migrationConflictInfo);
 
-        if (auto mtab = mtabByPrefix.getTenantMigrationAccessBlockerForDbPrefix(
-                migrationConflictInfo->getDatabasePrefix())) {
+        if (auto mtab = mtabByPrefix.getTenantMigrationAccessBlockerForTenantId(
+                migrationConflictInfo->getTenantId())) {
             replyBuilder->getBodyBuilder().resetToEmpty();
             mtab->checkIfCanWriteOrBlock(opCtx);
         }
