@@ -98,7 +98,6 @@
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/ldap/ldap_manager.h"
 #include "mongo/db/log_process_details.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_cache_factory_mongod.h"
 #include "mongo/db/logical_time_metadata_hook.h"
@@ -127,6 +126,7 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/replication_recovery.h"
 #include "mongo/db/repl/storage_interface_impl.h"
+#include "mongo/db/repl/tenant_migration_donor_op_observer.h"
 #include "mongo/db/repl/tenant_migration_donor_service.h"
 #include "mongo/db/repl/tenant_migration_recipient_service.h"
 #include "mongo/db/repl/topology_coordinator.h"
@@ -384,8 +384,13 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
                      std::make_unique<FlowControl>(
                          serviceContext, repl::ReplicationCoordinator::get(serviceContext)));
 
+    // Creating the operation context before initializing the storage engine allows the storage
+    // engine initialization to make use of the lock manager. As the storage engine is not yet
+    // initialized, a noop recovery unit is used until the initialization is complete.
+    auto startupOpCtx = serviceContext->makeOperationContext(&cc());
+
     auto lastStorageEngineShutdownState =
-        initializeStorageEngine(serviceContext, StorageEngineInitFlags::kNone);
+        initializeStorageEngine(startupOpCtx.get(), StorageEngineInitFlags::kNone);
     StorageControl::startStorageControls(serviceContext);
 
 #ifdef MONGO_CONFIG_WIREDTIGER_ENABLED
@@ -459,8 +464,6 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     if (mongodGlobalParams.scriptingEnabled) {
         ScriptEngine::setup();
     }
-
-    auto startupOpCtx = serviceContext->makeOperationContext(&cc());
 
     try {
         startup_recovery::repairAndRecoverDatabases(startupOpCtx.get(),
@@ -741,7 +744,16 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     // operation context anymore
     startupOpCtx.reset();
 
-    auto start = serviceContext->getServiceEntryPoint()->start();
+    auto start = serviceContext->getServiceExecutor()->start();
+    if (!start.isOK()) {
+        LOGV2_ERROR(20570,
+                    "Error starting service executor: {error}",
+                    "Error starting service executor",
+                    "error"_attr = start);
+        return EXIT_NET_ERROR;
+    }
+
+    start = serviceContext->getServiceEntryPoint()->start();
     if (!start.isOK()) {
         LOGV2_ERROR(20571,
                     "Error starting service entry point: {error}",
@@ -978,9 +990,6 @@ void setUpReplication(ServiceContext* serviceContext) {
     topoCoordOptions.maxSyncSourceLagSecs = Seconds(repl::maxSyncSourceLagSecs);
     topoCoordOptions.clusterRole = serverGlobalParams.clusterRole;
 
-    auto logicalClock = std::make_unique<LogicalClock>(serviceContext);
-    LogicalClock::set(serviceContext, std::move(logicalClock));
-
     auto replCoord = std::make_unique<repl::ReplicationCoordinatorImpl>(
         serviceContext,
         getGlobalReplSettings(),
@@ -1021,6 +1030,7 @@ void setUpObservers(ServiceContext* serviceContext) {
     opObserverRegistry->addObserver(std::make_unique<AuthOpObserver>());
     opObserverRegistry->addObserver(
         std::make_unique<repl::PrimaryOnlyServiceOpObserver>(serviceContext));
+    opObserverRegistry->addObserver(std::make_unique<repl::TenantMigrationDonorOpObserver>());
     opObserverRegistry->addObserver(std::make_unique<FcvOpObserver>());
 
     setupFreeMonitoringOpObserver(opObserverRegistry.get());
@@ -1180,6 +1190,19 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
             4784909, {LogComponent::kReplication}, "Shutting down the ReplicationCoordinator");
         repl::ReplicationCoordinator::get(serviceContext)->shutdown(opCtx);
 
+        LOGV2_OPTIONS(5093807,
+                      {LogComponent::kTenantMigration},
+                      "Shutting down all TenantMigrationAccessBlockers on global shutdown");
+        TenantMigrationAccessBlockerByPrefix::get(serviceContext).shutDown();
+
+        LOGV2_OPTIONS(5093808,
+                      {LogComponent::kTenantMigration},
+                      "Shutting down and joining the tenant migration donor executor");
+        auto tenantMigrationDonorExecutor =
+            tenant_migration_donor::getTenantMigrationDonorExecutor();
+        tenantMigrationDonorExecutor->shutdown();
+        tenantMigrationDonorExecutor->join();
+
         // Terminate the index consistency check.
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             LOGV2_OPTIONS(4784904,
@@ -1278,6 +1301,11 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         CatalogCacheLoader::get(serviceContext).shutDown();
     }
 
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+    // When running under address sanitizer, we get false positive leaks due to disorder around
+    // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
+    // harder to dry up the server from active connections before going on to really shut down.
+
     // Shutdown the Service Entry Point and its sessions and give it a grace period to complete.
     if (auto sep = serviceContext->getServiceEntryPoint()) {
         LOGV2_OPTIONS(4784923, {LogComponent::kCommand}, "Shutting down the ServiceEntryPoint");
@@ -1287,6 +1315,19 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
                           "Service entry point did not shutdown within the time limit");
         }
     }
+
+    // Shutdown and wait for the service executor to exit
+    if (auto svcExec = serviceContext->getServiceExecutor()) {
+        LOGV2_OPTIONS(4784924, {LogComponent::kExecutor}, "Shutting down the service executor");
+        Status status = svcExec->shutdown(Seconds(10));
+        if (!status.isOK()) {
+            LOGV2_OPTIONS(20564,
+                          {LogComponent::kNetwork},
+                          "Service executor did not shutdown within the time limit",
+                          "error"_attr = status);
+        }
+    }
+#endif
 
     LOGV2(4784925, "Shutting down free monitoring");
     stopFreeMonitoring();
@@ -1330,6 +1371,12 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
 
 #ifndef MONGO_CONFIG_USE_RAW_LATCHES
     LatchAnalyzer::get(serviceContext).dump();
+#endif
+
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+    // SessionKiller relies on the network stack being cleanly shutdown which only occurs under
+    // sanitizers
+    SessionKiller::shutdown(serviceContext);
 #endif
 
     FlowControl::shutdown(serviceContext);

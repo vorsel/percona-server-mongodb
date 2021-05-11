@@ -29,8 +29,9 @@
 
 #pragma once
 
+#include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
-#include "mongo/db/exec/sbe/values/id_generators.h"
+#include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/matcher/expression.h"
 
 namespace mongo::stage_builder {
@@ -41,10 +42,14 @@ namespace mongo::stage_builder {
  * specifies the slots produced by the 'stage' subtree that must remain visible to consumers of
  * the tree returned by this function.
  */
-std::unique_ptr<sbe::PlanStage> generateFilter(const MatchExpression* root,
+std::unique_ptr<sbe::PlanStage> generateFilter(OperationContext* opCtx,
+                                               const MatchExpression* root,
                                                std::unique_ptr<sbe::PlanStage> stage,
                                                sbe::value::SlotIdGenerator* slotIdGenerator,
+                                               sbe::value::FrameIdGenerator* frameIdGenerator,
                                                sbe::value::SlotId inputSlotIn,
-                                               sbe::value::SlotVector relevantSlotsIn);
+                                               sbe::RuntimeEnvironment* env,
+                                               sbe::value::SlotVector relevantSlotsIn,
+                                               PlanNodeId planNodeId);
 
 }  // namespace mongo::stage_builder

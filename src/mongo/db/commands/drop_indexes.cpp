@@ -47,10 +47,10 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/exit_code.h"
@@ -79,6 +79,11 @@ public:
     virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
         return true;
     }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
+    }
+
     std::string help() const override {
         return "drop indexes for a collection";
     }
@@ -145,15 +150,16 @@ public:
                     << toReIndexNss << "' while replication is active");
         }
 
-        AutoGetCollection collection(opCtx, toReIndexNss, MODE_X);
-        if (!collection) {
-            auto db = collection.getDb();
+        AutoGetCollection autoColl(opCtx, toReIndexNss, MODE_X);
+        if (!autoColl) {
+            auto db = autoColl.getDb();
             if (db && ViewCatalog::get(db)->lookup(opCtx, toReIndexNss.ns()))
                 uasserted(ErrorCodes::CommandNotSupportedOnView, "can't re-index a view");
             else
                 uasserted(ErrorCodes::NamespaceNotFound, "collection does not exist");
         }
 
+        CollectionWriter collection(autoColl, CollectionCatalog::LifetimeMode::kUnmanagedClone);
         IndexBuildsCoordinator::get(opCtx)->assertNoIndexBuildInProgForCollection(
             collection->uuid());
 
@@ -216,21 +222,19 @@ public:
         indexer->setIndexBuildMethod(IndexBuildMethod::kForeground);
         StatusWith<std::vector<BSONObj>> swIndexesToRebuild(ErrorCodes::UnknownError,
                                                             "Uninitialized");
-
         writeConflictRetry(opCtx, "dropAllIndexes", toReIndexNss.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
             collection.getWritableCollection()->getIndexCatalog()->dropAllIndexes(opCtx, true);
 
-            swIndexesToRebuild = indexer->init(
-                opCtx, collection.getWritableCollection(), all, MultiIndexBlock::kNoopOnInitFn);
+            swIndexesToRebuild =
+                indexer->init(opCtx, collection, all, MultiIndexBlock::kNoopOnInitFn);
             uassertStatusOK(swIndexesToRebuild.getStatus());
             wunit.commit();
         });
 
         // The 'indexer' can throw, so ensure build cleanup occurs.
         auto abortOnExit = makeGuard([&] {
-            indexer->abortIndexBuild(
-                opCtx, collection.getWritableCollection(), MultiIndexBlock::kNoopOnCleanUpFn);
+            indexer->abortIndexBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
         });
 
         if (MONGO_unlikely(reIndexCrashAfterDrop.shouldFail())) {
@@ -240,10 +244,9 @@ public:
 
         // The following function performs its own WriteConflict handling, so don't wrap it in a
         // writeConflictRetry loop.
-        uassertStatusOK(
-            indexer->insertAllDocumentsInCollection(opCtx, collection.getWritableCollection()));
+        uassertStatusOK(indexer->insertAllDocumentsInCollection(opCtx, collection.get()));
 
-        uassertStatusOK(indexer->checkConstraints(opCtx));
+        uassertStatusOK(indexer->checkConstraints(opCtx, collection.get()));
 
         writeConflictRetry(opCtx, "commitReIndex", toReIndexNss.ns(), [&] {
             WriteUnitOfWork wunit(opCtx);
@@ -259,8 +262,10 @@ public:
         // This was also done when dropAllIndexes() committed, but we need to ensure that no one
         // tries to read in the intermediate state where all indexes are newer than the current
         // snapshot so are unable to be used.
-        auto clusterTime = LogicalClock::getClusterTimeForReplicaSet(opCtx).asTimestamp();
-        collection.getWritableCollection()->setMinimumVisibleSnapshot(clusterTime);
+        const auto currentTime = VectorClock::get(opCtx)->getTime();
+        collection.getWritableCollection()->setMinimumVisibleSnapshot(
+            currentTime.clusterTime().asTimestamp());
+        collection.commitToCatalog();
 
         result.append("nIndexes", static_cast<int>(swIndexesToRebuild.getValue().size()));
         result.append("indexes", swIndexesToRebuild.getValue());

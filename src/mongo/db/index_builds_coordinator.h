@@ -661,7 +661,7 @@ protected:
      */
     void _insertSortedKeysIntoIndexForResume(OperationContext* opCtx,
                                              std::shared_ptr<ReplIndexBuildState> replState);
-    void _setUpForScanCollectionAndInsertSortedKeysIntoIndex(
+    const Collection* _setUpForScanCollectionAndInsertSortedKeysIntoIndex(
         OperationContext* opCtx, std::shared_ptr<ReplIndexBuildState> replState);
 
     /**
@@ -772,7 +772,7 @@ protected:
      */
     StatusWith<std::pair<long long, long long>> _runIndexRebuildForRecovery(
         OperationContext* opCtx,
-        Collection* collection,
+        CollectionWriter& collection,
         const UUID& buildUUID,
         RepairData repair) noexcept;
 

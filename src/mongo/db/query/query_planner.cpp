@@ -175,6 +175,7 @@ string optionString(size_t options) {
                 break;
             case QueryPlannerParams::ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG:
                 ss << "ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG ";
+                break;
             case QueryPlannerParams::ENUMERATE_OR_CHILDREN_LOCKSTEP:
                 ss << "ENUMERATE_OR_CHILDREN_LOCKSTEP ";
                 break;
@@ -1062,7 +1063,7 @@ StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
 
             QueryPlannerParams paramsForCoveredIxScan;
             auto soln = buildWholeIXSoln(index, query, paramsForCoveredIxScan);
-            if (soln && !soln->root->fetched()) {
+            if (soln && !soln->root()->fetched()) {
                 LOGV2_DEBUG(
                     20983, 5, "Planner: outputting soln that uses index to provide projection");
                 PlanCacheIndexTree* indexTree = new PlanCacheIndexTree();

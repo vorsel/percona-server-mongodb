@@ -40,8 +40,9 @@ TraverseStage::TraverseStage(std::unique_ptr<PlanStage> outer,
                              value::SlotVector outerCorrelated,
                              std::unique_ptr<EExpression> foldExpr,
                              std::unique_ptr<EExpression> finalExpr,
+                             PlanNodeId planNodeId,
                              boost::optional<size_t> nestedArraysDepth)
-    : PlanStage("traverse"_sd),
+    : PlanStage("traverse"_sd, planNodeId),
       _inField(inField),
       _outField(outField),
       _outFieldInner(outFieldInner),
@@ -65,7 +66,9 @@ std::unique_ptr<PlanStage> TraverseStage::clone() const {
                                            _outFieldInner,
                                            _correlatedSlots,
                                            _fold ? _fold->clone() : nullptr,
-                                           _final ? _final->clone() : nullptr);
+                                           _final ? _final->clone() : nullptr,
+                                           _commonStats.nodeId,
+                                           _nestedArraysDepth);
 }
 
 void TraverseStage::prepare(CompileCtx& ctx) {
@@ -142,7 +145,7 @@ PlanState TraverseStage::getNext() {
         return trackPlanState(state);
     }
 
-    traverse(_inFieldAccessor, &_outFieldOutputAccessor, 0);
+    [[maybe_unused]] auto earlyExit = traverse(_inFieldAccessor, &_outFieldOutputAccessor, 0);
 
     return trackPlanState(PlanState::ADVANCED);
 }
@@ -300,14 +303,14 @@ std::vector<DebugPrinter::Block> TraverseStage::debugPrint() const {
     }
 
     DebugPrinter::addNewLine(ret);
-    DebugPrinter::addIdentifier(ret, "in");
-    ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
-    DebugPrinter::addBlocks(ret, _children[1]->debugPrint());
-    ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
-
     DebugPrinter::addIdentifier(ret, "from");
     ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
     DebugPrinter::addBlocks(ret, _children[0]->debugPrint());
+    ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
+
+    DebugPrinter::addIdentifier(ret, "in");
+    ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
+    DebugPrinter::addBlocks(ret, _children[1]->debugPrint());
     ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
 
     return ret;

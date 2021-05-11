@@ -46,7 +46,6 @@
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
@@ -106,7 +105,7 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
     {
         WriteUnitOfWork wunit(opCtx);
         coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespaceForMetadataWrite(
-            opCtx, NamespaceString(ns));
+            opCtx, CollectionCatalog::LifetimeMode::kInplace, NamespaceString(ns));
         if (!coll) {
             coll = autoDb.getDb()->createCollection(opCtx, NamespaceString(ns));
         }
@@ -114,11 +113,12 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
         wunit.commit();
     }
     MultiIndexBlock indexer;
-    auto abortOnExit =
-        makeGuard([&] { indexer.abortIndexBuild(opCtx, coll, MultiIndexBlock::kNoopOnCleanUpFn); });
+    CollectionWriter collection(coll);
+    auto abortOnExit = makeGuard(
+        [&] { indexer.abortIndexBuild(opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn); });
     Status status = indexer
                         .init(opCtx,
-                              coll,
+                              collection,
                               spec,
                               [opCtx](const std::vector<BSONObj>& specs) -> Status {
                                   if (opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
@@ -141,7 +141,7 @@ Status createIndexFromSpec(OperationContext* opCtx, StringData ns, const BSONObj
     if (!status.isOK()) {
         return status;
     }
-    status = indexer.checkConstraints(opCtx);
+    status = indexer.checkConstraints(opCtx, coll);
     if (!status.isOK()) {
         return status;
     }
@@ -192,9 +192,6 @@ int dbtestsMain(int argc, char** argv) {
 
     const auto service = getGlobalServiceContext();
     service->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(service));
-
-    auto logicalClock = std::make_unique<LogicalClock>(service);
-    LogicalClock::set(service, std::move(logicalClock));
 
     auto fastClock = std::make_unique<ClockSourceMock>();
     // Timestamps are split into two 32-bit integers, seconds and "increments". Currently (but

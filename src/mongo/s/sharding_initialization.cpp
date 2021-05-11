@@ -40,7 +40,6 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/keys_collection_client_sharded.h"
 #include "mongo/db/keys_collection_manager.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
@@ -218,7 +217,7 @@ Status initializeGlobalShardingState(OperationContext* opCtx,
                networkPtr);
 
     // The shard registry must be started once the grid is initialized
-    grid->shardRegistry()->startup(opCtx);
+    grid->shardRegistry()->startupPeriodicReloader(opCtx);
 
     // The catalog client must be started after the shard registry has been started up
     grid->catalogClient()->startup();

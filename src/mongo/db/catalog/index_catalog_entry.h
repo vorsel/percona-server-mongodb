@@ -38,6 +38,7 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/record_id.h"
+#include "mongo/db/storage/key_string.h"
 #include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
@@ -75,9 +76,7 @@ public:
 
     virtual bool isHybridBuilding() const = 0;
 
-    virtual IndexBuildInterceptor* indexBuildInterceptor() = 0;
-
-    virtual const IndexBuildInterceptor* indexBuildInterceptor() const = 0;
+    virtual IndexBuildInterceptor* indexBuildInterceptor() const = 0;
 
     virtual void setIndexBuildInterceptor(IndexBuildInterceptor* interceptor) = 0;
 
@@ -134,6 +133,7 @@ public:
      */
     virtual void setMultikey(OperationContext* const opCtx,
                              const Collection* coll,
+                             const KeyStringSet& multikeyMetadataKeys,
                              const MultikeyPaths& multikeyPaths) = 0;
 
     // if this ready is ready for queries

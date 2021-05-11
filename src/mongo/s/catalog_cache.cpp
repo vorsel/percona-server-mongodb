@@ -38,7 +38,6 @@
 #include "mongo/s/catalog_cache.h"
 
 #include "mongo/bson/bsonobjbuilder.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/optime_with.h"
 #include "mongo/logv2/log.h"
@@ -55,13 +54,6 @@
 #include "mongo/util/timer.h"
 
 namespace mongo {
-
-const OperationContext::Decoration<bool> operationShouldBlockBehindCatalogCacheRefresh =
-    OperationContext::declareDecoration<bool>();
-
-const OperationContext::Decoration<bool> operationBlockedBehindCatalogCacheRefresh =
-    OperationContext::declareDecoration<bool>();
-
 namespace {
 
 // How many times to try refreshing the routing info if the set of chunks loaded from the config
@@ -69,8 +61,13 @@ namespace {
 const int kMaxInconsistentRoutingInfoRefreshAttempts = 3;
 
 const int kDatabaseCacheSize = 10000;
-
 const int kCollectionCacheSize = 10000;
+
+const OperationContext::Decoration<bool> operationShouldBlockBehindCatalogCacheRefresh =
+    OperationContext::declareDecoration<bool>();
+
+const OperationContext::Decoration<bool> operationBlockedBehindCatalogCacheRefresh =
+    OperationContext::declareDecoration<bool>();
 
 }  // namespace
 
@@ -97,37 +94,45 @@ CatalogCache::~CatalogCache() {
 }
 
 StatusWith<CachedDatabaseInfo> CatalogCache::getDatabase(OperationContext* opCtx,
-                                                         StringData dbName) {
-    invariant(!opCtx->lockState() || !opCtx->lockState()->isLocked(),
-              "Do not hold a lock while refreshing the catalog cache. Doing so would potentially "
-              "hold the lock during a network call, and can lead to a deadlock as described in "
-              "SERVER-37398.");
+                                                         StringData dbName,
+                                                         bool allowLocks) {
+    if (!allowLocks) {
+        invariant(
+            !opCtx->lockState() || !opCtx->lockState()->isLocked(),
+            "Do not hold a lock while refreshing the catalog cache. Doing so would potentially "
+            "hold the lock during a network call, and can lead to a deadlock as described in "
+            "SERVER-37398.");
+    }
+
     try {
         // TODO SERVER-49724: Make ReadThroughCache support StringData keys
         auto dbEntry =
             _databaseCache.acquire(opCtx, dbName.toString(), CacheCausalConsistency::kLatestKnown);
-        if (!dbEntry) {
-            return {ErrorCodes::NamespaceNotFound,
-                    str::stream() << "database " << dbName << " not found"};
-        }
-        const auto primaryShard = uassertStatusOKWithContext(
-            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, dbEntry->getPrimary()),
-            str::stream() << "could not find the primary shard for database " << dbName);
-        return {CachedDatabaseInfo(*dbEntry, std::move(primaryShard))};
+        uassert(ErrorCodes::NamespaceNotFound,
+                str::stream() << "database " << dbName << " not found",
+                dbEntry);
+
+        return {CachedDatabaseInfo(*dbEntry)};
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
 }
 
 StatusWith<ChunkManager> CatalogCache::_getCollectionRoutingInfoAt(
-    OperationContext* opCtx, const NamespaceString& nss, boost::optional<Timestamp> atClusterTime) {
-    invariant(
-        !opCtx->lockState() || !opCtx->lockState()->isLocked(),
-        "Do not hold a lock while refreshing the catalog cache. Doing so would potentially hold "
-        "the lock during a network call, and can lead to a deadlock as described in SERVER-37398.");
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    boost::optional<Timestamp> atClusterTime,
+    bool allowLocks) {
+    if (!allowLocks) {
+        invariant(!opCtx->lockState() || !opCtx->lockState()->isLocked(),
+                  "Do not hold a lock while refreshing the catalog cache. Doing so would "
+                  "potentially hold "
+                  "the lock during a network call, and can lead to a deadlock as described in "
+                  "SERVER-37398.");
+    }
 
     try {
-        const auto swDbInfo = getDatabase(opCtx, nss.db());
+        const auto swDbInfo = getDatabase(opCtx, nss.db(), allowLocks);
 
         if (!swDbInfo.isOK()) {
             if (swDbInfo == ErrorCodes::NamespaceNotFound) {
@@ -157,6 +162,10 @@ StatusWith<ChunkManager> CatalogCache::_getCollectionRoutingInfoAt(
                                 dbInfo.databaseVersion(),
                                 collEntryFuture.get(opCtx),
                                 atClusterTime);
+        }
+
+        if (allowLocks) {
+            return Status{ErrorCodes::StaleShardVersion, "Routing info refresh did not complete"};
         }
 
         operationBlockedBehindCatalogCacheRefresh(opCtx) = true;
@@ -192,14 +201,15 @@ StatusWith<ChunkManager> CatalogCache::_getCollectionRoutingInfoAt(
 }
 
 StatusWith<ChunkManager> CatalogCache::getCollectionRoutingInfo(OperationContext* opCtx,
-                                                                const NamespaceString& nss) {
-    return _getCollectionRoutingInfoAt(opCtx, nss, boost::none);
+                                                                const NamespaceString& nss,
+                                                                bool allowLocks) {
+    return _getCollectionRoutingInfoAt(opCtx, nss, boost::none, allowLocks);
 }
 
 StatusWith<ChunkManager> CatalogCache::getCollectionRoutingInfoAt(OperationContext* opCtx,
                                                                   const NamespaceString& nss,
                                                                   Timestamp atClusterTime) {
-    return _getCollectionRoutingInfoAt(opCtx, nss, atClusterTime);
+    return _getCollectionRoutingInfoAt(opCtx, nss, atClusterTime, false);
 }
 
 StatusWith<CachedDatabaseInfo> CatalogCache::getDatabaseWithRefresh(OperationContext* opCtx,
@@ -254,16 +264,20 @@ void CatalogCache::invalidateShardOrEntireCollectionEntryForShardedCollection(
     _stats.countStaleConfigErrors.addAndFetch(1);
 
     auto collectionEntry = _collectionCache.peekLatestCached(nss);
-    if (collectionEntry && collectionEntry->optRt) {
-        collectionEntry->optRt->setShardStale(shardId);
-    }
 
-    if (wantedVersion) {
-        _collectionCache.advanceTimeInStore(
-            nss, ComparableChunkVersion::makeComparableChunkVersion(*wantedVersion));
-    } else {
-        _collectionCache.advanceTimeInStore(
-            nss, ComparableChunkVersion::makeComparableChunkVersionForForcedRefresh());
+    const auto newChunkVersion = wantedVersion
+        ? ComparableChunkVersion::makeComparableChunkVersion(*wantedVersion)
+        : ComparableChunkVersion::makeComparableChunkVersionForForcedRefresh();
+
+    const bool timeAdvanced = _collectionCache.advanceTimeInStore(nss, newChunkVersion);
+
+    if (timeAdvanced && collectionEntry && collectionEntry->optRt) {
+        // Shards marked stale will be reset on the next refresh.
+        // We can mark the shard stale only if the time advanced, otherwise no refresh would happen
+        // and the shard will remain marked stale.
+        // Even if a concurrent refresh is happening this is still the old collectionEntry,
+        // so it is safe to call setShardStale.
+        collectionEntry->optRt->setShardStale(shardId);
     }
 }
 
@@ -440,6 +454,10 @@ CatalogCache::DatabaseCache::LookupResult CatalogCache::DatabaseCache::_lookupDa
     Timer t{};
     try {
         auto newDb = _catalogCacheLoader.getDatabase(dbName).get();
+        uassertStatusOKWithContext(
+            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, newDb.getPrimary()),
+            str::stream() << "The primary shard for database " << dbName << " does not exist");
+
         auto newDbVersion =
             ComparableDatabaseVersion::makeComparableDatabaseVersion(newDb.getVersion());
         LOGV2_FOR_CATALOG_REFRESH(24101,
@@ -569,7 +587,9 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
         std::set<ShardId> shardIds;
         newRoutingHistory.getAllShardIds(&shardIds);
         for (const auto& shardId : shardIds) {
-            uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
+            uassertStatusOKWithContext(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId),
+                                       str::stream() << "Collection " << nss
+                                                     << " references shard which does not exist");
         }
 
         const auto newVersion =
@@ -644,8 +664,7 @@ bool ComparableDatabaseVersion::operator<(const ComparableDatabaseVersion& other
     }
 }
 
-CachedDatabaseInfo::CachedDatabaseInfo(DatabaseType dbt, std::shared_ptr<Shard> primaryShard)
-    : _dbt(std::move(dbt)), _primaryShard(std::move(primaryShard)) {}
+CachedDatabaseInfo::CachedDatabaseInfo(DatabaseType dbt) : _dbt(std::move(dbt)) {}
 
 const ShardId& CachedDatabaseInfo::primaryId() const {
     return _dbt.getPrimary();

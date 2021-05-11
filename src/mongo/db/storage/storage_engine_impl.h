@@ -69,7 +69,8 @@ class StorageEngineImpl final : public StorageEngineInterface, public StorageEng
     void keydbDropDatabase(const std::string& db) override;
 
 public:
-    StorageEngineImpl(std::unique_ptr<KVEngine> engine,
+    StorageEngineImpl(OperationContext* opCtx,
+                      std::unique_ptr<KVEngine> engine,
                       StorageEngineOptions options = StorageEngineOptions());
 
     virtual ~StorageEngineImpl();

@@ -57,7 +57,6 @@
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/lasterror.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/logical_time_validator.h"
@@ -81,6 +80,7 @@
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/stats/api_version_metrics.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/transaction_participant.h"
@@ -1037,6 +1037,12 @@ void execCommandDatabase(OperationContext* opCtx,
             str::stream() << "Invalid database name: '" << dbname << "'",
             NamespaceString::validDBName(dbname, NamespaceString::DollarInDbNameBehavior::Allow));
 
+        ResourceConsumption::ScopedMetricsCollector scopedMetrics(
+            opCtx, command->collectsResourceConsumptionMetrics());
+        if (ResourceConsumption::shouldCollectMetricsForDatabase(dbname)) {
+            auto& opMetrics = ResourceConsumption::MetricsCollector::get(opCtx);
+            opMetrics.setDbName(dbname);
+        }
 
         const auto allowTransactionsOnConfigDatabase =
             (serverGlobalParams.clusterRole == ClusterRole::ConfigServer ||

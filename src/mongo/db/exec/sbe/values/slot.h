@@ -29,8 +29,10 @@
 
 #pragma once
 
-#include "mongo/db/exec/sbe/values/value.h"
 #include <boost/container/small_vector.hpp>
+
+#include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/util/id_generator.h"
 
 namespace mongo {
 class BufReader;
@@ -549,10 +551,10 @@ struct MaterializedRowComparator {
 
 struct MaterializedRowHasher {
     std::size_t operator()(const MaterializedRow& k) const {
-        size_t res = 17;
+        size_t res = hashInit();
         for (size_t idx = 0; idx < k.size(); ++idx) {
             auto [tag, val] = k.getViewOfValue(idx);
-            res = res * 31 + hashValue(tag, val);
+            res = hashCombine(res, hashValue(tag, val));
         }
         return res;
     }
@@ -582,4 +584,8 @@ using SlotAccessorMap = SlotMap<SlotAccessor*>;
 using FieldAccessorMap = absl::flat_hash_map<std::string, std::unique_ptr<ViewOfValueAccessor>>;
 using SlotSet = absl::flat_hash_set<SlotId>;
 using SlotVector = std::vector<SlotId>;
+
+using SlotIdGenerator = IdGenerator<value::SlotId>;
+using FrameIdGenerator = IdGenerator<FrameId>;
+using SpoolIdGenerator = IdGenerator<SpoolId>;
 }  // namespace mongo::sbe::value

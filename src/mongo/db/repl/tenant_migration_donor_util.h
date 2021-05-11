@@ -44,14 +44,20 @@ namespace mongo {
 namespace tenant_migration_donor {
 
 /**
- * Creates a task executor to be used for a tenant migration.
+ * Returns a task executor to be used for tenant migration donor tasks that need to run even while
+ * the node is not primary, creating it if needed.
  */
-std::unique_ptr<executor::TaskExecutor> makeTenantMigrationExecutor(ServiceContext* serviceContext);
+std::shared_ptr<executor::TaskExecutor> getTenantMigrationDonorExecutor();
 
 /**
- * Updates the donor's in-memory migration state to reflect the given persisted state.
+ * Updates the donor's in-memory migration state to reflect the given state doc.
  */
-void onDonorStateDocUpdate(OperationContext* opCtx, const BSONObj& donorStateDocBson);
+void onInsertOrUpdate(OperationContext* opCtx, const BSONObj& donorStateDocBson);
+
+/**
+ * Removes the donor's in-memory migration state for the migration for the given database prefix.
+ */
+void onDelete(OperationContext* opCtx, const std::string dbPrefix);
 
 /**
  * If the operation has read concern "snapshot" or includes afterClusterTime, and the database is
@@ -71,6 +77,12 @@ void checkIfLinearizableReadWasAllowedOrThrow(OperationContext* opCtx, StringDat
  * blocking state. Throws TenantMigrationCommitted if it is in committed.
  */
 void onWriteToDatabase(OperationContext* opCtx, StringData dbName);
+
+/**
+ * Scan config.tenantMigrationDonors and creates the necessary TenantMigrationAccessBlockers for
+ * unfinished migrations.
+ */
+void recoverTenantMigrationAccessBlockers(OperationContext* opCtx);
 
 /**
  * Runs the argument function 'callable'. If it throws a TenantMigrationConflict error (as indicated

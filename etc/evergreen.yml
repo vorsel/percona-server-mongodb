@@ -1375,6 +1375,19 @@ functions:
         # activate the virtualenv if it has been set up
         ${activate_virtualenv}
 
+        # on *SAN builds, extract the debug symbols so they're available
+        # to the symbolizer
+        if [[ -n "${san_options}" ]]; then
+          # the debug symbols archive isn't always available (not every *SAN
+          # task requires compile)
+          if [[ -f "mongo-debugsymbols.tgz" ]]; then
+            tar xf mongo-debugsymbols.tgz
+          else
+            echo "mongo-debugsymbols.tgz is not available. If you're seeing this message in a task that uses mongod or mongos binaries, please ensure debug symbols have been generated, otherwise the llvm-symbolizer may not correctly symbolize the sanitizer output."
+          fi
+        fi
+
+
         # Set the TMPDIR environment variable to be a directory in the task's working
         # directory so that temporary files created by processes spawned by resmoke.py get
         # cleaned up after the task completes. This also ensures the spawned processes
@@ -5114,17 +5127,18 @@ tasks:
       resmoke_args: --suites=aggregation_read_concern_majority_passthrough --storageEngine=wiredTiger
       resmoke_jobs_factor: 0.5
 
-- <<: *task_template
-  name: aggregation_secondary_reads
-  tags: ["aggregation", "secondary_reads", "large"]
+- name: aggregation_secondary_reads_gen
+  tags: ["aggregation", "secondary_reads"]
   depends_on:
   - name: aggregation
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
     vars:
-      resmoke_args: --suites=aggregation_secondary_reads --storageEngine=wiredTiger
+      depends_on: aggregation
+      use_large_distro: "true"
+      resmoke_args: --storageEngine=wiredTiger
       resmoke_jobs_max: 1
+      fallback_num_sub_suites: 3
 
 - <<: *task_template
   name: aggregation_sharded_collections_passthrough
@@ -5837,6 +5851,17 @@ tasks:
       resmoke_args: --suites=sharded_jscore_txns_sharded_collections --storageEngine=wiredTiger
 
 - <<: *task_template
+  name: cst_jscore_passthrough
+  tags: ["jscore"]
+  depends_on:
+    - name: jsCore
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=cst_jscore_passthrough --storageEngine=wiredTiger
+
+- <<: *task_template
   name: libunwind_tests
   tags: []
   commands:
@@ -5912,15 +5937,16 @@ tasks:
     vars:
       resmoke_args: --suites=replica_sets_jscore_passthrough --storageEngine=wiredTiger
 
-- <<: *task_template
-  name: replica_sets_reconfig_jscore_passthrough
+- name: replica_sets_reconfig_jscore_passthrough_gen
   depends_on:
   - name: jsCore
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
     vars:
-      resmoke_args: --suites=replica_sets_reconfig_jscore_passthrough --storageEngine=wiredTiger
+      depends_on: jsCore
+      use_large_distro: "true"
+      resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 5
 
 - <<: *task_template
   name: replica_sets_reconfig_jscore_stepdown_passthrough
@@ -6351,15 +6377,14 @@ tasks:
       resmoke_args: --suites=concurrency --storageEngine=wiredTiger
       resmoke_jobs_max: 1
 
-- <<: *task_template
-  name: concurrency_replication
+- name: concurrency_replication_gen
   tags: ["concurrency", "common", "repl"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
     vars:
-      resmoke_args: "--suites=concurrency_replication --storageEngine=wiredTiger"
+      resmoke_args: "--storageEngine=wiredTiger"
       resmoke_jobs_max: 1
+      fallback_num_sub_suites: 3
 
 - <<: *task_template
   name: concurrency_replication_multiversion_gen
@@ -6423,15 +6448,14 @@ tasks:
       resmoke_args: --suites=concurrency_replication_multi_stmt_txn_ubsan --storageEngine=wiredTiger
       resmoke_jobs_max: 1
 
-- <<: *task_template
-  name: concurrency_replication_wiredtiger_cursor_sweeps
+- name: concurrency_replication_wiredtiger_cursor_sweeps_gen
   tags: ["concurrency", "repl"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
     vars:
-      resmoke_args: "--suites=concurrency_replication_wiredtiger_cursor_sweeps --storageEngine=wiredTiger"
+      resmoke_args: "--storageEngine=wiredTiger"
       resmoke_jobs_max: 1
+      fallback_num_sub_suites: 3
 
 - <<: *task_template
   name: concurrency_replication_wiredtiger_eviction_debug
@@ -6544,25 +6568,25 @@ tasks:
       resmoke_args: "--suites=concurrency_sharded_with_stepdowns_and_balancer --storageEngine=wiredTiger"
       resmoke_jobs_max: 1
 
-- <<: *task_template
-  name: concurrency_sharded_terminate_primary_with_balancer
-  tags: ["concurrency", "stepdowns", "kill_terminate", "large"]
+- name: concurrency_sharded_terminate_primary_with_balancer_gen
+  tags: ["concurrency", "stepdowns", "kill_terminate"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
     vars:
-      resmoke_args: "--suites=concurrency_sharded_terminate_primary_with_balancer --storageEngine=wiredTiger"
+      use_large_distro: "true"
+      resmoke_args: "--storageEngine=wiredTiger"
       resmoke_jobs_max: 1
+      fallback_num_sub_suites: 3
 
-- <<: *task_template
-  name: concurrency_sharded_kill_primary_with_balancer
-  tags: ["concurrency", "stepdowns", "kill_terminate", "large"]
+- name: concurrency_sharded_kill_primary_with_balancer_gen
+  tags: ["concurrency", "stepdowns", "kill_terminate"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
     vars:
-      resmoke_args: "--suites=concurrency_sharded_kill_primary_with_balancer --storageEngine=wiredTiger"
+      use_large_distro: "true"
+      resmoke_args: "--storageEngine=wiredTiger"
       resmoke_jobs_max: 1
+      fallback_num_sub_suites: 3
 
 - <<: *task_template
   name: concurrency_sharded_multi_stmt_txn
@@ -6615,24 +6639,26 @@ tasks:
       resmoke_jobs_max: 1
 
 - <<: *task_template
-  name: concurrency_sharded_multi_stmt_txn_terminate_primary
-  tags: ["concurrency", "stepdowns", "kill_terminate", "large"]
+  name: concurrency_sharded_multi_stmt_txn_terminate_primary_gen
+  tags: ["concurrency", "stepdowns", "kill_terminate"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
     vars:
-      resmoke_args: "--suites=concurrency_sharded_multi_stmt_txn_terminate_primary --storageEngine=wiredTiger"
+      use_large_distro: "true"
+      resmoke_args: "--storageEngine=wiredTiger"
       resmoke_jobs_max: 1
+      fallback_num_sub_suites: 3
 
 - <<: *task_template
-  name: concurrency_sharded_multi_stmt_txn_kill_primary
-  tags: ["concurrency", "stepdowns", "kill_terminate", "large"]
+  name: concurrency_sharded_multi_stmt_txn_kill_primary_gen
+  tags: ["concurrency", "stepdowns", "kill_terminate"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
     vars:
-      resmoke_args: "--suites=concurrency_sharded_multi_stmt_txn_kill_primary --storageEngine=wiredTiger"
+      use_large_distro: "true"
+      resmoke_args: "--storageEngine=wiredTiger"
       resmoke_jobs_max: 1
+      fallback_num_sub_suites: 3
 
 - <<: *task_template
   name: concurrency_simultaneous
@@ -8660,7 +8686,7 @@ buildvariants:
   - name: .ocsp
   - name: .read_write_concern
   - name: .replica_sets !.encrypt
-  - name: replica_sets_reconfig_jscore_passthrough
+  - name: replica_sets_reconfig_jscore_passthrough_gen
   - name: replica_sets_reconfig_jscore_stepdown_passthrough
   - name: .retry
   - name: .read_only
@@ -9156,7 +9182,7 @@ buildvariants:
   - name: .integration !.audit
     distros:
     - ubuntu1804-zseries-build
-  - name: .jscore .common !.auth
+  - name: .jscore .common !.auth !.sbe
   - name: jsCore_op_query
   - name: .read_write_concern
   - name: replica_sets
@@ -9600,10 +9626,7 @@ buildvariants:
   - name: compile_all_run_unittests_TG
     distros:
     - windows-64-vs2019-large
-  - name: .aggregation !.auth !.encrypt !.large
-  - name: .aggregation .large
-    distros:
-    - windows-64-vs2019-large
+  - name: .aggregation !.auth !.encrypt
   - name: aggregation_expression_multiversion_fuzzer_gen
   - name: aggregation_expression_optimization_fuzzer_gen
   - name: auth_gen
@@ -9843,10 +9866,7 @@ buildvariants:
     distros:
     - windows-64-vs2019-large
   - name: .aggfuzzer
-  - name: .aggregation !.auth !.encrypt !.unwind !.large
-  - name: .aggregation .large
-    distros:
-    - windows-64-vs2019-large
+  - name: .aggregation !.auth !.encrypt !.unwind
   - name: auth_gen
   - name: .auth .gle
   - name: causally_consistent_jscore_txns_passthrough
@@ -10142,9 +10162,7 @@ buildvariants:
   - name: .replica_sets !.encrypt !.auth
     distros:
     - rhel62-large
-  - name: replica_sets_reconfig_jscore_passthrough
-    distros:
-    - rhel62-large
+  - name: replica_sets_reconfig_jscore_passthrough_gen
   - name: replica_sets_reconfig_jscore_stepdown_passthrough
     distros:
     - rhel62-large
@@ -10262,9 +10280,7 @@ buildvariants:
   - name: .replica_sets !.encrypt !.auth
     distros:
     - rhel62-large
-  - name: replica_sets_reconfig_jscore_passthrough
-    distros:
-    - rhel62-large
+  - name: replica_sets_reconfig_jscore_passthrough_gen
   - name: replica_sets_reconfig_jscore_stepdown_passthrough
     distros:
     - rhel62-large
@@ -10291,6 +10307,9 @@ buildvariants:
   - name: secondary_reads_passthrough_gen
   - name: server_discovery_and_monitoring_json_test_TG
   - name: server_selection_json_test_TG
+    distros:
+    - rhel62-large
+  - name: cst_jscore_passthrough
 
 - name: enterprise-rhel-62-64-bit-large-txns-format
   display_name: "Enterprise RHEL 6.2 (large transactions format)"
@@ -10324,7 +10343,7 @@ buildvariants:
   - name: change_streams
   - name: change_streams_whole_db_passthrough
   - name: change_streams_whole_cluster_passthrough
-  - name: concurrency_replication
+  - name: concurrency_replication_gen
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
     distros:
@@ -10637,6 +10656,41 @@ buildvariants:
   # jsCore does not exercise the lock-free reads feature, as it is overridden to disabled on standalones, but is a pre-req for other tasks.
   - name: jsCore
   - name: .replica_sets
+
+- name: enterprise-rhel-62-64-bit-operation-resource-consumption-metrics
+  display_name: "Enterprise RHEL 6.2 Shared Library (Operation Resource Consumption Metrics)"
+  modules:
+  - enterprise
+  run_on:
+  - rhel62-small
+  batchtime: 10080 # 7 days
+  expansions:
+    test_flags: >-
+      --mongodSetParameters="{measureOperationResourceConsumption: true}"
+    compile_flags: >-
+      -j$(grep -c ^processor /proc/cpuinfo)
+      --ssl
+      --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+      MONGO_DISTMOD=rhel62
+      --link-model=dynamic
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    build_mongoreplay: false
+    large_distro_name: rhel62-large
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - rhel62-large
+  - name: jsCore
+  - name: noPassthrough_gen
+  - name: noPassthroughWithMongod_gen
+  - name: .replica_sets .common
+  - name: .concurrency .common !.large
+  - name: .concurrency .common .large
+    distros:
+    - rhel62-large
 
 - name: enterprise-rhel-62-64-bit-coverage
   display_name: "~ Enterprise RHEL 6.2 DEBUG Code Coverage"
@@ -11427,7 +11481,7 @@ buildvariants:
   - name: .integration !.audit
     distros:
     - rhel72-zseries-build
-  - name: .jscore .common !.auth
+  - name: .jscore .common !.auth !.sbe
   - name: jsCore_op_query
   - name: .read_write_concern
   - name: replica_sets
@@ -11499,7 +11553,7 @@ buildvariants:
   - name: .integration !.audit !.sharded
     distros:
     - rhel67-zseries-build
-  - name: .jscore .common
+  - name: .jscore .common !.sbe
   - name: jsCore_minimum_batch_size
   - name: replica_sets_jscore_passthrough
   - name: sasl
@@ -11753,7 +11807,7 @@ buildvariants:
   - name: .integration !.audit
     distros:
     - suse12-zseries-build
-  - name: .jscore .common !.auth
+  - name: .jscore .common !.auth !.sbe
   - name: jsCore_op_query
   - name: .read_write_concern
   - name: replica_sets
@@ -12241,7 +12295,7 @@ buildvariants:
   - name: .misc_js
   # SERVER-50296: Investigate concurrency test failures.
   # - name: concurrency
-  # - name: concurrency_replication
+  # - name: concurrency_replication_gen
   # - name: concurrency_replication_causal_consistency
   # - name: concurrency_simultaneous
   # - name: concurrency_simultaneous_replication
@@ -12318,7 +12372,7 @@ buildvariants:
   - name: .integration !.audit
     distros:
     - rhel72-zseries-build
-  - name: .jscore .common !.decimal
+  - name: .jscore .common !.decimal !.sbe
   - name: jsCore_op_query
   - name: .read_write_concern !.durable_history
   - name: replica_sets

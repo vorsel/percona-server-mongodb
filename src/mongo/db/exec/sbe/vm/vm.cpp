@@ -32,6 +32,7 @@
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
 
+#include <boost/algorithm/string.hpp>
 #include <pcrecpp.h>
 
 #include "mongo/db/exec/sbe/values/bson.h"
@@ -96,6 +97,7 @@ int Instruction::stackOffset[Instruction::Tags::lastInstruction] = {
     0,  // isString
     0,  // isNumber
     0,  // isBinData
+    0,  // isDate
     0,  // typeMatch
 
     0,  // function is special, the stack offset is encoded in the instruction itself
@@ -312,6 +314,10 @@ void CodeFragment::appendIsNumber() {
 
 void CodeFragment::appendIsBinData() {
     appendSimpleInstruction(Instruction::isBinData);
+}
+
+void CodeFragment::appendIsDate() {
+    appendSimpleInstruction(Instruction::isDate);
 }
 
 void CodeFragment::appendTypeMatch(uint32_t typeMask) {
@@ -1212,6 +1218,159 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinBsonSize(uint8_
     return {false, value::TypeTags::Nothing, 0};
 }
 
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinToUpper(uint8_t arity) {
+    auto [_, operandTag, operandVal] = getFromStack(0);
+
+    if (value::isString(operandTag)) {
+        auto strView = value::getStringView(operandTag, operandVal);
+        auto [strTag, strVal] = value::makeNewString(strView);
+        char* str = value::getRawStringView(strTag, strVal);
+        boost::to_upper(str);
+        return {true, strTag, strVal};
+    }
+    return {false, value::TypeTags::Nothing, 0};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinToLower(uint8_t arity) {
+    auto [_, operandTag, operandVal] = getFromStack(0);
+
+    if (value::isString(operandTag)) {
+        auto strView = value::getStringView(operandTag, operandVal);
+        auto [strTag, strVal] = value::makeNewString(strView);
+        char* str = value::getRawStringView(strTag, strVal);
+        boost::to_lower(str);
+        return {true, strTag, strVal};
+    }
+    return {false, value::TypeTags::Nothing, 0};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinCoerceToString(uint8_t arity) {
+    auto [operandOwn, operandTag, operandVal] = getFromStack(0);
+
+    if (value::isString(operandTag)) {
+        topStack(false, value::TypeTags::Nothing, 0);
+        return {operandOwn, operandTag, operandVal};
+    }
+
+    switch (operandTag) {
+        case value::TypeTags::NumberInt32: {
+            std::string str = str::stream() << value::bitcastTo<int32_t>(operandVal);
+            auto [strTag, strVal] = value::makeNewString(str);
+            return {true, strTag, strVal};
+        }
+        case value::TypeTags::NumberInt64: {
+            std::string str = str::stream() << value::bitcastTo<int64_t>(operandVal);
+            auto [strTag, strVal] = value::makeNewString(str);
+            return {true, strTag, strVal};
+        }
+        case value::TypeTags::NumberDouble: {
+            std::string str = str::stream() << value::bitcastTo<double>(operandVal);
+            auto [strTag, strVal] = value::makeNewString(str);
+            return {true, strTag, strVal};
+        }
+        case value::TypeTags::NumberDecimal: {
+            std::string str = value::bitcastTo<Decimal128>(operandVal).toString();
+            auto [strTag, strVal] = value::makeNewString(str);
+            return {true, strTag, strVal};
+        }
+        case value::TypeTags::Date: {
+            std::string str = str::stream()
+                << TimeZoneDatabase::utcZone().formatDate(
+                       kISOFormatString,
+                       Date_t::fromMillisSinceEpoch(value::bitcastTo<uint64_t>(operandVal)));
+            auto [strTag, strVal] = value::makeNewString(str);
+            return {true, strTag, strVal};
+        }
+        case value::TypeTags::Timestamp: {
+            Timestamp ts{value::bitcastTo<uint64_t>(operandVal)};
+            auto [strTag, strVal] = value::makeNewString(ts.toString());
+            return {true, strTag, strVal};
+        }
+        case value::TypeTags::Null: {
+            auto [strTag, strVal] = value::makeNewString("");
+            return {true, strTag, strVal};
+        }
+        default:
+            break;
+    }
+    return {false, value::TypeTags::Nothing, 0};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinAcos(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericAcos(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinAcosh(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericAcosh(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinAsin(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericAsin(operandTag, operandValue);
+}
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinAsinh(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericAsinh(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinAtan(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericAtan(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinAtanh(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericAtanh(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinAtan2(uint8_t arity) {
+    auto [owned1, operandTag1, operandValue1] = getFromStack(0);
+    auto [owned2, operandTag2, operandValue2] = getFromStack(1);
+    return genericAtan2(operandTag1, operandValue1, operandTag2, operandValue2);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinCos(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericCos(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinCosh(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericCosh(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDegreesToRadians(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericDegreesToRadians(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinRadiansToDegrees(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericRadiansToDegrees(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinSin(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericSin(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinSinh(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericSinh(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinTan(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericTan(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinTanh(uint8_t arity) {
+    auto [_, operandTag, operandValue] = getFromStack(0);
+    return genericTanh(operandTag, operandValue);
+}
+
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builtin f,
                                                                           uint8_t arity) {
     switch (f) {
@@ -1247,6 +1406,42 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builti
             return builtinBitTestPosition(arity);
         case Builtin::bsonSize:
             return builtinBsonSize(arity);
+        case Builtin::toUpper:
+            return builtinToUpper(arity);
+        case Builtin::toLower:
+            return builtinToLower(arity);
+        case Builtin::coerceToString:
+            return builtinCoerceToString(arity);
+        case Builtin::acos:
+            return builtinAcos(arity);
+        case Builtin::acosh:
+            return builtinAcosh(arity);
+        case Builtin::asin:
+            return builtinAsin(arity);
+        case Builtin::asinh:
+            return builtinAsinh(arity);
+        case Builtin::atan:
+            return builtinAtan(arity);
+        case Builtin::atanh:
+            return builtinAtanh(arity);
+        case Builtin::atan2:
+            return builtinAtan2(arity);
+        case Builtin::cos:
+            return builtinCos(arity);
+        case Builtin::cosh:
+            return builtinCosh(arity);
+        case Builtin::degreesToRadians:
+            return builtinDegreesToRadians(arity);
+        case Builtin::radiansToDegrees:
+            return builtinRadiansToDegrees(arity);
+        case Builtin::sin:
+            return builtinSin(arity);
+        case Builtin::sinh:
+            return builtinSinh(arity);
+        case Builtin::tan:
+            return builtinTan(arity);
+        case Builtin::tanh:
+            return builtinTanh(arity);
     }
 
     MONGO_UNREACHABLE;
@@ -1807,6 +2002,18 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
 
                     if (tag != value::TypeTags::Nothing) {
                         topStack(false, value::TypeTags::Boolean, value::isBinData(tag));
+                    }
+
+                    if (owned) {
+                        value::releaseValue(tag, val);
+                    }
+                    break;
+                }
+                case Instruction::isDate: {
+                    auto [owned, tag, val] = getFromStack(0);
+
+                    if (tag != value::TypeTags::Nothing) {
+                        topStack(false, value::TypeTags::Boolean, tag == value::TypeTags::Date);
                     }
 
                     if (owned) {

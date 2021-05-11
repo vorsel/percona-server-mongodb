@@ -61,7 +61,6 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/delete_request_gen.h"
@@ -587,6 +586,7 @@ Status StorageInterfaceImpl::renameCollection(OperationContext* opCtx,
 Status StorageInterfaceImpl::setIndexIsMultikey(OperationContext* opCtx,
                                                 const NamespaceString& nss,
                                                 const std::string& indexName,
+                                                const KeyStringSet& multikeyMetadataKeys,
                                                 const MultikeyPaths& paths,
                                                 Timestamp ts) {
     if (ts.isNull()) {
@@ -617,7 +617,8 @@ Status StorageInterfaceImpl::setIndexIsMultikey(OperationContext* opCtx,
                           str::stream() << "Could not find index " << indexName << " in "
                                         << nss.ns() << " to set to multikey.");
         }
-        collection->getIndexCatalog()->setMultikeyPaths(opCtx, collection, idx, paths);
+        collection->getIndexCatalog()->setMultikeyPaths(
+            opCtx, collection, idx, multikeyMetadataKeys, paths);
         wunit.commit();
         return Status::OK();
     });

@@ -55,7 +55,6 @@
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/client_metadata_ismaster.h"
 #include "mongo/rpc/metadata/impersonated_user_metadata.h"
-#include "mongo/transport/service_executor.h"
 #include "mongo/util/hex.h"
 #include "mongo/util/log_with_sampling.h"
 #include "mongo/util/net/socket_utils.h"
@@ -306,12 +305,6 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
         serializeAuthenticatedUsers("effectiveUsers"_sd);
     }
 
-    if (const auto seCtx = transport::ServiceExecutorContext::get(client)) {
-        bool isDedicated = (seCtx->getThreadingModel() ==
-                            transport::ServiceExecutorContext::ThreadingModel::kDedicated);
-        infoBuilder->append("threaded"_sd, isDedicated);
-    }
-
     if (clientOpCtx) {
         infoBuilder->append("opid", static_cast<int>(clientOpCtx->getOpID()));
 
@@ -341,7 +334,7 @@ void CurOp::reportCurrentOpForClient(OperationContext* opCtx,
             /** This branch becomes useful again with SERVER-44091
             for (const auto& frame : diagnostic->makeStackTrace().frames) {
                 BSONObjBuilder backtraceObj(backtraceBuilder.subobjStart());
-                backtraceObj.append("addr", integerToHex(frame.instructionOffset));
+                backtraceObj.append("addr", unsignedHex(frame.instructionOffset));
                 backtraceObj.append("path", frame.objectPath);
             }
             */
@@ -892,9 +885,9 @@ string OpDebug::report(OperationContext* opCtx, const SingleThreadedLockStats* l
     OPDEBUG_TOSTRING_HELP(nreturned);
 
     if (queryHash) {
-        s << " queryHash:" << unsignedIntToFixedLengthHex(*queryHash);
+        s << " queryHash:" << zeroPaddedHex(*queryHash);
         invariant(planCacheKey);
-        s << " planCacheKey:" << unsignedIntToFixedLengthHex(*planCacheKey);
+        s << " planCacheKey:" << zeroPaddedHex(*planCacheKey);
     }
 
     if (!errInfo.isOK()) {
@@ -1061,9 +1054,9 @@ void OpDebug::report(OperationContext* opCtx,
     OPDEBUG_TOATTR_HELP(nreturned);
 
     if (queryHash) {
-        pAttrs->addDeepCopy("queryHash", unsignedIntToFixedLengthHex(*queryHash));
+        pAttrs->addDeepCopy("queryHash", zeroPaddedHex(*queryHash));
         invariant(planCacheKey);
-        pAttrs->addDeepCopy("planCacheKey", unsignedIntToFixedLengthHex(*planCacheKey));
+        pAttrs->addDeepCopy("planCacheKey", zeroPaddedHex(*planCacheKey));
     }
 
     if (!errInfo.isOK()) {
@@ -1188,9 +1181,9 @@ void OpDebug::append(OperationContext* opCtx,
     OPDEBUG_APPEND_NUMBER(b, nreturned);
 
     if (queryHash) {
-        b.append("queryHash", unsignedIntToFixedLengthHex(*queryHash));
+        b.append("queryHash", zeroPaddedHex(*queryHash));
         invariant(planCacheKey);
-        b.append("planCacheKey", unsignedIntToFixedLengthHex(*planCacheKey));
+        b.append("planCacheKey", zeroPaddedHex(*planCacheKey));
     }
 
     {
@@ -1443,12 +1436,12 @@ std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requ
 
     addIfNeeded("queryHash", [](auto field, auto args, auto& b) {
         if (args.op.queryHash) {
-            b.append(field, unsignedIntToFixedLengthHex(*args.op.queryHash));
+            b.append(field, zeroPaddedHex(*args.op.queryHash));
         }
     });
     addIfNeeded("planCacheKey", [](auto field, auto args, auto& b) {
         if (args.op.planCacheKey) {
-            b.append(field, unsignedIntToFixedLengthHex(*args.op.planCacheKey));
+            b.append(field, zeroPaddedHex(*args.op.planCacheKey));
         }
     });
 

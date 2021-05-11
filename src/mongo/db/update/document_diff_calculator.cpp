@@ -29,147 +29,224 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/checked_cast.h"
 #include "mongo/db/update/document_diff_calculator.h"
 
 namespace mongo::doc_diff {
 namespace {
 
 // Note: This function is mutually with computeArrayDiff() and computeDocDiff().
-template <class DiffBuilder, class T>
+template <class Node, class T>
 void calculateSubDiffHelper(const BSONElement& preVal,
                             const BSONElement& postVal,
                             T fieldIdentifier,
-                            DiffBuilder* builder);
+                            Node* diffNode);
 
-bool computeArrayDiff(const BSONObj& pre,
-                      const BSONObj& post,
-                      doc_diff::ArrayDiffBuilder* diffBuilder) {
+std::unique_ptr<diff_tree::ArrayNode> computeArrayDiff(const BSONObj& pre, const BSONObj& post) {
+    auto diffNode = std::make_unique<diff_tree::ArrayNode>();
     auto preItr = BSONObjIterator(pre);
     auto postItr = BSONObjIterator(post);
     const size_t postObjSize = static_cast<size_t>(post.objsize());
     size_t nFieldsInPostArray = 0;
-    for (; preItr.more() && postItr.more(); ++preItr, ++postItr, ++nFieldsInPostArray) {
+    while (preItr.more() && postItr.more()) {
         // Bailout if the generated diff so far is larger than the 'post' object.
-        if (postObjSize < diffBuilder->getObjSize()) {
-            return false;
+        if (postObjSize < diffNode->getObjSize()) {
+            return nullptr;
         }
-        if (!(*preItr).binaryEqual(*postItr)) {
+
+        auto preVal = *preItr;
+        auto postVal = *postItr;
+
+        if (!preVal.binaryEqual(postVal)) {
             // If both are arrays or objects, then recursively compute the diff of the respective
             // array or object.
-            if ((*preItr).type() == (*postItr).type() &&
-                ((*preItr).type() == BSONType::Object || (*preItr).type() == BSONType::Array)) {
-                calculateSubDiffHelper(*preItr, *postItr, nFieldsInPostArray, diffBuilder);
+            if (preVal.type() == postVal.type() &&
+                (preVal.type() == BSONType::Object || preVal.type() == BSONType::Array)) {
+                calculateSubDiffHelper(preVal, postVal, nFieldsInPostArray, diffNode.get());
             } else {
-                diffBuilder->addUpdate(nFieldsInPostArray, *postItr);
+                diffNode->addUpdate(nFieldsInPostArray, postVal);
             }
         }
+
+        preItr.advance(preVal);
+        postItr.advance(postVal);
+        ++nFieldsInPostArray;
     }
 
     // When we reach here, only one of postItr or preItr can have more fields. If postItr has more
     // fields, we need to add all the remaining fields.
-    for (; postItr.more(); ++postItr, ++nFieldsInPostArray) {
-        diffBuilder->addUpdate(nFieldsInPostArray, *postItr);
+    for (; postItr.more(); ++nFieldsInPostArray) {
+        auto postVal = *postItr;
+        diffNode->addUpdate(nFieldsInPostArray, postVal);
+        postItr.advance(postVal);
     }
 
     // If preItr has more fields, we can ignore the remaining fields, since we only need to do a
     // resize operation.
     if (preItr.more()) {
-        diffBuilder->setResize(nFieldsInPostArray);
+        diffNode->setResize(nFieldsInPostArray);
     }
-    return postObjSize > diffBuilder->getObjSize();
+    return (postObjSize > diffNode->getObjSize()) ? std::move(diffNode) : nullptr;
 }
 
-bool computeDocDiff(const BSONObj& pre,
-                    const BSONObj& post,
-                    doc_diff::DocumentDiffBuilder* diffBuilder) {
+std::unique_ptr<diff_tree::DocumentSubDiffNode> computeDocDiff(const BSONObj& pre,
+                                                               const BSONObj& post,
+                                                               size_t padding = 0) {
+    auto diffNode = std::make_unique<diff_tree::DocumentSubDiffNode>(padding);
     BSONObjIterator preItr(pre);
     BSONObjIterator postItr(post);
     const size_t postObjSize = static_cast<size_t>(post.objsize());
     std::set<StringData> deletes;
     while (preItr.more() && postItr.more()) {
-        auto preVal = *preItr;
-        auto postVal = *postItr;
-
         // Bailout if the generated diff so far is larger than the 'post' object.
-        if (postObjSize < diffBuilder->getObjSize()) {
-            return false;
+        if (postObjSize < diffNode->getObjSize()) {
+            return nullptr;
         }
+
+        auto preVal = *preItr;
+        // Fast path for case where they're equal.
+        if (postItr.currentElementBinaryEqual(preVal)) {
+            // Here the current element of preItr and postItr are equal. So it's safe to advance
+            // 'postItr' using 'preVal'. This way we can save the cost of constructing 'postVal'.
+            preItr.advance(preVal);
+            postItr.advance(preVal);
+            continue;
+        }
+
+        auto postVal = *postItr;
         if (preVal.fieldNameStringData() == postVal.fieldNameStringData()) {
-            if (preVal.binaryEqual(postVal)) {
-                // They're identical. Move on.
-            } else if (preVal.type() == postVal.type() &&
-                       (preVal.type() == BSONType::Object || preVal.type() == BSONType::Array)) {
+            if (preVal.type() == postVal.type() &&
+                (preVal.type() == BSONType::Object || preVal.type() == BSONType::Array)) {
                 // Both are either arrays or objects, recursively compute the diff of the respective
                 // array or object.
-                calculateSubDiffHelper(preVal, postVal, preVal.fieldNameStringData(), diffBuilder);
+                calculateSubDiffHelper(
+                    preVal, postVal, preVal.fieldNameStringData(), diffNode.get());
             } else {
                 // Any other case, just replace with the 'postVal'.
-                diffBuilder->addUpdate((*preItr).fieldNameStringData(), postVal);
+                diffNode->addUpdate((*preItr).fieldNameStringData(), postVal);
             }
-            preItr.next();
-            postItr.next();
+            preItr.advance(preVal);
+            postItr.advance(postVal);
         } else {
             // If the 'preVal' field name does not exist in the 'post' object then, just remove it.
             // If it present, we do nothing for now, since the field gets inserted later.
             deletes.insert(preVal.fieldNameStringData());
-            preItr.next();
+            preItr.advance(preVal);
         }
     }
 
     // When we reach here, only one of postItr or preItr can have more fields. Record remaining
     // fields in preItr as removals.
-    for (; preItr.more(); preItr.next()) {
+    while (preItr.more()) {
         // Note that we don't need to record these into the 'deletes' set because there are no more
         // fields in the post image.
         invariant(!postItr.more());
-        diffBuilder->addDelete((*preItr).fieldNameStringData());
+        auto next = (*preItr);
+        diffNode->addDelete(next.fieldNameStringData());
+        preItr.advance(next);
     }
 
     // Record remaining fields in postItr as creates.
-    for (; postItr.more(); postItr.next()) {
-        auto fieldName = (*postItr).fieldNameStringData();
-        diffBuilder->addInsert(fieldName, *postItr);
-        deletes.erase(fieldName);
+    while (postItr.more()) {
+        auto next = (*postItr);
+
+        diffNode->addInsert(next.fieldNameStringData(), next);
+        deletes.erase(next.fieldNameStringData());
+        postItr.advance(next);
     }
     for (auto&& deleteField : deletes) {
-        diffBuilder->addDelete(deleteField);
+        diffNode->addDelete(deleteField);
     }
-    return postObjSize > diffBuilder->getObjSize();
+    return (postObjSize > diffNode->getObjSize()) ? std::move(diffNode) : nullptr;
 }
 
-template <class DiffBuilder, class T>
+template <class Node, class T>
 void calculateSubDiffHelper(const BSONElement& preVal,
                             const BSONElement& postVal,
                             T fieldIdentifier,
-                            DiffBuilder* builder) {
-    if (preVal.type() == BSONType::Object) {
-        auto subDiffBuilderGuard = builder->startSubObjDiff(fieldIdentifier);
-        const auto hasSubDiff = computeDocDiff(
-            preVal.embeddedObject(), postVal.embeddedObject(), subDiffBuilderGuard.builder());
-        if (!hasSubDiff) {
-            subDiffBuilderGuard.abandon();
-            builder->addUpdate(fieldIdentifier, postVal);
-        }
+                            Node* diffNode) {
+    auto subDiff = (preVal.type() == BSONType::Object)
+        ? std::unique_ptr<diff_tree::InternalNode>(
+              computeDocDiff(preVal.embeddedObject(), postVal.embeddedObject()))
+        : std::unique_ptr<diff_tree::InternalNode>(
+              computeArrayDiff(preVal.embeddedObject(), postVal.embeddedObject()));
+    if (!subDiff) {
+        // We could not compute sub-diff because the potential sub-diff is bigger than the 'postVal'
+        // itself. So we just log the modification as an update.
+        diffNode->addUpdate(fieldIdentifier, postVal);
     } else {
-        auto subDiffBuilderGuard = builder->startSubArrDiff(fieldIdentifier);
-        const auto hasSubDiff = computeArrayDiff(
-            preVal.embeddedObject(), postVal.embeddedObject(), subDiffBuilderGuard.builder());
-        if (!hasSubDiff) {
-            subDiffBuilderGuard.abandon();
-            builder->addUpdate(fieldIdentifier, postVal);
+        diffNode->addChild(fieldIdentifier, std::move(subDiff));
+    }
+}
+
+class StringWrapper {
+public:
+    StringWrapper(size_t s) : storage(std::to_string(s)), str(storage) {}
+    StringWrapper(StringData s) : str(s) {}
+
+    StringData getStr() {
+        return str;
+    }
+
+private:
+    std::string storage;
+    StringData str;
+};
+
+template <class DiffNode>
+bool anyIndexesMightBeAffected(const DiffNode* node,
+                               const UpdateIndexData* indexData,
+                               FieldRef* path) {
+    for (auto&& [field, child] : node->getChildren()) {
+        // The 'field' here can either be an integer or a string.
+        StringWrapper wrapper(field);
+        FieldRef::FieldRefTempAppend tempAppend(*path, wrapper.getStr());
+        switch (child->type()) {
+            case diff_tree::NodeType::kDelete:
+            case diff_tree::NodeType::kUpdate:
+            case diff_tree::NodeType::kInsert: {
+                if (indexData && indexData->mightBeIndexed(*path)) {
+                    return true;
+                }
+                break;
+            }
+            case diff_tree::NodeType::kDocumentSubDiff: {
+                if (anyIndexesMightBeAffected<diff_tree::DocumentSubDiffNode>(
+                        checked_cast<const diff_tree::DocumentSubDiffNode*>(child.get()),
+                        indexData,
+                        path)) {
+                    return true;
+                }
+                break;
+            }
+            case diff_tree::NodeType::kArray: {
+                auto* arrayNode = checked_cast<const diff_tree::ArrayNode*>(child.get());
+                if ((arrayNode->getResize() && indexData && indexData->mightBeIndexed(*path)) ||
+                    anyIndexesMightBeAffected<diff_tree::ArrayNode>(arrayNode, indexData, path)) {
+                    return true;
+                }
+                break;
+            }
+            case diff_tree::NodeType::kDocumentInsert: {
+                MONGO_UNREACHABLE;
+            }
         }
     }
+    return false;
 }
 }  // namespace
 
-boost::optional<doc_diff::Diff> computeDiff(const BSONObj& pre,
-                                            const BSONObj& post,
-                                            size_t padding) {
-    doc_diff::DocumentDiffBuilder diffBuilder(padding);
-    if (computeDocDiff(pre, post, &diffBuilder)) {
-        auto diff = diffBuilder.serialize();
+boost::optional<DiffResult> computeDiff(const BSONObj& pre,
+                                        const BSONObj& post,
+                                        size_t padding,
+                                        const UpdateIndexData* indexData) {
+    if (auto diffNode = computeDocDiff(pre, post, padding)) {
+        auto diff = diffNode->serialize();
         if (diff.objsize() < post.objsize()) {
-            return diff;
+            FieldRef path;
+            return DiffResult{diff,
+                              anyIndexesMightBeAffected<diff_tree::DocumentSubDiffNode>(
+                                  diffNode.get(), indexData, &path)};
         }
     }
     return {};

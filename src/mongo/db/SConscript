@@ -159,7 +159,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/stats/timer_stats',
         '$BUILD_DIR/mongo/rpc/client_metadata',
-        '$BUILD_DIR/mongo/transport/service_executor',
         '$BUILD_DIR/mongo/util/diagnostic_info' if get_option('use-diagnostic-latches') == 'on' else [],
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/net/network',
@@ -532,6 +531,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/storage/key_string',
     ],
 )
 
@@ -975,6 +975,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/dbhelpers',
 
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        '$BUILD_DIR/mongo/db/repl/replica_set_messages',
         '$BUILD_DIR/mongo/db/repl/timestamp_block',
         '$BUILD_DIR/mongo/db/s/sharding_api_d',
         '$BUILD_DIR/mongo/db/storage/encryption_hooks',
@@ -1289,6 +1290,7 @@ env.Library(
         'catalog/database_holder',
         'commands/server_status_core',
         'kill_sessions',
+        'stats/resource_consumption_metrics',
     ],
 )
 
@@ -1694,7 +1696,6 @@ env.Library(
         'key_generator.cpp',
         'keys_collection_cache.cpp',
         'keys_collection_manager.cpp',
-        'logical_clock.cpp',
         'logical_time_validator.cpp',
         'vector_clock.cpp',
         env.Idlc('keys_collection_manager.idl')[0],
@@ -1780,9 +1781,9 @@ env.Library(
 )
 
 env.Library(
-    target= 'logical_clock_test_fixture',
+    target= 'vector_clock_test_fixture',
     source= [
-        'logical_clock_test_fixture.cpp',
+        'vector_clock_test_fixture.cpp',
     ],
     LIBDEPS= [
         '$BUILD_DIR/mongo/db/auth/authmocks',
@@ -2269,7 +2270,6 @@ envWithAsio.CppUnitTest(
         'index_builds_coordinator_mongod_test.cpp',
         'keypattern_test.cpp',
         'keys_collection_document_test.cpp',
-        'logical_clock_test.cpp',
         'logical_session_cache_test.cpp',
         'logical_session_id_test.cpp',
         'logical_time_test.cpp',
@@ -2296,6 +2296,7 @@ envWithAsio.CppUnitTest(
         'transaction_participant_test.cpp',
         'update_index_data_test.cpp',
         'vector_clock_mongod_test.cpp',
+        'vector_clock_test.cpp',
         'write_concern_options_test.cpp',
         'error_labels_test.cpp',
         env.Idlc('commands_test_example.idl')[0],
@@ -2333,7 +2334,6 @@ envWithAsio.CppUnitTest(
         'index_builds_coordinator_mongod',
         'keys_collection_client_direct',
         'keys_collection_document',
-        'logical_clock_test_fixture',
         'logical_session_cache',
         'logical_session_cache_impl',
         'logical_session_id',
@@ -2374,6 +2374,7 @@ envWithAsio.CppUnitTest(
         'transaction',
         'update_index_data',
         'vector_clock',
+        'vector_clock_test_fixture',
         'write_concern_options',
         'write_ops',
     ],

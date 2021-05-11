@@ -42,12 +42,14 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/unordered_set.h"
+#include "mongo/transport/service_executor.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/hierarchical_acquisition.h"
 #include "mongo/util/periodic_runner.h"
+#include "mongo/util/synchronized_value.h"
 #include "mongo/util/tick_source.h"
 #include "mongo/util/uuid.h"
 
@@ -487,6 +489,14 @@ public:
     ServiceEntryPoint* getServiceEntryPoint() const;
 
     /**
+     * Get the service executor for the service context.
+     *
+     * See ServiceStateMachine for how this is used. Some configurations may not have a service
+     * executor registered and this will return a nullptr.
+     */
+    transport::ServiceExecutor* getServiceExecutor() const;
+
+    /**
      * Waits for the ServiceContext to be fully initialized and for all TransportLayers to have been
      * added/started.
      *
@@ -571,6 +581,11 @@ public:
     void setTransportLayer(std::unique_ptr<transport::TransportLayer> tl);
 
     /**
+     * Binds the service executor to the service context
+     */
+    void setServiceExecutor(std::unique_ptr<transport::ServiceExecutor> exec);
+
+    /**
      * Creates a delayed execution baton with basic functionality
      */
     BatonHandle makeBaton(OperationContext* opCtx) const;
@@ -586,6 +601,40 @@ public:
     LockedClient getLockedClient(OperationId id);
 
 private:
+    /**
+     * A synchronized unique_ptr wrapper to avoid setters racing with getters.
+     */
+    template <typename T>
+    class SyncUnique {
+    public:
+        SyncUnique() = default;
+        explicit SyncUnique(std::unique_ptr<T> p) : _ptr(std::move(p)) {}
+
+        SyncUnique& operator=(std::unique_ptr<T> p) {
+            _ptr->swap(p);
+            return *this;
+        }
+
+        T* get() const {
+            return _ptr->get();
+        }
+
+        T* operator->() const {
+            return get();
+        }
+
+        T& operator*() const {
+            return *get();
+        }
+
+        explicit operator bool() const {
+            return static_cast<bool>(**_ptr);
+        }
+
+    private:
+        mutable synchronized_value<std::unique_ptr<T>, RawSynchronizedValueMutexPolicy> _ptr;
+    };
+
     class ClientObserverHolder {
     public:
         explicit ClientObserverHolder(std::unique_ptr<ClientObserver> observer)
@@ -620,22 +669,27 @@ private:
     /**
      * The periodic runner.
      */
-    std::unique_ptr<PeriodicRunner> _runner;
+    SyncUnique<PeriodicRunner> _runner;
 
     /**
      * The TransportLayer.
      */
-    std::unique_ptr<transport::TransportLayer> _transportLayer;
+    SyncUnique<transport::TransportLayer> _transportLayer;
 
     /**
      * The service entry point
      */
-    std::unique_ptr<ServiceEntryPoint> _serviceEntryPoint;
+    SyncUnique<ServiceEntryPoint> _serviceEntryPoint;
+
+    /**
+     * The ServiceExecutor
+     */
+    SyncUnique<transport::ServiceExecutor> _serviceExecutor;
 
     /**
      * The storage engine, if any.
      */
-    std::unique_ptr<StorageEngine> _storageEngine;
+    SyncUnique<StorageEngine> _storageEngine;
 
     /**
      * Vector of registered observers.
@@ -648,20 +702,20 @@ private:
     /**
      * The registered OpObserver.
      */
-    std::unique_ptr<OpObserver> _opObserver;
+    SyncUnique<OpObserver> _opObserver;
 
-    std::unique_ptr<TickSource> _tickSource;
+    SyncUnique<TickSource> _tickSource;
 
     /**
      * A ClockSource implementation that may be less precise than the _preciseClockSource but
      * may be cheaper to call.
      */
-    std::unique_ptr<ClockSource> _fastClockSource;
+    SyncUnique<ClockSource> _fastClockSource;
 
     /**
      * A ClockSource implementation that is very precise but may be expensive to call.
      */
-    std::unique_ptr<ClockSource> _preciseClockSource;
+    SyncUnique<ClockSource> _preciseClockSource;
 
     // Flag set to indicate that all operations are to be interrupted ASAP.
     AtomicWord<bool> _globalKill{false};

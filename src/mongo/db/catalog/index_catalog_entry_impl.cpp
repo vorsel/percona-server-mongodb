@@ -42,7 +42,6 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/multi_key_path_tracker.h"
@@ -65,11 +64,9 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
                                              RecordId catalogId,
                                              const std::string& ident,
                                              std::unique_ptr<IndexDescriptor> descriptor,
-                                             CollectionQueryInfo* const queryInfo,
                                              bool isFrozen)
     : _ident(ident),
       _descriptor(std::move(descriptor)),
-      _queryInfo(queryInfo),
       _catalogId(catalogId),
       _ordering(Ordering::make(_descriptor->keyPattern())),
       _isReady(false),
@@ -86,7 +83,7 @@ IndexCatalogEntryImpl::IndexCatalogEntryImpl(OperationContext* const opCtx,
         const bool isMultikey = _catalogIsMultikey(opCtx, &_indexMultikeyPaths);
         _isMultikeyForRead.store(isMultikey);
         _isMultikeyForWrite.store(isMultikey);
-        _indexTracksPathLevelMultikeyInfo = !_indexMultikeyPaths.empty();
+        _indexTracksMultikeyPathsInCatalog = !_indexMultikeyPaths.empty();
     }
 
     auto nss = DurableCatalog::get(opCtx)->getEntry(_catalogId).nss;
@@ -174,14 +171,19 @@ void IndexCatalogEntryImpl::setIsReady(bool newIsReady) {
 
 void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
                                         const Collection* collection,
+                                        const KeyStringSet& multikeyMetadataKeys,
                                         const MultikeyPaths& multikeyPaths) {
-    if (!_indexTracksPathLevelMultikeyInfo && _isMultikeyForWrite.load()) {
-        // If the index is already set as multikey and we don't have any path-level information to
-        // update, then there's nothing more for us to do.
+    // An index can either track path-level multikey information in the catalog or as metadata keys
+    // in the index itself, but not both.
+    invariant(!(_indexTracksMultikeyPathsInCatalog && multikeyMetadataKeys.size() > 0));
+    // If the index is already set as multikey and we don't have any path-level information to
+    // update, then there's nothing more for us to do.
+    bool hasNoPathLevelInfo = (!_indexTracksMultikeyPathsInCatalog && multikeyMetadataKeys.empty());
+    if (hasNoPathLevelInfo && _isMultikeyForWrite.load()) {
         return;
     }
 
-    if (_indexTracksPathLevelMultikeyInfo) {
+    if (_indexTracksMultikeyPathsInCatalog) {
         stdx::lock_guard<Latch> lk(_indexMultikeyPathsMutex);
         invariant(multikeyPaths.size() == _indexMultikeyPaths.size());
 
@@ -205,7 +207,7 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
         }
     }
 
-    MultikeyPaths paths = _indexTracksPathLevelMultikeyInfo ? multikeyPaths : MultikeyPaths{};
+    MultikeyPaths paths = _indexTracksMultikeyPathsInCatalog ? multikeyPaths : MultikeyPaths{};
 
     // On a primary, we can simply assign this write the same timestamp as the index creation,
     // insert, or update that caused this index to become multikey. This is because if two
@@ -228,14 +230,20 @@ void IndexCatalogEntryImpl::setMultikey(OperationContext* opCtx,
     // it multikey, that write will be marked as "isTrackingMultikeyPathInfo" on the applier's
     // OperationContext and we can safely defer that write to the end of the batch.
     if (MultikeyPathTracker::get(opCtx).isTrackingMultikeyPathInfo()) {
-        MultikeyPathInfo info;
-        info.nss = collection->ns();
-        info.indexName = _descriptor->indexName();
-        info.multikeyPaths = paths;
-        MultikeyPathTracker::get(opCtx).addMultikeyPathInfo(info);
+        MultikeyPathTracker::get(opCtx).addMultikeyPathInfo(
+            {collection->ns(), _descriptor->indexName(), multikeyMetadataKeys, std::move(paths)});
         return;
     }
 
+    // If multikeyMetadataKeys is non-empty, we must insert these keys into the index itself. We do
+    // not have to account for potential dupes, since all metadata keys are indexed against a single
+    // RecordId. An attempt to write a duplicate key will therefore be ignored.
+    if (!multikeyMetadataKeys.empty()) {
+        uassertStatusOK(accessMethod()->insertKeys(
+            opCtx, collection, multikeyMetadataKeys, {}, {}, {}, nullptr));
+    }
+
+    // Mark the catalog as multikey, and record the multikey paths if applicable.
     if (opCtx->inMultiDocumentTransaction()) {
         auto status = _setMultikeyInMultiDocumentTransaction(opCtx, collection, paths);
         // Retry without side transaction.
@@ -350,19 +358,19 @@ void IndexCatalogEntryImpl::_catalogSetMultikey(OperationContext* opCtx,
     // multikey can be undone. Alternatively, one could use a counter instead of a boolean to avoid
     // that problem.
     _isMultikeyForRead.store(true);
-    if (_indexTracksPathLevelMultikeyInfo) {
+    if (_indexTracksMultikeyPathsInCatalog) {
         stdx::lock_guard<Latch> lk(_indexMultikeyPathsMutex);
         for (size_t i = 0; i < multikeyPaths.size(); ++i) {
             _indexMultikeyPaths[i].insert(multikeyPaths[i].begin(), multikeyPaths[i].end());
         }
     }
-    if (indexMetadataHasChanged && _queryInfo) {
+    if (indexMetadataHasChanged) {
         LOGV2_DEBUG(4718705,
                     1,
                     "Index set to multi key, clearing query plan cache",
                     "namespace"_attr = collection->ns(),
                     "keyPattern"_attr = _descriptor->keyPattern());
-        _queryInfo->clearQueryCache(collection);
+        CollectionQueryInfo::get(collection).clearQueryCache(collection);
     }
 
     opCtx->recoveryUnit()->onCommit([this](boost::optional<Timestamp>) {

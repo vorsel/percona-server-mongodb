@@ -27,56 +27,57 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
+#pragma once
 
-#include "mongo/platform/basic.h"
-
-#include "mongo/db/logical_clock.h"
-
-#include "mongo/base/status.h"
-#include "mongo/db/global_settings.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/time_proof_service.h"
-#include "mongo/db/vector_clock.h"
-#include "mongo/logv2/log.h"
+#include "mongo/db/s/sharding_mongod_test_fixture.h"
 
 namespace mongo {
 
-namespace {
-const auto getLogicalClock = ServiceContext::declareDecoration<std::unique_ptr<LogicalClock>>();
-}  // namespace
+class ClockSourceMock;
+class DBDirectClient;
+class LogicalTime;
+class VectorClock;
+class VectorClockMutable;
 
-LogicalTime LogicalClock::getClusterTimeForReplicaSet(ServiceContext* svcCtx) {
-    if (getGlobalReplSettings().usingReplSets()) {
-        return get(svcCtx)->getClusterTime();
-    }
+/**
+ * A test fixture that installs a VectorClock instance with a TimeProofService onto a service
+ * context, in addition to the mock storage engine, network, and OpObserver provided by
+ * ShardingMongodTestFixture.
+ */
+class VectorClockTestFixture : public ShardingMongodTestFixture {
+public:
+    VectorClockTestFixture();
+    ~VectorClockTestFixture();
 
-    return {};
-}
+protected:
+    /**
+     * Sets up this fixture as the primary node in a shard server replica set with a VectorClock
+     * (with a TimeProofService), storage engine, DBClient, OpObserver, and a mocked clock source.
+     */
+    void setUp() override;
 
-LogicalTime LogicalClock::getClusterTimeForReplicaSet(OperationContext* opCtx) {
-    return getClusterTimeForReplicaSet(opCtx->getClient()->getServiceContext());
-}
+    void tearDown() override;
 
-LogicalClock* LogicalClock::get(ServiceContext* service) {
-    return getLogicalClock(service).get();
-}
+    VectorClockMutable* resetClock();
 
-LogicalClock* LogicalClock::get(OperationContext* ctx) {
-    return get(ctx->getClient()->getServiceContext());
-}
+    void advanceClusterTime(LogicalTime newTime);
 
-void LogicalClock::set(ServiceContext* service, std::unique_ptr<LogicalClock> clockArg) {
-    auto& clock = getLogicalClock(service);
-    clock = std::move(clockArg);
-}
+    VectorClock* getClock() const;
 
-LogicalClock::LogicalClock(ServiceContext* service) : _service(service) {}
+    LogicalTime getClusterTime() const;
 
-LogicalTime LogicalClock::getClusterTime() {
-    auto time = VectorClock::get(_service)->getTime();
-    return time.clusterTime();
-}
+    ClockSourceMock* getMockClockSource() const;
+
+    void setMockClockSourceTime(Date_t time) const;
+
+    Date_t getMockClockSourceTime() const;
+
+    DBDirectClient* getDBClient() const;
+
+private:
+    VectorClock* _clock;
+    std::shared_ptr<ClockSourceMock> _mockClockSource = std::make_shared<ClockSourceMock>();
+    std::unique_ptr<DBDirectClient> _dbDirectClient;
+};
 
 }  // namespace mongo

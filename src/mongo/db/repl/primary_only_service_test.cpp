@@ -136,6 +136,8 @@ public:
                 .semi();
         }
 
+        void interrupt(Status status) override{};
+
         int getID() {
             stdx::lock_guard lk(_mutex);
             return _id["_id"].Int();
@@ -242,6 +244,9 @@ public:
     }
 
     void tearDown() override {
+        // Ensure that even on test failures all failpoint state gets reset.
+        globalFailPointRegistry().disableAllFailpoints();
+
         WaitForMajorityService::get(getServiceContext()).shutDown();
 
         _testExecutor->shutdown();

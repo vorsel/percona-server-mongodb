@@ -29,6 +29,8 @@
 
 #include "mongo/platform/basic.h"
 
+#include <boost/algorithm/string.hpp>
+
 #include "mongo/base/string_data.h"
 #include "mongo/db/cst/bson_lexer.h"
 #include "mongo/db/cst/parser_gen.hpp"
@@ -40,9 +42,9 @@ using namespace std::string_literals;
 
 namespace {
 
-// Mapping of reserved keywords to BSON token. Any key which is not included in this map is assumed
-// to be a user field name and is treated as a terminal by the parser.
-const StringMap<ParserGen::token_type> reservedKeyLookup = {
+// Mapping of reserved key fieldnames to BSON token. Any key which is not included in this map is
+// assumed to be a user field name.
+const StringMap<ParserGen::token_type> reservedKeyFieldnameLookup = {
     {"_id", ParserGen::token::ID},
     // Stages and their arguments.
     {"$_internalInhibitOptimization", ParserGen::token::STAGE_INHIBIT_OPTIMIZATION},
@@ -55,47 +57,52 @@ const StringMap<ParserGen::token_type> reservedKeyLookup = {
     {"coll", ParserGen::token::ARG_COLL},
     {"pipeline", ParserGen::token::ARG_PIPELINE},
     // Expressions
-    {"$add", ParserGen::token::ADD},
-    {"$atan2", ParserGen::token::ATAN2},
-    {"$and", ParserGen::token::AND},
-    {"$or", ParserGen::token::OR},
-    {"$nor", ParserGen::token::NOR},
-    {"$not", ParserGen::token::NOT},
-    {"$const", ParserGen::token::CONST_EXPR},
-    {"$literal", ParserGen::token::LITERAL},
-    {"$cmp", ParserGen::token::CMP},
-    {"$eq", ParserGen::token::EQ},
-    {"$gt", ParserGen::token::GT},
-    {"$gte", ParserGen::token::GTE},
-    {"$lt", ParserGen::token::LT},
-    {"$lte", ParserGen::token::LTE},
-    {"$ne", ParserGen::token::NE},
-    {"$convert", ParserGen::token::CONVERT},
-    {"input", ParserGen::token::ARG_INPUT},
-    {"to", ParserGen::token::ARG_TO},
-    {"onError", ParserGen::token::ARG_ON_ERROR},
-    {"onNull", ParserGen::token::ARG_ON_NULL},
-    {"$toBool", ParserGen::token::TO_BOOL},
-    {"$toDate", ParserGen::token::TO_DATE},
-    {"$toDecimal", ParserGen::token::TO_DECIMAL},
-    {"$toDouble", ParserGen::token::TO_DOUBLE},
-    {"$toInt", ParserGen::token::TO_INT},
-    {"$toLong", ParserGen::token::TO_LONG},
-    {"$toObjectId", ParserGen::token::TO_OBJECT_ID},
-    {"$toString", ParserGen::token::TO_STRING},
-    {"$type", ParserGen::token::TYPE},
     {"$abs", ParserGen::token::ABS},
+    {"$acos", ParserGen::token::ACOS},
+    {"$acosh", ParserGen::token::ACOSH},
+    {"$add", ParserGen::token::ADD},
+    {"$and", ParserGen::token::AND},
+    {"$asin", ParserGen::token::ASIN},
+    {"$asinh", ParserGen::token::ASINH},
+    {"$atan", ParserGen::token::ATAN},
+    {"$atan2", ParserGen::token::ATAN2},
+    {"$atan2", ParserGen::token::ATAN2},
+    {"$atanh", ParserGen::token::ATANH},
     {"$ceil", ParserGen::token::CEIL},
+    {"$cmp", ParserGen::token::CMP},
+    {"$concat", ParserGen::token::CONCAT},
+    {"$const", ParserGen::token::CONST_EXPR},
+    {"$convert", ParserGen::token::CONVERT},
+    {"$cos", ParserGen::token::COS},
+    {"$cosh", ParserGen::token::COSH},
+    {"$dateFromString", ParserGen::token::DATE_FROM_STRING},
+    {"$dateToString", ParserGen::token::DATE_TO_STRING},
+    {"$degreesToRadians", ParserGen::token::DEGREES_TO_RADIANS},
     {"$divide", ParserGen::token::DIVIDE},
+    {"$eq", ParserGen::token::EQ},
     {"$exp", ParserGen::token::EXPONENT},
     {"$floor", ParserGen::token::FLOOR},
+    {"$gt", ParserGen::token::GT},
+    {"$gte", ParserGen::token::GTE},
+    {"$indexOfBytes", ParserGen::token::INDEX_OF_BYTES},
+    {"$indexOfCP", ParserGen::token::INDEX_OF_CP},
+    {"$literal", ParserGen::token::LITERAL},
     {"$ln", ParserGen::token::LN},
     {"$log", ParserGen::token::LOG},
     {"$log10", ParserGen::token::LOGTEN},
+    {"$lt", ParserGen::token::LT},
+    {"$lte", ParserGen::token::LTE},
+    {"$ltrim", ParserGen::token::LTRIM},
+    {"$meta", ParserGen::token::META},
     {"$mod", ParserGen::token::MOD},
     {"$multiply", ParserGen::token::MULTIPLY},
+    {"$ne", ParserGen::token::NE},
+    {"$nor", ParserGen::token::NOR},
+    {"$not", ParserGen::token::NOT},
+    {"$or", ParserGen::token::OR},
     {"$pow", ParserGen::token::POW},
     {"$round", ParserGen::token::ROUND},
+    {"$slice", ParserGen::token::SLICE},
     {"$sqrt", ParserGen::token::SQRT},
     {"$subtract", ParserGen::token::SUBTRACT},
     {"$trunc", ParserGen::token::TRUNC},
@@ -106,40 +113,74 @@ const StringMap<ParserGen::token_type> reservedKeyLookup = {
     {"$indexOfCP", ParserGen::token::INDEX_OF_CP},
     {"$ltrim", ParserGen::token::LTRIM},
     {"$meta", ParserGen::token::META},
+    {"$radiansToDegrees", ParserGen::token::RADIANS_TO_DEGREES},
     {"$regexFind", ParserGen::token::REGEX_FIND},
     {"$regexFindAll", ParserGen::token::REGEX_FIND_ALL},
     {"$regexMatch", ParserGen::token::REGEX_MATCH},
-    {"$replaceOne", ParserGen::token::REPLACE_ONE},
     {"$replaceAll", ParserGen::token::REPLACE_ALL},
+    {"$replaceOne", ParserGen::token::REPLACE_ONE},
+    {"$round", ParserGen::token::ROUND},
     {"$rtrim", ParserGen::token::RTRIM},
+    {"$sin", ParserGen::token::SIN},
+    {"$sinh", ParserGen::token::SINH},
     {"$split", ParserGen::token::SPLIT},
+    {"$sqrt", ParserGen::token::SQRT},
+    {"$strcasecmp", ParserGen::token::STR_CASE_CMP},
     {"$strLenBytes", ParserGen::token::STR_LEN_BYTES},
     {"$strLenCP", ParserGen::token::STR_LEN_CP},
-    {"$strcasecmp", ParserGen::token::STR_CASE_CMP},
     {"$substr", ParserGen::token::SUBSTR},
     {"$substrBytes", ParserGen::token::SUBSTR_BYTES},
     {"$substrCP", ParserGen::token::SUBSTR_CP},
+    {"$subtract", ParserGen::token::SUBTRACT},
+    {"$tan", ParserGen::token::TAN},
+    {"$tanh", ParserGen::token::TANH},
+    {"$toBool", ParserGen::token::TO_BOOL},
+    {"$toDate", ParserGen::token::TO_DATE},
+    {"$toDecimal", ParserGen::token::TO_DECIMAL},
+    {"$toDouble", ParserGen::token::TO_DOUBLE},
+    {"$toInt", ParserGen::token::TO_INT},
+    {"$toLong", ParserGen::token::TO_LONG},
     {"$toLower", ParserGen::token::TO_LOWER},
-    {"$trim", ParserGen::token::TRIM},
+    {"$toObjectId", ParserGen::token::TO_OBJECT_ID},
+    {"$toString", ParserGen::token::TO_STRING},
     {"$toUpper", ParserGen::token::TO_UPPER},
-    {"dateString", ParserGen::token::ARG_DATE_STRING},
-    {"format", ParserGen::token::ARG_FORMAT},
-    {"timezone", ParserGen::token::ARG_TIMEZONE},
-    {"date", ParserGen::token::ARG_DATE},
+    {"$trim", ParserGen::token::TRIM},
+    {"$trunc", ParserGen::token::TRUNC},
+    {"$type", ParserGen::token::TYPE},
     {"chars", ParserGen::token::ARG_CHARS},
-    {"regex", ParserGen::token::ARG_REGEX},
+    {"date", ParserGen::token::ARG_DATE},
+    {"dateString", ParserGen::token::ARG_DATE_STRING},
+    {"find", ParserGen::token::ARG_FIND},
+    {"format", ParserGen::token::ARG_FORMAT},
+    {"input", ParserGen::token::ARG_INPUT},
+    {"onError", ParserGen::token::ARG_ON_ERROR},
+    {"onNull", ParserGen::token::ARG_ON_NULL},
     {"options", ParserGen::token::ARG_OPTIONS},
     {"find", ParserGen::token::ARG_FIND},
+    {"regex", ParserGen::token::ARG_REGEX},
     {"replacement", ParserGen::token::ARG_REPLACEMENT},
-    {"filter", ParserGen::token::ARG_FILTER},
-    {"query", ParserGen::token::ARG_QUERY},
-    {"q", ParserGen::token::ARG_Q},
-    {"sort", ParserGen::token::ARG_SORT},
+    {"$allElementsTrue", ParserGen::token::ALL_ELEMENTS_TRUE},
+    {"$anyElementTrue", ParserGen::token::ANY_ELEMENT_TRUE},
+    {"$setDifference", ParserGen::token::SET_DIFFERENCE},
+    {"$setEquals", ParserGen::token::SET_EQUALS},
+    {"$setIntersection", ParserGen::token::SET_INTERSECTION},
+    {"$setIsSubset", ParserGen::token::SET_IS_SUBSET},
+    {"$setUnion", ParserGen::token::SET_UNION},
+    {"timezone", ParserGen::token::ARG_TIMEZONE},
+    {"to", ParserGen::token::ARG_TO},
 };
-// Mapping of reserved keywords to BSON tokens. Any key which is not included in this map is
+
+// Mapping of reserved key values to BSON token. Any key which is not included in this map is
 // assumed to be a user value.
 const StringMap<ParserGen::token_type> reservedKeyValueLookup = {
+    {"geoNearDistance", ParserGen::token::GEO_NEAR_DISTANCE},
+    {"geoNearPoint", ParserGen::token::GEO_NEAR_POINT},
+    {"indexKey", ParserGen::token::INDEX_KEY},
     {"randVal", ParserGen::token::RAND_VAL},
+    {"recordId", ParserGen::token::RECORD_ID},
+    {"searchHighlights", ParserGen::token::SEARCH_HIGHLIGHTS},
+    {"searchScore", ParserGen::token::SEARCH_SCORE},
+    {"sortKey", ParserGen::token::SORT_KEY},
     {"textScore", ParserGen::token::TEXT_SCORE},
 };
 
@@ -218,17 +259,22 @@ void BSONLexer::tokenize(BSONElement elem, bool includeFieldName) {
     boost::optional<ScopedLocationTracker> context;
     // Skipped when we are tokenizing arrays.
     if (includeFieldName) {
-        if (auto it = reservedKeyLookup.find(elem.fieldNameStringData());
-            it != reservedKeyLookup.end()) {
-            // Place the token expected by the parser if this is a reserved keyword.
+        if (auto it = reservedKeyFieldnameLookup.find(elem.fieldNameStringData());
+            it != reservedKeyFieldnameLookup.end()) {
+            // Place the token expected by the parser if this is a reserved key fieldname.
             pushToken(elem.fieldNameStringData(), it->second);
             context.emplace(this, elem.fieldNameStringData());
+        } else if (elem.fieldNameStringData().find('.') != std::string::npos) {
+            auto components = std::vector<std::string>{};
+            boost::split(components, elem.fieldNameStringData(), [](auto&& c) { return c == '.'; });
+            pushToken(elem.fieldNameStringData(),
+                      ParserGen::token::DOTTED_FIELDNAME,
+                      std::move(components));
         } else if (elem.fieldNameStringData()[0] == '$') {
             pushToken(elem.fieldNameStringData(),
                       ParserGen::token::DOLLAR_PREF_FIELDNAME,
                       elem.fieldName());
         } else {
-            // If we don't care about the keyword, then it's treated as a generic fieldname.
             pushToken(elem.fieldNameStringData(), ParserGen::token::FIELDNAME, elem.fieldName());
         }
     }
@@ -265,18 +311,22 @@ void BSONLexer::tokenize(BSONElement elem, bool includeFieldName) {
         case BSONType::String:
             if (auto it = reservedKeyValueLookup.find(elem.valueStringData());
                 it != reservedKeyValueLookup.end()) {
-                pushToken(elem.String(), it->second);
-            } else if (elem.valueStringData()[0] == '$') {
-                if (elem.valueStringData()[1] == '$') {
-                    pushToken(elem.valueStringData(),
-                              ParserGen::token::DOLLAR_DOLLAR_STRING,
-                              elem.String());
-                } else {
-                    pushToken(
-                        elem.valueStringData(), ParserGen::token::DOLLAR_STRING, elem.String());
-                }
+                // Place the token expected by the parser if this is a reserved key value.
+                pushToken(elem.valueStringData(), it->second);
             } else {
-                pushToken(elem.valueStringData(), ParserGen::token::STRING, elem.String());
+                // If we don't care about the keyword, then it's treated as a generic value.
+                if (elem.valueStringData()[0] == '$') {
+                    if (elem.valueStringData()[1] == '$') {
+                        pushToken(elem.valueStringData(),
+                                  ParserGen::token::DOLLAR_DOLLAR_STRING,
+                                  elem.String());
+                    } else {
+                        pushToken(
+                            elem.valueStringData(), ParserGen::token::DOLLAR_STRING, elem.String());
+                    }
+                } else {
+                    pushToken(elem.valueStringData(), ParserGen::token::STRING, elem.String());
+                }
             }
             break;
         case BSONType::BinData: {
@@ -366,8 +416,32 @@ void BSONLexer::tokenize(BSONElement elem, bool includeFieldName) {
     }
 }
 
-BSONLexer::BSONLexer(BSONElement input) {
-    tokenize(input, true);
+BSONLexer::BSONLexer(BSONObj obj, ParserGen::token_type startingToken) {
+    // Add a prefix to the location depending on the starting token.
+    ScopedLocationTracker inputPrefix{
+        this,
+        startingToken == ParserGen::token::START_PIPELINE
+            ? "pipeline"
+            : (startingToken == ParserGen::token::START_SORT ? "sort" : "filter")};
+    pushToken("start", startingToken);
+
+    // If 'obj' is representing a pipeline, each element is a stage with the fieldname being the
+    // array index. No need to tokenize the fieldname for that case.
+    if (startingToken == ParserGen::token::START_PIPELINE) {
+        pushToken("start array", ParserGen::token::START_ARRAY);
+        auto index = 0;
+        for (auto&& elem : obj) {
+            ScopedLocationTracker stageCtx{this, index++};
+            tokenize(elem, false);
+        }
+        pushToken("end array", ParserGen::token::END_ARRAY);
+    } else {
+        pushToken("start object", ParserGen::token::START_OBJECT);
+        for (auto&& elem : obj) {
+            tokenize(elem, true);
+        }
+        pushToken("end object", ParserGen::token::END_OBJECT);
+    }
 
     // Final token must indicate EOF.
     pushToken("EOF", ParserGen::token::END_OF_FILE);

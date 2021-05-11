@@ -35,6 +35,8 @@
 #include "mongo/db/repl/tenant_migration_donor_util.h"
 
 #include "mongo/db/commands/tenant_migration_recipient_cmds_gen.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_by_prefix.h"
 #include "mongo/db/repl/tenant_migration_state_machine_gen.h"
@@ -46,6 +48,9 @@
 
 namespace mongo {
 
+// Failpoint that will cause recoverTenantMigrationAccessBlockers to return early.
+MONGO_FAIL_POINT_DEFINE(skipRecoverTenantMigrationAccessBlockers);
+
 namespace tenant_migration_donor {
 
 namespace {
@@ -53,6 +58,23 @@ namespace {
 const char kThreadNamePrefix[] = "TenantMigrationWorker-";
 const char kPoolName[] = "TenantMigrationWorkerThreadPool";
 const char kNetName[] = "TenantMigrationWorkerNetwork";
+
+const auto donorStateDocToDeleteDecoration = OperationContext::declareDecoration<BSONObj>();
+
+/**
+ * Updates the TenantMigrationAccessBlocker when the tenant migration transitions to the data sync
+ * state.
+ */
+void onTransitionToDataSync(OperationContext* opCtx,
+                            const TenantMigrationDonorDocument& donorStateDoc) {
+    invariant(donorStateDoc.getState() == TenantMigrationDonorStateEnum::kDataSync);
+    auto mtab = std::make_shared<TenantMigrationAccessBlocker>(
+        opCtx->getServiceContext(),
+        getTenantMigrationDonorExecutor(),
+        donorStateDoc.getDatabasePrefix().toString());
+    TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext())
+        .add(donorStateDoc.getDatabasePrefix(), mtab);
+}
 
 /**
  * Updates the TenantMigrationAccessBlocker when the tenant migration transitions to the blocking
@@ -63,25 +85,16 @@ void onTransitionToBlocking(OperationContext* opCtx,
     invariant(donorStateDoc.getState() == TenantMigrationDonorStateEnum::kBlocking);
     invariant(donorStateDoc.getBlockTimestamp());
 
-    auto& mtabByPrefix = TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext());
-    auto mtab =
-        mtabByPrefix.getTenantMigrationAccessBlockerForDbPrefix(donorStateDoc.getDatabasePrefix());
+    auto mtab = TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext())
+                    .getTenantMigrationAccessBlockerForDbPrefix(donorStateDoc.getDatabasePrefix());
+    invariant(mtab);
 
     if (!opCtx->writesAreReplicated()) {
-        // A primary must create the TenantMigrationAccessBlocker and call startBlockingWrites on it
-        // before reserving the OpTime for the "start blocking" write, so only secondaries create
-        // the TenantMigrationAccessBlocker and call startBlockingWrites on it in the op observer.
-        invariant(!mtab);
-
-        mtab = std::make_shared<TenantMigrationAccessBlocker>(
-            opCtx->getServiceContext(),
-            tenant_migration_donor::makeTenantMigrationExecutor(opCtx->getServiceContext()),
-            donorStateDoc.getDatabasePrefix().toString());
-        mtabByPrefix.add(donorStateDoc.getDatabasePrefix(), mtab);
+        // A primary must call startBlockingWrites on the TenantMigrationAccessBlocker before
+        // reserving the OpTime for the "start blocking" write, so only secondaries call
+        // startBlockingWrites on the TenantMigrationAccessBlocker in the op observer.
         mtab->startBlockingWrites();
     }
-
-    invariant(mtab);
 
     // Both primaries and secondaries call startBlockingReadsAfter in the op observer, since
     // startBlockingReadsAfter just needs to be called before the "start blocking" write's oplog
@@ -97,9 +110,8 @@ void onTransitionToCommitted(OperationContext* opCtx,
     invariant(donorStateDoc.getState() == TenantMigrationDonorStateEnum::kCommitted);
     invariant(donorStateDoc.getCommitOrAbortOpTime());
 
-    auto& mtabByPrefix = TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext());
-    auto mtab =
-        mtabByPrefix.getTenantMigrationAccessBlockerForDbPrefix(donorStateDoc.getDatabasePrefix());
+    auto mtab = TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext())
+                    .getTenantMigrationAccessBlockerForDbPrefix(donorStateDoc.getDatabasePrefix());
     invariant(mtab);
     mtab->commit(donorStateDoc.getCommitOrAbortOpTime().get());
 }
@@ -112,50 +124,70 @@ void onTransitionToAborted(OperationContext* opCtx,
     invariant(donorStateDoc.getState() == TenantMigrationDonorStateEnum::kAborted);
     invariant(donorStateDoc.getCommitOrAbortOpTime());
 
-    auto& mtabByPrefix = TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext());
-    auto mtab =
-        mtabByPrefix.getTenantMigrationAccessBlockerForDbPrefix(donorStateDoc.getDatabasePrefix());
+    auto mtab = TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext())
+                    .getTenantMigrationAccessBlockerForDbPrefix(donorStateDoc.getDatabasePrefix());
     invariant(mtab);
     mtab->abort(donorStateDoc.getCommitOrAbortOpTime().get());
 }
 
 }  // namespace
 
-std::unique_ptr<executor::TaskExecutor> makeTenantMigrationExecutor(
-    ServiceContext* serviceContext) {
-    ThreadPool::Options tpOptions;
-    tpOptions.threadNamePrefix = kThreadNamePrefix;
-    tpOptions.poolName = kPoolName;
-    tpOptions.maxThreads = ThreadPool::Options::kUnlimited;
+std::shared_ptr<executor::TaskExecutor> getTenantMigrationDonorExecutor() {
+    static Mutex mutex = MONGO_MAKE_LATCH("TenantMigrationDonorUtilExecutor::_mutex");
+    static std::shared_ptr<executor::TaskExecutor> executor;
 
-    return std::make_unique<executor::ThreadPoolTaskExecutor>(
-        std::make_unique<ThreadPool>(tpOptions),
-        executor::makeNetworkInterface(kNetName, nullptr, nullptr));
+    stdx::lock_guard<Latch> lg(mutex);
+    if (!executor) {
+        ThreadPool::Options tpOptions;
+        tpOptions.threadNamePrefix = kThreadNamePrefix;
+        tpOptions.poolName = kPoolName;
+        tpOptions.minThreads = 0;
+        tpOptions.maxThreads = 16;
+
+        executor = std::make_shared<executor::ThreadPoolTaskExecutor>(
+            std::make_unique<ThreadPool>(tpOptions), executor::makeNetworkInterface(kNetName));
+        executor->startup();
+    }
+
+    return executor;
 }
 
-void onDonorStateDocUpdate(OperationContext* opCtx, const BSONObj& donorStateDocBson) {
+void onInsertOrUpdate(OperationContext* opCtx, const BSONObj& donorStateDocBson) {
+    // Disable the OpObserver during startup recovery, initial sync and rollback since the in-memory
+    // state will be recovered by recoverTenantMigrationAccessBlockers.
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    if (replCoord->isReplEnabled()) {
+        if (replCoord->getMemberState().startup() || replCoord->getMemberState().startup2() ||
+            replCoord->getMemberState().rollback()) {
+            return;
+        }
+    }
     auto donorStateDoc = TenantMigrationDonorDocument::parse(IDLParserErrorContext("donorStateDoc"),
                                                              donorStateDocBson);
     if (donorStateDoc.getExpireAt()) {
-        TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext())
-            .remove(donorStateDoc.getDatabasePrefix());
-    } else {
-        switch (donorStateDoc.getState()) {
-            case TenantMigrationDonorStateEnum::kDataSync:
-                break;
-            case TenantMigrationDonorStateEnum::kBlocking:
-                onTransitionToBlocking(opCtx, donorStateDoc);
-                break;
-            case TenantMigrationDonorStateEnum::kCommitted:
-                onTransitionToCommitted(opCtx, donorStateDoc);
-                break;
-            case TenantMigrationDonorStateEnum::kAborted:
-                onTransitionToAborted(opCtx, donorStateDoc);
-                break;
-            default:
-                MONGO_UNREACHABLE;
-        }
+        return;
     }
+
+    switch (donorStateDoc.getState()) {
+        case TenantMigrationDonorStateEnum::kDataSync:
+            onTransitionToDataSync(opCtx, donorStateDoc);
+            break;
+        case TenantMigrationDonorStateEnum::kBlocking:
+            onTransitionToBlocking(opCtx, donorStateDoc);
+            break;
+        case TenantMigrationDonorStateEnum::kCommitted:
+            onTransitionToCommitted(opCtx, donorStateDoc);
+            break;
+        case TenantMigrationDonorStateEnum::kAborted:
+            onTransitionToAborted(opCtx, donorStateDoc);
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+void onDelete(OperationContext* opCtx, const std::string dbPrefix) {
+    TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext()).remove(dbPrefix);
 }
 
 void checkIfCanReadOrBlock(OperationContext* opCtx, StringData dbName) {
@@ -196,12 +228,58 @@ void checkIfLinearizableReadWasAllowedOrThrow(OperationContext* opCtx, StringDat
 }
 
 void onWriteToDatabase(OperationContext* opCtx, StringData dbName) {
-    auto& mtabByPrefix = TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext());
-    auto mtab = mtabByPrefix.getTenantMigrationAccessBlockerForDbName(dbName);
+    auto mtab = TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext())
+                    .getTenantMigrationAccessBlockerForDbName(dbName);
 
     if (mtab) {
         mtab->checkIfCanWriteOrThrow();
     }
+}
+
+void recoverTenantMigrationAccessBlockers(OperationContext* opCtx) {
+    if (MONGO_unlikely(skipRecoverTenantMigrationAccessBlockers.shouldFail())) {
+        return;
+    }
+
+    PersistentTaskStore<TenantMigrationDonorDocument> store(
+        NamespaceString::kTenantMigrationDonorsNamespace);
+    Query query;
+
+    store.forEach(opCtx, query, [&](const TenantMigrationDonorDocument& doc) {
+        auto mtab =
+            std::make_shared<TenantMigrationAccessBlocker>(opCtx->getServiceContext(),
+                                                           getTenantMigrationDonorExecutor(),
+                                                           doc.getDatabasePrefix().toString());
+
+        TenantMigrationAccessBlockerByPrefix::get(opCtx->getServiceContext())
+            .add(doc.getDatabasePrefix(), mtab);
+
+        switch (doc.getState()) {
+            case TenantMigrationDonorStateEnum::kDataSync:
+                break;
+            case TenantMigrationDonorStateEnum::kBlocking:
+                invariant(doc.getBlockTimestamp());
+                mtab->startBlockingWrites();
+                mtab->startBlockingReadsAfter(doc.getBlockTimestamp().get());
+                break;
+            case TenantMigrationDonorStateEnum::kCommitted:
+                invariant(doc.getBlockTimestamp());
+                mtab->startBlockingWrites();
+                mtab->startBlockingReadsAfter(doc.getBlockTimestamp().get());
+                mtab->commit(doc.getCommitOrAbortOpTime().get());
+                break;
+            case TenantMigrationDonorStateEnum::kAborted:
+                if (doc.getBlockTimestamp()) {
+                    mtab->startBlockingWrites();
+                    mtab->startBlockingReadsAfter(doc.getBlockTimestamp().get());
+                }
+                mtab->abort(doc.getCommitOrAbortOpTime().get());
+                break;
+            default:
+                MONGO_UNREACHABLE;
+        }
+        return true;
+    });
 }
 
 }  // namespace tenant_migration_donor

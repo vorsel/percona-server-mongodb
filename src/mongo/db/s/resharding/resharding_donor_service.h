@@ -63,20 +63,20 @@ public:
  * Represents the current state of a resharding donor operation on this shard. This class drives
  * state transitions and updates to underlying on-disk metadata.
  */
-class DonorStateMachine final
-    : public repl::PrimaryOnlyService::TypedInstance<ReshardingDonorService::Instance> {
+class DonorStateMachine final : public repl::PrimaryOnlyService::TypedInstance<DonorStateMachine> {
 public:
     explicit DonorStateMachine(const BSONObj& donorDoc);
 
-    virtual SemiFuture<void> run(
-        std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept override;
+    SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept override;
+
+    void interrupt(Status status) override{};
 
     void onReshardingFieldsChanges(
         boost::optional<TypeCollectionReshardingFields> reshardingFields);
 
 private:
     // The following functions correspond to the actions to take at a particular donor state.
-    void _onInitializingCalculateMinFetchTimestampThenBeginDonating();
+    void _onPreparingToDonateCalculateMinFetchTimestampThenBeginDonating();
 
     ExecutorFuture<void> _awaitAllRecipientsDoneApplyingThenStartMirroring(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
@@ -87,7 +87,8 @@ private:
     void _dropOriginalCollectionThenDeleteLocalState();
 
     // Transitions the state on-disk and in-memory to 'endState'.
-    void _transitionState(DonorStateEnum endState);
+    void _transitionState(DonorStateEnum endState,
+                          boost::optional<Timestamp> minFetchTimestamp = boost::none);
 
     // Transitions the state on-disk and in-memory to kError.
     void _transitionStateToError(const Status& status);

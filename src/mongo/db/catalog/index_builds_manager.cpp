@@ -80,7 +80,7 @@ IndexBuildsManager::~IndexBuildsManager() {
 }
 
 Status IndexBuildsManager::setUpIndexBuild(OperationContext* opCtx,
-                                           Collection* collection,
+                                           CollectionWriter& collection,
                                            const std::vector<BSONObj>& specs,
                                            const UUID& buildUUID,
                                            OnInitFn onInit,
@@ -130,12 +130,13 @@ Status IndexBuildsManager::startBuildingIndex(OperationContext* opCtx,
 }
 
 Status IndexBuildsManager::resumeBuildingIndexFromBulkLoadPhase(OperationContext* opCtx,
+                                                                const Collection* collection,
                                                                 const UUID& buildUUID) {
-    return invariant(_getBuilder(buildUUID))->dumpInsertsFromBulk(opCtx);
+    return invariant(_getBuilder(buildUUID))->dumpInsertsFromBulk(opCtx, collection);
 }
 
 StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingIndexForRecovery(
-    OperationContext* opCtx, Collection* coll, const UUID& buildUUID, RepairData repair) {
+    OperationContext* opCtx, const Collection* coll, const UUID& buildUUID, RepairData repair) {
     auto builder = invariant(_getBuilder(buildUUID));
 
     // Iterate all records in the collection. Validate the records and index them
@@ -230,7 +231,7 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
     // Delete duplicate record and insert it into local lost and found.
     Status status = [&] {
         if (repair == RepairData::kYes) {
-            return builder->dumpInsertsFromBulk(opCtx, [&](const RecordId& rid) {
+            return builder->dumpInsertsFromBulk(opCtx, coll, [&](const RecordId& rid) {
                 auto moveStatus = _moveRecordToLostAndFound(opCtx, ns, lostAndFoundNss, rid);
                 if (moveStatus.isOK() && (moveStatus.getValue() > 0)) {
                     recordsRemoved++;
@@ -239,7 +240,7 @@ StatusWith<std::pair<long long, long long>> IndexBuildsManager::startBuildingInd
                 return moveStatus.getStatus();
             });
         } else {
-            return builder->dumpInsertsFromBulk(opCtx);
+            return builder->dumpInsertsFromBulk(opCtx, coll);
         }
     }();
     if (!status.isOK()) {
@@ -283,14 +284,15 @@ Status IndexBuildsManager::retrySkippedRecords(OperationContext* opCtx,
 }
 
 Status IndexBuildsManager::checkIndexConstraintViolations(OperationContext* opCtx,
+                                                          const Collection* collection,
                                                           const UUID& buildUUID) {
     auto builder = invariant(_getBuilder(buildUUID));
 
-    return builder->checkConstraints(opCtx);
+    return builder->checkConstraints(opCtx, collection);
 }
 
 Status IndexBuildsManager::commitIndexBuild(OperationContext* opCtx,
-                                            Collection* collection,
+                                            CollectionWriter& collection,
                                             const NamespaceString& nss,
                                             const UUID& buildUUID,
                                             MultiIndexBlock::OnCreateEachFn onCreateEachFn,
@@ -301,9 +303,10 @@ Status IndexBuildsManager::commitIndexBuild(OperationContext* opCtx,
         opCtx,
         "IndexBuildsManager::commitIndexBuild",
         nss.ns(),
-        [this, builder, buildUUID, opCtx, collection, nss, &onCreateEachFn, &onCommitFn] {
+        [this, builder, buildUUID, opCtx, &collection, nss, &onCreateEachFn, &onCommitFn] {
             WriteUnitOfWork wunit(opCtx);
-            auto status = builder->commit(opCtx, collection, onCreateEachFn, onCommitFn);
+            auto status = builder->commit(
+                opCtx, collection.getWritableCollection(), onCreateEachFn, onCommitFn);
             if (!status.isOK()) {
                 return status;
             }
@@ -313,7 +316,7 @@ Status IndexBuildsManager::commitIndexBuild(OperationContext* opCtx,
 }
 
 bool IndexBuildsManager::abortIndexBuild(OperationContext* opCtx,
-                                         Collection* collection,
+                                         CollectionWriter& collection,
                                          const UUID& buildUUID,
                                          OnCleanUpFn onCleanUpFn) {
     auto builder = _getBuilder(buildUUID);
@@ -344,7 +347,8 @@ bool IndexBuildsManager::abortIndexBuildWithoutCleanupForRollback(OperationConte
           "Index build aborted without cleanup for rollback",
           "buildUUID"_attr = buildUUID);
 
-    if (auto resumeInfo = builder.getValue()->abortWithoutCleanupForRollback(opCtx, isResumable)) {
+    if (auto resumeInfo =
+            builder.getValue()->abortWithoutCleanupForRollback(opCtx, collection, isResumable)) {
         _resumeInfos.push_back(std::move(*resumeInfo));
     }
 
@@ -363,7 +367,7 @@ bool IndexBuildsManager::abortIndexBuildWithoutCleanupForShutdown(OperationConte
     LOGV2(
         4841500, "Index build aborted without cleanup for shutdown", "buildUUID"_attr = buildUUID);
 
-    builder.getValue()->abortWithoutCleanupForShutdown(opCtx, isResumable);
+    builder.getValue()->abortWithoutCleanupForShutdown(opCtx, collection, isResumable);
     return true;
 }
 

@@ -30,7 +30,7 @@
 #pragma once
 
 #include "mongo/db/exec/sbe/stages/stages.h"
-#include "mongo/db/exec/sbe/values/id_generators.h"
+#include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/trial_run_progress_tracker.h"
 #include "mongo/db/query/query_solution.h"
 
@@ -77,5 +77,6 @@ std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> generateSingleInt
     boost::optional<sbe::value::SlotId> recordSlot,
     sbe::value::SlotIdGenerator* slotIdGenerator,
     PlanYieldPolicy* yieldPolicy,
-    TrialRunProgressTracker* tracker);
+    TrialRunProgressTracker* tracker,
+    PlanNodeId nodeId);
 }  // namespace mongo::stage_builder

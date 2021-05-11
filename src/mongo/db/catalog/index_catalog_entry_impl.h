@@ -46,7 +46,6 @@
 namespace mongo {
 
 class CollatorInterface;
-class CollectionQueryInfo;
 class IndexAccessMethod;
 class IndexDescriptor;
 class MatchExpression;
@@ -62,7 +61,6 @@ public:
                           RecordId catalogId,
                           const std::string& ident,
                           std::unique_ptr<IndexDescriptor> descriptor,  // ownership passes to me
-                          CollectionQueryInfo* queryInfo,               // not owned, optional
                           bool isFrozen);
 
     void init(std::unique_ptr<IndexAccessMethod> accessMethod) final;
@@ -89,11 +87,7 @@ public:
         return _indexBuildInterceptor != nullptr;
     }
 
-    IndexBuildInterceptor* indexBuildInterceptor() final {
-        return _indexBuildInterceptor;
-    }
-
-    const IndexBuildInterceptor* indexBuildInterceptor() const final {
+    IndexBuildInterceptor* indexBuildInterceptor() const final {
         return _indexBuildInterceptor;
     }
 
@@ -162,6 +156,7 @@ public:
      */
     void setMultikey(OperationContext* opCtx,
                      const Collection* coll,
+                     const KeyStringSet& multikeyMetadataKeys,
                      const MultikeyPaths& multikeyPaths) final;
 
     // if this ready is ready for queries
@@ -221,8 +216,6 @@ private:
 
     std::unique_ptr<IndexDescriptor> _descriptor;  // owned here
 
-    CollectionQueryInfo* _queryInfo;  // not owned here
-
     std::unique_ptr<IndexAccessMethod> _accessMethod;
 
     IndexBuildInterceptor* _indexBuildInterceptor = nullptr;  // not owned here
@@ -241,10 +234,9 @@ private:
     bool _isFrozen;
     AtomicWord<bool> _isDropped;  // Whether the index drop is committed.
 
-    // Set to true if this index supports path-level multikey tracking.
-    // '_indexTracksPathLevelMultikeyInfo' is effectively const after IndexCatalogEntry::init() is
-    // called.
-    bool _indexTracksPathLevelMultikeyInfo = false;
+    // Set to true if this index can track path-level multikey information in the catalog. This
+    // member is effectively const after IndexCatalogEntry::init() is called.
+    bool _indexTracksMultikeyPathsInCatalog = false;
 
     // Set to true if this index may contain multikey data.
     AtomicWord<bool> _isMultikeyForRead;

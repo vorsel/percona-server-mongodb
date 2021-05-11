@@ -31,7 +31,7 @@
 
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
-#include "mongo/db/exec/sbe/values/id_generators.h"
+#include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/query/projection.h"
 
@@ -48,6 +48,7 @@ std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> generateProjectio
     sbe::value::SlotIdGenerator* slotIdGenerator,
     sbe::value::FrameIdGenerator* frameIdGenerator,
     sbe::value::SlotId inputVar,
-    sbe::RuntimeEnvironment* env);
+    sbe::RuntimeEnvironment* env,
+    PlanNodeId planNodeId);
 
 }  // namespace mongo::stage_builder

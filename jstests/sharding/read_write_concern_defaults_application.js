@@ -461,6 +461,7 @@ let testCases = {
     hello: {skip: "does not accept read or write concern"},
     hostInfo: {skip: "does not accept read or write concern"},
     httpClientRequest: {skip: "does not accept read or write concern"},
+    exportCollection: {skip: "internal command"},
     importCollection: {skip: "internal command"},
     insert: {
         setUp: function(conn) {
@@ -666,6 +667,7 @@ let testCases = {
     updateZoneKeyRange: {skip: "does not accept read or write concern"},
     usersInfo: {skip: "does not accept read or write concern"},
     validate: {skip: "does not accept read or write concern"},
+    voteCommitImportCollection: {skip: "internal command"},
     voteCommitIndexBuild: {skip: "internal command"},
     waitForFailPoint: {skip: "does not accept read or write concern"},
     waitForOngoingChunkSplits: {skip: "does not accept read or write concern"},

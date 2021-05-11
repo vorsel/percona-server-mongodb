@@ -50,7 +50,8 @@ class SpoolEagerProducerStage final : public PlanStage {
 public:
     SpoolEagerProducerStage(std::unique_ptr<PlanStage> input,
                             SpoolId spoolId,
-                            value::SlotVector vals);
+                            value::SlotVector vals,
+                            PlanNodeId planNodeId);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -66,7 +67,7 @@ public:
 
 private:
     std::shared_ptr<SpoolBuffer> _buffer{nullptr};
-    size_t _bufferIt;
+    size_t _bufferIt{0};
     const SpoolId _spoolId;
 
     const value::SlotVector _vals;
@@ -97,7 +98,8 @@ public:
     SpoolLazyProducerStage(std::unique_ptr<PlanStage> input,
                            SpoolId spoolId,
                            value::SlotVector vals,
-                           std::unique_ptr<EExpression> predicate);
+                           std::unique_ptr<EExpression> predicate,
+                           PlanNodeId planNodeId);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -144,13 +146,13 @@ private:
 template <bool IsStack>
 class SpoolConsumerStage final : public PlanStage {
 public:
-    SpoolConsumerStage(SpoolId spoolId, value::SlotVector vals)
-        : PlanStage{IsStack ? "sspool"_sd : "cspool"_sd},
+    SpoolConsumerStage(SpoolId spoolId, value::SlotVector vals, PlanNodeId planNodeId)
+        : PlanStage{IsStack ? "sspool"_sd : "cspool"_sd, planNodeId},
           _spoolId{spoolId},
           _vals{std::move(vals)} {}
 
     std::unique_ptr<PlanStage> clone() const {
-        return std::make_unique<SpoolConsumerStage<IsStack>>(_spoolId, _vals);
+        return std::make_unique<SpoolConsumerStage<IsStack>>(_spoolId, _vals, _commonStats.nodeId);
     }
 
     void prepare(CompileCtx& ctx) {
@@ -242,7 +244,7 @@ public:
 
 private:
     std::shared_ptr<SpoolBuffer> _buffer{nullptr};
-    size_t _bufferIt;
+    size_t _bufferIt{0};
     const SpoolId _spoolId;
 
     const value::SlotVector _vals;

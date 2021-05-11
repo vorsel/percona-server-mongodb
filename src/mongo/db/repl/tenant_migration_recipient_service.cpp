@@ -31,7 +31,12 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/base/checked_cast.h"
+#include "mongo/client/dbclient_connection.h"
+#include "mongo/client/replica_set_monitor.h"
+#include "mongo/client/replica_set_monitor_manager.h"
 #include "mongo/db/client.h"
+#include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -48,6 +53,9 @@ namespace repl {
 
 // Fails before waiting for the state doc to be majority replicated.
 MONGO_FAIL_POINT_DEFINE(failWhilePersistingTenantMigrationRecipientInstanceStateDoc);
+MONGO_FAIL_POINT_DEFINE(stopAfterPersistingTenantMigrationRecipientInstanceStateDoc);
+MONGO_FAIL_POINT_DEFINE(stopAfterConnectingTenantMigrationRecipientInstance);
+MONGO_FAIL_POINT_DEFINE(setTenantMigrationRecipientInstanceHostTimeout);
 
 TenantMigrationRecipientService::TenantMigrationRecipientService(ServiceContext* serviceContext)
     : PrimaryOnlyService(serviceContext) {}
@@ -71,18 +79,161 @@ std::shared_ptr<PrimaryOnlyService::Instance> TenantMigrationRecipientService::c
 }
 
 TenantMigrationRecipientService::Instance::Instance(BSONObj stateDoc)
-    : PrimaryOnlyService::TypedInstance<Instance>() {
-    _stateDoc = TenantMigrationRecipientDocument::parse(IDLParserErrorContext("recipientStateDoc"),
-                                                        stateDoc);
+    : PrimaryOnlyService::TypedInstance<Instance>(),
+      _stateDoc(TenantMigrationRecipientDocument::parse(IDLParserErrorContext("recipientStateDoc"),
+                                                        stateDoc)),
+      _tenantId(_stateDoc.getDatabasePrefix().toString()),
+      _migrationUuid(_stateDoc.getId()),
+      _donorConnectionString(_stateDoc.getDonorConnectionString().toString()),
+      _readPreference(_stateDoc.getReadPreference()) {}
+
+std::unique_ptr<DBClientConnection> TenantMigrationRecipientService::Instance::_connectAndAuth(
+    const HostAndPort& serverAddress, StringData applicationName, BSONObj authParams) {
+    std::string errMsg;
+    auto clientBase = ConnectionString(serverAddress).connect(applicationName, errMsg);
+    if (!clientBase) {
+        LOGV2_ERROR(4880400,
+                    "Failed to connect to migration donor",
+                    "tenantId"_attr = getTenantId(),
+                    "migrationId"_attr = getMigrationUUID(),
+                    "serverAddress"_attr = serverAddress,
+                    "applicationName"_attr = applicationName,
+                    "error"_attr = errMsg);
+        uasserted(ErrorCodes::HostNotFound, errMsg);
+    }
+    // ConnectionString::connect() always returns a DBClientConnection in a unique_ptr of
+    // DBClientBase type.
+    std::unique_ptr<DBClientConnection> client(
+        checked_cast<DBClientConnection*>(clientBase.release()));
+    if (!authParams.isEmpty()) {
+        client->auth(authParams);
+    } else {
+        // Tenant migration in production should always require auth.
+        uassert(4880405, "No auth data provided to tenant migration", getTestCommandsEnabled());
+    }
+
+    return client;
 }
+
+SemiFuture<void> TenantMigrationRecipientService::Instance::_createAndConnectClients() {
+    LOGV2_DEBUG(4880401,
+                1,
+                "Recipient migration service connecting clients",
+                "tenantId"_attr = getTenantId(),
+                "migrationId"_attr = getMigrationUUID(),
+                "connectionString"_attr = _donorConnectionString,
+                "readPreference"_attr = _readPreference,
+                "authParams"_attr = redact(_authParams));
+    auto connectionStringWithStatus = ConnectionString::parse(_donorConnectionString);
+    if (!connectionStringWithStatus.isOK()) {
+        LOGV2_ERROR(4880403,
+                    "Failed to parse connection string",
+                    "tenantId"_attr = getTenantId(),
+                    "migrationId"_attr = getMigrationUUID(),
+                    "connectionString"_attr = _donorConnectionString,
+                    "error"_attr = connectionStringWithStatus.getStatus());
+
+        return SemiFuture<void>::makeReady(connectionStringWithStatus.getStatus());
+    }
+    auto connectionString = std::move(connectionStringWithStatus.getValue());
+    const auto& servers = connectionString.getServers();
+    stdx::lock_guard lk(_mutex);
+    _donorReplicaSetMonitor = ReplicaSetMonitor::createIfNeeded(
+        connectionString.getSetName(), std::set<HostAndPort>(servers.begin(), servers.end()));
+    Milliseconds findHostTimeout = ReplicaSetMonitorInterface::kDefaultFindHostTimeout;
+    setTenantMigrationRecipientInstanceHostTimeout.execute([&](const BSONObj& data) {
+        findHostTimeout = Milliseconds(data["findHostTimeoutMillis"].safeNumberLong());
+    });
+    return _donorReplicaSetMonitor->getHostOrRefresh(_readPreference, findHostTimeout)
+        .thenRunOn(**_scopedExecutor)
+        .then([this](const HostAndPort& serverAddress) {
+            stdx::lock_guard lk(_mutex);
+            auto applicationName =
+                "TenantMigrationRecipient_" + getTenantId() + "_" + getMigrationUUID().toString();
+            _client = _connectAndAuth(serverAddress, applicationName, _authParams);
+
+            applicationName += "_fetcher";
+            _oplogFetcherClient = _connectAndAuth(serverAddress, applicationName, _authParams);
+        })
+        .onError([this](const Status& status) {
+            LOGV2_ERROR(4880404,
+                        "Connecting to donor failed",
+                        "tenantId"_attr = getTenantId(),
+                        "migrationId"_attr = getMigrationUUID(),
+                        "error"_attr = status);
+
+            // Make sure we don't end up with a partially initialized set of connections.
+            stdx::lock_guard lk(_mutex);
+            _client = nullptr;
+            _oplogFetcherClient = nullptr;
+            return status;
+        })
+        .semi();
+}
+
+SharedSemiFuture<void> TenantMigrationRecipientService::Instance::_initializeStateDoc() {
+    stdx::lock_guard lk(_mutex);
+    // If the instance state is not 'kUninitialized', then the instance is restarted by step
+    // up. So, skip persisting the state doc. And, PrimaryOnlyService::onStepUp() waits for
+    // majority commit of the primary no-op oplog entry written by the node in the newer
+    // term before scheduling the Instance::run(). So, it's also safe to assume that
+    // instance's state document written in an older term on disk won't get rolled back for
+    // step up case.
+    if (_stateDoc.getState() != TenantMigrationRecipientStateEnum::kUninitialized) {
+        return {Future<void>::makeReady()};
+    }
+
+    auto uniqueOpCtx = cc().makeOperationContext();
+    auto opCtx = uniqueOpCtx.get();
+
+
+    LOGV2_DEBUG(5081400,
+                2,
+                "Recipient migration service initializing state document",
+                "tenantId"_attr = getTenantId(),
+                "migrationId"_attr = getMigrationUUID(),
+                "connectionString"_attr = _donorConnectionString,
+                "readPreference"_attr = _readPreference);
+
+    // Persist the state doc before starting the data sync.
+    _stateDoc.setState(TenantMigrationRecipientStateEnum::kStarted);
+    uassertStatusOK(tenantMigrationRecipientEntryHelpers::insertStateDoc(opCtx, _stateDoc));
+
+    if (MONGO_unlikely(failWhilePersistingTenantMigrationRecipientInstanceStateDoc.shouldFail())) {
+        LOGV2(4878500, "Persisting state doc failed due to fail point enabled.");
+        uassert(ErrorCodes::NotWritablePrimary,
+                "Persisting state doc failed - "
+                "'failWhilePersistingTenantMigrationRecipientInstanceStateDoc' fail point active",
+                false);
+    }
+
+    // Wait for the state doc to be majority replicated to make sure that the state doc doesn't
+    // rollback.
+    auto insertOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    return WaitForMajorityService::get(opCtx->getServiceContext()).waitUntilMajority(insertOpTime);
+}
+
+namespace {
+constexpr std::int32_t stopFailPointErrorCode = 4880402;
+void stopOnFailPoint(FailPoint* fp) {
+    uassert(stopFailPointErrorCode,
+            "Skipping remaining processing due to fail point",
+            MONGO_likely(!fp->shouldFail()));
+}
+}  // namespace
 
 SemiFuture<void> TenantMigrationRecipientService::Instance::run(
     std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept {
+    _scopedExecutor = executor;
     return ExecutorFuture(**executor)
-        .then([this]() -> SharedSemiFuture<void> {
-            auto uniqueOpCtx = cc().makeOperationContext();
-            auto opCtx = uniqueOpCtx.get();
-
+        .then([this]() { return _initializeStateDoc(); })
+        .then([this] {
+            stopOnFailPoint(&stopAfterPersistingTenantMigrationRecipientInstanceStateDoc);
+            return _createAndConnectClients();
+        })
+        .then([this] {
+            stopOnFailPoint(&stopAfterConnectingTenantMigrationRecipientInstance);
+            stdx::lock_guard lk(_mutex);
             // The instance is marked as garbage collect if the migration is either
             // committed or aborted on donor side. So, don't start the recipient task if the
             // instance state doc is marked for garbage collect.
@@ -90,66 +241,30 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
                     str::stream() << "Can't start the data sync as the state doc is already marked "
                                      "for garbage collect for migration uuid: "
                                   << getMigrationUUID(),
-                    !isMarkedForGarbageCollect());
+                    !_stateDoc.getGarbageCollect());
 
-            auto lastOpBeforeRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
-
-            // Persist the state doc before starting the data sync.
-            auto status = tenantMigrationRecipientEntryHelpers::insertStateDoc(opCtx, _stateDoc);
-
-            // TODO SERVER-50742: Ignoring duplicate check step should be removed.
-            // We can hit duplicate key error when the instances are rebuilt on a new primary after
-            // step up. So, it's ok to ignore duplicate key errors.
-            if (status != ErrorCodes::DuplicateKey) {
-                uassertStatusOK(status);
-            }
-
-            auto lastOpAfterRun = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
-            // No writes happened implies that the state doc is already on disk. This can happen
-            // only when the instances are rebuilt on node step up. And,
-            // PrimaryOnlyService::onStepUp() waits for majority commit of the primary no-op oplog
-            // entry written by the node in the newer term before scheduling the Instance::run().
-            // So, it's safe to assume that instance's state document written in an older term on
-            // disk won't get rolled back for step up case.
-            if (lastOpBeforeRun == lastOpAfterRun) {
-                // TODO SERVER-50742: Add an invariant check to make sure this case can happen only
-                // for step up.
-                return {Future<void>::makeReady()};
-            }
-
-            if (MONGO_unlikely(
-                    failWhilePersistingTenantMigrationRecipientInstanceStateDoc.shouldFail())) {
-                LOGV2(4878500, "Persisting state doc failed due to fail point enabled.");
-                uassert(ErrorCodes::NotWritablePrimary, "not writable primary ", false);
-            }
-
-            // Wait for the state doc to be majority replicated.
-            return WaitForMajorityService::get(opCtx->getServiceContext())
-                .waitUntilMajority(lastOpAfterRun);
-        })
-        .then([this] {
             // TODO SERVER-48808: Run cloners in MigrationServiceInstance
             // TODO SERVER-48811: Oplog fetching in MigrationServiceInstance
         })
         .onCompletion([this](Status status) {
             LOGV2(4878501,
                   "Tenant Recipient data sync completed.",
+                  "tenantId"_attr = getTenantId(),
                   "migrationId"_attr = getMigrationUUID(),
-                  "dbPrefix"_attr = _stateDoc.getDatabasePrefix(),
-                  "status"_attr = status);
+                  "error"_attr = status);
+            if (status.code() == stopFailPointErrorCode)
+                return Status::OK();
             return status;
         })
         .semi();
 }
 
 const UUID& TenantMigrationRecipientService::Instance::getMigrationUUID() const {
-    stdx::lock_guard lk(_mutex);
-    return _stateDoc.getId();
+    return _migrationUuid;
 }
 
-bool TenantMigrationRecipientService::Instance::isMarkedForGarbageCollect() const {
-    stdx::lock_guard lk(_mutex);
-    return _stateDoc.getGarbageCollect();
+const std::string& TenantMigrationRecipientService::Instance::getTenantId() const {
+    return _tenantId;
 }
 
 }  // namespace repl

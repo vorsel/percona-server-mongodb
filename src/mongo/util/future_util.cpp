@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -27,55 +27,33 @@
  *    it in the license file.
  */
 
-#pragma once
-
-#include "mongo/db/s/sharding_mongod_test_fixture.h"
+#include "mongo/util/future_util.h"
 
 namespace mongo {
 
-class ClockSourceMock;
-class DBDirectClient;
-class LogicalClock;
-class LogicalTime;
-class VectorClockMutable;
+ExecutorFuture<void> sleepUntil(std::shared_ptr<executor::TaskExecutor> executor,
+                                const Date_t& date) {
+    auto [promise, future] = makePromiseFuture<void>();
+    auto taskCompletionPromise = std::make_shared<Promise<void>>(std::move(promise));
 
-/**
- * A test fixture that installs a LogicalClock instance with a TimeProofService onto a service
- * context, in addition to the mock storage engine, network, and OpObserver provided by
- * ShardingMongodTestFixture.
- */
-class LogicalClockTestFixture : public ShardingMongodTestFixture {
-public:
-    LogicalClockTestFixture();
-    ~LogicalClockTestFixture();
+    auto scheduledWorkHandle = executor->scheduleWorkAt(
+        date, [taskCompletionPromise](const executor::TaskExecutor::CallbackArgs& args) mutable {
+            if (args.status.isOK()) {
+                taskCompletionPromise->emplaceValue();
+            } else {
+                taskCompletionPromise->setError(args.status);
+            }
+        });
 
-protected:
-    /**
-     * Sets up this fixture as the primary node in a shard server replica set with a LogicalClock
-     * (with a TimeProofService), storage engine, DBClient, OpObserver, and a mocked clock source.
-     */
-    void setUp() override;
+    if (!scheduledWorkHandle.isOK()) {
+        taskCompletionPromise->setError(scheduledWorkHandle.getStatus());
+    }
+    return std::move(future).thenRunOn(executor);
+}
 
-    void tearDown() override;
-
-    VectorClockMutable* resetClock();
-
-    void advanceClusterTime(LogicalTime newTime);
-
-    LogicalClock* getClock() const;
-
-    ClockSourceMock* getMockClockSource() const;
-
-    void setMockClockSourceTime(Date_t time) const;
-
-    Date_t getMockClockSourceTime() const;
-
-    DBDirectClient* getDBClient() const;
-
-private:
-    LogicalClock* _clock;
-    std::shared_ptr<ClockSourceMock> _mockClockSource = std::make_shared<ClockSourceMock>();
-    std::unique_ptr<DBDirectClient> _dbDirectClient;
-};
+ExecutorFuture<void> sleepFor(std::shared_ptr<executor::TaskExecutor> executor,
+                              Milliseconds duration) {
+    return sleepUntil(executor, executor->now() + duration);
+}
 
 }  // namespace mongo

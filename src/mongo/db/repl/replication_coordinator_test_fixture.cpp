@@ -36,7 +36,6 @@
 #include <functional>
 #include <memory>
 
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/repl/is_master_response.h"
 #include "mongo/db/repl/repl_set_heartbeat_args_v1.h"
 #include "mongo/db/repl/repl_settings.h"
@@ -129,9 +128,6 @@ void ReplCoordTest::init() {
     // PRNG seed for tests.
     const int64_t seed = 0;
 
-    auto logicalClock = std::make_unique<LogicalClock>(service);
-    LogicalClock::set(service, std::move(logicalClock));
-
     TopologyCoordinator::Options settings;
     auto topo = std::make_unique<TopologyCoordinator>(settings);
     _topo = topo.get();
@@ -172,6 +168,9 @@ void ReplCoordTest::start() {
     // construct ServiceEntryPoint and this causes a segmentation fault when
     // reconstructPreparedTransactions uses DBDirectClient to call into ServiceEntryPoint.
     FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
+    // Skip recovering tenant migration access blockers for the same reason as the above.
+    FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
+        "skipRecoverTenantMigrationAccessBlockers");
     invariant(!_callShutdown);
     // if we haven't initialized yet, do that first.
     if (!_repl) {

@@ -46,7 +46,7 @@ namespace {
 TEST(CstMatchTest, ParsesEmptyPredicate) {
     CNode output;
     auto input = fromjson("{filter: {}}");
-    BSONLexer lexer(input["filter"]);
+    BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
     auto parseTree = ParserGen(lexer, &output);
     ASSERT_EQ(0, parseTree.parse());
     ASSERT_EQ(output.toBson().toString(), "{}");
@@ -55,37 +55,41 @@ TEST(CstMatchTest, ParsesEmptyPredicate) {
 TEST(CstMatchTest, ParsesEqualityPredicates) {
     CNode output;
     auto input = fromjson("{filter: {a: 5.0, b: NumberInt(10), _id: NumberLong(15)}}");
-    BSONLexer lexer(input["filter"]);
+    BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
     auto parseTree = ParserGen(lexer, &output);
     ASSERT_EQ(0, parseTree.parse());
     ASSERT_EQ(output.toBson().toString(),
-              "{ a: \"<UserDouble 5.000000>\", b: \"<UserInt 10>\", _id: \"<UserLong 15>\" }");
+              "{ <UserFieldname a>: \"<UserDouble 5.000000>\", <UserFieldname b>: \"<UserInt "
+              "10>\", <UserFieldname _id>: \"<UserLong 15>\" }");
 }
 
 TEST(CstMatchTest, ParsesLogicalOperatorsWithOneChild) {
     {
         CNode output;
         auto input = fromjson("{filter: {$and: [{a: 1}]}}");
-        BSONLexer lexer(input["filter"]);
+        BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
         auto parseTree = ParserGen(lexer, &output);
         ASSERT_EQ(0, parseTree.parse());
-        ASSERT_EQ(output.toBson().toString(), "{ andExpr: [ { a: \"<UserInt 1>\" } ] }");
+        ASSERT_EQ(output.toBson().toString(),
+                  "{ <KeyFieldname andExpr>: [ { <UserFieldname a>: \"<UserInt 1>\" } ] }");
     }
     {
         CNode output;
         auto input = fromjson("{filter: {$or: [{a: 1}]}}");
-        BSONLexer lexer(input["filter"]);
+        BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
         auto parseTree = ParserGen(lexer, &output);
         ASSERT_EQ(0, parseTree.parse());
-        ASSERT_EQ(output.toBson().toString(), "{ orExpr: [ { a: \"<UserInt 1>\" } ] }");
+        ASSERT_EQ(output.toBson().toString(),
+                  "{ <KeyFieldname orExpr>: [ { <UserFieldname a>: \"<UserInt 1>\" } ] }");
     }
     {
         CNode output;
         auto input = fromjson("{filter: {$nor: [{a: 1}]}}");
-        BSONLexer lexer(input["filter"]);
+        BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
         auto parseTree = ParserGen(lexer, &output);
         ASSERT_EQ(0, parseTree.parse());
-        ASSERT_EQ(output.toBson().toString(), "{ norExpr: [ { a: \"<UserInt 1>\" } ] }");
+        ASSERT_EQ(output.toBson().toString(),
+                  "{ <KeyFieldname norExpr>: [ { <UserFieldname a>: \"<UserInt 1>\" } ] }");
     }
 }
 
@@ -93,54 +97,60 @@ TEST(CstMatchTest, ParsesLogicalOperatorsWithMultipleChildren) {
     {
         CNode output;
         auto input = fromjson("{filter: {$and: [{a: 1}, {b: 'bee'}]}}");
-        BSONLexer lexer(input["filter"]);
+        BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
         auto parseTree = ParserGen(lexer, &output);
         ASSERT_EQ(0, parseTree.parse());
         ASSERT_EQ(output.toBson().toString(),
-                  "{ andExpr: [ { b: \"<UserString bee>\" }, { a: \"<UserInt 1>\" } ] }");
+                  "{ <KeyFieldname andExpr>: [ { <UserFieldname b>: \"<UserString bee>\" }, { "
+                  "<UserFieldname a>: \"<UserInt 1>\" } ] }");
     }
     {
         CNode output;
         auto input = fromjson("{filter: {$or: [{a: 1}, {b: 'bee'}]}}");
-        BSONLexer lexer(input["filter"]);
+        BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
         auto parseTree = ParserGen(lexer, &output);
         ASSERT_EQ(0, parseTree.parse());
         ASSERT_EQ(output.toBson().toString(),
-                  "{ orExpr: [ { b: \"<UserString bee>\" }, { a: \"<UserInt 1>\" } ] }");
+                  "{ <KeyFieldname orExpr>: [ { <UserFieldname b>: \"<UserString bee>\" }, { "
+                  "<UserFieldname a>: \"<UserInt 1>\" } ] }");
     }
     {
         CNode output;
         auto input = fromjson("{filter: {$nor: [{a: 1}, {b: 'bee'}]}}");
-        BSONLexer lexer(input["filter"]);
+        BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
         auto parseTree = ParserGen(lexer, &output);
         ASSERT_EQ(0, parseTree.parse());
         ASSERT_EQ(output.toBson().toString(),
-                  "{ norExpr: [ { b: \"<UserString bee>\" }, { a: \"<UserInt 1>\" } ] }");
+                  "{ <KeyFieldname norExpr>: [ { <UserFieldname b>: \"<UserString bee>\" }, { "
+                  "<UserFieldname a>: \"<UserInt 1>\" } ] }");
     }
 }
 
 TEST(CstMatchTest, ParsesNotWithRegex) {
     CNode output;
     auto input = fromjson("{filter: {a: {$not: /^a/}}}");
-    BSONLexer lexer(input["filter"]);
+    BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
     auto parseTree = ParserGen(lexer, &output);
     ASSERT_EQ(0, parseTree.parse());
-    ASSERT_EQ(output.toBson().toString(), "{ a: { notExpr: \"<UserRegex /^a/>\" } }");
+    ASSERT_EQ(output.toBson().toString(),
+              "{ <UserFieldname a>: { <KeyFieldname notExpr>: \"<UserRegex /^a/>\" } }");
 }
 
 TEST(CstMatchTest, ParsesNotWithChildExpression) {
     CNode output;
     auto input = fromjson("{filter: {a: {$not: {$not: /^a/}}}}");
-    BSONLexer lexer(input["filter"]);
+    BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
     auto parseTree = ParserGen(lexer, &output);
     ASSERT_EQ(0, parseTree.parse());
-    ASSERT_EQ(output.toBson().toString(), "{ a: { notExpr: { notExpr: \"<UserRegex /^a/>\" } } }");
+    ASSERT_EQ(output.toBson().toString(),
+              "{ <UserFieldname a>: { <KeyFieldname notExpr>: { <KeyFieldname notExpr>: "
+              "\"<UserRegex /^a/>\" } } }");
 }
 
 TEST(CstMatchTest, FailsToParseNotWithNonObject) {
     CNode output;
     auto input = fromjson("{filter: {a: {$not: 1}}}");
-    BSONLexer lexer(input["filter"]);
+    BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
     ASSERT_THROWS_CODE_AND_WHAT(ParserGen(lexer, nullptr).parse(),
                                 AssertionException,
                                 ErrorCodes::FailedToParse,
@@ -151,7 +161,7 @@ TEST(CstMatchTest, FailsToParseNotWithNonObject) {
 TEST(CstMatchTest, FailsToParseUnknownOperatorWithinNotExpression) {
     CNode output;
     auto input = fromjson("{filter: {a: {$not: {$and: [{a: 1}]}}}}");
-    BSONLexer lexer(input["filter"]);
+    BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
     ASSERT_THROWS_CODE_AND_WHAT(ParserGen(lexer, nullptr).parse(),
                                 AssertionException,
                                 ErrorCodes::FailedToParse,
@@ -162,7 +172,7 @@ TEST(CstMatchTest, FailsToParseUnknownOperatorWithinNotExpression) {
 TEST(CstMatchTest, FailsToParseNotWithEmptyObject) {
     CNode output;
     auto input = fromjson("{filter: {a: {$not: {}}}}");
-    BSONLexer lexer(input["filter"]);
+    BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
     ASSERT_THROWS_CODE_AND_WHAT(ParserGen(lexer, nullptr).parse(),
                                 AssertionException,
                                 ErrorCodes::FailedToParse,
@@ -173,7 +183,7 @@ TEST(CstMatchTest, FailsToParseNotWithEmptyObject) {
 TEST(CstMatchTest, FailsToParseDollarPrefixedPredicates) {
     {
         auto input = fromjson("{filter: {$atan2: [3, 5]}}");
-        BSONLexer lexer(input["filter"]);
+        BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
         ASSERT_THROWS_CODE_AND_WHAT(
             ParserGen(lexer, nullptr).parse(),
             AssertionException,
@@ -182,7 +192,7 @@ TEST(CstMatchTest, FailsToParseDollarPrefixedPredicates) {
     }
     {
         auto input = fromjson("{filter: {$prefixed: 5}}");
-        BSONLexer lexer(input["filter"]);
+        BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
         ASSERT_THROWS_CODE_AND_WHAT(
             ParserGen(lexer, nullptr).parse(),
             AssertionException,
@@ -191,7 +201,7 @@ TEST(CstMatchTest, FailsToParseDollarPrefixedPredicates) {
     }
     {
         auto input = fromjson("{filter: {$$ROOT: 5}}");
-        BSONLexer lexer(input["filter"]);
+        BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
         ASSERT_THROWS_CODE_AND_WHAT(
             ParserGen(lexer, nullptr).parse(),
             AssertionException,
@@ -202,7 +212,7 @@ TEST(CstMatchTest, FailsToParseDollarPrefixedPredicates) {
 
 TEST(CstMatchTest, FailsToParseDollarPrefixedPredicatesWithinLogicalExpression) {
     auto input = fromjson("{filter: {$and: [{$prefixed: 5}]}}");
-    BSONLexer lexer(input["filter"]);
+    BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
     ASSERT_THROWS_CODE_AND_WHAT(
         ParserGen(lexer, nullptr).parse(),
         AssertionException,
@@ -213,7 +223,7 @@ TEST(CstMatchTest, FailsToParseDollarPrefixedPredicatesWithinLogicalExpression) 
 
 TEST(CstMatchTest, FailsToParseNonArrayLogicalKeyword) {
     auto input = fromjson("{filter: {$and: {a: 5}}}");
-    BSONLexer lexer(input["filter"]);
+    BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
     ASSERT_THROWS_CODE_AND_WHAT(ParserGen(lexer, nullptr).parse(),
                                 AssertionException,
                                 ErrorCodes::FailedToParse,
@@ -223,7 +233,7 @@ TEST(CstMatchTest, FailsToParseNonArrayLogicalKeyword) {
 
 TEST(CstMatchTest, FailsToParseNonObjectWithinLogicalKeyword) {
     auto input = fromjson("{filter: {$or: [5]}}");
-    BSONLexer lexer(input["filter"]);
+    BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
     ASSERT_THROWS_CODE_AND_WHAT(ParserGen(lexer, nullptr).parse(),
                                 AssertionException,
                                 ErrorCodes::FailedToParse,
@@ -233,7 +243,7 @@ TEST(CstMatchTest, FailsToParseNonObjectWithinLogicalKeyword) {
 
 TEST(CstMatchTest, FailsToParseLogicalKeywordWithEmptyArray) {
     auto input = fromjson("{filter: {$nor: []}}");
-    BSONLexer lexer(input["filter"]);
+    BSONLexer lexer(input["filter"].embeddedObject(), ParserGen::token::START_MATCH);
     ASSERT_THROWS_CODE_AND_WHAT(ParserGen(lexer, nullptr).parse(),
                                 AssertionException,
                                 ErrorCodes::FailedToParse,

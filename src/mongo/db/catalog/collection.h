@@ -84,7 +84,7 @@ struct CollectionUpdateArgs {
     // Fully updated document with damages (update modifiers) applied.
     BSONObj updatedDoc;
 
-    // Document containing update modifiers -- e.g. $set and $unset
+    // Document describing the update.
     BSONObj update;
 
     // Document containing the _id field of the doc being updated.
@@ -438,7 +438,7 @@ public:
      */
     virtual void cappedTruncateAfter(OperationContext* const opCtx,
                                      RecordId end,
-                                     const bool inclusive) = 0;
+                                     const bool inclusive) const = 0;
 
     /**
      * Returns a non-ok Status if validator is not legal for this collection.

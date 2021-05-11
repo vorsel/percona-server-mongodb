@@ -40,13 +40,17 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/auth/address_restriction.h"
 #include "mongo/db/auth/auth_options_gen.h"
+#include "mongo/db/auth/auth_types_gen.h"
 #include "mongo/db/auth/privilege_parser.h"
 #include "mongo/db/auth/user_document_parser.h"
 #include "mongo/db/ldap/ldap_manager.h"
 #include "mongo/db/ldap_options.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/storage/snapshot_manager.h"
 #include "mongo/logv2/log.h"
+#include "mongo/util/duration.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/net/ssl_types.h"
 #include "mongo/util/str.h"
 
@@ -194,6 +198,28 @@ ResolveRoleOption makeResolveRoleOption(PrivilegeFormat showPrivileges,
 
     return option;
 }
+
+MONGO_FAIL_POINT_DEFINE(authLocalGetUser);
+void handleAuthLocalGetUserFailPoint(const std::vector<RoleName>& directRoles) {
+    auto sfp = authLocalGetUser.scoped();
+    if (!sfp.isActive()) {
+        return;
+    }
+
+    IDLParserErrorContext ctx("authLocalGetUser");
+    auto delay = AuthLocalGetUserFailPoint::parse(ctx, sfp.getData()).getResolveRolesDelayMS();
+
+    if (delay <= 0) {
+        return;
+    }
+
+    LOGV2_DEBUG(4859400,
+                3,
+                "Sleeping prior to merging direct roles, after user acquisition",
+                "duration"_attr = Milliseconds(delay),
+                "directRoles"_attr = directRoles);
+    sleepmillis(delay);
+}
 }  // namespace
 
 bool AuthzManagerExternalStateLocal::hasAnyPrivilegeDocuments(OperationContext* opCtx) {
@@ -219,6 +245,23 @@ bool AuthzManagerExternalStateLocal::hasAnyPrivilegeDocuments(OperationContext* 
     }
 
     return false;
+}
+
+AuthzManagerExternalStateLocal::RolesLocks::RolesLocks(OperationContext* opCtx) {
+    _adminLock =
+        std::make_unique<Lock::DBLock>(opCtx, NamespaceString::kAdminDb, LockMode::MODE_IS);
+    _rolesLock = std::make_unique<Lock::CollectionLock>(
+        opCtx, AuthorizationManager::rolesCollectionNamespace, LockMode::MODE_S);
+}
+
+AuthzManagerExternalStateLocal::RolesLocks::~RolesLocks() {
+    _rolesLock.reset(nullptr);
+    _adminLock.reset(nullptr);
+}
+
+AuthzManagerExternalStateLocal::RolesLocks AuthzManagerExternalStateLocal::_lockRoles(
+    OperationContext* opCtx) {
+    return AuthzManagerExternalStateLocal::RolesLocks(opCtx);
 }
 
 static StatusWith<boost::optional<const std::set<RoleName>&>> _userRoles(
@@ -253,6 +296,8 @@ StatusWith<User> AuthzManagerExternalStateLocal::getUserObject(OperationContext*
         return rolesStatus.getStatus();
     const auto& roles = rolesStatus.getValue();
 
+    auto rolesLock = _lockRoles(opCtx);
+
     if (!roles) {
         // Normal path: Acquire a user from the local store by UserName.
         BSONObj userDoc;
@@ -283,6 +328,8 @@ StatusWith<User> AuthzManagerExternalStateLocal::getUserObject(OperationContext*
         user.setRoles(makeRoleNameIteratorForContainer(directRoles));
     }
 
+    handleAuthLocalGetUserFailPoint(directRoles);
+
     auto data = uassertStatusOK(resolveRoles(opCtx, directRoles, ResolveRoleOption::kAll));
     data.roles->insert(directRoles.cbegin(), directRoles.cend());
     user.setIndirectRoles(makeRoleNameIteratorForContainer(data.roles.get()));
@@ -306,6 +353,8 @@ Status AuthzManagerExternalStateLocal::getUserDescription(OperationContext* opCt
     if (!rolesStatus.isOK())
         return rolesStatus.getStatus();
     const auto& roles = rolesStatus.getValue();
+
+    auto rolesLock = _lockRoles(opCtx);
 
     if (!roles) {
         BSONObj userDoc;
@@ -335,6 +384,8 @@ Status AuthzManagerExternalStateLocal::getUserDescription(OperationContext* opCt
         }
         rolesBuilder.doneFast();
     }
+
+    handleAuthLocalGetUserFailPoint(directRoles);
 
     auto data = uassertStatusOK(resolveRoles(opCtx, directRoles, ResolveRoleOption::kAll));
     data.roles->insert(directRoles.cbegin(), directRoles.cend());

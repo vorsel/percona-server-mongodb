@@ -37,26 +37,18 @@
 #include "mongo/transport/session.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
-#include "mongo/util/thread_safety_context.h"
 
 namespace mongo {
 
 MONGO_FAIL_POINT_DEFINE(hangBeforeSchedulingServiceExecutorFixedTask);
+MONGO_FAIL_POINT_DEFINE(hangAfterServiceExecutorFixedExecutorThreadsStart);
+MONGO_FAIL_POINT_DEFINE(hangBeforeServiceExecutorFixedLastExecutorThreadReturns);
 
 namespace transport {
 namespace {
 constexpr auto kThreadsRunning = "threadsRunning"_sd;
 constexpr auto kExecutorLabel = "executor"_sd;
 constexpr auto kExecutorName = "fixed"_sd;
-
-const auto getServiceExecutorFixed =
-    ServiceContext::declareDecoration<std::unique_ptr<ServiceExecutorFixed>>();
-
-const auto serviceExecutorFixedRegisterer = ServiceContext::ConstructorActionRegisterer{
-    "ServiceExecutorFixed", [](ServiceContext* ctx) {
-        getServiceExecutorFixed(ctx) =
-            std::make_unique<ServiceExecutorFixed>(ThreadPool::Options{});
-    }};
 }  // namespace
 
 ServiceExecutorFixed::ServiceExecutorFixed(ThreadPool::Options options)
@@ -92,12 +84,6 @@ Status ServiceExecutorFixed::start() {
     LOGV2_DEBUG(
         4910501, 3, "Started fixed thread-pool service executor", "name"_attr = _options.poolName);
     return Status::OK();
-}
-
-ServiceExecutorFixed* ServiceExecutorFixed::get(ServiceContext* ctx) {
-    auto& ref = getServiceExecutorFixed(ctx);
-    invariant(ref);
-    return ref.get();
 }
 
 Status ServiceExecutorFixed::shutdown(Milliseconds timeout) {
@@ -183,6 +169,20 @@ void ServiceExecutorFixed::appendStats(BSONObjBuilder* bob) const {
 int ServiceExecutorFixed::getRecursionDepthForExecutorThread() const {
     invariant(_executorContext);
     return _executorContext->getRecursionDepth();
+}
+
+ServiceExecutorFixed::ExecutorThreadContext::ExecutorThreadContext(
+    std::weak_ptr<ServiceExecutorFixed> serviceExecutor)
+    : _executor(std::move(serviceExecutor)) {
+    _adjustRunningExecutorThreads(1);
+    hangAfterServiceExecutorFixedExecutorThreadsStart.pauseWhileSet();
+}
+
+ServiceExecutorFixed::ExecutorThreadContext::~ExecutorThreadContext() {
+    if (auto threadsRunning = _adjustRunningExecutorThreads(-1);
+        threadsRunning.has_value() && threadsRunning.value() == 0) {
+        hangBeforeServiceExecutorFixedLastExecutorThreadReturns.pauseWhileSet();
+    }
 }
 
 }  // namespace transport

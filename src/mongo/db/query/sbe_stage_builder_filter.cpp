@@ -75,18 +75,11 @@
 namespace mongo::stage_builder {
 namespace {
 /**
- * The various flavors of PathMatchExpressions require the same skeleton of traverse operators in
- * order to perform implicit path traversal, but may translate differently to an SBE expression that
- * actually applies the predicate against an individual array element.
- *
- * A function of this type can be called to generate an EExpression which applies a predicate to the
- * value found in 'inputSlot'.
+ * Helper functions for building common EExpressions and PlanStage trees.
  */
-using MakePredicateEExprFn =
-    std::function<std::unique_ptr<sbe::EExpression>(sbe::value::SlotId inputSlot)>;
-
-std::unique_ptr<sbe::PlanStage> makeLimitCoScanTree(long long limit = 1) {
-    return sbe::makeS<sbe::LimitSkipStage>(sbe::makeS<sbe::CoScanStage>(), limit, boost::none);
+std::unique_ptr<sbe::PlanStage> makeLimitCoScanTree(PlanNodeId planNodeId, long long limit = 1) {
+    return sbe::makeS<sbe::LimitSkipStage>(
+        sbe::makeS<sbe::CoScanStage>(planNodeId), limit, boost::none, planNodeId);
 }
 
 std::unique_ptr<sbe::EExpression> makeNot(std::unique_ptr<sbe::EExpression> e) {
@@ -100,6 +93,9 @@ std::unique_ptr<sbe::EExpression> makeFillEmptyFalse(std::unique_ptr<sbe::EExpre
         sbe::makeEs(std::move(e), sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean, 0)));
 }
 
+/**
+ * EvalExpr is a wrapper around an EExpression that can also carry a SlotId.
+ */
 struct EvalExpr {
     EvalExpr() {}
 
@@ -130,7 +126,7 @@ struct EvalExpr {
         return *this;
     }
 
-    operator bool() const {
+    explicit operator bool() const {
         return static_cast<bool>(expr);
     }
 
@@ -170,18 +166,39 @@ struct EvalFrame {
 };
 
 /**
+ * The various flavors of PathMatchExpressions require the same skeleton of traverse operators in
+ * order to perform implicit path traversal, but may translate differently to an SBE expression that
+ * actually applies the predicate against an individual array element.
+ *
+ * A function of this type can be called to generate an EExpression which applies a predicate to the
+ * value found in 'inputSlot'.
+ */
+using MakePredicateFn = std::function<std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>>(
+    sbe::value::SlotId inputSlot, std::unique_ptr<sbe::PlanStage> inputStage)>;
+
+using MakePredicateReturnType = std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>>;
+
+/**
  * A struct for storing context across calls to visit() methods in MatchExpressionVisitor's.
  */
 struct MatchExpressionVisitorContext {
-    MatchExpressionVisitorContext(sbe::value::SlotIdGenerator* slotIdGenerator,
+    MatchExpressionVisitorContext(OperationContext* opCtx,
+                                  sbe::value::SlotIdGenerator* slotIdGenerator,
+                                  sbe::value::FrameIdGenerator* frameIdGenerator,
                                   std::unique_ptr<sbe::PlanStage> inputStage,
                                   sbe::value::SlotId inputSlotIn,
                                   sbe::value::SlotVector relevantSlotsIn,
-                                  const MatchExpression* root)
-        : inputSlot{inputSlotIn},
+                                  const MatchExpression* root,
+                                  sbe::RuntimeEnvironment* env,
+                                  PlanNodeId planNodeId)
+        : opCtx{opCtx},
+          inputSlot{inputSlotIn},
           relevantSlots{std::move(relevantSlotsIn)},
           slotIdGenerator{slotIdGenerator},
-          topLevelAnd{nullptr} {
+          frameIdGenerator{frameIdGenerator},
+          topLevelAnd{nullptr},
+          env{env},
+          planNodeId{planNodeId} {
         // If 'inputSlot' is not present within 'relevantSlots', add it now.
         if (!std::count(relevantSlots.begin(), relevantSlots.end(), inputSlot)) {
             relevantSlots.push_back(inputSlot);
@@ -202,19 +219,26 @@ struct MatchExpressionVisitorContext {
         auto& frame = evalStack.back();
 
         if (frame.output) {
-            frame.stage = sbe::makeS<sbe::FilterStage<false>>(std::move(frame.stage),
-                                                              std::move(frame.output.expr));
+            frame.stage = sbe::makeS<sbe::FilterStage<false>>(
+                std::move(frame.stage), std::move(frame.output.expr), planNodeId);
             frame.output.reset();
         }
 
         return std::move(frame.stage);
     }
 
+    OperationContext* opCtx;
     std::vector<EvalFrame> evalStack;
     sbe::value::SlotId inputSlot;
     sbe::value::SlotVector relevantSlots;
     sbe::value::SlotIdGenerator* slotIdGenerator;
+    sbe::value::FrameIdGenerator* frameIdGenerator;
     const MatchExpression* topLevelAnd;
+    sbe::RuntimeEnvironment* env;
+
+    // The id of the 'QuerySolutionNode' which houses the match expression that we are converting to
+    // SBE.
+    const PlanNodeId planNodeId;
 };
 
 /**
@@ -224,6 +248,7 @@ struct MatchExpressionVisitorContext {
 std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> projectEvalExpr(
     EvalExpr evalExpr,
     std::unique_ptr<sbe::PlanStage> stage,
+    PlanNodeId planNodeId,
     sbe::value::SlotIdGenerator* slotIdGenerator) {
     // If evalExpr's value is already in a slot, return the slot.
     if (evalExpr.slot) {
@@ -233,19 +258,88 @@ std::pair<sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>> projectEvalExpr(
     // If evalExpr's value is an expression, create a ProjectStage to evaluate the expression
     // into a slot.
     auto slot = slotIdGenerator->generate();
-    stage = sbe::makeProjectStage(std::move(stage), slot, std::move(evalExpr.expr));
+    stage = sbe::makeProjectStage(std::move(stage), planNodeId, slot, std::move(evalExpr.expr));
     return {slot, std::move(stage)};
 }
 
-enum class LeafArrayTraversalMode {
-    kArrayAndItsElements = 0,  // Visit both the array's elements _and_ the array itself
-    kArrayElementsOnly = 1,    // Visit the array's elements but don't visit the array itself
+std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>> generateShortCircuitingLogicalOp(
+    sbe::EPrimBinary::Op logicOp,
+    std::vector<std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>>> branches,
+    PlanNodeId planNodeId,
+    sbe::value::SlotIdGenerator* slotIdGenerator) {
+    invariant(logicOp == sbe::EPrimBinary::logicAnd || logicOp == sbe::EPrimBinary::logicOr);
+
+    // For AND and OR, if 'branches' only has one element, we can just return branches[0].
+    if (branches.size() == 1) {
+        return std::move(branches[0]);
+    }
+
+    // Prepare to create limit-1/union with N branches (where N is the number of operands). Each
+    // branch will be evaluated from left to right until one of the branches produces a value. The
+    // first N-1 branches have a FilterStage to control whether they produce a value. If a branch's
+    // filter condition is true, the branch will produce a value and the remaining branches will not
+    // be evaluated. In other words, the evaluation process will "short-circuit". If a branch's
+    // filter condition is false, the branch will not produce a value and the evaluation process
+    // will continue. The last branch doesn't have a FilterStage and will always produce a value.
+    std::vector<std::unique_ptr<sbe::PlanStage>> stages;
+    std::vector<sbe::value::SlotVector> inputs;
+    for (size_t i = 0, n = branches.size(); i < n; ++i) {
+        auto [expr, stage] = std::move(branches[i]);
+        sbe::value::SlotId slot;
+
+        if (i != n - 1) {
+            // Create a FilterStage for each branch (except the last one). If a branch's filter
+            // condition is true, it will "short-circuit" the evaluation process. For AND, short-
+            // circuiting should happen if an operand evalautes to false. For OR, short-circuiting
+            // should happen if an operand evaluates to true.
+            auto filterExpr = (logicOp == sbe::EPrimBinary::logicAnd)
+                ? makeNot(std::move(expr.expr))
+                : std::move(expr.expr);
+            stage = sbe::makeS<sbe::FilterStage<false>>(
+                std::move(stage), std::move(filterExpr), planNodeId);
+
+            // Set up an output value to be returned if short-circuiting occurs. For AND, when
+            // short-circuiting occurs, the output returned should be false. For OR, when short-
+            // circuiting occurs, the output returned should be true.
+            auto shortCircuitVal = sbe::makeE<sbe::EConstant>(
+                sbe::value::TypeTags::Boolean, (logicOp == sbe::EPrimBinary::logicOr));
+            slot = slotIdGenerator->generate();
+            stage = sbe::makeProjectStage(
+                std::move(stage), planNodeId, slot, std::move(shortCircuitVal));
+        } else {
+            std::tie(slot, stage) =
+                projectEvalExpr(std::move(expr), std::move(stage), planNodeId, slotIdGenerator);
+        }
+
+        stages.emplace_back(std::move(stage));
+        inputs.emplace_back(sbe::makeSV(slot));
+    }
+
+    // Return a union wrapped in a limit-1.
+    auto outputSlot = slotIdGenerator->generate();
+    auto outputStage = sbe::makeS<sbe::UnionStage>(
+        std::move(stages), std::move(inputs), sbe::makeSV(outputSlot), planNodeId);
+    outputStage =
+        sbe::makeS<sbe::LimitSkipStage>(std::move(outputStage), 1, boost::none, planNodeId);
+
+    return {outputSlot, std::move(outputStage)};
+}
+
+enum class LeafTraversalMode {
+    // Don't generate a TraverseStage for the leaf.
+    kDoNotTraverseLeaf = 0,
+
+    // Traverse the leaf, ard for arrays visit both the array's elements _and_ the array itself.
+    kArrayAndItsElements = 1,
+
+    // Traverse the leaf, and for arrays visit the array's elements but not the array itself.
+    kArrayElementsOnly = 2,
 };
 
 /**
- * A helper function to generate a path traversal plan stage at the given nested 'level' of the
- * traversal path. For example, for a dotted path expression {'a.b': 2}, the traversal sub-tree will
- * look like this:
+ * This function generates a path traversal plan stage at the given nested 'level' of the traversal
+ * path. For example, for a dotted path expression {'a.b': 2}, the traversal sub-tree will look like
+ * this:
  *
  *     traverse
  *          outputSlot1 // the traversal result
@@ -255,7 +349,7 @@ enum class LeafArrayTraversalMode {
  *          {outputSlot1 || innerSlot1} // the folding expression - combining
  *                                      // results for each element
  *          {outputSlot1} // final (early out) expression - when we hit the 'true' value,
- *  i                     // we don't have to traverse the whole array
+ *                        // we don't have to traverse the whole array
  *      in
  *          project [innerSlot1 =                               // if getField(fieldSlot1,'b')
  *                    fillEmpty(outputSlot2, false) ||          // returns an array, compare the
@@ -286,15 +380,19 @@ enum class LeafArrayTraversalMode {
  */
 std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>> generateTraverseHelper(
     std::unique_ptr<sbe::PlanStage> inputStage,
+    const sbe::value::SlotVector& relevantSlots,
     sbe::value::SlotId inputSlot,
     const FieldPath& fp,
     size_t level,
+    PlanNodeId planNodeId,
     sbe::value::SlotIdGenerator* slotIdGenerator,
-    const MakePredicateEExprFn& makePredicate,
-    LeafArrayTraversalMode mode) {
+    const MakePredicateFn& makePredicate,
+    LeafTraversalMode mode) {
     using namespace std::literals;
 
     invariant(level < fp.getPathLength());
+
+    const bool isLeafField = (level == fp.getPathLength() - 1u);
 
     // Generate the projection stage to read a sub-field at the current nested level and bind it
     // to 'fieldSlot'.
@@ -302,32 +400,42 @@ std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>> generateTraverseHelper(
     auto fieldSlot{slotIdGenerator->generate()};
     auto fromBranch = sbe::makeProjectStage(
         std::move(inputStage),
+        planNodeId,
         fieldSlot,
         sbe::makeE<sbe::EFunction>("getField"sv,
                                    sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot),
                                                sbe::makeE<sbe::EConstant>(fieldName))));
 
     // Generate the 'in' branch for the TraverseStage that we're about to construct.
-    sbe::value::SlotId innerSlot;
-    std::unique_ptr<sbe::PlanStage> innerBranch;
-
-    if (level == fp.getPathLength() - 1u) {
-        // Base case: Genereate a ProjectStage to evaluate the predicate.
-        innerSlot = slotIdGenerator->generate();
-        innerBranch =
-            sbe::makeProjectStage(makeLimitCoScanTree(), innerSlot, makePredicate(fieldSlot));
-    } else {
+    auto [innerExpr, innerBranch] = isLeafField
+        // Base case: Evaluate the predicate.
+        ? makePredicate(fieldSlot, makeLimitCoScanTree(planNodeId))
         // Recursive case.
-        auto [expr, stage] = generateTraverseHelper(
-            makeLimitCoScanTree(), fieldSlot, fp, level + 1, slotIdGenerator, makePredicate, mode);
+        : generateTraverseHelper(makeLimitCoScanTree(planNodeId),
+                                 sbe::makeSV(),
+                                 fieldSlot,
+                                 fp,
+                                 level + 1,
+                                 planNodeId,
+                                 slotIdGenerator,
+                                 makePredicate,
+                                 mode);
 
-        std::tie(innerSlot, stage) =
-            projectEvalExpr(std::move(expr), std::move(stage), slotIdGenerator);
-        innerBranch = std::move(stage);
+    if (isLeafField && mode == LeafTraversalMode::kDoNotTraverseLeaf) {
+        auto relSlots = relevantSlots;
+        relSlots.push_back(fieldSlot);
+        auto outputStage = sbe::makeS<sbe::LoopJoinStage>(
+            std::move(fromBranch), std::move(innerBranch), relSlots, relSlots, nullptr, planNodeId);
+
+        return {std::move(innerExpr), std::move(outputStage)};
     }
 
+    sbe::value::SlotId innerSlot;
+    std::tie(innerSlot, innerBranch) =
+        projectEvalExpr(std::move(innerExpr), std::move(innerBranch), planNodeId, slotIdGenerator);
+
     // Generate the traverse stage for the current nested level.
-    auto outputSlot{slotIdGenerator->generate()};
+    auto outputSlot = slotIdGenerator->generate();
     auto outputStage = sbe::makeS<sbe::TraverseStage>(
         std::move(fromBranch),
         std::move(innerBranch),
@@ -339,25 +447,27 @@ std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>> generateTraverseHelper(
                                      sbe::makeE<sbe::EVariable>(outputSlot),
                                      sbe::makeE<sbe::EVariable>(innerSlot)),
         sbe::makeE<sbe::EVariable>(outputSlot),
+        planNodeId,
         1);
 
-    auto outputExpr = sbe::makeE<sbe::EVariable>(outputSlot);
-
-    if (mode == LeafArrayTraversalMode::kArrayAndItsElements && level == fp.getPathLength() - 1u) {
+    if (isLeafField && mode == LeafTraversalMode::kArrayAndItsElements) {
         // For the last level, if 'mode' == kArrayAndItsElements and getField() returns an array we
         // need to apply the predicate both to the elements of the array _and_ to the array itself.
         // By itself, TraverseStage only applies the predicate to the elements of the array. Thus,
         // for the last level, we add a ProjectStage so that we also apply the predicate to the
         // array itself. (For cases where getField() doesn't return an array, this additional
         // ProjectStage is effectively a no-op.)
+        EvalExpr outputExpr;
+        std::tie(outputExpr, outputStage) = makePredicate(fieldSlot, std::move(outputStage));
+
         outputExpr = sbe::makeE<sbe::EPrimBinary>(
             sbe::EPrimBinary::logicOr,
-            makeFillEmptyFalse(std::move(outputExpr)),
+            makeFillEmptyFalse(sbe::makeE<sbe::EVariable>(outputSlot)),
             sbe::makeE<sbe::EPrimBinary>(
                 sbe::EPrimBinary::logicAnd,
                 makeFillEmptyFalse(sbe::makeE<sbe::EFunction>(
                     "isArray", sbe::makeEs(sbe::makeE<sbe::EVariable>(fieldSlot)))),
-                makePredicate(fieldSlot)));
+                std::move(outputExpr.expr)));
 
         return {std::move(outputExpr), std::move(outputStage)};
     } else {
@@ -365,161 +475,103 @@ std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>> generateTraverseHelper(
     }
 }
 
-/*
- * A helper function for 'generateTraverseForArraySize' similar to the 'generateTraverseHelper'. The
- * function extends the traverse sub-tree generation by retuning a special leaf-level traverse stage
- * that uses a fold expression to add counts of elements in the array, as well as performs an extra
- * check that the leaf-level traversal is being done on a valid array.
- */
-std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>> generateTraverseForArraySizeHelper(
-    std::unique_ptr<sbe::PlanStage> inputStage,
-    sbe::value::SlotId inputSlot,
-    const FieldPath& fp,
-    size_t level,
-    sbe::value::SlotIdGenerator* slotIdGenerator,
-    int size) {
-    using namespace std::literals;
-
-    invariant(level < fp.getPathLength());
-
-    // Generate the projection stage to read a sub-field at the current nested level and bind it
-    // to 'fieldSlot'.
-    std::string_view fieldName{fp.getFieldName(level).rawData(), fp.getFieldName(level).size()};
-    auto fieldSlot{slotIdGenerator->generate()};
-    auto fromBranch = sbe::makeProjectStage(
-        std::move(inputStage),
-        fieldSlot,
-        sbe::makeE<sbe::EFunction>("getField"sv,
-                                   sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot),
-                                               sbe::makeE<sbe::EConstant>(fieldName))));
-
-    sbe::value::SlotId innerSlot;
-    std::unique_ptr<sbe::PlanStage> innerBranch;
-
-    if (level == fp.getPathLength() - 1u) {
-        innerSlot = slotIdGenerator->generate();
-
-        // Before generating a final leaf traverse stage, check that the thing we are about to
-        // traverse is indeed an array.
-        fromBranch = sbe::makeS<sbe::FilterStage<false>>(
-            std::move(fromBranch),
-            sbe::makeE<sbe::EFunction>("isArray",
-                                       sbe::makeEs(sbe::makeE<sbe::EVariable>(fieldSlot))));
-
-        // Project '1' for each element in the array, then sum up using a fold expression.
-        innerBranch =
-            sbe::makeProjectStage(makeLimitCoScanTree(),
-                                  innerSlot,
-                                  sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 1));
-
-        // The final traverse stage for the leaf level with a fold expression that sums up
-        // values in slot fieldSlot, resulting in the count of elements in the array.
-        auto outputSlot{slotIdGenerator->generate()};
-        auto leafLevelTraverseStage = sbe::makeS<sbe::TraverseStage>(
-            std::move(fromBranch),
-            std::move(innerBranch),
-            fieldSlot,
-            outputSlot,
-            innerSlot,
-            sbe::makeSV(),
-            sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::add,
-                                         sbe::makeE<sbe::EVariable>(outputSlot),
-                                         sbe::makeE<sbe::EVariable>(innerSlot)),
-            nullptr,
-            1);
-
-        // Final project stage to filter based on the user provided value. If the traversal result
-        // was not evaluated to Nothing, then compare to the user provided value. If the traversal
-        // final result did evaluate to Nothing, the only way the fold expression result would be
-        // Nothing is if the array was empty, so replace Nothing with 0 and compare to the user
-        // provided value.
-        auto outputExpr = sbe::makeE<sbe::EPrimBinary>(
-            sbe::EPrimBinary::eq,
-            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, size),
-            sbe::makeE<sbe::EIf>(sbe::makeE<sbe::EFunction>(
-                                     "exists", sbe::makeEs(sbe::makeE<sbe::EVariable>(outputSlot))),
-                                 sbe::makeE<sbe::EVariable>(outputSlot),
-                                 sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 0)));
-
-        return {std::move(outputExpr), std::move(leafLevelTraverseStage)};
-    } else {
-        // Recursive case.
-        auto [expr, stage] = generateTraverseForArraySizeHelper(
-            makeLimitCoScanTree(), fieldSlot, fp, level + 1, slotIdGenerator, size);
-
-        std::tie(innerSlot, stage) =
-            projectEvalExpr(std::move(expr), std::move(stage), slotIdGenerator);
-        innerBranch = std::move(stage);
-    }
-
-    // The final traverse stage for the current nested level.
-    auto outputSlot{slotIdGenerator->generate()};
-    auto outputStage = sbe::makeS<sbe::TraverseStage>(
-        std::move(fromBranch),
-        std::move(innerBranch),
-        fieldSlot,
-        outputSlot,
-        innerSlot,
-        sbe::makeSV(),
-        sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::logicOr,
-                                     sbe::makeE<sbe::EVariable>(outputSlot),
-                                     sbe::makeE<sbe::EVariable>(innerSlot)),
-        sbe::makeE<sbe::EVariable>(outputSlot),
-        1);
-
-    return {outputSlot, std::move(outputStage)};
-}
-
 /**
- * For the given PathMatchExpression 'expr', generates a path traversal SBE plan stage sub-tree
- * implementing the expression. Generates a sequence of nested traverse operators in order to
- * perform nested array traversal, and then calls 'makeEExprCallback' in order to generate an SBE
- * expression responsible for applying the predicate to individual array elements.
+ * Given a field path 'path' and a predicate 'makePredicate', this function generates an SBE tree
+ * that will evaluate the predicate on the field path. When 'path' is not empty string (""), this
+ * function generates a sequence of nested traverse operators to traverse the field path and it uses
+ * 'makePredicate' to generate an SBE expression for evaluating the predicate on individual value.
+ * When 'path' is empty, this function simply uses 'makePredicate' to generate an SBE expression for
+ * evaluating the predicate on a single value.
  */
 void generateTraverse(MatchExpressionVisitorContext* context,
-                      const PathMatchExpression* matchExpr,
-                      MakePredicateEExprFn makePredicate) {
+                      StringData path,
+                      MakePredicateFn makePredicate,
+                      LeafTraversalMode mode = LeafTraversalMode::kArrayAndItsElements) {
     auto& frame = context->evalStack.back();
-
-    FieldPath fp{matchExpr->path()};
-
-    std::tie(frame.output, frame.stage) =
-        generateTraverseHelper(std::move(frame.stage),
-                               frame.inputSlot,
-                               fp,
-                               0,
-                               context->slotIdGenerator,
-                               makePredicate,
-                               LeafArrayTraversalMode::kArrayAndItsElements);
+    std::tie(frame.output, frame.stage) = generateTraverseHelper(std::move(frame.stage),
+                                                                 frame.relevantSlots,
+                                                                 frame.inputSlot,
+                                                                 FieldPath{path},
+                                                                 0,
+                                                                 context->planNodeId,
+                                                                 context->slotIdGenerator,
+                                                                 makePredicate,
+                                                                 mode);
 }
 
 /**
  * Generates a path traversal SBE plan stage sub-tree for matching arrays with '$size'. Applies
  * an extra project on top of the sub-tree to filter based on user provided value.
  */
-void generateTraverseForArraySize(MatchExpressionVisitorContext* context,
-                                  const SizeMatchExpression* matchExpr) {
-    auto& frame = context->evalStack.back();
+void generateArraySize(MatchExpressionVisitorContext* context,
+                       const SizeMatchExpression* matchExpr) {
+    int size = matchExpr->getData();
 
-    FieldPath fp{matchExpr->path()};
+    auto makePredicate =
+        [&](sbe::value::SlotId inputSlot,
+            std::unique_ptr<sbe::PlanStage> inputStage) -> MakePredicateReturnType {
+        // Before generating a final leaf traverse stage, check that the thing we are about
+        // traverse is indeed an array.
+        auto fromBranch = sbe::makeS<sbe::FilterStage<false>>(
+            std::move(inputStage),
+            sbe::makeE<sbe::EFunction>("isArray",
+                                       sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot))),
+            context->planNodeId);
 
-    std::tie(frame.output, frame.stage) =
-        generateTraverseForArraySizeHelper(std::move(frame.stage),
-                                           frame.inputSlot,
-                                           fp,
-                                           0,
-                                           context->slotIdGenerator,
-                                           matchExpr->getData());
+        // Generate a traverse that projects the integer value 1 for each element in the array and
+        // then sums up the 1's, resulting in the count of elements in the array.
+        auto innerSlot = context->slotIdGenerator->generate();
+        auto traverseSlot = context->slotIdGenerator->generate();
+        auto innerBranch =
+            sbe::makeProjectStage(makeLimitCoScanTree(context->planNodeId),
+                                  context->planNodeId,
+                                  innerSlot,
+                                  sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 1));
+        auto traverseStage = sbe::makeS<sbe::TraverseStage>(
+            std::move(fromBranch),
+            std::move(innerBranch),
+            inputSlot,
+            traverseSlot,
+            innerSlot,
+            sbe::makeSV(),
+            sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::add,
+                                         sbe::makeE<sbe::EVariable>(traverseSlot),
+                                         sbe::makeE<sbe::EVariable>(innerSlot)),
+            nullptr,
+            context->planNodeId,
+            1);
+
+        // If the traversal result was not Nothing, compare it to the user provided value. If the
+        // traversal result was Nothing, that means the array was empty, so replace Nothing with 0
+        // and compare it to the user provided value.
+        auto sizeOutput = sbe::makeE<sbe::EPrimBinary>(
+            sbe::EPrimBinary::eq,
+            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, size),
+            sbe::makeE<sbe::EIf>(
+                sbe::makeE<sbe::EFunction>("exists",
+                                           sbe::makeEs(sbe::makeE<sbe::EVariable>(traverseSlot))),
+                sbe::makeE<sbe::EVariable>(traverseSlot),
+                sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64, 0)));
+
+        return {std::move(sizeOutput), std::move(traverseStage)};
+    };
+
+    generateTraverse(context,
+                     matchExpr->path(),
+                     std::move(makePredicate),
+                     LeafTraversalMode::kDoNotTraverseLeaf);
 }
 
 /**
  * Generates a path traversal SBE plan stage sub-tree which implments the comparison match
  * expression 'expr'. The comparison itself executes using the given 'binaryOp'.
  */
-void generateTraverseForComparisonPredicate(MatchExpressionVisitorContext* context,
-                                            const ComparisonMatchExpression* expr,
-                                            sbe::EPrimBinary::Op binaryOp) {
-    auto makeEExprFn = [expr, binaryOp](sbe::value::SlotId inputSlot) {
+void generateComparison(MatchExpressionVisitorContext* context,
+                        const ComparisonMatchExpression* expr,
+                        sbe::EPrimBinary::Op binaryOp) {
+    auto makePredicate =
+        [expr, binaryOp](sbe::value::SlotId inputSlot,
+                         std::unique_ptr<sbe::PlanStage> inputStage) -> MakePredicateReturnType {
         const auto& rhs = expr->getData();
         auto [tagView, valView] = sbe::bson::convertFrom(
             true, rhs.rawdata(), rhs.rawdata() + rhs.size(), rhs.fieldNameSize() - 1);
@@ -527,10 +579,14 @@ void generateTraverseForComparisonPredicate(MatchExpressionVisitorContext* conte
         // SBE EConstant assumes ownership of the value so we have to make a copy here.
         auto [tag, val] = sbe::value::copyValue(tagView, valView);
 
-        return makeFillEmptyFalse(sbe::makeE<sbe::EPrimBinary>(
-            binaryOp, sbe::makeE<sbe::EVariable>(inputSlot), sbe::makeE<sbe::EConstant>(tag, val)));
+        return {
+            makeFillEmptyFalse(sbe::makeE<sbe::EPrimBinary>(binaryOp,
+                                                            sbe::makeE<sbe::EVariable>(inputSlot),
+                                                            sbe::makeE<sbe::EConstant>(tag, val))),
+            std::move(inputStage)};
     };
-    generateTraverse(context, expr, std::move(makeEExprFn));
+
+    generateTraverse(context, expr->path(), std::move(makePredicate));
 }
 
 /**
@@ -542,74 +598,18 @@ void generateAlwaysBoolean(MatchExpressionVisitorContext* context, bool value) {
     frame.output = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean, value);
 }
 
-std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>> generateShortCircuitingLogicalOp(
-    std::unique_ptr<sbe::PlanStage> inputStage,
-    sbe::value::SlotVector relevantSlots,
-    sbe::EPrimBinary::Op logicOp,
-    std::vector<std::unique_ptr<sbe::PlanStage>> stages,
-    std::vector<std::unique_ptr<sbe::EExpression>> outputs,
-    sbe::value::SlotIdGenerator* slotIdGenerator) {
-    invariant(logicOp == sbe::EPrimBinary::logicAnd || logicOp == sbe::EPrimBinary::logicOr);
-    invariant(stages.size() == outputs.size());
-
-    // Prepare to create limit-1/union with N branches (where N is the number of operands). Each
-    // branch will be evaluated from left to right until one of the branches produces a value. The
-    // first N-1 branches have a FilterStage to control whether they produce a value. If a branch's
-    // filter condition is true, the branch will produce a value and the remaining branches will not
-    // be evaluated. In other words, the evaluation process will "short-circuit". If a branch's
-    // filter condition is false, the branch will not produce a value and the evaluation process
-    // will continue. The last branch doesn't have a FilterStage and will always produce a value.
-    std::vector<sbe::value::SlotVector> inputVals;
-    for (size_t i = 0, n = stages.size(); i < n; ++i) {
-        if (i != n - 1) {
-            // Create a FilterStage for each branch (except the last one). If a branch's filter
-            // condition is true, it will "short-circuit" the evaluation process. For AND, short-
-            // circuiting should happen if an operand evalautes to false. For OR, short-circuiting
-            // should happen if an operand evaluates to true.
-            stages[i] = sbe::makeS<sbe::FilterStage<false>>(std::move(stages[i]),
-                                                            logicOp == sbe::EPrimBinary::logicAnd
-                                                                ? makeNot(std::move(outputs[i]))
-                                                                : std::move(outputs[i]));
-
-            // Set up an output value to be returned if short-circuiting occurs. For AND, when
-            // short-circuiting occurs, the output returned should be false. For OR, when short-
-            // circuiting occurs, the output returned should be true.
-            bool shortCircuitVal = (logicOp == sbe::EPrimBinary::logicOr);
-            outputs[i] = sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean, shortCircuitVal);
-        }
-
-        // Project the output expression into a slot, and add the slot to the union's vector of
-        // input slots.
-        auto slot = slotIdGenerator->generate();
-        stages[i] = sbe::makeProjectStage(std::move(stages[i]), slot, std::move(outputs[i]));
-        inputVals.emplace_back(sbe::makeSV(slot));
-    }
-
-    // Generate the union wrapped in a limit-1.
-    auto outputSlot = slotIdGenerator->generate();
-    auto unionStage = sbe::makeS<sbe::LimitSkipStage>(
-        sbe::makeS<sbe::UnionStage>(
-            std::move(stages), std::move(inputVals), sbe::makeSV(outputSlot)),
-        1,
-        boost::none);
-
-    // Join inputStage with unionStage and return it.
-    auto outputStage = sbe::makeS<sbe::LoopJoinStage>(
-        std::move(inputStage), std::move(unionStage), relevantSlots, relevantSlots, nullptr);
-
-    // The UnionStage's output slot holds the result of the logical operation ('logicOp').
-    return {outputSlot, std::move(outputStage)};
-}
-
 /**
  * Generates a SBE plan stage sub-tree which implements the bitwise match expression 'expr'. The
  * various bit test expressions accept a numeric, BinData or position list bitmask. Here we handle
  * building an EExpression for both the numeric and BinData or position list forms of the bitmask.
  */
-void generateTraverseForBitTests(MatchExpressionVisitorContext* context,
-                                 const BitTestMatchExpression* expr,
-                                 const sbe::BitTestBehavior& bitTestBehavior) {
-    auto makeEExprFn = [expr, bitTestBehavior](sbe::value::SlotId inputSlot) {
+void generateBitTest(MatchExpressionVisitorContext* context,
+                     const BitTestMatchExpression* expr,
+                     const sbe::BitTestBehavior& bitTestBehavior) {
+    auto makePredicate =
+        [expr,
+         bitTestBehavior](sbe::value::SlotId inputSlot,
+                          std::unique_ptr<sbe::PlanStage> inputStage) -> MakePredicateReturnType {
         auto bitPositions = expr->getBitPositions();
 
         // Build an array set of bit positions for the bitmask, and remove duplicates in the
@@ -667,13 +667,16 @@ void generateTraverseForBitTests(MatchExpressionVisitorContext* context,
         } else {
             MONGO_UNREACHABLE;
         }
-        return sbe::makeE<sbe::EIf>(
-            sbe::makeE<sbe::EFunction>("isBinData",
-                                       sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot))),
-            std::move(binaryBitTestEExpr),
-            std::move(numericBitTestEExpr));
+
+        return {sbe::makeE<sbe::EIf>(
+                    sbe::makeE<sbe::EFunction>("isBinData",
+                                               sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot))),
+                    std::move(binaryBitTestEExpr),
+                    std::move(numericBitTestEExpr)),
+                std::move(inputStage)};
     };
-    generateTraverse(context, expr, std::move(makeEExprFn));
+
+    generateTraverse(context, expr->path(), std::move(makePredicate));
 }
 
 /**
@@ -686,6 +689,7 @@ public:
 
     void visit(const AlwaysFalseMatchExpression* expr) final {}
     void visit(const AlwaysTrueMatchExpression* expr) final {}
+
     void visit(const AndMatchExpression* matchExpr) final {
         auto& frame = _context->evalStack.back();
 
@@ -699,23 +703,34 @@ public:
 
         // For non-top-level $and's, we evaluate each child in its own EvalFrame. Set up a new
         // EvalFrame with a limit-1/coscan tree for the first child.
-        _context->evalStack.emplace_back(makeLimitCoScanTree(), frame.inputSlot, sbe::makeSV());
+        _context->evalStack.emplace_back(
+            makeLimitCoScanTree(_context->planNodeId), frame.inputSlot, sbe::makeSV());
     }
+
     void visit(const BitsAllClearMatchExpression* expr) final {}
     void visit(const BitsAllSetMatchExpression* expr) final {}
     void visit(const BitsAnyClearMatchExpression* expr) final {}
     void visit(const BitsAnySetMatchExpression* expr) final {}
-    void visit(const ElemMatchObjectMatchExpression* expr) final {
-        unsupportedExpression(expr);
+
+    void visit(const ElemMatchObjectMatchExpression* matchExpr) final {
+        // ElemMatchObjectMatchExpression is guaranteed to always have exactly 1 child
+        invariant(matchExpr->numChildren() == 1);
+
+        // We evaluate $elemMatch's child in a new EvalFrame. For the child's EvalFrame, we set the
+        // 'stage' field to be a limit-1/coscan tree, and we set the 'inputSlot' field to be a newly
+        // allocated slot (childInputSlot). childInputSlot is a "correlated slot" that will be set
+        // up later (handled in the post-visitor).
+        auto childInputSlot = _context->slotIdGenerator->generate();
+        _context->evalStack.emplace_back(
+            makeLimitCoScanTree(_context->planNodeId), childInputSlot, sbe::makeSV());
     }
+
     void visit(const ElemMatchValueMatchExpression* expr) final {
         unsupportedExpression(expr);
     }
     void visit(const EqualityMatchExpression* expr) final {}
     void visit(const ExistsMatchExpression* expr) final {}
-    void visit(const ExprMatchExpression* expr) final {
-        unsupportedExpression(expr);
-    }
+    void visit(const ExprMatchExpression* expr) final {}
     void visit(const GTEMatchExpression* expr) final {}
     void visit(const GTMatchExpression* expr) final {}
     void visit(const GeoMatchExpression* expr) final {
@@ -727,9 +742,7 @@ public:
     void visit(const InMatchExpression* expr) final {
         unsupportedExpression(expr);
     }
-    void visit(const InternalExprEqMatchExpression* expr) final {
-        unsupportedExpression(expr);
-    }
+    void visit(const InternalExprEqMatchExpression* expr) final {}
     void visit(const InternalSchemaAllElemMatchFromIndexMatchExpression* expr) final {
         unsupportedExpression(expr);
     }
@@ -793,9 +806,11 @@ public:
     void visit(const NorMatchExpression* expr) final {
         unsupportedExpression(expr);
     }
+
     void visit(const NotMatchExpression* expr) final {
         invariant(expr->numChildren() == 1);
     }
+
     void visit(const OrMatchExpression* matchExpr) final {
         auto& frame = _context->evalStack.back();
 
@@ -806,22 +821,27 @@ public:
         }
 
         // Set up a new EvalFrame with a limit-1/coscan tree for the first child.
-        _context->evalStack.emplace_back(makeLimitCoScanTree(), frame.inputSlot, sbe::makeSV());
+        _context->evalStack.emplace_back(
+            makeLimitCoScanTree(_context->planNodeId), frame.inputSlot, sbe::makeSV());
     }
+
     void visit(const RegexMatchExpression* expr) final {}
     void visit(const SizeMatchExpression* expr) final {}
+
     void visit(const TextMatchExpression* expr) final {
         // The QueryPlanner always converts a $text predicate into a query solution involving the
         // 'TextNode' which is translated to an SBE plan elsewhere. Therefore, no $text predicates
         // should remain in the MatchExpression tree when converting it to SBE.
         MONGO_UNREACHABLE;
     }
+
     void visit(const TextNoOpMatchExpression* expr) final {
         // No-op $text match expressions exist as a crutch for parsing a $text predicate without
         // having access to the FTS subsystem. We should never attempt to execute a MatchExpression
         // containing such a no-op node.
         MONGO_UNREACHABLE;
     }
+
     void visit(const TwoDPtInAnnulusExpression* expr) final {
         unsupportedExpression(expr);
     }
@@ -868,8 +888,8 @@ public:
                 // Process the output of the last child.
                 auto& frame = _context->evalStack.back();
                 invariant(frame.output);
-                frame.stage = sbe::makeS<sbe::FilterStage<false>>(std::move(frame.stage),
-                                                                  std::move(frame.output.expr));
+                frame.stage = sbe::makeS<sbe::FilterStage<false>>(
+                    std::move(frame.stage), std::move(frame.output.expr), _context->planNodeId);
                 frame.output.reset();
             }
             return;
@@ -883,79 +903,202 @@ public:
             return;
         }
 
-        // For non-top-level $and's, we evaluate each child in its own EvalFrame. Now that
-        // we're done evaluating each child, process their outputs.
-
-        // Move the outputs from the evalStack into various data structures in preparation for
-        // generating a UnionStage.
-        std::vector<std::unique_ptr<sbe::PlanStage>> stages;
-        std::vector<std::unique_ptr<sbe::EExpression>> outputs;
+        // For non-top-level $and's, we evaluate each child in its own EvalFrame. Now that we're
+        // done evaluating the children, move the children's outputs off of the evalStack into
+        // a vector in preparation for calling generateShortCircuitingLogicalOp().
+        std::vector<std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>>> branches;
         for (size_t i = 0, stackSize = _context->evalStack.size(); i < numChildren; ++i) {
             auto& childFrame = _context->evalStack[stackSize - numChildren + i];
-            stages.emplace_back(std::move(childFrame.stage));
-            outputs.emplace_back(std::move(childFrame.output.expr));
+            branches.emplace_back(std::move(childFrame.output), std::move(childFrame.stage));
         }
-        // Remove the children's EvalFrames from the stack.
+
         for (size_t i = 0; i < numChildren; ++i) {
             _context->evalStack.pop_back();
         }
 
         auto& frame = _context->evalStack.back();
 
-        std::tie(frame.output, frame.stage) =
-            generateShortCircuitingLogicalOp(std::move(frame.stage),
-                                             frame.relevantSlots,
-                                             sbe::EPrimBinary::logicAnd,
-                                             std::move(stages),
-                                             std::move(outputs),
+        std::unique_ptr<sbe::PlanStage> andStage;
+        std::tie(frame.output, andStage) =
+            generateShortCircuitingLogicalOp(sbe::EPrimBinary::logicAnd,
+                                             std::move(branches),
+                                             _context->planNodeId,
                                              _context->slotIdGenerator);
+
+        // Join frame stage with andStage.
+        auto& relSlots = frame.relevantSlots;
+        frame.stage = sbe::makeS<sbe::LoopJoinStage>(std::move(frame.stage),
+                                                     std::move(andStage),
+                                                     relSlots,
+                                                     relSlots,
+                                                     nullptr,
+                                                     _context->planNodeId);
     }
 
     void visit(const BitsAllClearMatchExpression* expr) final {
-        generateTraverseForBitTests(_context, expr, sbe::BitTestBehavior::AllClear);
+        generateBitTest(_context, expr, sbe::BitTestBehavior::AllClear);
     }
 
     void visit(const BitsAllSetMatchExpression* expr) final {
-        generateTraverseForBitTests(_context, expr, sbe::BitTestBehavior::AllSet);
+        generateBitTest(_context, expr, sbe::BitTestBehavior::AllSet);
     }
 
     void visit(const BitsAnyClearMatchExpression* expr) final {
-        generateTraverseForBitTests(_context, expr, sbe::BitTestBehavior::AnyClear);
+        generateBitTest(_context, expr, sbe::BitTestBehavior::AnyClear);
     }
 
     void visit(const BitsAnySetMatchExpression* expr) final {
-        generateTraverseForBitTests(_context, expr, sbe::BitTestBehavior::AnySet);
+        generateBitTest(_context, expr, sbe::BitTestBehavior::AnySet);
     }
 
-    void visit(const ElemMatchObjectMatchExpression* expr) final {}
+    void visit(const ElemMatchObjectMatchExpression* matchExpr) final {
+        // ElemMatchObjectMatchExpression is guaranteed to always have exactly 1 child
+        invariant(matchExpr->numChildren() == 1);
+
+        // Extract the input slot, the output, and the stage from of the child's EvalFrame, and
+        // remove the child's EvalFrame from the stack.
+        auto childInputSlot = _context->evalStack.back().inputSlot;
+        auto [childOutputSlot, childStage] = [&]() {
+            if (matchExpr->getChild(0)->matchType() == MatchExpression::AND &&
+                matchExpr->getChild(0)->numChildren() == 0) {
+                auto childOutputSlot = _context->slotIdGenerator->generate();
+                auto isObjectOrArrayExpr = sbe::makeE<sbe::EPrimBinary>(
+                    sbe::EPrimBinary::logicOr,
+                    sbe::makeE<sbe::EFunction>(
+                        "isObject", sbe::makeEs(sbe::makeE<sbe::EVariable>(childInputSlot))),
+                    sbe::makeE<sbe::EFunction>(
+                        "isArray", sbe::makeEs(sbe::makeE<sbe::EVariable>(childInputSlot))));
+                return std::make_pair(
+                    childOutputSlot,
+                    sbe::makeProjectStage(makeLimitCoScanTree(_context->planNodeId),
+                                          _context->planNodeId,
+                                          childOutputSlot,
+                                          std::move(isObjectOrArrayExpr)));
+            }
+            return projectEvalExpr(std::move(_context->evalStack.back().output),
+                                   std::move(_context->evalStack.back().stage),
+                                   _context->planNodeId,
+                                   _context->slotIdGenerator);
+        }();
+
+        _context->evalStack.pop_back();
+
+        auto makePredicate = [&, childOutputSlot = childOutputSlot, &childStage = childStage](
+                                 sbe::value::SlotId inputSlot,
+                                 std::unique_ptr<sbe::PlanStage> inputStage) {
+            // The 'childStage' subtree was generated to read from 'childInputSlot', based on the
+            // assumption that 'childInputSlot' is some correlated slot that will be made available
+            // by childStages's parent. We add a projection here to 'inputStage' to feed 'inputSlot'
+            // into 'childInputSlot'.
+            inputStage = sbe::makeProjectStage(std::move(inputStage),
+                                               _context->planNodeId,
+                                               childInputSlot,
+                                               sbe::makeE<sbe::EVariable>(inputSlot));
+
+            // Generate a subtree to check if inputSlot is an array.
+            auto isArrayExpr = sbe::makeE<sbe::EFunction>(
+                "isArray", sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot)));
+
+            // Generate the traverse.
+            auto traverseSlot = _context->slotIdGenerator->generate();
+            auto traverseStage = sbe::makeS<sbe::TraverseStage>(
+                std::move(inputStage),
+                std::move(childStage),
+                childInputSlot,
+                traverseSlot,
+                childOutputSlot,
+                sbe::makeSV(),
+                sbe::makeE<sbe::EPrimBinary>(sbe::EPrimBinary::logicOr,
+                                             sbe::makeE<sbe::EVariable>(traverseSlot),
+                                             sbe::makeE<sbe::EVariable>(childOutputSlot)),
+                sbe::makeE<sbe::EVariable>(traverseSlot),
+                _context->planNodeId,
+                1);
+
+            // Use the short-circuiting 'logicAnd' operator to combine the 'isArray' check and the
+            // predicate.
+            std::vector<std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>>> branches;
+            branches.emplace_back(std::move(isArrayExpr),
+                                  makeLimitCoScanTree(_context->planNodeId));
+            branches.emplace_back(traverseSlot, std::move(traverseStage));
+
+            return generateShortCircuitingLogicalOp(sbe::EPrimBinary::logicAnd,
+                                                    std::move(branches),
+                                                    _context->planNodeId,
+                                                    _context->slotIdGenerator);
+        };
+
+        generateTraverse(_context,
+                         matchExpr->path(),
+                         std::move(makePredicate),
+                         LeafTraversalMode::kDoNotTraverseLeaf);
+    }
+
     void visit(const ElemMatchValueMatchExpression* expr) final {}
 
     void visit(const EqualityMatchExpression* expr) final {
-        generateTraverseForComparisonPredicate(_context, expr, sbe::EPrimBinary::eq);
+        generateComparison(_context, expr, sbe::EPrimBinary::eq);
     }
 
     void visit(const ExistsMatchExpression* expr) final {
-        auto makeEExprFn = [](sbe::value::SlotId inputSlot) {
-            return sbe::makeE<sbe::EFunction>("exists",
-                                              sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot)));
+        auto makePredicate =
+            [](sbe::value::SlotId inputSlot,
+               std::unique_ptr<sbe::PlanStage> inputStage) -> MakePredicateReturnType {
+            return {sbe::makeE<sbe::EFunction>("exists",
+                                               sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot))),
+                    std::move(inputStage)};
         };
-        generateTraverse(_context, expr, std::move(makeEExprFn));
+
+        generateTraverse(_context, expr->path(), std::move(makePredicate));
     }
 
-    void visit(const ExprMatchExpression* expr) final {}
+    void visit(const ExprMatchExpression* matchExpr) final {
+        auto& frame = _context->evalStack.back();
+
+        // The $expr expression must by applied to the current $$ROOT document, so make sure that
+        // an input slot associated with the current frame is the same slot as the input slot for
+        // the entire match expression we're translating.
+        invariant(frame.inputSlot == _context->inputSlot);
+
+        auto&& [_, expr, stage] = generateExpression(_context->opCtx,
+                                                     matchExpr->getExpression().get(),
+                                                     std::move(frame.stage),
+                                                     _context->slotIdGenerator,
+                                                     _context->frameIdGenerator,
+                                                     frame.inputSlot,
+                                                     _context->env,
+                                                     _context->planNodeId,
+                                                     &frame.relevantSlots);
+        auto frameId = _context->frameIdGenerator->generate();
+
+        // We will need to convert the result of $expr to a boolean value, so we'll wrap it into an
+        // expression which does exactly that.
+        auto logicExpr = generateCoerceToBoolExpression(sbe::EVariable{frameId, 0});
+
+        frame.output = sbe::makeE<sbe::ELocalBind>(
+            frameId, sbe::makeEs(std::move(expr)), std::move(logicExpr));
+        frame.stage = std::move(stage);
+    }
 
     void visit(const GTEMatchExpression* expr) final {
-        generateTraverseForComparisonPredicate(_context, expr, sbe::EPrimBinary::greaterEq);
+        generateComparison(_context, expr, sbe::EPrimBinary::greaterEq);
     }
 
     void visit(const GTMatchExpression* expr) final {
-        generateTraverseForComparisonPredicate(_context, expr, sbe::EPrimBinary::greater);
+        generateComparison(_context, expr, sbe::EPrimBinary::greater);
     }
 
     void visit(const GeoMatchExpression* expr) final {}
     void visit(const GeoNearMatchExpression* expr) final {}
     void visit(const InMatchExpression* expr) final {}
-    void visit(const InternalExprEqMatchExpression* expr) final {}
+    void visit(const InternalExprEqMatchExpression* expr) final {
+        // This is a no-op. The $_internalExprEq match expression is produced internally by
+        // rewriting an $expr expression to an AND($expr, $_internalExprEq), which can later be
+        // eliminated by via a conversion into EXACT index bounds, or remains present. In the latter
+        // case we can simply ignore it, as the result of AND($expr, $_internalExprEq) is equal to
+        // just $expr.
+        generateAlwaysBoolean(_context, true);
+    }
     void visit(const InternalSchemaAllElemMatchFromIndexMatchExpression* expr) final {}
     void visit(const InternalSchemaAllowedPropertiesMatchExpression* expr) final {}
     void visit(const InternalSchemaBinDataEncryptedTypeExpression* expr) final {}
@@ -977,30 +1120,34 @@ public:
     void visit(const InternalSchemaXorMatchExpression* expr) final {}
 
     void visit(const LTEMatchExpression* expr) final {
-        generateTraverseForComparisonPredicate(_context, expr, sbe::EPrimBinary::lessEq);
+        generateComparison(_context, expr, sbe::EPrimBinary::lessEq);
     }
 
     void visit(const LTMatchExpression* expr) final {
-        generateTraverseForComparisonPredicate(_context, expr, sbe::EPrimBinary::less);
+        generateComparison(_context, expr, sbe::EPrimBinary::less);
     }
 
     void visit(const ModMatchExpression* expr) final {
         // The mod function returns the result of the mod operation between the operand and
         // given divisor, so construct an expression to then compare the result of the operation
         // to the given remainder.
-        auto makeEExprFn = [expr](sbe::value::SlotId inputSlot) {
-            return makeFillEmptyFalse(sbe::makeE<sbe::EPrimBinary>(
-                sbe::EPrimBinary::eq,
-                sbe::makeE<sbe::EFunction>(
-                    "mod",
-                    sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot),
-                                sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
-                                                           expr->getDivisor()))),
-                sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
-                                           expr->getRemainder())));
+        auto makePredicate =
+            [expr](sbe::value::SlotId inputSlot,
+                   std::unique_ptr<sbe::PlanStage> inputStage) -> MakePredicateReturnType {
+            return {
+                makeFillEmptyFalse(sbe::makeE<sbe::EPrimBinary>(
+                    sbe::EPrimBinary::eq,
+                    sbe::makeE<sbe::EFunction>(
+                        "mod",
+                        sbe::makeEs(sbe::makeE<sbe::EVariable>(inputSlot),
+                                    sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
+                                                               expr->getDivisor()))),
+                    sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt64,
+                                               expr->getRemainder()))),
+                std::move(inputStage)};
         };
 
-        generateTraverse(_context, expr, std::move(makeEExprFn));
+        generateTraverse(_context, expr->path(), std::move(makePredicate));
     }
 
     void visit(const NorMatchExpression* expr) final {}
@@ -1019,58 +1166,64 @@ public:
             generateAlwaysBoolean(_context, false);
             return;
         } else if (numChildren == 1) {
-            // For $or's with 1 child, do nothing and return.
+            // For $or's with 1 child, do nothing and return. The post-visitor for the child
+            // expression has already done all the necessary work.
             return;
         }
 
-        // For $or's, we evaluate each child in its own EvalFrame. Now that  we're done evaluating
-        // each child, process their outputs.
-
-        // Move the outputs from the evalStack into various data structures in preparation for
-        // generating a UnionStage.
-        std::vector<std::unique_ptr<sbe::PlanStage>> stages;
-        std::vector<std::unique_ptr<sbe::EExpression>> outputs;
+        // Move the children's outputs off of the evalStack into a vector in preparation for
+        // calling generateShortCircuitingLogicalOp().
+        std::vector<std::pair<EvalExpr, std::unique_ptr<sbe::PlanStage>>> branches;
         for (size_t i = 0, stackSize = _context->evalStack.size(); i < numChildren; ++i) {
             auto& childFrame = _context->evalStack[stackSize - numChildren + i];
-            stages.emplace_back(std::move(childFrame.stage));
-            outputs.emplace_back(std::move(childFrame.output.expr));
+            branches.emplace_back(std::move(childFrame.output), std::move(childFrame.stage));
         }
-        // Remove the children's EvalFrames from the stack.
+
         for (size_t i = 0; i < numChildren; ++i) {
             _context->evalStack.pop_back();
         }
 
         auto& frame = _context->evalStack.back();
-
-        std::tie(frame.output, frame.stage) =
-            generateShortCircuitingLogicalOp(std::move(frame.stage),
-                                             frame.relevantSlots,
-                                             sbe::EPrimBinary::logicOr,
-                                             std::move(stages),
-                                             std::move(outputs),
+        std::unique_ptr<sbe::PlanStage> orStage;
+        std::tie(frame.output, orStage) =
+            generateShortCircuitingLogicalOp(sbe::EPrimBinary::logicOr,
+                                             std::move(branches),
+                                             _context->planNodeId,
                                              _context->slotIdGenerator);
+
+        // Join frame.stage with orStage.
+        auto& relSlots = frame.relevantSlots;
+        frame.stage = sbe::makeS<sbe::LoopJoinStage>(std::move(frame.stage),
+                                                     std::move(orStage),
+                                                     relSlots,
+                                                     relSlots,
+                                                     nullptr,
+                                                     _context->planNodeId);
     }
 
     void visit(const RegexMatchExpression* expr) final {
-        auto makeEExprFn = [expr](sbe::value::SlotId inputSlot) {
+        auto makePredicate =
+            [expr](sbe::value::SlotId inputSlot,
+                   std::unique_ptr<sbe::PlanStage> inputStage) -> MakePredicateReturnType {
             auto regex = RegexMatchExpression::makeRegex(expr->getString(), expr->getFlags());
             auto ownedRegexVal = sbe::value::bitcastFrom(regex.release());
 
             // TODO: In the future, this needs to account for the fact that the regex match
             // expression matches strings, but also matches stored regexes. For example,
             // {$match: {a: /foo/}} matches the document {a: /foo/} in addition to {a: "foobar"}.
-            return makeFillEmptyFalse(sbe::makeE<sbe::EFunction>(
-                "regexMatch",
-                sbe::makeEs(
-                    sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::pcreRegex, ownedRegexVal),
-                    sbe::makeE<sbe::EVariable>(inputSlot))));
+            return {makeFillEmptyFalse(sbe::makeE<sbe::EFunction>(
+                        "regexMatch",
+                        sbe::makeEs(sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::pcreRegex,
+                                                               ownedRegexVal),
+                                    sbe::makeE<sbe::EVariable>(inputSlot)))),
+                    std::move(inputStage)};
         };
 
-        generateTraverse(_context, expr, std::move(makeEExprFn));
+        generateTraverse(_context, expr->path(), std::move(makePredicate));
     }
 
     void visit(const SizeMatchExpression* expr) final {
-        generateTraverseForArraySize(_context, expr);
+        generateArraySize(_context, expr);
     }
 
     void visit(const TextMatchExpression* expr) final {}
@@ -1078,12 +1231,16 @@ public:
     void visit(const TwoDPtInAnnulusExpression* expr) final {}
 
     void visit(const TypeMatchExpression* expr) final {
-        auto makeEExprFn = [expr](sbe::value::SlotId inputSlot) {
+        auto makePredicate =
+            [expr](sbe::value::SlotId inputSlot,
+                   std::unique_ptr<sbe::PlanStage> inputStage) -> MakePredicateReturnType {
             const MatcherTypeSet& ts = expr->typeSet();
-            return sbe::makeE<sbe::ETypeMatch>(sbe::makeE<sbe::EVariable>(inputSlot),
-                                               ts.getBSONTypeMask());
+            return {sbe::makeE<sbe::ETypeMatch>(sbe::makeE<sbe::EVariable>(inputSlot),
+                                                ts.getBSONTypeMask()),
+                    std::move(inputStage)};
         };
-        generateTraverse(_context, expr, std::move(makeEExprFn));
+
+        generateTraverse(_context, expr->path(), std::move(makePredicate));
     }
 
     void visit(const WhereMatchExpression* expr) final {}
@@ -1113,14 +1270,15 @@ public:
             // For a top-level $and, we evaluate each child within the current EvalFrame.
             // Process the output of the most recently evaluated child.
             invariant(frame.output);
-            frame.stage = sbe::makeS<sbe::FilterStage<false>>(std::move(frame.stage),
-                                                              std::move(frame.output.expr));
+            frame.stage = sbe::makeS<sbe::FilterStage<false>>(
+                std::move(frame.stage), std::move(frame.output.expr), _context->planNodeId);
             frame.output.reset();
         } else {
             // For non-top-level $and's, we evaluate each child in its own EvalFrame, and we
             // leave these EvalFrames on the stack until we're done evaluating all the children.
             // Set up a new EvalFrame with a limit-1/coscan tree for the next child.
-            _context->evalStack.emplace_back(makeLimitCoScanTree(), frame.inputSlot, sbe::makeSV());
+            _context->evalStack.emplace_back(
+                makeLimitCoScanTree(_context->planNodeId), frame.inputSlot, sbe::makeSV());
         }
     }
 
@@ -1128,7 +1286,12 @@ public:
     void visit(const BitsAllSetMatchExpression* expr) final {}
     void visit(const BitsAnyClearMatchExpression* expr) final {}
     void visit(const BitsAnySetMatchExpression* expr) final {}
-    void visit(const ElemMatchObjectMatchExpression* expr) final {}
+
+    void visit(const ElemMatchObjectMatchExpression* matchExpr) final {
+        // ElemMatchObjectMatchExpression is guaranteed to always have exactly 1 child, so we don't
+        // need to do anything here.
+    }
+
     void visit(const ElemMatchValueMatchExpression* expr) final {}
     void visit(const EqualityMatchExpression* expr) final {}
     void visit(const ExistsMatchExpression* expr) final {}
@@ -1171,7 +1334,8 @@ public:
 
         // We leave the EvalFrame of each child on the stack until we're done evaluating all the
         // children. Set up a new EvalFrame with a limit-1/coscan tree for the next child.
-        _context->evalStack.emplace_back(makeLimitCoScanTree(), frame.inputSlot, sbe::makeSV());
+        _context->evalStack.emplace_back(
+            makeLimitCoScanTree(_context->planNodeId), frame.inputSlot, sbe::makeSV());
     }
 
     void visit(const RegexMatchExpression* expr) final {}
@@ -1188,19 +1352,30 @@ private:
 };
 }  // namespace
 
-std::unique_ptr<sbe::PlanStage> generateFilter(const MatchExpression* root,
+std::unique_ptr<sbe::PlanStage> generateFilter(OperationContext* opCtx,
+                                               const MatchExpression* root,
                                                std::unique_ptr<sbe::PlanStage> stage,
                                                sbe::value::SlotIdGenerator* slotIdGenerator,
+                                               sbe::value::FrameIdGenerator* frameIdGenerator,
                                                sbe::value::SlotId inputSlot,
-                                               sbe::value::SlotVector relevantSlots) {
+                                               sbe::RuntimeEnvironment* env,
+                                               sbe::value::SlotVector relevantSlots,
+                                               PlanNodeId planNodeId) {
     // The planner adds an $and expression without the operands if the query was empty. We can bail
     // out early without generating the filter plan stage if this is the case.
     if (root->matchType() == MatchExpression::AND && root->numChildren() == 0) {
         return stage;
     }
 
-    MatchExpressionVisitorContext context{
-        slotIdGenerator, std::move(stage), inputSlot, relevantSlots, root};
+    MatchExpressionVisitorContext context{opCtx,
+                                          slotIdGenerator,
+                                          frameIdGenerator,
+                                          std::move(stage),
+                                          inputSlot,
+                                          relevantSlots,
+                                          root,
+                                          env,
+                                          planNodeId};
     MatchExpressionPreVisitor preVisitor{&context};
     MatchExpressionInVisitor inVisitor{&context};
     MatchExpressionPostVisitor postVisitor{&context};

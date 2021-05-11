@@ -31,7 +31,7 @@
 
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
-#include "mongo/db/exec/sbe/values/id_generators.h"
+#include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression.h"
 
@@ -57,6 +57,7 @@ generateExpression(OperationContext* opCtx,
                    sbe::value::FrameIdGenerator* frameIdGenerator,
                    sbe::value::SlotId inputVar,
                    sbe::RuntimeEnvironment* env,
+                   PlanNodeId planNodeId,
                    sbe::value::SlotVector* relevantSlots = nullptr);
 
 /**
@@ -64,5 +65,5 @@ generateExpression(OperationContext* opCtx,
  * can be of any type to a Boolean value based on MQL's definition of truth for the branch of any
  * logical expression.
  */
-std::unique_ptr<sbe::EExpression> generateExpressionForLogicBranch(sbe::EVariable branchRef);
+std::unique_ptr<sbe::EExpression> generateCoerceToBoolExpression(sbe::EVariable branchRef);
 }  // namespace mongo::stage_builder

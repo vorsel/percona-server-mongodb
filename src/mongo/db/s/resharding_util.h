@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
@@ -45,6 +46,13 @@
 namespace mongo {
 
 constexpr auto kReshardingOplogPrePostImageOps = "prePostImageOps"_sd;
+
+/**
+ * Gets the UUID for 'nss' from the 'cm'
+ *
+ * Note: throws if the collection does not have a UUID.
+ */
+UUID getCollectionUUIDFromChunkManger(const NamespaceString& nss, const ChunkManager& cm);
 
 /**
  * Constructs the temporary resharding collection's namespace provided the original collection's
@@ -104,9 +112,55 @@ std::unique_ptr<Pipeline, PipelineDeleter> createAggForReshardingOplogBuffer(
     const boost::optional<ReshardingDonorOplogId>& resumeToken);
 
 /**
- * Creates a view on the oplog that facilitates the specialized oplog tailing a resharding recipient
- * performs on a donor.
+ * Create pipeline stages for iterating donor config.transactions.  The pipeline has these stages:
+ * pipeline: [
+ *      {$match: {_id: {$gt: <startAfter>}}},
+ *      {$sort: {_id: 1}},
+ *      {$match: {"lastWriteOpTime.ts": {$lt: <fetchTimestamp>}}},
+ * ],
+ * Note that the caller is responsible for making sure that the transactions ns is set in the
+ * expCtx.
+ *
+ * fetchTimestamp never isNull()
+ */
+std::unique_ptr<Pipeline, PipelineDeleter> createConfigTxnCloningPipelineForResharding(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    Timestamp fetchTimestamp,
+    boost::optional<LogicalSessionId> startAfter);
+
+/**
+ * Creates a view on the oplog that facilitates the specialized oplog tailing a resharding
+ * recipient performs on a donor.
  */
 void createSlimOplogView(OperationContext* opCtx, Database* db);
+
+BSONObj getSlimOplogPipeline();
+
+/**
+ * Creates a pipeline that can be serialized into a query for fetching oplog entries. `startAfter`
+ * may be `Timestamp::isNull()` to fetch from the beginning of the oplog.
+ */
+std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForResharding(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const ReshardingDonorOplogId& startAfter,
+    UUID collUUID,
+    const ShardId& recipientShard,
+    bool doesDonorOwnMinKeyChunk);
+
+/**
+ * Returns the shard Id of the recipient shard that would own the document under the new shard
+ * key pattern.
+ */
+boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
+                                              const NamespaceString& sourceNss,
+                                              BSONObj fullDocument);
+/**
+ * Creates pipeline for filtering collection data matching the recipient shard.
+ */
+std::unique_ptr<Pipeline, PipelineDeleter> createAggForCollectionCloning(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const ShardKeyPattern& newShardKeyPattern,
+    const NamespaceString& sourceNss,
+    const ShardId& recipientShard);
 
 }  // namespace mongo

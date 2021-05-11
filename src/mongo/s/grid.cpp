@@ -90,7 +90,7 @@ void Grid::init(std::unique_ptr<ShardingCatalogClient> catalogClient,
     _executorPool = std::move(executorPool);
     _network = network;
 
-    _shardRegistry->init();
+    _shardRegistry->init(grid.owner(this));
 }
 
 bool Grid::isShardingInitialized() const {
@@ -124,8 +124,8 @@ void Grid::setAllowLocalHost(bool allow) {
 repl::ReadConcernArgs Grid::readConcernWithConfigTime(
     repl::ReadConcernLevel readConcernLevel) const {
     if (fcvGreaterThanOrEqualTo47()) {
-        auto now = VectorClock::get(grid.owner(this))->getTime();
-        if (auto configTime = now.configTime(); !configTime.asTimestamp().isNull()) {
+        const auto currentTime = VectorClock::get(grid.owner(this))->getTime();
+        if (auto configTime = currentTime.configTime(); !configTime.asTimestamp().isNull()) {
             // TODO SERVER-44097: investigate why not using a term (e.g. with a LogicalTime)
             // can lead - upon CSRS stepdowns - to a last applied opTime lower than the
             // previous primary's committed opTime
@@ -140,8 +140,8 @@ repl::ReadConcernArgs Grid::readConcernWithConfigTime(
 ReadPreferenceSetting Grid::readPreferenceWithConfigTime(
     const ReadPreferenceSetting& readPreference) const {
     if (fcvGreaterThanOrEqualTo47()) {
-        auto now = VectorClock::get(grid.owner(this))->getTime();
-        if (auto configTime = now.configTime(); !configTime.asTimestamp().isNull()) {
+        const auto currentTime = VectorClock::get(grid.owner(this))->getTime();
+        if (auto configTime = currentTime.configTime(); !configTime.asTimestamp().isNull()) {
             ReadPreferenceSetting readPrefToReturn(readPreference);
             readPrefToReturn.minClusterTime = configTime.asTimestamp();
             return readPrefToReturn;

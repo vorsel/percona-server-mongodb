@@ -230,7 +230,7 @@ void WiredTigerRecoveryUnit::prepareUnitOfWork() {
                 "preparing transaction at time: {prepareTimestamp}",
                 "prepareTimestamp"_attr = _prepareTimestamp);
 
-    const std::string conf = "prepare_timestamp=" + integerToHex(_prepareTimestamp.asULL());
+    const std::string conf = "prepare_timestamp=" + unsignedHex(_prepareTimestamp.asULL());
     // Prepare the transaction.
     invariantWTOK(s->prepare_transaction(s, conf.c_str()));
 }
@@ -360,13 +360,13 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
             invariant(_readAtTimestamp.isNull() || _commitTimestamp >= _readAtTimestamp);
 
             if (MONGO_likely(!doUntimestampedWritesForIdempotencyTests.shouldFail())) {
-                conf << "commit_timestamp=" << integerToHex(_commitTimestamp.asULL()) << ",";
+                conf << "commit_timestamp=" << unsignedHex(_commitTimestamp.asULL()) << ",";
             }
             _isTimestamped = true;
         }
 
         if (!_durableTimestamp.isNull()) {
-            conf << "durable_timestamp=" << integerToHex(_durableTimestamp.asULL());
+            conf << "durable_timestamp=" << unsignedHex(_durableTimestamp.asULL());
         }
 
         if (_mustBeTimestamped) {
@@ -579,6 +579,17 @@ Timestamp WiredTigerRecoveryUnit::_beginTransactionAtAllDurableTimestamp(WT_SESS
     return readTimestamp;
 }
 
+namespace {
+/**
+ * This mutex serializes starting read transactions at lastApplied. This throttles new transactions
+ * so they do not overwhelm the WiredTiger spinlock that manages the global read timestamp queue.
+ * Because this queue can grow larger than the number of active transactions, the MongoDB ticketing
+ * system alone cannot restrict its growth and thus bound the amount of time the queue is locked.
+ * TODO: WT-6709
+ */
+Mutex _lastAppliedTxnMutex = MONGO_MAKE_LATCH("lastAppliedTxnMutex");
+}  // namespace
+
 Timestamp WiredTigerRecoveryUnit::_beginTransactionAtLastAppliedTimestamp(WT_SESSION* session) {
     auto lastApplied = _sessionCache->snapshotManager().getLastApplied();
     if (!lastApplied) {
@@ -598,13 +609,16 @@ Timestamp WiredTigerRecoveryUnit::_beginTransactionAtLastAppliedTimestamp(WT_SES
         return Timestamp();
     }
 
-    WiredTigerBeginTxnBlock txnOpen(session,
-                                    _prepareConflictBehavior,
-                                    _roundUpPreparedTimestamps,
-                                    RoundUpReadTimestamp::kRound);
-    auto status = txnOpen.setReadSnapshot(*lastApplied);
-    fassert(4847501, status);
-    txnOpen.done();
+    {
+        stdx::lock_guard<Mutex> lock(_lastAppliedTxnMutex);
+        WiredTigerBeginTxnBlock txnOpen(session,
+                                        _prepareConflictBehavior,
+                                        _roundUpPreparedTimestamps,
+                                        RoundUpReadTimestamp::kRound);
+        auto status = txnOpen.setReadSnapshot(*lastApplied);
+        fassert(4847501, status);
+        txnOpen.done();
+    }
 
     // We might have rounded to oldest between calling getLastApplied and setReadSnapshot. We
     // need to get the actual read timestamp we used.
@@ -709,7 +723,7 @@ Status WiredTigerRecoveryUnit::setTimestamp(Timestamp timestamp) {
         return Status::OK();
     }
 
-    const std::string conf = "commit_timestamp=" + integerToHex(timestamp.asULL());
+    const std::string conf = "commit_timestamp=" + unsignedHex(timestamp.asULL());
     auto rc = session->timestamp_transaction(session, conf.c_str());
     if (rc == 0) {
         _isTimestamped = true;

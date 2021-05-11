@@ -70,8 +70,12 @@ public:
     public:
         Instance(ServiceContext* serviceContext, const BSONObj& initialState);
 
+        ~Instance();
+
         SemiFuture<void> run(
             std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept override;
+
+        void interrupt(Status status) override;
 
         /**
          * To be called on the instance returned by PrimaryOnlyService::getOrCreate. Returns an
@@ -96,7 +100,8 @@ public:
          * Inserts the state document to _stateDocumentsNS and returns the opTime for the insert
          * oplog entry.
          */
-        repl::OpTime _insertStateDocument();
+        ExecutorFuture<repl::OpTime> _insertStateDocument(
+            std::shared_ptr<executor::ScopedTaskExecutor> executor);
 
         /**
          * Updates the state document to have the given state. Then, persists the updated document
@@ -104,56 +109,58 @@ public:
          * commitOrAbortTimestamp depending on the state. Returns the opTime for the update oplog
          * entry.
          */
-        repl::OpTime _updateStateDocument(const TenantMigrationDonorStateEnum nextState);
+        ExecutorFuture<repl::OpTime> _updateStateDocument(
+            std::shared_ptr<executor::ScopedTaskExecutor> executor,
+            const TenantMigrationDonorStateEnum nextState);
 
         /**
-         * Sets the "expireAt" time for the state document to be garbage collected.
+         * Sets the "expireAt" time for the state document to be garbage collected, and returns the
+         * the opTime for the write.
          */
-        repl::OpTime _markStateDocumentAsGarbageCollectable();
+        ExecutorFuture<repl::OpTime> _markStateDocumentAsGarbageCollectable(
+            std::shared_ptr<executor::ScopedTaskExecutor> executor);
 
         /**
          * Waits for given opTime to be majority committed.
          */
         ExecutorFuture<void> _waitForMajorityWriteConcern(
-            const std::shared_ptr<executor::ScopedTaskExecutor>& executor, repl::OpTime opTime);
+            std::shared_ptr<executor::ScopedTaskExecutor> executor, repl::OpTime opTime);
 
         /**
          * Sends the given command to the recipient replica set.
          */
         ExecutorFuture<void> _sendCommandToRecipient(
-            OperationContext* opCtx,
-            const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
-            RemoteCommandTargeter* recipientTargeter,
+            std::shared_ptr<executor::ScopedTaskExecutor> executor,
+            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
             const BSONObj& cmdObj);
 
         /**
          * Sends the recipientSyncData command to the recipient replica set.
          */
         ExecutorFuture<void> _sendRecipientSyncDataCommand(
-            const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
-            RemoteCommandTargeter* recipientTargeter);
+            std::shared_ptr<executor::ScopedTaskExecutor> executor,
+            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS);
 
         /**
          * Sends the recipientForgetMigration command to the recipient replica set.
          */
         ExecutorFuture<void> _sendRecipientForgetMigrationCommand(
-            const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
-            RemoteCommandTargeter* recipientTargeter);
-
-        mutable Mutex _mutex = MONGO_MAKE_LATCH("TenantMigrationDonorService::_mutex");
+            std::shared_ptr<executor::ScopedTaskExecutor> executor,
+            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS);
 
         ServiceContext* _serviceContext;
 
         TenantMigrationDonorDocument _stateDoc;
-
-        std::shared_ptr<TenantMigrationAccessBlocker> _mtab;
         boost::optional<Status> _abortReason;
+
+        // Protects the promises below.
+        mutable Mutex _mutex = MONGO_MAKE_LATCH("TenantMigrationDonorService::_mutex");
 
         // Promise that is resolved when the donor has majority-committed the migration decision.
         SharedPromise<void> _decisionPromise;
 
         // Promise that is resolved when the donor receives the donorForgetMigration command.
-        SharedPromise<void> _receivedDonorForgetMigrationPromise;
+        SharedPromise<void> _receiveDonorForgetMigrationPromise;
     };
 
 private:

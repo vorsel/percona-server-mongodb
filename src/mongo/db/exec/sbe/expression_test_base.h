@@ -32,7 +32,7 @@
 
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/stages/co_scan.h"
-#include "mongo/db/exec/sbe/values/id_generators.h"
+#include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/vm/vm.h"
 
 namespace mongo::sbe {
@@ -92,7 +92,7 @@ protected:
 
 private:
     value::SlotIdGenerator _slotIdGenerator;
-    CoScanStage _emptyStage;
+    CoScanStage _emptyStage{kEmptyPlanNodeId};
     CompileCtx _ctx;
     vm::ByteCode _vm;
 };

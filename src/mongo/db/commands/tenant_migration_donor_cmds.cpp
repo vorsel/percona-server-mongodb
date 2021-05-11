@@ -77,8 +77,7 @@ public:
                 TenantMigrationDonorDocument(requestBody.getMigrationId(),
                                              requestBody.getRecipientConnectionString().toString(),
                                              requestBody.getReadPreference(),
-                                             requestBody.getDatabasePrefix().toString(),
-                                             TenantMigrationDonorStateEnum::kDataSync)
+                                             requestBody.getDatabasePrefix().toString())
                     .toBSON();
 
             auto donorService =
@@ -88,7 +87,7 @@ public:
                 TenantMigrationDonorService::Instance::getOrCreate(donorService, donorStateDoc);
             uassertStatusOK(donor->checkIfOptionsConflict(donorStateDoc));
 
-            donor->getDecisionFuture().get();
+            donor->getDecisionFuture().get(opCtx);
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const {}
@@ -182,7 +181,7 @@ public:
                     donor);
 
             donor.get().get()->onReceiveDonorForgetMigration();
-            donor.get().get()->getCompletionFuture().get();
+            donor.get().get()->getCompletionFuture().get(opCtx);
         }
 
     private:

@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -29,46 +29,49 @@
 
 #pragma once
 
-#include "mongo/db/logical_time.h"
-#include "mongo/platform/mutex.h"
-
 namespace mongo {
-class ServiceContext;
-class OperationContext;
-
-
 /**
- * LogicalClock provides a legacy interface to the cluster time, which is now provided by the
- * VectorClock class.
- *
- * TODO SERVER-48433: Remove this legacy LogicalClock interface.
+ * A reusable id generator suitable for use with integer ids that generates each new id by adding an
+ * increment to the previously generated id. This generator is not thread safe; calls to
+ * generateByIncrementing must be serialized.
  */
-class LogicalClock {
-public:
-    // Decorate ServiceContext with LogicalClock instance.
-    static LogicalClock* get(ServiceContext* service);
-    static LogicalClock* get(OperationContext* ctx);
-    static void set(ServiceContext* service, std::unique_ptr<LogicalClock> logicalClock);
-
+template <class T>
+class IncrementingIdGenerator {
+protected:
     /**
-     * Returns the current cluster time if this is a replica set node, otherwise returns a null
-     * logical time.
+     * Constructs a new generator using 'startingId' as the first generated id and 'incrementStep'
+     * as the value to add to generate subsequent ids. Note that 'incrementStep' may be negative but
+     * must not be zero.
      */
-    static LogicalTime getClusterTimeForReplicaSet(ServiceContext* svcCtx);
-    static LogicalTime getClusterTimeForReplicaSet(OperationContext* opCtx);
+    IncrementingIdGenerator(T startingId, T incrementStep)
+        : _currentId(startingId), _incrementStep(incrementStep) {}
 
-    /**
-     * Creates an instance of LogicalClock.
-     */
-    LogicalClock(ServiceContext*);
-
-    /**
-     * Returns the current clusterTime.
-     */
-    LogicalTime getClusterTime();
+    T generateByIncrementing() {
+        _currentId += _incrementStep;
+        return _currentId;
+    }
 
 private:
-    ServiceContext* const _service;
+    T _currentId;
+    T _incrementStep;
 };
 
+template <class T>
+class IdGenerator : IncrementingIdGenerator<T> {
+public:
+    IdGenerator(T startingId = 0, T incrementStep = 1)
+        : IncrementingIdGenerator<T>(startingId, incrementStep) {}
+
+    T generate() {
+        return this->generateByIncrementing();
+    }
+
+    auto generateMultiple(size_t num) {
+        std::vector<T> idVector(num);
+        for (T& id : idVector) {
+            id = generate();
+        }
+        return idVector;
+    }
+};
 }  // namespace mongo

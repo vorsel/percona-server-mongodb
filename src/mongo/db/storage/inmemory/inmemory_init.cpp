@@ -62,7 +62,8 @@ const std::string kInMemoryEngineName = "inMemory";
 class InMemoryFactory : public StorageEngine::Factory {
 public:
     virtual ~InMemoryFactory() {}
-    virtual std::unique_ptr<StorageEngine> create(const StorageGlobalParams& params,
+    virtual std::unique_ptr<StorageEngine> create(OperationContext* opCtx,
+                                                  const StorageGlobalParams& params,
                                                   const StorageEngineLockFile*) const {
         syncInMemoryAndWiredTigerOptions();
 
@@ -103,7 +104,7 @@ public:
         options.directoryPerDB = params.directoryperdb;
         options.directoryForIndexes = wiredTigerGlobalOptions.directoryForIndexes;
         options.forRepair = params.repair;
-        return std::make_unique<StorageEngineImpl>(std::move(kv), options);
+        return std::make_unique<StorageEngineImpl>(opCtx, std::move(kv), options);
     }
 
     virtual StringData getCanonicalName() const {

@@ -892,7 +892,8 @@ protected:
     std::unique_ptr<SlotBasedPrepareExecutionResult> buildEofPlan() final {
         auto result = makeResult();
         result->emplace(
-            {sbe::makeS<sbe::LimitSkipStage>(sbe::makeS<sbe::CoScanStage>(), 0, boost::none),
+            {sbe::makeS<sbe::LimitSkipStage>(
+                 sbe::makeS<sbe::CoScanStage>(kEmptyPlanNodeId), 0, boost::none, kEmptyPlanNodeId),
              stage_builder::PlanStageData{std::make_unique<sbe::RuntimeEnvironment>()}},
             nullptr);
         return result;
@@ -1535,7 +1536,7 @@ namespace {
  * Otherwise, returns 'false'.
  */
 bool turnIxscanIntoCount(QuerySolution* soln) {
-    QuerySolutionNode* root = soln->root.get();
+    QuerySolutionNode* root = soln->root();
 
     // Root should be an ixscan or fetch w/o any filters.
     if (!(STAGE_FETCH == root->getType() || STAGE_IXSCAN == root->getType())) {
@@ -1583,13 +1584,13 @@ bool turnIxscanIntoCount(QuerySolution* soln) {
     }
 
     // Make the count node that we replace the fetch + ixscan with.
-    CountScanNode* csn = new CountScanNode(isn->index);
+    auto csn = std::make_unique<CountScanNode>(isn->index);
     csn->startKey = startKey;
     csn->startKeyInclusive = startKeyInclusive;
     csn->endKey = endKey;
     csn->endKeyInclusive = endKeyInclusive;
     // Takes ownership of 'cn' and deletes the old root.
-    soln->root.reset(csn);
+    soln->setRoot(std::move(csn));
     return true;
 }
 
@@ -1759,7 +1760,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCoun
 bool turnIxscanIntoDistinctIxscan(QuerySolution* soln,
                                   const std::string& field,
                                   bool strictDistinctOnly) {
-    QuerySolutionNode* root = soln->root.get();
+    auto root = soln->root();
 
     // We can attempt to convert a plan if it follows one of these patterns (starting from the
     // root):
@@ -1898,7 +1899,7 @@ bool turnIxscanIntoDistinctIxscan(QuerySolution* soln,
             root->children.clear();
 
             // Make the fetch the new root. This destroys the project stage.
-            soln->root.reset(fetchNode);
+            soln->setRoot(std::unique_ptr<QuerySolutionNode>(fetchNode));
         }
 
         // Whenver we have a FETCH node, the IXSCAN is its child. We detach the IXSCAN from the

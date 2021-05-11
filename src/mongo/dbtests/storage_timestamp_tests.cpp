@@ -52,10 +52,12 @@
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index/index_build_interceptor.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/wildcard_access_method.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/multi_key_path_tracker.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
+#include "mongo/db/query/wildcard_multikey_paths.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/multiapplier.h"
@@ -265,7 +267,7 @@ public:
         ASSERT_OK(coll->insertDocument(_opCtx, stmt, nullOpDebug, fromMigrate));
     }
 
-    void createIndex(Collection* coll, std::string indexName, const BSONObj& indexKey) {
+    void createIndex(CollectionWriter& coll, std::string indexName, const BSONObj& indexKey) {
 
         // Build an index.
         MultiIndexBlock indexer;
@@ -278,20 +280,20 @@ public:
                 indexer.init(_opCtx,
                              coll,
                              {BSON("v" << 2 << "name" << indexName << "key" << indexKey)},
-                             MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, coll));
+                             MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, coll.get()));
             ASSERT_OK(swIndexInfoObj.getStatus());
             indexInfoObj = std::move(swIndexInfoObj.getValue()[0]);
         }
 
-        ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, coll));
-        ASSERT_OK(indexer.checkConstraints(_opCtx));
+        ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, coll.get()));
+        ASSERT_OK(indexer.checkConstraints(_opCtx, coll.get()));
 
         {
             WriteUnitOfWork wuow(_opCtx);
             // Timestamping index completion. Primaries write an oplog entry.
             ASSERT_OK(
                 indexer.commit(_opCtx,
-                               coll,
+                               coll.getWritableCollection(),
                                [&](const BSONObj& indexSpec) {
                                    _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
                                        _opCtx, coll->ns(), coll->uuid(), indexSpec, false);
@@ -1344,6 +1346,200 @@ public:
     }
 };
 
+class SecondarySetWildcardIndexMultikeyOnInsert : public StorageTimestampTest {
+
+public:
+    void run() {
+        // Pretend to be a secondary.
+        repl::UnreplicatedWritesBlock uwb(_opCtx);
+
+        NamespaceString nss("unittests.SecondarySetWildcardIndexMultikeyOnInsert");
+        reset(nss);
+        UUID uuid = UUID::gen();
+        {
+            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
+            uuid = autoColl.getCollection()->uuid();
+        }
+        auto indexName = "a_1";
+        auto indexSpec = BSON("name" << indexName << "key" << BSON("$**" << 1) << "v"
+                                     << static_cast<int>(kIndexVersion));
+        ASSERT_OK(dbtests::createIndexFromSpec(_opCtx, nss.ns(), indexSpec));
+
+        _coordinatorMock->alwaysAllowWrites(false);
+
+        const LogicalTime insertTime0 = _clock->tickClusterTime(1);
+        const LogicalTime insertTime1 = _clock->tickClusterTime(1);
+        const LogicalTime insertTime2 = _clock->tickClusterTime(1);
+
+        BSONObj doc0 = BSON("_id" << 0 << "a" << 3);
+        BSONObj doc1 = BSON("_id" << 1 << "a" << BSON_ARRAY(1 << 2));
+        BSONObj doc2 = BSON("_id" << 2 << "a" << BSON_ARRAY(1 << 2));
+        auto op0 = repl::OplogEntry(
+            BSON("ts" << insertTime0.asTimestamp() << "t" << 1LL << "v" << 2 << "op"
+                      << "i"
+                      << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc0));
+        auto op1 = repl::OplogEntry(
+            BSON("ts" << insertTime1.asTimestamp() << "t" << 1LL << "v" << 2 << "op"
+                      << "i"
+                      << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc1));
+        auto op2 = repl::OplogEntry(
+            BSON("ts" << insertTime2.asTimestamp() << "t" << 1LL << "v" << 2 << "op"
+                      << "i"
+                      << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc2));
+
+        // Coerce oplog application to apply op2 before op1.
+        std::vector<repl::OplogEntry> ops = {op0, op2, op1};
+
+        DoNothingOplogApplierObserver observer;
+        auto storageInterface = repl::StorageInterface::get(_opCtx);
+        auto writerPool = repl::makeReplWriterPool();
+        repl::OplogApplierImpl oplogApplier(
+            nullptr,  // task executor. not required for applyOplogBatch().
+            nullptr,  // oplog buffer. not required for applyOplogBatch().
+            &observer,
+            _coordinatorMock,
+            _consistencyMarkers,
+            storageInterface,
+            repl::OplogApplier::Options(repl::OplogApplication::Mode::kRecovering),
+            writerPool.get());
+
+        uassertStatusOK(oplogApplier.applyOplogBatch(_opCtx, ops));
+
+        AutoGetCollectionForRead autoColl(_opCtx, nss);
+        auto wildcardIndexDescriptor =
+            autoColl.getCollection()->getIndexCatalog()->findIndexByName(_opCtx, indexName);
+        const IndexAccessMethod* wildcardIndexAccessMethod = autoColl.getCollection()
+                                                                 ->getIndexCatalog()
+                                                                 ->getEntry(wildcardIndexDescriptor)
+                                                                 ->accessMethod();
+        {
+            // Verify that, even though op2 was applied first, the multikey state is observed in all
+            // WiredTiger transactions that can contain the data written by op1.
+            OneOffRead oor(_opCtx, insertTime1.asTimestamp());
+            const WildcardAccessMethod* wam =
+                dynamic_cast<const WildcardAccessMethod*>(wildcardIndexAccessMethod);
+            MultikeyMetadataAccessStats stats;
+            std::set<FieldRef> paths = getWildcardMultikeyPathSet(wam, _opCtx, &stats);
+            ASSERT_EQUALS(1, paths.size());
+            ASSERT_EQUALS("a", paths.begin()->dottedField());
+        }
+        {
+            // Oplog application conservatively uses the first optime in the batch, insertTime0, as
+            // the point at which the index became multikey, despite the fact that the earliest op
+            // which caused the index to become multikey did not occur until insertTime1. This works
+            // because if we construct a query plan that incorrectly believes a particular path to
+            // be multikey, the plan will still be correct (if possibly sub-optimal). Conversely, if
+            // we were to construct a query plan that incorrectly believes a path is NOT multikey,
+            // it could produce incorrect results.
+            OneOffRead oor(_opCtx, insertTime0.asTimestamp());
+            const WildcardAccessMethod* wam =
+                dynamic_cast<const WildcardAccessMethod*>(wildcardIndexAccessMethod);
+            MultikeyMetadataAccessStats stats;
+            std::set<FieldRef> paths = getWildcardMultikeyPathSet(wam, _opCtx, &stats);
+            ASSERT_EQUALS(1, paths.size());
+            ASSERT_EQUALS("a", paths.begin()->dottedField());
+        }
+    }
+};
+
+class SecondarySetWildcardIndexMultikeyOnUpdate : public StorageTimestampTest {
+
+public:
+    void run() {
+        // Pretend to be a secondary.
+        repl::UnreplicatedWritesBlock uwb(_opCtx);
+
+        NamespaceString nss("unittests.SecondarySetWildcardIndexMultikeyOnUpdate");
+        reset(nss);
+        UUID uuid = UUID::gen();
+        {
+            AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_IX);
+            uuid = autoColl.getCollection()->uuid();
+        }
+        auto indexName = "a_1";
+        auto indexSpec = BSON("name" << indexName << "key" << BSON("$**" << 1) << "v"
+                                     << static_cast<int>(kIndexVersion));
+        ASSERT_OK(dbtests::createIndexFromSpec(_opCtx, nss.ns(), indexSpec));
+
+        _coordinatorMock->alwaysAllowWrites(false);
+
+        const LogicalTime insertTime0 = _clock->tickClusterTime(1);
+        const LogicalTime updateTime1 = _clock->tickClusterTime(1);
+        const LogicalTime updateTime2 = _clock->tickClusterTime(1);
+
+        BSONObj doc0 = BSON("_id" << 0 << "a" << 3);
+        BSONObj doc1 = BSON("$v" << 1 << "$set" << BSON("a" << BSON_ARRAY(1 << 2)));
+        BSONObj doc2 = BSON("$v" << 1 << "$set" << BSON("a" << BSON_ARRAY(1 << 2)));
+        auto op0 = repl::OplogEntry(
+            BSON("ts" << insertTime0.asTimestamp() << "t" << 1LL << "v" << 2 << "op"
+                      << "i"
+                      << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc0));
+        auto op1 = repl::OplogEntry(
+            BSON("ts" << updateTime1.asTimestamp() << "t" << 1LL << "v" << 2 << "op"
+                      << "u"
+                      << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc1
+                      << "o2" << BSON("_id" << 0)));
+        auto op2 = repl::OplogEntry(
+            BSON("ts" << updateTime2.asTimestamp() << "t" << 1LL << "v" << 2 << "op"
+                      << "u"
+                      << "ns" << nss.ns() << "ui" << uuid << "wall" << Date_t() << "o" << doc2
+                      << "o2" << BSON("_id" << 0)));
+
+        // Coerce oplog application to apply op2 before op1.
+        std::vector<repl::OplogEntry> ops = {op0, op2, op1};
+
+        DoNothingOplogApplierObserver observer;
+        auto storageInterface = repl::StorageInterface::get(_opCtx);
+        auto writerPool = repl::makeReplWriterPool();
+        repl::OplogApplierImpl oplogApplier(
+            nullptr,  // task executor. not required for applyOplogBatch().
+            nullptr,  // oplog buffer. not required for applyOplogBatch().
+            &observer,
+            _coordinatorMock,
+            _consistencyMarkers,
+            storageInterface,
+            repl::OplogApplier::Options(repl::OplogApplication::Mode::kRecovering),
+            writerPool.get());
+
+        uassertStatusOK(oplogApplier.applyOplogBatch(_opCtx, ops));
+
+        AutoGetCollectionForRead autoColl(_opCtx, nss);
+        auto wildcardIndexDescriptor =
+            autoColl.getCollection()->getIndexCatalog()->findIndexByName(_opCtx, indexName);
+        const IndexAccessMethod* wildcardIndexAccessMethod = autoColl.getCollection()
+                                                                 ->getIndexCatalog()
+                                                                 ->getEntry(wildcardIndexDescriptor)
+                                                                 ->accessMethod();
+        {
+            // Verify that, even though op2 was applied first, the multikey state is observed in all
+            // WiredTiger transactions that can contain the data written by op1.
+            OneOffRead oor(_opCtx, updateTime1.asTimestamp());
+            const WildcardAccessMethod* wam =
+                dynamic_cast<const WildcardAccessMethod*>(wildcardIndexAccessMethod);
+            MultikeyMetadataAccessStats stats;
+            std::set<FieldRef> paths = getWildcardMultikeyPathSet(wam, _opCtx, &stats);
+            ASSERT_EQUALS(1, paths.size());
+            ASSERT_EQUALS("a", paths.begin()->dottedField());
+        }
+        {
+            // Oplog application conservatively uses the first optime in the batch, insertTime0, as
+            // the point at which the index became multikey, despite the fact that the earliest op
+            // which caused the index to become multikey did not occur until updateTime1. This works
+            // because if we construct a query plan that incorrectly believes a particular path to
+            // be multikey, the plan will still be correct (if possibly sub-optimal). Conversely, if
+            // we were to construct a query plan that incorrectly believes a path is NOT multikey,
+            // it could produce incorrect results.
+            OneOffRead oor(_opCtx, insertTime0.asTimestamp());
+            const WildcardAccessMethod* wam =
+                dynamic_cast<const WildcardAccessMethod*>(wildcardIndexAccessMethod);
+            MultikeyMetadataAccessStats stats;
+            std::set<FieldRef> paths = getWildcardMultikeyPathSet(wam, _opCtx, &stats);
+            ASSERT_EQUALS(1, paths.size());
+            ASSERT_EQUALS("a", paths.begin()->dottedField());
+        }
+    }
+};
+
 class InitialSyncSetIndexMultikeyOnInsert : public StorageTimestampTest {
 
 public:
@@ -1870,12 +2066,14 @@ public:
         reset(nss);
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        CollectionWriter coll(autoColl);
+
         RecordId catalogId = autoColl.getCollection()->getCatalogId();
 
         const LogicalTime insertTimestamp = _clock->tickClusterTime(1);
         {
             WriteUnitOfWork wuow(_opCtx);
-            insertDocument(autoColl.getCollection(),
+            insertDocument(coll.get(),
                            InsertStatement(BSON("_id" << 0 << "a" << BSON_ARRAY(1 << 2)),
                                            insertTimestamp.asTimestamp(),
                                            presentTerm));
@@ -1889,10 +2087,8 @@ public:
 
         // Build an index on `{a: 1}`. This index will be multikey.
         MultiIndexBlock indexer;
-        auto abortOnExit = makeGuard([&] {
-            indexer.abortIndexBuild(
-                _opCtx, autoColl.getWritableCollection(), MultiIndexBlock::kNoopOnCleanUpFn);
-        });
+        auto abortOnExit = makeGuard(
+            [&] { indexer.abortIndexBuild(_opCtx, coll, MultiIndexBlock::kNoopOnCleanUpFn); });
         const LogicalTime beforeIndexBuild = _clock->tickClusterTime(2);
         BSONObj indexInfoObj;
         {
@@ -1910,7 +2106,7 @@ public:
 
             auto swIndexInfoObj = indexer.init(
                 _opCtx,
-                autoColl.getWritableCollection(),
+                coll,
                 {BSON("v" << 2 << "unique" << true << "name"
                           << "a_1"
                           << "key" << BSON("a" << 1))},
@@ -1924,28 +2120,29 @@ public:
         // Inserting all the documents has the side-effect of setting internal state on the index
         // builder that the index is multikey.
         ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, autoColl.getCollection()));
-        ASSERT_OK(indexer.checkConstraints(_opCtx));
+        ASSERT_OK(indexer.checkConstraints(_opCtx, autoColl.getCollection()));
 
         {
             WriteUnitOfWork wuow(_opCtx);
             // All callers of `MultiIndexBlock::commit` are responsible for timestamping index
             // completion  Primaries write an oplog entry. Secondaries explicitly set a
             // timestamp.
-            ASSERT_OK(indexer.commit(
-                _opCtx,
-                autoColl.getWritableCollection(),
-                [&](const BSONObj& indexSpec) {
-                    if (SimulatePrimary) {
-                        // The timestamping responsibility for each index is placed on the caller.
-                        _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                            _opCtx, nss, autoColl.getCollection()->uuid(), indexSpec, false);
-                    } else {
-                        const auto currentTime = _clock->getTime();
-                        ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(
-                            currentTime.clusterTime().asTimestamp()));
-                    }
-                },
-                MultiIndexBlock::kNoopOnCommitFn));
+            ASSERT_OK(
+                indexer.commit(_opCtx,
+                               autoColl.getWritableCollection(),
+                               [&](const BSONObj& indexSpec) {
+                                   if (SimulatePrimary) {
+                                       // The timestamping responsibility for each index is placed
+                                       // on the caller.
+                                       _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                                           _opCtx, nss, coll->uuid(), indexSpec, false);
+                                   } else {
+                                       const auto currentTime = _clock->getTime();
+                                       ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(
+                                           currentTime.clusterTime().asTimestamp()));
+                                   }
+                               },
+                               MultiIndexBlock::kNoopOnCommitFn));
             wuow.commit();
         }
         abortOnExit.dismiss();
@@ -2000,12 +2197,12 @@ public:
         reset(nss);
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        CollectionWriter collection(autoColl);
 
         // Build an index on `{a: 1}`.
         MultiIndexBlock indexer;
         auto abortOnExit = makeGuard([&] {
-            indexer.abortIndexBuild(
-                _opCtx, autoColl.getWritableCollection(), MultiIndexBlock::kNoopOnCleanUpFn);
+            indexer.abortIndexBuild(_opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
         });
         const LogicalTime beforeIndexBuild = _clock->tickClusterTime(2);
         BSONObj indexInfoObj;
@@ -2024,11 +2221,11 @@ public:
 
             auto swIndexInfoObj = indexer.init(
                 _opCtx,
-                autoColl.getWritableCollection(),
+                collection,
                 {BSON("v" << 2 << "unique" << true << "name"
                           << "a_1"
                           << "ns" << nss.ns() << "key" << BSON("a" << 1))},
-                MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, autoColl.getCollection()));
+                MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, collection.get()));
             ASSERT_OK(swIndexInfoObj.getStatus());
             indexInfoObj = std::move(swIndexInfoObj.getValue()[0]);
         }
@@ -2040,7 +2237,7 @@ public:
         const LogicalTime firstInsert = _clock->tickClusterTime(1);
         {
             WriteUnitOfWork wuow(_opCtx);
-            insertDocument(autoColl.getCollection(),
+            insertDocument(collection.get(),
                            InsertStatement(BSON("_id" << 0 << "a" << 1),
                                            firstInsert.asTimestamp(),
                                            presentTerm));
@@ -2115,25 +2312,26 @@ public:
             ASSERT_TRUE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
         }
 
-        ASSERT_OK(indexer.checkConstraints(_opCtx));
+        ASSERT_OK(indexer.checkConstraints(_opCtx, autoColl.getCollection()));
 
         {
             WriteUnitOfWork wuow(_opCtx);
-            ASSERT_OK(indexer.commit(
-                _opCtx,
-                autoColl.getCollection(),
-                [&](const BSONObj& indexSpec) {
-                    if (SimulatePrimary) {
-                        // The timestamping responsibility for each index is placed on the caller.
-                        _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
-                            _opCtx, nss, autoColl.getCollection()->uuid(), indexSpec, false);
-                    } else {
-                        const auto currentTime = _clock->getTime();
-                        ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(
-                            currentTime.clusterTime().asTimestamp()));
-                    }
-                },
-                MultiIndexBlock::kNoopOnCommitFn));
+            ASSERT_OK(
+                indexer.commit(_opCtx,
+                               collection.get(),
+                               [&](const BSONObj& indexSpec) {
+                                   if (SimulatePrimary) {
+                                       // The timestamping responsibility for each index is placed
+                                       // on the caller.
+                                       _opCtx->getServiceContext()->getOpObserver()->onCreateIndex(
+                                           _opCtx, nss, collection.get()->uuid(), indexSpec, false);
+                                   } else {
+                                       const auto currentTime = _clock->getTime();
+                                       ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(
+                                           currentTime.clusterTime().asTimestamp()));
+                                   }
+                               },
+                               MultiIndexBlock::kNoopOnCommitFn));
             wuow.commit();
         }
         abortOnExit.dismiss();
@@ -2493,6 +2691,7 @@ public:
         reset(nss);
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        CollectionWriter coll(autoColl);
 
         const LogicalTime insertTimestamp = _clock->tickClusterTime(1);
         {
@@ -2516,8 +2715,7 @@ public:
         std::vector<std::string> indexIdents;
         // Create an index and get the ident for each index.
         for (auto key : {"a", "b", "c"}) {
-            createIndex(
-                autoColl.getWritableCollection(), str::stream() << key << "_1", BSON(key << 1));
+            createIndex(coll, str::stream() << key << "_1", BSON(key << 1));
 
             // Timestamps at the completion of each index build.
             afterCreateTimestamps.push_back(_clock->tickClusterTime(1).asTimestamp());
@@ -2573,6 +2771,7 @@ public:
         reset(nss);
 
         AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        CollectionWriter coll(autoColl);
 
         const LogicalTime insertTimestamp = _clock->tickClusterTime(1);
         {
@@ -2596,8 +2795,7 @@ public:
         std::vector<std::string> indexIdents;
         // Create an index and get the ident for each index.
         for (auto key : {"a", "b", "c"}) {
-            createIndex(
-                autoColl.getWritableCollection(), str::stream() << key << "_1", BSON(key << 1));
+            createIndex(coll, str::stream() << key << "_1", BSON(key << 1));
 
             // Timestamps at the completion of each index build.
             afterCreateTimestamps.push_back(_clock->tickClusterTime(1).asTimestamp());
@@ -2721,7 +2919,8 @@ public:
         NamespaceString nss("unittests.timestampIndexBuilds");
         reset(nss);
 
-        AutoGetCollection collection(_opCtx, nss, LockMode::MODE_X);
+        AutoGetCollection autoColl(_opCtx, nss, LockMode::MODE_X);
+        CollectionWriter collection(autoColl);
 
         // Indexing of parallel arrays is not allowed, so these are deemed "bad".
         const auto badDoc1 =
@@ -2736,7 +2935,7 @@ public:
         {
             LOGV2(22505, "inserting {badDoc1}", "badDoc1"_attr = badDoc1);
             WriteUnitOfWork wuow(_opCtx);
-            insertDocument(collection.getCollection(),
+            insertDocument(collection.get(),
                            InsertStatement(badDoc1, insert1.asTimestamp(), presentTerm));
             wuow.commit();
         }
@@ -2745,7 +2944,7 @@ public:
         {
             LOGV2(22506, "inserting {badDoc2}", "badDoc2"_attr = badDoc2);
             WriteUnitOfWork wuow(_opCtx);
-            insertDocument(collection.getCollection(),
+            insertDocument(collection.get(),
                            InsertStatement(badDoc2, insert2.asTimestamp(), presentTerm));
             wuow.commit();
         }
@@ -2753,8 +2952,7 @@ public:
         const IndexCatalogEntry* buildingIndex = nullptr;
         MultiIndexBlock indexer;
         auto abortOnExit = makeGuard([&] {
-            indexer.abortIndexBuild(
-                _opCtx, collection.getWritableCollection(), MultiIndexBlock::kNoopOnCleanUpFn);
+            indexer.abortIndexBuild(_opCtx, collection, MultiIndexBlock::kNoopOnCleanUpFn);
         });
 
         // Provide a build UUID, indicating that this is a two-phase index build.
@@ -2772,14 +2970,14 @@ public:
             {
                 TimestampBlock tsBlock(_opCtx, indexInit.asTimestamp());
 
-                auto swSpecs = indexer.init(_opCtx,
-                                            collection.getWritableCollection(),
-                                            {BSON("v" << 2 << "name"
-                                                      << "a_1_b_1"
-                                                      << "ns" << collection->ns().ns() << "key"
-                                                      << BSON("a" << 1 << "b" << 1))},
-                                            MultiIndexBlock::makeTimestampedIndexOnInitFn(
-                                                _opCtx, collection.getCollection()));
+                auto swSpecs = indexer.init(
+                    _opCtx,
+                    collection,
+                    {BSON("v" << 2 << "name"
+                              << "a_1_b_1"
+                              << "ns" << collection->ns().ns() << "key"
+                              << BSON("a" << 1 << "b" << 1))},
+                    MultiIndexBlock::makeTimestampedIndexOnInitFn(_opCtx, collection.get()));
                 ASSERT_OK(swSpecs.getStatus());
             }
 
@@ -2788,7 +2986,7 @@ public:
                 indexCatalog->findIndexByName(_opCtx, "a_1_b_1", /* includeUnfinished */ true));
             ASSERT(buildingIndex);
 
-            ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, collection.getCollection()));
+            ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, collection.get()));
 
             ASSERT_TRUE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
 
@@ -2822,7 +3020,7 @@ public:
             buildingIndex->indexBuildInterceptor()->getSkippedRecordTracker()->areAllRecordsApplied(
                 _opCtx));
         // This fails because the bad record is still invalid.
-        auto status = indexer.retrySkippedRecords(_opCtx, collection.getCollection());
+        auto status = indexer.retrySkippedRecords(_opCtx, collection.get());
         ASSERT_EQ(status.code(), ErrorCodes::CannotIndexParallelArrays);
 
         ASSERT_FALSE(
@@ -2835,7 +3033,7 @@ public:
         Helpers::upsert(_opCtx, collection->ns().ns(), BSON("_id" << 0 << "a" << 1 << "b" << 1));
         {
             RecordId badRecord = Helpers::findOne(
-                _opCtx, collection.getCollection(), BSON("_id" << 1), false /* requireIndex */);
+                _opCtx, collection.get(), BSON("_id" << 1), false /* requireIndex */);
             WriteUnitOfWork wuow(_opCtx);
             collection->deleteDocument(_opCtx, kUninitializedStmtId, badRecord, nullptr);
             wuow.commit();
@@ -2848,12 +3046,12 @@ public:
 
 
         // This succeeds because the bad documents are now either valid or removed.
-        ASSERT_OK(indexer.retrySkippedRecords(_opCtx, collection.getCollection()));
+        ASSERT_OK(indexer.retrySkippedRecords(_opCtx, collection.get()));
         ASSERT_TRUE(
             buildingIndex->indexBuildInterceptor()->getSkippedRecordTracker()->areAllRecordsApplied(
                 _opCtx));
         ASSERT_TRUE(buildingIndex->indexBuildInterceptor()->areAllWritesApplied(_opCtx));
-        ASSERT_OK(indexer.checkConstraints(_opCtx));
+        ASSERT_OK(indexer.checkConstraints(_opCtx, collection.get()));
 
         {
             WriteUnitOfWork wuow(_opCtx);
@@ -3999,6 +4197,8 @@ public:
         addIf<SecondaryCreateCollectionBetweenInserts>();
         addIf<PrimaryCreateCollectionInApplyOps>();
         addIf<SecondarySetIndexMultikeyOnInsert>();
+        addIf<SecondarySetWildcardIndexMultikeyOnInsert>();
+        addIf<SecondarySetWildcardIndexMultikeyOnUpdate>();
         addIf<InitialSyncSetIndexMultikeyOnInsert>();
         addIf<PrimarySetIndexMultikeyOnInsert>();
         addIf<PrimarySetIndexMultikeyOnInsertUnreplicated>();

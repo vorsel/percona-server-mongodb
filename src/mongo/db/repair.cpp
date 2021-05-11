@@ -52,7 +52,6 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
-#include "mongo/db/logical_clock.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/rebuild_indexes.h"
@@ -61,6 +60,7 @@
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/storage/storage_repair_observer.h"
 #include "mongo/db/storage/storage_util.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -87,7 +87,7 @@ Status rebuildIndexesForNamespace(OperationContext* opCtx,
 }
 
 namespace {
-Status dropUnfinishedIndexes(OperationContext* opCtx, Collection* collection) {
+Status dropUnfinishedIndexes(OperationContext* opCtx, const Collection* collection) {
     std::vector<std::string> indexNames;
     auto durableCatalog = DurableCatalog::get(opCtx);
     durableCatalog->getAllIndexes(opCtx, collection->getCatalogId(), &indexNames);
@@ -170,12 +170,13 @@ Status repairDatabase(OperationContext* opCtx, StorageEngine* engine, const std:
         // Set the minimum snapshot for all Collections in this db. This ensures that readers
         // using majority readConcern level can only use the collections after their repaired
         // versions are in the committed view.
-        auto clusterTime = LogicalClock::getClusterTimeForReplicaSet(opCtx).asTimestamp();
+        const auto currentTime = VectorClock::get(opCtx)->getTime();
 
         for (auto collIt = db->begin(opCtx); collIt != db->end(opCtx); ++collIt) {
-            auto collection = *collIt;
+            auto collection =
+                collIt.getWritableCollection(opCtx, CollectionCatalog::LifetimeMode::kInplace);
             if (collection) {
-                collection->setMinimumVisibleSnapshot(clusterTime);
+                collection->setMinimumVisibleSnapshot(currentTime.clusterTime().asTimestamp());
             }
         }
 
@@ -201,14 +202,17 @@ Status repairCollection(OperationContext* opCtx,
 
     LOGV2(21027, "Repairing collection", "namespace"_attr = nss);
 
-    auto collection =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespaceForMetadataWrite(opCtx, nss);
-    Status status = engine->repairRecordStore(opCtx, collection->getCatalogId(), nss);
+    Status status = Status::OK();
+    {
+        auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+        status = engine->repairRecordStore(opCtx, collection->getCatalogId(), nss);
+    }
+
 
     // Need to lookup from catalog again because the old collection object was invalidated by
     // repairRecordStore.
-    collection =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespaceForMetadataWrite(opCtx, nss);
+    auto collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespaceForMetadataWrite(
+        opCtx, CollectionCatalog::LifetimeMode::kInplace, nss);
 
     // If data was modified during repairRecordStore, we know to rebuild indexes without needing
     // to run an expensive collection validation.

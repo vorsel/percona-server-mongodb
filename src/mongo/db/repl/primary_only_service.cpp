@@ -59,6 +59,7 @@
 namespace mongo {
 namespace repl {
 
+MONGO_FAIL_POINT_DEFINE(PrimaryOnlyServiceSkipRebuildingInstances);
 MONGO_FAIL_POINT_DEFINE(PrimaryOnlyServiceHangBeforeRebuildingInstances);
 MONGO_FAIL_POINT_DEFINE(PrimaryOnlyServiceFailRebuildingInstances);
 
@@ -329,9 +330,15 @@ void PrimaryOnlyService::onStepDown() {
         return;
     }
 
+    for (auto& instance : _instances) {
+        instance.second->interrupt({ErrorCodes::InterruptedDueToReplStateChange,
+                                    "PrimaryOnlyService interrupted due to stepdown"});
+    }
+
     if (_scopedExecutor) {
         (*_scopedExecutor)->shutdown();
     }
+
     _state = State::kPaused;
     _rebuildStatus = Status::OK();
 }
@@ -356,6 +363,11 @@ void PrimaryOnlyService::shutdown() {
         _state = State::kShutdown;
     }
 
+    for (auto& instance : savedInstances) {
+        instance.second->interrupt(
+            {ErrorCodes::InterruptedAtShutdown, "PrimaryOnlyService interrupted due to shutdown"});
+    }
+
     if (savedScopedExecutor) {
         // Make sure to shut down the scoped executor before the parent executor to avoid
         // SERVER-50612.
@@ -363,6 +375,7 @@ void PrimaryOnlyService::shutdown() {
         // No need to join() here since joining the parent executor below will join with all tasks
         // owned by the scoped executor.
     }
+
     if (savedExecutor) {
         savedExecutor->shutdown();
         savedExecutor->join();
@@ -441,6 +454,10 @@ void PrimaryOnlyService::releaseAllInstances() {
 }
 
 void PrimaryOnlyService::_rebuildInstances() noexcept {
+    if (MONGO_unlikely(PrimaryOnlyServiceSkipRebuildingInstances.shouldFail())) {
+        return;
+    }
+
     std::vector<BSONObj> stateDocuments;
     {
         // The PrimaryOnlyServiceClientObserver will make any OpCtx created as part of a
