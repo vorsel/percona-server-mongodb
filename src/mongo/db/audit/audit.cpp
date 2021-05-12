@@ -638,18 +638,16 @@ namespace audit {
 
     }
 
-    void logAuthentication(Client* client,
-                           StringData mechanism,
-                           const UserName& user,
-                           ErrorCodes::Error result) {
+    void logAuthentication(Client* client, const AuthenticateEvent& authEvent) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("user" << user.getUser() <<
-                                    "db" << user.getDB() <<
-                                    "mechanism" << mechanism);
-        _auditEvent(client, "authenticate", params, result, false);
+        BSONObjBuilder params;
+        params << "user" << authEvent.getUser() << "db" << authEvent.getDatabase() << "mechanism"
+               << authEvent.getMechanism();
+        authEvent.appendExtraInfo(&params);
+        _auditEvent(client, "authenticate", params.done(), authEvent.getResult(), false);
     }
 
     void logCommandAuthzCheck(Client* client,

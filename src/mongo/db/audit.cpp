@@ -31,10 +31,7 @@
 
 #if !PERCONA_AUDIT_ENABLED
 
-void mongo::audit::logAuthentication(Client* client,
-                                     StringData mechanism,
-                                     const UserName& user,
-                                     ErrorCodes::Error result) {}
+void mongo::audit::logAuthentication(Client* client, const AuthenticateEvent& authEvent) {}
 
 void mongo::audit::logCommandAuthzCheck(Client* client,
                                         const OpMsgRequest& cmdObj,

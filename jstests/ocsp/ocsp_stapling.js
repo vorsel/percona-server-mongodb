@@ -1,12 +1,12 @@
-// Check that OCSP verification works
-// @tags: [requires_http_client]
+// Check that OCSP stapling works
+// @tags: [requires_http_client, requires_ocsp_stapling]
 
 load("jstests/ocsp/lib/mock_ocsp.js");
 
 (function() {
 "use strict";
 
-if (determineSSLProvider() !== "openssl") {
+if (!supportsStapling()) {
     return;
 }
 
@@ -85,5 +85,8 @@ function test(serverCert, caCert, responderCertPair) {
 
 test(OCSP_SERVER_CERT, OCSP_CA_PEM, OCSP_DELEGATE_RESPONDER);
 test(OCSP_SERVER_CERT, OCSP_CA_PEM, OCSP_CA_RESPONDER);
-test(OCSP_SERVER_INTERMEDIATE_CA_CERT, OCSP_INTERMEDIATE_CA_PEM, OCSP_INTERMEDIATE_RESPONDER);
+test(OCSP_SERVER_SIGNED_BY_INTERMEDIATE_CA_PEM,
+     OCSP_INTERMEDIATE_CA_WITH_ROOT_PEM,
+     OCSP_INTERMEDIATE_RESPONDER);
+test(OCSP_SERVER_AND_INTERMEDIATE_APPENDED_PEM, OCSP_CA_PEM, OCSP_INTERMEDIATE_RESPONDER);
 }());
