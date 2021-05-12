@@ -37,6 +37,7 @@
 #include "mongo/transport/session.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/thread_safety_context.h"
 
 namespace mongo {
 
@@ -49,6 +50,15 @@ namespace {
 constexpr auto kThreadsRunning = "threadsRunning"_sd;
 constexpr auto kExecutorLabel = "executor"_sd;
 constexpr auto kExecutorName = "fixed"_sd;
+
+const auto getServiceExecutorFixed =
+    ServiceContext::declareDecoration<std::unique_ptr<ServiceExecutorFixed>>();
+
+const auto serviceExecutorFixedRegisterer = ServiceContext::ConstructorActionRegisterer{
+    "ServiceExecutorFixed", [](ServiceContext* ctx) {
+        getServiceExecutorFixed(ctx) =
+            std::make_unique<ServiceExecutorFixed>(ThreadPool::Options{});
+    }};
 }  // namespace
 
 ServiceExecutorFixed::ServiceExecutorFixed(ThreadPool::Options options)
@@ -84,6 +94,12 @@ Status ServiceExecutorFixed::start() {
     LOGV2_DEBUG(
         4910501, 3, "Started fixed thread-pool service executor", "name"_attr = _options.poolName);
     return Status::OK();
+}
+
+ServiceExecutorFixed* ServiceExecutorFixed::get(ServiceContext* ctx) {
+    auto& ref = getServiceExecutorFixed(ctx);
+    invariant(ref);
+    return ref.get();
 }
 
 Status ServiceExecutorFixed::shutdown(Milliseconds timeout) {
@@ -144,7 +160,7 @@ Status ServiceExecutorFixed::scheduleTask(Task task, ScheduleFlags flags) {
     // May throw if an attempt is made to schedule after the thread pool is shutdown.
     try {
         _threadPool->schedule([task = std::move(task)](Status status) mutable {
-            internalAssert(status);
+            iassert(status);
             invariant(_executorContext);
             _executorContext->run(std::move(task));
         });

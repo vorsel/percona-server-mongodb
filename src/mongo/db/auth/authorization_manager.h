@@ -273,7 +273,15 @@ public:
                                        const std::vector<RoleName>& roleName,
                                        PrivilegeFormat privilegeFormat,
                                        AuthenticationRestrictionsFormat,
-                                       BSONObj* result) = 0;
+                                       std::vector<BSONObj>* result) = 0;
+
+    /**
+     * Delegates method call to the underlying AuthzManagerExternalState.
+     */
+    virtual Status getRolesAsUserFragment(OperationContext* opCtx,
+                                          const std::vector<RoleName>& roleName,
+                                          AuthenticationRestrictionsFormat,
+                                          BSONObj* result) = 0;
 
     /**
      * Delegates method call to the underlying AuthzManagerExternalState.
@@ -283,7 +291,7 @@ public:
                                             PrivilegeFormat privilegeFormat,
                                             AuthenticationRestrictionsFormat,
                                             bool showBuiltinRoles,
-                                            BSONArrayBuilder* result) = 0;
+                                            std::vector<BSONObj>* result) = 0;
 
     /**
      * Returns a Status or UserHandle for the given userName. If the user cache already has a
@@ -315,7 +323,7 @@ public:
     /**
      * Initializes the authorization manager.  Depending on what version the authorization
      * system is at, this may involve building up the user cache and/or the roles graph.
-     * Call this function at startup and after resynchronizing a slave/secondary.
+     * Call this function at startup and after resynchronizing a secondary.
      */
     virtual Status initialize(OperationContext* opCtx) = 0;
 

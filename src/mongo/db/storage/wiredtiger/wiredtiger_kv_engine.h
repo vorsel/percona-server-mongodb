@@ -199,7 +199,9 @@ public:
                                                                        const IndexDescriptor* desc,
                                                                        KVPrefix prefix) override;
 
-    Status dropIdent(RecoveryUnit* ru, StringData ident) override;
+    Status dropIdent(RecoveryUnit* ru,
+                     StringData ident,
+                     StorageEngine::DropIdentCallback&& onDrop = nullptr) override;
 
     void dropIdentForImport(OperationContext* opCtx, StringData ident) override;
 
@@ -290,8 +292,6 @@ public:
     boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override;
 
     Timestamp getAllDurableTimestamp() const override;
-
-    Timestamp getOldestOpenReadTimestamp() const override;
 
     bool supportsReadConcernSnapshot() const final override;
 
@@ -395,6 +395,11 @@ public:
 private:
     class WiredTigerSessionSweeper;
 
+    struct IdentToDrop {
+        std::string uri;
+        StorageEngine::DropIdentCallback callback;
+    };
+
     // srcPath, destPath, session, cursor
     typedef std::tuple<boost::filesystem::path, boost::filesystem::path, std::shared_ptr<WiredTigerSession>, WT_CURSOR*> DBTuple;
     // srcPath, destPath, filename, size to copy
@@ -495,7 +500,7 @@ private:
     std::string _indexOptions;
 
     mutable Mutex _identToDropMutex = MONGO_MAKE_LATCH("WiredTigerKVEngine::_identToDropMutex");
-    std::list<std::string> _identToDrop;
+    std::list<IdentToDrop> _identToDrop;
 
     mutable Date_t _previousCheckedDropsQueued;
 

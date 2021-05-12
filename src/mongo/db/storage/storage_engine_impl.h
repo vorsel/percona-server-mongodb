@@ -157,8 +157,6 @@ public:
 
     virtual Timestamp getAllDurableTimestamp() const override;
 
-    virtual Timestamp getOldestOpenReadTimestamp() const override;
-
     boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final;
 
     bool supportsReadConcernSnapshot() const final;
@@ -200,6 +198,9 @@ public:
          *
          * The TimestampListener must be registered in the TimestampMonitor in order to be notified
          * of timestamp changes and react to changes for the duration it's part of the monitor.
+         *
+         * Listeners expected to run in standalone mode should handle Timestamp::min() notifications
+         * appropriately.
          */
         class TimestampListener {
         public:
@@ -261,7 +262,8 @@ public:
         ~TimestampMonitor();
 
         /**
-         * Monitor changes in timestamps and to notify the listeners on change.
+         * Monitor changes in timestamps and to notify the listeners on change. Notifies all
+         * listeners on Timestamp::min() in order to support standalone mode that is untimestamped.
          */
         void startup();
 
@@ -323,7 +325,7 @@ public:
     void addDropPendingIdent(const Timestamp& dropTimestamp,
                              const NamespaceString& nss,
                              std::shared_ptr<Ident> ident,
-                             const DropIdentCallback& onDrop) override;
+                             DropIdentCallback&& onDrop) override;
 
     void checkpoint() override;
 

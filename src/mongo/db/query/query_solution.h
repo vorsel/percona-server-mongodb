@@ -38,6 +38,7 @@
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/query/index_bounds.h"
 #include "mongo/db/query/plan_cache.h"
+#include "mongo/db/query/plan_enumerator_explain_info.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/util/id_generator.h"
 
@@ -234,6 +235,19 @@ struct QuerySolutionNode {
                        [](auto& child) { return child.release(); });
     }
 
+    bool getScanLimit() {
+        if (hitScanLimit) {
+            return hitScanLimit;
+        }
+        for (const auto& child : children) {
+            if (child->getScanLimit()) {
+                hitScanLimit = true;
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * True, if this node, or any of it's children is of the given 'type'.
      */
@@ -258,6 +272,8 @@ struct QuerySolutionNode {
     // If a stage has a non-NULL filter all values outputted from that stage must pass that
     // filter.
     std::unique_ptr<MatchExpression> filter;
+
+    bool hitScanLimit = false;
 
 protected:
     /**
@@ -366,6 +382,8 @@ public:
 
     // Owned here. Used by the plan cache.
     std::unique_ptr<SolutionCacheData> cacheData;
+
+    PlanEnumeratorExplainInfo _enumeratorExplainInfo;
 
 private:
     using QsnIdGenerator = IdGenerator<PlanNodeId>;
@@ -480,6 +498,51 @@ struct CollectionScanNode : public QuerySolutionNodeWithSortSet {
 
     // Once the first matching document is found, assume that all documents after it must match.
     bool stopApplyingFilterAfterFirstMatch = false;
+};
+
+/**
+ * A VirtualScanNode is similar to a collection or an index scan except that it doesn't depend on an
+ * underlying storage implementation. It can be used to represent a virtual
+ * collection or an index scan in memory by using a backing vector of BSONArray.
+ */
+struct VirtualScanNode : public QuerySolutionNodeWithSortSet {
+    VirtualScanNode(std::vector<BSONArray> docs, bool hasRecordId);
+    virtual ~VirtualScanNode() {}
+
+    virtual StageType getType() const {
+        return STAGE_VIRTUAL_SCAN;
+    }
+
+    virtual void appendToString(str::stream* ss, int indent) const;
+
+    bool fetched() const {
+        return true;
+    }
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return FieldAvailability::kFullyProvided;
+    }
+    bool sortedByDiskLoc() const {
+        return false;
+    }
+
+    QuerySolutionNode* clone() const;
+
+    // A representation of a collection's documents. Here we use a BSONArray so metadata like a
+    // RecordId can be stored alongside of the main document payload. The format of the data in
+    // BSONArray is entirely up to a client of this node, but if this node is to be used for
+    // consumption downstream by stage builder implementations it must conform to the format
+    // expected by those stage builders. That expected contract depends on the hasRecordId flag. If
+    // the hasRecordId flag is 'false' the BSONArray will have a single element that is a BSONObj
+    // representation of a document being produced from this node. If 'hasRecordId' is true, then
+    // each BSONArray in docs will carry a RecordId in the zeroth position of the array and a
+    // BSONObj in the first position of the array.
+    std::vector<BSONArray> docs;
+
+    // A flag to indicate the format of the BSONArray document payload in the above vector, docs. If
+    // hasRecordId is set to true, then both a RecordId and a BSONObj document are stored in that
+    // order for every BSONArray in docs. Otherwise, the RecordId is omitted and the BSONArray will
+    // only carry a BSONObj document.
+    bool hasRecordId;
 };
 
 struct AndHashNode : public QuerySolutionNode {
@@ -860,6 +923,11 @@ struct SortNode : public QuerySolutionNodeWithSortSet {
 
     bool addSortKeyMetadata = false;
 
+    // The maximum number of bytes of memory we're willing to use during execution of the sort. If
+    // this limit is exceeded and we're not allowed to spill to disk, the query will fail at
+    // execution time. Otherwise, the data will be spilled to disk.
+    uint64_t maxMemoryUsageBytes = internalQueryMaxBlockingSortMemoryUsageBytes.load();
+
 protected:
     void cloneSortData(SortNode* copy) const;
 
@@ -1166,4 +1234,27 @@ struct EnsureSortedNode : public QuerySolutionNode {
     BSONObj pattern;
 };
 
+struct EofNode : public QuerySolutionNodeWithSortSet {
+    EofNode() {}
+
+    virtual StageType getType() const {
+        return STAGE_EOF;
+    }
+
+    virtual void appendToString(str::stream* ss, int indent) const;
+
+    bool fetched() const {
+        return false;
+    }
+
+    FieldAvailability getFieldAvailability(const std::string& field) const {
+        return FieldAvailability::kNotProvided;
+    }
+
+    bool sortedByDiskLoc() const {
+        return false;
+    }
+
+    QuerySolutionNode* clone() const;
+};
 }  // namespace mongo

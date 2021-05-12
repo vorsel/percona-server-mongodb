@@ -3,7 +3,6 @@
 //   requires_fastcount,
 //   requires_javascript,
 //   requires_non_retryable_commands,
-//   sbe_incompatible,
 // ]
 
 t = db.jstests_js3;
@@ -18,8 +17,8 @@ for (z = 0; z < 2; z++) {
     t.drop();
 
     if (z > 0) {
-        t.ensureIndex({_id: 1});
-        t.ensureIndex({i: 1});
+        t.createIndex({_id: 1});
+        t.createIndex({i: 1});
     }
 
     for (i = 0; i < 1000; i++)
@@ -51,8 +50,8 @@ for (z = 0; z < 2; z++) {
     debug(ok);
     assert(ok);
 
-    t.ensureIndex({z: 1});
-    t.ensureIndex({q: 1});
+    t.createIndex({z: 1});
+    t.createIndex({q: 1});
 
     debug("before indexed find");
 

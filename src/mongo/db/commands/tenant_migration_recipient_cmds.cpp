@@ -54,7 +54,8 @@ public:
         Response typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::CommandNotSupported,
                     "recipientSyncData command not enabled",
-                    repl::enableTenantMigrations);
+                    repl::feature_flags::gTenantMigrations.isEnabled(
+                        serverGlobalParams.featureCompatibility));
 
             const auto& cmd = request();
 
@@ -79,13 +80,13 @@ public:
                 opCtx, recipientService, stateDoc.toBSON());
             uassertStatusOK(recipientInstance->checkIfOptionsConflict(stateDoc));
 
-            auto returnAfterReachingTimestamp = cmd.getReturnAfterReachingTimestamp();
-            if (!returnAfterReachingTimestamp) {
+            auto returnAfterReachingDonorTs = cmd.getReturnAfterReachingDonorTimestamp();
+            if (!returnAfterReachingDonorTs) {
                 return Response(recipientInstance->waitUntilMigrationReachesConsistentState(opCtx));
             }
 
             return Response(recipientInstance->waitUntilTimestampIsMajorityCommitted(
-                opCtx, *returnAfterReachingTimestamp));
+                opCtx, *returnAfterReachingDonorTs));
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const {}
@@ -126,7 +127,8 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::CommandNotSupported,
                     "recipientForgetMigration command not enabled",
-                    repl::enableTenantMigrations);
+                    repl::feature_flags::gTenantMigrations.isEnabled(
+                        serverGlobalParams.featureCompatibility));
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const {}

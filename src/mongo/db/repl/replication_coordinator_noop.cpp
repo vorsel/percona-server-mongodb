@@ -74,7 +74,7 @@ const ReplSettings& ReplicationCoordinatorNoOp::getSettings() const {
     MONGO_UNREACHABLE;
 }
 
-bool ReplicationCoordinatorNoOp::isMasterForReportingPurposes() {
+bool ReplicationCoordinatorNoOp::isWritablePrimaryForReportingPurposes() {
     MONGO_UNREACHABLE;
 }
 
@@ -100,13 +100,13 @@ bool ReplicationCoordinatorNoOp::canAcceptWritesFor(OperationContext* opCtx,
 
 Status ReplicationCoordinatorNoOp::checkCanServeReadsFor_UNSAFE(OperationContext* opCtx,
                                                                 const NamespaceString& ns,
-                                                                bool slaveOk) {
+                                                                bool secondaryOkay) {
     MONGO_UNREACHABLE;
 }
 
 Status ReplicationCoordinatorNoOp::checkCanServeReadsFor(OperationContext* opCtx,
                                                          const NamespaceString& ns,
-                                                         bool slaveOk) {
+                                                         bool secondaryOkay) {
     MONGO_UNREACHABLE;
 }
 
@@ -169,7 +169,7 @@ Status ReplicationCoordinatorNoOp::waitForMemberState(MemberState, Milliseconds)
     MONGO_UNREACHABLE;
 }
 
-Seconds ReplicationCoordinatorNoOp::getSlaveDelaySecs() const {
+Seconds ReplicationCoordinatorNoOp::getSecondaryDelaySecs() const {
     MONGO_UNREACHABLE;
 }
 
@@ -285,7 +285,7 @@ Status ReplicationCoordinatorNoOp::processReplSetGetStatus(BSONObjBuilder*,
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::appendSlaveInfoData(BSONObjBuilder*) {
+void ReplicationCoordinatorNoOp::appendSecondaryInfoData(BSONObjBuilder*) {
     MONGO_UNREACHABLE;
 }
 
@@ -496,7 +496,7 @@ void ReplicationCoordinatorNoOp::incrementTopologyVersion() {
     MONGO_UNREACHABLE;
 }
 
-std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorNoOp::awaitIsMasterResponse(
+std::shared_ptr<const HelloResponse> ReplicationCoordinatorNoOp::awaitHelloResponse(
     OperationContext* opCtx,
     const SplitHorizon::Parameters& horizonParams,
     boost::optional<TopologyVersion> clientTopologyVersion,
@@ -505,8 +505,8 @@ std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorNoOp::awaitIsMaste
 }
 
 
-SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>
-ReplicationCoordinatorNoOp::getIsMasterResponseFuture(
+SharedSemiFuture<std::shared_ptr<const HelloResponse>>
+ReplicationCoordinatorNoOp::getHelloResponseFuture(
     const SplitHorizon::Parameters& horizonParams,
     boost::optional<TopologyVersion> clientTopologyVersion) {
     MONGO_UNREACHABLE;
@@ -535,7 +535,7 @@ BSONObj ReplicationCoordinatorNoOp::runCmdOnPrimaryAndAwaitResponse(
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::restartHeartbeats_forTest() {
+void ReplicationCoordinatorNoOp::restartScheduledHeartbeats_forTest() {
     MONGO_UNREACHABLE;
 }
 

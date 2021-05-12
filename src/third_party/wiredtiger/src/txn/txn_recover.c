@@ -841,11 +841,19 @@ __wt_txn_recover(WT_SESSION_IMPL *session, const char *cfg[])
         WT_ERR(ret);
     }
 
-    /* Check whether the history store exists. */
-    WT_ERR(__hs_exists(session, metac, cfg, &hs_exists));
-
     /* Scan the metadata to find the live files and their IDs. */
     WT_ERR(__recovery_file_scan(&r));
+
+    /*
+     * Check whether the history store exists.
+     *
+     * This will open a dhandle on the history store and initialize its write gen so we must ensure
+     * that the connection-wide base write generation is stable at this point. Performing a recovery
+     * file scan will involve updating the connection-wide base write generation so we MUST do this
+     * before checking for the existence of a history store file.
+     */
+    WT_ERR(__hs_exists(session, metac, cfg, &hs_exists));
+
     /*
      * Clear this out. We no longer need it and it could have been re-allocated when scanning the
      * files.
@@ -923,13 +931,9 @@ done:
      * Perform rollback to stable only when the following conditions met.
      * 1. The connection is not read-only. A read-only connection expects that there shouldn't be
      *    any changes that need to be done on the database other than reading.
-     * 2. A valid recovery timestamp. The recovery timestamp is the stable timestamp retrieved
-     *    from the metadata checkpoint information to indicate the stable timestamp when the
-     *    checkpoint happened. Anything updates newer than this timestamp must rollback.
-     * 3. The history store file was found in the metadata.
+     * 2. The history store file was found in the metadata.
      */
-    if (hs_exists && !F_ISSET(conn, WT_CONN_READONLY) &&
-      conn->txn_global.recovery_timestamp != WT_TS_NONE) {
+    if (hs_exists && !F_ISSET(conn, WT_CONN_READONLY)) {
         /* Start the eviction threads for rollback to stable if not already started. */
         if (!eviction_started) {
             WT_ERR(__wt_evict_create(session));
@@ -956,7 +960,10 @@ done:
          * stable.
          */
         conn->txn_global.stable_timestamp = conn->txn_global.recovery_timestamp;
-        conn->txn_global.has_stable_timestamp = true;
+        conn->txn_global.has_stable_timestamp = false;
+
+        if (conn->txn_global.recovery_timestamp != WT_TS_NONE)
+            conn->txn_global.has_stable_timestamp = true;
 
         __wt_verbose(session, WT_VERB_RTS,
           "Performing recovery rollback_to_stable with stable timestamp: %s and oldest timestamp: "

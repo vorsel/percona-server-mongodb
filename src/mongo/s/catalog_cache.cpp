@@ -44,7 +44,7 @@
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/client/shard_registry.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/is_mongos.h"
 #include "mongo/s/mongod_and_mongos_server_parameters_gen.h"
@@ -105,9 +105,7 @@ StatusWith<CachedDatabaseInfo> CatalogCache::getDatabase(OperationContext* opCtx
     }
 
     try {
-        // TODO SERVER-49724: Make ReadThroughCache support StringData keys
-        auto dbEntry =
-            _databaseCache.acquire(opCtx, dbName.toString(), CacheCausalConsistency::kLatestKnown);
+        auto dbEntry = _databaseCache.acquire(opCtx, dbName, CacheCausalConsistency::kLatestKnown);
         uassert(ErrorCodes::NamespaceNotFound,
                 str::stream() << "database " << dbName << " not found",
                 dbEntry);
@@ -220,8 +218,7 @@ StatusWith<ChunkManager> CatalogCache::getCollectionRoutingInfoAt(OperationConte
 
 StatusWith<CachedDatabaseInfo> CatalogCache::getDatabaseWithRefresh(OperationContext* opCtx,
                                                                     StringData dbName) {
-    // TODO SERVER-49724: Make ReadThroughCache support StringData keys
-    _databaseCache.invalidate(dbName.toString());
+    _databaseCache.invalidate(dbName);
     return getDatabase(opCtx, dbName);
 }
 
@@ -252,9 +249,9 @@ void CatalogCache::onStaleDatabaseVersion(const StringData dbName,
                                   "Registering new database version",
                                   "db"_attr = dbName,
                                   "version"_attr = version.toBSONForLogging());
-        _databaseCache.advanceTimeInStore(dbName.toString(), version);
+        _databaseCache.advanceTimeInStore(dbName, version);
     } else {
-        _databaseCache.invalidate(dbName.toString());
+        _databaseCache.invalidate(dbName);
     }
 }
 
@@ -295,7 +292,7 @@ void CatalogCache::checkEpochOrThrow(const NamespaceString& nss,
     uassert(StaleConfigInfo(nss, targetCollectionVersion, boost::none, shardId),
             str::stream() << "could not act as router for " << nss.ns()
                           << ", no entry for database " << nss.db(),
-            _databaseCache.peekLatestCached(nss.db().toString()));
+            _databaseCache.peekLatestCached(nss.db()));
 
     auto collectionValueHandle = _collectionCache.peekLatestCached(nss);
     uassert(StaleConfigInfo(nss, targetCollectionVersion, boost::none, shardId),
@@ -352,7 +349,7 @@ void CatalogCache::invalidateEntriesThatReferenceShard(const ShardId& shardId) {
 }
 
 void CatalogCache::purgeDatabase(StringData dbName) {
-    _databaseCache.invalidate(dbName.toString());
+    _databaseCache.invalidate(dbName);
     _collectionCache.invalidateKeyIf(
         [&](const NamespaceString& nss) { return nss.db() == dbName; });
 }
@@ -566,6 +563,7 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
             if (isIncremental &&
                 existingHistory->optRt->getVersion().epoch() == collectionAndChunks.epoch) {
                 return existingHistory->optRt->makeUpdated(collectionAndChunks.reshardingFields,
+                                                           collectionAndChunks.allowMigrations,
                                                            collectionAndChunks.changedChunks);
             }
 
@@ -586,6 +584,7 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
                                                 collectionAndChunks.shardKeyIsUnique,
                                                 collectionAndChunks.epoch,
                                                 std::move(collectionAndChunks.reshardingFields),
+                                                collectionAndChunks.allowMigrations,
                                                 collectionAndChunks.changedChunks);
         }();
 
@@ -637,47 +636,6 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
                                   "error"_attr = redact(ex));
 
         throw;
-    }
-}
-
-AtomicWord<uint64_t> ComparableDatabaseVersion::_uuidDisambiguatingSequenceNumSource{1ULL};
-
-ComparableDatabaseVersion ComparableDatabaseVersion::makeComparableDatabaseVersion(
-    const DatabaseVersion& version) {
-    return ComparableDatabaseVersion(version, _uuidDisambiguatingSequenceNumSource.fetchAndAdd(1));
-}
-
-BSONObj ComparableDatabaseVersion::toBSONForLogging() const {
-    BSONObjBuilder builder;
-    if (_dbVersion)
-        builder.append("dbVersion"_sd, _dbVersion->toBSON());
-    else
-        builder.append("dbVersion"_sd, "None");
-
-    builder.append("uuidDisambiguatingSequenceNum"_sd,
-                   static_cast<int64_t>(_uuidDisambiguatingSequenceNum));
-
-    return builder.obj();
-}
-
-
-bool ComparableDatabaseVersion::operator==(const ComparableDatabaseVersion& other) const {
-    if (!_dbVersion && !other._dbVersion)
-        return true;  // Default constructed value
-    if (_dbVersion.is_initialized() != other._dbVersion.is_initialized())
-        return false;  // One side is default constructed value
-
-    return sameUuid(other) && (_dbVersion->getLastMod() == other._dbVersion->getLastMod());
-}
-
-bool ComparableDatabaseVersion::operator<(const ComparableDatabaseVersion& other) const {
-    if (!_dbVersion && !other._dbVersion)
-        return false;  // Default constructed value
-
-    if (_dbVersion && other._dbVersion && sameUuid(other)) {
-        return _dbVersion->getLastMod() < other._dbVersion->getLastMod();
-    } else {
-        return _uuidDisambiguatingSequenceNum < other._uuidDisambiguatingSequenceNum;
     }
 }
 

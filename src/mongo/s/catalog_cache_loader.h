@@ -43,9 +43,6 @@
 
 namespace mongo {
 
-class NamespaceString;
-class OperationContext;
-
 /**
  * Interface through which the sharding catalog cache requests the set of changed chunks to be
  * retrieved from the persisted metadata store.
@@ -69,24 +66,30 @@ public:
     struct CollectionAndChangedChunks {
         CollectionAndChangedChunks();
         CollectionAndChangedChunks(
-            boost::optional<UUID> uuid,
-            const OID& collEpoch,
+            OID collEpoch,
+            boost::optional<Timestamp> collCreationTime,
+            UUID uuid,
             const BSONObj& collShardKeyPattern,
             const BSONObj& collDefaultCollation,
             bool collShardKeyIsUnique,
             boost::optional<TypeCollectionReshardingFields> collReshardingFields,
+            bool allowMigrations,
             std::vector<ChunkType> chunks);
 
         // Information about the entire collection
-        boost::optional<UUID> uuid;
         OID epoch;
+        boost::optional<Timestamp> creationTime;
+        boost::optional<UUID> uuid;  // This value can never be boost::none,
+                                     // except under the default constructor
         BSONObj shardKeyPattern;
         BSONObj defaultCollation;
-        bool shardKeyIsUnique{false};
+        bool shardKeyIsUnique;
 
         // If the collection is currently undergoing a resharding operation, the optional will be
         // populated.
         boost::optional<TypeCollectionReshardingFields> reshardingFields;
+
+        bool allowMigrations;
 
         // The chunks which have changed sorted by their chunkVersion. This list might potentially
         // contain all the chunks in the collection.

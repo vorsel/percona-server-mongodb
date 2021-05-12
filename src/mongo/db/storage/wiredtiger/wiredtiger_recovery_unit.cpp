@@ -496,18 +496,18 @@ void WiredTigerRecoveryUnit::_txnClose(bool commit) {
     _mustBeTimestamped = false;
 }
 
-Status WiredTigerRecoveryUnit::obtainMajorityCommittedSnapshot() {
+Status WiredTigerRecoveryUnit::majorityCommittedSnapshotAvailable() const {
     invariant(_timestampReadSource == ReadSource::kMajorityCommitted);
     auto snapshotName = _sessionCache->snapshotManager().getMinSnapshotForNextCommittedRead();
     if (!snapshotName) {
         return {ErrorCodes::ReadConcernMajorityNotAvailableYet,
                 "Read concern majority reads are currently not possible."};
     }
-    _majorityCommittedSnapshot = *snapshotName;
     return Status::OK();
 }
 
-boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp() {
+boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp(
+    OperationContext* opCtx) {
     // After a ReadSource has been set on this RecoveryUnit, callers expect that this method returns
     // the read timestamp that will be used for current or future transactions. Because callers use
     // this timestamp to inform visibility of operations, it is therefore necessary to open a
@@ -516,11 +516,6 @@ boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp()
     switch (_timestampReadSource) {
         case ReadSource::kNoTimestamp:
             return boost::none;
-        case ReadSource::kMajorityCommitted:
-            // This ReadSource depends on a previous call to obtainMajorityCommittedSnapshot() and
-            // does not require an open transaction to return a valid timestamp.
-            invariant(!_majorityCommittedSnapshot.isNull());
-            return _majorityCommittedSnapshot;
         case ReadSource::kProvided:
             // The read timestamp is set by the user and does not require a transaction to be open.
             invariant(!_readAtTimestamp.isNull());
@@ -531,10 +526,12 @@ boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp()
         case ReadSource::kNoOverlap:
         case ReadSource::kLastApplied:
         case ReadSource::kAllDurableSnapshot:
+        case ReadSource::kMajorityCommitted:
             break;
     }
 
-    // Ensure a transaction is opened.
+    // Ensure a transaction is opened. Storage engine operations require the global lock.
+    invariant(opCtx->lockState()->isNoop() || opCtx->lockState()->isLocked());
     getSession();
 
     switch (_timestampReadSource) {
@@ -548,12 +545,12 @@ boost::optional<Timestamp> WiredTigerRecoveryUnit::getPointInTimeReadTimestamp()
             }
             return boost::none;
         case ReadSource::kAllDurableSnapshot:
+        case ReadSource::kMajorityCommitted:
             invariant(!_readAtTimestamp.isNull());
             return _readAtTimestamp;
 
         // The follow ReadSources returned values in the first switch block.
         case ReadSource::kNoTimestamp:
-        case ReadSource::kMajorityCommitted:
         case ReadSource::kProvided:
             MONGO_UNREACHABLE;
     }
@@ -583,11 +580,8 @@ void WiredTigerRecoveryUnit::_txnOpen() {
             break;
         }
         case ReadSource::kMajorityCommitted: {
-            // We reset _majorityCommittedSnapshot to the actual read timestamp used when the
-            // transaction was started.
-            _majorityCommittedSnapshot =
-                _sessionCache->snapshotManager().beginTransactionOnCommittedSnapshot(
-                    session, _prepareConflictBehavior, _roundUpPreparedTimestamps);
+            _readAtTimestamp = _sessionCache->snapshotManager().beginTransactionOnCommittedSnapshot(
+                session, _prepareConflictBehavior, _roundUpPreparedTimestamps);
             break;
         }
         case ReadSource::kLastApplied: {

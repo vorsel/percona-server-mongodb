@@ -47,9 +47,9 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/shard_metadata_util.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/s/type_shard_collection.h"
+#include "mongo/db/s/type_shard_database.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/catalog/type_shard_collection.h"
-#include "mongo/s/catalog/type_shard_database.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/fail_point.h"
@@ -94,17 +94,15 @@ Status persistCollectionAndChangedChunks(OperationContext* opCtx,
                                          const CollectionAndChangedChunks& collAndChunks,
                                          const ChunkVersion& maxLoaderVersion) {
     // Update the collections collection entry for 'nss' in case there are any new updates.
-    ShardCollectionType update = ShardCollectionType(
-        nss, collAndChunks.epoch, collAndChunks.shardKeyPattern, collAndChunks.shardKeyIsUnique);
-
-    update.setUuid(collAndChunks.uuid);
-    if (!collAndChunks.defaultCollation.isEmpty()) {
-        update.setDefaultCollation(collAndChunks.defaultCollation.getOwned());
-    }
-
-    if (collAndChunks.reshardingFields) {
-        update.setReshardingFields(collAndChunks.reshardingFields.get());
-    }
+    ShardCollectionType update(nss,
+                               collAndChunks.epoch,
+                               collAndChunks.creationTime,
+                               *collAndChunks.uuid,
+                               collAndChunks.shardKeyPattern,
+                               collAndChunks.shardKeyIsUnique);
+    update.setDefaultCollation(collAndChunks.defaultCollation);
+    update.setReshardingFields(collAndChunks.reshardingFields);
+    update.setAllowMigrations(collAndChunks.allowMigrations);
 
     // Mark the chunk metadata as refreshing, so that secondaries are aware of refresh.
     update.setRefreshing(true);
@@ -233,12 +231,14 @@ CollectionAndChangedChunks getPersistedMetadataSinceVersion(OperationContext* op
     auto changedChunks = uassertStatusOK(
         readShardChunks(opCtx, nss, diff.query, diff.sort, boost::none, startingVersion.epoch()));
 
-    return CollectionAndChangedChunks{shardCollectionEntry.getUuid(),
-                                      shardCollectionEntry.getEpoch(),
+    return CollectionAndChangedChunks{shardCollectionEntry.getEpoch(),
+                                      shardCollectionEntry.getTimestamp(),
+                                      shardCollectionEntry.getUuid(),
                                       shardCollectionEntry.getKeyPattern().toBSON(),
                                       shardCollectionEntry.getDefaultCollation(),
                                       shardCollectionEntry.getUnique(),
                                       shardCollectionEntry.getReshardingFields(),
+                                      shardCollectionEntry.getAllowMigrations(),
                                       std::move(changedChunks)};
 }
 

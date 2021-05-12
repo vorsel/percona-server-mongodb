@@ -32,7 +32,6 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/client.h"
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/field_parser.h"
@@ -41,6 +40,7 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo {
@@ -304,7 +304,7 @@ public:
         if (wcResult.wTimedOut) {
             dassert(!wcResult.err.empty());  // so we always report err
             dassert(!status.isOK());
-            result.append("errmsg", "timed out waiting for slaves");
+            result.append("errmsg", "timed out waiting for secondaries");
             result.append("code", status.code());
             result.append("codeName", ErrorCodes::errorString(status.code()));
             return true;

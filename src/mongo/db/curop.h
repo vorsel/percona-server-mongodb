@@ -167,7 +167,7 @@ public:
 
     void report(OperationContext* opCtx,
                 const SingleThreadedLockStats* lockStats,
-                const ResourceConsumption::Metrics* operationMetrics,
+                const ResourceConsumption::OperationMetrics* operationMetrics,
                 logv2::DynamicAttributes* pAttrs) const;
 
     /**
@@ -445,7 +445,7 @@ public:
         if (_dbprofile <= 0)
             return false;
 
-        if (CollectionCatalog::get(opCtx).getDatabaseProfileSettings(getNSS().db()).filter)
+        if (CollectionCatalog::get(opCtx)->getDatabaseProfileSettings(getNSS().db()).filter)
             return true;
 
         return elapsedTimeExcludingPauses() >= Milliseconds{serverGlobalParams.slowMS};
@@ -758,6 +758,11 @@ private:
     TickSource::Tick startTime();
     Microseconds computeElapsedTimeTotal(TickSource::Tick startTime,
                                          TickSource::Tick endTime) const;
+
+    /**
+     * Adds 'this' to the stack of active CurOp objects.
+     */
+    void _finishInit(OperationContext* opCtx, CurOpStack* stack);
 
     static const OperationContext::Decoration<CurOpStack> _curopStack;
 

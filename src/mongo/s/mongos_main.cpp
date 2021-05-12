@@ -163,7 +163,7 @@ Status waitForSigningKeys(OperationContext* opCtx) {
 
         auto configCS = shardRegistry->getConfigServerConnectionString();
         auto rsm = ReplicaSetMonitor::get(configCS.getSetName());
-        // mongod will set minWireVersion == maxWireVersion for isMaster requests from
+        // mongod will set minWireVersion == maxWireVersion for hello requests from
         // internalClient.
         if (rsm && (rsm->getMaxWireVersion() < WireVersion::SUPPORTS_OP_MSG)) {
             LOGV2(22841, "Waiting for signing keys not supported by config shard");
@@ -288,7 +288,7 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
         }
 
         // Enter quiesce mode so that existing and new short operations are allowed to finish.
-        // At this point, we will start responding to any isMaster request with ShutdownInProgress
+        // At this point, we will start responding to any hello request with ShutdownInProgress
         // so that clients can re-route their operations.
         //
         // TODO SERVER-49138: Remove this FCV check when 5.0 becomes last-lts.
@@ -361,11 +361,6 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
             CatalogCacheLoader::get(serviceContext).shutDown();
         }
 
-#if __has_feature(address_sanitizer)
-        // When running under address sanitizer, we get false positive leaks due to disorder around
-        // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
-        // harder to dry up the server from active connections before going on to really shut down.
-
         // Shutdown the Service Entry Point and its sessions and give it a grace period to complete.
         if (auto sep = serviceContext->getServiceEntryPoint()) {
             if (!sep->shutdown(Seconds(10))) {
@@ -374,18 +369,6 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
                               "Service entry point did not shutdown within the time limit");
             }
         }
-
-        // Shutdown and wait for the service executor to exit
-        if (auto svcExec = serviceContext->getServiceExecutor()) {
-            Status status = svcExec->shutdown(Seconds(5));
-            if (!status.isOK()) {
-                LOGV2_OPTIONS(22845,
-                              {LogComponent::kNetwork},
-                              "Service executor did not shutdown within the time limit",
-                              "error"_attr = status);
-            }
-        }
-#endif
 
         // Shutdown Full-Time Data Capture
         stopMongoSFTDC();
@@ -419,8 +402,8 @@ Status initializeSharding(OperationContext* opCtx) {
     };
 
     ShardFactory::BuildersMap buildersMap{
-        {ConnectionString::SET, std::move(setBuilder)},
-        {ConnectionString::MASTER, std::move(masterBuilder)},
+        {ConnectionString::ConnectionType::kReplicaSet, std::move(setBuilder)},
+        {ConnectionString::ConnectionType::kStandalone, std::move(masterBuilder)},
     };
 
     auto shardFactory =
@@ -442,7 +425,7 @@ Status initializeSharding(OperationContext* opCtx) {
             catCache->invalidateEntriesThatReferenceShard(removedShard);
         }};
 
-    if (mongosGlobalParams.configdbs.type() == ConnectionString::INVALID) {
+    if (!mongosGlobalParams.configdbs) {
         return {ErrorCodes::BadValue, "Unrecognized connection string."};
     }
 
@@ -737,33 +720,33 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     auto opCtxHolder = tc->makeOperationContext();
     auto const opCtx = opCtxHolder.get();
 
-    {
-        Status status = initializeSharding(opCtx);
-        if (!status.isOK()) {
-            if (status == ErrorCodes::CallbackCanceled) {
-                invariant(globalInShutdownDeprecated());
-                LOGV2(22850, "Shutdown called before mongos finished starting up");
-                return EXIT_CLEAN;
-            }
-            LOGV2_ERROR(22857,
-                        "Error initializing sharding system: {error}",
-                        "Error initializing sharding system",
-                        "error"_attr = status);
-            return EXIT_SHARDING_ERROR;
+    try {
+        uassertStatusOK(initializeSharding(opCtx));
+    } catch (const DBException& ex) {
+        if (ex.code() == ErrorCodes::CallbackCanceled) {
+            invariant(globalInShutdownDeprecated());
+            LOGV2(22850, "Shutdown called before mongos finished starting up");
+            return EXIT_CLEAN;
         }
 
-        Grid::get(serviceContext)
-            ->getBalancerConfiguration()
-            ->refreshAndCheck(opCtx)
-            .transitional_ignore();
+        LOGV2_ERROR(22857,
+                    "Error initializing sharding system: {error}",
+                    "Error initializing sharding system",
+                    "error"_attr = redact(ex));
+        return EXIT_SHARDING_ERROR;
+    }
 
-        try {
-            ReadWriteConcernDefaults::get(serviceContext).refreshIfNecessary(opCtx);
-        } catch (const DBException& ex) {
-            LOGV2_WARNING(22855,
-                          "Error loading read and write concern defaults at startup",
-                          "error"_attr = redact(ex));
-        }
+    Grid::get(serviceContext)
+        ->getBalancerConfiguration()
+        ->refreshAndCheck(opCtx)
+        .transitional_ignore();
+
+    try {
+        ReadWriteConcernDefaults::get(serviceContext).refreshIfNecessary(opCtx);
+    } catch (const DBException& ex) {
+        LOGV2_WARNING(22855,
+                      "Error loading read and write concern defaults at startup",
+                      "error"_attr = redact(ex));
     }
 
     startMongoSFTDC();
@@ -811,15 +794,6 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
         std::make_unique<LogicalSessionCacheImpl>(std::make_unique<ServiceLiaisonMongos>(),
                                                   std::make_unique<SessionsCollectionSharded>(),
                                                   RouterSessionCatalog::reapSessionsOlderThan));
-
-    status = serviceContext->getServiceExecutor()->start();
-    if (!status.isOK()) {
-        LOGV2_ERROR(22859,
-                    "Error starting service executor: {error}",
-                    "Error starting service executor",
-                    "error"_attr = redact(status));
-        return EXIT_NET_ERROR;
-    }
 
     status = serviceContext->getServiceEntryPoint()->start();
     if (!status.isOK()) {

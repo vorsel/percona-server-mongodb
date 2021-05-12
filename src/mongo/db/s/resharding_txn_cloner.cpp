@@ -43,9 +43,11 @@
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/persistent_task_store.h"
 #include "mongo/db/pipeline/document_source_match.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
+#include "mongo/db/s/resharding/resharding_txn_cloner_progress_gen.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/session_txn_record_gen.h"
 #include "mongo/db/transaction_participant.h"
@@ -65,14 +67,9 @@ std::unique_ptr<Pipeline, PipelineDeleter> createConfigTxnCloningPipelineForResh
 
     std::list<boost::intrusive_ptr<DocumentSource>> stages;
     if (startAfter) {
-        stages.emplace_back(DocumentSourceMatch::create(BSON(SessionTxnRecord::kSessionIdFieldName
-                                                             << BSON("$gt" << startAfter->toBSON())
-                                                             << SessionTxnRecord::kStateFieldName
-                                                             << BSON("$exists" << false)),
-                                                        expCtx));
-    } else {
         stages.emplace_back(DocumentSourceMatch::create(
-            BSON(SessionTxnRecord::kStateFieldName << BSON("$exists" << false)), expCtx));
+            BSON(SessionTxnRecord::kSessionIdFieldName << BSON("$gt" << startAfter->toBSON())),
+            expCtx));
     }
     stages.emplace_back(
         DocumentSourceSort::create(expCtx, BSON(SessionTxnRecord::kSessionIdFieldName << 1)));
@@ -87,7 +84,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> createConfigTxnCloningPipelineForResh
 
 std::unique_ptr<Fetcher> cloneConfigTxnsForResharding(
     OperationContext* opCtx,
-    const ShardId& shardId,
+    const ReshardingSourceId& sourceId,
     Timestamp fetchTimestamp,
     boost::optional<LogicalSessionId> startAfter,
     std::function<void(OperationContext*, BSONObj)> merge,
@@ -101,19 +98,20 @@ std::unique_ptr<Fetcher> cloneConfigTxnsForResharding(
                                pipeline->serializeToBson());
 
     request.setReadConcern(BSON(repl::ReadConcernArgs::kLevelFieldName
-                                << repl::ReadConcernLevel::kMajorityReadConcern
+                                << repl::readConcernLevels::kMajorityName
                                 << repl::ReadConcernArgs::kAfterClusterTimeFieldName
                                 << fetchTimestamp));
-    request.setHint(BSON("_id_" << 1));
+    request.setHint(BSON("_id" << 1));
 
-    auto shard = uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
+    auto shard =
+        uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, sourceId.getShardId()));
     const auto targetHost = uassertStatusOK(
         shard->getTargeter()->findHost(opCtx, ReadPreferenceSetting{ReadPreference::Nearest}));
     auto serviceContext = opCtx->getServiceContext();
     auto fetcherCallback =
-        [merge, status, serviceContext](const Fetcher::QueryResponseStatus& dataStatus,
-                                        Fetcher::NextAction* nextAction,
-                                        BSONObjBuilder* getMoreBob) {
+        [merge, status, serviceContext, sourceId](const Fetcher::QueryResponseStatus& dataStatus,
+                                                  Fetcher::NextAction* nextAction,
+                                                  BSONObjBuilder* getMoreBob) {
             if (!dataStatus.isOK()) {
                 *status = dataStatus.getStatus();
                 return;
@@ -130,6 +128,23 @@ std::unique_ptr<Fetcher> cloneConfigTxnsForResharding(
                     *status = ex.toStatus();
                     return;
                 }
+            }
+
+            if (data.documents.size()) {
+                auto lastTxnRecord = SessionTxnRecord::parse(
+                    IDLParserErrorContext("ReshardingTxnClonerProgress"), data.documents.back());
+
+                // TODO SERVER-52921: Ensure fetcherOpCtx is interrupted on stepdown so the progress
+                // document write cannot happen in a different term than the config.transactions
+                // writes above.
+                PersistentTaskStore<ReshardingTxnClonerProgress> store(
+                    NamespaceString::kReshardingTxnClonerProgressNamespace);
+                store.upsert(
+                    fetcherOpCtx,
+                    QUERY(ReshardingTxnClonerProgress::kSourceIdFieldName << sourceId.toBSON()),
+                    BSON("$set" << BSON(ReshardingTxnClonerProgress::kProgressFieldName
+                                        << lastTxnRecord.getSessionId().toBSON())),
+                    WriteConcernOptions());
             }
 
             if (!getMoreBob) {
@@ -164,8 +179,8 @@ void configTxnsMergerForResharding(OperationContext* opCtx, BSONObj donorBsonTra
         auto ocs = std::make_unique<MongoDOperationContextSession>(opCtx);
 
         auto txnParticipant = TransactionParticipant::get(opCtx);
-        // Which error code should this be? what message?
         uassert(4989900, "Failed to get transaction Participant", txnParticipant);
+
         try {
             txnParticipant.beginOrContinue(
                 opCtx, donorTransaction.getTxnNum(), boost::none, boost::none);
@@ -189,7 +204,7 @@ void configTxnsMergerForResharding(OperationContext* opCtx, BSONObj donorBsonTra
 
         repl::MutableOplogEntry oplogEntry;
         oplogEntry.setObject(BSON("$sessionMigrateInfo" << 1));
-        oplogEntry.setObject2(BSON("$incompleteOplogHistory" << 1));
+        oplogEntry.setObject2(TransactionParticipant::kDeadEndSentinel);
         oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
         oplogEntry.setSessionId(donorTransaction.getSessionId());
         oplogEntry.setTxnNumber(donorTransaction.getTxnNum());

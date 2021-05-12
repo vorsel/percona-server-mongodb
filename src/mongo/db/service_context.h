@@ -405,9 +405,10 @@ public:
     //
 
     /**
-     * Signal all OperationContext(s) that they have been killed.
+     * Signal all OperationContext(s) that they have been killed except the ones belonging to the
+     * excluded clients.
      */
-    void setKillAllOperations();
+    void setKillAllOperations(const std::set<std::string>& excludedClients = {});
 
     /**
      * Reset the operation kill state after a killAllOperations.
@@ -487,14 +488,6 @@ public:
      * See ServiceEntryPoint for more details.
      */
     ServiceEntryPoint* getServiceEntryPoint() const;
-
-    /**
-     * Get the service executor for the service context.
-     *
-     * See ServiceStateMachine for how this is used. Some configurations may not have a service
-     * executor registered and this will return a nullptr.
-     */
-    transport::ServiceExecutor* getServiceExecutor() const;
 
     /**
      * Waits for the ServiceContext to be fully initialized and for all TransportLayers to have been
@@ -579,11 +572,6 @@ public:
      * This should be a TransportLayerManager created with the global server configuration.
      */
     void setTransportLayer(std::unique_ptr<transport::TransportLayer> tl);
-
-    /**
-     * Binds the service executor to the service context
-     */
-    void setServiceExecutor(std::unique_ptr<transport::ServiceExecutor> exec);
 
     /**
      * Creates a delayed execution baton with basic functionality

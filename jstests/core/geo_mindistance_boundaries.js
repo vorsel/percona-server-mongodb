@@ -8,8 +8,8 @@ var t = db.geo_mindistance_boundaries;
 t.drop();
 t.insert({loc: [1, 0]});  // 1 degree of longitude from origin.
 
-/* $minDistance is supported for 2dsphere index only, not 2d or geoHaystack. */
-t.ensureIndex({loc: "2dsphere"});
+/* $minDistance is supported for 2dsphere index only, not 2d */
+t.createIndex({loc: "2dsphere"});
 
 //
 // Useful constants.

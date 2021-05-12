@@ -49,6 +49,7 @@
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -66,7 +67,7 @@ namespace {
 UUID getCollectionUuid(OperationContext* opCtx, const NamespaceString& nss) {
     dassert(opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IS));
 
-    auto uuid = CollectionCatalog::get(opCtx).lookupUUIDByNSS(opCtx, nss);
+    auto uuid = CollectionCatalog::get(opCtx)->lookupUUIDByNSS(opCtx, nss);
     invariant(uuid);
 
     return *uuid;
@@ -83,30 +84,6 @@ bool documentBelongsToMe(OperationContext* opCtx,
 
     return ownershipFilter.keyBelongsToMe(currentKeyPattern.extractShardKeyFromDoc(doc));
 }
-
-boost::optional<TypeCollectionDonorFields> getDonorFields(OperationContext* opCtx,
-                                                          const NamespaceString& sourceNss,
-                                                          const BSONObj& fullDocument) {
-    auto css = CollectionShardingState::get(opCtx, sourceNss);
-    auto collDesc = css->getCollectionDescription(opCtx);
-
-    if (!collDesc.isSharded())
-        return boost::none;
-
-    const auto& reshardingFields = collDesc.getReshardingFields();
-    if (!reshardingFields)
-        return boost::none;
-
-    const auto& donorFields = reshardingFields->getDonorFields();
-    if (!donorFields)
-        return boost::none;
-
-    if (!documentBelongsToMe(opCtx, css, fullDocument))
-        return boost::none;
-
-    return donorFields;
-}
-
 }  // namespace
 
 DonorShardEntry makeDonorShard(ShardId shardId,
@@ -149,54 +126,6 @@ NamespaceString constructTemporaryReshardingNss(StringData db, const UUID& sourc
                            fmt::format("{}{}",
                                        NamespaceString::kTemporaryReshardingCollectionPrefix,
                                        sourceUuid.toString()));
-}
-
-BatchedCommandRequest buildInsertOp(const NamespaceString& nss, std::vector<BSONObj> docs) {
-    BatchedCommandRequest request([&] {
-        write_ops::Insert insertOp(nss);
-        insertOp.setDocuments(docs);
-        return insertOp;
-    }());
-
-    return request;
-}
-
-BatchedCommandRequest buildUpdateOp(const NamespaceString& nss,
-                                    const BSONObj& query,
-                                    const BSONObj& update,
-                                    bool upsert,
-                                    bool multi) {
-    BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setUpdates({[&] {
-            write_ops::UpdateOpEntry entry;
-            entry.setQ(query);
-            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
-            entry.setUpsert(upsert);
-            entry.setMulti(multi);
-            return entry;
-        }()});
-        return updateOp;
-    }());
-
-    return request;
-}
-
-BatchedCommandRequest buildDeleteOp(const NamespaceString& nss,
-                                    const BSONObj& query,
-                                    bool multiDelete) {
-    BatchedCommandRequest request([&] {
-        write_ops::Delete deleteOp(nss);
-        deleteOp.setDeletes({[&] {
-            write_ops::DeleteOpEntry entry;
-            entry.setQ(query);
-            entry.setMulti(multiDelete);
-            return entry;
-        }()});
-        return deleteOp;
-    }());
-
-    return request;
 }
 
 void tellShardsToRefresh(OperationContext* opCtx,
@@ -387,7 +316,7 @@ void createSlimOplogView(OperationContext* opCtx, Database* db) {
             {
                 // Create 'system.views' in a separate WUOW if it does not exist.
                 WriteUnitOfWork wuow(opCtx);
-                CollectionPtr coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+                CollectionPtr coll = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
                     opCtx, NamespaceString(db->getSystemViewsName()));
                 if (!coll) {
                     coll = db->createCollection(opCtx, NamespaceString(db->getSystemViewsName()));
@@ -609,97 +538,17 @@ std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForReshard
     return Pipeline::create(std::move(stages), expCtx);
 }
 
-std::unique_ptr<Pipeline, PipelineDeleter> createAggForCollectionCloning(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const ShardKeyPattern& newShardKeyPattern,
-    const NamespaceString& tempNss,
-    const ShardId& recipientShard) {
-    std::list<boost::intrusive_ptr<DocumentSource>> stages;
-
-    BSONObj replaceWithBSON = BSON("$replaceWith" << BSON("original"
-                                                          << "$$ROOT"));
-    stages.emplace_back(
-        DocumentSourceReplaceRoot::createFromBson(replaceWithBSON.firstElement(), expCtx));
-
-    invariant(tempNss.isTemporaryReshardingCollection());
-    std::string cacheChunksColl = "cache.chunks." + tempNss.toString();
-    BSONObjBuilder lookupBuilder;
-    lookupBuilder.append("from",
-                         BSON("db"
-                              << "config"
-                              << "coll" << cacheChunksColl));
-    {
-        BSONObjBuilder letBuilder(lookupBuilder.subobjStart("let"));
-        {
-            BSONArrayBuilder skVarBuilder(letBuilder.subarrayStart("sk"));
-            for (auto&& field : newShardKeyPattern.toBSON()) {
-                if (ShardKeyPattern::isHashedPatternEl(field)) {
-                    skVarBuilder.append(BSON("$toHashedIndexKey"
-                                             << "$original." + field.fieldNameStringData()));
-                } else {
-                    skVarBuilder.append("$original." + field.fieldNameStringData());
-                }
-            }
-        }
-    }
-    BSONArrayBuilder lookupPipelineBuilder(lookupBuilder.subarrayStart("pipeline"));
-    lookupPipelineBuilder.append(
-        BSON("$match" << BSON(
-                 "$expr" << BSON("$eq" << BSON_ARRAY(recipientShard.toString() << "$shard")))));
-    lookupPipelineBuilder.append(BSON(
-        "$match" << BSON(
-            "$expr" << BSON(
-                "$let" << BSON(
-                    "vars" << BSON("min" << BSON("$map" << BSON("input" << BSON("$objectToArray"
-                                                                                << "$_id")
-                                                                        << "in"
-                                                                        << "$$this.v"))
-                                         << "max"
-                                         << BSON("$map" << BSON("input" << BSON("$objectToArray"
-                                                                                << "$max")
-                                                                        << "in"
-                                                                        << "$$this.v")))
-                           << "in"
-                           << BSON(
-                                  "$and" << BSON_ARRAY(
-                                      BSON("$gte" << BSON_ARRAY("$$sk"
-                                                                << "$$min"))
-                                      << BSON("$cond" << BSON(
-                                                  "if"
-                                                  << BSON("$allElementsTrue" << BSON_ARRAY(BSON(
-                                                              "$map"
-                                                              << BSON("input"
-                                                                      << "$$max"
-                                                                      << "in"
-                                                                      << BSON("$eq" << BSON_ARRAY(
-                                                                                  BSON("$type"
-                                                                                       << "$$this")
-                                                                                  << "maxKey"))))))
-                                                  << "then"
-                                                  << BSON("$lte" << BSON_ARRAY("$$sk"
-                                                                               << "$$max"))
-                                                  << "else"
-                                                  << BSON("$lt" << BSON_ARRAY("$$sk"
-                                                                              << "$$max")))))))))));
-
-    lookupPipelineBuilder.done();
-    lookupBuilder.append("as", "intersectingChunk");
-    BSONObj lookupBSON(BSON("" << lookupBuilder.obj()));
-    stages.emplace_back(DocumentSourceLookUp::createFromBson(lookupBSON.firstElement(), expCtx));
-    stages.emplace_back(DocumentSourceMatch::create(
-        BSON("intersectingChunk" << BSON("$ne" << BSONArray())), expCtx));
-    stages.emplace_back(DocumentSourceReplaceRoot::createFromBson(BSON("$replaceWith"
-                                                                       << "$original")
-                                                                      .firstElement(),
-                                                                  expCtx));
-    return Pipeline::create(std::move(stages), expCtx);
-}
-
 boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
                                               const NamespaceString& sourceNss,
                                               const BSONObj& fullDocument) {
-    auto donorFields = getDonorFields(opCtx, sourceNss, fullDocument);
-    if (!donorFields)
+    auto css = CollectionShardingState::get(opCtx, sourceNss);
+
+    auto reshardingKeyPattern =
+        css->getCollectionDescription(opCtx).getReshardingKeyIfShouldForwardOps();
+    if (!reshardingKeyPattern)
+        return boost::none;
+
+    if (!documentBelongsToMe(opCtx, css, fullDocument))
         return boost::none;
 
     bool allowLocks = true;
@@ -714,8 +563,7 @@ boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
 
     uassertStatusOK(tempNssRoutingInfo);
 
-    auto reshardingKeyPattern = ShardKeyPattern(donorFields->getReshardingKey());
-    auto shardKey = reshardingKeyPattern.extractShardKeyFromDoc(fullDocument);
+    auto shardKey = reshardingKeyPattern->extractShardKeyFromDoc(fullDocument);
 
     return tempNssRoutingInfo.getValue()
         .findIntersectingChunkWithSimpleCollation(shardKey)

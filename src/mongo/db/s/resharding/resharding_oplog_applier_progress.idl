@@ -34,24 +34,15 @@ global:
 imports:
     - "mongo/idl/basic_types.idl"
     - "mongo/db/s/resharding/donor_oplog_id.idl"
+    - "mongo/s/resharding/common_types.idl"
     - "mongo/s/sharding_types.idl"
 
 structs:
-    ReshardingOplogSourceId:
-        description: "Identifier for the oplog source."
-        fields:
-            reshardingUUID:
-                type: uuid
-                description: "The identifier for the resharding in progress."
-            shardId:
-                type: shard_id
-                description: "The shard from which the oplog originated from."
-
     ReshardingOplogApplierProgress:
         description: "Used for storing the progress made by the resharding oplog applier."
         fields:
             _id:
-                type: ReshardingOplogSourceId
+                type: ReshardingSourceId
                 description: "The identifier for the source of the oplog entries."
                 cpp_name: oplogSourceId
             progress:

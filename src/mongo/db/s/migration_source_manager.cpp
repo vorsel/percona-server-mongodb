@@ -52,12 +52,12 @@
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/s/sharding_statistics.h"
+#include "mongo/db/s/type_shard_collection.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
-#include "mongo/s/catalog/type_shard_collection.h"
 #include "mongo/s/catalog_cache_loader.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/commit_chunk_migration_request_type.h"
@@ -128,11 +128,6 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
       _stats(ShardingStatistics::get(_opCtx)) {
     invariant(!_opCtx->lockState()->isLocked());
 
-    // Disallow moving a chunk to ourselves
-    uassert(ErrorCodes::InvalidOptions,
-            "Destination shard cannot be the same as source",
-            _args.getFromShardId() != _args.getToShardId());
-
     LOGV2(22016,
           "Starting chunk migration donation {requestParameters} with expected collection epoch "
           "{collectionEpoch}",
@@ -164,6 +159,9 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
         uassert(ErrorCodes::IncompatibleShardingMetadata,
                 "Cannot move chunks for an unsharded collection",
                 metadata.isSharded());
+        uassert(ErrorCodes::ConflictingOperationInProgress,
+                "Collection is undergoing changes so moveChunk is not allowed.",
+                metadata.allowMigrations());
 
         return std::make_tuple(std::move(metadata), std::move(collectionUUID));
     }();

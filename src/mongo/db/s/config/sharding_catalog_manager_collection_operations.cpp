@@ -54,6 +54,7 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/sharding_logging.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/executor/network_interface.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
@@ -70,6 +71,7 @@
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/shard_util.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/transport/service_entry_point.h"
@@ -141,7 +143,7 @@ BatchedCommandRequest buildUpdateOp(const NamespaceString& nss,
                                     const BSONObj& query,
                                     const BSONObj& update,
                                     bool upsert,
-                                    bool useMultiUpdate) {
+                                    bool multi) {
     BatchedCommandRequest request([&] {
         write_ops::Update updateOp(nss);
         updateOp.setUpdates({[&] {
@@ -149,7 +151,7 @@ BatchedCommandRequest buildUpdateOp(const NamespaceString& nss,
             entry.setQ(query);
             entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
             entry.setUpsert(upsert);
-            entry.setMulti(useMultiUpdate);
+            entry.setMulti(multi);
             return entry;
         }()});
         return updateOp;
@@ -268,9 +270,7 @@ void sendDropCollectionToAllShards(OperationContext* opCtx, const NamespaceStrin
                            opCtx->getWriteConcern().toBSON());
         }
 
-        auto ignoredShardVersion = ChunkVersion::IGNORED();
-        ignoredShardVersion.setToThrowSSVOnIgnored();
-        ignoredShardVersion.appendToCommand(&builder);
+        ChunkVersion::IGNORED().appendToCommand(&builder);
         return builder.obj();
     }();
 
@@ -338,7 +338,7 @@ void sendSSVToAllShards(OperationContext* opCtx, const NamespaceString& nss) {
         const auto& shard = uassertStatusOK(shardRegistry->getShard(opCtx, shardEntry.getName()));
 
         SetShardVersionRequest ssv(
-            nss, ChunkVersion::DROPPED(), true /* isAuthoritative */, true /* forceRefresh */);
+            nss, ChunkVersion::UNSHARDED(), true /* isAuthoritative */, true /* forceRefresh */);
 
         auto ssvResult = shard->runCommandWithFixedRetryAttempts(
             opCtx,
@@ -401,21 +401,16 @@ void ShardingCatalogManager::dropCollection(OperationContext* opCtx, const Names
                 "dropCollection chunk and tag data deleted",
                 "namespace"_attr = nss.ns());
 
-    // Mark the collection as dropped
-    CollectionType coll;
-    coll.setNs(nss);
-    coll.setDropped(true);
-    coll.setEpoch(ChunkVersion::DROPPED().epoch());
-    coll.setUpdatedAt(Grid::get(opCtx)->getNetwork()->now());
-
-    const bool upsert = false;
-    uassertStatusOK(ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
-        opCtx, nss, coll, upsert));
-
+    const auto catalogClient = Grid::get(opCtx)->catalogClient();
+    uassertStatusOK(
+        catalogClient->removeConfigDocuments(opCtx,
+                                             CollectionType::ConfigNS,
+                                             BSON(CollectionType::kNssFieldName << nss.ns()),
+                                             ShardingCatalogClient::kMajorityWriteConcern));
     LOGV2_DEBUG(21927,
                 1,
-                "dropCollection {namespace} collection marked as dropped",
-                "dropCollection collection marked as dropped",
+                "dropCollection {namespace} collection entry deleted",
+                "dropCollection collection entry deleted",
                 "namespace"_attr = nss.ns());
 
     sendSSVToAllShards(opCtx, nss);
@@ -443,58 +438,6 @@ void ShardingCatalogManager::ensureDropCollectionCompleted(OperationContext* opC
     IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
     removeChunksAndTagsForDroppedCollection(opCtx, nss);
     sendSSVToAllShards(opCtx, nss);
-}
-
-void ShardingCatalogManager::generateUUIDsForExistingShardedCollections(OperationContext* opCtx) {
-    // Retrieve all collections in config.collections that do not have a UUID. Some collections
-    // may already have a UUID if an earlier upgrade attempt failed after making some progress.
-    auto shardedColls =
-        uassertStatusOK(
-            Grid::get(opCtx)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
-                opCtx,
-                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                repl::ReadConcernLevel::kLocalReadConcern,
-                CollectionType::ConfigNS,
-                BSON(CollectionType::uuid.name() << BSON("$exists" << false) << "dropped" << false),
-                BSONObj(),   // sort
-                boost::none  // limit
-                ))
-            .docs;
-
-    if (shardedColls.empty()) {
-        LOGV2(21930, "all sharded collections already have UUIDs");
-
-        // We did a local read of the collections collection above and found that all sharded
-        // collections already have UUIDs. However, the data may not be majority committed (a
-        // previous setFCV attempt may have failed with a write concern error). Since the current
-        // Client doesn't know the opTime of the last write to the collections collection, make it
-        // wait for the last opTime in the system when we wait for writeConcern.
-        repl::ReplClientInfo::forClient(opCtx->getClient()).setLastOpToSystemLastOpTime(opCtx);
-        return;
-    }
-
-    // Generate and persist a new UUID for each collection that did not have a UUID.
-    LOGV2(21931,
-          "Generating UUIDs for {collectionCount} sharded collections that do not yet have a UUID",
-          "Generating UUIDs for sharded collections that do not yet have a UUID",
-          "collectionCount"_attr = shardedColls.size());
-    for (auto& coll : shardedColls) {
-        auto collType = uassertStatusOK(CollectionType::fromBSON(coll));
-        invariant(!collType.getUUID());
-
-        auto uuid = CollectionUUID::gen();
-        collType.setUUID(uuid);
-
-        uassertStatusOK(ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
-            opCtx, collType.getNs(), collType, false /* upsert */));
-        LOGV2_DEBUG(21932,
-                    2,
-                    "Updated entry in config.collections for sharded collection {namespace} "
-                    "with UUID {generatedUUID}",
-                    "Updated entry in config.collections for sharded collection",
-                    "namespace"_attr = collType.getNs(),
-                    "generatedUUID"_attr = uuid);
-    }
 }
 
 // Returns the pipeline updates to be used for updating a refined collection's chunk and tag
@@ -623,8 +566,7 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
     Timer executionTimer, totalTimer;
     const auto newEpoch = OID::gen();
 
-    auto collType =
-        uassertStatusOK(Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss)).value;
+    auto collType = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss);
     const auto oldShardKeyPattern = ShardKeyPattern(collType.getKeyPattern());
 
     uassertStatusOK(ShardingLogging::get(opCtx)->logChangeChecked(
@@ -642,15 +584,16 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
     collType.setEpoch(newEpoch);
     collType.setKeyPattern(newShardKeyPattern.getKeyPattern());
 
-    {
-        // Update the config.collections entry for the given namespace.
-        AlternativeSessionRegion asr(opCtx);
-        AuthorizationSession::get(asr.opCtx()->getClient())
-            ->grantInternalAuthorization(asr.opCtx()->getClient());
-        TxnNumber txnNumber = 0;
+    if (feature_flags::gShardingFullDDLSupport.isEnabled(serverGlobalParams.featureCompatibility)) {
+        auto now = VectorClock::get(opCtx)->getTime();
+        auto newClusterTime = now.clusterTime().asTimestamp();
+        collType.setTimestamp(newClusterTime);
+    }
 
+    auto updateCollectionAndChunksFn = [&](OperationContext* opCtx, TxnNumber txnNumber) {
+        // Update the config.collections entry for the given namespace.
         updateShardingCatalogEntryForCollectionInTxn(
-            asr.opCtx(), nss, collType, false /* upsert */, true /* startTransaction */, txnNumber);
+            opCtx, nss, collType, false /* upsert */, txnNumber);
 
         LOGV2(21933,
               "refineCollectionShardKey updated collection entry for {namespace}: took "
@@ -672,17 +615,15 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
         // to the newly-generated objectid, (ii) their bounds for each new field in the refined
         // key to MinKey (except for the global max chunk where the max bounds are set to
         // MaxKey), and unsetting (iii) their jumbo field.
-        uassertStatusOK(getStatusFromWriteCommandReply(
-            writeToConfigDocumentInTxn(asr.opCtx(),
-                                       ChunkType::ConfigNS,
-                                       buildPipelineUpdateOp(ChunkType::ConfigNS,
-                                                             BSON("ns" << nss.ns()),
-                                                             chunkUpdates,
-                                                             false,  // upsert
-                                                             true    // useMultiUpdate
-                                                             ),
-                                       false,  // startTransaction
-                                       txnNumber)));
+        writeToConfigDocumentInTxn(opCtx,
+                                   ChunkType::ConfigNS,
+                                   buildPipelineUpdateOp(ChunkType::ConfigNS,
+                                                         BSON("ns" << nss.ns()),
+                                                         chunkUpdates,
+                                                         false,  // upsert
+                                                         true    // useMultiUpdate
+                                                         ),
+                                   txnNumber);
 
         LOGV2(21935,
               "refineCollectionShardKey: updated chunk entries for {namespace}: took "
@@ -696,17 +637,15 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
         // Update all config.tags entries for the given namespace by setting their bounds for
         // each new field in the refined key to MinKey (except for the global max tag where the
         // max bounds are set to MaxKey).
-        uassertStatusOK(getStatusFromWriteCommandReply(
-            writeToConfigDocumentInTxn(asr.opCtx(),
-                                       TagsType::ConfigNS,
-                                       buildPipelineUpdateOp(TagsType::ConfigNS,
-                                                             BSON("ns" << nss.ns()),
-                                                             tagUpdates,
-                                                             false,  // upsert
-                                                             true    // useMultiUpdate
-                                                             ),
-                                       false,  // startTransaction
-                                       txnNumber)));
+        writeToConfigDocumentInTxn(opCtx,
+                                   TagsType::ConfigNS,
+                                   buildPipelineUpdateOp(TagsType::ConfigNS,
+                                                         BSON("ns" << nss.ns()),
+                                                         tagUpdates,
+                                                         false,  // upsert
+                                                         true    // useMultiUpdate
+                                                         ),
+                                   txnNumber);
 
 
         LOGV2(21936,
@@ -721,10 +660,9 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
             LOGV2(21937, "Hit hangRefineCollectionShardKeyBeforeCommit failpoint");
             hangRefineCollectionShardKeyBeforeCommit.pauseWhileSet(opCtx);
         }
+    };
 
-        // Note this will wait for majority write concern.
-        commitTxnForConfigDocument(asr.opCtx(), txnNumber);
-    }
+    withTransaction(opCtx, nss, std::move(updateCollectionAndChunksFn));
 
     ShardingLogging::get(opCtx)->logChange(opCtx,
                                            "refineCollectionShardKey.end",
@@ -752,22 +690,21 @@ void ShardingCatalogManager::updateShardingCatalogEntryForCollectionInTxn(
     const NamespaceString& nss,
     const CollectionType& coll,
     const bool upsert,
-    const bool startTransaction,
     TxnNumber txnNumber) {
-    fassert(51249, coll.validate());
-
-    auto status = getStatusFromCommandResult(
+    try {
         writeToConfigDocumentInTxn(opCtx,
                                    CollectionType::ConfigNS,
                                    buildUpdateOp(CollectionType::ConfigNS,
-                                                 BSON(CollectionType::fullNs(nss.ns())),
+                                                 BSON(CollectionType::kNssFieldName << nss.ns()),
                                                  coll.toBSON(),
                                                  upsert,
                                                  false /* multi */
                                                  ),
-                                   startTransaction,
-                                   txnNumber));
-    uassertStatusOKWithContext(status, "Collection metadata write failed");
+                                   txnNumber);
+    } catch (DBException& e) {
+        e.addContext("Collection metadata write failed");
+        throw;
+    }
 }
 
 }  // namespace mongo

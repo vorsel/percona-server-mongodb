@@ -307,29 +307,9 @@ let testConnReadPreference = function(conn, isMongos, rsNodes, {readPref, expect
     cmdTest(
         {dbStats: 1}, allowedOnSecondary.kAlways, true, formatProfileQuery(kDbName, {dbStats: 1}));
 
-    assert.commandWorked(shardedColl.ensureIndex({loc: '2d'}));
-    assert.commandWorked(
-        shardedColl.ensureIndex({position: 'geoHaystack', type: 1}, {bucketSize: 10}));
+    assert.commandWorked(shardedColl.createIndex({loc: '2d'}));
 
-    // TODO: SERVER-38961 Remove when simultaneous index builds complete.
-    // Run a no-op command and wait for it to be applied on secondaries. Due to the asynchronous
-    // completion nature of indexes on secondaries, we can guarantee an index build is complete
-    // on all secondaries once all secondaries have applied this collMod command.
-    assert.commandWorked(testDB.runCommand({collMod: kShardedCollName}));
     assert.commandWorked(testDB.runCommand({getLastError: 1, w: nodeCount}));
-
-    // Mongos doesn't implement geoSearch; test it only with ReplicaSetConnection.
-    if (!isMongos) {
-        cmdTest({
-            geoSearch: kShardedCollName,
-            near: [1, 1],
-            search: {type: 'restaurant'},
-            maxDistance: 10
-        },
-                allowedOnSecondary.kAlways,
-                true,
-                formatProfileQuery(kShardedNs, {geoSearch: kShardedCollName}));
-    }
 
     // Test on sharded
     cmdTest({aggregate: kShardedCollName, pipeline: [{$project: {x: 1}}], cursor: {}},
@@ -632,10 +612,11 @@ jsTest.log('Starting test for mongos connection');
 const replicaSetMonitorProtocol =
     assert.commandWorked(st.s.adminCommand({getParameter: 1, replicaSetMonitorProtocol: 1}))
         .replicaSetMonitorProtocol;
-let failPoint = configureFailPoint(st.s,
-                                   replicaSetMonitorProtocol === "scanning"
-                                       ? "scanningServerSelectorIgnoreLatencyWindow"
-                                       : "sdamServerSelectorIgnoreLatencyWindow");
+
+assert(replicaSetMonitorProtocol === "streamable" || replicaSetMonitorProtocol === "sdam");
+
+let failPoint = configureFailPoint(st.s, "sdamServerSelectorIgnoreLatencyWindow");
+
 testAllModes(st.s, st.rs0.nodes, true);
 failPoint.off();
 

@@ -73,7 +73,7 @@ ReplicationCoordinator::Mode ReplicationCoordinatorEmbedded::getReplicationMode(
     return ReplicationCoordinator::Mode::modeNone;
 }
 
-bool ReplicationCoordinatorEmbedded::isMasterForReportingPurposes() {
+bool ReplicationCoordinatorEmbedded::isWritablePrimaryForReportingPurposes() {
     return true;
 }
 
@@ -99,13 +99,13 @@ bool ReplicationCoordinatorEmbedded::canAcceptWritesFor_UNSAFE(
 
 Status ReplicationCoordinatorEmbedded::checkCanServeReadsFor(OperationContext* opCtx,
                                                              const NamespaceString& ns,
-                                                             bool slaveOk) {
+                                                             bool secondaryOk) {
     return Status::OK();
 }
 
 Status ReplicationCoordinatorEmbedded::checkCanServeReadsFor_UNSAFE(OperationContext* opCtx,
                                                                     const NamespaceString& ns,
-                                                                    bool slaveOk) {
+                                                                    bool secondaryOk) {
     return Status::OK();
 }
 
@@ -174,7 +174,7 @@ Status ReplicationCoordinatorEmbedded::waitForMemberState(MemberState, Milliseco
     UASSERT_NOT_IMPLEMENTED;
 }
 
-Seconds ReplicationCoordinatorEmbedded::getSlaveDelaySecs() const {
+Seconds ReplicationCoordinatorEmbedded::getSecondaryDelaySecs() const {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -309,7 +309,7 @@ Status ReplicationCoordinatorEmbedded::processReplSetGetStatus(BSONObjBuilder*,
     UASSERT_NOT_IMPLEMENTED;
 }
 
-void ReplicationCoordinatorEmbedded::appendSlaveInfoData(BSONObjBuilder*) {
+void ReplicationCoordinatorEmbedded::appendSecondaryInfoData(BSONObjBuilder*) {
     UASSERT_NOT_IMPLEMENTED;
 }
 
@@ -522,7 +522,7 @@ void ReplicationCoordinatorEmbedded::incrementTopologyVersion() {
     UASSERT_NOT_IMPLEMENTED;
 }
 
-std::shared_ptr<const repl::IsMasterResponse> ReplicationCoordinatorEmbedded::awaitIsMasterResponse(
+std::shared_ptr<const repl::HelloResponse> ReplicationCoordinatorEmbedded::awaitHelloResponse(
     OperationContext* opCtx,
     const repl::SplitHorizon::Parameters& horizonParams,
     boost::optional<TopologyVersion> previous,
@@ -530,8 +530,8 @@ std::shared_ptr<const repl::IsMasterResponse> ReplicationCoordinatorEmbedded::aw
     UASSERT_NOT_IMPLEMENTED;
 };
 
-SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>
-ReplicationCoordinatorEmbedded::getIsMasterResponseFuture(
+SharedSemiFuture<std::shared_ptr<const HelloResponse>>
+ReplicationCoordinatorEmbedded::getHelloResponseFuture(
     const SplitHorizon::Parameters& horizonParams,
     boost::optional<TopologyVersion> clientTopologyVersion) {
     UASSERT_NOT_IMPLEMENTED;
@@ -560,7 +560,7 @@ BSONObj ReplicationCoordinatorEmbedded::runCmdOnPrimaryAndAwaitResponse(
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorEmbedded::restartHeartbeats_forTest() {
+void ReplicationCoordinatorEmbedded::restartScheduledHeartbeats_forTest() {
     MONGO_UNREACHABLE;
 }
 

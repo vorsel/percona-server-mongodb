@@ -38,7 +38,6 @@
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
-#include "mongo/s/database_version_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/fail_point.h"
 
@@ -82,7 +81,7 @@ CollectionAndChangedChunks getChangedChunks(OperationContext* opCtx,
     const auto catalogClient = Grid::get(opCtx)->catalogClient();
 
     // Decide whether to do a full or partial load based on the state of the collection
-    const auto coll = uassertStatusOK(catalogClient->getCollection(opCtx, nss)).value;
+    const auto coll = catalogClient->getCollection(opCtx, nss);
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "Collection " << nss.ns() << " is dropped.",
             !coll.getDropped());
@@ -109,13 +108,15 @@ CollectionAndChangedChunks getChangedChunks(OperationContext* opCtx,
             "No chunks were found for the collection",
             !changedChunks.empty());
 
-    return CollectionAndChangedChunks(coll.getUUID(),
-                                      coll.getEpoch(),
+    return CollectionAndChangedChunks{coll.getEpoch(),
+                                      coll.getTimestamp(),
+                                      coll.getUuid(),
                                       coll.getKeyPattern().toBSON(),
                                       coll.getDefaultCollation(),
                                       coll.getUnique(),
                                       coll.getReshardingFields(),
-                                      std::move(changedChunks));
+                                      coll.getAllowMigrations(),
+                                      std::move(changedChunks)};
 }
 
 }  // namespace
@@ -182,12 +183,9 @@ SemiFuture<DatabaseType> ConfigServerCatalogCacheLoader::getDatabase(StringData 
             ThreadClient tc("ConfigServerCatalogCacheLoader::getDatabase",
                             getGlobalServiceContext());
             auto opCtx = tc->makeOperationContext();
-            return uassertStatusOK(Grid::get(opCtx.get())
-                                       ->catalogClient()
-                                       ->getDatabase(opCtx.get(),
-                                                     name,
-                                                     repl::ReadConcernLevel::kMajorityReadConcern))
-                .value;
+            return Grid::get(opCtx.get())
+                ->catalogClient()
+                ->getDatabase(opCtx.get(), name, repl::ReadConcernLevel::kMajorityReadConcern);
         })
         .semi();
 }

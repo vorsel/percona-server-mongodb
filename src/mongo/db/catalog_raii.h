@@ -62,6 +62,8 @@ public:
               LockMode mode,
               Date_t deadline = Date_t::max());
 
+    AutoGetDb(AutoGetDb&&) = default;
+
     /**
      * Returns the database, or nullptr if it didn't exist.
      */
@@ -76,9 +78,9 @@ public:
 
 private:
     OperationContext* _opCtx;
-    const std::string _dbName;
+    std::string _dbName;
 
-    const Lock::DBLock _dbLock;
+    Lock::DBLock _dbLock;
     Database* _db;
 };
 
@@ -204,30 +206,30 @@ protected:
  * The collection references returned by this class will no longer be safe to retain after this
  * object goes out of scope. This object ensures the continued existence of a Collection reference,
  * if the collection exists when this object is instantiated.
+ *
+ * This class is only used by AutoGetCollectionForReadLockFree.
  */
 class AutoGetCollectionLockFree {
     AutoGetCollectionLockFree(const AutoGetCollectionLockFree&) = delete;
     AutoGetCollectionLockFree& operator=(const AutoGetCollectionLockFree&) = delete;
 
 public:
-    AutoGetCollectionLockFree(
-        OperationContext* opCtx,
-        const NamespaceStringOrUUID& nsOrUUID,
-        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max());
+    /**
+     * Function used to customize restore after yield behavior
+     */
+    using RestoreFromYieldFn =
+        std::function<void(std::shared_ptr<const Collection>&, OperationContext*, CollectionUUID)>;
 
     /**
-     * Same constructor as above except it accepts a fifth unused LockMode parameter in order to
-     * parallel AutoGetCollection and meet the templated AutoGetCollectionForReadBase class'
-     * type structure expectations.
+     * Used by AutoGetCollectionForReadLockFree where it provides implementation for restore after
+     * yield.
      */
     AutoGetCollectionLockFree(
         OperationContext* opCtx,
         const NamespaceStringOrUUID& nsOrUUID,
-        LockMode unused,  // unused
+        RestoreFromYieldFn restoreFromYield,
         AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
-        Date_t deadline = Date_t::max())
-        : AutoGetCollectionLockFree(opCtx, nsOrUUID, viewMode, deadline) {}
+        Date_t deadline = Date_t::max());
 
     explicit operator bool() const {
         // Use the CollectionPtr because it is updated if it yields whereas _collection is not until
@@ -270,6 +272,11 @@ public:
     }
 
 private:
+    // Indicate that we are lock-free on code paths that can run either lock-free or locked for
+    // different kinds of operations. Note: this class member is currently declared first so that it
+    // destructs last, as a safety measure, but not because it is currently depended upon behavior.
+    boost::optional<LockFreeReadsBlock> _lockFreeReadsBlock;
+
     Lock::GlobalLock _globalLock;
 
     // If the object was instantiated with a UUID, contains the resolved namespace, otherwise it is
@@ -342,9 +349,6 @@ public:
     // invalidated.
     Collection* getWritableCollection();
 
-    // Commits unmanaged Collection to the catalog
-    void commitToCatalog();
-
 private:
     // If this class is instantiated with the constructors that take UUID or nss we need somewhere
     // to store the CollectionPtr used. But if it is instantiated with an AutoGetCollection then the
@@ -396,35 +400,6 @@ private:
     AutoGetDb _autoDb;
 
     Database* _db;
-};
-
-/**
- * RAII-style class. Hides changes to the CollectionCatalog for the life of the object, so that
- * calls to CollectionCatalog::lookupNSSByUUID will return results as before the RAII object was
- * instantiated.
- *
- * The caller must hold the global exclusive lock for the life of the instance.
- */
-class ConcealCollectionCatalogChangesBlock {
-    ConcealCollectionCatalogChangesBlock(const ConcealCollectionCatalogChangesBlock&) = delete;
-    ConcealCollectionCatalogChangesBlock& operator=(const ConcealCollectionCatalogChangesBlock&) =
-        delete;
-
-public:
-    /**
-     * Conceals future CollectionCatalog changes and stashes a pointer to the opCtx for the
-     * destructor to use.
-     */
-    ConcealCollectionCatalogChangesBlock(OperationContext* opCtx);
-
-    /**
-     * Reveals CollectionCatalog changes.
-     */
-    ~ConcealCollectionCatalogChangesBlock();
-
-private:
-    // Needed for the destructor to access the CollectionCatalog in order to call onOpenCatalog.
-    OperationContext* _opCtx;
 };
 
 /**

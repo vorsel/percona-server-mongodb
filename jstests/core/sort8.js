@@ -1,7 +1,4 @@
 // Check sorting of arrays indexed by key SERVER-2884
-// @tags: [
-//   sbe_incompatible,
-// ]
 
 t = db.jstests_sort8;
 t.drop();
@@ -10,7 +7,7 @@ t.save({a: [1, 10]});
 t.save({a: 5});
 unindexedForward = t.find().sort({a: 1}).toArray();
 unindexedReverse = t.find().sort({a: -1}).toArray();
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 indexedForward = t.find().sort({a: 1}).hint({a: 1}).toArray();
 indexedReverse = t.find().sort({a: -1}).hint({a: 1}).toArray();
 
@@ -25,7 +22,7 @@ assert.eq([1, 10], unindexedReverse[0].a);
 t.dropIndexes();
 unindexedForward = t.find({a: {$gte: 5}}).sort({a: 1}).toArray();
 unindexedReverse = t.find({a: {$lte: 5}}).sort({a: -1}).toArray();
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 indexedForward = t.find({a: {$gte: 5}}).sort({a: 1}).hint({a: 1}).toArray();
 indexedReverse = t.find({a: {$lte: 5}}).sort({a: -1}).hint({a: 1}).toArray();
 

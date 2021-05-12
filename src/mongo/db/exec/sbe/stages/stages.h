@@ -48,12 +48,14 @@ enum class PlanState { ADVANCED, IS_EOF };
 /**
  * Provides methods to detach and re-attach to an operation context, which derived classes may
  * override to perform additional actions when these events occur.
+ *
+ * Parameter 'T' is the typename of the class derived from this class. It's used to implement the
+ * curiously recurring template pattern and access the internal state of the derived class.
  */
+template <typename T>
 class CanSwitchOperationContext {
 public:
-    CanSwitchOperationContext(PlanStage* stage) : _stage(stage) {
-        invariant(_stage);
-    }
+    CanSwitchOperationContext() = default;
 
     /**
      * Detaches from the OperationContext and releases any storage-engine state.
@@ -64,7 +66,17 @@ public:
      *
      * Propagates to all children, then calls doDetachFromOperationContext().
      */
-    void detachFromOperationContext();
+    void detachFromOperationContext() {
+        invariant(_opCtx);
+
+        auto stage = static_cast<T*>(this);
+        for (auto&& child : stage->_children) {
+            child->detachFromOperationContext();
+        }
+
+        stage->doDetachFromOperationContext();
+        _opCtx = nullptr;
+    }
 
     /**
      * Reattaches to the OperationContext and reacquires any storage-engine state.
@@ -74,29 +86,35 @@ public:
      *
      * Propagates to all children, then calls doReattachToOperationContext().
      */
-    void attachFromOperationContext(OperationContext* opCtx);
+    void attachFromOperationContext(OperationContext* opCtx) {
+        invariant(opCtx);
+        invariant(!_opCtx);
+
+        auto stage = static_cast<T*>(this);
+        for (auto&& child : stage->_children) {
+            child->attachFromOperationContext(opCtx);
+        }
+
+        _opCtx = opCtx;
+        stage->doAttachFromOperationContext(opCtx);
+    }
 
 protected:
-    // Derived classes can optionally override these methods.
-    virtual void doDetachFromOperationContext() {}
-    virtual void doAttachFromOperationContext(OperationContext* opCtx) {}
-
     OperationContext* _opCtx{nullptr};
-
-private:
-    PlanStage* const _stage;
 };
 
 /**
  * Provides methods to save and restore the state of the object which derives from this class
  * when corresponding events are generated as a response to a change in the underlying data source.
  * Derived classes may override these methods to perform additional actions when these events occur.
+ *
+ * Parameter 'T' is the typename of the class derived from this class. It's used to implement the
+ * curiously recurring template pattern and access the internal state of the derived class.
  */
+template <typename T>
 class CanChangeState {
 public:
-    CanChangeState(PlanStage* stage) : _stage(stage) {
-        invariant(_stage);
-    }
+    CanChangeState() = default;
 
     /**
      * Notifies the stage that the underlying data source may change.
@@ -106,7 +124,15 @@ public:
      *
      * Propagates to all children, then calls doSaveState().
      */
-    void saveState();
+    void saveState() {
+        auto stage = static_cast<T*>(this);
+        stage->_commonStats.yields++;
+        for (auto&& child : stage->_children) {
+            child->saveState();
+        }
+
+        stage->doSaveState();
+    }
 
     /**
      * Notifies the stage that underlying data is stable again and prepares for calls to work().
@@ -119,29 +145,35 @@ public:
      * collection drop. May throw a WriteConflictException, in which case the caller may choose to
      * retry.
      */
-    void restoreState();
+    void restoreState() {
+        auto stage = static_cast<T*>(this);
+        stage->_commonStats.unyields++;
+        for (auto&& child : stage->_children) {
+            child->restoreState();
+        }
 
-protected:
-    // Derived classes can optionally override these methods.
-    virtual void doSaveState() {}
-    virtual void doRestoreState() {}
-
-private:
-    PlanStage* const _stage;
+        stage->doRestoreState();
+    }
 };
 
 /**
  * Provides methods to obtain execution statistics specific to a plan stage.
+ *
+ * Parameter 'T' is the typename of the class derived from this class. It's used to implement the
+ * curiously recurring template pattern and access the internal state of the derived class.
  */
+template <typename T>
 class CanTrackStats {
 public:
     CanTrackStats(StringData stageType, PlanNodeId nodeId) : _commonStats(stageType, nodeId) {}
 
     /**
      * Returns a tree of stats. If the stage has any children it must propagate the request for
-     * stats to them.
+     * stats to them. If 'includeDebugInfo' is set to 'true' the stage may include some additional
+     * debug info, opaque to the caller, which will be available via 'PlanStageStats::debugInfo'
+     * member.
      */
-    virtual std::unique_ptr<PlanStageStats> getStats() const = 0;
+    virtual std::unique_ptr<PlanStageStats> getStats(bool includeDebugInfo) const = 0;
 
     /**
      * Get stats specific to this stage. Some stages may not have specific stats, in which
@@ -162,6 +194,24 @@ public:
      */
     const CommonStats* getCommonStats() const {
         return &_commonStats;
+    }
+
+    /**
+     * Populates plan 'summary' object by walking through the entire PlanStage tree and for each
+     * node whose plan node ID equals to the given 'nodeId', or if 'nodeId' is 'kEmptyPlanNodeId',
+     * invoking 'accumulate(summary)' on the SpecificStats instance obtained by calling
+     * 'getSpecificStats()'.
+     */
+    void accumulate(PlanNodeId nodeId, PlanSummaryStats& summary) const {
+        if (auto stats = getSpecificStats();
+            stats && (nodeId == kEmptyPlanNodeId || _commonStats.nodeId == nodeId)) {
+            stats->accumulate(summary);
+        }
+
+        auto stage = static_cast<const T*>(this);
+        for (auto&& child : stage->_children) {
+            child->accumulate(nodeId, summary);
+        }
     }
 
 protected:
@@ -219,16 +269,13 @@ private:
 /**
  * This is an abstract base class of all plan stages in SBE.
  */
-class PlanStage : public CanSwitchOperationContext,
-                  public CanChangeState,
-                  public CanTrackStats,
+class PlanStage : public CanSwitchOperationContext<PlanStage>,
+                  public CanChangeState<PlanStage>,
+                  public CanTrackStats<PlanStage>,
                   public CanInterrupt {
 public:
     PlanStage(StringData stageType, PlanYieldPolicy* yieldPolicy, PlanNodeId nodeId)
-        : CanSwitchOperationContext{this},
-          CanChangeState{this},
-          CanTrackStats{stageType, nodeId},
-          CanInterrupt{yieldPolicy} {}
+        : CanTrackStats{stageType, nodeId}, CanInterrupt{yieldPolicy} {}
 
     PlanStage(StringData stageType, PlanNodeId nodeId) : PlanStage(stageType, nullptr, nodeId) {}
 
@@ -280,10 +327,17 @@ public:
         return {DebugPrinter::Block(str)};
     }
 
-    friend class CanSwitchOperationContext;
-    friend class CanChangeState;
+    friend class CanSwitchOperationContext<PlanStage>;
+    friend class CanChangeState<PlanStage>;
+    friend class CanTrackStats<PlanStage>;
 
 protected:
+    // Derived classes can optionally override these methods.
+    virtual void doSaveState() {}
+    virtual void doRestoreState() {}
+    virtual void doDetachFromOperationContext() {}
+    virtual void doAttachFromOperationContext(OperationContext* opCtx) {}
+
     std::vector<std::unique_ptr<PlanStage>> _children;
 };
 

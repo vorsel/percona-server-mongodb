@@ -33,6 +33,7 @@
 #include "mongo/client/remote_command_targeter_rs.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/repl/tenant_migration_donor_util.h"
+#include "mongo/util/cancelation.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
@@ -77,7 +78,8 @@ public:
 
         ~Instance();
 
-        void run(std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept override;
+        SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                             const CancelationToken& token) noexcept override;
 
         void interrupt(Status status) override;
 
@@ -149,21 +151,24 @@ public:
         ExecutorFuture<void> _sendCommandToRecipient(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
             std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
-            const BSONObj& cmdObj);
+            const BSONObj& cmdObj,
+            const CancelationToken& token);
 
         /**
          * Sends the recipientSyncData command to the recipient replica set.
          */
         ExecutorFuture<void> _sendRecipientSyncDataCommand(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
-            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS);
+            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
+            const CancelationToken& token);
 
         /**
          * Sends the recipientForgetMigration command to the recipient replica set.
          */
         ExecutorFuture<void> _sendRecipientForgetMigrationCommand(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
-            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS);
+            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
+            const CancelationToken& token);
 
         ServiceContext* _serviceContext;
 

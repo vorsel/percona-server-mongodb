@@ -47,6 +47,7 @@ env.SConscript(
         'sorter',
         'stats',
         'storage',
+        'timeseries',
         'update',
         'views',
     ],
@@ -419,17 +420,15 @@ env.Library(
         'mongod_options_storage.idl',
         'ratelimit_parameter.idl',
     ],
-    LIBDEPS=[
-        'repl/repl_settings',
-        'repl/replica_set_messages',
-        'server_options_servers',
-        'storage/storage_options',
-    ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/ldap_options',
+        '$BUILD_DIR/mongo/db/repl/repl_settings',
+        '$BUILD_DIR/mongo/db/repl/replica_set_messages',
+        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
         'global_settings',
         'server_options_base',
+        'server_options_servers',
     ]
 )
 
@@ -441,6 +440,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/idl/basic_types',
         '$BUILD_DIR/mongo/idl/idl_parser',
     ],
     LIBDEPS_PRIVATE=[
@@ -455,6 +455,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/bson/util/bson_extract',
+        '$BUILD_DIR/mongo/idl/basic_types',
         'read_write_concern_provenance',
     ],
 )
@@ -491,6 +492,7 @@ env.Library(
     source=[
         'baton.cpp',
         'client.cpp',
+        'client_strand.cpp',
         'default_baton.cpp',
         'operation_context.cpp',
         'operation_context_group.cpp',
@@ -609,31 +611,23 @@ env.Library(
     target="commands",
     source=[
         'commands.cpp',
+        'drop.idl',
+        'drop_database.idl',
+        'list_collections.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
+        '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/rpc/command_status',
         '$BUILD_DIR/mongo/rpc/rpc',
         'audit',
         'auth/auth',
-        'command_generic_argument',
         'commands/server_status_core',
         'commands/test_commands_enabled',
         'namespace_string',
-    ],
-)
-
-env.Library(
-    target='command_generic_argument',
-    source=[
-        'command_generic_argument.cpp',
-    ],
-    LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/commands/server_status_core',
     ],
 )
 
@@ -968,6 +962,7 @@ env.Library(
     source=[
         "index_builds_coordinator.cpp",
         "repl_index_build_state.cpp",
+        "active_index_builds.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
@@ -1231,6 +1226,7 @@ env.Library(
         'query/plan_executor_impl.cpp',
         'query/plan_executor_factory.cpp',
         'query/plan_executor_sbe.cpp',
+        'query/plan_explainer_factory.cpp',
         'query/plan_explainer_impl.cpp',
         'query/plan_explainer_sbe.cpp',
         'query/plan_insert_listener.cpp',
@@ -1247,8 +1243,8 @@ env.Library(
         'query/sbe_stage_builder_filter.cpp',
         'query/sbe_stage_builder_index_scan.cpp',
         'query/sbe_stage_builder_projection.cpp',
-        'query/sbe_stage_builder_helpers.cpp',
         'query/sbe_sub_planner.cpp',
+        'query/shard_filterer_factory_impl.cpp',
         'query/stage_builder_util.cpp',
         'query/wildcard_multikey_paths.cpp',
         'run_op_kill_cursors.cpp',
@@ -1256,6 +1252,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/index/index_access_methods',
+        '$BUILD_DIR/mongo/db/s/resharding_util',
         '$BUILD_DIR/mongo/s/common_s',
         '$BUILD_DIR/mongo/scripting/scripting',
         '$BUILD_DIR/mongo/util/background_job',
@@ -1290,6 +1287,7 @@ env.Library(
         'query/plan_yield_policy',
         'query/query_common',
         'query/query_planner',
+        'query/sbe_stage_builder_helpers',
         'repl/repl_coordinator_interface',
         's/sharding_api_d',
         'shared_request_handling',
@@ -1304,7 +1302,6 @@ env.Library(
         'commands/server_status_core',
         'kill_sessions',
         'stats/resource_consumption_metrics',
-        'storage/snapshot_helper',
     ],
 )
 
@@ -1714,7 +1711,7 @@ env.Library(
         'logical_time_validator.cpp',
         'vector_clock.cpp',
         'keys_collection_manager.idl',
-        'logical_clock.idl',
+        'vector_clock.idl',
         'vector_clock_document.idl',
     ],
     LIBDEPS=[
@@ -2003,6 +2000,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/util/net/ssl_options_server' if get_option('ssl') == 'on' else '',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser',
         'mongod_options',
     ]
 )
@@ -2099,8 +2097,8 @@ env.Library(
         'repl/storage_interface_impl',
         'repl/topology_coordinator',
         'rw_concern_d',
-        's/balancer',
         's/sessions_collection_config_server',
+        's/sharding_catalog_manager',
         's/sharding_commands_d',
         's/sharding_runtime_d',
         'service_context_d',
@@ -2272,6 +2270,7 @@ envWithAsio.CppUnitTest(
     target='db_unittest_test',
     source=[
         'catalog_raii_test.cpp',
+        'client_strand_test.cpp',
         'collection_index_usage_tracker_test.cpp',
         'commands_test.cpp',
         'curop_test.cpp',

@@ -115,17 +115,6 @@ ServiceContext::UniqueOperationContext Client::makeOperationContext() {
     return getServiceContext()->makeOperationContext(this);
 }
 
-void Client::setOperationContext(OperationContext* opCtx) {
-    // We can only set the OperationContext once before resetting it.
-    invariant(opCtx != nullptr && _opCtx == nullptr);
-    _opCtx = opCtx;
-}
-
-void Client::resetOperationContext() {
-    invariant(_opCtx != nullptr);
-    _opCtx = nullptr;
-}
-
 std::string Client::clientAddress(bool includePort) const {
     if (!hasRemote()) {
         return "";
@@ -156,7 +145,7 @@ bool haveClient() {
 }
 
 ServiceContext::UniqueClient Client::releaseCurrent() {
-    invariant(haveClient());
+    invariant(haveClient(), "No client to release");
     if (auto opCtx = currentClient->_opCtx)
         if (auto timer = OperationCPUTimer::get(opCtx))
             timer->onThreadDetach();

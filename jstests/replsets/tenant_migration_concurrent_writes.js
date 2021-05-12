@@ -15,29 +15,16 @@
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load("jstests/replsets/libs/tenant_migration_test.js");
 
-const donorRst = new ReplSetTest(
-    {nodes: 1, name: 'donor', nodeOptions: {setParameter: {enableTenantMigrations: true}}});
-const recipientRst = new ReplSetTest({
-    nodes: 1,
-    name: 'recipient',
-    nodeOptions: {
-        setParameter: {
-            enableTenantMigrations: true,
-            // TODO SERVER-51734: Remove the failpoint 'returnResponseOkForRecipientSyncDataCmd'.
-            'failpoint.returnResponseOkForRecipientSyncDataCmd': tojson({mode: 'alwaysOn'})
-        }
-    }
-});
-
-donorRst.startSet();
-donorRst.initiate();
-recipientRst.startSet();
-recipientRst.initiate();
+const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
+if (!tenantMigrationTest.isFeatureFlagEnabled()) {
+    jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
+    return;
+}
+const donorRst = tenantMigrationTest.getDonorRst();
 
 const primary = donorRst.getPrimary();
-const kRecipientConnString = recipientRst.getURL();
 const kCollName = "testColl";
 
 const kTenantDefinedDbName = "0";
@@ -141,27 +128,25 @@ function validateTestCase(testCase) {
     assert(testCase.explicitlyCreateCollection
                ? typeof (testCase.explicitlyCreateCollection) === "boolean"
                : true);
-    assert(testCase.isSupportedInTransaction
-               ? typeof (testCase.isSupportedInTransaction) === "boolean"
-               : true);
-    assert(testCase.isRetryableWriteCommand
-               ? typeof (testCase.isRetryableWriteCommand) === "boolean"
-               : true);
+    assert(testCase.testInTransaction ? typeof (testCase.testInTransaction) === "boolean" : true);
+    assert(testCase.testAsRetryableWrite ? typeof (testCase.testAsRetryableWrite) === "boolean"
+                                         : true);
 }
 
-function makeTestOptions(primary, testCase, dbName, collName, useTransaction, useRetryableWrite) {
-    assert(!useTransaction || !useRetryableWrite);
+function makeTestOptions(
+    primary, testCase, dbName, collName, testInTransaction, testAsRetryableWrite) {
+    assert(!testInTransaction || !testAsRetryableWrite);
 
-    const useSession = useTransaction || useRetryableWrite;
+    const useSession = testInTransaction || testAsRetryableWrite || testCase.isTransactionCommand;
     const primaryConn = useSession ? primary.startSession({causalConsistency: false}) : primary;
     const primaryDB = useSession ? primaryConn.getDatabase(dbName) : primaryConn.getDB(dbName);
 
     let command = testCase.command(dbName, collName);
 
-    if (useTransaction || useRetryableWrite) {
+    if (testInTransaction || testAsRetryableWrite) {
         command.txnNumber = kTxnNumber;
     }
-    if (useTransaction) {
+    if (testInTransaction) {
         command.startTransaction = true;
         command.autocommit = false;
     }
@@ -175,22 +160,22 @@ function makeTestOptions(primary, testCase, dbName, collName, useTransaction, us
         dbName,
         collName,
         useSession,
-        useTransaction
+        testInTransaction
     };
 }
 
 function runTest(
-    primary, testCase, testFunc, dbName, collName, {useTransaction, useRetryableWrite} = {}) {
-    const testOpts =
-        makeTestOptions(primary, testCase, dbName, collName, useTransaction, useRetryableWrite);
-    jsTest.log("Testing command " + tojson(testOpts.command));
+    primary, testCase, testFunc, dbName, collName, {testInTransaction, testAsRetryableWrite} = {}) {
+    const testOpts = makeTestOptions(
+        primary, testCase, dbName, collName, testInTransaction, testAsRetryableWrite);
+    jsTest.log("Testing testOpts: " + tojson(testOpts) + " with testFunc " + testFunc.name);
 
     if (testCase.explicitlyCreateCollection) {
         createCollectionAndInsertDocs(testOpts.primaryDB, collName, testCase.isCapped);
     }
 
     if (testCase.setUp) {
-        testCase.setUp(testOpts.primaryDB, collName);
+        testCase.setUp(testOpts.primaryDB, collName, testInTransaction);
     }
 
     testFunc(testCase, testOpts);
@@ -199,13 +184,30 @@ function runTest(
 function runCommand(testOpts, expectedError) {
     let res;
 
-    if (testOpts.useTransaction) {
-        // Test that the command doesn't throw an error but the transaction cannot commit.
-        testOpts.primaryConn.startTransaction();
+    if (testOpts.testInTransaction) {
+        // Since oplog entries for write commands inside a transaction are not generated until the
+        // commitTransaction command is run, here we assert on the response of the commitTransaction
+        // command instead.
         assert.commandWorked(testOpts.runAgainstAdminDb
                                  ? testOpts.primaryDB.adminCommand(testOpts.command)
                                  : testOpts.primaryDB.runCommand(testOpts.command));
-        res = testOpts.primaryConn.commitTransaction_forTesting();
+
+        let commitTxnCommand = {
+            commitTransaction: 1,
+            txnNumber: testOpts.command.txnNumber,
+            autocommit: false,
+            writeConcern: {w: "majority"}
+        };
+
+        // 'testWriteBlocksIfMigrationIsInBlocking' runs each write command with maxTimeMS attached
+        // and asserts that the command blocks and fails with MaxTimeMSExpired. So in the case of
+        // transactions, we want to assert that commitTransaction blocks and fails MaxTimeMSExpired
+        // instead.
+        if (testOpts.command.maxTimeMS) {
+            commitTxnCommand.maxTimeMS = testOpts.command.maxTimeMS;
+        }
+
+        res = testOpts.primaryDB.adminCommand(commitTxnCommand);
     } else {
         res = testOpts.runAgainstAdminDb ? testOpts.primaryDB.adminCommand(testOpts.command)
                                          : testOpts.primaryDB.runCommand(testOpts.command);
@@ -233,14 +235,11 @@ function testWriteIsRejectedIfSentAfterMigrationHasCommitted(testCase, testOpts)
     const tenantId = testOpts.dbName.split('_')[0];
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        recipientConnString: kRecipientConnString,
-        tenantId: tenantId,
-        readPreference: {mode: "primary"},
+        tenantId,
     };
 
-    const res = assert.commandWorked(
-        TenantMigrationUtil.startMigration(testOpts.primaryHost, migrationOpts));
-    assert.eq(res.state, "committed");
+    const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
+    assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
 
     runCommand(testOpts, ErrorCodes.TenantMigrationCommitted);
     testCase.assertCommandFailed(testOpts.primaryDB, testOpts.dbName, testOpts.collName);
@@ -253,24 +252,21 @@ function testWriteIsAcceptedIfSentAfterMigrationHasAborted(testCase, testOpts) {
     const tenantId = testOpts.dbName.split('_')[0];
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        recipientConnString: kRecipientConnString,
-        tenantId: tenantId,
-        readPreference: {mode: "primary"},
+        tenantId,
     };
 
     let abortFp = configureFailPoint(testOpts.primaryDB, "abortTenantMigrationAfterBlockingStarts");
-    const res = assert.commandWorked(
-        TenantMigrationUtil.startMigration(testOpts.primaryHost, migrationOpts));
-    assert.eq(res.state, "aborted");
+    const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
+    assert.eq(stateRes.state, TenantMigrationTest.State.kAborted);
     abortFp.off();
 
     // Wait until the in-memory migration state is updated after the migration has majority
     // committed the abort decision. Otherwise, the command below is expected to block and then get
     // rejected.
     assert.soon(() => {
-        const mtab =
+        const mtabs =
             testOpts.primaryDB.adminCommand({serverStatus: 1}).tenantMigrationAccessBlocker;
-        return mtab[tenantId].access === TenantMigrationUtil.accessState.kAllow;
+        return mtabs[tenantId].state === TenantMigrationTest.AccessState.kAborted;
     });
 
     runCommand(testOpts);
@@ -284,27 +280,24 @@ function testWriteBlocksIfMigrationIsInBlocking(testCase, testOpts) {
     const tenantId = testOpts.dbName.split('_')[0];
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        recipientConnString: kRecipientConnString,
-        tenantId: tenantId,
-        readPreference: {mode: "primary"},
+        tenantId,
     };
 
     let blockingFp =
         configureFailPoint(testOpts.primaryDB, "pauseTenantMigrationAfterBlockingStarts");
-    let migrationThread =
-        new Thread(TenantMigrationUtil.startMigration, testOpts.primaryHost, migrationOpts);
+
+    assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
 
     // Run the command after the migration enters the blocking state.
-    migrationThread.start();
     blockingFp.wait();
     testOpts.command.maxTimeMS = kMaxTimeMS;
     runCommand(testOpts, ErrorCodes.MaxTimeMSExpired);
 
     // Allow the migration to complete.
     blockingFp.off();
-    migrationThread.join();
-    const res = assert.commandWorked(migrationThread.returnData());
-    assert.eq(res.state, "committed");
+    const stateRes =
+        assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
+    assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
 
     testCase.assertCommandFailed(testOpts.primaryDB, testOpts.dbName, testOpts.collName);
 }
@@ -317,9 +310,7 @@ function testBlockedWriteGetsUnblockedAndRejectedIfMigrationCommits(testCase, te
     const tenantId = testOpts.dbName.split('_')[0];
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        recipientConnString: kRecipientConnString,
-        tenantId: tenantId,
-        readPreference: {mode: "primary"},
+        tenantId,
     };
 
     let blockingFp =
@@ -331,14 +322,12 @@ function testBlockedWriteGetsUnblockedAndRejectedIfMigrationCommits(testCase, te
             .count +
         1;
 
-    let migrationThread =
-        new Thread(TenantMigrationUtil.startMigration, testOpts.primaryHost, migrationOpts);
     let resumeMigrationThread =
         new Thread(resumeMigrationAfterBlockingWrite, testOpts.primaryHost, targetBlockedWrites);
 
     // Run the command after the migration enters the blocking state.
     resumeMigrationThread.start();
-    migrationThread.start();
+    assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
     blockingFp.wait();
 
     // The migration should unpause and commit after the write is blocked. Verify that the write is
@@ -347,9 +336,9 @@ function testBlockedWriteGetsUnblockedAndRejectedIfMigrationCommits(testCase, te
 
     // Verify that the migration succeeded.
     resumeMigrationThread.join();
-    migrationThread.join();
-    const res = assert.commandWorked(migrationThread.returnData());
-    assert.eq(res.state, "committed");
+    const stateRes =
+        assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
+    assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
 
     testCase.assertCommandFailed(testOpts.primaryDB, testOpts.dbName, testOpts.collName);
 }
@@ -362,9 +351,7 @@ function testBlockedWriteGetsUnblockedAndRejectedIfMigrationAborts(testCase, tes
     const tenantId = testOpts.dbName.split('_')[0];
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        recipientConnString: kRecipientConnString,
-        tenantId: tenantId,
-        readPreference: {mode: "primary"},
+        tenantId,
     };
 
     let blockingFp =
@@ -377,14 +364,12 @@ function testBlockedWriteGetsUnblockedAndRejectedIfMigrationAborts(testCase, tes
             .count +
         1;
 
-    let migrationThread =
-        new Thread(TenantMigrationUtil.startMigration, testOpts.primaryHost, migrationOpts);
     let resumeMigrationThread =
         new Thread(resumeMigrationAfterBlockingWrite, testOpts.primaryHost, targetBlockedWrites);
 
     // Run the command after the migration enters the blocking state.
+    assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
     resumeMigrationThread.start();
-    migrationThread.start();
     blockingFp.wait();
 
     // The migration should unpause and abort after the write is blocked. Verify that the write is
@@ -393,10 +378,10 @@ function testBlockedWriteGetsUnblockedAndRejectedIfMigrationAborts(testCase, tes
 
     // Verify that the migration aborted due to the simulated error.
     resumeMigrationThread.join();
-    migrationThread.join();
+    const stateRes =
+        assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
     abortFp.off();
-    const res = assert.commandWorked(migrationThread.returnData());
-    assert.eq(res.state, "aborted");
+    assert.eq(stateRes.state, TenantMigrationTest.State.kAborted);
 
     testCase.assertCommandFailed(testOpts.primaryDB, testOpts.dbName, testOpts.collName);
 }
@@ -451,9 +436,11 @@ const testCases = {
     _shardsvrCloneCatalogData: {skip: isNotRunOnUserDatabase},
     _shardsvrMovePrimary: {skip: isNotRunOnUserDatabase},
     _shardsvrShardCollection: {skip: isNotRunOnUserDatabase},
+    _shardsvrRenameCollection: {skip: isOnlySupportedOnShardedCluster},
     _transferMods: {skip: isNotRunOnUserDatabase},
     abortTransaction: {
-        skip: true,  // TODO (SERVER-49844)
+        skip: isNotWriteCommand  // aborting unprepared transaction doesn't create an abort oplog
+                                 // entry.
     },
     aggregate: {
         explicitlyCreateCollection: true,
@@ -472,18 +459,19 @@ const testCases = {
         }
     },
     appendOplogNote: {skip: isNotRunOnUserDatabase},
-    applyOps: {
-        explicitlyCreateCollection: true,
-        command: function(dbName, collName) {
-            return {applyOps: [{op: "i", ns: dbName + "." + collName, o: {_id: 0}}]};
-        },
-        assertCommandSucceeded: function(db, dbName, collName) {
-            assert.eq(countDocs(db, collName, {_id: 0}), 1);
-        },
-        assertCommandFailed: function(db, dbName, collName) {
-            assert.eq(countDocs(db, collName, {_id: 0}), 0);
-        }
-    },
+    // TODO (SERVER-51753): Handle applyOps running concurrently with a tenant migration.
+    // applyOps: {
+    //     explicitlyCreateCollection: true,
+    //     command: function(dbName, collName) {
+    //         return {applyOps: [{op: "i", ns: dbName + "." + collName, o: {_id: 0}}]};
+    //     },
+    //     assertCommandSucceeded: function(db, dbName, collName) {
+    //         assert.eq(countDocs(db, collName, {_id: 0}), 1);
+    //     },
+    //     assertCommandFailed: function(db, dbName, collName) {
+    //         assert.eq(countDocs(db, collName, {_id: 0}), 0);
+    //     }
+    // },
     authenticate: {skip: isAuthCommand},
     availableQueryOptions: {skip: isNotWriteCommand},
     buildInfo: {skip: isNotWriteCommand},
@@ -540,7 +528,31 @@ const testCases = {
     },
     collStats: {skip: isNotWriteCommand},
     commitTransaction: {
-        skip: true,  // TODO (SERVER-49844)
+        isTransactionCommand: true,
+        runAgainstAdminDb: true,
+        setUp: function(primaryDB, collName) {
+            assert.commandWorked(primaryDB.runCommand({
+                insert: collName,
+                documents: [kTestDoc],
+                txnNumber: NumberLong(kTxnNumber),
+                startTransaction: true,
+                autocommit: false
+            }));
+        },
+        command: function(dbName, collName) {
+            return {
+                commitTransaction: 1,
+                txnNumber: NumberLong(kTxnNumber),
+                autocommit: false,
+                writeConcern: {w: "majority"}
+            };
+        },
+        assertCommandSucceeded: function(db, dbName, collName) {
+            assert.eq(countDocs(db, collName), 1);
+        },
+        assertCommandFailed: function(db, dbName, collName) {
+            assert.eq(countDocs(db, collName), 0);
+        }
     },
     compact: {
         skip: isNotWriteCommand,  // TODO (SERVER-49834)
@@ -571,6 +583,7 @@ const testCases = {
     count: {skip: isNotWriteCommand},
     cpuload: {skip: isNotRunOnUserDatabase},
     create: {
+        testInTransaction: true,
         command: function(dbName, collName) {
             return {create: collName};
         },
@@ -582,7 +595,16 @@ const testCases = {
         }
     },
     createIndexes: {
+        testInTransaction: true,
         explicitlyCreateCollection: true,
+        setUp: function(primaryDB, collName, testInTransaction) {
+            if (testInTransaction) {
+                // Drop the collection that was explicitly created above since inside transactions
+                // the index to create must either be on a non-existing collection, or on a new
+                // empty collection created earlier in the same transaction.
+                assert.commandWorked(primaryDB.runCommand({drop: collName}));
+            }
+        },
         command: function(dbName, collName) {
             return {createIndexes: collName, indexes: [kTestIndex]};
         },
@@ -590,7 +612,7 @@ const testCases = {
             assert(indexExists(db, collName, kTestIndex));
         },
         assertCommandFailed: function(db, dbName, collName) {
-            assert(!indexExists(db, collName, kTestIndex));
+            assert(!collectionExists(db, collName) || !indexExists(db, collName, kTestIndex));
         }
     },
     createRole: {skip: isAuthCommand},
@@ -601,8 +623,8 @@ const testCases = {
     dbHash: {skip: isNotWriteCommand},
     dbStats: {skip: isNotWriteCommand},
     delete: {
-        isSupportedInTransaction: true,
-        isRetryableWriteCommand: true,
+        testInTransaction: true,
+        testAsRetryableWrite: true,
         setUp: insertTestDoc,
         command: function(dbName, collName) {
             return {delete: collName, deletes: [{q: kTestDoc, limit: 1}]};
@@ -681,8 +703,8 @@ const testCases = {
     filemd5: {skip: isNotWriteCommand},
     find: {skip: isNotWriteCommand},
     findAndModify: {
-        isSupportedInTransaction: true,
-        isRetryableWriteCommand: true,
+        testInTransaction: true,
+        testAsRetryableWrite: true,
         setUp: insertTestDoc,
         command: function(dbName, collName) {
             return {findAndModify: collName, query: kTestDoc, remove: true};
@@ -697,7 +719,6 @@ const testCases = {
     flushRouterConfig: {skip: isNotRunOnUserDatabase},
     fsync: {skip: isNotRunOnUserDatabase},
     fsyncUnlock: {skip: isNotRunOnUserDatabase},
-    geoSearch: {skip: isNotWriteCommand},
     getCmdLineOpts: {skip: isNotRunOnUserDatabase},
     getDatabaseVersion: {skip: isNotRunOnUserDatabase},
     getDefaultRWConcern: {skip: isNotRunOnUserDatabase},
@@ -718,8 +739,8 @@ const testCases = {
     hostInfo: {skip: isNotRunOnUserDatabase},
     httpClientRequest: {skip: isNotRunOnUserDatabase},
     insert: {
-        isSupportedInTransaction: true,
-        isRetryableWriteCommand: true,
+        testInTransaction: true,
+        testAsRetryableWrite: true,
         explicitlyCreateCollection: true,
         command: function(dbName, collName) {
             return {insert: collName, documents: [kTestDoc]};
@@ -845,8 +866,8 @@ const testCases = {
     top: {skip: isNotRunOnUserDatabase},
     unsetSharding: {skip: isNotRunOnUserDatabase},
     update: {
-        isSupportedInTransaction: true,
-        isRetryableWriteCommand: true,
+        testInTransaction: true,
+        testAsRetryableWrite: true,
         setUp: insertTestDoc,
         command: function(dbName, collName) {
             return {
@@ -896,31 +917,28 @@ for (const [testName, testFunc] of Object.entries(testFuncs)) {
             continue;
         }
 
-        runTest(primary,
-                testCase,
-                testFunc,
-                baseDbName + "Basic" +
-                    "_" + kTenantDefinedDbName,
-                kCollName);
+        runTest(
+            primary, testCase, testFunc, baseDbName + "Basic_" + kTenantDefinedDbName, kCollName);
 
-        // TODO (SERVER-49844): Test transactional writes during migration.
-        if (testCase.isSupportedInTransaction && testName == "noMigration") {
-            runTest(
-                primary, testCase, testFunc, baseDbName + "Txn", kCollName, {useTransaction: true});
-        }
-
-        if (testCase.isRetryableWriteCommand) {
+        if (testCase.testInTransaction) {
             runTest(primary,
                     testCase,
                     testFunc,
-                    baseDbName + "Retryable" +
-                        "_" + kTenantDefinedDbName,
+                    baseDbName + "Txn_" + kTenantDefinedDbName,
                     kCollName,
-                    {useRetryableWrite: true});
+                    {testInTransaction: true});
+        }
+
+        if (testCase.testAsRetryableWrite) {
+            runTest(primary,
+                    testCase,
+                    testFunc,
+                    baseDbName + "Retryable_" + kTenantDefinedDbName,
+                    kCollName,
+                    {testAsRetryableWrite: true});
         }
     }
 }
 
-donorRst.stopSet();
-recipientRst.stopSet();
+tenantMigrationTest.stop();
 })();

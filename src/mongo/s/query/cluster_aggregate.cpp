@@ -206,7 +206,7 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
     uassert(51028, "Cannot specify exchange option to a mongos", !request.getExchangeSpec());
     uassert(51143,
             "Cannot specify runtime constants option to a mongos",
-            !request.getRuntimeConstants());
+            !request.getLegacyRuntimeConstants());
     uassert(51089,
             str::stream() << "Internal parameter(s) [" << AggregationRequest::kNeedsMergeName
                           << ", " << AggregationRequest::kFromMongosName
@@ -289,7 +289,8 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
         // passthrough, we only need a bare minimum expression context anyway.
         invariant(targeter.policy ==
                   cluster_aggregation_planner::AggregationTargeter::kPassthrough);
-        expCtx = make_intrusive<ExpressionContext>(opCtx, nullptr, namespaces.executionNss);
+        expCtx = make_intrusive<ExpressionContext>(
+            opCtx, nullptr, namespaces.executionNss, boost::none, request.getLetParameters());
     }
 
     if (request.getExplain()) {
@@ -352,6 +353,12 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
         updateHostsTargetedMetrics(opCtx, namespaces.executionNss, cm, involvedNamespaces);
         // Report usage statistics for each stage in the pipeline.
         liteParsedPipeline.tickGlobalStageCounters();
+
+        // Add 'command' object to explain output.
+        if (expCtx->explain) {
+            explain_common::appendIfRoom(
+                request.serializeToCommandObj().toBson(), "command", result);
+        }
     }
     return status;
 }

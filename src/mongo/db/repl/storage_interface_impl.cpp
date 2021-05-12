@@ -59,6 +59,7 @@
 #include "mongo/db/exec/delete.h"
 #include "mongo/db/exec/update_stage.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
@@ -220,7 +221,12 @@ StorageInterfaceImpl::createCollectionForBulkLoading(
         getGlobalServiceContext()->makeClient(str::stream() << nss.ns() << " loader"));
     auto opCtx = cc().makeOperationContext();
 
-    documentValidationDisabled(opCtx.get()) = true;
+    // DocumentValidationSettings::kDisableInternalValidation is currently inert.
+    // But, it's logically ok to disable internal validation as this function gets called
+    // only during initial sync.
+    DocumentValidationSettings::get(opCtx.get())
+        .setFlags(DocumentValidationSettings::kDisableSchemaValidation |
+                  DocumentValidationSettings::kDisableInternalValidation);
 
     std::unique_ptr<AutoGetCollection> autoColl;
     // Retry if WCE.
@@ -474,7 +480,7 @@ Status StorageInterfaceImpl::createCollection(OperationContext* opCtx,
         AutoGetOrCreateDb databaseWriteGuard(opCtx, nss.db(), MODE_IX);
         auto db = databaseWriteGuard.getDb();
         invariant(db);
-        if (CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)) {
+        if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)) {
             return Status(ErrorCodes::NamespaceExists,
                           str::stream() << "Collection " << nss.ns() << " already exists.");
         }
@@ -496,24 +502,29 @@ Status StorageInterfaceImpl::createIndexesOnEmptyCollection(
     OperationContext* opCtx,
     const NamespaceString& nss,
     const std::vector<BSONObj>& secondaryIndexSpecs) {
-    return writeConflictRetry(opCtx, "createIndexesOnEmptyCollection", nss.ns(), [&] {
-        AutoGetCollection autoColl(opCtx, nss, fixLockModeForSystemDotViewsChanges(nss, MODE_IX));
-        WriteUnitOfWork wunit(opCtx);
-
-        for (auto&& spec : secondaryIndexSpecs) {
-            // Will error if collection is not empty.
-            auto secIndexSW =
-                autoColl.getWritableCollection()->getIndexCatalog()->createIndexOnEmptyCollection(
-                    opCtx, spec);
-            auto status = secIndexSW.getStatus();
-            if (!status.isOK()) {
-                return status;
-            }
-        }
-
-        wunit.commit();
+    if (!secondaryIndexSpecs.size())
         return Status::OK();
-    });
+
+    try {
+        writeConflictRetry(
+            opCtx, "StorageInterfaceImpl::createIndexesOnEmptyCollection", nss.ns(), [&] {
+                AutoGetCollection autoColl(
+                    opCtx, nss, fixLockModeForSystemDotViewsChanges(nss, MODE_X));
+                CollectionWriter collection(opCtx, nss);
+
+                WriteUnitOfWork wunit(opCtx);
+                // Use IndexBuildsCoordinator::createIndexesOnEmptyCollection() rather than
+                // IndexCatalog::createIndexOnEmptyCollection() as the former generates
+                // 'createIndexes' oplog entry for replicated writes.
+                IndexBuildsCoordinator::get(opCtx)->createIndexesOnEmptyCollection(
+                    opCtx, collection, secondaryIndexSpecs, false /* fromMigrate */);
+                wunit.commit();
+            });
+    } catch (DBException& ex) {
+        return ex.toStatus();
+    }
+
+    return Status::OK();
 }
 
 Status StorageInterfaceImpl::dropCollection(OperationContext* opCtx, const NamespaceString& nss) {
@@ -1260,7 +1271,9 @@ StatusWith<OptionalCollectionUUID> StorageInterfaceImpl::getCollectionUUID(
     return collection->uuid();
 }
 
-void StorageInterfaceImpl::setStableTimestamp(ServiceContext* serviceCtx, Timestamp snapshotName) {
+void StorageInterfaceImpl::setStableTimestamp(ServiceContext* serviceCtx,
+                                              Timestamp snapshotName,
+                                              bool force) {
     auto newStableTimestamp = snapshotName;
     // Hold the stable timestamp back if this failpoint is enabled.
     holdStableTimestampAtSpecificTimestamp.execute([&](const BSONObj& dataObj) {
@@ -1276,7 +1289,7 @@ void StorageInterfaceImpl::setStableTimestamp(ServiceContext* serviceCtx, Timest
     StorageEngine* storageEngine = serviceCtx->getStorageEngine();
     Timestamp prevStableTimestamp = storageEngine->getStableTimestamp();
 
-    storageEngine->setStableTimestamp(newStableTimestamp);
+    storageEngine->setStableTimestamp(newStableTimestamp, force);
 
     Checkpointer* checkpointer = Checkpointer::get(serviceCtx);
     if (checkpointer && !checkpointer->hasTriggeredFirstStableCheckpoint()) {
@@ -1297,7 +1310,7 @@ Timestamp StorageInterfaceImpl::recoverToStableTimestamp(OperationContext* opCtx
     // Pass an InterruptedDueToReplStateChange error to async callers waiting on the JournalFlusher
     // thread for durability.
     Status reason = Status(ErrorCodes::InterruptedDueToReplStateChange, "Rollback in progress.");
-    StorageControl::stopStorageControls(serviceContext, reason);
+    StorageControl::stopStorageControls(serviceContext, reason, /*forRestart=*/true);
 
     auto swStableTimestamp = serviceContext->getStorageEngine()->recoverToStableTimestamp(opCtx);
     fassert(31049, swStableTimestamp);
@@ -1339,13 +1352,13 @@ Status StorageInterfaceImpl::isAdminDbValid(OperationContext* opCtx) {
         return Status::OK();
     }
 
-    CollectionPtr usersCollection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
-        opCtx, AuthorizationManager::usersCollectionNamespace);
+    auto catalog = CollectionCatalog::get(opCtx);
+    CollectionPtr usersCollection =
+        catalog->lookupCollectionByNamespace(opCtx, AuthorizationManager::usersCollectionNamespace);
     const bool hasUsers =
         usersCollection && !Helpers::findOne(opCtx, usersCollection, BSONObj(), false).isNull();
-    CollectionPtr adminVersionCollection =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
-            opCtx, AuthorizationManager::versionCollectionNamespace);
+    CollectionPtr adminVersionCollection = catalog->lookupCollectionByNamespace(
+        opCtx, AuthorizationManager::versionCollectionNamespace);
     BSONObj authSchemaVersionDocument;
     if (!adminVersionCollection ||
         !Helpers::findOne(opCtx,
@@ -1428,12 +1441,8 @@ Timestamp StorageInterfaceImpl::getAllDurableTimestamp(ServiceContext* serviceCt
     return serviceCtx->getStorageEngine()->getAllDurableTimestamp();
 }
 
-Timestamp StorageInterfaceImpl::getOldestOpenReadTimestamp(ServiceContext* serviceCtx) const {
-    return serviceCtx->getStorageEngine()->getOldestOpenReadTimestamp();
-}
-
 Timestamp StorageInterfaceImpl::getPointInTimeReadTimestamp(OperationContext* opCtx) const {
-    auto readTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+    auto readTimestamp = opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx);
     invariant(readTimestamp);
     return *readTimestamp;
 }

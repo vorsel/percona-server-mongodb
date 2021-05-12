@@ -42,7 +42,7 @@
 #include "mongo/s/catalog/sharding_catalog_client_mock.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache_loader_mock.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
@@ -326,7 +326,7 @@ public:
     const UUID kDefaultUUID = UUID::gen();
     const OID kEpoch = OID::gen();
     const DatabaseType kDefaultDatabaseType =
-        DatabaseType(kNss.db().toString(), ShardId("0"), true, DatabaseVersion(kDefaultUUID, 1));
+        DatabaseType(kNss.db().toString(), ShardId("0"), true, DatabaseVersion(kDefaultUUID));
     const std::vector<ShardType> kShardList = {ShardType("0", "Host0:12345"),
                                                ShardType("1", "Host1:12345")};
 
@@ -380,10 +380,9 @@ public:
             return repl::OpTimeWith<std::vector<ShardType>>(_shards);
         }
 
-        StatusWith<std::vector<CollectionType>> getCollections(
+        std::vector<CollectionType> getCollections(
             OperationContext* opCtx,
-            const std::string* dbName,
-            repl::OpTime* optime,
+            StringData dbName,
             repl::ReadConcernLevel readConcernLevel) override {
             return _colls;
         }
@@ -414,12 +413,9 @@ public:
     }
 
     CollectionType makeCollectionType(UUID uuid, OID epoch) {
-        CollectionType coll;
-        coll.setNs(kNss);
-        coll.setEpoch(epoch);
+        CollectionType coll(kNss, epoch, Date_t::now(), uuid);
         coll.setKeyPattern(kShardKeyPattern.getKeyPattern());
         coll.setUnique(true);
-        coll.setUUID(uuid);
         return coll;
     }
 

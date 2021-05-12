@@ -209,7 +209,6 @@ let testCases = {
     forceerror: {skip: "does not return user data"},
     fsync: {skip: "does not return user data"},
     fsyncUnlock: {skip: "does not return user data"},
-    geoSearch: {skip: "not supported in mongos"},
     getCmdLineOpts: {skip: "does not return user data"},
     getDefaultRWConcern: {skip: "does not return user data"},
     getDiagnosticData: {skip: "does not return user data"},
@@ -549,20 +548,6 @@ for (let command of commands) {
         // with local read concern.
         profilerHasSingleMatchingEntryOrThrow({
             profileDB: donorShardSecondary.getDB(db),
-            filter: Object.extend({
-                "command.shardVersion": {"$exists": true},
-                "command.$readPreference": {"mode": "secondary"},
-                "command.readConcern": {"level": "local"},
-                "errCode": ErrorCodes.StaleConfig
-            },
-                                  commandProfile)
-        });
-
-        // Check that the recipient shard secondary received the request with local read concern
-        // and also returned stale shardVersion once, even though the mongos is fresh, because
-        // the secondary was stale.
-        profilerHasSingleMatchingEntryOrThrow({
-            profileDB: recipientShardSecondary.getDB(db),
             filter: Object.extend({
                 "command.shardVersion": {"$exists": true},
                 "command.$readPreference": {"mode": "secondary"},

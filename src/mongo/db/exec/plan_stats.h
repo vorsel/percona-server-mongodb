@@ -36,6 +36,7 @@
 
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/query/plan_summary_stats.h"
 #include "mongo/db/query/stage_types.h"
 #include "mongo/util/container_size_helper.h"
 #include "mongo/util/time_support.h"
@@ -54,6 +55,8 @@ struct SpecificStats {
     virtual SpecificStats* clone() const = 0;
 
     virtual uint64_t estimateObjectSizeInBytes() const = 0;
+
+    virtual void accumulate(PlanSummaryStats& summary) const {}
 };
 
 // Every stage has CommonStats.
@@ -152,6 +155,10 @@ struct BasePlanStageStats {
 
     // Per-stage place to stash additional information
     std::unique_ptr<SpecificStats> specific;
+
+    // Per-stage additional debug info which is opaque to the caller. Callers should not attempt to
+    // process/read this BSONObj other than for dumping the results to logs or back to the user.
+    BSONObj debugInfo;
 
     // The stats of the node's children.
     std::vector<std::unique_ptr<BasePlanStageStats<C, T>>> children;
@@ -609,14 +616,24 @@ struct ProjectionStats : public SpecificStats {
 
 struct SortStats : public SpecificStats {
     SortStats() = default;
+    SortStats(uint64_t limit, uint64_t maxMemoryUsageBytes)
+        : limit(limit), maxMemoryUsageBytes(maxMemoryUsageBytes) {}
 
-    SpecificStats* clone() const final {
+    SpecificStats* clone() const {
         SortStats* specific = new SortStats(*this);
         return specific;
     }
 
     uint64_t estimateObjectSizeInBytes() const {
         return sortPattern.objsize() + sizeof(*this);
+    }
+
+    void accumulate(PlanSummaryStats& summary) const final {
+        summary.hasSortStage = true;
+
+        if (spills > 0) {
+            summary.usedDisk = true;
+        }
     }
 
     // The pattern according to which we are sorting.
@@ -635,8 +652,11 @@ struct SortStats : public SpecificStats {
     // disk use is allowed.
     uint64_t totalDataSizeBytes = 0u;
 
-    // Whether we spilled data to disk during the execution of this query.
-    bool wasDiskUsed = false;
+    // The number of keys that we've sorted.
+    uint64_t keysSorted = 0u;
+
+    // The number of times that we spilled data to disk during the execution of this query.
+    uint64_t spills = 0u;
 };
 
 struct MergeSortStats : public SpecificStats {

@@ -287,13 +287,7 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToSpli
 
     const auto& shardStats = shardStatsStatus.getValue();
 
-    auto swCollections = Grid::get(opCtx)->catalogClient()->getCollections(opCtx, nullptr, nullptr);
-    if (!swCollections.isOK()) {
-        return swCollections.getStatus();
-    }
-
-    auto& collections = swCollections.getValue();
-
+    auto collections = Grid::get(opCtx)->catalogClient()->getCollections(opCtx, {});
     if (collections.empty()) {
         return SplitInfoVector{};
     }
@@ -307,7 +301,7 @@ StatusWith<SplitInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToSpli
             continue;
         }
 
-        const NamespaceString nss(coll.getNs());
+        const NamespaceString& nss(coll.getNss());
 
         auto candidatesStatus = _getSplitCandidatesForCollection(opCtx, nss, shardStats);
         if (candidatesStatus == ErrorCodes::NamespaceNotFound) {
@@ -365,13 +359,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToMo
         return MigrateInfoVector{};
     }
 
-    auto swCollections = Grid::get(opCtx)->catalogClient()->getCollections(opCtx, nullptr, nullptr);
-    if (!swCollections.isOK()) {
-        return swCollections.getStatus();
-    }
-
-    auto& collections = swCollections.getValue();
-
+    auto collections = Grid::get(opCtx)->catalogClient()->getCollections(opCtx, {});
     if (collections.empty()) {
         return MigrateInfoVector{};
     }
@@ -386,14 +374,16 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToMo
             continue;
         }
 
-        const NamespaceString nss(coll.getNs());
+        const NamespaceString& nss(coll.getNss());
 
-        if (!coll.getAllowBalance()) {
+        if (!coll.getAllowBalance() || !coll.getAllowMigrations()) {
             LOGV2_DEBUG(21851,
                         1,
                         "Not balancing collection {namespace}; explicitly disabled.",
                         "Not balancing explicitly disabled collection",
-                        "namespace"_attr = nss);
+                        "namespace"_attr = nss,
+                        "allowBalance"_attr = coll.getAllowBalance(),
+                        "allowMigrations"_attr = coll.getAllowMigrations());
             continue;
         }
 
@@ -428,14 +418,7 @@ StatusWith<MigrateInfoVector> BalancerChunkSelectionPolicyImpl::selectChunksToMo
 
     const auto& shardStats = shardStatsStatus.getValue();
 
-    // Validate collection information
-    auto swCollection = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss);
-    if (!swCollection.isOK()) {
-        return swCollection.getStatus();
-    }
-
-    const auto& collection = swCollection.getValue().value;
-
+    auto collection = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss);
     if (collection.getDropped()) {
         return Status(ErrorCodes::NamespaceNotFound,
                       str::stream() << "collection " << nss.ns() << " not found");

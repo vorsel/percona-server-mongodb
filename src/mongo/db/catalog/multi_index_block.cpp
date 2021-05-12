@@ -388,11 +388,25 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
         progress.set(CurOp::get(opCtx)->setProgress_inlock(curopMessage, numRecords));
     }
 
-    if (MONGO_unlikely(hangAfterSettingUpIndexBuild.shouldFail())) {
-        // Hang the build after the curOP info is set up.
-        LOGV2(20387, "Hanging index build due to failpoint 'hangAfterSettingUpIndexBuild'");
-        hangAfterSettingUpIndexBuild.pauseWhileSet();
-    }
+    hangAfterSettingUpIndexBuild.executeIf(
+        [buildUUID = _buildUUID](const BSONObj& data) {
+            // Hang the build after the curOP info is set up.
+            LOGV2(20387,
+                  "Hanging index build due to failpoint 'hangAfterSettingUpIndexBuild'",
+                  "buildUUID"_attr = buildUUID);
+            hangAfterSettingUpIndexBuild.pauseWhileSet();
+        },
+        [buildUUID = _buildUUID](const BSONObj& data) {
+            if (!buildUUID || !data.hasField("buildUUIDs")) {
+                return true;
+            }
+
+            auto buildUUIDs = data.getObjectField("buildUUIDs");
+            return std::any_of(
+                buildUUIDs.begin(), buildUUIDs.end(), [buildUUID = *buildUUID](const auto& elem) {
+                    return UUID::parse(elem.String()) == buildUUID;
+                });
+        });
 
     if (MONGO_unlikely(hangAfterSettingUpIndexBuildUnlocked.shouldFail())) {
         uassert(4585200, "failpoint may not be set on foreground indexes", isBackgroundBuilding());
@@ -459,7 +473,7 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
 
             // The external sorter is not part of the storage engine and therefore does not need a
             // WriteUnitOfWork to write keys.
-            uassertStatusOK(insertSingleDocumentForInitialSyncOrRecovery(opCtx, objToIndex, loc));
+            uassertStatusOK(_insert(opCtx, objToIndex, loc));
 
             _failPointHangDuringBuild(opCtx,
                                       &hangIndexBuildDuringCollectionScanPhaseAfterInsertion,
@@ -552,6 +566,10 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
 Status MultiIndexBlock::insertSingleDocumentForInitialSyncOrRecovery(OperationContext* opCtx,
                                                                      const BSONObj& doc,
                                                                      const RecordId& loc) {
+    return _insert(opCtx, doc, loc);
+}
+
+Status MultiIndexBlock::_insert(OperationContext* opCtx, const BSONObj& doc, const RecordId& loc) {
     invariant(!_buildIsCleanedUp);
     for (size_t i = 0; i < _indexes.size(); i++) {
         if (_indexes[i].filterExpression && !_indexes[i].filterExpression->matchesBSON(doc)) {
@@ -670,7 +688,7 @@ Status MultiIndexBlock::drainBackgroundWrites(
     ReadSourceScope readSourceScope(opCtx, readSource);
 
     const CollectionPtr& coll =
-        CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, _collectionUUID.get());
+        CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, _collectionUUID.get());
 
     // Drain side-writes table for each index. This only drains what is visible. Assuming intent
     // locks are held on the user collection, more writes can come in after this drain completes.
@@ -953,6 +971,7 @@ Status MultiIndexBlock::_failPointHangDuringBuild(OperationContext* opCtx,
                       "Hanging index build during collection scan phase",
                       "where"_attr = where,
                       "doc"_attr = doc,
+                      "iteration"_attr = iteration,
                       "buildUUID"_attr = _buildUUID);
 
                 fp->pauseWhileSet(opCtx);

@@ -31,12 +31,12 @@
 
 #include "mongo/db/exec/sbe/values/value.h"
 
-#include <pcrecpp.h>
-
+#include "mongo/db/exec/js_function.h"
 #include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/exec/sbe/values/value_builder.h"
 #include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/storage/key_string.h"
+#include "mongo/util/regex_util.h"
 
 namespace mongo {
 namespace sbe {
@@ -47,9 +47,59 @@ std::pair<TypeTags, Value> makeCopyKeyString(const KeyString::Value& inKey) {
     return {TypeTags::ksValue, bitcastFrom<KeyString::Value*>(k)};
 }
 
-std::pair<TypeTags, Value> makeCopyPcreRegex(const pcrecpp::RE& regex) {
-    auto ownedRegexVal = sbe::value::bitcastFrom<pcrecpp::RE*>(new pcrecpp::RE(regex));
-    return {TypeTags::pcreRegex, ownedRegexVal};
+std::pair<TypeTags, Value> makeNewPcreRegex(std::string_view pattern, std::string_view options) {
+    auto regex = std::make_unique<PcreRegex>(pattern, options);
+    if (regex->isValid()) {
+        return {TypeTags::pcreRegex, bitcastFrom<PcreRegex*>(regex.release())};
+    }
+    return {TypeTags::Nothing, 0};
+}
+
+std::pair<TypeTags, Value> makeCopyPcreRegex(const PcreRegex& regex) {
+    if (regex.isValid()) {
+        auto regexCopy = std::make_unique<PcreRegex>(regex);
+        invariant(regexCopy->isValid());
+        return {TypeTags::pcreRegex, bitcastFrom<PcreRegex*>(regexCopy.release())};
+    }
+    return {TypeTags::Nothing, 0};
+}
+
+void PcreRegex::_compile() {
+    const auto pcreOptions = regex_util::flagsToPcreOptions(_options.c_str(), false).all_options();
+    const char* compile_error;
+    int eoffset;
+    _pcrePtr = pcre_compile(_pattern.c_str(), pcreOptions, &compile_error, &eoffset, nullptr);
+    _isValid = (_pcrePtr != nullptr);
+}
+
+int PcreRegex::execute(std::string_view stringView, int startPos, std::vector<int>& buf) {
+    invariant(_isValid);
+    return pcre_exec(_pcrePtr,
+                     nullptr,
+                     stringView.data(),
+                     stringView.length(),
+                     startPos,
+                     0,
+                     &(buf.front()),
+                     buf.size());
+}
+
+size_t PcreRegex::getNumberCaptures() const {
+    int numCaptures;
+    invariant(_isValid);
+    pcre_fullinfo(_pcrePtr, nullptr, PCRE_INFO_CAPTURECOUNT, &numCaptures);
+    invariant(numCaptures >= 0);
+    return static_cast<size_t>(numCaptures);
+}
+
+std::pair<TypeTags, Value> makeCopyJsFunction(const JsFunction& jsFunction) {
+    auto ownedJsFunction = sbe::value::bitcastFrom<JsFunction*>(new JsFunction(jsFunction));
+    return {TypeTags::jsFunction, ownedJsFunction};
+}
+
+std::pair<TypeTags, Value> makeCopyShardFilterer(const ShardFilterer& filterer) {
+    auto filter = sbe::value::bitcastFrom<ShardFilterer*>(filterer.clone().release());
+    return {TypeTags::shardFilterer, filter};
 }
 
 void releaseValue(TypeTags tag, Value val) noexcept {
@@ -83,6 +133,12 @@ void releaseValue(TypeTags tag, Value val) noexcept {
             break;
         case TypeTags::pcreRegex:
             delete getPcreRegexView(val);
+            break;
+        case TypeTags::jsFunction:
+            delete getJsFunctionView(val);
+            break;
+        case TypeTags::shardFilterer:
+            delete getShardFiltererView(val);
             break;
         default:
             break;
@@ -160,6 +216,15 @@ void writeTagToStream(T& stream, const TypeTags tag) {
             break;
         case TypeTags::timeZoneDB:
             stream << "timeZoneDB";
+            break;
+        case TypeTags::RecordId:
+            stream << "RecordId";
+            break;
+        case TypeTags::jsFunction:
+            stream << "jsFunction";
+            break;
+        case TypeTags::shardFilterer:
+            stream << "shardFilterer";
             break;
         default:
             stream << "unknown tag";
@@ -360,14 +425,24 @@ void writeValueToStream(T& stream, TypeTags tag, Value val) {
         }
         case value::TypeTags::pcreRegex: {
             auto regex = getPcreRegexView(val);
-            // TODO: Also include the regex flags.
-            stream << "/" << regex->pattern() << "/";
+            stream << "/" << regex->pattern() << "/" << regex->options();
             break;
         }
         case value::TypeTags::timeZoneDB: {
             auto tzdb = getTimeZoneDBView(val);
             auto timeZones = tzdb->getTimeZoneStrings();
             stream << "TimeZoneDatabase(" + timeZones.front() + "..." + timeZones.back() + ")";
+            break;
+        }
+        case value::TypeTags::RecordId:
+            stream << "RecordId(" << bitcastTo<int64_t>(val) << ")";
+            break;
+        case value::TypeTags::jsFunction:
+            // TODO: Also include code.
+            stream << "jsFunction";
+            break;
+        case value::TypeTags::shardFilterer: {
+            stream << "ShardFilterer";
             break;
         }
         default:
@@ -401,6 +476,7 @@ BSONType tagToType(TypeTags tag) noexcept {
             return BSONType::EOO;
         case TypeTags::NumberInt32:
             return BSONType::NumberInt;
+        case TypeTags::RecordId:
         case TypeTags::NumberInt64:
             return BSONType::NumberLong;
         case TypeTags::NumberDouble:
@@ -449,6 +525,7 @@ std::size_t hashValue(TypeTags tag, Value val) noexcept {
     switch (tag) {
         case TypeTags::NumberInt32:
             return absl::Hash<int32_t>{}(bitcastTo<int32_t>(val));
+        case TypeTags::RecordId:
         case TypeTags::NumberInt64:
             return absl::Hash<int64_t>{}(bitcastTo<int64_t>(val));
         case TypeTags::NumberDouble: {
@@ -695,6 +772,9 @@ std::pair<TypeTags, Value> compareValue(TypeTags lhsTag,
     } else if (lhsTag == TypeTags::Nothing && rhsTag == TypeTags::Nothing) {
         // Special case for Nothing in a hash table (group) and sort comparison.
         return {TypeTags::NumberInt32, bitcastFrom<int32_t>(0)};
+    } else if (lhsTag == TypeTags::RecordId && rhsTag == TypeTags::RecordId) {
+        auto result = compareHelper(bitcastTo<int64_t>(lhsValue), bitcastTo<int64_t>(rhsValue));
+        return {TypeTags::NumberInt32, bitcastFrom<int32_t>(result)};
     } else {
         // Different types.
         auto result =
@@ -840,6 +920,35 @@ void readKeyStringValueIntoAccessors(const KeyString::Value& keyString,
     valBuilder.readValues(accessors);
 }
 
+std::pair<TypeTags, Value> arrayToSet(TypeTags tag, Value val) {
+    if (!isArray(tag)) {
+        return {value::TypeTags::Nothing, 0};
+    }
+    switch (tag) {
+        case TypeTags::ArraySet: {
+            return makeCopyArraySet(*getArraySetView(val));
+        }
+        case TypeTags::Array:
+        case TypeTags::bsonArray: {
+            auto [setTag, setVal] = makeNewArraySet();
+            ValueGuard guard{setTag, setVal};
+            auto setView = getArraySetView(setVal);
+
+            auto arrIter = ArrayEnumerator{tag, val};
+            while (!arrIter.atEnd()) {
+                auto [elTag, elVal] = arrIter.getViewOfValue();
+                auto [copyTag, copyVal] = copyValue(elTag, elVal);
+                setView->push_back(copyTag, copyVal);
+                arrIter.advance();
+            }
+            guard.reset();
+            return {setTag, setVal};
+        }
+
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
 }  // namespace value
 }  // namespace sbe
 }  // namespace mongo

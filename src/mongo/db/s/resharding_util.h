@@ -40,7 +40,7 @@
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/s/catalog_cache.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/s/resharded_chunk_gen.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/write_ops/batched_command_request.h"
@@ -100,27 +100,6 @@ UUID getCollectionUUIDFromChunkManger(const NamespaceString& nss, const ChunkMan
  *      <db>.system.resharding.<existing collection's UUID>
  */
 NamespaceString constructTemporaryReshardingNss(StringData db, const UUID& sourceUuid);
-
-/**
- * Constructs a BatchedCommandRequest with batch type 'Insert'.
- */
-BatchedCommandRequest buildInsertOp(const NamespaceString& nss, std::vector<BSONObj> docs);
-
-/**
- * Constructs a BatchedCommandRequest with batch type 'Update'.
- */
-BatchedCommandRequest buildUpdateOp(const NamespaceString& nss,
-                                    const BSONObj& query,
-                                    const BSONObj& update,
-                                    bool upsert,
-                                    bool multi);
-
-/**
- * Constructs a BatchedCommandRequest with batch type 'Delete'.
- */
-BatchedCommandRequest buildDeleteOp(const NamespaceString& nss,
-                                    const BSONObj& query,
-                                    bool multiDelete);
 
 /**
  * Sends _flushRoutingTableCacheUpdatesWithWriteConcern to a list of shards. Throws if one of the
@@ -205,15 +184,6 @@ std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForReshard
 boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
                                               const NamespaceString& sourceNss,
                                               const BSONObj& fullDocument);
-
-/**
- * Creates pipeline for filtering collection data matching the recipient shard.
- */
-std::unique_ptr<Pipeline, PipelineDeleter> createAggForCollectionCloning(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const ShardKeyPattern& newShardKeyPattern,
-    const NamespaceString& sourceNss,
-    const ShardId& recipientShard);
 
 /**
  * Sentinel oplog format:

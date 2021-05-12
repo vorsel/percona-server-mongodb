@@ -14,10 +14,13 @@ const expectedParamDefaults = {
     internalQueryPlanEvaluationWorks: 10000,
     internalQueryPlanEvaluationCollFraction: 0.3,
     internalQueryPlanEvaluationMaxResults: 101,
+    internalQueryCacheMaxEntriesPerCollection: 5000,
+    // This is a deprecated alias for "internalQueryCacheMaxEntriesPerCollection".
     internalQueryCacheSize: 5000,
     internalQueryCacheEvictionRatio: 10.0,
     internalQueryCacheWorksGrowthCoefficient: 2.0,
     internalQueryCacheDisableInactiveEntries: false,
+    internalQueryCacheMaxSizeBytesBeforeStripDebugInfo: 512 * 1024 * 1024,
     internalQueryPlannerMaxIndexedSolutions: 64,
     internalQueryEnumerationMaxOrSolutions: 10,
     internalQueryEnumerationMaxIntersectPerAnd: 3,
@@ -34,6 +37,7 @@ const expectedParamDefaults = {
     internalDocumentSourceLookupCacheSizeBytes: 100 * 1024 * 1024,
     internalLookupStageIntermediateDocumentMaxSizeBytes: 100 * 1024 * 1024,
     internalDocumentSourceGroupMaxMemoryBytes: 100 * 1024 * 1024,
+    internalPipelineLengthLimit: 1000,
     internalQueryMaxJsEmitBytes: 100 * 1024 * 1024,
     internalQueryMaxPushBytes: 100 * 1024 * 1024,
     internalQueryMaxAddToSetBytes: 100 * 1024 * 1024,
@@ -86,9 +90,17 @@ assertSetParameterSucceeds("internalQueryPlanEvaluationMaxResults", 11);
 assertSetParameterSucceeds("internalQueryPlanEvaluationMaxResults", 0);
 assertSetParameterFails("internalQueryPlanEvaluationMaxResults", -1);
 
+assertSetParameterSucceeds("internalQueryCacheMaxEntriesPerCollection", 1);
+assertSetParameterSucceeds("internalQueryCacheMaxEntriesPerCollection", 0);
+assertSetParameterFails("internalQueryCacheMaxEntriesPerCollection", -1);
+// "internalQueryCacheSize" is a deprecated alias for "internalQueryCacheMaxEntriesPerCollection".
 assertSetParameterSucceeds("internalQueryCacheSize", 1);
 assertSetParameterSucceeds("internalQueryCacheSize", 0);
 assertSetParameterFails("internalQueryCacheSize", -1);
+
+assertSetParameterSucceeds("internalQueryCacheMaxSizeBytesBeforeStripDebugInfo", 1);
+assertSetParameterSucceeds("internalQueryCacheMaxSizeBytesBeforeStripDebugInfo", 0);
+assertSetParameterFails("internalQueryCacheMaxSizeBytesBeforeStripDebugInfo", -1);
 
 assertSetParameterSucceeds("internalQueryCacheEvictionRatio", 1.0);
 assertSetParameterSucceeds("internalQueryCacheEvictionRatio", 0.0);

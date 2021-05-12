@@ -1,14 +1,11 @@
 // SERVER-13039. Confirm that we return the right results when $text is
 // inside an $or.
-// @tags: [
-//   sbe_incompatible,
-// ]
 
 var t = db.jstests_fts6;
 t.drop();
 
-t.ensureIndex({a: 1});
-t.ensureIndex({b: "text"});
+t.createIndex({a: 1});
+t.createIndex({b: "text"});
 
 t.save({_id: 1, a: 0});
 t.save({_id: 2, a: 0, b: "foo"});

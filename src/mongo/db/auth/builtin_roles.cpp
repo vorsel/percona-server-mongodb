@@ -189,16 +189,17 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::listSessions // clusterManager gets this also
         << ActionType::listShards  // clusterManager gets this also
         << ActionType::netstat
+        << ActionType::operationMetrics
         << ActionType::replSetGetConfig  // clusterManager gets this also
         << ActionType::replSetGetStatus  // clusterManager gets this also
-        << ActionType::serverStatus 
+        << ActionType::serverStatus
         << ActionType::top
         << ActionType::useUUID
         << ActionType::inprog
         << ActionType::shardingState;
 
     // clusterMonitor role actions that target a database (or collection) resource
-    clusterMonitorRoleDatabaseActions 
+    clusterMonitorRoleDatabaseActions
         << ActionType::collStats  // dbAdmin gets this also
         << ActionType::dbStats  // dbAdmin gets this also
         << ActionType::getDatabaseVersion
@@ -240,7 +241,7 @@ MONGO_INITIALIZER(AuthorizationBuiltinRoles)(InitializerContext* context) {
         << ActionType::replSetGetStatus  // clusterMonitor gets this also
         << ActionType::replSetStateChange
         << ActionType::resync  // hostManager gets this also
-        << ActionType::addShard 
+        << ActionType::addShard
         << ActionType::removeShard
         << ActionType::listSessions  // clusterMonitor gets this also
         << ActionType::listShards  // clusterMonitor gets this also
@@ -478,6 +479,10 @@ void addClusterAdminPrivileges(PrivilegeVector* privileges) {
     addClusterManagerPrivileges(privileges);
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyNormalResource(), ActionType::dropDatabase));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forAnyResource(), ActionType::importCollection));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forAnyResource(), ActionType::exportCollection));
 }
 
 

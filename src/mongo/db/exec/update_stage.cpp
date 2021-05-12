@@ -48,6 +48,8 @@
 #include "mongo/db/query/explain.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/operation_sharding_state.h"
+#include "mongo/db/s/resharding_util.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/update/path_support.h"
@@ -270,8 +272,8 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
 
                 Snapshotted<RecordData> snap(oldObj.snapshotId(), oldRec);
 
-                if (_isUserInitiatedWrite && checkUpdateChangesShardKeyFields(oldObj) &&
-                    !args.preImageDoc) {
+                if (_isUserInitiatedWrite &&
+                    checkUpdateChangesShardKeyFields(boost::none, oldObj) && !args.preImageDoc) {
                     args.preImageDoc = oldObj.value().getOwned();
                 }
 
@@ -295,7 +297,7 @@ BSONObj UpdateStage::transformAndUpdate(const Snapshotted<BSONObj>& oldObj, Reco
                     newObj.objsize() <= BSONObjMaxUserSize);
 
             if (!request->explain()) {
-                if (_isUserInitiatedWrite && checkUpdateChangesShardKeyFields(oldObj) &&
+                if (_isUserInitiatedWrite && checkUpdateChangesShardKeyFields(newObj, oldObj) &&
                     !args.preImageDoc) {
                     args.preImageDoc = oldObj.value().getOwned();
                 }
@@ -567,14 +569,58 @@ PlanStage::StageState UpdateStage::prepareToRetryWSM(WorkingSetID idToRetry, Wor
     return NEED_YIELD;
 }
 
-bool UpdateStage::checkUpdateChangesShardKeyFields(const Snapshotted<BSONObj>& oldObj) {
+bool UpdateStage::wasReshardingKeyUpdated(const ScopedCollectionDescription& collDesc,
+                                          const BSONObj& newObj,
+                                          const Snapshotted<BSONObj>& oldObj) {
+    auto reshardingKeyPattern = collDesc.getReshardingKeyIfShouldForwardOps();
+    if (!reshardingKeyPattern)
+        return false;
+
+    auto oldShardKey = reshardingKeyPattern->extractShardKeyFromDoc(oldObj.value());
+    auto newShardKey = reshardingKeyPattern->extractShardKeyFromDoc(newObj);
+
+    if (newShardKey.binaryEqual(oldShardKey))
+        return false;
+
+    // If this node is a replica set primary node, an attempted update to the shard key value must
+    // either be a retryable write or inside a transaction.
+    // If this node is a replica set secondary node, we can skip validation.
+    uassert(ErrorCodes::IllegalOperation,
+            "Must run update to resharding key field in a multi-statement transaction or with "
+            "retryWrites: true.",
+            opCtx()->getTxnNumber() || !opCtx()->writesAreReplicated());
+
+    auto oldRecipShard = getDestinedRecipient(opCtx(), collection()->ns(), oldObj.value());
+    auto newRecipShard = getDestinedRecipient(opCtx(), collection()->ns(), newObj);
+
+    uassert(WouldChangeOwningShardInfo(oldObj.value(), newObj, false /* upsert */),
+            "This update would cause the doc to change owning shards under the new shard key",
+            oldRecipShard == newRecipShard);
+
+    return true;
+}
+
+bool UpdateStage::checkUpdateChangesShardKeyFields(const boost::optional<BSONObj>& newObjCopy,
+                                                   const Snapshotted<BSONObj>& oldObj) {
     auto* const css = CollectionShardingState::get(opCtx(), collection()->ns());
     const auto collDesc = css->getCollectionDescription(opCtx());
+
+    // Calling mutablebson::Document::getObject() renders a full copy of the updated document. This
+    // can be expensive for larger documents, so we skip calling it when the collection isn't even
+    // sharded.
     if (!collDesc.isSharded()) {
         return false;
     }
 
-    auto newObj = _doc.getObject();
+    const auto& newObj = newObjCopy ? *newObjCopy : _doc.getObject();
+    return wasExistingShardKeyUpdated(css, collDesc, newObj, oldObj) ||
+        wasReshardingKeyUpdated(collDesc, newObj, oldObj);
+}
+
+bool UpdateStage::wasExistingShardKeyUpdated(CollectionShardingState* css,
+                                             const ScopedCollectionDescription& collDesc,
+                                             const BSONObj& newObj,
+                                             const Snapshotted<BSONObj>& oldObj) {
     const ShardKeyPattern shardKeyPattern(collDesc.getKeyPattern());
     auto oldShardKey = shardKeyPattern.extractShardKeyFromDoc(oldObj.value());
     auto newShardKey = shardKeyPattern.extractShardKeyFromDoc(newObj);

@@ -671,7 +671,7 @@ public:
         invariantWTOK(_cursor->get_value(_cursor, &value));
 
         auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
-        metricsCollector.incrementOneDocRead(_opCtx, value.size);
+        metricsCollector.incrementOneDocRead(value.size);
 
         return {{id, {static_cast<const char*>(value.data), static_cast<int>(value.size)}}};
     }
@@ -1030,10 +1030,13 @@ bool WiredTigerRecordStore::findRecord(OperationContext* opCtx,
         return false;
     }
     invariantWTOK(ret);
-    *out = _getData(curwrap);
 
     auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
-    metricsCollector.incrementOneDocRead(opCtx, out->size());
+    metricsCollector.incrementOneCursorSeek();
+
+    *out = _getData(curwrap);
+
+    metricsCollector.incrementOneDocRead(out->size());
 
     return true;
 }
@@ -1056,6 +1059,9 @@ void WiredTigerRecordStore::deleteRecord(OperationContext* opCtx, const RecordId
     int ret = wiredTigerPrepareConflictRetry(opCtx, [&] { return c->search(c); });
     invariantWTOK(ret);
 
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementOneCursorSeek();
+
     WT_ITEM old_value;
     ret = c->get_value(c, &old_value);
     invariantWTOK(ret);
@@ -1065,7 +1071,6 @@ void WiredTigerRecordStore::deleteRecord(OperationContext* opCtx, const RecordId
     ret = WT_OP_CHECK(wiredTigerCursorRemove(opCtx, c));
     invariantWTOK(ret);
 
-    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
     metricsCollector.incrementOneDocWritten(old_length);
 
     _changeNumRecords(opCtx, -1);
@@ -1173,6 +1178,9 @@ void WiredTigerRecordStore::_positionAtFirstRecordId(OperationContext* opCtx,
                 opCtx, [&] { return cursor->search_near(cursor, &cmp); });
             invariantWTOK(ret);
 
+            auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+            metricsCollector.incrementOneCursorSeek();
+
             // This is (or was) the first recordId, so it should never be the case that we have a
             // RecordId before that.
             invariant(cmp >= 0);
@@ -1216,11 +1224,15 @@ int64_t WiredTigerRecordStore::_cappedDeleteAsNeeded_inlock(OperationContext* op
         bool positioned = false;  // Mark if the cursor is on the first key
         RecordId savedFirstKey;
 
+        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+
         // If we know where the first record is, go to it
         if (_cappedFirstRecord != RecordId()) {
             setKey(truncateEnd, _cappedFirstRecord);
             ret = wiredTigerPrepareConflictRetry(opCtx,
                                                  [&] { return truncateEnd->search(truncateEnd); });
+            metricsCollector.incrementOneCursorSeek();
+
             if (ret == 0) {
                 positioned = true;
                 savedFirstKey = _cappedFirstRecord;
@@ -1241,6 +1253,7 @@ int64_t WiredTigerRecordStore::_cappedDeleteAsNeeded_inlock(OperationContext* op
 
             WT_ITEM old_value;
             invariantWTOK(truncateEnd->get_value(truncateEnd, &old_value));
+            metricsCollector.incrementOneDocRead(old_value.size);
 
             ++docsRemoved;
             sizeSaved += old_value.size;
@@ -1291,7 +1304,10 @@ int64_t WiredTigerRecordStore::_cappedDeleteAsNeeded_inlock(OperationContext* op
                     if (--toRemove > 0) {
                         firstRecordId = getKey(truncateEnd);
                     }
+                    WT_ITEM old_value;
+                    ret = truncateEnd->get_value(truncateEnd, &old_value);
                     invariantWTOK(wiredTigerCursorRemove(opCtx, truncateEnd));
+                    metricsCollector.incrementOneDocWritten(old_value.size);
                 }
                 ret = 0;
             } else {
@@ -1305,6 +1321,12 @@ int64_t WiredTigerRecordStore::_cappedDeleteAsNeeded_inlock(OperationContext* op
                 // operation faster.
                 _positionAtFirstRecordId(opCtx, truncateStart, savedFirstKey, true);
                 ret = session->truncate(session, nullptr, truncateStart, truncateEnd, nullptr);
+                // We do not count the truncate operation in the write metrics because truncate
+                // is very efficient. We do count the reads performed above (that determine the
+                // number of documents to delete) because reading at the beginning of a capped
+                // collection is the most expensive part due to the data almost always being out of
+                // cache. By counting the read operations but not the truncate operation we are able
+                // to represent the cost of this operation most accurately.
             }
 
             invariantWTOK(ret);
@@ -1404,6 +1426,29 @@ void WiredTigerRecordStore::reclaimOplog(OperationContext* opCtx, Timestamp mayT
                               "stone_lastRecord"_attr = stone->lastRecord);
             }
 
+            // It is necessary that there exists a record after the stone but before or including
+            // the mayTruncateUpTo point.  Since the mayTruncateUpTo point may fall between
+            // records, the stone check is not sufficient.
+            setKey(cursor, stone->lastRecord);
+            ret = wiredTigerPrepareConflictRetry(opCtx, [&] { return cursor->search(cursor); });
+            invariantWTOK(ret);
+            ret = wiredTigerPrepareConflictRetry(opCtx, [&] { return cursor->next(cursor); });
+            if (ret == WT_NOTFOUND) {
+                LOGV2_DEBUG(5140900, 0, "Will not truncate entire oplog");
+                return;
+            }
+            invariantWTOK(ret);
+            RecordId nextRecord = getKey(cursor);
+            if (static_cast<std::uint64_t>(nextRecord.repr()) > mayTruncateUpTo.asULL()) {
+                LOGV2_DEBUG(5140901,
+                            0,
+                            "Cannot truncate as there are no oplog entries after the stone but "
+                            "before the truncate-up-to point",
+                            "nextRecord"_attr = Timestamp(nextRecord.repr()),
+                            "mayTruncateUpTo"_attr = mayTruncateUpTo);
+                return;
+            }
+            invariantWTOK(cursor->reset(cursor));
             setKey(cursor, stone->lastRecord);
             invariantWTOK(session->truncate(session, nullptr, nullptr, cursor, nullptr));
             _changeNumRecords(opCtx, -stone->records);
@@ -1512,8 +1557,10 @@ Status WiredTigerRecordStore::_insertRecords(OperationContext* opCtx,
 
         // Increment metrics for each insert separately, as opposed to outside of the loop. The API
         // requires that each record be accounted for separately.
-        auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
-        metricsCollector.incrementOneDocWritten(value.size);
+        if (!_isOplog) {
+            auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+            metricsCollector.incrementOneDocWritten(value.size);
+        }
     }
 
     _changeNumRecords(opCtx, nRecords);
@@ -1614,6 +1661,9 @@ Status WiredTigerRecordStore::updateRecord(OperationContext* opCtx,
     int ret = wiredTigerPrepareConflictRetry(opCtx, [&] { return c->search(c); });
     invariantWTOK(ret);
 
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementOneCursorSeek();
+
     WT_ITEM old_value;
     ret = c->get_value(c, &old_value);
     invariantWTOK(ret);
@@ -1635,7 +1685,6 @@ Status WiredTigerRecordStore::updateRecord(OperationContext* opCtx,
     const int kMaxEntries = 16;
     const int kMaxDiffBytes = len / 10;
 
-    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
     bool skip_update = false;
     if (!_isLogged && len > kMinLengthForDiff && len <= old_length + kMaxDiffBytes) {
         int nentries = kMaxEntries;
@@ -2233,7 +2282,7 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::next() {
     invariantWTOK(c->get_value(c, &value));
 
     auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
-    metricsCollector.incrementOneDocRead(_opCtx, value.size);
+    metricsCollector.incrementOneDocRead(value.size);
 
     _lastReturnedId = id;
     return {{id, {static_cast<const char*>(value.data), static_cast<int>(value.size)}}};
@@ -2263,11 +2312,13 @@ boost::optional<Record> WiredTigerRecordStoreCursorBase::seekExact(const RecordI
     }
     invariantWTOK(seekRet);
 
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
+    metricsCollector.incrementOneCursorSeek();
+
     WT_ITEM value;
     invariantWTOK(c->get_value(c, &value));
 
-    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
-    metricsCollector.incrementOneDocRead(_opCtx, value.size);
+    metricsCollector.incrementOneDocRead(value.size);
 
     _lastReturnedId = id;
     _eof = false;
@@ -2510,6 +2561,9 @@ void WiredTigerRecordStorePrefixedCursor::initCursorToBeginning() {
         return;
     }
     invariantWTOK(err);
+
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(_opCtx);
+    metricsCollector.incrementOneCursorSeek();
 
     RecordId recordId;
     if (_forward) {

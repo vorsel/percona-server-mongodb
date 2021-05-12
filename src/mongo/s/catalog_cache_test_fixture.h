@@ -34,7 +34,6 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/catalog/type_shard.h"
-#include "mongo/s/catalog_cache.h"
 #include "mongo/s/sharding_router_test_fixture.h"
 
 namespace mongo {
@@ -120,7 +119,7 @@ protected:
         NamespaceString nss,
         const BSONObj& shardKey,
         boost::optional<std::string> primaryShardId = boost::none,
-        boost::optional<UUID> uuid = boost::none);
+        UUID uuid = UUID::gen());
 
     /**
      * Mocks network responses for loading a sharded database and collection from the config server.
@@ -128,8 +127,8 @@ protected:
     void expectGetDatabase(NamespaceString nss, std::string primaryShard = "0");
     void expectGetCollection(NamespaceString nss,
                              OID epoch,
-                             const ShardKeyPattern& shardKeyPattern,
-                             boost::optional<UUID> uuid = boost::none);
+                             UUID uuid,
+                             const ShardKeyPattern& shardKeyPattern);
 
     const HostAndPort kConfigHostAndPort{"DummyConfig", 1234};
 };

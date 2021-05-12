@@ -51,7 +51,8 @@ public:
         Response typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::CommandNotSupported,
                     "donorStartMigration command not enabled",
-                    repl::enableTenantMigrations);
+                    repl::feature_flags::gTenantMigrations.isEnabled(
+                        serverGlobalParams.featureCompatibility));
 
             const RequestType& requestBody = request();
 
@@ -67,9 +68,24 @@ public:
                     ->lookupServiceByName(TenantMigrationDonorService::kServiceName);
             auto donor = TenantMigrationDonorService::Instance::getOrCreate(
                 opCtx, donorService, donorStateDoc);
+
+            // If the conflict is discovered here, it implies that there is an existing instance
+            // with the same migrationId but different options (e.g. tenantId or
+            // recipientConnectionString or readPreference).
             uassertStatusOK(donor->checkIfOptionsConflict(donorStateDoc));
 
-            auto durableState = donor->getDurableState(opCtx);
+            auto durableState = [&] {
+                try {
+                    return donor->getDurableState(opCtx);
+                } catch (ExceptionFor<ErrorCodes::ConflictingOperationInProgress>&) {
+                    // The conflict is discovered while inserting the donor instance's state doc.
+                    // This implies that there is no other instance with the same migrationId, but
+                    // there is another instance with the same tenantId. Therefore, the instance
+                    // above was created by this command, so remove it.
+                    donorService->releaseInstance(donorStateDoc["_id"].wrap());
+                    throw;
+                }
+            }();
 
             auto response = Response(durableState.state);
             if (durableState.abortReason) {
@@ -118,7 +134,8 @@ public:
         void typedRun(OperationContext* opCtx) {
             uassert(ErrorCodes::CommandNotSupported,
                     "donorForgetMigration command not enabled",
-                    repl::enableTenantMigrations);
+                    repl::feature_flags::gTenantMigrations.isEnabled(
+                        serverGlobalParams.featureCompatibility));
 
             const RequestType& requestBody = request();
 

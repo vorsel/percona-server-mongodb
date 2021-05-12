@@ -136,7 +136,7 @@ void abortIndexBuilds(OperationContext* opCtx,
                commandType == OplogEntry::CommandType::kDropIndexes ||
                commandType == OplogEntry::CommandType::kRenameCollection) {
         const boost::optional<UUID> collUUID =
-            CollectionCatalog::get(opCtx).lookupUUIDByNSS(opCtx, nss);
+            CollectionCatalog::get(opCtx)->lookupUUIDByNSS(opCtx, nss);
         invariant(collUUID);
 
         indexBuildsCoordinator->abortCollectionIndexBuilds(opCtx, nss, *collUUID, reason);
@@ -172,10 +172,6 @@ void registerApplyImportCollectionFn(ApplyImportCollectionFn func) {
     applyImportCollection = func;
 }
 
-void setOplogCollectionName(ServiceContext* service) {
-    LocalOplogInfo::get(service)->setOplogCollectionName(service);
-}
-
 void createIndexForApplyOps(OperationContext* opCtx,
                             const BSONObj& indexSpec,
                             const NamespaceString& indexNss,
@@ -186,7 +182,7 @@ void createIndexForApplyOps(OperationContext* opCtx,
     auto databaseHolder = DatabaseHolder::get(opCtx);
     auto db = databaseHolder->getDb(opCtx, indexNss.ns());
     auto indexCollection =
-        db ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, indexNss) : nullptr;
+        db ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, indexNss) : nullptr;
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "Failed to create index due to missing collection: " << indexNss.ns(),
             indexCollection);
@@ -196,6 +192,30 @@ void createIndexForApplyOps(OperationContext* opCtx,
     if (opCtx->writesAreReplicated()) {
         ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInsert(
             opCtx->getWriteConcern());
+    }
+
+    // Check for conflict with two-phase index builds during initial sync. It is possible that
+    // this index may have been dropped and recreated after inserting documents into the collection.
+    auto indexBuildsCoordinator = IndexBuildsCoordinator::get(opCtx);
+    if (OplogApplication::Mode::kInitialSync == mode) {
+        auto normalSpecs =
+            indexBuildsCoordinator->normalizeIndexSpecs(opCtx, indexCollection, {indexSpec});
+        invariant(1U == normalSpecs.size(),
+                  str::stream() << "Unexpected result from normalizeIndexSpecs - ns: " << indexNss
+                                << "; uuid: " << indexCollection->uuid()
+                                << "; original index spec: " << indexSpec
+                                << "; normalized index specs: "
+                                << BSON("normalSpecs" << normalSpecs));
+        auto indexCatalog = indexCollection->getIndexCatalog();
+        auto prepareSpecResult = indexCatalog->prepareSpecForCreate(opCtx, normalSpecs[0], {});
+        if (ErrorCodes::IndexBuildAlreadyInProgress == prepareSpecResult) {
+            LOGV2(4924900,
+                  "Index build: already in progress during initial sync",
+                  "ns"_attr = indexNss,
+                  "uuid"_attr = indexCollection->uuid(),
+                  "spec"_attr = indexSpec);
+            return;
+        }
     }
 
     // TODO(SERVER-48593): Add invariant on shouldRelaxIndexConstraints(opCtx, indexNss) and
@@ -209,7 +229,6 @@ void createIndexForApplyOps(OperationContext* opCtx,
     // stop using ghost timestamps. Single phase builds are only used for empty collections, and
     // to rebuild indexes admin.system collections. See SERVER-47439.
     IndexBuildsCoordinator::updateCurOpOpDescription(opCtx, indexNss, {indexSpec});
-    auto indexBuildsCoordinator = IndexBuildsCoordinator::get(opCtx);
     auto collUUID = indexCollection->uuid();
     auto fromMigrate = false;
     indexBuildsCoordinator->createIndex(opCtx, collUUID, indexSpec, constraints, fromMigrate);
@@ -258,25 +277,36 @@ void _logOpsInner(OperationContext* opCtx,
         uasserted(ErrorCodes::NotWritablePrimary, ss);
     }
 
-    // TODO (SERVER-50598): Not allow tenant migration donor to write "commitIndexBuild" and
-    // "abortIndexBuild" oplog entries in the blocking state.
-    // Allow that for now since if the donor doesn't write either a commit or abort oplog entry,
-    // some resources will not be released on the donor nodes, and this can lead to deadlocks.
-    auto isCommitOrAbortIndexBuild =
-        std::any_of(records->begin(), records->end(), [](Record record) {
-            auto o = record.data.toBson().getObjectField("o");
-            return o.hasField("commitIndexBuild") || o.hasField("abortIndexBuild");
+    // Throw TenantMigrationConflict error if the database for 'nss' is being migrated. The oplog
+    // entry for renameCollection has 'nss' set to the fromCollection's ns. renameCollection can be
+    // across databases, but a tenant will never be able to rename into a database with a different
+    // prefix, so it is safe to use the fromCollection's db's prefix for this check.
+    //
+    // We ignore FCV here when checking the feature flag since the FCV may not have been initialized
+    // yet. This is safe since tenant migrations does not have any upgrade/downgrade behavior.
+    if (repl::feature_flags::gTenantMigrations.isEnabledAndIgnoreFCV()) {
+        // Skip the check if this is an "abortIndexBuild" oplog entry since it is safe to the abort
+        // an index build on the donor after the blockTimestamp, plus if an index build fails to
+        // commit due to TenantMigrationConflict, we need to be able to abort the index build and
+        // clean up.
+        auto isAbortIndexBuild = std::any_of(records->begin(), records->end(), [](Record record) {
+            auto oplogEntry = uassertStatusOK(OplogEntry::parse(record.data.toBson()));
+            return oplogEntry.getCommandType() == OplogEntry::CommandType::kAbortIndexBuild;
         });
 
-    if (!isCommitOrAbortIndexBuild) {
-        // Throw TenantMigrationConflict error if the database for 'nss' is being migrated.
-        // The oplog entry for renameCollection has 'nss' set to the fromCollection's ns.
-        // renameCollection can be across databases, but a tenant will never be able to rename into
-        // a database with a different prefix, so it is safe to use the fromCollection's db's prefix
-        // for this check.
-        tenant_migration_donor::onWriteToDatabase(opCtx, nss.db());
-    } else {
-        invariant(records->size() == 1);
+        if (!isAbortIndexBuild) {
+            tenant_migration_donor::onWriteToDatabase(opCtx, nss.db());
+        } else if (records->size() > 1) {
+            str::stream ss;
+            ss << "abortIndexBuild cannot be logged with other oplog entries ";
+            ss << ": nss " << nss;
+            ss << ": entries: " << records->size() << ": [ ";
+            for (const auto& record : *records) {
+                ss << "(" << record.id << ", " << redact(record.data.toBson()) << ") ";
+            }
+            ss << "]";
+            uasserted(ErrorCodes::IllegalOperation, ss);
+        }
     }
 
     Status result = oplogCollection->insertDocumentsForOplog(opCtx, records, timestamps);
@@ -580,7 +610,7 @@ void createOplog(OperationContext* opCtx,
 
     OldClientContext ctx(opCtx, oplogCollectionName.ns());
     CollectionPtr collection =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, oplogCollectionName);
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, oplogCollectionName);
 
     if (collection) {
         if (replSettings.getOplogSizeBytes() != 0) {
@@ -638,7 +668,7 @@ void createOplog(OperationContext* opCtx,
 void createOplog(OperationContext* opCtx) {
     const auto isReplSet = ReplicationCoordinator::get(opCtx)->getReplicationMode() ==
         ReplicationCoordinator::modeReplSet;
-    createOplog(opCtx, LocalOplogInfo::get(opCtx)->getOplogCollectionName(), isReplSet);
+    createOplog(opCtx, NamespaceString::kRsOplogNamespace, isReplSet);
 }
 
 std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count) {
@@ -667,8 +697,8 @@ std::pair<OptionalCollectionUUID, NamespaceString> extractCollModUUIDAndNss(
         return std::pair<OptionalCollectionUUID, NamespaceString>(boost::none, extractNs(ns, cmd));
     }
     CollectionUUID uuid = ui.get();
-    auto& catalog = CollectionCatalog::get(opCtx);
-    const auto nsByUUID = catalog.lookupNSSByUUID(opCtx, uuid);
+    auto catalog = CollectionCatalog::get(opCtx);
+    const auto nsByUUID = catalog->lookupNSSByUUID(opCtx, uuid);
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "Failed to apply operation due to missing collection (" << uuid
                           << "): " << redact(cmd.toString()),
@@ -677,8 +707,8 @@ std::pair<OptionalCollectionUUID, NamespaceString> extractCollModUUIDAndNss(
 }
 
 NamespaceString extractNsFromUUID(OperationContext* opCtx, const UUID& uuid) {
-    auto& catalog = CollectionCatalog::get(opCtx);
-    auto nss = catalog.lookupNSSByUUID(opCtx, uuid);
+    auto catalog = CollectionCatalog::get(opCtx);
+    auto nss = catalog->lookupNSSByUUID(opCtx, uuid);
     uassert(ErrorCodes::NamespaceNotFound, "No namespace with UUID " + uuid.toString(), nss);
     return *nss;
 }
@@ -1042,8 +1072,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
     NamespaceString requestNss;
     CollectionPtr collection = nullptr;
     if (auto uuid = op.getUuid()) {
-        CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-        collection = catalog.lookupCollectionByUUID(opCtx, uuid.get());
+        auto catalog = CollectionCatalog::get(opCtx);
+        collection = catalog->lookupCollectionByUUID(opCtx, uuid.get());
         uassert(ErrorCodes::NamespaceNotFound,
                 str::stream() << "Failed to apply operation due to missing collection ("
                               << uuid.get() << "): " << redact(opOrGroupedInserts.toBSON()),
@@ -1055,7 +1085,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
         invariant(requestNss.coll().size());
         dassert(opCtx->lockState()->isCollectionLockedForMode(requestNss, MODE_IX),
                 requestNss.ns());
-        collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, requestNss);
+        collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, requestNss);
     }
 
     BSONObj o = op.getObject();
@@ -1532,7 +1562,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
         Lock::DBLock lock(opCtx, nss.db(), MODE_IS);
         auto databaseHolder = DatabaseHolder::get(opCtx);
         auto db = databaseHolder->getDb(opCtx, nss.ns());
-        if (db && !CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss) &&
+        if (db && !CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss) &&
             ViewCatalog::get(db)->lookup(opCtx, nss.ns())) {
             return {ErrorCodes::CommandNotSupportedOnView,
                     str::stream() << "applyOps not supported on view:" << nss.ns()};
@@ -1765,7 +1795,7 @@ void initTimestampFromOplog(OperationContext* opCtx, const NamespaceString& oplo
     DBDirectClient c(opCtx);
     static const BSONObj reverseNaturalObj = BSON("$natural" << -1);
     BSONObj lastOp =
-        c.findOne(oplogNss.ns(), Query().sort(reverseNaturalObj), nullptr, QueryOption_SlaveOk);
+        c.findOne(oplogNss.ns(), Query().sort(reverseNaturalObj), nullptr, QueryOption_SecondaryOk);
 
     if (!lastOp.isEmpty()) {
         LOGV2_DEBUG(21256, 1, "replSet setting last Timestamp");
@@ -1779,12 +1809,8 @@ void clearLocalOplogPtr() {
 }
 
 void acquireOplogCollectionForLogging(OperationContext* opCtx) {
-    auto oplogInfo = LocalOplogInfo::get(opCtx);
-    const auto& nss = oplogInfo->getOplogCollectionName();
-    if (!nss.isEmpty()) {
-        AutoGetCollection autoColl(opCtx, nss, MODE_IX);
-        LocalOplogInfo::get(opCtx)->setCollection(autoColl.getCollection());
-    }
+    AutoGetCollection autoColl(opCtx, NamespaceString::kRsOplogNamespace, MODE_IX);
+    LocalOplogInfo::get(opCtx)->setCollection(autoColl.getCollection());
 }
 
 void establishOplogCollectionForLogging(OperationContext* opCtx, const CollectionPtr& oplog) {

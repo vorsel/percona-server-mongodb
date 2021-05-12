@@ -53,6 +53,7 @@ env.Library(
         "query_settings.cpp",
         "query_solution.cpp",
         "expression_index_knobs.idl",
+        "stage_types.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
@@ -70,6 +71,18 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         "$BUILD_DIR/mongo/idl/server_parameter",
+    ],
+)
+
+env.Library(
+    target='sbe_stage_builder_helpers',
+    source=[
+        "sbe_stage_builder_helpers.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+        '$BUILD_DIR/mongo/db/exec/sbe/query_sbe',
+        "$BUILD_DIR/mongo/db/matcher/expressions",
     ],
 )
 
@@ -127,7 +140,7 @@ env.Library(
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
-        "$BUILD_DIR/mongo/db/command_generic_argument",
+        "$BUILD_DIR/mongo/idl/idl_parser",
     ],
 )
 
@@ -280,6 +293,7 @@ env.CppUnitTest(
     source=[
         "canonical_query_encoder_test.cpp",
         "canonical_query_test.cpp",
+        "classic_stage_builder_test.cpp",
         "count_command_test.cpp",
         "cursor_response_test.cpp",
         "explain_options_test.cpp",
@@ -323,17 +337,24 @@ env.CppUnitTest(
         "query_request_test.cpp",
         "query_settings_test.cpp",
         "query_solution_test.cpp",
+        "sbe_stage_builder_test_fixture.cpp",
+        "sbe_stage_builder_test.cpp",
+        "sbe_shard_filter_test.cpp",
+        "shard_filterer_factory_mock.cpp",
         "view_response_formatter_test.cpp",
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/db/auth/authmocks",
         "$BUILD_DIR/mongo/db/concurrency/lock_manager",
+        "$BUILD_DIR/mongo/db/exec/sbe/sbe_plan_stage_test",
         "$BUILD_DIR/mongo/db/pipeline/aggregation_request",
         "$BUILD_DIR/mongo/db/query_exec",
         "$BUILD_DIR/mongo/db/service_context_d",
+        "$BUILD_DIR/mongo/db/service_context_d_test_fixture",
         "$BUILD_DIR/mongo/db/service_context_test_fixture",
         "$BUILD_DIR/mongo/dbtests/mocklib",
         "$BUILD_DIR/mongo/rpc/rpc",
+        "$BUILD_DIR/mongo/util/clock_source_mock",
         "collation/collator_factory_mock",
         "collation/collator_interface_mock",
         "command_request_response",

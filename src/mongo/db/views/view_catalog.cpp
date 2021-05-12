@@ -122,11 +122,22 @@ Status ViewCatalog::_reload(WithLock,
             }
         }
 
+        boost::optional<TimeseriesOptions> timeseries;
+        if (view.hasField("timeseries")) {
+            try {
+                timeseries =
+                    TimeseriesOptions::parse({"ViewCatalog::_reload"}, view["timeseries"].Obj());
+            } catch (const DBException& ex) {
+                return ex.toStatus();
+            }
+        }
+
         _viewMap[viewName.ns()] = std::make_shared<ViewDefinition>(viewName.db(),
                                                                    viewName.coll(),
                                                                    view["viewOn"].str(),
                                                                    pipeline,
-                                                                   std::move(collator.getValue()));
+                                                                   std::move(collator.getValue()),
+                                                                   timeseries);
         return Status::OK();
     };
 
@@ -185,7 +196,8 @@ Status ViewCatalog::_createOrUpdateView(WithLock lk,
                                         const NamespaceString& viewName,
                                         const NamespaceString& viewOn,
                                         const BSONArray& pipeline,
-                                        std::unique_ptr<CollatorInterface> collator) {
+                                        std::unique_ptr<CollatorInterface> collator,
+                                        const boost::optional<TimeseriesOptions>& timeseries) {
     invariant(opCtx->lockState()->isDbLockedForMode(viewName.db(), MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(
@@ -206,10 +218,17 @@ Status ViewCatalog::_createOrUpdateView(WithLock lk,
     if (collator) {
         viewDefBuilder.append("collation", collator->getSpec().toBSON());
     }
+    if (timeseries) {
+        viewDefBuilder.append("timeseries", timeseries->toBSON());
+    }
 
     BSONObj ownedPipeline = pipeline.getOwned();
-    auto view = std::make_shared<ViewDefinition>(
-        viewName.db(), viewName.coll(), viewOn.coll(), ownedPipeline, std::move(collator));
+    auto view = std::make_shared<ViewDefinition>(viewName.db(),
+                                                 viewName.coll(),
+                                                 viewOn.coll(),
+                                                 ownedPipeline,
+                                                 std::move(collator),
+                                                 timeseries);
 
     // Check that the resulting dependency graph is acyclic and within the maximum depth.
     Status graphStatus = _upsertIntoGraph(lk, opCtx, *(view.get()));
@@ -221,16 +240,22 @@ Status ViewCatalog::_createOrUpdateView(WithLock lk,
     _viewMap[viewName.ns()] = view;
 
     // Register the view in the CollectionCatalog mapping from ResourceID->namespace
-    CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
     auto viewRid = ResourceId(RESOURCE_COLLECTION, viewName.ns());
-    catalog.addResource(viewRid, viewName.ns());
+    CollectionCatalog::write(
+        opCtx, [&](CollectionCatalog& catalog) { catalog.addResource(viewRid, viewName.ns()); });
 
     opCtx->recoveryUnit()->onRollback([this, viewName, opCtx, viewRid]() {
-        this->_viewMap.erase(viewName.ns());
-        this->_viewGraphNeedsRefresh = true;
-        CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-        catalog.removeResource(viewRid, viewName.ns());
+        {
+            stdx::lock_guard<Latch> lk(_mutex);
+            this->_viewMap.erase(viewName.ns());
+            this->_viewGraphNeedsRefresh = true;
+        }
+
+        CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+            catalog.removeResource(viewRid, viewName.ns());
+        });
     });
+
 
     // Reload the view catalog with the changes applied.
     return _reload(lk, opCtx, ViewCatalogLookupBehavior::kValidateDurableViews);
@@ -397,7 +422,8 @@ Status ViewCatalog::createView(OperationContext* opCtx,
                                const NamespaceString& viewName,
                                const NamespaceString& viewOn,
                                const BSONArray& pipeline,
-                               const BSONObj& collation) {
+                               const BSONObj& collation,
+                               const boost::optional<TimeseriesOptions>& timeseries) {
     invariant(opCtx->lockState()->isDbLockedForMode(viewName.db(), MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(viewName, MODE_IX));
     invariant(opCtx->lockState()->isCollectionLockedForMode(
@@ -422,7 +448,7 @@ Status ViewCatalog::createView(OperationContext* opCtx,
         return collator.getStatus();
 
     return _createOrUpdateView(
-        lk, opCtx, viewName, viewOn, pipeline, std::move(collator.getValue()));
+        lk, opCtx, viewName, viewOn, pipeline, std::move(collator.getValue()), timeseries);
 }
 
 Status ViewCatalog::modifyView(OperationContext* opCtx,
@@ -452,10 +478,16 @@ Status ViewCatalog::modifyView(OperationContext* opCtx,
     ViewDefinition savedDefinition = *viewPtr;
 
     opCtx->recoveryUnit()->onRollback([this, viewName, savedDefinition, opCtx]() {
-        this->_viewMap[viewName.ns()] = std::make_shared<ViewDefinition>(savedDefinition);
+        auto definition = std::make_shared<ViewDefinition>(savedDefinition);
+        {
+            stdx::lock_guard<Latch> lk(_mutex);
+            this->_viewMap[viewName.ns()] = std::move(definition);
+        }
         auto viewRid = ResourceId(RESOURCE_COLLECTION, viewName.ns());
-        CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-        catalog.addResource(viewRid, viewName.ns());
+
+        CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+            catalog.addResource(viewRid, viewName.ns());
+        });
     });
 
     return _createOrUpdateView(lk,
@@ -494,15 +526,17 @@ Status ViewCatalog::dropView(OperationContext* opCtx, const NamespaceString& vie
     _viewGraph.remove(savedDefinition.name());
     _viewMap.erase(viewName.ns());
 
-    CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
     auto viewRid = ResourceId(RESOURCE_COLLECTION, viewName.ns());
-    catalog.removeResource(viewRid, viewName.ns());
+    CollectionCatalog::write(
+        opCtx, [&](CollectionCatalog& catalog) { catalog.removeResource(viewRid, viewName.ns()); });
 
     opCtx->recoveryUnit()->onRollback([this, viewName, savedDefinition, opCtx, viewRid]() {
         this->_viewGraphNeedsRefresh = true;
         this->_viewMap[viewName.ns()] = std::make_shared<ViewDefinition>(savedDefinition);
-        CollectionCatalog& catalog = CollectionCatalog::get(opCtx);
-        catalog.addResource(viewRid, viewName.ns());
+
+        CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+            catalog.addResource(viewRid, viewName.ns());
+        });
     });
 
     // Reload the view catalog with the changes applied.

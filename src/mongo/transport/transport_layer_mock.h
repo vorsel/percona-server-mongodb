@@ -60,10 +60,12 @@ public:
     StatusWith<SessionHandle> connect(HostAndPort peer,
                                       ConnectSSLMode sslMode,
                                       Milliseconds timeout) override;
-    Future<SessionHandle> asyncConnect(HostAndPort peer,
-                                       ConnectSSLMode sslMode,
-                                       const ReactorHandle& reactor,
-                                       Milliseconds timeout) override;
+    Future<SessionHandle> asyncConnect(
+        HostAndPort peer,
+        ConnectSSLMode sslMode,
+        const ReactorHandle& reactor,
+        Milliseconds timeout,
+        std::shared_ptr<const SSLConnectionContext> transientSSLContext = nullptr) override;
 
     Status setup() override;
     Status start() override;
@@ -81,6 +83,10 @@ public:
                               bool asyncOCSPStaple) override {
         return Status::OK();
     }
+
+    StatusWith<std::shared_ptr<const transport::SSLConnectionContext>> createTransientSSLContext(
+        const TransientSSLParams& transientSSLParams,
+        const SSLManagerInterface* optionalManager) override;
 #endif
 
 private:

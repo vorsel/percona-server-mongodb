@@ -45,25 +45,15 @@
 #include "mongo/db/repl/cloner_utils.h"
 #include "mongo/db/repl/insert_group.h"
 #include "mongo/db/repl/oplog_applier_utils.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/tenant_migration_decoration.h"
+#include "mongo/db/repl/tenant_migration_recipient_service.h"
 #include "mongo/db/repl/tenant_oplog_batcher.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
 namespace repl {
-
-// These batch sizes are pretty arbitrary.
-// TODO(SERVER-50024): come up with some reasonable numbers, and make them a settable parameter.
-constexpr size_t kTenantApplierBatchSizeBytes = 16 * 1024 * 1024;
-
-// TODO(SERVER-50024): kTenantApplierBatchSizeOps is currently chosen as the default value of
-// internalInsertMaxBatchSize.  This is probably reasonable but should be a settable parameter.
-constexpr size_t kTenantApplierBatchSizeOps = 500;
-const size_t kMinOplogEntriesPerThread = 16;
-
-// TODO(SERVER-50024):: This is also arbitary and should be a settable parameter.
-constexpr size_t kTenantApplierThreadCount = 5;
 
 TenantOplogApplier::TenantOplogApplier(const UUID& migrationUuid,
                                        const std::string& tenantId,
@@ -77,8 +67,7 @@ TenantOplogApplier::TenantOplogApplier(const UUID& migrationUuid,
       _beginApplyingAfterOpTime(applyFromOpTime),
       _oplogBuffer(oplogBuffer),
       _executor(std::move(executor)),
-      _writerPool(writerPool),
-      _limits(kTenantApplierBatchSizeBytes, kTenantApplierBatchSizeOps) {}
+      _writerPool(writerPool) {}
 
 TenantOplogApplier::~TenantOplogApplier() {
     shutdown();
@@ -93,9 +82,9 @@ SemiFuture<TenantOplogApplier::OpTimePair> TenantOplogApplier::getNotificationFo
         return SemiFuture<OpTimePair>::makeReady(_finalStatus);
     }
     // If this optime has already passed, just return a ready future.
-    if (_lastBatchCompletedOpTimes.donorOpTime >= donorOpTime ||
+    if (_lastAppliedOpTimesUpToLastBatch.donorOpTime >= donorOpTime ||
         _beginApplyingAfterOpTime >= donorOpTime) {
-        return SemiFuture<OpTimePair>::makeReady(_lastBatchCompletedOpTimes);
+        return SemiFuture<OpTimePair>::makeReady(_lastAppliedOpTimesUpToLastBatch);
     }
 
     // This will pull a new future off the existing promise for this time if it exists, otherwise
@@ -109,7 +98,10 @@ Status TenantOplogApplier::_doStartup_inlock() noexcept {
     auto status = _oplogBatcher->startup();
     if (!status.isOK())
         return status;
-    auto fut = _oplogBatcher->getNextBatch(_limits);
+
+    auto fut = _oplogBatcher->getNextBatch(
+        TenantOplogBatcher::BatchLimits(std::size_t(tenantApplierBatchSizeBytes.load()),
+                                        std::size_t(tenantApplierBatchSizeOps.load())));
     std::move(fut)
         .thenRunOn(_executor)
         .then([&](TenantOplogBatch batch) { _applyLoop(std::move(batch)); })
@@ -127,7 +119,10 @@ void TenantOplogApplier::_doShutdown_inlock() noexcept {
 void TenantOplogApplier::_applyLoop(TenantOplogBatch batch) {
     // Getting the future for the next batch here means the batcher can retrieve the next batch
     // while the applier is processing the current one.
-    auto nextBatchFuture = _oplogBatcher->getNextBatch(_limits);
+
+    auto nextBatchFuture = _oplogBatcher->getNextBatch(
+        TenantOplogBatcher::BatchLimits(std::size_t(tenantApplierBatchSizeBytes.load()),
+                                        std::size_t(tenantApplierBatchSizeOps.load())));
     try {
         _applyOplogBatch(&batch);
     } catch (const DBException& e) {
@@ -218,20 +213,26 @@ void TenantOplogApplier::_applyOplogBatch(TenantOplogBatch* batch) {
                 "migrationUuid"_attr = _migrationUuid);
     auto lastBatchCompletedOpTimes = _writeNoOpEntries(opCtx.get(), *batch);
     stdx::lock_guard lk(_mutex);
-    _lastBatchCompletedOpTimes = lastBatchCompletedOpTimes;
+    _lastAppliedOpTimesUpToLastBatch.donorOpTime = lastBatchCompletedOpTimes.donorOpTime;
+    // If the batch contains only resume token no-ops, then the last batch completed
+    // recipient optime returned will be null.
+    if (!lastBatchCompletedOpTimes.recipientOpTime.isNull()) {
+        _lastAppliedOpTimesUpToLastBatch.recipientOpTime =
+            lastBatchCompletedOpTimes.recipientOpTime;
+    }
+
     LOGV2_DEBUG(4886002,
                 1,
                 "Tenant Oplog Applier finished applying batch",
                 "tenant"_attr = _tenantId,
                 "migrationUuid"_attr = _migrationUuid,
-                "lastDonorOptime"_attr = lastBatchCompletedOpTimes.donorOpTime,
-                "lastRecipientOptime"_attr = lastBatchCompletedOpTimes.recipientOpTime);
+                "lastBatchCompletedOpTimes"_attr = lastBatchCompletedOpTimes);
 
-    // Notify all the waiters on optimes before and including _lastBatchCompletedOpTimes.
+    // Notify all the waiters on optimes before and including _lastAppliedOpTimesUpToLastBatch.
     auto firstUnexpiredIter =
-        _opTimeNotificationList.upper_bound(_lastBatchCompletedOpTimes.donorOpTime);
+        _opTimeNotificationList.upper_bound(_lastAppliedOpTimesUpToLastBatch.donorOpTime);
     for (auto iter = _opTimeNotificationList.begin(); iter != firstUnexpiredIter; iter++) {
-        iter->second.emplaceValue(_lastBatchCompletedOpTimes);
+        iter->second.emplaceValue(_lastAppliedOpTimesUpToLastBatch);
     }
     _opTimeNotificationList.erase(_opTimeNotificationList.begin(), firstUnexpiredIter);
 }
@@ -285,6 +286,21 @@ void TenantOplogApplier::_checkNsAndUuidsBelongToTenant(OperationContext* opCtx,
     }
 }
 
+namespace {
+bool isResumeTokenNoop(const OplogEntry& entry) {
+    if (entry.getOpType() != OpTypeEnum::kNoop) {
+        return false;
+    }
+    if (!entry.getObject().hasField("msg")) {
+        return false;
+    }
+    if (entry.getObject().getStringField("msg") != TenantMigrationRecipientService::kNoopMsg) {
+        return false;
+    }
+    return true;
+}
+}  // namespace
+
 TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
     OperationContext* opCtx, const TenantOplogBatch& batch) {
     auto* opObserver = cc().getServiceContext()->getOpObserver();
@@ -292,13 +308,23 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
     WriteUnitOfWork wuow(opCtx);
     // Reserve oplog slots for all entries.  This allows us to write them in parallel.
     auto oplogSlots = repl::getNextOpTimes(opCtx, batch.ops.size());
+    // Keep track of the greatest oplog slot actually used, ignoring resume token noops. This is
+    // what we want to return from this function.
+    auto greatestOplogSlotUsed = OpTime();
     auto slotIter = oplogSlots.begin();
     for (const auto& op : batch.ops) {
+        if (isResumeTokenNoop(op.entry)) {
+            // We do not want to set the recipient optime for resume token noop oplog entries since
+            // we won't actually apply them.
+            slotIter++;
+            continue;
+        }
+        greatestOplogSlotUsed = *slotIter;
         _setRecipientOpTime(op.entry.getOpTime(), *slotIter++);
     }
     const size_t numOplogThreads = _writerPool->getStats().numThreads;
-    const size_t numOpsPerThread =
-        std::max(kMinOplogEntriesPerThread, (batch.ops.size() / numOplogThreads));
+    const size_t numOpsPerThread = std::max(std::size_t(minOplogEntriesPerThread.load()),
+                                            (batch.ops.size() / numOplogThreads));
     slotIter = oplogSlots.begin();
     auto opsIter = batch.ops.begin();
     LOGV2_DEBUG(4886003,
@@ -326,7 +352,7 @@ TenantOplogApplier::OpTimePair TenantOplogApplier::_writeNoOpEntries(
     }
     invariant(opsIter == batch.ops.end());
     _writerPool->waitForIdle();
-    return {batch.ops.back().entry.getOpTime(), oplogSlots.back()};
+    return {batch.ops.back().entry.getOpTime(), greatestOplogSlotUsed};
 }
 
 
@@ -379,18 +405,24 @@ void TenantOplogApplier::_writeNoOpsForRange(OpObserver* opObserver,
             WriteUnitOfWork wuow(opCtx.get());
             auto slot = firstSlot;
             for (auto iter = begin; iter != end; iter++, slot++) {
+                const auto& entry = iter->entry;
+                if (isResumeTokenNoop(entry)) {
+                    // We don't want to write noops for resume token noop oplog entries. They would
+                    // not be applied in a change stream anyways.
+                    continue;
+                }
                 opObserver->onInternalOpMessage(
                     opCtx.get(),
-                    iter->entry.getNss(),
-                    iter->entry.getUuid(),
-                    iter->entry.toBSON(),
+                    entry.getNss(),
+                    entry.getUuid(),
+                    entry.toBSON(),
                     BSONObj(),
                     // We link the no-ops together by recipient op time the same way the actual ops
                     // were linked together by donor op time.  This is to allow retryable writes
                     // and changestreams to find the ops they need.
-                    _maybeGetRecipientOpTime(iter->entry.getPreImageOpTime()),
-                    _maybeGetRecipientOpTime(iter->entry.getPostImageOpTime()),
-                    _maybeGetRecipientOpTime(iter->entry.getPrevWriteOpTimeInTransaction()),
+                    _maybeGetRecipientOpTime(entry.getPreImageOpTime()),
+                    _maybeGetRecipientOpTime(entry.getPostImageOpTime()),
+                    _maybeGetRecipientOpTime(entry.getPrevWriteOpTimeInTransaction()),
                     *slot);
             }
         });
@@ -502,7 +534,7 @@ Status TenantOplogApplier::_applyOplogBatchPerWorker(std::vector<const OplogEntr
 }
 
 std::unique_ptr<ThreadPool> makeTenantMigrationWriterPool() {
-    return makeTenantMigrationWriterPool(kTenantApplierThreadCount);
+    return makeTenantMigrationWriterPool(tenantApplierThreadCount);
 }
 
 std::unique_ptr<ThreadPool> makeTenantMigrationWriterPool(int threadCount) {

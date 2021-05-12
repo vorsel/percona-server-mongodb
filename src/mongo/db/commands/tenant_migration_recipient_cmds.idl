@@ -51,6 +51,7 @@ structs:
 commands:
   recipientSyncData:
     description: "Parser for the 'recipientSyncData' command."
+    command_name: recipientSyncData
     strict: true
     namespace: ignored
     fields:
@@ -75,9 +76,9 @@ commands:
         description: >-
           The read preference settings that the donor will pass on to the recipient.
         type: readPreference
-      returnAfterReachingTimestamp:
+      returnAfterReachingDonorTimestamp:
         description: >-
-          If provided, the recipient should return after syncing up to this timestamp. 
+          If provided, the recipient should return after syncing up to this donor timestamp.
           Otherwise, the recipient will return once its copy of the data is consistent.
         type: timestamp
         optional: true
@@ -86,6 +87,7 @@ commands:
 
   recipientForgetMigration:
     description: "Parser for the 'recipientForgetMigration' command."
+    command_name: recipientForgetMigration
     strict: true
     namespace: ignored
     fields:

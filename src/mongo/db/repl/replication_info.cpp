@@ -49,7 +49,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/internal_plans.h"
-#include "mongo/db/repl/is_master_response.h"
+#include "mongo/db/repl/hello_response.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/repl/replication_auth.h"
 #include "mongo/db/repl/replication_coordinator.h"
@@ -61,7 +61,7 @@
 #include "mongo/executor/network_interface.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/client_metadata.h"
-#include "mongo/transport/ismaster_metrics.h"
+#include "mongo/transport/hello_metrics.h"
 #include "mongo/util/decimal_counter.h"
 #include "mongo/util/fail_point.h"
 
@@ -72,6 +72,8 @@ MONGO_FAIL_POINT_DEFINE(waitInHello);
 // Awaitable hello requests with the proper topologyVersions will sleep for maxAwaitTimeMS on
 // standalones. This failpoint will hang right before doing this sleep when set.
 MONGO_FAIL_POINT_DEFINE(hangWaitingForHelloResponseOnStandalone);
+
+MONGO_FAIL_POINT_DEFINE(appendHelloOkToHelloResponse);
 
 using std::list;
 using std::string;
@@ -91,7 +93,7 @@ void appendPrimaryOnlyServiceInfo(ServiceContext* serviceContext, BSONObjBuilder
 }
 
 /**
- * Appends replication-related fields to the isMaster response. Returns the topology version that
+ * Appends replication-related fields to the hello response. Returns the topology version that
  * was included in the response.
  */
 TopologyVersion appendReplicationInfo(OperationContext* opCtx,
@@ -110,14 +112,14 @@ TopologyVersion appendReplicationInfo(OperationContext* opCtx,
             deadline = opCtx->getServiceContext()->getPreciseClockSource()->now() +
                 Milliseconds(*maxAwaitTimeMS);
         }
-        auto isMasterResponse =
-            replCoord->awaitIsMasterResponse(opCtx, horizonParams, clientTopologyVersion, deadline);
-        result->appendElements(isMasterResponse->toBSON(useLegacyResponseFields));
+        auto helloResponse =
+            replCoord->awaitHelloResponse(opCtx, horizonParams, clientTopologyVersion, deadline);
+        result->appendElements(helloResponse->toBSON(useLegacyResponseFields));
         if (appendReplicationProcess) {
-            replCoord->appendSlaveInfoData(result);
+            replCoord->appendSecondaryInfoData(result);
         }
-        invariant(isMasterResponse->getTopologyVersion());
-        return isMasterResponse->getTopologyVersion().get();
+        invariant(helloResponse->getTopologyVersion());
+        return helloResponse->getTopologyVersion().get();
     }
 
     auto currentTopologyVersion = replCoord->getTopologyVersion();
@@ -147,7 +149,7 @@ TopologyVersion appendReplicationInfo(OperationContext* opCtx,
     }
 
     result->appendBool((useLegacyResponseFields ? "ismaster" : "isWritablePrimary"),
-                       ReplicationCoordinator::get(opCtx)->isMasterForReportingPurposes());
+                       ReplicationCoordinator::get(opCtx)->isWritablePrimaryForReportingPurposes());
 
     BSONObjBuilder topologyVersionBuilder(result->subobjStart("topologyVersion"));
     currentTopologyVersion.serialize(&topologyVersionBuilder);
@@ -365,7 +367,7 @@ public:
                 });
         }
 
-        // If a client is following the awaitable isMaster protocol, maxAwaitTimeMS should be
+        // If a client is following the awaitable hello protocol, maxAwaitTimeMS should be
         // present if and only if topologyVersion is present in the request.
         auto topologyVersionElement = cmdObj["topologyVersion"];
         auto maxAwaitTimeMSField = cmdObj["maxAwaitTimeMS"];
@@ -387,9 +389,9 @@ public:
 
             uassert(31373, "maxAwaitTimeMS must be a non-negative integer", *maxAwaitTimeMS >= 0);
 
-            LOGV2_DEBUG(23904, 3, "Using maxAwaitTimeMS for awaitable isMaster protocol.");
+            LOGV2_DEBUG(23904, 3, "Using maxAwaitTimeMS for awaitable hello protocol.");
 
-            // Awaitable isMaster commands have high latency by design.
+            // Awaitable hello commands have high latency by design.
             opCtx->setShouldIncrementLatencyStats(false);
         } else {
             uassert(31368,
@@ -400,6 +402,28 @@ public:
         }
 
         auto result = replyBuilder->getBodyBuilder();
+
+        // Try to parse the optional 'helloOk' field. This should be provided on the initial
+        // handshake for an incoming connection if the client supports the hello command. Clients
+        // that specify 'helloOk' do not rely on "not master" error message parsing, which means
+        // that we can safely return "not primary" error messages instead.
+        bool helloOk = client->supportsHello();
+        Status status = bsonExtractBooleanField(cmdObj, "helloOk", &helloOk);
+        if (status.isOK()) {
+            // If the hello request contains a "helloOk" field, set _supportsHello on the Client
+            // to the value.
+            client->setSupportsHello(helloOk);
+            // Attach helloOk: true to the response so that the client knows the server supports
+            // the hello command.
+            result.append("helloOk", true);
+        } else if (status.code() != ErrorCodes::NoSuchKey) {
+            uassertStatusOK(status);
+        }
+
+        if (MONGO_unlikely(appendHelloOkToHelloResponse.shouldFail())) {
+            result.append("clientSupportsHello", client->supportsHello());
+        }
+
         auto currentTopologyVersion = appendReplicationInfo(
             opCtx, &result, 0, useLegacyResponseFields(), clientTopologyVersion, maxAwaitTimeMS);
 
@@ -469,7 +493,7 @@ public:
             }
         }
 
-        handleIsMasterSpeculativeAuth(opCtx, cmdObj, &result);
+        handleHelloSpeculativeAuth(opCtx, cmdObj, &result);
 
         return true;
     }

@@ -136,7 +136,7 @@ public:
             boost::optional<AutoGetDb> autoDb;
             autoDb.emplace(opCtx, nss.db(), MODE_IS);
 
-            // Slave nodes cannot support set shard version
+            // Secondary nodes cannot support set shard version
             uassert(ErrorCodes::NotWritablePrimary,
                     str::stream() << "setShardVersion with collection version is only supported "
                                      "against primary nodes, but it was received for namespace "
@@ -150,7 +150,7 @@ public:
             // Views do not require a shard version check. We do not care about invalid system views
             // for this check, only to validate if a view already exists for this namespace.
             if (autoDb->getDb() &&
-                !CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss) &&
+                !CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss) &&
                 ViewCatalog::get(autoDb->getDb())
                     ->lookupWithoutValidatingDurableViews(opCtx, nss.ns())) {
                 return true;
@@ -249,7 +249,7 @@ public:
         const auto status = [&] {
             try {
                 // TODO (SERVER-50812) remove this if-else: just call onShardVersionMismatch
-                if (requestedVersion == requestedVersion.DROPPED()) {
+                if (requestedVersion == ChunkVersion::UNSHARDED()) {
                     forceShardFilteringMetadataRefresh(opCtx, nss);
                 } else {
                     onShardVersionMismatch(opCtx, nss, requestedVersion);

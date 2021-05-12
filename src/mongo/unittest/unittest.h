@@ -49,6 +49,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
+#include "mongo/logv2/log_debug.h"
 #include "mongo/logv2/log_detail.h"
 #include "mongo/unittest/bson_test_util.h"
 #include "mongo/unittest/unittest_helpers.h"
@@ -506,12 +507,22 @@ public:
     /**
      * Called on the test object before running the test.
      */
-    virtual void setUp() {}
+    virtual void setUp() {
+        // React to any tasserts in the unittest framework initialisation, or between tests.
+        checkForTripwireAssertions();
+        // Clear tasserts for the code that's about to be under test.
+        assertionCount.tripwire.store(0);
+    }
 
     /**
      * Called on the test object after running the test.
      */
-    virtual void tearDown() {}
+    virtual void tearDown() {
+        // React to any tasserts in the code that was under test.
+        checkForTripwireAssertions();
+        // Clear tasserts in case of any between tests, or during the unittest framework shutdown.
+        assertionCount.tripwire.store(0);
+    }
 
 protected:
     /**

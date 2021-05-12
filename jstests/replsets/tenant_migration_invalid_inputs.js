@@ -9,10 +9,16 @@
 (function() {
 "use strict";
 
-const rst =
-    new ReplSetTest({nodes: 1, nodeOptions: {setParameter: {enableTenantMigrations: true}}});
+load("jstests/replsets/libs/tenant_migration_util.js");
+
+const rst = new ReplSetTest({nodes: 1});
 rst.startSet();
 rst.initiate();
+if (!TenantMigrationUtil.isFeatureFlagEnabled(rst.getPrimary())) {
+    jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
+    rst.stopSet();
+    return;
+}
 const primary = rst.getPrimary();
 const tenantId = "test";
 const connectionString = "foo/bar:12345";
@@ -91,7 +97,7 @@ assert.commandFailedWithCode(primary.adminCommand({
 }),
                              ErrorCodes.BadValue);
 
-// Test 'returnAfterReachingTimestamp' can' be null.
+// Test 'returnAfterReachingDonorTimestamp' can' be null.
 const nullTimestamps = [Timestamp(0, 0), Timestamp(0, 1)];
 nullTimestamps.forEach((nullTs) => {
     assert.commandFailedWithCode(primary.adminCommand({
@@ -100,7 +106,7 @@ nullTimestamps.forEach((nullTs) => {
         donorConnectionString: connectionString,
         tenantId: tenantId,
         readPreference: readPreference,
-        returnAfterReachingTimestamp: nullTs
+        returnAfterReachingDonorTimestamp: nullTs
     }),
                                  ErrorCodes.BadValue);
 });

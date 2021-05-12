@@ -159,6 +159,10 @@ void QuerySolution::assignNodeIds(QsnIdGenerator& idGenerator, QuerySolutionNode
 
 void QuerySolution::setRoot(std::unique_ptr<QuerySolutionNode> root) {
     _root = std::move(root);
+    if (_root) {
+        _enumeratorExplainInfo.hitScanLimit = _root->getScanLimit();
+    }
+
     QsnIdGenerator idGenerator;
     assignNodeIds(idGenerator, *_root);
 }
@@ -230,6 +234,29 @@ QuerySolutionNode* CollectionScanNode::clone() const {
     copy->assertMinTsHasNotFallenOffOplog = this->assertMinTsHasNotFallenOffOplog;
     copy->shouldWaitForOplogVisibility = this->shouldWaitForOplogVisibility;
 
+    return copy;
+}
+
+//
+// VirtualScanNode
+//
+
+VirtualScanNode::VirtualScanNode(std::vector<BSONArray> docs, bool hasRecordId)
+    : docs(std::move(docs)), hasRecordId(hasRecordId) {}
+
+void VirtualScanNode::appendToString(str::stream* ss, int indent) const {
+    addIndent(ss, indent);
+    *ss << "VIRTUAL_SCAN\n";
+    addIndent(ss, indent + 1);
+    *ss << "nDocuments = " << docs.size();
+    addIndent(ss, indent + 1);
+    *ss << "hasRecordId = " << hasRecordId;
+    addCommon(ss, indent);
+}
+
+QuerySolutionNode* VirtualScanNode::clone() const {
+    auto copy = new VirtualScanNode(docs, this->hasRecordId);
+    cloneBaseData(copy);
     return copy;
 }
 
@@ -1319,6 +1346,21 @@ QuerySolutionNode* EnsureSortedNode::clone() const {
 
     copy->pattern = this->pattern;
 
+    return copy;
+}
+
+//
+// EofNode
+//
+
+void EofNode::appendToString(str::stream* ss, int indent) const {
+    addIndent(ss, indent);
+    *ss << "EOF\n";
+}
+
+QuerySolutionNode* EofNode::clone() const {
+    auto copy = new EofNode();
+    cloneBaseData(copy);
     return copy;
 }
 

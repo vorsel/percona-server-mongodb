@@ -78,7 +78,9 @@ public:
     virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
         OperationContext* opCtx, StringData ident, const IndexDescriptor* desc);
 
-    virtual Status dropIdent(RecoveryUnit* ru, StringData ident) {
+    virtual Status dropIdent(RecoveryUnit* ru,
+                             StringData ident,
+                             StorageEngine::DropIdentCallback&& onDrop) {
         return Status::OK();
     }
 
@@ -120,10 +122,6 @@ public:
     void setJournalListener(JournalListener* jl) final {}
 
     virtual Timestamp getAllDurableTimestamp() const override {
-        return Timestamp();
-    }
-
-    virtual Timestamp getOldestOpenReadTimestamp() const override {
         return Timestamp();
     }
 

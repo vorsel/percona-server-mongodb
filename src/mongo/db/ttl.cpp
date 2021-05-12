@@ -51,6 +51,7 @@
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/ttl_collection_cache.h"
 #include "mongo/db/ttl_gen.h"
@@ -185,9 +186,11 @@ private:
         // Pair of collection namespace and index spec.
         std::vector<std::pair<NamespaceString, BSONObj>> ttlIndexes;
 
-        ttlPasses.increment();
+        // Increment the metric after the TTL work has been finished.
+        ON_BLOCK_EXIT([&] { ttlPasses.increment(); });
 
         // Get all TTL indexes from every collection.
+        auto collectionCatalog = CollectionCatalog::get(opCtxPtr.get());
         for (const std::pair<UUID, std::string>& ttlInfo : ttlInfos) {
             auto uuid = ttlInfo.first;
             auto indexName = ttlInfo.second;
@@ -195,12 +198,11 @@ private:
             // Skip collections that have not been made visible yet. The TTLCollectionCache already
             // has the index information available, so we want to avoid removing it until the
             // collection is visible.
-            const CollectionCatalog& collectionCatalog = CollectionCatalog::get(opCtxPtr.get());
-            if (collectionCatalog.isCollectionAwaitingVisibility(uuid)) {
+            if (collectionCatalog->isCollectionAwaitingVisibility(uuid)) {
                 continue;
             }
 
-            auto nss = collectionCatalog.lookupNSSByUUID(&opCtx, uuid);
+            auto nss = collectionCatalog->lookupNSSByUUID(&opCtx, uuid);
             if (!nss) {
                 ttlCollectionCache.deregisterTTLInfo(ttlInfo);
                 continue;
@@ -309,6 +311,9 @@ private:
         if (!repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, collectionNSS)) {
             return;
         }
+
+        ResourceConsumption::ScopedMetricsCollector scopedMetrics(opCtx,
+                                                                  collectionNSS.db().toString());
 
         const IndexDescriptor* desc = collection->getIndexCatalog()->findIndexByName(opCtx, name);
         if (!desc) {

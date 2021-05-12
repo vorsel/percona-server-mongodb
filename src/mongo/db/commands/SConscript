@@ -87,7 +87,6 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/command_generic_argument',
         '$BUILD_DIR/mongo/db/namespace_string',
     ],
     LIBDEPS_PRIVATE=[
@@ -131,6 +130,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/logical_session_id_helpers',
         '$BUILD_DIR/mongo/db/mongohasher',
         '$BUILD_DIR/mongo/db/server_options_core',
+        '$BUILD_DIR/mongo/idl/basic_types',
         '$BUILD_DIR/mongo/idl/server_parameter',
         '$BUILD_DIR/mongo/rpc/protocol',
         'test_commands_enabled',
@@ -264,6 +264,21 @@ env.Library(
     ],
 )
 
+env.Library(
+    target='create_command',
+    source=[
+        'create.idl',
+        'create_command_validation.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/timeseries/timeseries_idl',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
+)
+
 # Commands that are present in both mongod and embedded
 env.Library(
     target="standalone",
@@ -298,7 +313,6 @@ env.Library(
         "validate.cpp",
         "whats_my_sni_command.cpp",
         "write_commands/write_commands.cpp",
-        'create.idl',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
@@ -320,16 +334,20 @@ env.Library(
         '$BUILD_DIR/mongo/db/query/command_request_response',
         '$BUILD_DIR/mongo/db/query_exec',
         '$BUILD_DIR/mongo/db/repl/replica_set_messages',
+        '$BUILD_DIR/mongo/db/repl/tenant_migration_donor',
         '$BUILD_DIR/mongo/db/rw_concern_d',
         '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/db/stats/server_read_concern_write_concern_metrics',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
         "$BUILD_DIR/mongo/db/storage/two_phase_index_build_knobs_idl",
+        '$BUILD_DIR/mongo/db/timeseries/bucket_catalog',
         '$BUILD_DIR/mongo/db/transaction',
         '$BUILD_DIR/mongo/db/views/views_mongod',
+        '$BUILD_DIR/mongo/idl/feature_flag',
         '$BUILD_DIR/mongo/util/log_and_backoff',
         '$BUILD_DIR/mongo/util/net/http_client',
         'core',
+        'create_command',
         'current_op_common',
         'fsync_locked',
         'kill_common',
@@ -413,12 +431,13 @@ env.Library(
         "dbcommands_d.cpp",
         "dbhash.cpp",
         "driverHelpers.cpp",
-        "haystack.cpp",
         "internal_rename_if_options_and_indexes_match_cmd.cpp",
         "map_reduce_command.cpp",
         "oplog_application_checks.cpp",
         "oplog_note.cpp",
         'read_write_concern_defaults_server_status.cpp',
+        "resharding_test_commands.cpp",
+        "resharding_test_commands.idl",
         "resize_oplog.cpp",
         "resize_oplog.idl",
         'rwc_defaults_commands.cpp',
@@ -656,6 +675,7 @@ env.CppUnitTest(
         "$BUILD_DIR/mongo/db/repl/storage_interface_impl",
         "$BUILD_DIR/mongo/db/service_context_d",
         "$BUILD_DIR/mongo/db/service_context_d_test_fixture",
+        '$BUILD_DIR/mongo/idl/idl_parser',
         "core",
         "mongod",
         "servers",

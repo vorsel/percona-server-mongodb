@@ -33,14 +33,18 @@
 
 #include "mongo/db/catalog/create_collection.h"
 
+#include <fmt/printf.h>
+
 #include "mongo/bson/bsonobj.h"
+#include "mongo/bson/json.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/command_generic_argument.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
@@ -48,14 +52,24 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo {
 namespace {
+void _createSystemDotViewsIfNecessary(OperationContext* opCtx, const Database* db) {
+    // Create 'system.views' in a separate WUOW if it does not exist.
+    if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx,
+                                                                    db->getSystemViewsName())) {
+        WriteUnitOfWork wuow(opCtx);
+        invariant(db->createCollection(opCtx, db->getSystemViewsName()));
+        wuow.commit();
+    }
+}
 
 Status _createView(OperationContext* opCtx,
                    const NamespaceString& nss,
-                   const CollectionOptions& collectionOptions,
+                   CollectionOptions&& collectionOptions,
                    const BSONObj& idIndex) {
     return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
         AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_IX);
@@ -74,15 +88,7 @@ Status _createView(OperationContext* opCtx,
                           str::stream() << "Not primary while creating collection " << nss);
         }
 
-        // Create 'system.views' in a separate WUOW if it does not exist.
-        WriteUnitOfWork wuow(opCtx);
-        CollectionPtr coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
-            opCtx, NamespaceString(db->getSystemViewsName()));
-        if (!coll) {
-            coll = db->createCollection(opCtx, NamespaceString(db->getSystemViewsName()));
-        }
-        invariant(coll);
-        wuow.commit();
+        _createSystemDotViewsIfNecessary(opCtx, db);
 
         WriteUnitOfWork wunit(opCtx);
 
@@ -91,7 +97,7 @@ Status _createView(OperationContext* opCtx,
             nss,
             Top::LockType::NotLocked,
             AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-            CollectionCatalog::get(opCtx).getDatabaseProfileLevel(nss.db()));
+            CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nss.db()));
 
         // If the view creation rolls back, ensure that the Top entry created for the view is
         // deleted.
@@ -99,6 +105,8 @@ Status _createView(OperationContext* opCtx,
             Top::get(serviceContext).collectionDropped(nss);
         });
 
+        // Even though 'collectionOptions' is passed by rvalue reference, it is not safe to move
+        // because 'userCreateNS' may throw a WriteConflictException.
         Status status = db->userCreateNS(opCtx, nss, collectionOptions, true, idIndex);
         if (!status.isOK()) {
             return status;
@@ -109,9 +117,190 @@ Status _createView(OperationContext* opCtx,
     });
 }
 
+Status _createTimeseries(OperationContext* opCtx,
+                         const NamespaceString& ns,
+                         CollectionOptions&& options) {
+    auto bucketsNs = ns.makeTimeseriesBucketsNamespace();
+
+    options.viewOn = bucketsNs.coll().toString();
+
+    // The time field cannot be sparse, so we use it as the exit condition for the loop.
+    auto assembleData =
+        "function(dataArray) { \
+                const assembledData = []; \
+                if (dataArray.length === 0) { \
+                    return assembledData; \
+                } \
+                for (let i = 0;;i++) { \
+                    const assembledObj = {}; \
+                    for (const elem of dataArray) { \
+                        if (elem.v.hasOwnProperty(i)) { \
+                            assembledObj[elem.k] = elem.v[i]; \
+                        } else if (elem.k === '" +
+        options.timeseries->getTimeField() +
+        "') { \
+                            return assembledData; \
+                        } \
+                    } \
+                    assembledData.push(assembledObj); \
+                } \
+            }";
+    options.pipeline =
+        BSON_ARRAY(BSON("$project" << BSON("dataArray" << BSON("$objectToArray"
+                                                               << "$data")))
+                   << BSON("$project" << BSON(
+                               "assembledData" << BSON(
+                                   "$function" << BSON("body" << assembleData << "args"
+                                                              << BSON_ARRAY("$dataArray") << "lang"
+                                                              << "js"))))
+                   << BSON("$unwind"
+                           << "$assembledData")
+                   << BSON("$replaceWith"
+                           << "$assembledData"));
+
+    return writeConflictRetry(opCtx, "create", ns.ns(), [&]() -> Status {
+        AutoGetCollection autoColl(opCtx, ns, MODE_IX, AutoGetCollectionViewMode::kViewsPermitted);
+        Lock::CollectionLock bucketsCollLock(opCtx, bucketsNs, MODE_IX);
+        Lock::CollectionLock systemDotViewsLock(
+            opCtx,
+            NamespaceString(ns.db(), NamespaceString::kSystemDotViewsCollectionName),
+            MODE_X);
+
+        // This is a top-level handler for time-series creation name conflicts. New commands coming
+        // in, or commands that generated a WriteConflict must return a NamespaceExists error here
+        // on conflict.
+        if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, ns)) {
+            return Status(ErrorCodes::NamespaceExists,
+                          str::stream() << "Collection already exists. NS: " << ns);
+        }
+
+        auto db = autoColl.ensureDbExists();
+        if (ViewCatalog::get(db)->lookup(opCtx, ns.ns())) {
+            return {ErrorCodes::NamespaceExists,
+                    str::stream() << "A view already exists. NS: " << ns};
+        }
+
+        if (opCtx->writesAreReplicated() &&
+            !repl::ReplicationCoordinator::get(opCtx)->canAcceptWritesFor(opCtx, ns)) {
+            return {ErrorCodes::NotWritablePrimary,
+                    str::stream() << "Not primary while creating collection " << ns};
+        }
+
+        _createSystemDotViewsIfNecessary(opCtx, db);
+
+        auto catalog = CollectionCatalog::get(opCtx);
+        WriteUnitOfWork wuow(opCtx);
+
+        AutoStatsTracker statsTracker(opCtx,
+                                      ns,
+                                      Top::LockType::NotLocked,
+                                      AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                                      catalog->getDatabaseProfileLevel(ns.db()));
+
+        AutoStatsTracker bucketsStatsTracker(opCtx,
+                                             bucketsNs,
+                                             Top::LockType::NotLocked,
+                                             AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
+                                             catalog->getDatabaseProfileLevel(ns.db()));
+
+        // If the buckets collection and time-series view creation roll back, ensure that their Top
+        // entries are deleted.
+        opCtx->recoveryUnit()->onRollback(
+            [serviceContext = opCtx->getServiceContext(), ns, bucketsNs]() {
+                Top::get(serviceContext).collectionDropped(ns);
+                Top::get(serviceContext).collectionDropped(bucketsNs);
+            });
+
+        CollectionOptions bucketsOptions;
+
+        // Set the validator option to a JSON schema enforcing constraints on bucket documents.
+        // This validation is only structural to prevent accidental corruption by users and cannot
+        // cover all constraints.
+        // Leave the validationLevel and validationAction to their strict/error defaults.
+        auto timeField = options.timeseries->getTimeField();
+        bucketsOptions.validator = fromjson(fmt::sprintf(R"(
+{
+    '$jsonSchema' : {
+        bsonType: 'object',
+        required: ['_id', 'control', 'data'],
+        properties: {
+            _id: {bsonType: 'objectId'},
+            control: {
+                bsonType: 'object',
+                required: ['version', 'min', 'max'],
+                properties: {
+                    version: {bsonType: 'number'},
+                    min: {
+                        bsonType: 'object',
+                        required: ['%s'],
+                        properties: {'%s': {bsonType: 'date'}}
+                    },
+                    max: {
+                        bsonType: 'object',
+                        required: ['%s'],
+                        properties: {'%s': {bsonType: 'date'}}
+                    }
+                }
+            },
+            data: {bsonType: 'object'},
+            meta: {}
+        },
+        additionalProperties: false
+    }
+})",
+                                                         timeField,
+                                                         timeField,
+                                                         timeField,
+                                                         timeField));
+
+        // Create the buckets collection that will back the view.
+        auto bucketsCollection = db->createCollection(opCtx, bucketsNs, bucketsOptions);
+        invariant(bucketsCollection,
+                  str::stream() << "Failed to create buckets collection " << bucketsNs
+                                << " for time-series collection " << ns);
+
+        // Create a TTL index on 'control.min.[timeField]' if 'expireAfterSeconds' is provided.
+        if (auto expireAfterSeconds = options.timeseries->getExpireAfterSeconds()) {
+            CollectionWriter collectionWriter(opCtx, bucketsCollection->uuid());
+            auto indexBuildCoord = IndexBuildsCoordinator::get(opCtx);
+            const std::string controlMinTimeField = str::stream()
+                << "control.min." << options.timeseries->getTimeField();
+            auto indexSpec =
+                BSON(IndexDescriptor::kIndexVersionFieldName
+                     << IndexDescriptor::kLatestIndexVersion
+                     << IndexDescriptor::kKeyPatternFieldName << BSON(controlMinTimeField << 1)
+                     << IndexDescriptor::kIndexNameFieldName << (controlMinTimeField + "_1")
+                     << IndexDescriptor::kExpireAfterSecondsFieldName << *expireAfterSeconds);
+            auto fromMigrate = false;
+            try {
+                uassertStatusOK(index_key_validate::validateIndexSpecTTL(indexSpec));
+                indexBuildCoord->createIndexesOnEmptyCollection(
+                    opCtx, collectionWriter, {indexSpec}, fromMigrate);
+            } catch (DBException& ex) {
+                ex.addContext(str::stream() << "failed to create TTL index on bucket collection: "
+                                            << bucketsNs << "; index spec: " << indexSpec);
+                return ex.toStatus();
+            }
+        }
+
+        // Create the time-series view. Even though 'options' is passed by rvalue reference, it is
+        // not safe to move because 'userCreateNS' may throw a WriteConflictException.
+        auto status = db->userCreateNS(opCtx, ns, options);
+        if (!status.isOK()) {
+            return status.withContext(str::stream() << "Failed to create view on " << bucketsNs
+                                                    << " for time-series collection " << ns
+                                                    << " with options " << options.toBSON());
+        }
+
+        wuow.commit();
+
+        return Status::OK();
+    });
+}
+
 Status _createCollection(OperationContext* opCtx,
                          const NamespaceString& nss,
-                         const CollectionOptions& collectionOptions,
+                         CollectionOptions&& collectionOptions,
                          const BSONObj& idIndex) {
     return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
         AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_IX);
@@ -119,7 +308,7 @@ Status _createCollection(OperationContext* opCtx,
         // This is a top-level handler for collection creation name conflicts. New commands coming
         // in, or commands that generated a WriteConflict must return a NamespaceExists error here
         // on conflict.
-        if (CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss)) {
+        if (CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss)) {
             return Status(ErrorCodes::NamespaceExists,
                           str::stream() << "Collection already exists. NS: " << nss);
         }
@@ -141,7 +330,7 @@ Status _createCollection(OperationContext* opCtx,
             nss,
             Top::LockType::NotLocked,
             AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-            CollectionCatalog::get(opCtx).getDatabaseProfileLevel(nss.db()));
+            CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nss.db()));
 
         // If the collection creation rolls back, ensure that the Top entry created for the
         // collection is deleted.
@@ -149,6 +338,8 @@ Status _createCollection(OperationContext* opCtx,
             Top::get(serviceContext).collectionDropped(nss);
         });
 
+        // Even though 'collectionOptions' is passed by rvalue reference, it is not safe to move
+        // because 'userCreateNS' may throw a WriteConflictException.
         Status status = autoDb.getDb()->userCreateNS(opCtx, nss, collectionOptions, true, idIndex);
         if (!status.isOK()) {
             return status;
@@ -157,6 +348,39 @@ Status _createCollection(OperationContext* opCtx,
 
         return Status::OK();
     });
+}
+
+/**
+ * Creates the collection or the view as described by 'options'.
+ */
+Status createCollection(OperationContext* opCtx,
+                        const NamespaceString& ns,
+                        CollectionOptions&& options,
+                        const BSONObj& idIndex) {
+    auto status = userAllowedCreateNS(ns);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    if (options.isView()) {
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                str::stream() << "Cannot create a view in a multi-document "
+                                 "transaction.",
+                !opCtx->inMultiDocumentTransaction());
+        return _createView(opCtx, ns, std::move(options), idIndex);
+    } else if (options.timeseries) {
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                str::stream()
+                    << "Cannot create a time-series collection in a multi-document transaction.",
+                !opCtx->inMultiDocumentTransaction());
+        return _createTimeseries(opCtx, ns, std::move(options));
+    } else {
+        uassert(ErrorCodes::OperationNotSupportedInTransaction,
+                str::stream() << "Cannot create system collection " << ns
+                              << " within a transaction.",
+                !opCtx->inMultiDocumentTransaction() || !ns.isSystem());
+        return _createCollection(opCtx, ns, std::move(options), idIndex);
+    }
 }
 
 /**
@@ -173,11 +397,6 @@ Status createCollection(OperationContext* opCtx,
     // Skip the first cmdObj element.
     BSONElement firstElt = it.next();
     invariant(firstElt.fieldNameStringData() == "create");
-
-    Status status = userAllowedCreateNS(nss);
-    if (!status.isOK()) {
-        return status;
-    }
 
     // Build options object from remaining cmdObj elements.
     BSONObjBuilder optionsBuilder;
@@ -205,19 +424,7 @@ Status createCollection(OperationContext* opCtx,
         collectionOptions = statusWith.getValue();
     }
 
-    if (collectionOptions.isView()) {
-        uassert(ErrorCodes::OperationNotSupportedInTransaction,
-                str::stream() << "Cannot create a view in a multi-document "
-                                 "transaction.",
-                !opCtx->inMultiDocumentTransaction());
-        return _createView(opCtx, nss, collectionOptions, idIndex);
-    } else {
-        uassert(ErrorCodes::OperationNotSupportedInTransaction,
-                str::stream() << "Cannot create system collection " << nss.toString()
-                              << " within a transaction.",
-                !opCtx->inMultiDocumentTransaction() || !nss.isSystem());
-        return _createCollection(opCtx, nss, collectionOptions, idIndex);
-    }
+    return createCollection(opCtx, nss, std::move(collectionOptions), idIndex);
 }
 
 }  // namespace
@@ -231,6 +438,14 @@ Status createCollection(OperationContext* opCtx,
                             cmdObj,
                             idIndex,
                             CollectionOptions::parseForCommand);
+}
+
+Status createCollection(OperationContext* opCtx,
+                        const NamespaceString& ns,
+                        const CreateCommand& cmd) {
+    auto options = CollectionOptions::parse(cmd);
+    auto idIndex = std::exchange(options.idIndex, {});
+    return createCollection(opCtx, ns, std::move(options), idIndex);
 }
 
 Status createCollectionForApplyOps(OperationContext* opCtx,
@@ -259,8 +474,8 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
                 "Invalid UUID in applyOps create command: " + uuid.toString(),
                 uuid.isRFC4122v4());
 
-        auto& catalog = CollectionCatalog::get(opCtx);
-        const auto currentName = catalog.lookupNSSByUUID(opCtx, uuid);
+        auto catalog = CollectionCatalog::get(opCtx);
+        const auto currentName = catalog->lookupNSSByUUID(opCtx, uuid);
         auto serviceContext = opCtx->getServiceContext();
         auto opObserver = serviceContext->getOpObserver();
         if (currentName && *currentName == newCollName)
@@ -284,11 +499,11 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
         // a random temporary name is correct: once all entries are replayed no temporary
         // names will remain.
         const bool stayTemp = true;
-        auto futureColl = db
-            ? CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, newCollName)
-            : nullptr;
+        auto futureColl = db ? catalog->lookupCollectionByNamespace(opCtx, newCollName) : nullptr;
         bool needsRenaming = static_cast<bool>(futureColl);
-        invariant(!needsRenaming || allowRenameOutOfTheWay);
+        invariant(!needsRenaming || allowRenameOutOfTheWay,
+                  str::stream() << "Current collection name: " << currentName << ", UUID: " << uuid
+                                << ". Future collection name: " << newCollName);
 
         for (int tries = 0; needsRenaming && tries < 10; ++tries) {
             auto tmpNameResult = db->makeUniqueCollectionNamespace(opCtx, "tmp%%%%%.create");
@@ -331,7 +546,7 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
 
                     wuow.commit();
                     // Re-fetch collection after commit to get a valid pointer
-                    futureColl = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
+                    futureColl = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, uuid);
                     return Status::OK();
                 });
 
@@ -359,7 +574,7 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
 
         // If the collection with the requested UUID already exists, but with a different
         // name, just rename it to 'newCollName'.
-        if (catalog.lookupCollectionByUUID(opCtx, uuid)) {
+        if (catalog->lookupCollectionByUUID(opCtx, uuid)) {
             invariant(currentName);
             uassert(40655,
                     str::stream() << "Invalid name " << newCollName << " for UUID " << uuid,

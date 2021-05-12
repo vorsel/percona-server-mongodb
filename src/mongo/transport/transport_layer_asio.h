@@ -124,10 +124,12 @@ public:
                                       ConnectSSLMode sslMode,
                                       Milliseconds timeout) final;
 
-    Future<SessionHandle> asyncConnect(HostAndPort peer,
-                                       ConnectSSLMode sslMode,
-                                       const ReactorHandle& reactor,
-                                       Milliseconds timeout) final;
+    Future<SessionHandle> asyncConnect(
+        HostAndPort peer,
+        ConnectSSLMode sslMode,
+        const ReactorHandle& reactor,
+        Milliseconds timeout,
+        std::shared_ptr<const SSLConnectionContext> transientSSLContext = nullptr) final;
 
     Status setup() final;
 
@@ -150,8 +152,22 @@ public:
                               bool asyncOCSPStaple) override;
 
     std::shared_ptr<SSLManagerInterface> getSSLManager() {
-        return _sslContext.get()->manager;
+        auto sslContext = _sslContext.get();
+        if (!sslContext) {
+            return std::shared_ptr<SSLManagerInterface>{};
+        }
+        return sslContext->manager;
     }
+
+    /**
+     * Creates a transient SSL context using targeted (non default) SSL params.
+     * @param transientSSLParams overrides any value in stored SSLConnectionContext.
+     * @param optionalManager provides an optional SSL manager, otherwise the default one will be
+     * used.
+     */
+    StatusWith<std::shared_ptr<const transport::SSLConnectionContext>> createTransientSSLContext(
+        const TransientSSLParams& transientSSLParams,
+        const SSLManagerInterface* optionalManager) override;
 #endif
 
 private:
@@ -169,6 +185,12 @@ private:
     StatusWith<ASIOSessionHandle> _doSyncConnect(Endpoint endpoint,
                                                  const HostAndPort& peer,
                                                  const Milliseconds& timeout);
+
+    StatusWith<std::shared_ptr<const transport::SSLConnectionContext>> _createSSLContext(
+        std::shared_ptr<SSLManagerInterface>& manager,
+        SSLParams::SSLModes sslMode,
+        TransientSSLParams transientEgressSSLParams,
+        bool asyncOCSPStaple) const;
 
     void _runListener() noexcept;
 
@@ -205,12 +227,7 @@ private:
     std::shared_ptr<ASIOReactor> _acceptorReactor;
 
 #ifdef MONGO_CONFIG_SSL
-    struct SSLConnectionContext {
-        std::unique_ptr<asio::ssl::context> ingress;
-        std::unique_ptr<asio::ssl::context> egress;
-        std::shared_ptr<SSLManagerInterface> manager;
-    };
-    synchronized_value<std::shared_ptr<SSLConnectionContext>> _sslContext;
+    synchronized_value<std::shared_ptr<const SSLConnectionContext>> _sslContext;
 #endif
 
     std::vector<std::pair<SockAddr, GenericAcceptor>> _acceptors;

@@ -341,8 +341,9 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
     }
 
     if (_useFindCommand) {
+        const auto replyObj = commandDataReceived(reply);
         cursorId = 0;  // Don't try to kill cursor if we get back an error.
-        auto cr = uassertStatusOK(CursorResponse::parseFromBSON(commandDataReceived(reply)));
+        auto cr = uassertStatusOK(CursorResponse::parseFromBSON(replyObj));
         cursorId = cr.getCursorId();
         uassert(50935,
                 "Received a getMore response with a cursor id of 0 and the moreToCome flag set.",
@@ -352,17 +353,21 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
         // Store the resume token, if we got one.
         _postBatchResumeToken = cr.getPostBatchResumeToken();
         batch.objs = cr.releaseBatch();
+
+        if (replyObj.hasField(LogicalTime::kOperationTimeFieldName)) {
+            _operationTime = LogicalTime::fromOperationTime(replyObj).asTimestamp();
+        }
         return;
     }
 
     QueryResult::View qr = reply.singleData().view2ptr();
     resultFlags = qr.getResultFlags();
 
-    if (qr.getResultFlags() & ResultFlag_ErrSet) {
+    if (resultFlags & ResultFlag_ErrSet) {
         wasError = true;
     }
 
-    if (qr.getResultFlags() & ResultFlag_CursorNotFound) {
+    if (resultFlags & ResultFlag_CursorNotFound) {
         // cursor id no longer valid at the server.
         invariant(qr.getCursorId() == 0);
 
@@ -401,13 +406,11 @@ void DBClientCursor::dataReceived(const Message& reply, bool& retry, string& hos
             "Got invalid reply from external server while reading from cursor",
             data.atEof());
 
-    _client->checkResponse(batch.objs, false, &retry, &host);  // watches for "not master"
+    _client->checkResponse(batch.objs, false, &retry, &host);  // watches for "not primary"
 
-    if (qr.getResultFlags() & ResultFlag_ShardConfigStale) {
-        BSONObj error;
-        verify(peekError(&error));
-        uasserted(StaleConfigInfo::parseFromCommandError(error), "stale config on lazy receive");
-    }
+    tassert(5262101,
+            "Deprecated ShardConfigStale flag encountered in query result",
+            !(resultFlags & ResultFlag_ShardConfigStaleDeprecated));
 
     /* this assert would fire the way we currently work:
         verify( nReturned || cursorId == 0 );
@@ -498,7 +501,7 @@ void DBClientCursor::attach(AScopedConnection* conn) {
     verify(conn);
     verify(conn->get());
 
-    if (conn->get()->type() == ConnectionString::SET) {
+    if (conn->get()->type() == ConnectionString::ConnectionType::kReplicaSet) {
         if (_lazyHost.size() > 0)
             _scopedHost = _lazyHost;
         else if (_client)
@@ -599,7 +602,7 @@ StatusWith<std::unique_ptr<DBClientCursor>> DBClientCursor::fromAggregationReque
         if (!client->runCommand(aggRequest.getNamespaceString().db().toString(),
                                 aggRequest.serializeToCommandObj().toBson(),
                                 ret,
-                                secondaryOk ? QueryOption_SlaveOk : 0)) {
+                                secondaryOk ? QueryOption_SecondaryOk : 0)) {
             return {ErrorCodes::CommandFailed, ret.toString()};
         }
     } catch (...) {

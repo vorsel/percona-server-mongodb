@@ -11,6 +11,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/client/read_preference',
+        '$BUILD_DIR/mongo/idl/feature_flag',
         '$BUILD_DIR/mongo/idl/server_parameter',
     ]
 )
@@ -230,6 +231,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/catalog/database_holder',
+        '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/storage/oplog_cap_maintainer_thread',
         '$BUILD_DIR/mongo/db/storage/storage_control',
         '$BUILD_DIR/mongo/db/vector_clock',
@@ -343,6 +345,10 @@ env.Library(
         '$BUILD_DIR/mongo/db/dbdirectclient',
         '$BUILD_DIR/mongo/db/service_context',
         'storage_interface',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/catalog/document_validation',
+        '$BUILD_DIR/mongo/db/ops/write_ops_exec',
     ],
 )
 
@@ -826,7 +832,7 @@ env.Library('speculative_majority_read_info',
 env.Library(
     target='replica_set_messages',
     source=[
-        'is_master_response.cpp',
+        'hello_response.cpp',
         'member_config.cpp',
         'repl_set_config.cpp',
         'repl_set_config_validators.cpp',
@@ -1028,7 +1034,9 @@ env.Library(
         'task_runner',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/catalog/document_validation',
         '$BUILD_DIR/mongo/db/commands/list_collections_filter',
+        '$BUILD_DIR/mongo/db/ops/write_ops_exec',
         '$BUILD_DIR/mongo/rpc/metadata',
         '$BUILD_DIR/mongo/util/progress_meter',
         'repl_server_parameters',
@@ -1376,7 +1384,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/query_exec',
         '$BUILD_DIR/mongo/db/repl/oplog_buffer_proxy',
         '$BUILD_DIR/mongo/db/repl/replication_metrics',
-        '$BUILD_DIR/mongo/db/s/balancer',
+        '$BUILD_DIR/mongo/db/s/sharding_catalog_manager',
         '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/stats/counters',
@@ -1621,6 +1629,7 @@ env.CppUnitTest(
         'repl_server_parameters',
         'repl_sync_shared_data',
         'replmocks',
+        'storage_interface_impl',
         'tenant_migration_cloners'
     ],
 )
@@ -1767,5 +1776,6 @@ env.Library(
         'oplog',
         'oplog_application',
         'oplog_application_interface',
+        'repl_server_parameters'
     ],
 )

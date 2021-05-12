@@ -97,7 +97,7 @@ protected:
         auto chunk = ChunkType(nss, std::move(range), ChunkVersion(1, 0, epoch), kShardTwo);
         ChunkManager cm(
             kShardOne,
-            DatabaseVersion(uuid, 1),
+            DatabaseVersion(uuid),
             makeStandaloneRoutingTableHistory(RoutingTableHistory::makeNew(nss,
                                                                            uuid,
                                                                            shardKeyPattern,
@@ -105,6 +105,7 @@ protected:
                                                                            false,
                                                                            epoch,
                                                                            boost::none,
+                                                                           true,
                                                                            {std::move(chunk)})),
             boost::none);
 
@@ -153,7 +154,7 @@ protected:
         ASSERT_EQ(reshardingDoc.get_id(), reshardingUUID);
         ASSERT_EQ(reshardingDoc.getNss(), nss);
         ASSERT_EQ(reshardingDoc.getExistingUUID(), existingUUID);
-        ASSERT_BSONOBJ_EQ(reshardingDoc.getReshardingKey(), reshardingKey);
+        ASSERT_BSONOBJ_EQ(reshardingDoc.getReshardingKey().toBSON(), reshardingKey);
     }
 
     void assertDonorDocMatchesReshardingFields(const NamespaceString& nss,
@@ -181,7 +182,7 @@ protected:
             metadata.getShardKeyPattern().toBSON(),
             recipientDoc);
 
-        ASSERT(recipientDoc.getState() == RecipientStateEnum::kCloning);
+        ASSERT(recipientDoc.getState() == RecipientStateEnum::kCreatingCollection);
         ASSERT(recipientDoc.getFetchTimestamp() ==
                reshardingFields.getRecipientFields()->getFetchTimestamp());
 
@@ -253,6 +254,8 @@ public:
     void tearDown() override {
         WaitForMajorityService::get(getServiceContext()).shutDown();
 
+        Grid::get(operationContext())->getExecutorPool()->shutdownAndJoin();
+
         _registry->onShutdown();
 
         ShardServerTestFixture::tearDown();
@@ -294,6 +297,8 @@ TEST_F(ReshardingDonorRecipientCommonTest, CreateDonorServiceInstance) {
                                                  ReshardingDonorDocument>(opCtx, kReshardingUUID);
 
     ASSERT(donorStateMachine != boost::none);
+
+    donorStateMachine.get()->interrupt({ErrorCodes::InternalError, "Shut down for test"});
 }
 
 TEST_F(ReshardingDonorRecipientCommonTest, CreateRecipientServiceInstance) {
@@ -315,6 +320,8 @@ TEST_F(ReshardingDonorRecipientCommonTest, CreateRecipientServiceInstance) {
                                                                               kReshardingUUID);
 
     ASSERT(recipientStateMachine != boost::none);
+
+    recipientStateMachine.get()->interrupt({ErrorCodes::InternalError, "Shut down for test"});
 }
 
 TEST_F(ReshardingDonorRecipientCommonTest,

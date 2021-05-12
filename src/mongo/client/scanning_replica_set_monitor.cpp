@@ -201,6 +201,8 @@ void ScanningReplicaSetMonitor::drop() {
 }
 
 ScanningReplicaSetMonitor::~ScanningReplicaSetMonitor() {
+    // `drop` is idempotent and a duplicate call from ReplicaSetMonitorManager::removeMonitor() is
+    // safe.
     drop();
 }
 
@@ -302,8 +304,8 @@ void ScanningReplicaSetMonitor::SetState::rescheduleRefresh(SchedulingStrategy s
 }
 
 SemiFuture<HostAndPort> ScanningReplicaSetMonitor::getHostOrRefresh(
-    const ReadPreferenceSetting& criteria, Milliseconds maxWait) {
-    return _getHostsOrRefresh(criteria, maxWait)
+    const ReadPreferenceSetting& criteria, const CancelationToken&) {
+    return _getHostsOrRefresh(criteria, ReplicaSetMonitorInterface::kDefaultFindHostTimeout)
         .then([](const auto& hosts) {
             invariant(hosts.size());
             return hosts[0];
@@ -312,8 +314,8 @@ SemiFuture<HostAndPort> ScanningReplicaSetMonitor::getHostOrRefresh(
 }
 
 SemiFuture<std::vector<HostAndPort>> ScanningReplicaSetMonitor::getHostsOrRefresh(
-    const ReadPreferenceSetting& criteria, Milliseconds maxWait) {
-    return _getHostsOrRefresh(criteria, maxWait).semi();
+    const ReadPreferenceSetting& criteria, const CancelationToken&) {
+    return _getHostsOrRefresh(criteria, ReplicaSetMonitorInterface::kDefaultFindHostTimeout).semi();
 }
 
 Future<std::vector<HostAndPort>> ScanningReplicaSetMonitor::_getHostsOrRefresh(
@@ -350,8 +352,9 @@ Future<std::vector<HostAndPort>> ScanningReplicaSetMonitor::_getHostsOrRefresh(
 
     return std::move(pf.future);
 }
-HostAndPort ScanningReplicaSetMonitor::getMasterOrUassert() {
-    return getHostOrRefresh(kPrimaryOnlyReadPreference).get();
+
+HostAndPort ScanningReplicaSetMonitor::getPrimaryOrUassert() {
+    return getHostOrRefresh(kPrimaryOnlyReadPreference, CancelationToken::uncancelable()).get();
 }
 
 void ScanningReplicaSetMonitor::failedHost(const HostAndPort& host, const Status& status) {
@@ -574,7 +577,7 @@ void Refresher::scheduleIsMaster(const HostAndPort& host) {
             auto timer = Timer();
             auto reply = BSONObj();
             bool ignoredOutParam = false;
-            conn->isMaster(ignoredOutParam, &reply);
+            conn->isPrimary(ignoredOutParam, &reply);
             conn.done();  // return to pool on success.
 
             receivedIsMaster(host, timer.micros(), reply);
@@ -1434,6 +1437,7 @@ void SetState::init() {
 }
 
 void SetState::drop() {
+    // This is invoked from ScanningReplicaSetMonitor::drop() under lock.
     if (std::exchange(isDropped, true)) {
         // If a SetState calls drop() from destruction after the RSMM calls shutdown(), then the
         // RSMM's executor may no longer exist. Thus, only drop once.

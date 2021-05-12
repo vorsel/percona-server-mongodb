@@ -210,9 +210,12 @@ public:
     /**
      * Removes any knowledge of the ident from the storage engines metadata which includes removing
      * the underlying files belonging to the ident. If the storage engine is unable to process the
-     * removal immediately, we enqueue it to be removed at a later time.
+     * removal immediately, we enqueue it to be removed at a later time. If a callback is specified,
+     * it will be run upon the drop if this function returns an OK status.
      */
-    virtual Status dropIdent(RecoveryUnit* ru, StringData ident) = 0;
+    virtual Status dropIdent(RecoveryUnit* ru,
+                             StringData ident,
+                             StorageEngine::DropIdentCallback&& onDrop = nullptr) = 0;
 
     /**
      * Removes any knowledge of the ident from the storage engines metadata without removing the
@@ -419,11 +422,6 @@ public:
      * See `StorageEngine::getAllDurableTimestamp`
      */
     virtual Timestamp getAllDurableTimestamp() const = 0;
-
-    /**
-     * See `StorageEngine::getOldestOpenReadTimestamp`
-     */
-    virtual Timestamp getOldestOpenReadTimestamp() const = 0;
 
     /**
      * See `StorageEngine::getOplogNeededForCrashRecovery`

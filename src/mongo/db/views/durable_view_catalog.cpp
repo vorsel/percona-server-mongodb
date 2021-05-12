@@ -110,8 +110,8 @@ void DurableViewCatalogImpl::_iterate(OperationContext* opCtx,
                                       ViewCatalogLookupBehavior lookupBehavior) {
     invariant(opCtx->lockState()->isCollectionLockedForMode(_db->getSystemViewsName(), MODE_IS));
 
-    const CollectionPtr& systemViews =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, _db->getSystemViewsName());
+    CollectionPtr systemViews = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+        opCtx, _db->getSystemViewsName());
     if (!systemViews) {
         return;
     }
@@ -142,7 +142,8 @@ BSONObj DurableViewCatalogImpl::_validateViewDefinition(OperationContext* opCtx,
 
     for (const BSONElement& e : viewDefinition) {
         std::string name(e.fieldName());
-        valid &= name == "_id" || name == "viewOn" || name == "pipeline" || name == "collation";
+        valid &= name == "_id" || name == "viewOn" || name == "pipeline" || name == "collation" ||
+            name == "timeseries";
     }
 
     const auto viewName = viewDefinition["_id"].str();
@@ -168,6 +169,9 @@ BSONObj DurableViewCatalogImpl::_validateViewDefinition(OperationContext* opCtx,
     valid &= (!viewDefinition.hasField("collation") ||
               viewDefinition["collation"].type() == BSONType::Object);
 
+    valid &= !viewDefinition.hasField("timeseries") ||
+        viewDefinition["timeseries"].type() == BSONType::Object;
+
     uassert(ErrorCodes::InvalidViewDefinition,
             str::stream() << "found invalid view definition " << viewDefinition["_id"]
                           << " while reading '" << _db->getSystemViewsName() << "'",
@@ -186,7 +190,7 @@ void DurableViewCatalogImpl::upsert(OperationContext* opCtx,
     dassert(opCtx->lockState()->isCollectionLockedForMode(systemViewsNs, MODE_X));
 
     const CollectionPtr& systemViews =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, systemViewsNs);
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, systemViewsNs);
     invariant(systemViews);
 
     const bool requireIndex = false;
@@ -217,8 +221,8 @@ void DurableViewCatalogImpl::remove(OperationContext* opCtx, const NamespaceStri
     dassert(opCtx->lockState()->isDbLockedForMode(_db->name(), MODE_IX));
     dassert(opCtx->lockState()->isCollectionLockedForMode(name, MODE_IX));
 
-    const CollectionPtr& systemViews =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, _db->getSystemViewsName());
+    CollectionPtr systemViews = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
+        opCtx, _db->getSystemViewsName());
     dassert(opCtx->lockState()->isCollectionLockedForMode(systemViews->ns(), MODE_X));
 
     if (!systemViews)

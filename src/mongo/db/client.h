@@ -160,22 +160,6 @@ public:
     ServiceContext::UniqueOperationContext makeOperationContext();
 
     /**
-     * Sets the active operation context on this client to "opCtx", which must be non-NULL.
-     *
-     * It is an error to call this method if there is already an operation context on Client.
-     * It is an error to call this on an unlocked client.
-     */
-    void setOperationContext(OperationContext* opCtx);
-
-    /**
-     * Clears the active operation context on this client.
-     *
-     * There must already be such a context set on this client.
-     * It is an error to call this on an unlocked client.
-     */
-    void resetOperationContext();
-
-    /**
      * Gets the operation context active on this client, or nullptr if there is no such context.
      *
      * It is an error to call this method on an unlocked client, or to use the value returned
@@ -255,12 +239,35 @@ public:
         return _killed.loadRelaxed();
     }
 
+    /**
+     * Whether this client supports the hello command, which indicates that the server
+     * can return "not primary" error messages.
+     */
+    bool supportsHello() const {
+        return _supportsHello;
+    }
+
+    /**
+     * Will be set to true if the client sent { helloOk: true } when opening a
+     * connection to the server. Defaults to false.
+     */
+    void setSupportsHello(bool newVal) {
+        _supportsHello = newVal;
+    }
+
 private:
     friend class ServiceContext;
     friend class ThreadClient;
     explicit Client(std::string desc,
                     ServiceContext* serviceContext,
                     transport::SessionHandle session);
+
+    /**
+     * Sets the active operation context on this client to "opCtx".
+     */
+    void _setOperationContext(OperationContext* opCtx) {
+        _opCtx = opCtx;
+    }
 
     ServiceContext* const _serviceContext;
     const transport::SessionHandle _session;
@@ -286,6 +293,10 @@ private:
     PseudoRandom _prng;
 
     AtomicWord<bool> _killed{false};
+
+    // Whether this client used { helloOk: true } when opening its connection, indicating that
+    // it supports the hello command.
+    bool _supportsHello = false;
 };
 
 /**

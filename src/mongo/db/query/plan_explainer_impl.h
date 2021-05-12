@@ -30,7 +30,9 @@
 #pragma once
 
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/query/plan_enumerator_explain_info.h"
 #include "mongo/db/query/plan_explainer.h"
+#include "mongo/db/query/query_solution.h"
 
 namespace mongo {
 /**
@@ -42,6 +44,8 @@ namespace mongo {
  */
 class PlanExplainerImpl final : public PlanExplainer {
 public:
+    PlanExplainerImpl(PlanStage* root, const PlanEnumeratorExplainInfo& explainInfo)
+        : PlanExplainer{explainInfo}, _root{root} {}
     PlanExplainerImpl(PlanStage* root) : _root{root} {}
 
     bool isMultiPlan() const final;
@@ -50,8 +54,8 @@ public:
     PlanStatsDetails getWinningPlanStats(ExplainOptions::Verbosity verbosity) const final;
     std::vector<PlanStatsDetails> getRejectedPlansStats(
         ExplainOptions::Verbosity verbosity) const final;
-    std::vector<PlanStatsDetails> getCachedPlanStats(
-        const PlanCacheEntry& entry, ExplainOptions::Verbosity verbosity) const final;
+    std::vector<PlanStatsDetails> getCachedPlanStats(const PlanCacheEntry::DebugInfo&,
+                                                     ExplainOptions::Verbosity) const final;
 
 private:
     PlanStage* const _root;
@@ -62,4 +66,20 @@ private:
  * found.
  */
 PlanStage* getStageByType(PlanStage* root, StageType type);
+
+/**
+ * Adds the path-level multikey information to the explain output in a field called "multiKeyPaths".
+ * The value associated with the "multiKeyPaths" field is an object with keys equal to those in the
+ * index key pattern and values equal to an array of strings corresponding to paths that cause the
+ * index to be multikey.
+ *
+ * For example, with the index {'a.b': 1, 'a.c': 1} where the paths "a" and "a.b" cause the
+ * index to be multikey, we'd have {'multiKeyPaths': {'a.b': ['a', 'a.b'], 'a.c': ['a']}}.
+ *
+ * This function should only be called if the associated index supports path-level multikey
+ * tracking.
+ */
+void appendMultikeyPaths(const BSONObj& keyPattern,
+                         const MultikeyPaths& multikeyPaths,
+                         BSONObjBuilder* bob);
 }  // namespace mongo

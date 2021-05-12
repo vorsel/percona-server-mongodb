@@ -105,10 +105,22 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listCollectionsStage() {
 
     BSONObj readResult;
     BSONObj cmd = ClonerUtils::buildMajorityWaitRequest(_operationTime);
-    getClient()->runCommand("admin", cmd, readResult, QueryOption_SlaveOk);
+    getClient()->runCommand("admin", cmd, readResult, QueryOption_SecondaryOk);
     uassertStatusOKWithContext(
         getStatusFromCommandResult(readResult),
         "TenantDatabaseCloner failed to get listCollections result majority-committed");
+
+    {
+        // _operationTime is now majority committed on donor.
+        //
+        // Tenant Migration recipient oplog fetcher doesn't care about the donor term field in
+        // TenantMigrationRecipientDocument::DataConsistentStopDonorOpTime, which is determined by
+        // TenantMigrationSharedData::_lastVisibleOpTime. So, it's ok to build a fake OpTime with
+        // term set as OpTime::kUninitializedTerm.
+        stdx::lock_guard<TenantMigrationSharedData> lk(*getSharedData());
+        getSharedData()->setLastVisibleOpTime(lk,
+                                              OpTime(_operationTime, OpTime::kUninitializedTerm));
+    }
 
     // Process and verify the listCollections results.
     stdx::unordered_set<std::string> seen;

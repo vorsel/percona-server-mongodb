@@ -58,6 +58,7 @@
 #include "mongo/db/s/add_shard_util.h"
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/type_shard_identity.h"
+#include "mongo/db/vector_clock.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/task_executor.h"
@@ -70,8 +71,9 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_identity_loader.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/fail_point.h"
@@ -236,7 +238,8 @@ StatusWith<boost::optional<ShardType>> ShardingCatalogManager::_checkIfShardExis
             if (proposedShardConnectionString.type() != existingShardConnStr.type()) {
                 return false;
             }
-            if (proposedShardConnectionString.type() == ConnectionString::SET &&
+            if (proposedShardConnectionString.type() ==
+                    ConnectionString::ConnectionType::kReplicaSet &&
                 proposedShardConnectionString.getSetName() != existingShardConnStr.getSetName()) {
                 return false;
             }
@@ -246,8 +249,8 @@ StatusWith<boost::optional<ShardType>> ShardingCatalogManager::_checkIfShardExis
             return true;
         };
 
-        if (existingShardConnStr.type() == ConnectionString::SET &&
-            proposedShardConnectionString.type() == ConnectionString::SET &&
+        if (existingShardConnStr.type() == ConnectionString::ConnectionType::kReplicaSet &&
+            proposedShardConnectionString.type() == ConnectionString::ConnectionType::kReplicaSet &&
             existingShardConnStr.getSetName() == proposedShardConnectionString.getSetName()) {
             // An existing shard has the same replica set name as the shard being added.
             // If the options aren't the same, then this is an error,
@@ -533,7 +536,7 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
     const std::string* shardProposedName,
     const ConnectionString& shardConnectionString,
     const long long maxSize) {
-    if (shardConnectionString.type() == ConnectionString::INVALID) {
+    if (!shardConnectionString) {
         return {ErrorCodes::BadValue, "Invalid connection string"};
     }
 
@@ -565,7 +568,7 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
     auto targeter = shard->getTargeter();
 
     auto stopMonitoringGuard = makeGuard([&] {
-        if (shardConnectionString.type() == ConnectionString::SET) {
+        if (shardConnectionString.type() == ConnectionString::ConnectionType::kReplicaSet) {
             // This is a workaround for the case were we could have some bad shard being
             // requested to be added and we put that bad connection string on the global replica set
             // monitor registry. It needs to be cleaned up so that when a correct replica set is
@@ -589,17 +592,15 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
     }
 
     for (const auto& dbName : dbNamesStatus.getValue()) {
-        auto dbt = Grid::get(opCtx)->catalogClient()->getDatabase(
-            opCtx, dbName, repl::ReadConcernLevel::kLocalReadConcern);
-        if (dbt.isOK()) {
-            const auto& dbDoc = dbt.getValue().value;
+        try {
+            auto dbt = Grid::get(opCtx)->catalogClient()->getDatabase(
+                opCtx, dbName, repl::ReadConcernLevel::kLocalReadConcern);
             return Status(ErrorCodes::OperationFailed,
                           str::stream() << "can't add shard "
                                         << "'" << shardConnectionString.toString() << "'"
                                         << " because a local database '" << dbName
-                                        << "' exists in another " << dbDoc.getPrimary());
-        } else if (dbt != ErrorCodes::NamespaceNotFound) {
-            return dbt.getStatus();
+                                        << "' exists in another " << dbt.getPrimary());
+        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         }
     }
 
@@ -737,7 +738,15 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
 
     // Add all databases which were discovered on the new shard
     for (const auto& dbName : dbNamesStatus.getValue()) {
-        DatabaseType dbt(dbName, shardType.getName(), false, databaseVersion::makeNew());
+        boost::optional<Timestamp> clusterTime;
+        if (feature_flags::gShardingFullDDLSupport.isEnabled(
+                serverGlobalParams.featureCompatibility)) {
+            const auto now = VectorClock::get(opCtx)->getTime();
+            clusterTime = now.clusterTime().asTimestamp();
+        }
+
+        DatabaseType dbt(
+            dbName, shardType.getName(), false, DatabaseVersion(UUID::gen(), clusterTime));
 
         {
             const auto status = Grid::get(opCtx)->catalogClient()->updateConfigDocument(

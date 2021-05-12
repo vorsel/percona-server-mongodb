@@ -76,6 +76,7 @@ class UUID {
     friend class idl::import::One_UUID;
     friend class IndexBuildEntry;
     friend class KeyStoreRecord;
+    friend class ListCollectionsReplyInfo;
     friend class LogicalSessionId;
     friend class LogicalSessionToClient;
     friend class LogicalSessionIdToClient;
@@ -91,7 +92,7 @@ class UUID {
     friend class RecipientForgetMigration;
     friend class RecipientSyncData;
     friend class ReshardingDonorDocument;
-    friend class ReshardingOplogSourceId;
+    friend class ReshardingSourceId;
     friend class ResumeIndexInfo;
     friend class ResumeTokenInternal;
     friend class ShardCollectionTypeBase;
@@ -99,6 +100,7 @@ class UUID {
     friend class ShardsvrRenameCollection;
     friend class TenantMigrationDonorDocument;
     friend class TenantMigrationRecipientDocument;
+    friend class TestReshardCloneCollection;
     friend class TypeCollectionRecipientFields;
     friend class TypeCollectionReshardingFields;
     friend class VoteCommitIndexBuild;

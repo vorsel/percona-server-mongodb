@@ -69,7 +69,7 @@ public:
     bool getMaintenanceMode() override;
 
     bool isReplEnabled() const override;
-    bool isMasterForReportingPurposes() override;
+    bool isWritablePrimaryForReportingPurposes() override;
     bool isInPrimaryOrSecondaryState(OperationContext* opCtx) const override;
     bool isInPrimaryOrSecondaryState_UNSAFE() const override;
 
@@ -83,10 +83,10 @@ public:
 
     Status checkCanServeReadsFor(OperationContext* opCtx,
                                  const NamespaceString& ns,
-                                 bool slaveOk) override;
+                                 bool secondaryOk) override;
     Status checkCanServeReadsFor_UNSAFE(OperationContext* opCtx,
                                         const NamespaceString& ns,
-                                        bool slaveOk) override;
+                                        bool secondaryOk) override;
 
     bool shouldRelaxIndexConstraints(OperationContext* opCtx, const NamespaceString& ns) override;
 
@@ -107,7 +107,7 @@ public:
 
     Status waitForMemberState(repl::MemberState, Milliseconds) override;
 
-    Seconds getSlaveDelaySecs() const override;
+    Seconds getSecondaryDelaySecs() const override;
 
     void clearSyncSourceBlacklist() override;
 
@@ -175,7 +175,7 @@ public:
 
     Status processReplSetGetStatus(BSONObjBuilder*, ReplSetGetStatusResponseStyle) override;
 
-    void appendSlaveInfoData(BSONObjBuilder*) override;
+    void appendSecondaryInfoData(BSONObjBuilder*) override;
 
     repl::ReplSetConfig getConfig() const override;
 
@@ -284,15 +284,15 @@ public:
 
     void incrementTopologyVersion() override;
 
-    std::shared_ptr<const repl::IsMasterResponse> awaitIsMasterResponse(
+    std::shared_ptr<const repl::HelloResponse> awaitHelloResponse(
         OperationContext* opCtx,
         const repl::SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> previous,
         boost::optional<Date_t> deadline) override;
 
-    virtual SharedSemiFuture<std::shared_ptr<const repl::IsMasterResponse>>
-    getIsMasterResponseFuture(const repl::SplitHorizon::Parameters& horizonParams,
-                              boost::optional<TopologyVersion> clientTopologyVersion);
+    virtual SharedSemiFuture<std::shared_ptr<const repl::HelloResponse>> getHelloResponseFuture(
+        const repl::SplitHorizon::Parameters& horizonParams,
+        boost::optional<TopologyVersion> clientTopologyVersion);
 
     StatusWith<repl::OpTime> getLatestWriteOpTime(OperationContext* opCtx) const noexcept override;
 
@@ -306,7 +306,7 @@ public:
                                             OnRemoteCmdScheduledFn onRemoteCmdScheduled,
                                             OnRemoteCmdCompleteFn onRemoteCmdComplete) final;
 
-    virtual void restartHeartbeats_forTest() override;
+    virtual void restartScheduledHeartbeats_forTest() override;
 
 private:
     // Back pointer to the ServiceContext that has started the instance.

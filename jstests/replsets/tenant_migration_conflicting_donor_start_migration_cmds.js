@@ -7,9 +7,8 @@
 (function() {
 'use strict';
 
-load("jstests/libs/parallelTester.js");
 load("jstests/libs/uuid_util.js");
-load("jstests/replsets/libs/tenant_migration_util.js");
+load("jstests/replsets/libs/tenant_migration_test.js");
 
 /**
  * Asserts that the number of recipientDataSync commands executed on the given recipient primary is
@@ -20,6 +19,15 @@ function checkNumRecipientSyncDataCmdExecuted(recipientPrimary, expectedNumExecu
         recipientPrimary.adminCommand({serverStatus: 1}).metrics.commands.recipientSyncData;
     assert.eq(0, recipientSyncDataMetrics.failed);
     assert.eq(expectedNumExecuted, recipientSyncDataMetrics.total);
+}
+
+/**
+ * Returns an array of currentOp entries for the TenantMigrationDonorService instances that match
+ * the given query.
+ */
+function getTenantMigrationDonorCurrentOpEntries(donorPrimary, query) {
+    const cmdObj = Object.assign({currentOp: true, desc: "tenant donor migration"}, query);
+    return assert.commandWorked(donorPrimary.adminCommand(cmdObj)).inprog;
 }
 
 const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -33,76 +41,59 @@ function generateUniqueTenantId() {
     return chars[charIndex++];
 }
 
-let startupParams = {};
-startupParams["enableTenantMigrations"] = true;
-// TODO SERVER-51734: Remove the failpoint 'returnResponseOkForRecipientSyncDataCmd'.
-startupParams["failpoint.returnResponseOkForRecipientSyncDataCmd"] = tojson({mode: 'alwaysOn'});
+const donorRst = new ReplSetTest({nodes: 1, name: 'donorRst'});
 
-const rst0 = new ReplSetTest({nodes: 1, name: 'rst0', nodeOptions: {setParameter: startupParams}});
-const rst1 = new ReplSetTest({nodes: 1, name: 'rst1', nodeOptions: {setParameter: startupParams}});
-const rst2 = new ReplSetTest({nodes: 1, name: 'rst2', nodeOptions: {setParameter: startupParams}});
+donorRst.startSet();
+donorRst.initiate();
 
-rst0.startSet();
-rst0.initiate();
+const tenantMigrationTest0 = new TenantMigrationTest({name: jsTestName(), donorRst});
+if (!tenantMigrationTest0.isFeatureFlagEnabled()) {
+    jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
+    donorRst.stopSet();
+    return;
+}
 
-rst1.startSet();
-rst1.initiate();
-
-rst2.startSet();
-rst2.initiate();
-
-const rst0Primary = rst0.getPrimary();
-const rst1Primary = rst1.getPrimary();
-
-const kConfigDonorsNS = "config.tenantMigrationDonors";
+const donorPrimary = donorRst.getPrimary();
+const recipientPrimary = tenantMigrationTest0.getRecipientPrimary();
 
 let numRecipientSyncDataCmdSent = 0;
 
 // Test that a retry of a donorStartMigration command joins the existing migration that has
 // completed but has not been garbage-collected.
 (() => {
+    const tenantId = `${generateUniqueTenantId()}RetryAfterMigrationCompletes`;
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        recipientConnString: rst1.getURL(),
-        tenantId: generateUniqueTenantId() + "RetryAfterMigrationCompletes",
-        readPreference: {mode: "primary"}
+        tenantId,
     };
 
-    assert.commandWorked(TenantMigrationUtil.startMigration(rst0Primary.host, migrationOpts));
-    assert.commandWorked(TenantMigrationUtil.startMigration(rst0Primary.host, migrationOpts));
+    assert.commandWorked(tenantMigrationTest0.runMigration(migrationOpts));
+    assert.commandWorked(tenantMigrationTest0.runMigration(migrationOpts));
 
     // If the second donorStartMigration had started a duplicate migration, the recipient would have
     // received four recipientSyncData commands instead of two.
     numRecipientSyncDataCmdSent += 2;
-    checkNumRecipientSyncDataCmdExecuted(rst1Primary, numRecipientSyncDataCmdSent);
+    checkNumRecipientSyncDataCmdExecuted(recipientPrimary, numRecipientSyncDataCmdSent);
 })();
 
 // Test that a retry of a donorStartMigration command joins the ongoing migration.
 (() => {
+    const tenantId = `${generateUniqueTenantId()}RetryBeforeMigrationCompletes`;
     const migrationOpts = {
         migrationIdString: extractUUIDFromObject(UUID()),
-        recipientConnString: rst1.getURL(),
-        tenantId: generateUniqueTenantId() + "RetryBeforeMigrationCompletes",
-        readPreference: {mode: "primary"}
+        tenantId,
     };
 
-    let migrationThread0 =
-        new Thread(TenantMigrationUtil.startMigration, rst0Primary.host, migrationOpts);
-    let migrationThread1 =
-        new Thread(TenantMigrationUtil.startMigration, rst0Primary.host, migrationOpts);
+    assert.commandWorked(tenantMigrationTest0.startMigration(migrationOpts));
+    assert.commandWorked(tenantMigrationTest0.startMigration(migrationOpts));
 
-    migrationThread0.start();
-    migrationThread1.start();
-    migrationThread0.join();
-    migrationThread1.join();
-
-    assert.commandWorked(migrationThread0.returnData());
-    assert.commandWorked(migrationThread1.returnData());
+    assert.commandWorked(tenantMigrationTest0.waitForMigrationToComplete(migrationOpts));
+    assert.commandWorked(tenantMigrationTest0.waitForMigrationToComplete(migrationOpts));
 
     // If the second donorStartMigration had started a duplicate migration, the recipient would have
     // received four recipientSyncData commands instead of two.
     numRecipientSyncDataCmdSent += 2;
-    checkNumRecipientSyncDataCmdExecuted(rst1Primary, numRecipientSyncDataCmdSent);
+    checkNumRecipientSyncDataCmdExecuted(recipientPrimary, numRecipientSyncDataCmdSent);
 })();
 
 /**
@@ -111,135 +102,154 @@ let numRecipientSyncDataCmdSent = 0;
  * has committed but not garbage-collected (i.e. the donor has not received donorForgetMigration).
  */
 function testStartingConflictingMigrationAfterInitialMigrationCommitted(
-    donorPrimary, migrationOpts0, migrationOpts1) {
-    assert.commandWorked(TenantMigrationUtil.startMigration(donorPrimary.host, migrationOpts0));
-    assert.commandFailedWithCode(
-        TenantMigrationUtil.startMigration(donorPrimary.host, migrationOpts1),
-        ErrorCodes.ConflictingOperationInProgress);
+    tenantMigrationTest0, migrationOpts0, tenantMigrationTest1, migrationOpts1) {
+    tenantMigrationTest0.runMigration(migrationOpts0);
+    assert.commandFailedWithCode(tenantMigrationTest1.runMigration(migrationOpts1),
+                                 ErrorCodes.ConflictingOperationInProgress);
 
     // If the second donorStartMigration had started a duplicate migration, there would be two donor
-    // state docs.
-    let configDonorsColl = donorPrimary.getCollection(kConfigDonorsNS);
-    assert.eq(1, configDonorsColl.count({tenantId: migrationOpts0.tenantId}));
+    // state docs and TenantMigrationDonorService instances.
+    let configDonorsColl = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS);
+    assert.eq(1, configDonorsColl.count({_id: UUID(migrationOpts0.migrationIdString)}));
+    assert.eq(1, getTenantMigrationDonorCurrentOpEntries(donorPrimary, {
+                     "instanceID.uuid": UUID(migrationOpts0.migrationIdString)
+                 }).length);
+    if (migrationOpts0.migrationIdString != migrationOpts1.migrationIdString) {
+        assert.eq(0, configDonorsColl.count({_id: UUID(migrationOpts1.migrationIdString)}));
+        assert.eq(0, getTenantMigrationDonorCurrentOpEntries(donorPrimary, {
+                         "instanceID.uuid": UUID(migrationOpts1.migrationIdString)
+                     }).length);
+    } else if (migrationOpts0.tenantId != migrationOpts1.tenantId) {
+        assert.eq(0, configDonorsColl.count({tenantId: migrationOpts1.tenantId}));
+        assert.eq(0, getTenantMigrationDonorCurrentOpEntries(donorPrimary, {
+                         tenantId: migrationOpts1.tenantId
+                     }).length);
+    }
 }
 
 /**
  * Tests that if the client runs multiple donorStartMigration commands that would start conflicting
  * migrations, only one of the migrations will start and succeed.
  */
-function testConcurrentConflictingMigrations(donorPrimary, migrationOpts0, migrationOpts1) {
-    let migrationThread0 =
-        new Thread(TenantMigrationUtil.startMigration, rst0Primary.host, migrationOpts0);
-    let migrationThread1 =
-        new Thread(TenantMigrationUtil.startMigration, rst0Primary.host, migrationOpts1);
+function testConcurrentConflictingMigrations(
+    tenantMigrationTest0, migrationOpts0, tenantMigrationTest1, migrationOpts1) {
+    const res0 = tenantMigrationTest0.startMigration(migrationOpts0);
+    const res1 = tenantMigrationTest1.startMigration(migrationOpts1);
 
-    migrationThread0.start();
-    migrationThread1.start();
-    migrationThread0.join();
-    migrationThread1.join();
+    let configDonorsColl = donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS);
 
-    const res0 = migrationThread0.returnData();
-    const res1 = migrationThread1.returnData();
-    let configDonorsColl = donorPrimary.getCollection(kConfigDonorsNS);
-
-    // Verify that only one migration succeeded.
+    // Verify that exactly one migration succeeded.
     assert(res0.ok || res1.ok);
     assert(!res0.ok || !res1.ok);
 
     if (res0.ok) {
         assert.commandFailedWithCode(res1, ErrorCodes.ConflictingOperationInProgress);
-        assert.eq(1, configDonorsColl.count({tenantId: migrationOpts0.tenantId}));
-        if (migrationOpts0.tenantId != migrationOpts1.tenantId) {
+        assert.eq(1, configDonorsColl.count({_id: UUID(migrationOpts0.migrationIdString)}));
+        assert.eq(1, getTenantMigrationDonorCurrentOpEntries(donorPrimary, {
+                         "instanceID.uuid": UUID(migrationOpts0.migrationIdString)
+                     }).length);
+        if (migrationOpts0.migrationIdString != migrationOpts1.migrationIdString) {
+            assert.eq(0, configDonorsColl.count({_id: UUID(migrationOpts1.migrationIdString)}));
+            assert.eq(0, getTenantMigrationDonorCurrentOpEntries(donorPrimary, {
+                             "instanceID.uuid": UUID(migrationOpts1.migrationIdString)
+                         }).length);
+        } else if (migrationOpts0.tenantId != migrationOpts1.tenantId) {
             assert.eq(0, configDonorsColl.count({tenantId: migrationOpts1.tenantId}));
+            assert.eq(0, getTenantMigrationDonorCurrentOpEntries(donorPrimary, {
+                             tenantId: migrationOpts1.tenantId
+                         }).length);
         }
     } else {
         assert.commandFailedWithCode(res0, ErrorCodes.ConflictingOperationInProgress);
-        assert.eq(1, configDonorsColl.count({tenantId: migrationOpts1.tenantId}));
-        if (migrationOpts0.tenantId != migrationOpts1.tenantId) {
+        assert.eq(1, configDonorsColl.count({_id: UUID(migrationOpts1.migrationIdString)}));
+        assert.eq(1, getTenantMigrationDonorCurrentOpEntries(donorPrimary, {
+                         "instanceID.uuid": UUID(migrationOpts1.migrationIdString)
+                     }).length);
+        if (migrationOpts0.migrationIdString != migrationOpts1.migrationIdString) {
+            assert.eq(0, configDonorsColl.count({_id: UUID(migrationOpts0.migrationIdString)}));
+            assert.eq(0, getTenantMigrationDonorCurrentOpEntries(donorPrimary, {
+                             "instanceID.uuid": UUID(migrationOpts0.migrationIdString)
+                         }).length);
+        } else if (migrationOpts0.tenantId != migrationOpts1.tenantId) {
             assert.eq(0, configDonorsColl.count({tenantId: migrationOpts0.tenantId}));
+            assert.eq(0, getTenantMigrationDonorCurrentOpEntries(donorPrimary, {
+                             tenantId: migrationOpts0.tenantId
+                         }).length);
         }
     }
 }
 
 // Test migrations with different migrationIds but identical settings.
 (() => {
-    let makeMigrationOpts = () => {
+    let makeTestParams = () => {
         const migrationOpts0 = {
             migrationIdString: extractUUIDFromObject(UUID()),
-            recipientConnString: rst1.getURL(),
             tenantId: generateUniqueTenantId() + "DiffMigrationId",
-            readPreference: {mode: "primary"}
         };
         const migrationOpts1 = Object.extend({}, migrationOpts0, true);
         migrationOpts1.migrationIdString = extractUUIDFromObject(UUID());
-        return [migrationOpts0, migrationOpts1];
+        return [tenantMigrationTest0, migrationOpts0, tenantMigrationTest0, migrationOpts1];
     };
 
-    testStartingConflictingMigrationAfterInitialMigrationCommitted(rst0Primary,
-                                                                   ...makeMigrationOpts());
-    testConcurrentConflictingMigrations(rst0Primary, ...makeMigrationOpts());
+    testStartingConflictingMigrationAfterInitialMigrationCommitted(...makeTestParams());
+    testConcurrentConflictingMigrations(...makeTestParams());
 })();
 
 // Test reusing a migrationId for different migration settings.
 
 // Test different tenantIds.
 (() => {
-    let makeMigrationOpts = () => {
+    let makeTestParams = () => {
         const migrationOpts0 = {
             migrationIdString: extractUUIDFromObject(UUID()),
-            recipientConnString: rst1.getURL(),
             tenantId: generateUniqueTenantId() + "DiffTenantId",
-            readPreference: {mode: "primary"}
         };
         const migrationOpts1 = Object.extend({}, migrationOpts0, true);
         migrationOpts1.tenantId = generateUniqueTenantId() + "DiffTenantId";
-        return [migrationOpts0, migrationOpts1];
+        return [tenantMigrationTest0, migrationOpts0, tenantMigrationTest0, migrationOpts1];
     };
 
-    testStartingConflictingMigrationAfterInitialMigrationCommitted(rst0Primary,
-                                                                   ...makeMigrationOpts());
-    testConcurrentConflictingMigrations(rst0Primary, ...makeMigrationOpts());
+    testStartingConflictingMigrationAfterInitialMigrationCommitted(...makeTestParams());
+    testConcurrentConflictingMigrations(...makeTestParams());
 })();
 
 // Test different recipient connection strings.
 (() => {
-    let makeMigrationOpts = () => {
+    const tenantMigrationTest1 = new TenantMigrationTest({name: `${jsTestName()}1`, donorRst});
+
+    let makeTestParams = () => {
         const migrationOpts0 = {
             migrationIdString: extractUUIDFromObject(UUID()),
-            recipientConnString: rst1.getURL(),
             tenantId: generateUniqueTenantId() + "DiffRecipientConnString",
-            readPreference: {mode: "primary"}
         };
+        // The recipient connection string will be populated by the TenantMigrationTest fixture, so
+        // no need to set it here.
         const migrationOpts1 = Object.extend({}, migrationOpts0, true);
-        migrationOpts1.recipientConnString = rst2.getURL();
-        return [migrationOpts0, migrationOpts1];
+        return [tenantMigrationTest0, migrationOpts0, tenantMigrationTest1, migrationOpts1];
     };
 
-    testStartingConflictingMigrationAfterInitialMigrationCommitted(rst0Primary,
-                                                                   ...makeMigrationOpts());
-    testConcurrentConflictingMigrations(rst0Primary, ...makeMigrationOpts());
+    testStartingConflictingMigrationAfterInitialMigrationCommitted(...makeTestParams());
+    testConcurrentConflictingMigrations(...makeTestParams());
+
+    tenantMigrationTest1.stop();
 })();
 
 // Test different cloning read preference.
 (() => {
-    let makeMigrationOpts = () => {
+    let makeTestParams = () => {
         const migrationOpts0 = {
             migrationIdString: extractUUIDFromObject(UUID()),
-            recipientConnString: rst1.getURL(),
             tenantId: generateUniqueTenantId() + "DiffReadPref",
-            readPreference: {mode: "primary"}
         };
         const migrationOpts1 = Object.extend({}, migrationOpts0, true);
         migrationOpts1.readPreference = {mode: "secondary"};
-        return [migrationOpts0, migrationOpts1];
+        return [tenantMigrationTest0, migrationOpts0, tenantMigrationTest0, migrationOpts1];
     };
 
-    testStartingConflictingMigrationAfterInitialMigrationCommitted(rst0Primary,
-                                                                   ...makeMigrationOpts());
-    testConcurrentConflictingMigrations(rst0Primary, ...makeMigrationOpts());
+    testStartingConflictingMigrationAfterInitialMigrationCommitted(...makeTestParams());
+    testConcurrentConflictingMigrations(...makeTestParams());
 })();
 
-rst0.stopSet();
-rst1.stopSet();
-rst2.stopSet();
+tenantMigrationTest0.stop();
+donorRst.stopSet();
 })();

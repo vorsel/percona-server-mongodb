@@ -38,7 +38,7 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/catalog_cache_test_fixture.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/unittest/death_test.h"
 
 namespace mongo {
@@ -59,7 +59,7 @@ protected:
 
     void expectGetDatabase() {
         expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
-            DatabaseType db(kNss.db().toString(), {"0"}, true, databaseVersion::makeNew());
+            DatabaseType db(kNss.db().toString(), {"0"}, true, DatabaseVersion(UUID::gen()));
             return std::vector<BSONObj>{db.toBSON()};
         }());
     }
@@ -85,13 +85,9 @@ protected:
     }
 
     CollectionType getDefaultCollectionType(OID epoch, const ShardKeyPattern& shardKeyPattern) {
-        CollectionType collType;
-
-        collType.setNs(kNss);
-        collType.setEpoch(epoch);
+        CollectionType collType(kNss, epoch, Date_t::now(), UUID::gen());
         collType.setKeyPattern(shardKeyPattern.toBSON());
         collType.setUnique(false);
-
         return collType;
     }
 };
@@ -232,7 +228,8 @@ TEST_F(CatalogCacheRefreshTest, CollectionBSONCorrupted) {
         FAIL(str::stream() << "Returning corrupted collection entry did not fail and returned "
                            << cm.toString());
     } catch (const DBException& ex) {
-        ASSERT_EQ(ErrorCodes::NoSuchKey, ex.code());
+        constexpr int kParseError = 40414;
+        ASSERT_EQ(ErrorCodes::Error(kParseError), ex.code());
     }
 }
 

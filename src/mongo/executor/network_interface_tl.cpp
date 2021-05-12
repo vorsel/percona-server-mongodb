@@ -33,6 +33,7 @@
 
 #include "mongo/executor/network_interface_tl.h"
 
+#include "mongo/config.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/connection_pool_tl.h"
@@ -43,6 +44,7 @@
 #include "mongo/util/concurrency/idle_thread_block.h"
 #include "mongo/util/net/socket_utils.h"
 #include "mongo/util/testing_proctor.h"
+
 
 namespace mongo {
 namespace executor {
@@ -124,9 +126,19 @@ NetworkInterfaceTL::NetworkInterfaceTL(std::string instanceName,
         _tl = _ownedTransportLayer.get();
     }
 
+    std::shared_ptr<const transport::SSLConnectionContext> transientSSLContext;
+#ifdef MONGO_CONFIG_SSL
+    if (_connPoolOpts.transientSSLParams) {
+        auto statusOrContext =
+            _tl->createTransientSSLContext(_connPoolOpts.transientSSLParams.get(), nullptr);
+        uassertStatusOK(statusOrContext.getStatus());
+        transientSSLContext = std::move(statusOrContext.getValue());
+    }
+#endif
+
     _reactor = _tl->getReactor(transport::TransportLayer::kNewReactor);
     auto typeFactory = std::make_unique<connection_pool_tl::TLTypeFactory>(
-        _reactor, _tl, std::move(_onConnectHook), _connPoolOpts);
+        _reactor, _tl, std::move(_onConnectHook), _connPoolOpts, transientSSLContext);
     _pool = std::make_shared<ConnectionPool>(
         std::move(typeFactory), std::string("NetworkInterfaceTL-") + _instanceName, _connPoolOpts);
 
@@ -596,7 +608,7 @@ void NetworkInterfaceTL::CommandStateBase::doMetadataHook(
 
 void NetworkInterfaceTL::CommandState::fulfillFinalPromise(
     StatusWith<RemoteCommandOnAnyResponse> response) {
-    promise.setFromStatusWith(std::move(response));
+    promise.setFrom(std::move(response));
 }
 
 NetworkInterfaceTL::RequestManager::RequestManager(CommandStateBase* cmdState_)

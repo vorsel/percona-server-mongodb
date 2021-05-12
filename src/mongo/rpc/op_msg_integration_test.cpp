@@ -29,6 +29,8 @@
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kTest
 
+#include <fmt/format.h>
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/client/dbclient_connection.h"
@@ -196,7 +198,7 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
     const auto connStr = unittest::getFixtureConnectionString();
 
     // This test only works against a replica set.
-    if (connStr.type() != ConnectionString::SET) {
+    if (connStr.type() != ConnectionString::ConnectionType::kReplicaSet) {
         return;
     }
 
@@ -204,9 +206,9 @@ TEST(OpMsg, CloseConnectionOnFireAndForgetNotWritablePrimaryError) {
     for (auto host : connStr.getServers()) {
         DBClientConnection conn;
         uassertStatusOK(conn.connect(host, "integration_test"));
-        bool isMaster;
-        ASSERT(conn.isMaster(isMaster));
-        if (isMaster)
+        bool isPrimary;
+        ASSERT(conn.isPrimary(isPrimary));
+        if (isPrimary)
             continue;
         foundSecondary = true;
 
@@ -564,7 +566,7 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterCorrectly) {
 
     if (fixtureConn->isReplicaSetMember()) {
         // Connect directly to the primary.
-        conn = &static_cast<DBClientReplicaSet*>(fixtureConn.get())->masterConn();
+        conn = &static_cast<DBClientReplicaSet*>(fixtureConn.get())->primaryConn();
         ASSERT(conn);
     }
 
@@ -627,7 +629,7 @@ TEST(OpMsg, ServerHandlesExhaustIsMasterWithTopologyChange) {
 
     if (fixtureConn->isReplicaSetMember()) {
         // Connect directly to the primary.
-        conn = &static_cast<DBClientReplicaSet*>(fixtureConn.get())->masterConn();
+        conn = &static_cast<DBClientReplicaSet*>(fixtureConn.get())->primaryConn();
         ASSERT(conn);
     }
 
@@ -693,7 +695,7 @@ TEST(OpMsg, ServerRejectsExhaustIsMasterWithoutMaxAwaitTimeMS) {
 
     if (fixtureConn->isReplicaSetMember()) {
         // Connect directly to the primary.
-        conn = &static_cast<DBClientReplicaSet*>(fixtureConn.get())->masterConn();
+        conn = &static_cast<DBClientReplicaSet*>(fixtureConn.get())->primaryConn();
         ASSERT(conn);
     }
 
@@ -1283,4 +1285,79 @@ TEST(OpMsg, ServerHandlesReallyLargeMessagesGracefully) {
     ASSERT_NOT_OK(replyStatus);
     ASSERT_EQ(replyStatus, ErrorCodes::BSONObjectTooLarge);
 }
+
+class HelloOkTest final {
+public:
+    auto connect(boost::optional<bool> helloOk = boost::none) const {
+        auto connStr = unittest::getFixtureConnectionString();
+
+        auto swURI = MongoURI::parse(connStr.toString());
+        ASSERT_OK(swURI.getStatus());
+
+        auto uri = swURI.getValue();
+        if (helloOk.has_value()) {
+            uri.setHelloOk(helloOk.get());
+        }
+
+        std::string errMsg;
+        auto conn = connStr.connect(_appName, errMsg, 0, &uri);
+        uassert(ErrorCodes::SocketException, errMsg, conn);
+
+        _configureFailPoint(conn.get());
+        return conn;
+    }
+
+    auto checkIfClientSupportsHello(DBClientBase* conn) const {
+        auto checkHelloSupport = [conn](const std::string& helloCommand) {
+            auto response =
+                conn->runCommand(OpMsgRequest::fromDBAndBody("admin", BSON(helloCommand << 1)))
+                    ->getCommandReply()
+                    .getOwned();
+            auto helloOk = response.getField("clientSupportsHello");
+            ASSERT(!helloOk.eoo());
+            return helloOk.Bool();
+        };
+
+        auto helloOk = checkHelloSupport("hello");
+        ASSERT_EQ(helloOk, checkHelloSupport("isMaster"));
+        ASSERT_EQ(helloOk, checkHelloSupport("ismaster"));
+        return helloOk;
+    }
+
+private:
+    void _configureFailPoint(DBClientBase* conn) const {
+        const auto threadName = getThreadNameByAppName(conn, _appName);
+        const auto failPointObj = BSON("configureFailPoint"
+                                       << "appendHelloOkToHelloResponse"
+                                       << "mode"
+                                       << "alwaysOn"
+                                       << "data" << BSON("threadName" << threadName));
+        auto response = conn->runCommand(OpMsgRequest::fromDBAndBody("admin", failPointObj));
+        ASSERT_OK(getStatusFromCommandResult(response->getCommandReply()));
+    }
+
+    static constexpr auto _appName = "integration_test";
+};
+
+TEST(OpMsg, HelloOkIsDisabledByDefault) {
+    HelloOkTest instance;
+    auto conn = instance.connect();
+    auto isHelloOk = instance.checkIfClientSupportsHello(conn.get());
+    ASSERT(!isHelloOk);
+}
+
+TEST(OpMsg, HelloOkCanBeEnabled) {
+    HelloOkTest instance;
+    auto conn = instance.connect(true);
+    auto isHelloOk = instance.checkIfClientSupportsHello(conn.get());
+    ASSERT(isHelloOk);
+}
+
+TEST(OpMsg, HelloOkCanBeDisabled) {
+    HelloOkTest instance;
+    auto conn = instance.connect(false);
+    auto isHelloOk = instance.checkIfClientSupportsHello(conn.get());
+    ASSERT(!isHelloOk);
+}
+
 }  // namespace mongo

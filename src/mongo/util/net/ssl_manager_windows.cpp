@@ -269,7 +269,8 @@ public:
      */
     Status initSSLContext(SCHANNEL_CRED* cred,
                           const SSLParams& params,
-                          ConnectionDirection direction) final;
+                          const TransientSSLParams& transientParams,
+                          ConnectionDirection direction) override final;
 
     SSLConnectionInterface* connect(Socket* socket) final;
 
@@ -415,7 +416,8 @@ SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
 
     uassertStatusOK(_loadCertificates(params));
 
-    uassertStatusOK(initSSLContext(&_clientCred, params, ConnectionDirection::kOutgoing));
+    uassertStatusOK(
+        initSSLContext(&_clientCred, params, TransientSSLParams(), ConnectionDirection::kOutgoing));
 
     // Certificates may not have been loaded. This typically occurs in unit tests.
     if (_clientCertificates[0] != nullptr) {
@@ -425,7 +427,8 @@ SSLManagerWindows::SSLManagerWindows(const SSLParams& params, bool isServer)
 
     // SSL server specific initialization
     if (isServer) {
-        uassertStatusOK(initSSLContext(&_serverCred, params, ConnectionDirection::kIncoming));
+        uassertStatusOK(initSSLContext(
+            &_serverCred, params, TransientSSLParams(), ConnectionDirection::kIncoming));
 
         if (_serverCertificates[0] != nullptr) {
             SSLX509Name subjectName;
@@ -1295,6 +1298,16 @@ Status SSLManagerWindows::_loadCertificates(const SSLParams& params) {
             return swChain.getStatus();
         }
 
+        // Dump the CA cert chain into the memory store for the client cert. This ensures Windows
+        // can build a complete chain to send to the remote side.
+        if (std::get<0>(_pemCertificate)) {
+            auto status =
+                readCAPEMFile(std::get<0>(_pemCertificate).get()->hCertStore, params.sslCAFile);
+            if (!status.isOK()) {
+                return status;
+            }
+        }
+
         _clientEngine.CAstore = std::move(swChain.getValue());
     }
     _clientEngine.hasCRL = !params.sslCRLFile.empty();
@@ -1305,6 +1318,16 @@ Status SSLManagerWindows::_loadCertificates(const SSLParams& params) {
         auto swChain = readCertChains(serverCAFile, params.sslCRLFile);
         if (!swChain.isOK()) {
             return swChain.getStatus();
+        }
+
+        // Dump the CA cert chain into the memory store for the cluster cert. This ensures Windows
+        // can build a complete chain to send to the remote side.
+        if (std::get<0>(_clusterPEMCertificate)) {
+            auto status =
+                readCAPEMFile(std::get<0>(_clusterPEMCertificate).get()->hCertStore, serverCAFile);
+            if (!status.isOK()) {
+                return status;
+            }
         }
 
         _serverEngine.CAstore = std::move(swChain.getValue());
@@ -1351,6 +1374,7 @@ Status SSLManagerWindows::_loadCertificates(const SSLParams& params) {
 
 Status SSLManagerWindows::initSSLContext(SCHANNEL_CRED* cred,
                                          const SSLParams& params,
+                                         const TransientSSLParams& transientParams,
                                          ConnectionDirection direction) {
 
     memset(cred, 0, sizeof(*cred));
@@ -1368,6 +1392,8 @@ Status SSLManagerWindows::initSSLContext(SCHANNEL_CRED* cred,
         cred->dwFlags = cred->dwFlags          // flags
             | SCH_CRED_REVOCATION_CHECK_CHAIN  // Check certificate revocation
             | SCH_CRED_SNI_CREDENTIAL          // Pass along SNI creds
+            | SCH_CRED_MEMORY_STORE_CERT       // Read intermediate certificates from memory
+                                               // store associated with client certificate.
             | SCH_CRED_NO_SYSTEM_MAPPER        // Do not map certificate to user account
             | SCH_CRED_DISABLE_RECONNECTS;     // Do not support reconnects
 
@@ -1443,6 +1469,7 @@ SSLConnectionInterface* SSLManagerWindows::accept(Socket* socket,
 void SSLManagerWindows::_handshake(SSLConnectionWindows* conn, bool client) {
     initSSLContext(conn->_cred,
                    getSSLGlobalParams(),
+                   TransientSSLParams(),
                    client ? SSLManagerInterface::ConnectionDirection::kOutgoing
                           : SSLManagerInterface::ConnectionDirection::kIncoming);
 
@@ -2071,6 +2098,7 @@ Status getCertInfo(CertInformationToLog* info, PCCERT_CONTEXT cert) {
                       str::stream() << "getCertInfo failed to get certificate thumbprint: "
                                     << errnoWithDescription(gle));
     }
+    info->hexEncodedThumbprint = hexblob::encode(info->thumbprint.data(), info->thumbprint.size());
 
     info->validityNotBefore =
         Date_t::fromMillisSinceEpoch(FiletimeToEpocMillis(cert->pCertInfo->NotBefore));

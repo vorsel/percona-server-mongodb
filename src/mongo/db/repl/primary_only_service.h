@@ -43,6 +43,7 @@
 #include "mongo/executor/scoped_task_executor.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/mutex.h"
+#include "mongo/util/cancelation.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/fail_point.h"
@@ -111,13 +112,18 @@ public:
          * this Instance *must* be scheduled on 'executor'. Instances are responsible for inserting,
          * updating, and deleting their state documents as needed.
          *
-         * IMPORTANT NOTE: Once the state document for this Instance is deleted, all shared_ptr
+         * IMPORTANT NOTES:
+         * 1. Once the state document for this Instance is deleted, all shared_ptr
          * references to this Instance that are managed by the PrimaryOnlyService machinery are
          * removed, so all work running on behalf of this Instance must extend the Instance's
          * lifetime by getting a shared_ptr via 'shared_from_this' or else the Instance may be
          * destroyed out from under them.
+         *
+         * 2. On stepdown/shutdown of a PrimaryOnlyService, the input cancelation token will be
+         * marked canceled.
          */
-        virtual void run(std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept = 0;
+        virtual SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                     const CancelationToken& token) noexcept = 0;
 
         /**
          * This is the function that is called when this running Instance needs to be interrupted.
@@ -138,6 +144,15 @@ public:
 
     private:
         bool _running = false;
+        boost::optional<SemiFuture<void>> _finishedNotifyFuture;
+
+        // Each instance of a PrimaryOnlyService will own a CancelationSource for memory management
+        // purposes. Any memory associated with an instance's CancelationSource will be cleaned up
+        // upon the destruction of an instance. It must be instantiated from a token from the
+        // CancelationSource of the PrimaryOnlyService class in order to attain a hierarchical
+        // ownership pattern that allows for cancelation token clean up if the PrimaryOnlyService is
+        // shutdown/stepdown.
+        CancelationSource _source;
     };
 
     /**
@@ -317,7 +332,23 @@ protected:
      */
     std::shared_ptr<Instance> getOrCreateInstance(OperationContext* opCtx, BSONObj initialState);
 
+    /**
+     * Since, scoped task executor shuts down on stepdown, we might need to run some instance work,
+     * like cleanup, even while the node is not primary. So, use the parent executor in that case.
+     */
+    std::shared_ptr<executor::TaskExecutor> getInstanceCleanupExecutor() const;
+
 private:
+    /*
+     * This method is called once the _executor is initialized. This can be called only once
+     * in the lifetime of the POS object instance.
+     */
+    void _setHasExecutor(WithLock);
+    /*
+     * Returns true if the _executor is initialized.
+     */
+    bool _getHasExecutor() const;
+
     /**
      * Called as part of onSetUp before rebuilding instances. This function should do any additional
      * work required to rebuild the service on stepup, for example, creating a TTL index for the
@@ -343,23 +374,37 @@ private:
 
     ServiceContext* const _serviceContext;
 
+    // All member variables are labeled with one of the following codes indicating the
+    // synchronization rules for accessing them.
+    //
+    // (R)  Read-only in concurrent operation; no synchronization required.
+    // (S)  Self-synchronizing; access according to class's own rules.
+    // (M)  Reads and writes guarded by _mutex.
+    // (W)  Synchronization required only for writes.
     mutable Mutex _mutex = MONGO_MAKE_LATCH("PrimaryOnlyService::_mutex");
 
     // Condvar to receive notifications when _rebuildInstances has completed after stepUp.
-    stdx::condition_variable _rebuildCV;
+    stdx::condition_variable _rebuildCV;  // (S)
 
     // A ScopedTaskExecutor that is used to perform all work run on behalf of an Instance.
     // This ScopedTaskExecutor wraps _executor and is created at stepUp and destroyed at
     // stepDown so that all outstanding tasks get interrupted.
-    std::shared_ptr<executor::ScopedTaskExecutor> _scopedExecutor;
+    std::shared_ptr<executor::ScopedTaskExecutor> _scopedExecutor;  // (M)
 
+    // TODO SERVER-52901: Remove _hasExecutor.
+    // Note: This method has to be accessed only via _setHasExecutor() and _getHasExecutor()
+    // methods. This is present to make PrimaryOnlyService::_executor to have (W) synchronization
+    // rule instead of (M).
+    AtomicWord<bool> _hasExecutor{false};  //(S)
+
+    // TODO SERVER-52901: Make the synchronization rule as (R).
     // The concrete TaskExecutor backing _scopedExecutor. While _scopedExecutor is created and
     // destroyed with each stepUp/stepDown, _executor persists for the lifetime of the process. We
     // want _executor to survive failover to prevent us from having to reallocate lots of
     // thread and connection resources on every stepUp. Service instances should never have access
     // to _executor directly, they should only ever use _scopedExecutor so that they get the
     // guarantee that all outstanding tasks are interrupted at stepDown.
-    std::shared_ptr<executor::TaskExecutor> _executor;
+    std::shared_ptr<executor::TaskExecutor> _executor;  // (W)
 
     enum class State {
         kRunning,
@@ -369,21 +414,25 @@ private:
         kShutdown,
     };
 
-    State _state = State::kPaused;
+    State _state = State::kPaused;  // (M)
 
     // If reloading the state documents from disk fails, this Status gets set to a non-ok value and
     // calls to lookup() or getOrCreate() will throw this status until the node steps down.
-    Status _rebuildStatus = Status::OK();
+    Status _rebuildStatus = Status::OK();  // (M)
 
     // The term that this service is running under.
-    long long _term = OpTime::kUninitializedTerm;
+    long long _term = OpTime::kUninitializedTerm;  // (M)
 
     // Map of running instances, keyed by InstanceID.
     using InstanceMap = SimpleBSONObjUnorderedMap<std::shared_ptr<Instance>>;
-    InstanceMap _instances;
+    InstanceMap _instances;  // (M)
 
     // A set of OpCtxs running on Client threads associated with this PrimaryOnlyService.
-    stdx::unordered_set<OperationContext*> _opCtxs;
+    stdx::unordered_set<OperationContext*> _opCtxs;  // (M)
+
+    // CancelationSource used on stepdown/shutdown to cancel work in all running instances of a
+    // PrimaryOnlyService.
+    CancelationSource _source;
 };
 
 /**

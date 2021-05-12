@@ -111,7 +111,9 @@ public:
 
     /**
      * Inserts the specified keys into the index. Does not attempt to determine whether the
-     * insertion of these keys should cause the index to become multikey.
+     * insertion of these keys should cause the index to become multikey. The 'numInserted' output
+     * parameter, if non-nullptr, will be reset to the number of keys inserted by this function
+     * call, or to zero in the case of either a non-OK return Status or an empty 'keys' argument.
      */
     virtual Status insertKeys(OperationContext* opCtx,
                               const CollectionPtr& coll,
@@ -374,11 +376,6 @@ public:
      * documents into an index, except for testing purposes.
      */
     virtual SortedDataInterface* getSortedDataInterface() const = 0;
-
-    /**
-     * Fetches the Ident for this index.
-     */
-    virtual std::shared_ptr<Ident> getSharedIdent() const = 0;
 };
 
 /**
@@ -569,8 +566,6 @@ public:
 
     SortedDataInterface* getSortedDataInterface() const override final;
 
-    std::shared_ptr<Ident> getSharedIdent() const override final;
-
 protected:
     /**
      * Fills 'keys' with the keys that should be generated for 'obj' on this index.
@@ -618,7 +613,7 @@ private:
                                const KeyString::Value& dataKey,
                                const RecordIdHandlerFn& onDuplicateRecord);
 
-    const std::shared_ptr<SortedDataInterface> _newInterface;
+    const std::unique_ptr<SortedDataInterface> _newInterface;
 };
 
 }  // namespace mongo

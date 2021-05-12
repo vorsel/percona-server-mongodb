@@ -67,7 +67,7 @@
 #include "mongo/s/chunk_version.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/query/cluster_cursor_manager.h"
 #include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_id.h"
@@ -325,10 +325,17 @@ StatusWith<ShardType> ConfigServerTestFixture::getShardDoc(OperationContext* opC
     return ShardType::fromBSON(doc.getValue());
 }
 
-void ConfigServerTestFixture::setupChunks(const std::vector<ChunkType>& chunks) {
-    const NamespaceString chunkNS(ChunkType::ConfigNS);
+void ConfigServerTestFixture::setupCollection(const NamespaceString& nss,
+                                              const KeyPattern& shardKey,
+                                              const std::vector<ChunkType>& chunks) {
+    CollectionType coll(nss, chunks[0].getVersion().epoch(), Date_t::now(), UUID::gen());
+    coll.setKeyPattern(shardKey);
+    ASSERT_OK(
+        insertToConfigCollection(operationContext(), CollectionType::ConfigNS, coll.toBSON()));
+
     for (const auto& chunk : chunks) {
-        ASSERT_OK(insertToConfigCollection(operationContext(), chunkNS, chunk.toConfigBSON()));
+        ASSERT_OK(insertToConfigCollection(
+            operationContext(), ChunkType::ConfigNS, chunk.toConfigBSON()));
     }
 }
 
@@ -345,7 +352,7 @@ StatusWith<ChunkType> ConfigServerTestFixture::getChunkDoc(OperationContext* opC
 void ConfigServerTestFixture::setupDatabase(const std::string& dbName,
                                             const ShardId primaryShard,
                                             const bool sharded) {
-    DatabaseType db(dbName, primaryShard, sharded, databaseVersion::makeNew());
+    DatabaseType db(dbName, primaryShard, sharded, DatabaseVersion(UUID::gen()));
     ASSERT_OK(catalogClient()->insertConfigDocument(operationContext(),
                                                     DatabaseType::ConfigNS,
                                                     db.toBSON(),

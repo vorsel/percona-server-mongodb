@@ -3,7 +3,6 @@
 // order to apply the SHARDING_FILTER stage.
 // @tags: [
 //   assumes_unsharded_collection,
-//   sbe_incompatible,
 // ]
 
 // Compound index covered query tests with sort
@@ -17,7 +16,7 @@ for (i = 0; i < 100; i++) {
     coll.insert({a: i, b: "strvar_" + (i % 13), c: NumberInt(i % 10)});
 }
 
-coll.ensureIndex({a: 1, b: -1, c: 1});
+coll.createIndex({a: 1, b: -1, c: 1});
 
 // Test no query, sort on all fields in index order
 var plan = coll.find({}, {b: 1, c: 1, _id: 0})

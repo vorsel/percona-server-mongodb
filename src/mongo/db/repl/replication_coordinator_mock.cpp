@@ -34,7 +34,7 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/repl/is_master_response.h"
+#include "mongo/db/repl/hello_response.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/sync_source_resolver.h"
@@ -154,7 +154,7 @@ bool ReplicationCoordinatorMock::isInPrimaryOrSecondaryState_UNSAFE() const {
     return _memberState.primary() || _memberState.secondary();
 }
 
-Seconds ReplicationCoordinatorMock::getSlaveDelaySecs() const {
+Seconds ReplicationCoordinatorMock::getSecondaryDelaySecs() const {
     return Seconds(0);
 }
 
@@ -175,7 +175,7 @@ void ReplicationCoordinatorMock::stepDown(OperationContext* opCtx,
                                           const Milliseconds& waitTime,
                                           const Milliseconds& stepdownTime) {}
 
-bool ReplicationCoordinatorMock::isMasterForReportingPurposes() {
+bool ReplicationCoordinatorMock::isWritablePrimaryForReportingPurposes() {
     // TODO
     return true;
 }
@@ -211,15 +211,15 @@ bool ReplicationCoordinatorMock::canAcceptWritesFor_UNSAFE(OperationContext* opC
 
 Status ReplicationCoordinatorMock::checkCanServeReadsFor(OperationContext* opCtx,
                                                          const NamespaceString& ns,
-                                                         bool slaveOk) {
+                                                         bool secondaryOk) {
     // TODO
     return Status::OK();
 }
 
 Status ReplicationCoordinatorMock::checkCanServeReadsFor_UNSAFE(OperationContext* opCtx,
                                                                 const NamespaceString& ns,
-                                                                bool slaveOk) {
-    return checkCanServeReadsFor(opCtx, ns, slaveOk);
+                                                                bool secondaryOk) {
+    return checkCanServeReadsFor(opCtx, ns, secondaryOk);
 }
 
 bool ReplicationCoordinatorMock::shouldRelaxIndexConstraints(OperationContext* opCtx,
@@ -394,7 +394,7 @@ Status ReplicationCoordinatorMock::processReplSetGetStatus(BSONObjBuilder*,
     return Status::OK();
 }
 
-void ReplicationCoordinatorMock::appendSlaveInfoData(BSONObjBuilder* result) {}
+void ReplicationCoordinatorMock::appendSecondaryInfoData(BSONObjBuilder* result) {}
 
 void ReplicationCoordinatorMock::appendConnectionStats(executor::ConnectionPoolStats* stats) const {
 }
@@ -632,25 +632,25 @@ void ReplicationCoordinatorMock::incrementTopologyVersion() {
     return;
 }
 
-SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>
-ReplicationCoordinatorMock::getIsMasterResponseFuture(
+SharedSemiFuture<std::shared_ptr<const HelloResponse>>
+ReplicationCoordinatorMock::getHelloResponseFuture(
     const SplitHorizon::Parameters& horizonParams,
     boost::optional<TopologyVersion> clientTopologyVersion) {
     auto response =
-        awaitIsMasterResponse(nullptr, horizonParams, clientTopologyVersion, Date_t::now());
-    return SharedSemiFuture<std::shared_ptr<const IsMasterResponse>>(
-        std::shared_ptr<const IsMasterResponse>(response));
+        awaitHelloResponse(nullptr, horizonParams, clientTopologyVersion, Date_t::now());
+    return SharedSemiFuture<std::shared_ptr<const HelloResponse>>(
+        std::shared_ptr<const HelloResponse>(response));
 }
 
-std::shared_ptr<const IsMasterResponse> ReplicationCoordinatorMock::awaitIsMasterResponse(
+std::shared_ptr<const HelloResponse> ReplicationCoordinatorMock::awaitHelloResponse(
     OperationContext* opCtx,
     const SplitHorizon::Parameters& horizonParams,
     boost::optional<TopologyVersion> clientTopologyVersion,
     boost::optional<Date_t> deadline) {
     auto config = getConfig();
-    auto response = std::make_shared<IsMasterResponse>();
+    auto response = std::make_shared<HelloResponse>();
     response->setReplSetVersion(config.getConfigVersion());
-    response->setIsMaster(true);
+    response->setIsWritablePrimary(true);
     response->setIsSecondary(false);
     if (config.getNumMembers() > 0) {
         response->setMe(config.getMemberAt(0).getHostAndPort());
@@ -685,7 +685,7 @@ BSONObj ReplicationCoordinatorMock::runCmdOnPrimaryAndAwaitResponse(
     OnRemoteCmdCompleteFn onRemoteCmdComplete) {
     return BSON("ok" << 1);
 }
-void ReplicationCoordinatorMock::restartHeartbeats_forTest() {
+void ReplicationCoordinatorMock::restartScheduledHeartbeats_forTest() {
     return;
 }
 

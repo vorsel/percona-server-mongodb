@@ -180,7 +180,6 @@ let testCases = {
     forceerror: {skip: "does not return user data"},
     fsync: {skip: "does not return user data"},
     fsyncUnlock: {skip: "does not return user data"},
-    geoSearch: {skip: "not supported in mongos"},
     getCmdLineOpts: {skip: "does not return user data"},
     getDefaultRWConcern: {skip: "does not return user data"},
     getDiagnosticData: {skip: "does not return user data"},
@@ -459,13 +458,13 @@ for (let command of commands) {
                                   commandProfile)
         });
 
-        // Check that the recipient shard secondary received the request again and returned
-        // success.
+        // Check that the recipient shard secondary received the request again and returned success
         profilerHasSingleMatchingEntryOrThrow({
             profileDB: recipientShardSecondary.getDB(db),
             filter: Object.extend({
-                "command.shardVersion":
-                    {"$exists": true, $ne: [Timestamp(0, 0), ObjectId("00000000ffffffffffffffff")]},
+                "command.shardVersion": {"$exists": true},
+                "command.shardVersion.0": {$ne: Timestamp(0, 0)},
+                "command.shardVersion.1": {$ne: ObjectId("00000000ffffffffffffffff")},
                 "command.$readPreference": {"mode": "secondary"},
                 "command.readConcern": {"level": "local"},
                 "errCode": {"$ne": ErrorCodes.StaleConfig},

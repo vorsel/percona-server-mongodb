@@ -44,7 +44,7 @@
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/data_replicator_external_state_impl.h"
-#include "mongo/db/repl/is_master_response.h"
+#include "mongo/db/repl/hello_response.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -123,15 +123,14 @@ void killOperation(OperationContext* opCtx) {
     opCtx->getServiceContext()->killOperation(lkClient, opCtx);
 }
 
-std::shared_ptr<const repl::IsMasterResponse> awaitIsMasterWithNewOpCtx(
+std::shared_ptr<const repl::HelloResponse> awaitHelloWithNewOpCtx(
     ReplicationCoordinatorImpl* replCoord,
     TopologyVersion topologyVersion,
     const repl::SplitHorizon::Parameters& horizonParams,
     Date_t deadline) {
-    auto newClient = getGlobalServiceContext()->makeClient("awaitIsMaster");
+    auto newClient = getGlobalServiceContext()->makeClient("awaitIsHello");
     auto newOpCtx = newClient->makeOperationContext();
-    return replCoord->awaitIsMasterResponse(
-        newOpCtx.get(), horizonParams, topologyVersion, deadline);
+    return replCoord->awaitHelloResponse(newOpCtx.get(), horizonParams, topologyVersion, deadline);
 }
 
 TEST_F(ReplCoordTest, IsMasterIsFalseDuringStepdown) {
@@ -162,7 +161,7 @@ TEST_F(ReplCoordTest, IsMasterIsFalseDuringStepdown) {
     // Test that "ismaster" is immediately false, although "secondary" is not yet true.
     auto opCtx = makeOperationContext();
     const auto response =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
     ASSERT_TRUE(response->isConfigSet());
     BSONObj responseObj = response->toBSON();
     ASSERT_FALSE(responseObj["ismaster"].Bool());
@@ -2591,11 +2590,10 @@ TEST_F(StepDownTest, InterruptingStepDownCommandRestoresWriteAvailability) {
     // We should still be primary at this point
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
-    // We should not indicate that we are master, nor that we are secondary.
+    // We should not indicate that we are a writable primary, nor that we are secondary.
     auto opCtx = makeOperationContext();
-    auto response =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
-    ASSERT_FALSE(response->isMaster());
+    auto response = getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
+    ASSERT_FALSE(response->isWritablePrimary());
     ASSERT_FALSE(response->isSecondary());
 
     // Interrupt the ongoing stepdown command.
@@ -2608,9 +2606,9 @@ TEST_F(StepDownTest, InterruptingStepDownCommandRestoresWriteAvailability) {
     ASSERT_EQUALS(*result.second.get(), ErrorCodes::Interrupted);
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
-    // We should now report that we are master.
-    response = getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
-    ASSERT_TRUE(response->isMaster());
+    // We should now report that we are a writable primary.
+    response = getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
+    ASSERT_TRUE(response->isWritablePrimary());
     ASSERT_FALSE(response->isSecondary());
 
     // This is the important check, that we stepped back up when aborting the stepdown command
@@ -2643,12 +2641,11 @@ TEST_F(StepDownTest, InterruptingAfterUnconditionalStepdownDoesNotRestoreWriteAv
     // We should still be primary at this point
     ASSERT_TRUE(getReplCoord()->getMemberState().primary());
 
-    // We should not indicate that we are master, nor that we are secondary.
+    // We should not indicate that we are a writable primary, nor that we are secondary.
     auto opCtx = makeOperationContext();
-    auto response =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
+    auto response = getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
     ;
-    ASSERT_FALSE(response->isMaster());
+    ASSERT_FALSE(response->isWritablePrimary());
     ASSERT_FALSE(response->isSecondary());
 
     // Interrupt the ongoing stepdown command.
@@ -2670,9 +2667,9 @@ TEST_F(StepDownTest, InterruptingAfterUnconditionalStepdownDoesNotRestoreWriteAv
            stepDownStatus == ErrorCodes::Interrupted);
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
 
-    // We should still be indicating that we are not master.
-    response = getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
-    ASSERT_FALSE(response->isMaster());
+    // We should still be indicating that we are not a writable primary.
+    response = getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
+    ASSERT_FALSE(response->isWritablePrimary());
 
     // This is the important check, that we didn't accidentally step back up when aborting the
     // stepdown command attempt.
@@ -3084,7 +3081,7 @@ TEST_F(ReplCoordTest,
     }
 }
 
-TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsCurrentTopologyVersionOnTimeOut) {
+TEST_F(ReplCoordTest, AwaitHelloResponseReturnsCurrentTopologyVersionOnTimeOut) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -3101,27 +3098,27 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsCurrentTopologyVersionOnTimeOu
 
     auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
 
-    // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
+    // awaitHelloResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
-    stdx::thread getIsMasterThread([&] {
+    stdx::thread getHelloThread([&] {
         const auto response =
-            awaitIsMasterWithNewOpCtx(getReplCoord(), expectedTopologyVersion, {}, deadline);
+            awaitHelloWithNewOpCtx(getReplCoord(), expectedTopologyVersion, {}, deadline);
         auto topologyVersion = response->getTopologyVersion();
-        // Assert that on timeout, the returned IsMasterResponse contains the same TopologyVersion.
+        // Assert that on timeout, the returned HelloResponse contains the same TopologyVersion.
         ASSERT_EQUALS(topologyVersion->getCounter(), expectedTopologyVersion.getCounter());
         ASSERT_EQUALS(topologyVersion->getProcessId(), expectedTopologyVersion.getProcessId());
     });
 
-    // Set the network clock to the timeout deadline of awaitIsMasterResponse.
+    // Set the network clock to the timeout deadline of awaitHelloResponse.
     getNet()->enterNetwork();
     getNet()->advanceTime(deadline);
     ASSERT_EQUALS(deadline, getNet()->now());
-    getIsMasterThread.join();
+    getHelloThread.join();
     getNet()->exitNetwork();
 }
 
 TEST_F(ReplCoordTest,
-       AwaitIsMasterResponseReturnsCurrentTopologyVersionOnRequestWithDifferentProcessId) {
+       AwaitHelloResponseReturnsCurrentTopologyVersionOnRequestWithDifferentProcessId) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -3138,7 +3135,7 @@ TEST_F(ReplCoordTest,
 
     auto topologyVersion = getTopoCoord().getTopologyVersion();
 
-    // Get the IsMasterResponse for a request that contains a different process ID. This
+    // Get the HelloResponse for a request that contains a different process ID. This
     // should return immediately in all cases instead of waiting for a topology change.
     auto differentPid = OID::gen();
     ASSERT_NOT_EQUALS(differentPid, topologyVersion.getProcessId());
@@ -3147,7 +3144,7 @@ TEST_F(ReplCoordTest,
     auto topologyVersionWithDifferentProcessId =
         TopologyVersion(differentPid, topologyVersion.getCounter());
     ASSERT_EQUALS(topologyVersionWithDifferentProcessId.getCounter(), topologyVersion.getCounter());
-    auto response = getReplCoord()->awaitIsMasterResponse(
+    auto response = getReplCoord()->awaitHelloResponse(
         opCtx.get(), {}, topologyVersionWithDifferentProcessId, deadline);
     auto responseTopologyVersion = response->getTopologyVersion();
     ASSERT_EQUALS(responseTopologyVersion->getProcessId(), topologyVersion.getProcessId());
@@ -3160,7 +3157,7 @@ TEST_F(ReplCoordTest,
                         topologyVersion.getCounter());
 
     // Test receiving a TopologyVersion with a different process ID and a greater counter.
-    response = getReplCoord()->awaitIsMasterResponse(
+    response = getReplCoord()->awaitHelloResponse(
         opCtx.get(), {}, topologyVersionWithDifferentProcessId, deadline);
     responseTopologyVersion = response->getTopologyVersion();
     ASSERT_EQUALS(responseTopologyVersion->getProcessId(), topologyVersion.getProcessId());
@@ -3168,7 +3165,7 @@ TEST_F(ReplCoordTest,
 }
 
 TEST_F(ReplCoordTest,
-       AwaitIsMasterResponseReturnsCurrentTopologyVersionOnRequestWithStaleTopologyVersion) {
+       AwaitHelloResponseReturnsCurrentTopologyVersionOnRequestWithStaleTopologyVersion) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -3190,16 +3187,16 @@ TEST_F(ReplCoordTest,
     auto updatedTopologyVersion = getTopoCoord().getTopologyVersion();
     ASSERT_LESS_THAN(staleTopologyVersion.getCounter(), updatedTopologyVersion.getCounter());
 
-    // Get the IsMasterResponse for a request that contains a stale TopologyVersion. This should
+    // Get the HelloResponse for a request that contains a stale TopologyVersion. This should
     // return immediately instead of blocking and waiting for a topology change.
     auto response =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, staleTopologyVersion, deadline);
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, staleTopologyVersion, deadline);
     auto responseTopologyVersion = response->getTopologyVersion();
     ASSERT_EQUALS(responseTopologyVersion->getCounter(), updatedTopologyVersion.getCounter());
     ASSERT_EQUALS(responseTopologyVersion->getProcessId(), updatedTopologyVersion.getProcessId());
 }
 
-TEST_F(ReplCoordTest, AwaitIsMasterResponseFailsOnRequestWithFutureTopologyVersion) {
+TEST_F(ReplCoordTest, AwaitHelloResponseFailsOnRequestWithFutureTopologyVersion) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -3219,15 +3216,15 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseFailsOnRequestWithFutureTopologyVersi
         TopologyVersion(topologyVersion.getProcessId(), topologyVersion.getCounter() + 1);
     ASSERT_GREATER_THAN(futureTopologyVersion.getCounter(), topologyVersion.getCounter());
 
-    // We should fail immediately if trying to build an IsMasterResponse for a request with a
+    // We should fail immediately if trying to build an HelloResponse for a request with a
     // greater TopologyVersion.
     ASSERT_THROWS_CODE(
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, futureTopologyVersion, deadline),
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, futureTopologyVersion, deadline),
         AssertionException,
         31382);
 }
 
-TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnStepDown) {
+TEST_F(ReplCoordTest, AwaitHelloResponseReturnsOnStepDown) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -3256,49 +3253,50 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnStepDown) {
     auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
-    // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
+    // awaitHelloResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
-    stdx::thread getIsMasterThread([&] {
+    stdx::thread getHelloThread([&] {
         auto currentTopologyVersion = getTopoCoord().getTopologyVersion();
         auto expectedProcessId = currentTopologyVersion.getProcessId();
         // A topology change should increment the TopologyVersion counter.
         auto expectedCounter = currentTopologyVersion.getCounter() + 1;
 
         const auto responseAfterDisablingWrites =
-            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
+            awaitHelloWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
         const auto topologyVersionAfterDisablingWrites =
             responseAfterDisablingWrites->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterDisablingWrites->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersionAfterDisablingWrites->getProcessId(), expectedProcessId);
-        // We expect the server to increment the TopologyVersion and respond to waiting IsMasters
+        // We expect the server to increment the TopologyVersion and respond to waiting hellos
         // once we disable writes on the node that is stepping down from primary. At this time,
-        // isMaster will be false but the node will have yet to transition to secondary.
-        ASSERT_FALSE(responseAfterDisablingWrites->isMaster());
+        // the 'ismaster' response field will be false but the node will have yet to transition to
+        // secondary.
+        ASSERT_FALSE(responseAfterDisablingWrites->isWritablePrimary());
         ASSERT_FALSE(responseAfterDisablingWrites->isSecondary());
         ASSERT_EQUALS(responseAfterDisablingWrites->getPrimary().host(), "node1");
 
         // The server TopologyVersion will increment a second time once the old primary has
-        // completed its transition to secondary. An isMaster request with
+        // completed its transition to secondary. A hello request with
         // 'topologyVersionAfterDisablingWrites' should get a response immediately since that
         // TopologyVersion is now stale.
         expectedCounter = topologyVersionAfterDisablingWrites->getCounter() + 1;
         deadline = getNet()->now() + maxAwaitTime;
-        const auto responseStepdownComplete = awaitIsMasterWithNewOpCtx(
+        const auto responseStepdownComplete = awaitHelloWithNewOpCtx(
             getReplCoord(), topologyVersionAfterDisablingWrites.get(), {}, deadline);
         const auto topologyVersionStepDownComplete = responseStepdownComplete->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionStepDownComplete->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersionStepDownComplete->getProcessId(), expectedProcessId);
-        ASSERT_FALSE(responseStepdownComplete->isMaster());
+        ASSERT_FALSE(responseStepdownComplete->isWritablePrimary());
         ASSERT_TRUE(responseStepdownComplete->isSecondary());
         ASSERT_FALSE(responseStepdownComplete->hasPrimary());
     });
 
-    // Ensure that awaitIsMasterResponse() is called before triggering a stepdown.
+    // Ensure that awaitHelloResponse() is called before triggering a stepdown.
     waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
-    // A topology change should cause the server to respond to the waiting IsMasterResponse.
+    // A topology change should cause the server to respond to the waiting HelloResponse.
     getReplCoord()->stepDown(opCtx.get(), true, Milliseconds(0), Milliseconds(1000));
     ASSERT_TRUE(getTopoCoord().getMemberState().secondary());
-    getIsMasterThread.join();
+    getHelloThread.join();
 }
 
 TEST_F(ReplCoordTest, HelloReturnsErrorOnEnteringQuiesceMode) {
@@ -3319,17 +3317,17 @@ TEST_F(ReplCoordTest, HelloReturnsErrorOnEnteringQuiesceMode) {
     auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
-    stdx::thread getIsMasterThread([&] {
+    stdx::thread getHelloThread([&] {
         auto maxAwaitTime = Milliseconds(5000);
         auto deadline = getNet()->now() + maxAwaitTime;
 
         ASSERT_THROWS_CODE(
-            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline),
+            awaitHelloWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline),
             AssertionException,
             ErrorCodes::ShutdownInProgress);
     });
 
-    // Ensure that awaitIsMasterResponse() is called before entering quiesce mode.
+    // Ensure that awaitHelloResponse() is called before entering quiesce mode.
     waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     ASSERT(getReplCoord()->enterQuiesceModeIfSecondary(Milliseconds(0)));
     ASSERT_EQUALS(currentTopologyVersion.getCounter() + 1,
@@ -3337,10 +3335,10 @@ TEST_F(ReplCoordTest, HelloReturnsErrorOnEnteringQuiesceMode) {
     // Check that the cached topologyVersion counter was updated correctly.
     ASSERT_EQUALS(getTopoCoord().getTopologyVersion().getCounter(),
                   getReplCoord()->getTopologyVersion().getCounter());
-    getIsMasterThread.join();
+    getHelloThread.join();
 }
 
-TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceModeAfterWaitingTimesOut) {
+TEST_F(ReplCoordTest, HelloReturnsErrorOnEnteringQuiesceModeAfterWaitingTimesOut) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -3357,13 +3355,13 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceModeAfterWaitingTimes
     auto maxAwaitTime = Milliseconds(5000);
     auto deadline = getNet()->now() + maxAwaitTime;
 
-    AtomicWord<bool> isMasterReturned{false};
-    stdx::thread getIsMasterThread([&] {
+    AtomicWord<bool> helloReturned{false};
+    stdx::thread getHelloThread([&] {
         ASSERT_THROWS_CODE(
-            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline),
+            awaitHelloWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline),
             AssertionException,
             ErrorCodes::ShutdownInProgress);
-        isMasterReturned.store(true);
+        helloReturned.store(true);
     });
 
     auto failPoint = globalFailPointRegistry().find("hangAfterWaitingForTopologyChangeTimesOut");
@@ -3381,16 +3379,16 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorOnEnteringQuiesceModeAfterWaitingTimes
     failPoint->setMode(FailPoint::off, 0);
 
     // Advance the clock so that pauseWhileSet() will wake up.
-    while (!isMasterReturned.load()) {
+    while (!helloReturned.load()) {
         getNet()->enterNetwork();
         getNet()->advanceTime(getNet()->now() + Milliseconds(100));
         getNet()->exitNetwork();
     }
 
-    getIsMasterThread.join();
+    getHelloThread.join();
 }
 
-TEST_F(ReplCoordTest, IsMasterReturnsErrorInQuiesceMode) {
+TEST_F(ReplCoordTest, HelloReturnsErrorInQuiesceMode) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -3415,14 +3413,14 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorInQuiesceMode) {
 
     // Stale topology version
     ASSERT_THROWS_CODE(
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, currentTopologyVersion, deadline),
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, currentTopologyVersion, deadline),
         AssertionException,
         ErrorCodes::ShutdownInProgress);
 
     // Current topology version
     currentTopologyVersion = getTopoCoord().getTopologyVersion();
     ASSERT_THROWS_CODE(
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, currentTopologyVersion, deadline),
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, currentTopologyVersion, deadline),
         AssertionException,
         ErrorCodes::ShutdownInProgress);
 
@@ -3431,21 +3429,21 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorInQuiesceMode) {
     ASSERT_NOT_EQUALS(differentPid, currentTopologyVersion.getProcessId());
     auto topologyVersionWithDifferentProcessId =
         TopologyVersion(differentPid, currentTopologyVersion.getCounter());
-    ASSERT_THROWS_CODE(getReplCoord()->awaitIsMasterResponse(
+    ASSERT_THROWS_CODE(getReplCoord()->awaitHelloResponse(
                            opCtx.get(), {}, topologyVersionWithDifferentProcessId, deadline),
                        AssertionException,
                        ErrorCodes::ShutdownInProgress);
 
     // No topology version
     ASSERT_THROWS_CODE(
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none),
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none),
         AssertionException,
         ErrorCodes::ShutdownInProgress);
 
     // Check that status includes an extraErrorInfo class. Since we did not advance the clock, we
     // should still have the full quiesceTime as our remaining quiesceTime.
     try {
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, currentTopologyVersion, deadline);
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, currentTopologyVersion, deadline);
     } catch (const DBException& ex) {
         ASSERT(ex.extraInfo());
         ASSERT(ex.extraInfo<ShutdownInProgressQuiesceInfo>());
@@ -3487,7 +3485,7 @@ TEST_F(ReplCoordTest, QuiesceModeErrorsReturnAccurateRemainingQuiesceTime) {
     // Check that status includes an extraErrorInfo class. Since we advanced the clock halfway to
     // the quiesce deadline, we should have half of the total quiesceTime left, 500 ms.
     try {
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, currentTopologyVersion, deadline);
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, currentTopologyVersion, deadline);
     } catch (const DBException& ex) {
         ASSERT(ex.extraInfo());
         ASSERT(ex.extraInfo<ShutdownInProgressQuiesceInfo>());
@@ -3530,7 +3528,7 @@ TEST_F(ReplCoordTest, DoNotEnterQuiesceModeInStatesOtherThanSecondary) {
     ASSERT_FALSE(getReplCoord()->enterQuiesceModeIfSecondary(Milliseconds(0)));
 }
 
-TEST_F(ReplCoordTest, IsMasterReturnsErrorInQuiesceModeWhenNodeIsRemoved) {
+TEST_F(ReplCoordTest, HelloReturnsErrorInQuiesceModeWhenNodeIsRemoved) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -3586,42 +3584,42 @@ TEST_F(ReplCoordTest, IsMasterReturnsErrorInQuiesceModeWhenNodeIsRemoved) {
     ASSERT_EQUALS(topologyVersionAfterQuiesceMode.getCounter() + 1,
                   topologyVersionAfterRemoved.getCounter());
 
-    // Test isMaster requests.
+    // Test hello requests.
 
     auto opCtx = makeOperationContext();
     auto maxAwaitTime = Milliseconds(5000);
     auto deadline = getNet()->now() + maxAwaitTime;
 
     // Stale topology version
-    ASSERT_THROWS_CODE(getReplCoord()->awaitIsMasterResponse(
+    ASSERT_THROWS_CODE(getReplCoord()->awaitHelloResponse(
                            opCtx.get(), {}, topologyVersionAfterQuiesceMode, deadline),
                        AssertionException,
                        ErrorCodes::ShutdownInProgress);
 
     // Current topology version
-    ASSERT_THROWS_CODE(getReplCoord()->awaitIsMasterResponse(
-                           opCtx.get(), {}, topologyVersionAfterRemoved, deadline),
-                       AssertionException,
-                       ErrorCodes::ShutdownInProgress);
+    ASSERT_THROWS_CODE(
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, topologyVersionAfterRemoved, deadline),
+        AssertionException,
+        ErrorCodes::ShutdownInProgress);
 
     // Different process ID
     auto differentPid = OID::gen();
     ASSERT_NOT_EQUALS(differentPid, topologyVersionAfterRemoved.getProcessId());
     auto topologyVersionWithDifferentProcessId =
         TopologyVersion(differentPid, topologyVersionAfterRemoved.getCounter());
-    ASSERT_THROWS_CODE(getReplCoord()->awaitIsMasterResponse(
+    ASSERT_THROWS_CODE(getReplCoord()->awaitHelloResponse(
                            opCtx.get(), {}, topologyVersionWithDifferentProcessId, deadline),
                        AssertionException,
                        ErrorCodes::ShutdownInProgress);
 
     // No topology version
     ASSERT_THROWS_CODE(
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none),
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none),
         AssertionException,
         ErrorCodes::ShutdownInProgress);
 }
 
-TEST_F(ReplCoordTest, AllIsMasterFieldsRespectHorizon) {
+TEST_F(ReplCoordTest, AllHelloResponseFieldsRespectHorizon) {
     init();
     const auto primaryHostName = "node1:12345";
     const auto primaryHostNameHorizon = "horizon.com:15";
@@ -3652,14 +3650,14 @@ TEST_F(ReplCoordTest, AllIsMasterFieldsRespectHorizon) {
 
     auto opCtx = makeOperationContext();
 
-    // When no horizon is specified, the isMaster response uses the default horizon.
+    // When no horizon is specified, the hello response uses the default horizon.
     {
         HostAndPort primaryHostAndPort(primaryHostName);
         HostAndPort passiveHostAndPort(passiveHostName);
         HostAndPort arbiterHostAndPort(arbiterHostName);
 
         const auto response =
-            getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
+            getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
         const auto hosts = response->getHosts();
         ASSERT_EQUALS(hosts[0], primaryHostAndPort);
         ASSERT_EQUALS(response->getPrimary(), primaryHostAndPort);
@@ -3670,7 +3668,7 @@ TEST_F(ReplCoordTest, AllIsMasterFieldsRespectHorizon) {
         ASSERT_EQUALS(arbiters[0], arbiterHostAndPort);
     }
 
-    // The isMaster response respects the requested horizon.
+    // The hello response respects the requested horizon.
     {
         HostAndPort primaryHostAndPort(primaryHostNameHorizon);
         HostAndPort passiveHostAndPort(passiveHostNameHorizon);
@@ -3679,7 +3677,7 @@ TEST_F(ReplCoordTest, AllIsMasterFieldsRespectHorizon) {
         const std::string horizonSniName = "horizon.com";
         const auto horizon = SplitHorizon::Parameters(horizonSniName);
         const auto response =
-            getReplCoord()->awaitIsMasterResponse(opCtx.get(), horizon, boost::none, boost::none);
+            getReplCoord()->awaitHelloResponse(opCtx.get(), horizon, boost::none, boost::none);
         const auto hosts = response->getHosts();
         ASSERT_EQUALS(hosts[0], primaryHostAndPort);
         ASSERT_EQUALS(response->getPrimary(), primaryHostAndPort);
@@ -3691,7 +3689,7 @@ TEST_F(ReplCoordTest, AllIsMasterFieldsRespectHorizon) {
     }
 }
 
-TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsErrorOnHorizonChange) {
+TEST_F(ReplCoordTest, AwaitHelloResponseReturnsErrorOnHorizonChange) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -3719,24 +3717,24 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsErrorOnHorizonChange) {
     auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
-    // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
+    // awaitHelloResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
-    stdx::thread getIsMasterThread([&] {
+    stdx::thread getHelloThread([&] {
         auto currentTopologyVersion = getTopoCoord().getTopologyVersion();
         ASSERT_THROWS_CODE(
-            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline),
+            awaitHelloWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline),
             AssertionException,
             ErrorCodes::SplitHorizonChange);
     });
 
-    // Ensure that the isMaster request is waiting before doing a reconfig.
+    // Ensure that the hello request is waiting before doing a reconfig.
     waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     BSONObjBuilder garbage;
     ReplSetReconfigArgs args;
     // Use force to bypass the oplog commitment check, which we're not worried about testing here.
     args.force = true;
     // Do a reconfig that changes the SplitHorizon and also adds a third node. This should respond
-    // to all waiting isMaster requests with an error.
+    // to all waiting hello requests with an error.
     args.newConfigObj = BSON("_id"
                              << "mySet"
                              << "version" << 3 << "protocolVersion" << 1 << "members"
@@ -3763,15 +3761,15 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsErrorOnHorizonChange) {
     });
     replyToReceivedHeartbeatV1();
     reconfigThread.join();
-    getIsMasterThread.join();
+    getHelloThread.join();
 }
 
-TEST_F(ReplCoordTest, NonAwaitableIsMasterReturnsNoConfigsOnNodeWithUninitializedConfig) {
+TEST_F(ReplCoordTest, NonAwaitableHelloReturnsNoConfigsOnNodeWithUninitializedConfig) {
     start();
     auto opCtx = makeOperationContext();
 
-    const auto response = getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, {}, {});
-    ASSERT_FALSE(response->isMaster());
+    const auto response = getReplCoord()->awaitHelloResponse(opCtx.get(), {}, {}, {});
+    ASSERT_FALSE(response->isWritablePrimary());
     ASSERT_FALSE(response->isSecondary());
     ASSERT_FALSE(response->isConfigSet());
 }
@@ -3785,17 +3783,17 @@ TEST_F(ReplCoordTest, AwaitableHelloOnNodeWithUninitializedConfig) {
     auto halfwayToDeadline = getNet()->now() + maxAwaitTime / 2;
     auto deadline = getNet()->now() + maxAwaitTime;
 
-    AtomicWord<bool> isMasterReturned{false};
-    stdx::thread awaitIsMasterTimeout([&] {
+    AtomicWord<bool> isHelloReturned{false};
+    stdx::thread awaitHelloTimeout([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
         const auto response =
-            awaitIsMasterWithNewOpCtx(getReplCoord(), expectedTopologyVersion, {}, deadline);
-        isMasterReturned.store(true);
+            awaitHelloWithNewOpCtx(getReplCoord(), expectedTopologyVersion, {}, deadline);
+        isHelloReturned.store(true);
         auto responseTopologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(expectedTopologyVersion.getProcessId(),
                       responseTopologyVersion->getProcessId());
         ASSERT_EQUALS(expectedTopologyVersion.getCounter(), responseTopologyVersion->getCounter());
-        ASSERT_FALSE(response->isMaster());
+        ASSERT_FALSE(response->isWritablePrimary());
         ASSERT_FALSE(response->isSecondary());
         ASSERT_FALSE(response->isConfigSet());
     });
@@ -3803,12 +3801,12 @@ TEST_F(ReplCoordTest, AwaitableHelloOnNodeWithUninitializedConfig) {
     getNet()->enterNetwork();
     getNet()->advanceTime(halfwayToDeadline);
     ASSERT_EQUALS(halfwayToDeadline, getNet()->now());
-    ASSERT_FALSE(isMasterReturned.load());
+    ASSERT_FALSE(isHelloReturned.load());
 
     getNet()->advanceTime(deadline);
     ASSERT_EQUALS(deadline, getNet()->now());
-    awaitIsMasterTimeout.join();
-    ASSERT_TRUE(isMasterReturned.load());
+    awaitHelloTimeout.join();
+    ASSERT_TRUE(isHelloReturned.load());
     getNet()->exitNetwork();
 
     auto waitForHelloFailPoint = globalFailPointRegistry().find("waitForHelloResponse");
@@ -3816,19 +3814,18 @@ TEST_F(ReplCoordTest, AwaitableHelloOnNodeWithUninitializedConfig) {
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
     deadline = getNet()->now() + maxAwaitTime;
-    stdx::thread awaitIsMasterInitiate([&] {
+    stdx::thread awaitHelloInitiate([&] {
         const auto topologyVersion = getTopoCoord().getTopologyVersion();
-        const auto response =
-            awaitIsMasterWithNewOpCtx(getReplCoord(), topologyVersion, {}, deadline);
+        const auto response = awaitHelloWithNewOpCtx(getReplCoord(), topologyVersion, {}, deadline);
         auto responseTopologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(topologyVersion.getProcessId(), responseTopologyVersion->getProcessId());
         ASSERT_EQUALS(topologyVersion.getCounter() + 1, responseTopologyVersion->getCounter());
-        ASSERT_FALSE(response->isMaster());
+        ASSERT_FALSE(response->isWritablePrimary());
         ASSERT_FALSE(response->isSecondary());
         ASSERT_TRUE(response->isConfigSet());
     });
 
-    // Ensure that awaitIsMasterResponse() is called before initiating.
+    // Ensure that awaitHelloResponse() is called before initiating.
     waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     BSONObjBuilder result;
@@ -3841,10 +3838,10 @@ TEST_F(ReplCoordTest, AwaitableHelloOnNodeWithUninitializedConfig) {
                                                                              << "node1:12345"))),
                                                &result);
     ASSERT_OK(status);
-    awaitIsMasterInitiate.join();
+    awaitHelloInitiate.join();
 }
 
-TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigDifferentTopologyVersion) {
+TEST_F(ReplCoordTest, AwaitableHelloOnNodeWithUninitializedConfigDifferentTopologyVersion) {
     start();
     auto opCtx = makeOperationContext();
 
@@ -3857,7 +3854,7 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigDifferentTop
                                                        currentTopologyVersion.getCounter() + 1);
     ASSERT_GREATER_THAN(futureTopologyVersion.getCounter(), currentTopologyVersion.getCounter());
     ASSERT_THROWS_CODE(
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, futureTopologyVersion, deadline),
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, futureTopologyVersion, deadline),
         AssertionException,
         31382);
 
@@ -3867,10 +3864,10 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigDifferentTop
                                                       currentTopologyVersion.getCounter() - 1);
     ASSERT_LESS_THAN(staleTopologyVersion.getCounter(), currentTopologyVersion.getCounter());
     auto response =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, staleTopologyVersion, deadline);
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, staleTopologyVersion, deadline);
     auto responseTopologyVersion = response->getTopologyVersion();
     ASSERT_EQUALS(responseTopologyVersion->getCounter(), currentTopologyVersion.getCounter());
-    ASSERT_FALSE(response->isMaster());
+    ASSERT_FALSE(response->isWritablePrimary());
     ASSERT_FALSE(response->isSecondary());
     ASSERT_FALSE(response->isConfigSet());
 
@@ -3879,12 +3876,12 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigDifferentTop
     ASSERT_NOT_EQUALS(differentPid, currentTopologyVersion.getProcessId());
     auto topologyVersionWithDifferentProcessId =
         TopologyVersion(differentPid, currentTopologyVersion.getCounter());
-    response = getReplCoord()->awaitIsMasterResponse(
+    response = getReplCoord()->awaitHelloResponse(
         opCtx.get(), {}, topologyVersionWithDifferentProcessId, deadline);
     responseTopologyVersion = response->getTopologyVersion();
     ASSERT_EQUALS(responseTopologyVersion->getProcessId(), currentTopologyVersion.getProcessId());
     ASSERT_EQUALS(responseTopologyVersion->getCounter(), currentTopologyVersion.getCounter());
-    ASSERT_FALSE(response->isMaster());
+    ASSERT_FALSE(response->isWritablePrimary());
     ASSERT_FALSE(response->isSecondary());
     ASSERT_FALSE(response->isConfigSet());
 
@@ -3894,17 +3891,17 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigDifferentTop
         TopologyVersion(differentPid, currentTopologyVersion.getCounter() + 1);
     ASSERT_GREATER_THAN(topologyVersionWithDifferentProcessId.getCounter(),
                         currentTopologyVersion.getCounter());
-    response = getReplCoord()->awaitIsMasterResponse(
+    response = getReplCoord()->awaitHelloResponse(
         opCtx.get(), {}, topologyVersionWithDifferentProcessId, deadline);
     responseTopologyVersion = response->getTopologyVersion();
     ASSERT_EQUALS(responseTopologyVersion->getProcessId(), currentTopologyVersion.getProcessId());
     ASSERT_EQUALS(responseTopologyVersion->getCounter(), currentTopologyVersion.getCounter());
-    ASSERT_FALSE(response->isMaster());
+    ASSERT_FALSE(response->isWritablePrimary());
     ASSERT_FALSE(response->isSecondary());
     ASSERT_FALSE(response->isConfigSet());
 }
 
-TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigInvalidHorizon) {
+TEST_F(ReplCoordTest, AwaitableHelloOnNodeWithUninitializedConfigInvalidHorizon) {
     init("mySet");
     start(HostAndPort("node1", 12345));
     auto opCtx = makeOperationContext();
@@ -3915,9 +3912,9 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigInvalidHoriz
     const std::string horizonSniName = "horizon.com";
     const auto horizonParam = SplitHorizon::Parameters(horizonSniName);
 
-    // Send a non-awaitable isMaster.
-    const auto initialResponse = getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, {}, {});
-    ASSERT_FALSE(initialResponse->isMaster());
+    // Send a non-awaitable hello.
+    const auto initialResponse = getReplCoord()->awaitHelloResponse(opCtx.get(), {}, {}, {});
+    ASSERT_FALSE(initialResponse->isWritablePrimary());
     ASSERT_FALSE(initialResponse->isSecondary());
     ASSERT_FALSE(initialResponse->isConfigSet());
 
@@ -3925,18 +3922,18 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigInvalidHoriz
     auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
-    stdx::thread awaitIsMasterInitiate([&] {
+    stdx::thread awaitHelloInitiate([&] {
         const auto topologyVersion = getTopoCoord().getTopologyVersion();
         ASSERT_THROWS_CODE(
-            awaitIsMasterWithNewOpCtx(getReplCoord(), topologyVersion, horizonParam, deadline),
+            awaitHelloWithNewOpCtx(getReplCoord(), topologyVersion, horizonParam, deadline),
             AssertionException,
             ErrorCodes::SplitHorizonChange);
     });
 
-    // Ensure that the isMaster request has started waiting before initiating.
+    // Ensure that the hello request has started waiting before initiating.
     waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
-    // Call replSetInitiate with no horizon configured. This should return an error to the isMaster
+    // Call replSetInitiate with no horizon configured. This should return an error to the hello
     // request that is currently waiting on a horizonParam that doesn't exit in the config.
     BSONObjBuilder result;
     auto status =
@@ -3948,10 +3945,10 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigInvalidHoriz
                                                                              << "node1:12345"))),
                                                &result);
     ASSERT_OK(status);
-    awaitIsMasterInitiate.join();
+    awaitHelloInitiate.join();
 }
 
-TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigSpecifiedHorizon) {
+TEST_F(ReplCoordTest, AwaitableHelloOnNodeWithUninitializedConfigSpecifiedHorizon) {
     init("mySet");
     start(HostAndPort("node1", 12345));
     auto opCtx = makeOperationContext();
@@ -3969,16 +3966,16 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigSpecifiedHor
     const std::string horizonOneSniName = "horizon1.com";
     const auto horizonOne = SplitHorizon::Parameters(horizonOneSniName);
     const auto horizonOneView = HostAndPort("horizon1.com:12345");
-    stdx::thread awaitIsMasterInitiate([&] {
+    stdx::thread awaitHelloInitiate([&] {
         const auto topologyVersion = getTopoCoord().getTopologyVersion();
         const auto response =
-            awaitIsMasterWithNewOpCtx(getReplCoord(), topologyVersion, horizonOne, deadline);
+            awaitHelloWithNewOpCtx(getReplCoord(), topologyVersion, horizonOne, deadline);
         auto responseTopologyVersion = response->getTopologyVersion();
         const auto hosts = response->getHosts();
         ASSERT_EQUALS(hosts[0], horizonOneView);
         ASSERT_EQUALS(topologyVersion.getProcessId(), responseTopologyVersion->getProcessId());
         ASSERT_EQUALS(topologyVersion.getCounter() + 1, responseTopologyVersion->getCounter());
-        ASSERT_FALSE(response->isMaster());
+        ASSERT_FALSE(response->isWritablePrimary());
         ASSERT_FALSE(response->isSecondary());
         ASSERT_TRUE(response->isConfigSet());
     });
@@ -3999,10 +3996,10 @@ TEST_F(ReplCoordTest, AwaitableIsMasterOnNodeWithUninitializedConfigSpecifiedHor
                                               << "horizon1.com:12345")))),
         &result);
     ASSERT_OK(status);
-    awaitIsMasterInitiate.join();
+    awaitHelloInitiate.join();
 }
 
-TEST_F(ReplCoordTest, AwaitIsMasterUsesDefaultHorizonWhenRequestedHorizonNotFound) {
+TEST_F(ReplCoordTest, AwaitHelloUsesDefaultHorizonWhenRequestedHorizonNotFound) {
     init();
     const auto nodeOneHostName = "node1:12345";
     const auto nodeTwoHostName = "node2:12345";
@@ -4032,10 +4029,10 @@ TEST_F(ReplCoordTest, AwaitIsMasterUsesDefaultHorizonWhenRequestedHorizonNotFoun
 
     const auto oldHorizon = SplitHorizon::Parameters(nodeOneSniName);
 
-    stdx::thread getIsMasterOldHorizonThread([&] {
+    stdx::thread getHelloOldHorizonThread([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
-        const auto response = awaitIsMasterWithNewOpCtx(
-            getReplCoord(), expectedTopologyVersion, oldHorizon, deadline);
+        const auto response =
+            awaitHelloWithNewOpCtx(getReplCoord(), expectedTopologyVersion, oldHorizon, deadline);
         auto topologyVersion = response->getTopologyVersion();
         const auto hosts = response->getHosts();
         HostAndPort expectedNodeOneHorizonView(oldHorizonNodeOne);
@@ -4046,11 +4043,11 @@ TEST_F(ReplCoordTest, AwaitIsMasterUsesDefaultHorizonWhenRequestedHorizonNotFoun
         ASSERT_EQUALS(response->getMe(), expectedNodeOneHorizonView);
     });
 
-    // Set the network clock to the timeout deadline of awaitIsMasterResponse.
+    // Set the network clock to the timeout deadline of awaitHelloResponse.
     getNet()->enterNetwork();
     getNet()->advanceTime(deadline);
     ASSERT_EQUALS(deadline, getNet()->now());
-    getIsMasterOldHorizonThread.join();
+    getHelloOldHorizonThread.join();
     getNet()->exitNetwork();
     replyToReceivedHeartbeatV1();
 
@@ -4071,11 +4068,11 @@ TEST_F(ReplCoordTest, AwaitIsMasterUsesDefaultHorizonWhenRequestedHorizonNotFoun
     replyToReceivedHeartbeatV1();
     reconfigThread.join();
 
-    stdx::thread getIsMasterDefaultHorizonThread([&] {
+    stdx::thread getHelloDefaultHorizonThread([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
-        // Sending an isMaster request with a removed horizon should return the default horizon.
-        const auto response = awaitIsMasterWithNewOpCtx(
-            getReplCoord(), expectedTopologyVersion, oldHorizon, deadline);
+        // Sending a hello request with a removed horizon should return the default horizon.
+        const auto response =
+            awaitHelloWithNewOpCtx(getReplCoord(), expectedTopologyVersion, oldHorizon, deadline);
         auto topologyVersion = response->getTopologyVersion();
         const auto hosts = response->getHosts();
         HostAndPort expectedNodeOneHorizonView(nodeOneHostName);
@@ -4087,15 +4084,15 @@ TEST_F(ReplCoordTest, AwaitIsMasterUsesDefaultHorizonWhenRequestedHorizonNotFoun
     });
 
     deadline = getNet()->now() + maxAwaitTime;
-    // Set the network clock to the timeout deadline of awaitIsMasterResponse.
+    // Set the network clock to the timeout deadline of awaitHelloResponse.
     getNet()->enterNetwork();
     getNet()->advanceTime(deadline);
     ASSERT_EQUALS(deadline, getNet()->now());
-    getIsMasterDefaultHorizonThread.join();
+    getHelloDefaultHorizonThread.join();
     getNet()->exitNetwork();
 }
 
-TEST_F(ReplCoordTest, AwaitIsMasterRespondsWithNewHorizon) {
+TEST_F(ReplCoordTest, AwaitHelloRespondsWithNewHorizon) {
     init();
     const auto nodeOneHostName = "node1:12345";
     const auto nodeTwoHostName = "node2:12345";
@@ -4121,12 +4118,12 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsWithNewHorizon) {
     const std::string newHorizonSniName = "newhorizon.com";
     const auto newHorizon = SplitHorizon::Parameters(newHorizonSniName);
 
-    stdx::thread getIsMasterThread([&] {
+    stdx::thread getHelloThread([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
-        // The isMaster response should use the default horizon since no horizon has been
+        // The hello response should use the default horizon since no horizon has been
         // configured.
-        const auto response = awaitIsMasterWithNewOpCtx(
-            getReplCoord(), expectedTopologyVersion, newHorizon, deadline);
+        const auto response =
+            awaitHelloWithNewOpCtx(getReplCoord(), expectedTopologyVersion, newHorizon, deadline);
         const auto hosts = response->getHosts();
         HostAndPort expectedNodeOneHorizonView(nodeOneHostName);
         HostAndPort expectedNodeTwoHorizonView(nodeTwoHostName);
@@ -4136,11 +4133,11 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsWithNewHorizon) {
         ASSERT_EQUALS(response->getMe(), expectedNodeOneHorizonView);
     });
 
-    // Set the network clock to the timeout deadline of awaitIsMasterResponse.
+    // Set the network clock to the timeout deadline of awaitHelloResponse.
     getNet()->enterNetwork();
     getNet()->advanceTime(deadline);
     ASSERT_EQUALS(deadline, getNet()->now());
-    getIsMasterThread.join();
+    getHelloThread.join();
     getNet()->exitNetwork();
     replyToReceivedHeartbeatV1();
 
@@ -4166,11 +4163,11 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsWithNewHorizon) {
     replyToReceivedHeartbeatV1();
     reconfigThread.join();
 
-    stdx::thread getIsMasterNewHorizonThread([&] {
+    stdx::thread getHelloNewHorizonThread([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
-        // The isMaster response should now use the newly configured horizon.
-        const auto response = awaitIsMasterWithNewOpCtx(
-            getReplCoord(), expectedTopologyVersion, newHorizon, deadline);
+        // The hello response should now use the newly configured horizon.
+        const auto response =
+            awaitHelloWithNewOpCtx(getReplCoord(), expectedTopologyVersion, newHorizon, deadline);
         const auto hosts = response->getHosts();
         HostAndPort expectedNodeOneHorizonView(newHorizonNodeOne);
         HostAndPort expectedNodeTwoHorizonView(newHorizonNodeTwo);
@@ -4181,15 +4178,15 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsWithNewHorizon) {
     });
 
     deadline = getNet()->now() + maxAwaitTime;
-    // Set the network clock to the timeout deadline of awaitIsMasterResponse.
+    // Set the network clock to the timeout deadline of awaitHelloResponse.
     getNet()->enterNetwork();
     getNet()->advanceTime(deadline);
     ASSERT_EQUALS(deadline, getNet()->now());
-    getIsMasterNewHorizonThread.join();
+    getHelloNewHorizonThread.join();
     getNet()->exitNetwork();
 }
 
-TEST_F(ReplCoordTest, IsMasterOnRemovedNode) {
+TEST_F(ReplCoordTest, HelloOnRemovedNode) {
     init();
     const auto nodeOneHostName = "node1:12345";
     const auto nodeTwoHostName = "node2:12345";
@@ -4243,9 +4240,9 @@ TEST_F(ReplCoordTest, IsMasterOnRemovedNode) {
     auto opCtx = makeOperationContext();
     const auto currentTopologyVersion = getTopoCoord().getTopologyVersion();
 
-    // Non-awaitable isMaster requests should return immediately.
-    auto response = getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, {}, {});
-    ASSERT_FALSE(response->isMaster());
+    // Non-awaitable hello requests should return immediately.
+    auto response = getReplCoord()->awaitHelloResponse(opCtx.get(), {}, {}, {});
+    ASSERT_FALSE(response->isWritablePrimary());
     ASSERT_FALSE(response->isSecondary());
     ASSERT_FALSE(response->isConfigSet());
 
@@ -4254,7 +4251,7 @@ TEST_F(ReplCoordTest, IsMasterOnRemovedNode) {
                                                        currentTopologyVersion.getCounter() + 1);
     ASSERT_GREATER_THAN(futureTopologyVersion.getCounter(), currentTopologyVersion.getCounter());
     ASSERT_THROWS_CODE(
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, futureTopologyVersion, deadline),
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, futureTopologyVersion, deadline),
         AssertionException,
         31382);
 
@@ -4262,11 +4259,10 @@ TEST_F(ReplCoordTest, IsMasterOnRemovedNode) {
     const auto staleTopologyVersion = TopologyVersion(currentTopologyVersion.getProcessId(),
                                                       currentTopologyVersion.getCounter() - 1);
     ASSERT_LESS_THAN(staleTopologyVersion.getCounter(), currentTopologyVersion.getCounter());
-    response =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, staleTopologyVersion, deadline);
+    response = getReplCoord()->awaitHelloResponse(opCtx.get(), {}, staleTopologyVersion, deadline);
     auto responseTopologyVersion = response->getTopologyVersion();
     ASSERT_EQUALS(responseTopologyVersion->getCounter(), currentTopologyVersion.getCounter());
-    ASSERT_FALSE(response->isMaster());
+    ASSERT_FALSE(response->isWritablePrimary());
     ASSERT_FALSE(response->isSecondary());
     ASSERT_FALSE(response->isConfigSet());
 
@@ -4275,12 +4271,12 @@ TEST_F(ReplCoordTest, IsMasterOnRemovedNode) {
     ASSERT_NOT_EQUALS(differentPid, currentTopologyVersion.getProcessId());
     auto topologyVersionWithDifferentProcessId =
         TopologyVersion(differentPid, currentTopologyVersion.getCounter());
-    response = getReplCoord()->awaitIsMasterResponse(
+    response = getReplCoord()->awaitHelloResponse(
         opCtx.get(), {}, topologyVersionWithDifferentProcessId, deadline);
     responseTopologyVersion = response->getTopologyVersion();
     ASSERT_EQUALS(responseTopologyVersion->getProcessId(), currentTopologyVersion.getProcessId());
     ASSERT_EQUALS(responseTopologyVersion->getCounter(), currentTopologyVersion.getCounter());
-    ASSERT_FALSE(response->isMaster());
+    ASSERT_FALSE(response->isWritablePrimary());
     ASSERT_FALSE(response->isSecondary());
     ASSERT_FALSE(response->isConfigSet());
 
@@ -4290,45 +4286,45 @@ TEST_F(ReplCoordTest, IsMasterOnRemovedNode) {
         TopologyVersion(differentPid, currentTopologyVersion.getCounter() + 1);
     ASSERT_GREATER_THAN(topologyVersionWithDifferentProcessId.getCounter(),
                         currentTopologyVersion.getCounter());
-    response = getReplCoord()->awaitIsMasterResponse(
+    response = getReplCoord()->awaitHelloResponse(
         opCtx.get(), {}, topologyVersionWithDifferentProcessId, deadline);
     responseTopologyVersion = response->getTopologyVersion();
     ASSERT_EQUALS(responseTopologyVersion->getProcessId(), currentTopologyVersion.getProcessId());
     ASSERT_EQUALS(responseTopologyVersion->getCounter(), currentTopologyVersion.getCounter());
-    ASSERT_FALSE(response->isMaster());
+    ASSERT_FALSE(response->isWritablePrimary());
 
-    AtomicWord<bool> isMasterReturned{false};
+    AtomicWord<bool> helloReturned{false};
     // A request with an equal TopologyVersion should wait and timeout once the deadline is reached.
     const auto halfwayToDeadline = getNet()->now() + maxAwaitTime / 2;
-    stdx::thread getIsMasterThread([&] {
-        // Sending an isMaster request on a removed node should wait.
+    stdx::thread getHelloThread([&] {
+        // Sending a hello request on a removed node should wait.
         const auto response =
-            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
-        isMasterReturned.store(true);
+            awaitHelloWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
+        helloReturned.store(true);
         responseTopologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(responseTopologyVersion->getCounter(), currentTopologyVersion.getCounter());
-        ASSERT_FALSE(response->isMaster());
+        ASSERT_FALSE(response->isWritablePrimary());
         ASSERT_FALSE(response->isSecondary());
         ASSERT_FALSE(response->isConfigSet());
     });
 
     deadline = net->now() + maxAwaitTime;
     net->enterNetwork();
-    // Set the network clock to a time before the deadline of the isMaster request. The request
+    // Set the network clock to a time before the deadline of the hello request. The request
     // should still be waiting.
     net->advanceTime(halfwayToDeadline);
     ASSERT_EQUALS(halfwayToDeadline, net->now());
-    ASSERT_FALSE(isMasterReturned.load());
+    ASSERT_FALSE(helloReturned.load());
 
     // Set the network clock to the deadline.
     net->advanceTime(deadline);
     ASSERT_EQUALS(deadline, net->now());
-    getIsMasterThread.join();
-    ASSERT_TRUE(isMasterReturned.load());
+    getHelloThread.join();
+    ASSERT_TRUE(helloReturned.load());
     net->exitNetwork();
 }
 
-TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
+TEST_F(ReplCoordTest, AwaitHelloRespondsCorrectlyWhenNodeRemovedAndReadded) {
     init();
     const auto nodeOneHostName = "node1:12345";
     const auto nodeTwoHostName = "node2:12345";
@@ -4353,21 +4349,20 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
     auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
-    stdx::thread getIsMasterWaitingForRemovedNodeThread([&] {
+    stdx::thread getHelloWaitingForRemovedNodeThread([&] {
         const auto topologyVersion = getTopoCoord().getTopologyVersion();
-        // The isMaster response should indicate that the node does not have a valid replica set
+        // The hello response should indicate that the node does not have a valid replica set
         // config.
-        const auto response =
-            awaitIsMasterWithNewOpCtx(getReplCoord(), topologyVersion, {}, deadline);
+        const auto response = awaitHelloWithNewOpCtx(getReplCoord(), topologyVersion, {}, deadline);
         const auto responseTopologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(responseTopologyVersion->getProcessId(), topologyVersion.getProcessId());
         ASSERT_EQUALS(responseTopologyVersion->getCounter(), topologyVersion.getCounter() + 1);
-        ASSERT_FALSE(response->isMaster());
+        ASSERT_FALSE(response->isWritablePrimary());
         ASSERT_FALSE(response->isSecondary());
         ASSERT_FALSE(response->isConfigSet());
     });
 
-    // Ensure that awaitIsMasterResponse() is called before triggering a reconfig.
+    // Ensure that awaitHelloResponse() is called before triggering a reconfig.
     waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     enterNetwork();
@@ -4401,15 +4396,15 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
     ASSERT_OK(getReplCoord()->waitForMemberState(MemberState::RS_REMOVED, Seconds(1)));
     ASSERT_EQUALS(removedFromConfig.getConfigVersion(),
                   getReplCoord()->getConfig().getConfigVersion());
-    getIsMasterWaitingForRemovedNodeThread.join();
+    getHelloWaitingForRemovedNodeThread.join();
     const std::string newHorizonSniName = "newhorizon.com";
     auto newHorizon = SplitHorizon::Parameters(newHorizonSniName);
 
-    stdx::thread getIsMasterThread([&] {
+    stdx::thread getHelloThread([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
         // Wait for the node to be readded to the set. This should return an error.
         ASSERT_THROWS_CODE(
-            awaitIsMasterWithNewOpCtx(getReplCoord(), expectedTopologyVersion, {}, deadline),
+            awaitHelloWithNewOpCtx(getReplCoord(), expectedTopologyVersion, {}, deadline),
             AssertionException,
             ErrorCodes::SplitHorizonChange);
     });
@@ -4440,13 +4435,13 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
     replyToReceivedHeartbeatV1();
     reconfigThread.join();
     ASSERT_OK(getReplCoord()->waitForMemberState(MemberState::RS_SECONDARY, Seconds(1)));
-    getIsMasterThread.join();
+    getHelloThread.join();
 
-    stdx::thread getIsMasterThreadNewHorizon([&] {
+    stdx::thread getHelloThreadNewHorizon([&] {
         const auto expectedTopologyVersion = getTopoCoord().getTopologyVersion();
-        // Sending an isMaster on the rejoined node should return the appropriate horizon view.
-        const auto response = awaitIsMasterWithNewOpCtx(
-            getReplCoord(), expectedTopologyVersion, newHorizon, deadline);
+        // Sending a hello on the rejoined node should return the appropriate horizon view.
+        const auto response =
+            awaitHelloWithNewOpCtx(getReplCoord(), expectedTopologyVersion, newHorizon, deadline);
         HostAndPort expectedNodeOneHorizonView(newHorizonNodeOne);
         HostAndPort expectedNodeTwoHorizonView(newHorizonNodeTwo);
         const auto hosts = response->getHosts();
@@ -4456,15 +4451,15 @@ TEST_F(ReplCoordTest, AwaitIsMasterRespondsCorrectlyWhenNodeRemovedAndReadded) {
     });
 
     deadline = getNet()->now() + maxAwaitTime;
-    // Set the network clock to the timeout deadline of awaitIsMasterResponse.
+    // Set the network clock to the timeout deadline of awaitHelloResponse.
     getNet()->enterNetwork();
     getNet()->advanceTime(deadline);
     ASSERT_EQUALS(deadline, getNet()->now());
-    getIsMasterThreadNewHorizon.join();
+    getHelloThreadNewHorizon.join();
     getNet()->exitNetwork();
 }
 
-TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionTimeout) {
+TEST_F(ReplCoordTest, AwaitHelloResponseReturnsOnElectionTimeout) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -4484,7 +4479,7 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionTimeout) {
     simulateSuccessfulV1Election();
     ASSERT(getReplCoord()->getMemberState().primary());
 
-    // Wait for an isMaster with deadline past the election timeout.
+    // Wait for a hello with deadline past the election timeout.
     auto electionTimeout = getReplCoord()->getConfig().getElectionTimeoutPeriod();
     auto maxAwaitTime = electionTimeout + Milliseconds(5000);
     auto deadline = getNet()->now() + maxAwaitTime;
@@ -4500,31 +4495,31 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionTimeout) {
     auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
-    // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
+    // awaitHelloResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
-    stdx::thread getIsMasterThread([&] {
+    stdx::thread getHelloThread([&] {
         const auto response =
-            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
+            awaitHelloWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
         auto topologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(topologyVersion->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersion->getProcessId(), expectedProcessId);
 
-        ASSERT_FALSE(response->isMaster());
+        ASSERT_FALSE(response->isWritablePrimary());
         ASSERT_TRUE(response->isSecondary());
         ASSERT_FALSE(response->hasPrimary());
     });
 
-    // Ensure that awaitIsMasterResponse() is called before triggering an election timeout.
+    // Ensure that awaitHelloResponse() is called before triggering an election timeout.
     waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     getNet()->enterNetwork();
     // Primary steps down after not receiving a response within the election timeout.
     getNet()->advanceTime(electionTimeoutDate);
-    getIsMasterThread.join();
+    getHelloThread.join();
     exitNetwork();
     ASSERT_TRUE(getReplCoord()->getMemberState().secondary());
 }
 
-TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
+TEST_F(ReplCoordTest, AwaitHelloResponseReturnsOnElectionWin) {
     // The config does not have a "term" field, so step-up will not increment the config term
     // via reconfig. As a result, step-up only triggers two topology changes.
     init();
@@ -4554,10 +4549,10 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
     auto expectedCounter = currentTopologyVersion.getCounter() + 1;
 
     auto opCtx = makeOperationContext();
-    // Calling isMaster without a TopologyVersion field should return immediately.
+    // Calling hello without a TopologyVersion field should return immediately.
     const auto response =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
-    ASSERT_FALSE(response->isMaster());
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
+    ASSERT_FALSE(response->isWritablePrimary());
     ASSERT_TRUE(response->isSecondary());
     ASSERT_FALSE(response->hasPrimary());
 
@@ -4565,19 +4560,19 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
     auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
-    // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
+    // awaitHelloResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
-    stdx::thread getIsMasterThread([&] {
+    stdx::thread getHelloThread([&] {
         const auto responseAfterElection =
-            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
+            awaitHelloWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
 
         const auto topologyVersionAfterElection = responseAfterElection->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterElection->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersionAfterElection->getProcessId(), expectedProcessId);
 
-        // We expect the server to increment the TopologyVersion and respond to waiting IsMasters
+        // We expect the server to increment the TopologyVersion and respond to waiting hellos
         // once an election is won even if we have yet to signal drain completion.
-        ASSERT_FALSE(responseAfterElection->isMaster());
+        ASSERT_FALSE(responseAfterElection->isWritablePrimary());
         ASSERT_TRUE(responseAfterElection->isSecondary());
         ASSERT_TRUE(responseAfterElection->hasPrimary());
         ASSERT_EQUALS(responseAfterElection->getPrimary().host(), "node1");
@@ -4585,21 +4580,21 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
 
         // The server TopologyVersion will increment again once we exit drain mode.
         expectedCounter = topologyVersionAfterElection->getCounter() + 1;
-        const auto responseAfterDrainComplete = awaitIsMasterWithNewOpCtx(
+        const auto responseAfterDrainComplete = awaitHelloWithNewOpCtx(
             getReplCoord(), topologyVersionAfterElection.get(), {}, deadline);
         const auto topologyVersionAfterDrainComplete =
             responseAfterDrainComplete->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterDrainComplete->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersionAfterDrainComplete->getProcessId(), expectedProcessId);
 
-        ASSERT_TRUE(responseAfterDrainComplete->isMaster());
+        ASSERT_TRUE(responseAfterDrainComplete->isWritablePrimary());
         ASSERT_FALSE(responseAfterDrainComplete->isSecondary());
         ASSERT_TRUE(responseAfterDrainComplete->hasPrimary());
         ASSERT_EQUALS(responseAfterDrainComplete->getPrimary().host(), "node1");
         ASSERT(getReplCoord()->getMemberState().primary());
     });
 
-    // Ensure that awaitIsMasterResponse() is called before finishing the election.
+    // Ensure that awaitHelloResponse() is called before finishing the election.
     waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
     ASSERT_NOT_EQUALS(Date_t(), electionTimeoutWhen);
@@ -4612,10 +4607,10 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWin) {
     signalDrainComplete(opCtx.get());
     ASSERT(getReplCoord()->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
 
-    getIsMasterThread.join();
+    getHelloThread.join();
 }
 
-TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
+TEST_F(ReplCoordTest, AwaitHelloResponseReturnsOnElectionWinWithReconfig) {
     // The config has a "term" field, so step-up will increment the config term
     // via reconfig. As a result, step-up triggers three topology changes.
     init();
@@ -4645,10 +4640,10 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
     auto expectedCounter = currentTopologyVersion.getCounter() + 1;
 
     auto opCtx = makeOperationContext();
-    // Calling isMaster without a TopologyVersion field should return immediately.
+    // Calling hello without a TopologyVersion field should return immediately.
     const auto response =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
-    ASSERT_FALSE(response->isMaster());
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
+    ASSERT_FALSE(response->isWritablePrimary());
     ASSERT_TRUE(response->isSecondary());
     ASSERT_FALSE(response->hasPrimary());
 
@@ -4659,19 +4654,19 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
     auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn);
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
-    // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
+    // awaitHelloResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
-    stdx::thread getIsMasterThread([&] {
+    stdx::thread getHelloThread([&] {
         const auto responseAfterElection =
-            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
+            awaitHelloWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
 
         const auto topologyVersionAfterElection = responseAfterElection->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterElection->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersionAfterElection->getProcessId(), expectedProcessId);
 
-        // We expect the server to increment the TopologyVersion and respond to waiting IsMasters
+        // We expect the server to increment the TopologyVersion and respond to waiting hellos
         // once an election is won even if we have yet to signal drain completion.
-        ASSERT_FALSE(responseAfterElection->isMaster());
+        ASSERT_FALSE(responseAfterElection->isWritablePrimary());
         ASSERT_TRUE(responseAfterElection->isSecondary());
         ASSERT_TRUE(responseAfterElection->hasPrimary());
         ASSERT_EQUALS(responseAfterElection->getPrimary().host(), "node1");
@@ -4679,13 +4674,13 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
 
         // The server TopologyVersion will increment once we finish reconfig.
         expectedCounter = topologyVersionAfterElection->getCounter() + 1;
-        const auto responseAfterReconfig = awaitIsMasterWithNewOpCtx(
+        const auto responseAfterReconfig = awaitHelloWithNewOpCtx(
             getReplCoord(), topologyVersionAfterElection.get(), {}, deadline);
         const auto topologyVersionAfterReconfig = responseAfterReconfig->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterReconfig->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersionAfterReconfig->getProcessId(), expectedProcessId);
 
-        ASSERT_FALSE(responseAfterReconfig->isMaster());
+        ASSERT_FALSE(responseAfterReconfig->isWritablePrimary());
         ASSERT_TRUE(responseAfterReconfig->isSecondary());
         ASSERT_TRUE(responseAfterReconfig->hasPrimary());
         ASSERT_EQUALS(responseAfterReconfig->getPrimary().host(), "node1");
@@ -4694,21 +4689,21 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
         hangAfterReconfigFailPoint->setMode(FailPoint::off);
         // The server TopologyVersion will increment again once we exit drain mode.
         expectedCounter = topologyVersionAfterReconfig->getCounter() + 1;
-        const auto responseAfterDrainComplete = awaitIsMasterWithNewOpCtx(
+        const auto responseAfterDrainComplete = awaitHelloWithNewOpCtx(
             getReplCoord(), topologyVersionAfterReconfig.get(), {}, deadline);
         const auto topologyVersionAfterDrainComplete =
             responseAfterDrainComplete->getTopologyVersion();
         ASSERT_EQUALS(topologyVersionAfterDrainComplete->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersionAfterDrainComplete->getProcessId(), expectedProcessId);
 
-        ASSERT_TRUE(responseAfterDrainComplete->isMaster());
+        ASSERT_TRUE(responseAfterDrainComplete->isWritablePrimary());
         ASSERT_FALSE(responseAfterDrainComplete->isSecondary());
         ASSERT_TRUE(responseAfterDrainComplete->hasPrimary());
         ASSERT_EQUALS(responseAfterDrainComplete->getPrimary().host(), "node1");
         ASSERT(getReplCoord()->getMemberState().primary());
     });
 
-    // Ensure that awaitIsMasterResponse() is called before finishing the election.
+    // Ensure that awaitHelloResponse() is called before finishing the election.
     waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
     auto electionTimeoutWhen = getReplCoord()->getElectionTimeout_forTest();
     ASSERT_NOT_EQUALS(Date_t(), electionTimeoutWhen);
@@ -4721,15 +4716,15 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnElectionWinWithReconfig) {
     signalDrainComplete(opCtx.get());
     ASSERT(getReplCoord()->getApplierState() == ReplicationCoordinator::ApplierState::Stopped);
 
-    getIsMasterThread.join();
+    getHelloThread.join();
 }
 
-TEST_F(ReplCoordTest, IsMasterResponseMentionsLackOfReplicaSetConfig) {
+TEST_F(ReplCoordTest, HelloResponseMentionsLackOfReplicaSetConfig) {
     start();
 
     auto opCtx = makeOperationContext();
     const auto response =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
     ASSERT_FALSE(response->isConfigSet());
     BSONObj responseObj = response->toBSON();
     ASSERT_FALSE(responseObj["ismaster"].Bool());
@@ -4737,11 +4732,11 @@ TEST_F(ReplCoordTest, IsMasterResponseMentionsLackOfReplicaSetConfig) {
     ASSERT_TRUE(responseObj["isreplicaset"].Bool());
     ASSERT_EQUALS("Does not have a valid replica set config", responseObj["info"].String());
 
-    IsMasterResponse roundTripped;
+    HelloResponse roundTripped;
     ASSERT_OK(roundTripped.initialize(response->toBSON()));
 }
 
-TEST_F(ReplCoordTest, IsMaster) {
+TEST_F(ReplCoordTest, Hello) {
     HostAndPort h1("h1");
     HostAndPort h2("h2");
     HostAndPort h3("h3");
@@ -4769,18 +4764,18 @@ TEST_F(ReplCoordTest, IsMaster) {
 
     auto opCtx = makeOperationContext();
     const auto response =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
 
     ASSERT_EQUALS("mySet", response->getReplSetName());
     ASSERT_EQUALS(2, response->getReplSetVersion());
-    ASSERT_FALSE(response->isMaster());
+    ASSERT_FALSE(response->isWritablePrimary());
     ASSERT_TRUE(response->isSecondary());
     // TODO(spencer): test that response includes current primary when there is one.
     ASSERT_FALSE(response->isArbiterOnly());
     ASSERT_TRUE(response->isPassive());
     ASSERT_FALSE(response->isHidden());
     ASSERT_TRUE(response->shouldBuildIndexes());
-    ASSERT_EQUALS(Seconds(0), response->getSlaveDelay());
+    ASSERT_EQUALS(Seconds(0), response->getSecondaryDelaySecs());
     ASSERT_EQUALS(h4, response->getMe());
 
     std::vector<HostAndPort> hosts = response->getHosts();
@@ -4805,11 +4800,11 @@ TEST_F(ReplCoordTest, IsMaster) {
     ASSERT_EQUALS(opTime, response->getLastWriteOpTime());
     ASSERT_EQUALS(lastWriteDate, response->getLastWriteDate());
 
-    IsMasterResponse roundTripped;
+    HelloResponse roundTripped;
     ASSERT_OK(roundTripped.initialize(response->toBSON()));
 }
 
-TEST_F(ReplCoordTest, IsMasterWithCommittedSnapshot) {
+TEST_F(ReplCoordTest, HelloWithCommittedSnapshot) {
     init("mySet");
 
     assertStartSuccess(BSON("_id"
@@ -4832,7 +4827,7 @@ TEST_F(ReplCoordTest, IsMasterWithCommittedSnapshot) {
     ASSERT_EQUALS(majorityOpTime, getReplCoord()->getCurrentCommittedSnapshotOpTime());
 
     const auto response =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
 
     ASSERT_EQUALS(opTime, response->getLastWriteOpTime());
     ASSERT_EQUALS(lastWriteDate, response->getLastWriteDate());
@@ -4840,7 +4835,7 @@ TEST_F(ReplCoordTest, IsMasterWithCommittedSnapshot) {
     ASSERT_EQUALS(majorityWriteDate, response->getLastMajorityWriteDate());
 }
 
-TEST_F(ReplCoordTest, IsMasterInShutdown) {
+TEST_F(ReplCoordTest, HelloInShutdown) {
     init("mySet");
 
     assertStartSuccess(BSON("_id"
@@ -4853,16 +4848,16 @@ TEST_F(ReplCoordTest, IsMasterInShutdown) {
     runSingleNodeElection(opCtx.get());
 
     const auto responseBeforeShutdown =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
-    ASSERT_TRUE(responseBeforeShutdown->isMaster());
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
+    ASSERT_TRUE(responseBeforeShutdown->isWritablePrimary());
     ASSERT_FALSE(responseBeforeShutdown->isSecondary());
 
     shutdown(opCtx.get());
 
-    // Must not report ourselves as master while we're in shutdown.
+    // Must not report ourselves as a writable primary while we're in shutdown.
     const auto responseAfterShutdown =
-        getReplCoord()->awaitIsMasterResponse(opCtx.get(), {}, boost::none, boost::none);
-    ASSERT_FALSE(responseAfterShutdown->isMaster());
+        getReplCoord()->awaitHelloResponse(opCtx.get(), {}, boost::none, boost::none);
+    ASSERT_FALSE(responseAfterShutdown->isWritablePrimary());
     ASSERT_FALSE(responseBeforeShutdown->isSecondary());
 }
 
@@ -5115,7 +5110,7 @@ void doReplSetReconfig(ReplicationCoordinatorImpl* replCoord, Status* status, bo
     *status = replCoord->processReplSetReconfig(opCtx.get(), args, &garbage);
 }
 
-TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfig) {
+TEST_F(ReplCoordTest, AwaitHelloResponseReturnsOnReplSetReconfig) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -5148,33 +5143,33 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfig) {
     auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
-    // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
+    // awaitHelloResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
-    stdx::thread getIsMasterThread([&] {
+    stdx::thread getHelloThread([&] {
         const auto response =
-            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
+            awaitHelloWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
         auto topologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(topologyVersion->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersion->getProcessId(), expectedProcessId);
 
-        // Ensure the isMasterResponse contains the newly added node.
+        // Ensure the HelloResponse contains the newly added node.
         const auto hosts = response->getHosts();
         ASSERT_EQUALS(3, hosts.size());
         ASSERT_EQUALS("node3", hosts[2].host());
     });
 
-    // Ensure that awaitIsMasterResponse() is called before triggering a reconfig.
+    // Ensure that awaitHelloResponse() is called before triggering a reconfig.
     waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     // Do a reconfig to add a third node to the replica set. A reconfig should cause the server to
-    // respond to the waiting IsMasterResponse.
+    // respond to the waiting HelloResponse.
     Status status(ErrorCodes::InternalError, "Not Set");
     stdx::thread reconfigThread(
         [&] { doReplSetReconfig(getReplCoord(), &status, true /* force */); });
     replyToReceivedHeartbeatV1();
     reconfigThread.join();
     ASSERT_OK(status);
-    getIsMasterThread.join();
+    getHelloThread.join();
 }
 
 TEST_F(ReplCoordTest, AwaitReplicationShouldResolveAsNormalDuringAReconfig) {
@@ -5264,7 +5259,7 @@ void doReplSetReconfigToFewer(ReplicationCoordinatorImpl* replCoord, Status* sta
     *status = replCoord->processReplSetReconfig(opCtx.get(), args, &garbage);
 }
 
-TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfigOnSecondary) {
+TEST_F(ReplCoordTest, AwaitHelloResponseReturnsOnReplSetReconfigOnSecondary) {
     init();
     assertStartSuccess(BSON("_id"
                             << "mySet"
@@ -5299,34 +5294,34 @@ TEST_F(ReplCoordTest, AwaitIsMasterResponseReturnsOnReplSetReconfigOnSecondary) 
     auto timesEnteredFailPoint = waitForHelloFailPoint->setMode(FailPoint::alwaysOn, 0);
     ON_BLOCK_EXIT([&] { waitForHelloFailPoint->setMode(FailPoint::off, 0); });
 
-    // awaitIsMasterResponse blocks and waits on a future when the request TopologyVersion equals
+    // awaitHelloResponse blocks and waits on a future when the request TopologyVersion equals
     // the current TopologyVersion of the server.
-    stdx::thread getIsMasterThread([&] {
+    stdx::thread getHelloThread([&] {
         const auto response =
-            awaitIsMasterWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
+            awaitHelloWithNewOpCtx(getReplCoord(), currentTopologyVersion, {}, deadline);
         auto topologyVersion = response->getTopologyVersion();
         ASSERT_EQUALS(topologyVersion->getCounter(), expectedCounter);
         ASSERT_EQUALS(topologyVersion->getProcessId(), expectedProcessId);
 
-        // Ensure the isMasterResponse no longer contains the removed node.
+        // Ensure the HelloResponse no longer contains the removed node.
         const auto hosts = response->getHosts();
         ASSERT_EQUALS(2, hosts.size());
         ASSERT_EQUALS("node1", hosts[0].host());
         ASSERT_EQUALS("node3", hosts[1].host());
     });
 
-    // Ensure that awaitIsMasterResponse() is called before triggering a reconfig.
+    // Ensure that awaitHelloResponse() is called before triggering a reconfig.
     waitForHelloFailPoint->waitForTimesEntered(timesEnteredFailPoint + 1);
 
     // Do a reconfig to remove a node from the replica set. A reconfig should cause the server to
-    // respond to the waiting isMaster request.
+    // respond to the waiting hello request.
     Status status(ErrorCodes::InternalError, "Not Set");
     stdx::thread reconfigThread(
         [&] { doReplSetReconfigToFewer(getReplCoord(), &status, true /* force */); });
     replyToReceivedHeartbeatV1();
     reconfigThread.join();
     ASSERT_OK(status);
-    getIsMasterThread.join();
+    getHelloThread.join();
 }
 
 TEST_F(

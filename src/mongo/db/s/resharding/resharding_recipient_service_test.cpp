@@ -43,14 +43,14 @@
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog_cache_test_fixture.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/stale_exception.h"
 
 namespace mongo {
 namespace {
 
-class ReshardingRecipientServiceTest : public ServiceContextMongoDTest,
-                                       public CatalogCacheTestFixture {
+class ReshardingRecipientServiceTest : public CatalogCacheTestFixture,
+                                       public ServiceContextMongoDTest {
 public:
     const UUID kOrigUUID = UUID::gen();
     const NamespaceString kOrigNss = NamespaceString("db.foo");
@@ -74,7 +74,6 @@ public:
         auto _storageInterfaceImpl = std::make_unique<repl::StorageInterfaceImpl>();
         repl::StorageInterface::set(getServiceContext(), std::move(_storageInterfaceImpl));
 
-        repl::setOplogCollectionName(getServiceContext());
         repl::createOplog(operationContext());
         MongoDSessionCatalog::onStepUp(operationContext());
     }
@@ -136,12 +135,9 @@ public:
         auto future = scheduleRoutingInfoForcedRefresh(tempNss);
 
         expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
-            CollectionType coll;
-            coll.setNs(tempNss);
-            coll.setEpoch(epoch);
+            CollectionType coll(tempNss, epoch, Date_t::now(), uuid);
             coll.setKeyPattern(skey.getKeyPattern());
             coll.setUnique(false);
-            coll.setUUID(uuid);
 
             TypeCollectionReshardingFields reshardingFields;
             reshardingFields.setUuid(uuid);
@@ -176,9 +172,10 @@ public:
     void expectStaleDbVersionError(const NamespaceString& nss, StringData expectedCmdName) {
         onCommand([&](const executor::RemoteCommandRequest& request) {
             ASSERT_EQ(request.cmdObj.firstElementFieldNameStringData(), expectedCmdName);
-            return createErrorCursorResponse(Status(
-                StaleDbRoutingVersion(nss.db().toString(), databaseVersion::makeNew(), boost::none),
-                "dummy stale db version error"));
+            return createErrorCursorResponse(
+                Status(StaleDbRoutingVersion(
+                           nss.db().toString(), DatabaseVersion(UUID::gen()), boost::none),
+                       "dummy stale db version error"));
         });
     }
 
@@ -255,7 +252,7 @@ TEST_F(ReshardingRecipientServiceTest, CreateLocalReshardingCollectionBasic) {
     });
 
     resharding::createTemporaryReshardingCollectionLocally(
-        operationContext(), kReshardingNss, kDefaultFetchTimestamp);
+        operationContext(), kOrigNss, kReshardingUUID, kOrigUUID, kDefaultFetchTimestamp);
 
     future.default_timed_get();
 
@@ -305,7 +302,7 @@ TEST_F(ReshardingRecipientServiceTest,
     });
 
     resharding::createTemporaryReshardingCollectionLocally(
-        operationContext(), kReshardingNss, kDefaultFetchTimestamp);
+        operationContext(), kOrigNss, kReshardingUUID, kOrigUUID, kDefaultFetchTimestamp);
 
     future.default_timed_get();
 
@@ -366,7 +363,7 @@ TEST_F(ReshardingRecipientServiceTest,
     });
 
     resharding::createTemporaryReshardingCollectionLocally(
-        operationContext(), kReshardingNss, kDefaultFetchTimestamp);
+        operationContext(), kOrigNss, kReshardingUUID, kOrigUUID, kDefaultFetchTimestamp);
 
     future.default_timed_get();
 
@@ -429,7 +426,7 @@ TEST_F(ReshardingRecipientServiceTest,
     });
 
     resharding::createTemporaryReshardingCollectionLocally(
-        operationContext(), kReshardingNss, kDefaultFetchTimestamp);
+        operationContext(), kOrigNss, kReshardingUUID, kOrigUUID, kDefaultFetchTimestamp);
 
     future.default_timed_get();
 
@@ -482,7 +479,7 @@ TEST_F(ReshardingRecipientServiceTest,
     });
 
     resharding::createTemporaryReshardingCollectionLocally(
-        operationContext(), kReshardingNss, kDefaultFetchTimestamp);
+        operationContext(), kOrigNss, kReshardingUUID, kOrigUUID, kDefaultFetchTimestamp);
 
     future.default_timed_get();
 

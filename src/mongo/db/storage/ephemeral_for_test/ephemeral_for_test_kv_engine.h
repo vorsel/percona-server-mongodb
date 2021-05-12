@@ -93,7 +93,9 @@ public:
 
     virtual void endBackup(OperationContext* opCtx) {}
 
-    virtual Status dropIdent(mongo::RecoveryUnit* ru, StringData ident);
+    virtual Status dropIdent(mongo::RecoveryUnit* ru,
+                             StringData ident,
+                             StorageEngine::DropIdentCallback&& onDrop);
 
     virtual void dropIdentForImport(OperationContext* opCtx, StringData ident) {}
 
@@ -143,10 +145,6 @@ public:
     virtual Timestamp getAllDurableTimestamp() const override {
         RecordId id = _visibilityManager->getAllCommittedRecord();
         return Timestamp(id.repr());
-    }
-
-    virtual Timestamp getOldestOpenReadTimestamp() const override {
-        return Timestamp();
     }
 
     boost::optional<Timestamp> getOplogNeededForCrashRecovery() const final {

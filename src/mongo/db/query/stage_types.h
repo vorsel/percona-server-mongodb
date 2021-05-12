@@ -31,6 +31,8 @@
 
 #include <cstdint>
 
+#include "mongo/base/string_data.h"
+
 namespace mongo {
 /**
  * This type acts as an identifier for a node in a query plan tree, such as a 'QuerySolution' tree
@@ -49,6 +51,10 @@ enum StageType {
     STAGE_AND_SORTED,
     STAGE_CACHED_PLAN,
     STAGE_COLLSCAN,
+
+    // A virtual scan stage that simulates a collection scan and doesn't depend on underlying
+    // storage.
+    STAGE_VIRTUAL_SCAN,
 
     // This stage sits at the root of the query tree and counts up the number of results
     // returned by its child.
@@ -140,4 +146,5 @@ inline bool isSortStageType(StageType stageType) {
     }
 }
 
+StringData stageTypeToString(StageType stageType);
 }  // namespace mongo

@@ -122,8 +122,9 @@ ShardingMongodTestFixture::ShardingMongodTestFixture() {
                                       std::make_unique<repl::ReplicationConsistencyMarkersMock>(),
                                       std::make_unique<repl::ReplicationRecoveryMock>()));
 
-    ASSERT_OK(repl::ReplicationProcess::get(operationContext())
-                  ->initializeRollbackID(operationContext()));
+    auto uniqueOpCtx = makeOperationContext();
+    ASSERT_OK(
+        repl::ReplicationProcess::get(uniqueOpCtx.get())->initializeRollbackID(uniqueOpCtx.get()));
 
     repl::StorageInterface::set(service, std::move(storagePtr));
 
@@ -132,8 +133,7 @@ ShardingMongodTestFixture::ShardingMongodTestFixture() {
     opObserver->addObserver(std::make_unique<ConfigServerOpObserver>());
     opObserver->addObserver(std::make_unique<ShardServerOpObserver>());
 
-    repl::setOplogCollectionName(service);
-    repl::createOplog(operationContext());
+    repl::createOplog(uniqueOpCtx.get());
 
     // Set the highest FCV because otherwise it defaults to the lower FCV. This way we default to
     // testing this release's code, not backwards compatibility code.
@@ -192,14 +192,15 @@ std::unique_ptr<ShardRegistry> ShardingMongodTestFixture::makeShardRegistry(
         return std::make_unique<ShardRemote>(shardId, connStr, targeterFactoryPtr->create(connStr));
     };
 
-    ShardFactory::BuilderCallable masterBuilder = [targeterFactoryPtr](
-                                                      const ShardId& shardId,
-                                                      const ConnectionString& connStr) {
+    ShardFactory::BuilderCallable standaloneBuilder = [targeterFactoryPtr](
+                                                          const ShardId& shardId,
+                                                          const ConnectionString& connStr) {
         return std::make_unique<ShardRemote>(shardId, connStr, targeterFactoryPtr->create(connStr));
     };
 
-    ShardFactory::BuildersMap buildersMap{{ConnectionString::SET, std::move(setBuilder)},
-                                          {ConnectionString::MASTER, std::move(masterBuilder)}};
+    ShardFactory::BuildersMap buildersMap{
+        {ConnectionString::ConnectionType::kReplicaSet, std::move(setBuilder)},
+        {ConnectionString::ConnectionType::kStandalone, std::move(standaloneBuilder)}};
 
     // Only config servers use ShardLocal for now.
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
@@ -209,7 +210,7 @@ std::unique_ptr<ShardRegistry> ShardingMongodTestFixture::makeShardRegistry(
         };
         buildersMap.insert(
             std::pair<ConnectionString::ConnectionType, ShardFactory::BuilderCallable>(
-                ConnectionString::LOCAL, std::move(localBuilder)));
+                ConnectionString::ConnectionType::kLocal, std::move(localBuilder)));
     }
 
     auto shardFactory =
@@ -273,6 +274,10 @@ Status ShardingMongodTestFixture::initializeGlobalShardingStateForMongodForTest(
     return Status::OK();
 }
 
+void ShardingMongodTestFixture::setUp() {
+    ShardingTestFixtureCommon::setUp();
+}
+
 void ShardingMongodTestFixture::tearDown() {
     ReplicaSetMonitor::cleanup();
 
@@ -291,6 +296,7 @@ void ShardingMongodTestFixture::tearDown() {
     CollectionShardingStateFactory::clear(getServiceContext());
     Grid::get(operationContext())->clearForUnitTests();
 
+    ShardingTestFixtureCommon::tearDown();
     ServiceContextMongoDTest::tearDown();
 }
 

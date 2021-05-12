@@ -58,6 +58,7 @@
 #include "mongo/s/query/establish_cursors.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/visit_helper.h"
 
 namespace mongo::sharded_agg_helpers {
 
@@ -124,10 +125,29 @@ RemoteCursor openChangeStreamNewShardMonitor(const boost::intrusive_ptr<Expressi
 BSONObj genericTransformForShards(MutableDocument&& cmdForShards,
                                   const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                   boost::optional<ExplainOptions::Verbosity> explainVerbosity,
-                                  const boost::optional<RuntimeConstants>& constants,
                                   BSONObj collationObj) {
-    if (constants) {
-        cmdForShards[AggregationRequest::kRuntimeConstantsName] = Value(constants.get().toBSON());
+    // Serialize the variables.
+    // Check whether we are in a mixed-version cluster and so must use the old serialization format.
+    // This is only tricky in the case we are sending an aggregate from shard to shard. For this
+    // scenario we can rely on feature compatibility version to detect when this is safe. Feature
+    // compatibility version is not generally accurate on mongos since it was intended to guard
+    // changes to data format and mongos has no persisted state. However, mongos is upgraded last
+    // after all the shards, so any recipient will understand the 'let' parameter.
+    // TODO SERVER-52900 This code can be remove when we branch for the next LTS release.
+    if (serverGlobalParams.clusterRole == ClusterRole::ShardServer &&
+        !serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
+            ServerGlobalParams::FeatureCompatibility::Version::kVersion49)) {
+        // A mixed version cluster. Use the old format to be sure it is understood.
+        auto [legacyRuntimeConstants, unusedSerializedVariables] =
+            expCtx->variablesParseState.transitionalCompatibilitySerialize(expCtx->variables);
+
+        cmdForShards[AggregationRequest::kLegacyRuntimeConstantsName] =
+            Value(legacyRuntimeConstants.toBSON());
+    } else {
+        // Either this is a "modern" cluster or we are a mongos and can assume the shards are
+        // "modern" and will understand the 'let' parameter.
+        cmdForShards[AggregationRequest::kLetName] =
+            Value(expCtx->variablesParseState.serialize(expCtx->variables));
     }
 
     cmdForShards[AggregationRequest::kFromMongosName] = Value(expCtx->inMongos);
@@ -576,22 +596,27 @@ void abandonCacheIfSentToShards(Pipeline* shardsPipeline) {
 
 }  // namespace
 
-/**
- * For a sharded collection, establishes remote cursors on each shard that may have results, and
- * creates a DocumentSourceMergeCursors stage to merge the remote cursors. Returns a pipeline
- * beginning with that DocumentSourceMergeCursors stage. Note that one of the 'remote' cursors might
- * be this node itself.
- */
 std::unique_ptr<Pipeline, PipelineDeleter> targetShardsAndAddMergeCursors(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx, Pipeline* ownedPipeline) {
-    std::unique_ptr<Pipeline, PipelineDeleter> pipeline(ownedPipeline,
-                                                        PipelineDeleter(expCtx->opCtx));
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    stdx::variant<std::unique_ptr<Pipeline, PipelineDeleter>, AggregationRequest> targetRequest) {
+    auto&& [aggRequest, pipeline] = [&] {
+        return stdx::visit(
+            visit_helper::Overloaded{
+                [&](std::unique_ptr<Pipeline, PipelineDeleter>&& pipeline) {
+                    return std::make_pair(
+                        AggregationRequest(expCtx->ns, pipeline->serializeToBson()),
+                        std::move(pipeline));
+                },
+                [&](AggregationRequest&& aggRequest) {
+                    auto rawPipeline = aggRequest.getPipeline();
+                    return std::make_pair(std::move(aggRequest),
+                                          Pipeline::parse(std::move(rawPipeline), expCtx));
+                }},
+            std::move(targetRequest));
+    }();
 
     invariant(pipeline->getSources().empty() ||
               !dynamic_cast<DocumentSourceMergeCursors*>(pipeline->getSources().front().get()));
-
-    // Generate the command object for the targeted shards.
-    AggregationRequest aggRequest(expCtx->ns, pipeline->serializeToBson());
 
     // The default value for 'allowDiskUse' and 'maxTimeMS' in the AggregationRequest may not match
     // what was set on the originating command, so copy it from the ExpressionContext.
@@ -696,7 +721,6 @@ BSONObj createPassthroughCommandForShard(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     Document serializedCommand,
     boost::optional<ExplainOptions::Verbosity> explainVerbosity,
-    const boost::optional<RuntimeConstants>& constants,
     Pipeline* pipeline,
     BSONObj collationObj) {
     // Create the command for the shards.
@@ -706,7 +730,7 @@ BSONObj createPassthroughCommandForShard(
     }
 
     return genericTransformForShards(
-        std::move(targetedCmd), expCtx, explainVerbosity, constants, collationObj);
+        std::move(targetedCmd), expCtx, explainVerbosity, collationObj);
 }
 
 BSONObj createCommandForTargetedShards(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -744,11 +768,8 @@ BSONObj createCommandForTargetedShards(const boost::intrusive_ptr<ExpressionCont
     targetedCmd[AggregationRequest::kExchangeName] =
         exchangeSpec ? Value(exchangeSpec->exchangeSpec.toBSON()) : Value();
 
-    return genericTransformForShards(std::move(targetedCmd),
-                                     expCtx,
-                                     expCtx->explain,
-                                     expCtx->getRuntimeConstants(),
-                                     expCtx->getCollatorBSON());
+    return genericTransformForShards(
+        std::move(targetedCmd), expCtx, expCtx->explain, expCtx->getCollatorBSON());
 }
 
 /**
@@ -826,14 +847,11 @@ DispatchShardPipelineResults dispatchShardPipeline(
         opCtx,
         true,             /* appendRC */
         !expCtx->explain, /* appendWC */
-        splitPipelines ? createCommandForTargetedShards(
-                             expCtx, serializedCommand, *splitPipelines, exchangeSpec, true)
-                       : createPassthroughCommandForShard(expCtx,
-                                                          serializedCommand,
-                                                          expCtx->explain,
-                                                          expCtx->getRuntimeConstants(),
-                                                          pipeline.get(),
-                                                          collationObj));
+        splitPipelines
+            ? createCommandForTargetedShards(
+                  expCtx, serializedCommand, *splitPipelines, exchangeSpec, true)
+            : createPassthroughCommandForShard(
+                  expCtx, serializedCommand, expCtx->explain, pipeline.get(), collationObj));
 
     // A $changeStream pipeline must run on all shards, and will also open an extra cursor on the
     // config server in order to monitor for new shards. To guarantee that we do not miss any
@@ -1143,18 +1161,11 @@ std::unique_ptr<Pipeline, PipelineDeleter> attachCursorToPipeline(Pipeline* owne
             auto pipelineToTarget = pipeline->clone();
             if (allowTargetingShards && !expCtx->ns.isConfigDotCacheDotChunks() &&
                 expCtx->ns.db() != "local") {
-                return targetShardsAndAddMergeCursors(expCtx, pipelineToTarget.release());
+                return targetShardsAndAddMergeCursors(expCtx, std::move(pipelineToTarget));
             }
             return expCtx->mongoProcessInterface->attachCursorSourceToPipelineForLocalRead(
                 pipelineToTarget.release());
         });
 }
 
-void logFailedRetryAttempt(StringData taskDescription, const DBException& exception) {
-    LOGV2_DEBUG(4553800,
-                3,
-                "Retrying {task_description}. Got error: {exception}",
-                "task_description"_attr = taskDescription,
-                "exception"_attr = exception);
-}
 }  // namespace mongo::sharded_agg_helpers

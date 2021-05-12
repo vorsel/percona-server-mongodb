@@ -41,6 +41,7 @@
 #include "mongo/db/stats/timer_stats.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/oplog_query_metadata.h"
+#include "mongo/s/resharding/resume_token_gen.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/time_support.h"
@@ -188,6 +189,7 @@ OplogFetcher::OplogFetcher(executor::TaskExecutor* executor,
                            StartingPoint startingPoint,
                            BSONObj filter,
                            ReadConcernArgs readConcern,
+                           bool requestResumeToken,
                            StringData name)
     : AbstractAsyncComponent(executor, name.toString()),
       _source(source),
@@ -204,7 +206,8 @@ OplogFetcher::OplogFetcher(executor::TaskExecutor* executor,
       _batchSize(batchSize),
       _startingPoint(startingPoint),
       _queryFilter(filter),
-      _queryReadConcern(readConcern) {
+      _queryReadConcern(readConcern),
+      _requestResumeToken(requestResumeToken) {
     invariant(config.isInitialized());
     invariant(!_lastFetched.isNull());
     invariant(onShutdownCallbackFn);
@@ -376,16 +379,20 @@ void OplogFetcher::_runQuery(const executor::TaskExecutor::CallbackArgs& callbac
     _createNewCursor(true /* initialFind */);
 
     while (true) {
-        bool isShuttingDown;
+        Status status{Status::OK()};
         {
             // Both of these checks need to happen while holding the mutex since they could race
             // with shutdown.
             stdx::lock_guard<Latch> lock(_mutex);
-            isShuttingDown = _isShuttingDown_inlock();
-            invariant(isShuttingDown || !_runQueryHandle.isCanceled());
+            if (_isShuttingDown_inlock()) {
+                status = {ErrorCodes::CallbackCanceled, "oplog fetcher shutting down"};
+            } else if (_runQueryHandle.isCanceled()) {
+                invariant(_getExecutor()->isShuttingDown());
+                status = {ErrorCodes::CallbackCanceled, "oplog fetcher task executor shutdown"};
+            }
         }
-        if (isShuttingDown) {
-            _finishCallback(Status(ErrorCodes::CallbackCanceled, "oplog fetcher shutting down"));
+        if (!status.isOK()) {
+            _finishCallback(status);
             return;
         }
 
@@ -405,7 +412,7 @@ void OplogFetcher::_runQuery(const executor::TaskExecutor::CallbackArgs& callbac
         }
 
         // This will advance our view of _lastFetched.
-        auto status = _onSuccessfulBatch(batchResult.getValue());
+        status = _onSuccessfulBatch(batchResult.getValue());
         if (!status.isOK()) {
             // The stopReplProducer fail point expects this to return successfully. If another fail
             // point wants this to return unsuccessfully, it should use a different error code.
@@ -499,11 +506,16 @@ BSONObj OplogFetcher::_makeFindQuery(long long findTimeout) const {
     filterBob.append("ts", BSON("$gte" << lastOpTimeFetched.getTimestamp()));
     // Handle caller-provided filter.
     if (!_queryFilter.isEmpty()) {
-        filterBob.append("$and", _queryFilter);
+        filterBob.append(
+            "$or", BSON_ARRAY(_queryFilter << BSON("ts" << lastOpTimeFetched.getTimestamp())));
     }
     filterBob.done();
 
     queryBob.append("$maxTimeMS", findTimeout);
+    if (_requestResumeToken) {
+        queryBob.append("$hint", BSON("$natural" << 1));
+        queryBob.append("$_requestResumeToken", true);
+    }
 
     auto lastCommittedWithCurrentTerm =
         _dataReplicatorExternalState->getCurrentTermAndLastCommittedOpTime();
@@ -708,9 +720,19 @@ Status OplogFetcher::_onSuccessfulBatch(const Documents& documents) {
         //       right after that first document was enqueued. In such a scenario, we would not
         //       have advanced the lastFetched opTime, so we skip past that document to avoid
         //       duplicating it.
+        //    3. We have a query filter, and the first document doesn't match that filter.  This
+        //       happens on the first batch when we always accept a document with the previous
+        //       fetched timestamp.
 
         if (_startingPoint == StartingPoint::kSkipFirstDoc) {
             firstDocToApply++;
+        } else if (!_queryFilter.isEmpty()) {
+            auto opCtx = cc().makeOperationContext();
+            auto expCtx =
+                make_intrusive<ExpressionContext>(opCtx.get(), nullptr /* collator */, _nss);
+            Matcher m(_queryFilter, expCtx);
+            if (!m.matches(*firstDocToApply))
+                firstDocToApply++;
         }
     }
 
@@ -766,6 +788,13 @@ Status OplogFetcher::_onSuccessfulBatch(const Documents& documents) {
     networkByteStats.increment(info.networkDocumentBytes);
 
     oplogBatchStats.recordMillis(_lastBatchElapsedMS, documents.empty());
+
+    if (_cursor->getPostBatchResumeToken()) {
+        auto pbrt = ResumeTokenOplogTimestamp::parse(
+            IDLParserErrorContext("OplogFetcher PostBatchResumeToken"),
+            *_cursor->getPostBatchResumeToken());
+        info.resumeToken = pbrt.getTs();
+    }
 
     auto status = _enqueueDocumentsFn(firstDocToApply, documents.cend(), info);
     if (!status.isOK()) {

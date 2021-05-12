@@ -3,7 +3,6 @@
 // order to apply the SHARDING_FILTER stage.
 // @tags: [
 //   assumes_unsharded_collection,
-//   sbe_incompatible,
 // ]
 
 // Simple covered index query test with a unique sparse index
@@ -22,7 +21,7 @@ for (i = 0; i < 5; i++) {
 coll.insert({foo: "string"});
 coll.insert({foo: {bar: 1}});
 coll.insert({foo: null});
-coll.ensureIndex({foo: 1}, {sparse: true, unique: true});
+coll.createIndex({foo: 1}, {sparse: true, unique: true});
 
 // Test equality with int value
 var plan = coll.find({foo: 1}, {foo: 1, _id: 0}).hint({foo: 1}).explain("executionStats");
@@ -85,7 +84,7 @@ assert.eq(0,
 
 // Check that $nin can be covered.
 coll.dropIndexes();
-coll.ensureIndex({bar: 1});
+coll.createIndex({bar: 1});
 var plan =
     coll.find({bar: {$nin: [5, 8]}}, {bar: 1, _id: 0}).hint({bar: 1}).explain("executionStats");
 assert(isIndexOnly(db, plan.queryPlanner.winningPlan),

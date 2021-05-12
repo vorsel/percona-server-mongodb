@@ -60,6 +60,7 @@ class TenantMigrationRecipientService final : public PrimaryOnlyService {
 public:
     static constexpr StringData kTenantMigrationRecipientServiceName =
         "TenantMigrationRecipientService"_sd;
+    static constexpr StringData kNoopMsg = "Resume token noop"_sd;
 
     explicit TenantMigrationRecipientService(ServiceContext* serviceContext);
     ~TenantMigrationRecipientService() = default;
@@ -78,7 +79,8 @@ public:
         explicit Instance(const TenantMigrationRecipientService* recipientService,
                           BSONObj stateDoc);
 
-        void run(std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept final;
+        SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                             const CancelationToken& token) noexcept final;
 
         /*
          * Interrupts the running instance and cause the completion future to complete with
@@ -312,8 +314,8 @@ public:
 
         /*
          * Gets called when the cloner completes cloning data successfully.
-         * And, it is responsible to populate the 'dataConsistentStopOpTime'
-         * and 'cloneFinishedOpTime' fields in the state doc.
+         * And, it is responsible to populate the 'dataConsistentStopDonorOpTime'
+         * and 'cloneFinishedRecipientOpTime' fields in the state doc.
          */
         SemiFuture<void> _onCloneSuccess();
 
@@ -324,9 +326,9 @@ public:
         SemiFuture<void> _getDataConsistentFuture();
 
         /*
-         * Shuts down all components that are started by the instance.
+         * Cancels the tenant migration recipient instance task work.
          */
-        void _shutdownComponents(WithLock lk);
+        void _cancelRemainingWork(WithLock lk);
 
         /*
          * Performs some cleanup work on task completion, like, shutting down the components or

@@ -114,9 +114,11 @@ let testCases = {
     _recvChunkStart: {skip: "internal command"},
     _recvChunkStatus: {skip: "internal command"},
     _shardsvrCloneCatalogData: {skip: "internal command"},
+    _shardsvrDropCollection: {skip: "internal command"},
     _shardsvrMovePrimary: {skip: "internal command"},
     _shardsvrRenameCollection: {skip: "internal command"},
     _shardsvrShardCollection: {skip: "internal command"},
+    _shardsvrDropDatabase: {skip: "internal command"},
     _transferMods: {skip: "internal command"},
     _vectorClockPersist: {skip: "internal command"},
     abortTransaction: {
@@ -392,18 +394,6 @@ let testCases = {
     forceerror: {skip: "test command"},
     fsync: {skip: "does not accept read or write concern"},
     fsyncUnlock: {skip: "does not accept read or write concern"},
-    geoSearch: {
-        setUp: function(conn) {
-            assert.commandWorked(conn.getDB(db).runCommand({
-                createIndexes: coll,
-                indexes: [{key: {loc: "geoHaystack", foo: 1}, bucketSize: 1, name: "foo"}],
-                writeConcern: {w: 1}
-            }));
-        },
-        command: {geoSearch: coll, search: {}, near: [0, 0], maxDistance: 1},
-        checkReadConcern: true,
-        checkWriteConcern: false,
-    },
     getCmdLineOpts: {skip: "does not accept read or write concern"},
     getDatabaseVersion: {skip: "does not accept read or write concern"},
     getDefaultRWConcern: {skip: "does not accept read or write concern"},
@@ -627,6 +617,7 @@ let testCases = {
     testDeprecation: {skip: "does not accept read or write concern"},
     testDeprecationInVersion2: {skip: "does not accept read or write concern"},
     testRemoval: {skip: "does not accept read or write concern"},
+    testReshardCloneCollection: {skip: "internal command"},
     testVersions1And2: {skip: "does not accept read or write concern"},
     testVersion2: {skip: "does not accept read or write concern"},
     top: {skip: "does not accept read or write concern"},

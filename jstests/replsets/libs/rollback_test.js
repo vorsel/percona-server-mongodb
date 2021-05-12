@@ -237,6 +237,7 @@ function RollbackTest(name = "RollbackTest", replSet) {
 
         // We must wait for collection drops to complete so that we don't get spurious failures
         // in the consistency checks.
+        rst.awaitSecondaryNodes();
         rst.nodes.forEach(TwoPhaseDropCollectionTest.waitForAllCollectionDropsToComplete);
 
         const name = rst.name;
@@ -432,7 +433,7 @@ function RollbackTest(name = "RollbackTest", replSet) {
      * Insert on primary until its lastApplied >= the rollback node's. Useful for testing rollback
      * via refetch, which completes rollback recovery when new lastApplied >= old top of oplog.
      */
-    const _awaitPrimaryAppliedSurpassesRollbackApplied = function() {
+    this.awaitPrimaryAppliedSurpassesRollbackApplied = function() {
         log(`Waiting for lastApplied on sync source ${curPrimary.host} to surpass lastApplied` +
             ` on rollback node ${curSecondary.host}`);
 
@@ -532,7 +533,7 @@ function RollbackTest(name = "RollbackTest", replSet) {
             assert.commandWorked(curSecondary.adminCommand({serverStatus: 1}))
                 .storageEngine.supportsCommittedReads;
         if (!isMajorityReadConcernEnabledOnRollbackNode) {
-            _awaitPrimaryAppliedSurpassesRollbackApplied();
+            this.awaitPrimaryAppliedSurpassesRollbackApplied();
         }
 
         log(`RollbackTest transition to ${curState} took ${(new Date() - start)} ms`);
@@ -552,6 +553,9 @@ function RollbackTest(name = "RollbackTest", replSet) {
     this.transitionToSyncSourceOperationsDuringRollback = function() {
         const start = new Date();
         transitionIfAllowed(State.kSyncSourceOpsDuringRollback);
+
+        // Wait for expected states in case the secondary is starting up.
+        rst.awaitSecondaryNodes(null, [curSecondary]);
 
         log(`Reconnecting the secondary ${curSecondary.host} so it'll go into rollback`);
         // Reconnect the rollback node to the current primary, which is the node we want to sync

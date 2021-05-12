@@ -79,7 +79,7 @@ public:
     using OldestActiveTransactionTimestampCallback =
         std::function<OldestActiveTransactionTimestampResult(Timestamp stableTimestamp)>;
 
-    using DropIdentCallback = std::function<void(const NamespaceString& ns)>;
+    using DropIdentCallback = std::function<void()>;
 
     /**
      * The interface for creating new instances of storage engines.
@@ -476,7 +476,7 @@ public:
     virtual void addDropPendingIdent(const Timestamp& dropTimestamp,
                                      const NamespaceString& nss,
                                      std::shared_ptr<Ident> ident,
-                                     const DropIdentCallback& onDrop = nullptr) = 0;
+                                     DropIdentCallback&& onDrop = nullptr) = 0;
 
     /**
      * Called when the checkpoint thread instructs the storage engine to take a checkpoint. The
@@ -629,13 +629,6 @@ public:
      * Returns kMinimumTimestamp if there have been no new writes since the storage engine started.
      */
     virtual Timestamp getAllDurableTimestamp() const = 0;
-
-    /**
-     * Returns the oldest read timestamp in use by an open transaction. Storage engines that support
-     * the 'snapshot' ReadConcern must provide an implementation. Other storage engines may provide
-     * a no-op implementation.
-     */
-    virtual Timestamp getOldestOpenReadTimestamp() const = 0;
 
     /**
      * Returns the minimum possible Timestamp value in the oplog that replication may need for

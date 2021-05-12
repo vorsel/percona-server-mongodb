@@ -43,7 +43,6 @@
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/catalog/uncommitted_collections.h"
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -61,6 +60,7 @@
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/two_phase_index_build_knobs_gen.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/s/shard_key_pattern.h"
@@ -227,50 +227,9 @@ Status validateTTLOptions(OperationContext* opCtx, const BSONObj& cmdObj) {
     const BSONElement& indexes = cmdObj[kIndexesFieldName];
     for (const auto& index : indexes.Array()) {
         BSONObj indexObj = index.Obj();
-        if (!indexObj.hasField(kExpireAfterSeconds)) {
-            continue;
-        }
-
-        const BSONElement expireAfterSecondsElt = indexObj[kExpireAfterSeconds];
-        if (!expireAfterSecondsElt.isNumber()) {
-            return {ErrorCodes::CannotCreateIndex,
-                    str::stream() << "TTL index '" << kExpireAfterSeconds
-                                  << "' option must be numeric, but received a type of '"
-                                  << typeName(expireAfterSecondsElt.type())
-                                  << "'. Index spec: " << indexObj};
-        }
-
-        if (expireAfterSecondsElt.safeNumberLong() < 0) {
-            return {ErrorCodes::CannotCreateIndex,
-                    str::stream() << "TTL index '" << kExpireAfterSeconds
-                                  << "' option cannot be less than 0. Index spec: " << indexObj};
-        }
-
-        const std::string tooLargeErr = str::stream()
-            << "TTL index '" << kExpireAfterSeconds
-            << "' option must be within an acceptable range, try a lower number. Index spec: "
-            << indexObj;
-
-        // There are two cases where we can encounter an issue here.
-        // The first case is when we try to cast to millseconds from seconds, which could cause an
-        // overflow. The second case is where 'expireAfterSeconds' is larger than the current epoch
-        // time.
-        try {
-            auto expireAfterMillis =
-                duration_cast<Milliseconds>(Seconds(expireAfterSecondsElt.safeNumberLong()));
-            if (expireAfterMillis > Date_t::now().toDurationSinceEpoch()) {
-                return {ErrorCodes::CannotCreateIndex, tooLargeErr};
-            }
-        } catch (const AssertionException&) {
-            return {ErrorCodes::CannotCreateIndex, tooLargeErr};
-        }
-
-        const BSONObj key = indexObj["key"].Obj();
-        if (key.nFields() != 1) {
-            return {ErrorCodes::CannotCreateIndex,
-                    str::stream() << "TTL indexes are single-field indexes, compound indexes do "
-                                     "not support TTL. Index spec: "
-                                  << indexObj};
+        auto status = index_key_validate::validateIndexSpecTTL(indexObj);
+        if (!status.isOK()) {
+            return status;
         }
     }
 
@@ -570,7 +529,7 @@ bool runCreateIndexesWithCoordinator(OperationContext* opCtx,
                          ns,
                          Top::LockType::WriteLocked,
                          AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
-                         CollectionCatalog::get(opCtx).getDatabaseProfileLevel(ns.db()));
+                         CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(ns.db()));
 
     auto buildUUID = UUID::gen();
     ReplIndexBuildState::IndexCatalogStats stats;

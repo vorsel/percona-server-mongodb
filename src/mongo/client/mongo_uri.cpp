@@ -456,12 +456,12 @@ MongoURI MongoURI::parseImpl(StringData url) {
     auto options =
         addTXTOptions(parseOptions(connectionOptions, url), canonicalHost, url, isSeedlist);
 
-    // If a replica set option was specified, store it in the 'setName' field.
+    // If a replica set option was specified, store it in the 'replicaSetName' field.
     auto optIter = options.find("replicaSet");
-    std::string setName;
+    std::string replicaSetName;
     if (optIter != end(options)) {
-        setName = optIter->second;
-        invariant(!setName.empty());
+        replicaSetName = optIter->second;
+        invariant(!replicaSetName.empty());
     }
 
     // If an appName option was specified, validate that is 128 bytes or less.
@@ -484,6 +484,20 @@ MongoURI MongoURI::parseImpl(StringData url) {
         }
     }
 
+    const auto helloOk = [&options]() -> boost::optional<bool> {
+        if (auto optIter = options.find("helloOk"); optIter != end(options)) {
+            if (auto value = optIter->second; value == "true") {
+                return true;
+            } else if (value == "false") {
+                return false;
+            } else {
+                uasserted(ErrorCodes::FailedToParse,
+                          "helloOk must be either \"true\" or \"false\"");
+            }
+        }
+        return boost::none;
+    }();
+
     transport::ConnectSSLMode sslMode = transport::kGlobalSSLMode;
     auto sslModeIter = std::find_if(options.begin(), options.end(), [](auto pred) {
         return pred.first == CaseInsensitiveString("ssl") ||
@@ -500,14 +514,16 @@ MongoURI MongoURI::parseImpl(StringData url) {
         }
     }
 
-    ConnectionString cs(
-        setName.empty() ? ConnectionString::MASTER : ConnectionString::SET, servers, setName);
+    auto cs = replicaSetName.empty()
+        ? ConnectionString::forStandalones(std::move(servers))
+        : ConnectionString::forReplicaSet(replicaSetName, std::move(servers));
     return MongoURI(std::move(cs),
                     username,
                     password,
                     database,
                     std::move(retryWrites),
                     sslMode,
+                    helloOk,
                     std::move(options));
 }
 

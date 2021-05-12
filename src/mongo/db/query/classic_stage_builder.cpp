@@ -45,6 +45,7 @@
 #include "mongo/db/exec/count_scan.h"
 #include "mongo/db/exec/distinct_scan.h"
 #include "mongo/db/exec/ensure_sorted.h"
+#include "mongo/db/exec/eof.h"
 #include "mongo/db/exec/fetch.h"
 #include "mongo/db/exec/geo_near.h"
 #include "mongo/db/exec/index_scan.h"
@@ -52,6 +53,7 @@
 #include "mongo/db/exec/merge_sort.h"
 #include "mongo/db/exec/or.h"
 #include "mongo/db/exec/projection.h"
+#include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/return_key.h"
 #include "mongo/db/exec/shard_filter.h"
 #include "mongo/db/exec/skip.h"
@@ -127,7 +129,7 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
                 _ws,
                 SortPattern{snDefault->pattern, _cq.getExpCtx()},
                 snDefault->limit,
-                internalQueryMaxBlockingSortMemoryUsageBytes.load(),
+                snDefault->maxMemoryUsageBytes,
                 snDefault->addSortKeyMetadata,
                 std::move(childStage));
         }
@@ -139,7 +141,7 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
                 _ws,
                 SortPattern{snSimple->pattern, _cq.getExpCtx()},
                 snSimple->limit,
-                internalQueryMaxBlockingSortMemoryUsageBytes.load(),
+                snSimple->maxMemoryUsageBytes,
                 snSimple->addSortKeyMetadata,
                 std::move(childStage));
         }
@@ -350,10 +352,35 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
             return std::make_unique<EnsureSortedStage>(
                 expCtx, esn->pattern, _ws, std::move(childStage));
         }
+        case STAGE_EOF: {
+            return std::make_unique<EOFStage>(expCtx);
+        }
+        case STAGE_VIRTUAL_SCAN: {
+            const auto* vsn = static_cast<const VirtualScanNode*>(root);
+            invariant(vsn->hasRecordId);
+
+            auto qds = std::make_unique<QueuedDataStage>(expCtx, _ws);
+            for (auto&& arr : vsn->docs) {
+                // The VirtualScanNode should only have a single element that carrys the document
+                // as the QueuedDataStage cannot handle a recordId properly.
+                BSONObjIterator arrIt{arr};
+                invariant(arrIt.more());
+                auto firstElt = arrIt.next();
+                invariant(firstElt.type() == BSONType::Object);
+                invariant(!arrIt.more());
+
+                // Only add the first element to the working set.
+                auto wsID = _ws->allocate();
+                qds->pushBack(wsID);
+                auto* member = _ws->get(wsID);
+                member->keyData.clear();
+                member->doc = {{}, Document{firstElt.embeddedObject()}};
+            }
+            return qds;
+        }
         case STAGE_CACHED_PLAN:
         case STAGE_COUNT:
         case STAGE_DELETE:
-        case STAGE_EOF:
         case STAGE_IDHACK:
         case STAGE_MOCK:
         case STAGE_MULTI_ITERATOR:

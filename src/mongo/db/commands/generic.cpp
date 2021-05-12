@@ -52,14 +52,8 @@ using std::string;
 using std::stringstream;
 using std::vector;
 
-class PingCommand : public BasicCommand {
+class PingCommand : public PingCmdVersion1Gen<PingCommand> {
 public:
-    PingCommand() : BasicCommand("ping") {}
-
-    const std::set<std::string>& apiVersions() const {
-        return kApiVersions1;
-    }
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
@@ -67,25 +61,30 @@ public:
         return "a way to check that the server is alive. responds immediately even if server is "
                "in a db lock.";
     }
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
-        return false;
-    }
-    virtual bool allowsAfterClusterTime(const BSONObj& cmdObj) const override {
-        return false;
-    }
     virtual void addRequiredPrivileges(const std::string& dbname,
                                        const BSONObj& cmdObj,
                                        std::vector<Privilege>* out) const {}  // No auth required
     virtual bool requiresAuth() const override {
         return false;
     }
-    virtual bool run(OperationContext* opCtx,
-                     const string& badns,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        // IMPORTANT: Don't put anything in here that might lock db - including authentication
-        return true;
-    }
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
+        virtual bool supportsWriteConcern() const override {
+            return false;
+        }
+        virtual bool allowsAfterClusterTime() const override {
+            return false;
+        }
+        NamespaceString ns() const override {
+            return NamespaceString(request().getDbName());
+        }
+        void doCheckAuthorization(OperationContext* opCtx) const override {}
+        virtual Reply typedRun(OperationContext* opCtx) override {
+            // IMPORTANT: Don't put anything in here that might lock db - including authentication
+            return Reply{};
+        }
+    };
 } pingCmd;
 
 class EchoCommand final : public TypedCommand<EchoCommand> {

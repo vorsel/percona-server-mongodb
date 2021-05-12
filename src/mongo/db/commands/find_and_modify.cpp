@@ -127,8 +127,8 @@ void makeUpdateRequest(OperationContext* opCtx,
     requestOut->setProj(args.getFields());
     invariant(args.getUpdate());
     requestOut->setUpdateModification(*args.getUpdate());
-    requestOut->setRuntimeConstants(
-        args.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
+    requestOut->setLegacyRuntimeConstants(
+        args.getLegacyRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
     requestOut->setLetParameters(args.getLetParameters());
     requestOut->setSort(args.getSort());
     requestOut->setHint(args.getHint());
@@ -151,8 +151,8 @@ void makeDeleteRequest(OperationContext* opCtx,
                        DeleteRequest* requestOut) {
     requestOut->setQuery(args.getQuery());
     requestOut->setProj(args.getFields());
-    requestOut->setRuntimeConstants(
-        args.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
+    requestOut->setLegacyRuntimeConstants(
+        args.getLegacyRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx)));
     requestOut->setLet(args.getLetParameters());
     requestOut->setSort(args.getSort());
     requestOut->setHint(args.getHint());
@@ -299,7 +299,7 @@ public:
 
             auto bodyBuilder = result->getBodyBuilder();
             Explain::explainStages(
-                exec.get(), collection.getCollection(), verbosity, BSONObj(), &bodyBuilder);
+                exec.get(), collection.getCollection(), verbosity, BSONObj(), cmdObj, &bodyBuilder);
         } else {
             auto request = UpdateRequest();
             request.setNamespaceString(nsString);
@@ -323,7 +323,7 @@ public:
 
             auto bodyBuilder = result->getBodyBuilder();
             Explain::explainStages(
-                exec.get(), collection.getCollection(), verbosity, BSONObj(), &bodyBuilder);
+                exec.get(), collection.getCollection(), verbosity, BSONObj(), cmdObj, &bodyBuilder);
         }
 
         return Status::OK();
@@ -473,7 +473,7 @@ public:
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             CurOp::get(opCtx)->enter_inlock(
                 nsString.ns().c_str(),
-                CollectionCatalog::get(opCtx).getDatabaseProfileLevel(nsString.db()));
+                CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nsString.db()));
         }
 
         assertCanWrite(opCtx, nsString);
@@ -532,7 +532,7 @@ public:
             stdx::lock_guard<Client> lk(*opCtx->getClient());
             CurOp::get(opCtx)->enter_inlock(
                 nsString.ns().c_str(),
-                CollectionCatalog::get(opCtx).getDatabaseProfileLevel(nsString.db()));
+                CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(nsString.db()));
         }
 
         assertCanWrite(opCtx, nsString);
@@ -547,7 +547,7 @@ public:
             assertCanWrite(opCtx, nsString);
 
             createdCollection =
-                CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nsString);
+                CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nsString);
 
             // If someone else beat us to creating the collection, do nothing
             if (!createdCollection) {
@@ -558,7 +558,7 @@ public:
                 wuow.commit();
 
                 createdCollection =
-                    CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nsString);
+                    CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nsString);
             }
 
             invariant(createdCollection);

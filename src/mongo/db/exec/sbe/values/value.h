@@ -35,6 +35,7 @@
 #include <bitset>
 #include <cstdint>
 #include <ostream>
+#include <pcre.h>
 #include <string>
 #include <utility>
 #include <vector>
@@ -42,14 +43,11 @@
 #include "mongo/base/data_type_endian.h"
 #include "mongo/base/data_view.h"
 #include "mongo/bson/ordering.h"
+#include "mongo/db/exec/shard_filterer.h"
 #include "mongo/db/query/bson_typemask.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/represent_as.h"
-
-namespace pcrecpp {
-class RE;
-}  // namespace pcrecpp
 
 namespace mongo {
 /**
@@ -60,6 +58,8 @@ class Value;
 }
 
 class TimeZoneDatabase;
+
+class JsFunction;
 
 namespace sbe {
 using FrameId = int64_t;
@@ -99,6 +99,7 @@ enum class TypeTags : uint8_t {
     Object,
 
     ObjectId,
+    RecordId,
 
     // TODO add the rest of mongo types (regex, etc.)
 
@@ -117,6 +118,12 @@ enum class TypeTags : uint8_t {
 
     // Pointer to a timezone database object.
     timeZoneDB,
+
+    // Pointer to a compiled JS function with scope.
+    jsFunction,
+
+    // Pointer to a ShardFilterer for shard filtering.
+    shardFilterer,
 };
 
 inline constexpr bool isNumber(TypeTags tag) noexcept {
@@ -143,6 +150,14 @@ inline constexpr bool isObjectId(TypeTags tag) noexcept {
 
 inline constexpr bool isBinData(TypeTags tag) noexcept {
     return tag == TypeTags::bsonBinData;
+}
+
+inline constexpr bool isRecordId(TypeTags tag) noexcept {
+    return tag == TypeTags::RecordId;
+}
+
+inline constexpr bool isPcreRegex(TypeTags tag) noexcept {
+    return tag == TypeTags::pcreRegex;
 }
 
 BSONType tagToType(TypeTags tag) noexcept;
@@ -308,6 +323,35 @@ T bitcastTo(const Value in) noexcept {
 }
 
 /**
+ * Defines hash value for <TypeTags, Value> pair. To be used in associative containers.
+ */
+struct ValueHash {
+    size_t operator()(const std::pair<TypeTags, Value>& p) const {
+        return hashValue(p.first, p.second);
+    }
+};
+
+/**
+ * Defines equivalence of two <TypeTags, Value> pairs. To be used in associative containers.
+ */
+struct ValueEq {
+    bool operator()(const std::pair<TypeTags, Value>& lhs,
+                    const std::pair<TypeTags, Value>& rhs) const {
+        auto [tag, val] = compareValue(lhs.first, lhs.second, rhs.first, rhs.second);
+
+        if (tag != TypeTags::NumberInt32 || bitcastTo<int32_t>(val) != 0) {
+            return false;
+        } else {
+            return true;
+        }
+    }
+};
+
+template <typename T>
+using ValueMapType = absl::flat_hash_map<std::pair<TypeTags, Value>, T, ValueHash, ValueEq>;
+using ValueSetType = absl::flat_hash_set<std::pair<TypeTags, Value>, ValueHash, ValueEq>;
+
+/**
  * This is the SBE representation of objects/documents. It is a relatively simple structure of
  * vectors of field names, type tags, and values.
  */
@@ -451,27 +495,8 @@ private:
  * This is a set of unique values with the same interface as Array.
  */
 class ArraySet {
-    struct Hash {
-        size_t operator()(const std::pair<TypeTags, Value>& p) const {
-            return hashValue(p.first, p.second);
-        }
-    };
-    struct Eq {
-        bool operator()(const std::pair<TypeTags, Value>& lhs,
-                        const std::pair<TypeTags, Value>& rhs) const {
-            auto [tag, val] = compareValue(lhs.first, lhs.second, rhs.first, rhs.second);
-
-            if (tag != TypeTags::NumberInt32 || bitcastTo<int32_t>(val) != 0) {
-                return false;
-            } else {
-                return true;
-            }
-        }
-    };
-    using SetType = absl::flat_hash_set<std::pair<TypeTags, Value>, Hash, Eq>;
-
 public:
-    using iterator = SetType::iterator;
+    using iterator = ValueSetType::iterator;
 
     ArraySet() = default;
     ArraySet(const ArraySet& other) {
@@ -506,7 +531,82 @@ public:
     }
 
 private:
-    SetType _values;
+    ValueSetType _values;
+};
+
+/**
+ * Implements a wrapper of PCRE regular expression.
+ * Storing the pattern and the options allows for copying of the sbe::value::PcreRegex expression,
+ * which includes recompilation.
+ * The compiled expression pcre* allows for direct usage of the pcre C library functionality.
+ */
+class PcreRegex {
+public:
+    PcreRegex() = default;
+
+    PcreRegex(std::string_view pattern, std::string_view options)
+        : _pattern(pattern), _options(options), _pcrePtr(nullptr) {
+        _compile();
+    }
+
+    PcreRegex(std::string_view pattern) : PcreRegex(pattern, "") {}
+
+    PcreRegex(const PcreRegex& other) : PcreRegex(other._pattern, other._options) {}
+
+    PcreRegex& operator=(const PcreRegex& other) {
+        if (this != &other) {
+            if (_pcrePtr != nullptr) {
+                (*pcre_free)(_pcrePtr);
+            }
+            _pattern = other._pattern;
+            _options = other._options;
+            _isValid = false;
+            _compile();
+        }
+        return *this;
+    }
+
+    ~PcreRegex() {
+        if (_pcrePtr != nullptr) {
+            (*pcre_free)(_pcrePtr);
+        }
+    }
+
+    bool isValid() const {
+        return _isValid;
+    }
+
+    const std::string& pattern() const {
+        return _pattern;
+    }
+
+    const std::string& options() const {
+        return _options;
+    }
+
+    /**
+     * Wrapper function for pcre_exec().
+     * - input: The input string.
+     * - startPos: The position from where the search should start.
+     * - buf: Array populated with the found matched string and capture groups.
+     * Returns the number of matches or an error code:
+     *         < -1 error
+     *         = -1 no match
+     *         = 0  there was a match, but not enough space in the buffer
+     *         > 0  the number of matches
+     */
+    int execute(std::string_view input, int startPos, std::vector<int>& buf);
+
+    size_t getNumberCaptures() const;
+
+private:
+    void _compile();
+
+    std::string _pattern;
+    std::string _options;
+
+    pcre* _pcrePtr;
+    bool _isValid = false;
 };
 
 constexpr size_t kSmallStringThreshold = 8;
@@ -674,17 +774,31 @@ inline KeyString::Value* getKeyStringView(Value val) noexcept {
     return reinterpret_cast<KeyString::Value*>(val);
 }
 
-inline pcrecpp::RE* getPcreRegexView(Value val) noexcept {
-    return reinterpret_cast<pcrecpp::RE*>(val);
+std::pair<TypeTags, Value> makeNewPcreRegex(std::string_view pattern, std::string_view options);
+
+std::pair<TypeTags, Value> makeCopyPcreRegex(const PcreRegex& regex);
+
+inline PcreRegex* getPcreRegexView(Value val) noexcept {
+    return reinterpret_cast<PcreRegex*>(val);
+}
+
+inline JsFunction* getJsFunctionView(Value val) noexcept {
+    return reinterpret_cast<JsFunction*>(val);
 }
 
 inline TimeZoneDatabase* getTimeZoneDBView(Value val) noexcept {
     return reinterpret_cast<TimeZoneDatabase*>(val);
 }
 
+inline ShardFilterer* getShardFiltererView(Value val) noexcept {
+    return reinterpret_cast<ShardFilterer*>(val);
+}
+
 std::pair<TypeTags, Value> makeCopyKeyString(const KeyString::Value& inKey);
 
-std::pair<TypeTags, Value> makeCopyPcreRegex(const pcrecpp::RE&);
+std::pair<TypeTags, Value> makeCopyJsFunction(const JsFunction&);
+
+std::pair<TypeTags, Value> makeCopyShardFilterer(const ShardFilterer&);
 
 void releaseValue(TypeTags tag, Value val) noexcept;
 
@@ -747,6 +861,10 @@ inline std::pair<TypeTags, Value> copyValue(TypeTags tag, Value val) {
             return makeCopyKeyString(*getKeyStringView(val));
         case TypeTags::pcreRegex:
             return makeCopyPcreRegex(*getPcreRegexView(val));
+        case TypeTags::jsFunction:
+            return makeCopyJsFunction(*getJsFunctionView(val));
+        case TypeTags::shardFilterer:
+            return makeCopyShardFilterer(*getShardFiltererView(val));
         default:
             break;
     }
@@ -951,6 +1069,12 @@ private:
     const char* _arrayCurrent{nullptr};
     const char* _arrayEnd{nullptr};
 };
+
+/**
+ * Copies the content of the input array into an ArraySet. If the input has duplicate elements, they
+ * will be removed.
+ */
+std::pair<TypeTags, Value> arrayToSet(TypeTags tag, Value val);
 
 }  // namespace value
 }  // namespace sbe

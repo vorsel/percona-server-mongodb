@@ -34,7 +34,9 @@
 #include "mongo/db/repl/oplog_entry_or_grouped_inserts.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
+#include "mongo/db/s/resharding/resharding_oplog_application.h"
 #include "mongo/db/s/resharding/resharding_oplog_applier_progress_gen.h"
+#include "mongo/s/chunk_manager.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
@@ -51,13 +53,14 @@ class ThreadPool;
 class ReshardingOplogApplier {
 public:
     ReshardingOplogApplier(ServiceContext* service,
-                           ReshardingOplogSourceId sourceId,
+                           ReshardingSourceId sourceId,
                            NamespaceString oplogNs,
                            NamespaceString nsBeingResharded,
                            UUID collUUIDBeingResharded,
                            Timestamp reshardingCloneFinishedTs,
                            std::unique_ptr<ReshardingDonorOplogIteratorInterface> oplogIterator,
                            size_t batchSize,
+                           const ChunkManager& sourceChunkMgr,
                            OutOfLineExecutor* executor,
                            ThreadPool* writerPool);
 
@@ -78,12 +81,18 @@ public:
     Future<void> applyUntilDone();
 
     static boost::optional<ReshardingOplogApplierProgress> checkStoredProgress(
-        OperationContext* opCtx, const ReshardingOplogSourceId& id);
+        OperationContext* opCtx, const ReshardingSourceId& id);
 
 private:
     using OplogBatch = std::vector<repl::OplogEntry>;
 
     enum class Stage { kStarted, kErrorOccurred, kReachedCloningTS, kFinished };
+
+    struct RetryableOpsList {
+    public:
+        TxnNumber txnNum{kUninitializedTxnNumber};
+        std::vector<repl::OplogEntry*> ops;
+    };
 
     /**
      * Schedule to collect and apply the next batch of oplog entries.
@@ -99,10 +108,9 @@ private:
     /**
      * Partition the currently buffered oplog entries so they can be applied in parallel.
      */
-    std::vector<std::vector<const repl::OplogEntry*>> _fillWriterVectors(
-        OperationContext* opCtx,
-        OplogBatch* batch,
-        std::vector<std::vector<repl::OplogEntry>>* derivedOps);
+    std::vector<std::vector<const repl::OplogEntry*>> _fillWriterVectors(OperationContext* opCtx,
+                                                                         OplogBatch* batch,
+                                                                         OplogBatch* derivedOps);
 
     /**
      * Apply a slice of oplog entries from the current batch for a worker thread.
@@ -144,7 +152,7 @@ private:
     static constexpr auto kClientName = "ReshardingOplogApplier"_sd;
 
     // Identifier for the oplog source.
-    const ReshardingOplogSourceId _sourceId;
+    const ReshardingSourceId _sourceId;
 
     // Namespace that contains the oplog from a source shard that this is going to apply.
     const NamespaceString _oplogNs;
@@ -169,6 +177,10 @@ private:
     // before deciding to apply all oplog entries currently in the buffer.
     const size_t _batchSize;
 
+    // Actually applies the ops, using special rules that apply only to resharding. Only used when
+    // the 'useReshardingOplogApplicationRules' server parameter is set to true.
+    ReshardingOplogApplicationRules _applicationRules;
+
     Mutex _mutex = MONGO_MAKE_LATCH("ReshardingOplogApplier::_mutex");
 
     // Member variable concurrency access rules:
@@ -190,6 +202,9 @@ private:
     // (R) Buffer for the current batch of oplog entries to apply.
     OplogBatch _currentBatchToApply;
 
+    // (R) Buffer for internally generated oplog entries that needs to be processed for this batch.
+    OplogBatch _currentDerivedOps;
+
     // (R) A temporary scratch pad that contains pointers to oplog entries in _currentBatchToApply
     // that is used by the writer vector when applying oplog in parallel.
     std::vector<std::vector<const repl::OplogEntry*>> _currentWriterVectors;
@@ -201,7 +216,7 @@ private:
     int _remainingWritersToWait{0};
 
     // (M) Keeps track of the status from writer vectors. Will only keep one error if there are
-    // mulitple occurrances.
+    // multiple occurrances.
     Status _currentBatchConsolidatedStatus{Status::OK()};
 
     // (R) The source of the oplog entries to be applied.

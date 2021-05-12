@@ -45,7 +45,7 @@
 #include "mongo/logv2/log.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/write_ops/chunk_manager_targeter.h"
@@ -331,7 +331,7 @@ bool isMetadataDifferent(const ChunkManager& managerA,
         return managerA.getVersion() != managerB.getVersion();
     }
 
-    return !databaseVersion::equal(dbVersionA, dbVersionB);
+    return dbVersionA != dbVersionB;
 }
 
 }  // namespace
@@ -415,7 +415,7 @@ std::vector<ShardEndpoint> ChunkManagerTargeter::targetUpdate(OperationContext* 
                                                                collation,
                                                                boost::none,  // explain
                                                                itemRef.getLet(),
-                                                               itemRef.getRuntimeConstants());
+                                                               itemRef.getLegacyRuntimeConstants());
 
     const auto updateExpr =
         getUpdateExprForTargeting(expCtx, shardKeyPattern, updateType, updateOp);
@@ -456,15 +456,14 @@ std::vector<ShardEndpoint> ChunkManagerTargeter::targetUpdate(OperationContext* 
 
     // If we are here then this is an op-style update and we were not able to target a single shard.
     // Non-multi updates must target a single shard or an exact _id.
-    uassert(
-        ErrorCodes::InvalidOptions,
-        str::stream() << "A {multi:false} update on a sharded collection must either contain an "
-                         "exact match on _id or must target a single shard, but this update "
-                         "targeted _id (and have the collection default collation) or must target "
-                         "a single shard (and have the simple collation), but this update targeted "
-                      << endPoints.size() << " shards. Update request: " << updateOp.toBSON()
-                      << ", shard key pattern: " << shardKeyPattern.toString(),
-        updateOp.getMulti() || isExactIdQuery(opCtx, _nss, query, collation, *_cm));
+    uassert(ErrorCodes::InvalidOptions,
+            str::stream()
+                << "A {multi:false} update on a sharded collection must contain an "
+                   "exact match on _id (and have the collection default collation) or target a "
+                   "single shard (and have the simple collation), but this update targeted "
+                << endPoints.size() << " shards. Update request: " << updateOp.toBSON()
+                << ", shard key pattern: " << shardKeyPattern.toString(),
+            updateOp.getMulti() || isExactIdQuery(opCtx, _nss, query, collation, *_cm));
 
     // If the request is {multi:false}, then this is a single op-style update which we are
     // broadcasting to multiple shards by exact _id. Record this event in our serverStatus metrics.
@@ -485,7 +484,7 @@ std::vector<ShardEndpoint> ChunkManagerTargeter::targetDelete(OperationContext* 
                                                                collation,
                                                                boost::none,  // explain
                                                                itemRef.getLet(),
-                                                               itemRef.getRuntimeConstants());
+                                                               itemRef.getLegacyRuntimeConstants());
 
     BSONObj shardKey;
     if (_cm->isSharded()) {
@@ -630,8 +629,7 @@ void ChunkManagerTargeter::noteStaleDbResponse(const ShardEndpoint& endpoint,
     DatabaseVersion remoteDbVersion;
     if (!staleInfo.getVersionWanted()) {
         // If the vWanted is not set, assume the wanted version is higher than our current version.
-        remoteDbVersion = _cm->dbVersion();
-        remoteDbVersion = databaseVersion::makeIncremented(remoteDbVersion);
+        remoteDbVersion = _cm->dbVersion().makeUpdated();
     } else {
         remoteDbVersion = *staleInfo.getVersionWanted();
     }
@@ -647,7 +645,7 @@ void ChunkManagerTargeter::noteStaleDbResponse(const ShardEndpoint& endpoint,
         uassert(
             ErrorCodes::InternalError,
             "Did not expect to get multiple StaleDbVersion errors with different vWanted versions",
-            databaseVersion::equal(*_remoteDbVersion, remoteDbVersion));
+            *_remoteDbVersion == remoteDbVersion);
         return;
     }
     _remoteDbVersion = remoteDbVersion;

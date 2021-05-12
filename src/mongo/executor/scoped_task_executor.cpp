@@ -68,7 +68,7 @@ public:
                 // We are guaranteed that no more callbacks can be added to _cbHandles after
                 // _inShutdown is set to true. If there aren't any callbacks outstanding, then it is
                 // shutdown()'s responsibility to make the futures returned by joinAll() ready.
-                _promise.setWith([] {});
+                _promise.emplaceValue();
             }
             _inShutdown = true;
 
@@ -93,6 +93,11 @@ public:
 
     SharedSemiFuture<void> joinAsync() override {
         return _promise.getFuture();
+    }
+
+    bool isShuttingDown() const override {
+        stdx::lock_guard lk(_mutex);
+        return _inShutdown;
     }
 
     void appendDiagnosticBSON(BSONObjBuilder* b) const override {
@@ -336,11 +341,11 @@ private:
             // We are guaranteed that no more callbacks can be added to _cbHandles after _inShutdown
             // is set to true. If there are no more callbacks outstanding, then it is the last
             // callback's responsibility to make the futures returned by joinAll() ready.
-            _promise.setWith([] {});
+            _promise.emplaceValue();
         }
     }
 
-    Mutex _mutex = MONGO_MAKE_LATCH("ScopedTaskExecutor::_mutex");
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("ScopedTaskExecutor::_mutex");
     bool _inShutdown = false;
     std::shared_ptr<TaskExecutor> _executor;
     Status _shutdownStatus;

@@ -188,6 +188,12 @@ executor::RemoteCommandResponse initWireVersion(
     BSONObjBuilder bob;
     bob.append("isMaster", 1);
 
+    if (uri.isHelloOk()) {
+        // Attach "helloOk: true" to the initial handshake to indicate that the client supports the
+        // hello command.
+        bob.append("helloOk", true);
+    }
+
     *speculativeAuthType = auth::speculateAuth(&bob, uri, saslClientSession);
     if (!uri.getUser().empty()) {
         UserName user(uri.getUser(), uri.getAuthenticationDatabase());
@@ -450,7 +456,7 @@ std::pair<rpc::UniqueReply, DBClientBase*> DBClientConnection::runCommandWithTar
     if (!_parentReplSetName.empty()) {
         const auto replyBody = out.first->getCommandReply();
         if (!isOk(replyBody)) {
-            handleNotMasterResponse(replyBody, "errmsg");
+            handleNotPrimaryResponse(replyBody, "errmsg");
         }
     }
 
@@ -463,7 +469,7 @@ std::pair<rpc::UniqueReply, std::shared_ptr<DBClientBase>> DBClientConnection::r
     if (!_parentReplSetName.empty()) {
         const auto replyBody = out.first->getCommandReply();
         if (!isOk(replyBody)) {
-            handleNotMasterResponse(replyBody, "errmsg");
+            handleNotPrimaryResponse(replyBody, "errmsg");
         }
     }
 
@@ -643,7 +649,8 @@ unsigned long long DBClientConnection::query(std::function<void(DBClientCursorBa
     }
 
     // mask options
-    queryOptions &= (int)(QueryOption_NoCursorTimeout | QueryOption_SlaveOk | QueryOption_Exhaust);
+    queryOptions &=
+        (int)(QueryOption_NoCursorTimeout | QueryOption_SecondaryOk | QueryOption_Exhaust);
 
     unique_ptr<DBClientCursor> c(this->query(
         nsOrUuid, query, 0, 0, fieldsToReturn, queryOptions, batchSize, readConcernObj));
@@ -798,7 +805,7 @@ void DBClientConnection::checkResponse(const std::vector<BSONObj>& batch,
     *host = _serverAddress.toString();
 
     if (!_parentReplSetName.empty() && !batch.empty()) {
-        handleNotMasterResponse(batch[0], "$err");
+        handleNotPrimaryResponse(batch[0], "$err");
     }
 }
 
@@ -806,12 +813,12 @@ void DBClientConnection::setParentReplSetName(const string& replSetName) {
     _parentReplSetName = replSetName;
 }
 
-void DBClientConnection::handleNotMasterResponse(const BSONObj& replyBody,
-                                                 StringData errorMsgFieldName) {
+void DBClientConnection::handleNotPrimaryResponse(const BSONObj& replyBody,
+                                                  StringData errorMsgFieldName) {
     const BSONElement errorMsgElem = replyBody[errorMsgFieldName];
     const BSONElement codeElem = replyBody["code"];
 
-    if (!isNotMasterErrorString(errorMsgElem) &&
+    if (!isNotPrimaryErrorString(errorMsgElem) &&
         !ErrorCodes::isNotPrimaryError(ErrorCodes::Error(codeElem.numberInt()))) {
         return;
     }
@@ -820,7 +827,7 @@ void DBClientConnection::handleNotMasterResponse(const BSONObj& replyBody,
     if (monitor) {
         monitor->failedHost(_serverAddress,
                             {ErrorCodes::NotWritablePrimary,
-                             str::stream() << "got not master from: " << _serverAddress
+                             str::stream() << "got not primary from: " << _serverAddress
                                            << " of repl set: " << _parentReplSetName});
     }
 

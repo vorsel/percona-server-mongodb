@@ -56,11 +56,10 @@ void persistInitialStateAndCatalogUpdates(OperationContext* opCtx,
 void persistCommittedState(OperationContext* opCtx,
                            const ReshardingCoordinatorDocument& coordinatorDoc,
                            OID newCollectionEpoch,
-                           boost::optional<int> expectedNumChunksModified,
-                           boost::optional<int> expectedNumZonesModified);
+                           boost::optional<Timestamp> newCollectionTimestamp);
 
-void persistStateTransition(OperationContext* opCtx,
-                            const ReshardingCoordinatorDocument& coordinatorDoc);
+void persistStateTransitionAndCatalogUpdatesThenBumpShardVersions(
+    OperationContext* opCtx, const ReshardingCoordinatorDocument& coordinatorDoc);
 
 void removeCoordinatorDocAndReshardingFields(OperationContext* opCtx,
                                              const ReshardingCoordinatorDocument& coordinatorDoc);
@@ -101,7 +100,8 @@ public:
     explicit ReshardingCoordinator(const BSONObj& state);
     ~ReshardingCoordinator();
 
-    void run(std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept override;
+    SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                         const CancelationToken& token) noexcept override;
 
     void interrupt(Status status) override;
 
@@ -154,9 +154,16 @@ private:
 
     /**
      * Waits on _reshardingCoordinatorObserver to notify that all recipients have finished
-     * cloning. Transitions to 'kMirroring'.
+     * cloning. Transitions to 'kApplying'.
      */
     ExecutorFuture<void> _awaitAllRecipientsFinishedCloning(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+
+    /**
+     * Waits on _reshardingCoordinatorObserver to notify that all recipients have finished
+     * applying oplog entries. Transitions to 'kMirroring'.
+     */
+    ExecutorFuture<void> _awaitAllRecipientsFinishedApplying(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
     /**
@@ -177,38 +184,47 @@ private:
     Future<void> _commit(const ReshardingCoordinatorDocument& updatedDoc);
 
     /**
-     * Waits on _reshardingCoordinatorObserver to notify that all recipients have renamed the
-     * temporary collection to the original collection namespace. Transitions to 'kDropping'.
+     * Waits on _reshardingCoordinatorObserver to notify that:
+     * 1. All recipient shards have renamed the temporary collection to the original collection
+     *    namespace, and
+     * 2. All donor shards that were not also recipient shards have dropped the original
+     *    collection.
+     *
+     * Transitions to 'kDone'.
      */
-    ExecutorFuture<void> _awaitAllRecipientsRenamedCollection(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
-
-    /**
-     * Waits on _reshardingCoordinatorObserver to notify that all donors have dropped the
-     * original collection. Transitions to 'kDone'.
-     */
-    ExecutorFuture<void> _awaitAllDonorsDroppedOriginalCollection(
+    ExecutorFuture<void> _awaitAllParticipantShardsRenamedOrDroppedOriginalCollection(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
     /**
      * Updates the entry for this resharding operation in config.reshardingOperations and the
      * catalog entries for the original and temporary namespaces in config.collections.
      */
-    void _runUpdates(CoordinatorStateEnum nextState,
-                     ReshardingCoordinatorDocument updatedStateDoc,
-                     boost::optional<Timestamp> fetchTimestamp = boost::none);
+    void _updateCoordinatorDocStateAndCatalogEntries(
+        CoordinatorStateEnum nextState,
+        ReshardingCoordinatorDocument coordinatorDoc,
+        boost::optional<Timestamp> fetchTimestamp = boost::none);
 
     /**
-     * Sends 'flushRoutingTableCacheUpdatesWithWriteConcern' for the temporary namespace to all
-     * recipient shards.
+     * Sends 'flushRoutingTableCacheUpdatesWithWriteConcern' to all recipient shards.
+     *
+     * When the coordinator is in a state before 'kCommitting', refreshes the temporary namespace.
+     * When the coordinator is in a state at or after 'kCommitting', refreshes the original
+     * namespace.
      */
     void _tellAllRecipientsToRefresh(const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
     /**
-     * Sends 'flushRoutingTableCacheUpdatesWithWriteConcern' for the original namespace to all donor
-     * shards.
+     * Sends 'flushRoutingTableCacheUpdatesWithWriteConcern' for the original namespace to all
+     * donor shards.
      */
     void _tellAllDonorsToRefresh(const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+
+    /**
+     * Sends 'flushRoutingTableCacheUpdatesWithWriteConcern' for the original namespace to all
+     * participant shards.
+     */
+    void _tellAllParticipantsToRefresh(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
     // The unique key for a given resharding operation. InstanceID is an alias for BSONObj. The
     // value of this is the UUID that will be used as the collection UUID for the new sharded

@@ -67,11 +67,13 @@ StatusWith<SessionHandle> TransportLayerManager::connect(HostAndPort peer,
     return _tls.front()->connect(peer, sslMode, timeout);
 }
 
-Future<SessionHandle> TransportLayerManager::asyncConnect(HostAndPort peer,
-                                                          ConnectSSLMode sslMode,
-                                                          const ReactorHandle& reactor,
-                                                          Milliseconds timeout) {
-    return _tls.front()->asyncConnect(peer, sslMode, reactor, timeout);
+Future<SessionHandle> TransportLayerManager::asyncConnect(
+    HostAndPort peer,
+    ConnectSSLMode sslMode,
+    const ReactorHandle& reactor,
+    Milliseconds timeout,
+    std::shared_ptr<const SSLConnectionContext> transientSSLContext) {
+    return _tls.front()->asyncConnect(peer, sslMode, reactor, timeout, transientSSLContext);
 }
 
 ReactorHandle TransportLayerManager::getReactor(WhichReactor which) {
@@ -136,8 +138,6 @@ std::unique_ptr<TransportLayer> TransportLayerManager::createWithConfig(
     transport::TransportLayerASIO::Options opts(config);
     opts.transportMode = transport::Mode::kSynchronous;
 
-    ctx->setServiceExecutor(std::make_unique<ServiceExecutorSynchronous>(ctx));
-
     std::vector<std::unique_ptr<TransportLayer>> retVector;
     retVector.emplace_back(std::make_unique<transport::TransportLayerASIO>(opts, sep));
     return std::make_unique<TransportLayerManager>(std::move(retVector));
@@ -154,6 +154,23 @@ Status TransportLayerManager::rotateCertificates(std::shared_ptr<SSLManagerInter
     }
     return Status::OK();
 }
+
+StatusWith<std::shared_ptr<const transport::SSLConnectionContext>>
+TransportLayerManager::createTransientSSLContext(const TransientSSLParams& transientSSLParams,
+                                                 const SSLManagerInterface* optionalManager) {
+
+    Status firstError(ErrorCodes::InvalidSSLConfiguration,
+                      "Failure creating transient SSL context");
+    for (auto&& tl : _tls) {
+        auto statusOrContext = tl->createTransientSSLContext(transientSSLParams, optionalManager);
+        if (statusOrContext.isOK()) {
+            return std::move(statusOrContext.getValue());
+        }
+        firstError = statusOrContext.getStatus();
+    }
+    return firstError;
+}
+
 #endif
 
 }  // namespace transport

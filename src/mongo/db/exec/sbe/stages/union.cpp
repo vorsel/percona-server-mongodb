@@ -145,10 +145,22 @@ void UnionStage::close() {
     }
 }
 
-std::unique_ptr<PlanStageStats> UnionStage::getStats() const {
+std::unique_ptr<PlanStageStats> UnionStage::getStats(bool includeDebugInfo) const {
     auto ret = std::make_unique<PlanStageStats>(_commonStats);
+
+    if (includeDebugInfo) {
+        BSONObjBuilder bob;
+        BSONArrayBuilder childrenBob(bob.subarrayStart("inputSlots"));
+        for (auto&& slots : _inputVals) {
+            childrenBob.append(slots);
+        }
+        childrenBob.doneFast();
+        bob.append("outputSlots", _outputVals);
+        ret->debugInfo = bob.obj();
+    }
+
     for (auto&& child : _children) {
-        ret->children.emplace_back(child->getStats());
+        ret->children.emplace_back(child->getStats(includeDebugInfo));
     }
     return ret;
 }
@@ -169,6 +181,7 @@ std::vector<DebugPrinter::Block> UnionStage::debugPrint() const {
     }
     ret.emplace_back(DebugPrinter::Block("`]"));
 
+    ret.emplace_back(DebugPrinter::Block("[`"));
     ret.emplace_back(DebugPrinter::Block::cmdIncIndent);
     for (size_t childNum = 0; childNum < _children.size(); childNum++) {
         ret.emplace_back(DebugPrinter::Block("[`"));
@@ -183,10 +196,12 @@ std::vector<DebugPrinter::Block> UnionStage::debugPrint() const {
         DebugPrinter::addBlocks(ret, _children[childNum]->debugPrint());
 
         if (childNum + 1 < _children.size()) {
+            ret.emplace_back(DebugPrinter::Block(","));
             DebugPrinter::addNewLine(ret);
         }
     }
     ret.emplace_back(DebugPrinter::Block::cmdDecIndent);
+    ret.emplace_back(DebugPrinter::Block("`]"));
 
     return ret;
 }

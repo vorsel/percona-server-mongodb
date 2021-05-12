@@ -39,9 +39,11 @@
 #include "mongo/db/op_observer_registry.h"
 #include "mongo/db/repl/oplog_applier_impl_test_fixture.h"
 #include "mongo/db/repl/oplog_batcher_test_fixture.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/repl/storage_interface_impl.h"
 #include "mongo/db/repl/tenant_migration_decoration.h"
+#include "mongo/db/repl/tenant_migration_recipient_service.h"
 #include "mongo/db/repl/tenant_oplog_applier.h"
 #include "mongo/db/repl/tenant_oplog_batcher.h"
 #include "mongo/db/service_context_d_test_fixture.h"
@@ -116,6 +118,11 @@ public:
     void setUp() override {
         ServiceContextMongoDTest::setUp();
 
+        // These defaults are generated from the repl_server_paremeters IDL file. Set them here
+        // to start each test case from a clean state.
+        tenantApplierBatchSizeBytes.store(kTenantApplierBatchSizeBytesDefault);
+        tenantApplierBatchSizeOps.store(kTenantApplierBatchSizeOpsDefault);
+
         // Set up an OpObserver to track the documents OplogApplierImpl inserts.
         auto service = getServiceContext();
         auto opObserver = std::make_unique<TenantOplogApplierTestOpObserver>();
@@ -140,7 +147,6 @@ public:
         // expected to exist when fetching the next opTime (LocalOplogInfo::getNextOpTimes) to use
         // for a write.
         _opCtx = cc().makeOperationContext();
-        repl::setOplogCollectionName(service);
         repl::createOplog(_opCtx.get());
 
         // Ensure that we are primary.
@@ -184,6 +190,8 @@ protected:
 private:
     unittest::MinimumLoggedSeverityGuard _replicationSeverityGuard{
         logv2::LogComponent::kReplication, logv2::LogSeverity::Debug(1)};
+    unittest::MinimumLoggedSeverityGuard _tenantMigrationSeverityGuard{
+        logv2::LogComponent::kTenantMigration, logv2::LogSeverity::Debug(1)};
 };
 
 TEST_F(TenantOplogApplierTest, NoOpsForSingleBatch) {
@@ -245,8 +253,9 @@ TEST_F(TenantOplogApplierTest, NoOpsForMultipleBatches) {
     TenantOplogApplier applier(
         _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
 
-    TenantOplogBatcher::BatchLimits smallLimits(100 * 1024 /* bytes */, 2 /*ops*/);
-    applier.setBatchLimits_forTest(smallLimits);
+    tenantApplierBatchSizeBytes.store(100 * 1024 /* bytes */);
+    tenantApplierBatchSizeOps.store(2 /* ops */);
+
     ASSERT_OK(applier.startup());
     auto firstBatchFuture = applier.getNotificationForOpTime(srcOps[0].getOpTime());
     auto secondBatchFuture = applier.getNotificationForOpTime(srcOps[2].getOpTime());
@@ -722,6 +731,157 @@ TEST_F(TenantOplogApplierTest, ApplyCRUD_WrongUUID) {
     auto opAppliedFuture = applier.getNotificationForOpTime(entry.getOpTime());
     ASSERT_NOT_OK(opAppliedFuture.getNoThrow().getStatus());
     ASSERT_FALSE(onInsertsCalled);
+    applier.shutdown();
+    applier.join();
+}
+
+TEST_F(TenantOplogApplierTest, ApplyNoop_Success) {
+    std::vector<OplogEntry> srcOps;
+    srcOps.push_back(makeNoopOplogEntry(1, "foo"));
+    pushOps(srcOps);
+    auto writerPool = makeTenantMigrationWriterPool();
+
+    TenantOplogApplier applier(
+        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    ASSERT_OK(applier.startup());
+    auto opAppliedFuture = applier.getNotificationForOpTime(srcOps[0].getOpTime());
+    auto futureRes = opAppliedFuture.getNoThrow();
+
+    auto entries = _opObserver->getEntries();
+    ASSERT_EQ(1, entries.size());
+
+    ASSERT_OK(futureRes.getStatus());
+    ASSERT_EQUALS(futureRes.getValue().donorOpTime, srcOps[0].getOpTime());
+    ASSERT_EQUALS(futureRes.getValue().recipientOpTime, entries[0].getOpTime());
+
+    applier.shutdown();
+    applier.join();
+}
+
+TEST_F(TenantOplogApplierTest, ApplyResumeTokenNoop_Success) {
+    std::vector<OplogEntry> srcOps;
+    srcOps.push_back(makeNoopOplogEntry(1, TenantMigrationRecipientService::kNoopMsg));
+    pushOps(srcOps);
+    auto writerPool = makeTenantMigrationWriterPool();
+
+    TenantOplogApplier applier(
+        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    ASSERT_OK(applier.startup());
+    auto opAppliedFuture = applier.getNotificationForOpTime(srcOps[0].getOpTime());
+    auto futureRes = opAppliedFuture.getNoThrow();
+
+    auto entries = _opObserver->getEntries();
+    ASSERT_EQ(0, entries.size());
+
+    ASSERT_OK(futureRes.getStatus());
+    ASSERT_EQUALS(futureRes.getValue().donorOpTime, srcOps[0].getOpTime());
+    ASSERT_EQUALS(futureRes.getValue().recipientOpTime, OpTime());
+
+    applier.shutdown();
+    applier.join();
+}
+
+TEST_F(TenantOplogApplierTest, ApplyInsertThenResumeTokenNoopInDifferentBatch_Success) {
+    std::vector<OplogEntry> srcOps;
+    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo"), UUID::gen()));
+    srcOps.push_back(makeNoopOplogEntry(2, TenantMigrationRecipientService::kNoopMsg));
+    pushOps(srcOps);
+    auto writerPool = makeTenantMigrationWriterPool();
+
+    TenantOplogApplier applier(
+        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+
+    tenantApplierBatchSizeBytes.store(100 * 1024 /* bytes */);
+    tenantApplierBatchSizeOps.store(1 /* ops */);
+
+    ASSERT_OK(applier.startup());
+    auto opAppliedFuture = applier.getNotificationForOpTime(srcOps[1].getOpTime());
+    auto futureRes = opAppliedFuture.getNoThrow();
+
+    auto entries = _opObserver->getEntries();
+    ASSERT_EQ(1, entries.size());
+    assertNoOpMatches(srcOps[0], entries[0]);
+
+    ASSERT_OK(futureRes.getStatus());
+    ASSERT_EQUALS(futureRes.getValue().donorOpTime, srcOps[1].getOpTime());
+    ASSERT_EQUALS(futureRes.getValue().recipientOpTime, entries[0].getOpTime());
+
+    applier.shutdown();
+    applier.join();
+}
+
+TEST_F(TenantOplogApplierTest, ApplyResumeTokenNoopThenInsertInSameBatch_Success) {
+    std::vector<OplogEntry> srcOps;
+    srcOps.push_back(makeNoopOplogEntry(1, TenantMigrationRecipientService::kNoopMsg));
+    srcOps.push_back(makeInsertOplogEntry(2, NamespaceString(dbName, "foo"), UUID::gen()));
+    pushOps(srcOps);
+    auto writerPool = makeTenantMigrationWriterPool();
+
+    TenantOplogApplier applier(
+        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    ASSERT_OK(applier.startup());
+    auto opAppliedFuture = applier.getNotificationForOpTime(srcOps[1].getOpTime());
+    auto futureRes = opAppliedFuture.getNoThrow();
+
+    auto entries = _opObserver->getEntries();
+    ASSERT_EQ(1, entries.size());
+    assertNoOpMatches(srcOps[1], entries[0]);
+
+    ASSERT_OK(futureRes.getStatus());
+    ASSERT_EQUALS(futureRes.getValue().donorOpTime, srcOps[1].getOpTime());
+    ASSERT_EQUALS(futureRes.getValue().recipientOpTime, entries[0].getOpTime());
+
+    applier.shutdown();
+    applier.join();
+}
+
+TEST_F(TenantOplogApplierTest, ApplyResumeTokenInsertThenNoopSameTimestamp_Success) {
+    std::vector<OplogEntry> srcOps;
+    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo"), UUID::gen()));
+    srcOps.push_back(makeNoopOplogEntry(1, TenantMigrationRecipientService::kNoopMsg));
+    pushOps(srcOps);
+    ASSERT_EQ(srcOps[0].getOpTime(), srcOps[1].getOpTime());
+    auto writerPool = makeTenantMigrationWriterPool();
+
+    TenantOplogApplier applier(
+        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    ASSERT_OK(applier.startup());
+    auto opAppliedFuture = applier.getNotificationForOpTime(srcOps[1].getOpTime());
+    auto futureRes = opAppliedFuture.getNoThrow();
+
+    auto entries = _opObserver->getEntries();
+    ASSERT_EQ(1, entries.size());
+    assertNoOpMatches(srcOps[0], entries[0]);
+
+    ASSERT_OK(futureRes.getStatus());
+    ASSERT_EQUALS(futureRes.getValue().donorOpTime, srcOps[1].getOpTime());
+    ASSERT_EQUALS(futureRes.getValue().recipientOpTime, entries[0].getOpTime());
+
+    applier.shutdown();
+    applier.join();
+}
+
+TEST_F(TenantOplogApplierTest, ApplyResumeTokenInsertThenNoop_Success) {
+    std::vector<OplogEntry> srcOps;
+    srcOps.push_back(makeInsertOplogEntry(1, NamespaceString(dbName, "foo"), UUID::gen()));
+    srcOps.push_back(makeNoopOplogEntry(2, TenantMigrationRecipientService::kNoopMsg));
+    pushOps(srcOps);
+    auto writerPool = makeTenantMigrationWriterPool();
+
+    TenantOplogApplier applier(
+        _migrationUuid, _tenantId, OpTime(), &_oplogBuffer, _executor, writerPool.get());
+    ASSERT_OK(applier.startup());
+    auto opAppliedFuture = applier.getNotificationForOpTime(srcOps[1].getOpTime());
+    auto futureRes = opAppliedFuture.getNoThrow();
+
+    auto entries = _opObserver->getEntries();
+    ASSERT_EQ(1, entries.size());
+    assertNoOpMatches(srcOps[0], entries[0]);
+
+    ASSERT_OK(futureRes.getStatus());
+    ASSERT_EQUALS(futureRes.getValue().donorOpTime, srcOps[1].getOpTime());
+    ASSERT_EQUALS(futureRes.getValue().recipientOpTime, entries[0].getOpTime());
+
     applier.shutdown();
     applier.join();
 }

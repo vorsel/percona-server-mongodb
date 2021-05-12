@@ -44,6 +44,7 @@ selector:
   - jstests/core/all3.js
   - jstests/core/and.js
   - jstests/core/and.js
+  - jstests/core/and_or_index_sort.js
   - jstests/core/and_or_nested.js
   - jstests/core/andor.js
   - jstests/core/array1.js
@@ -286,7 +287,8 @@ selector:
   - jstests/core/list_namespaces_invalidation.js
   - jstests/core/list_sessions.js
   - jstests/core/min_max_key.js
-  - jstests/core/mod1.js
+  - jstests/core/mod.js
+  - jstests/core/mod_with_where.js
   - jstests/core/mod_overflow.js
   - jstests/core/mr_correctness.js
   - jstests/core/mr_merge.js
@@ -373,6 +375,7 @@ selector:
   - jstests/core/rollback_index_drop.js
   - jstests/core/server1470.js
   - jstests/core/server5346.js
+  - jstests/core/server50762.js
   - jstests/core/set7.js
   - jstests/core/single_field_hashed_index.js
   - jstests/core/sort1.js
@@ -599,7 +602,8 @@ selector:
   - jstests/core/list_collections_filter.js
   - jstests/core/list_databases.js
   - jstests/core/list_namespaces_invalidation.js
-  - jstests/core/mod1.js
+  - jstests/core/mod.js
+  - jstests/core/mod_with_where.js
   - jstests/core/mod_overflow.js
   - jstests/core/not2.js
   - jstests/core/optimized_match_explain.js

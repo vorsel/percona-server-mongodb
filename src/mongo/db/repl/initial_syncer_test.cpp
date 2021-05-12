@@ -64,6 +64,7 @@
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/storage/storage_engine_mock.h"
+#include "mongo/executor/mock_network_fixture.h"
 #include "mongo/executor/network_interface_mock.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/platform/mutex.h"
@@ -77,6 +78,7 @@
 #include "mongo/logv2/log.h"
 #include "mongo/unittest/barrier.h"
 #include "mongo/unittest/unittest.h"
+
 
 namespace mongo {
 namespace repl {
@@ -106,6 +108,7 @@ namespace {
 
 using namespace mongo;
 using namespace mongo::repl;
+using namespace mongo::test::mock;
 
 using executor::NetworkInterfaceMock;
 using executor::RemoteCommandRequest;
@@ -121,6 +124,15 @@ const BSONObj kListDatabasesFailPointData = BSON("cloner"
                                                  << "listDatabases");
 
 BSONObj makeListDatabasesResponse(std::vector<std::string> databaseNames);
+BSONObj makeRollbackCheckerResponse(int rollbackId);
+BSONObj makeOplogEntryObj(int t,
+                          OpTypeEnum opType = OpTypeEnum::kInsert,
+                          int version = OplogEntry::kOplogVersion);
+RemoteCommandResponse makeCursorResponse(CursorId cursorId,
+                                         const NamespaceString& nss,
+                                         std::vector<BSONObj> docs,
+                                         bool isFirstBatch = true,
+                                         int rbid = 1);
 
 struct CollectionCloneInfo {
     std::shared_ptr<CollectionMockStats> stats = std::make_shared<CollectionMockStats>();
@@ -359,6 +371,14 @@ protected:
 
         _target = HostAndPort{"localhost:12346"};
         _mockServer = std::make_unique<MockRemoteDBServer>(_target.toString());
+        _mock = std::make_unique<MockNetwork>(getNet());
+        // Default behavior for all tests using this mock.
+        _mock->defaultExpect("replSetGetRBID", makeRollbackCheckerResponse(1));
+        _mock->defaultExpect(
+            BSON("find"
+                 << "transactions"),
+            makeCursorResponse(0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
+
         // Usually we're just skipping the cloners in this test, so we provide an empty list
         // of databases.
         _mockServer->setCommandReply("listDatabases", makeListDatabasesResponse({}));
@@ -463,6 +483,7 @@ protected:
         _dbWorkThreadPool.reset();
         _replicationProcess.reset();
         _storageInterface.reset();
+        _mock.reset();
     }
 
     /**
@@ -498,6 +519,7 @@ protected:
     std::unique_ptr<StorageInterfaceMock> _storageInterface;
     HostAndPort _target;
     std::unique_ptr<MockRemoteDBServer> _mockServer;
+    std::unique_ptr<MockNetwork> _mock;
     CollectionOptions _options1;
     std::unique_ptr<ReplicationProcess> _replicationProcess;
     std::unique_ptr<ThreadPool> _dbWorkThreadPool;
@@ -549,8 +571,8 @@ BSONObj makeRollbackCheckerResponse(int rollbackId) {
 RemoteCommandResponse makeCursorResponse(CursorId cursorId,
                                          const NamespaceString& nss,
                                          std::vector<BSONObj> docs,
-                                         bool isFirstBatch = true,
-                                         int rbid = 1) {
+                                         bool isFirstBatch,
+                                         int rbid) {
     OpTime futureOpTime(Timestamp(1000, 1000), 1000);
     Date_t futureWallTime = Date_t() + Seconds(futureOpTime.getSecs());
     rpc::OplogQueryMetadata oqMetadata({futureOpTime, futureWallTime}, futureOpTime, rbid, 0, 0);
@@ -621,9 +643,7 @@ OplogEntry makeOplogEntry(int t,
                       boost::none);  // _id
 }
 
-BSONObj makeOplogEntryObj(int t,
-                          OpTypeEnum opType = OpTypeEnum::kInsert,
-                          int version = OplogEntry::kOplogVersion) {
+BSONObj makeOplogEntryObj(int t, OpTypeEnum opType, int version) {
     return makeOplogEntry(t, opType, version).toBSON();
 }
 
@@ -1713,6 +1733,39 @@ TEST_F(InitialSyncerTest, InitialSyncerPassesThroughFCVFetcherScheduleError) {
     assertFCVRequest(request);
 }
 
+// This is to demonstrate the unit testing mock framework. The logic is the same as the following
+// test.
+// (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+TEST_F(InitialSyncerTest, InitialSyncerPassesThroughFCVFetcherCallbackError_Mock) {
+    auto initialSyncer = &getInitialSyncer();
+    auto opCtx = makeOpCtx();
+
+    _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
+
+    _mock
+        ->expect(BSON("find"
+                      << "oplog.rs"),
+                 makeCursorResponse(0LL, _options.localOplogNS, {makeOplogEntryObj(1)}))
+        .times(2);
+
+    // This is what we want to test.
+    _mock
+        ->expect(BSON("find"
+                      << "system.version"),
+                 RemoteCommandResponse(ErrorCodes::OperationFailed,
+                                       "find command failed at sync source"))
+        .times(1);
+
+    // Start the real work.
+    ASSERT_OK(initialSyncer->startup(opCtx.get(), maxAttempts));
+
+    // Run mock.
+    _mock->runUntilExpectationsSatisfied();
+
+    initialSyncer->join();
+    ASSERT_EQUALS(ErrorCodes::OperationFailed, _lastApplied);
+}
+
 TEST_F(InitialSyncerTest, InitialSyncerPassesThroughFCVFetcherCallbackError) {
     auto initialSyncer = &getInitialSyncer();
     auto opCtx = makeOpCtx();
@@ -1941,6 +1994,62 @@ TEST_F(InitialSyncerTest, InitialSyncerSucceedsWhenFCVFetcherReturnsOldVersion) 
 
     initialSyncer->join();
     ASSERT_EQUALS(ErrorCodes::CallbackCanceled, _lastApplied);
+}
+
+// This is to demonstrate the unit testing mock framework. The logic is the same as the following
+// test.
+TEST_F(
+    InitialSyncerTest,
+    InitialSyncerPassesThroughOplogFetcherRestartsBasedOnInitialSyncFetcherRestartDecision_Mock) {
+    auto initialSyncer = &getInitialSyncer();
+    auto opCtx = makeOpCtx();
+
+    _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 12345));
+
+    const std::uint32_t initialSyncMaxAttempts = 2U;
+
+    auto lastOp = makeOplogEntry(2);
+
+    // Only respond to oplog queries twice to block the initial syncer on getting stopTimestamp.
+    _mock
+        ->expect(BSON("find"
+                      << "oplog.rs"),
+                 makeCursorResponse(0LL, _options.localOplogNS, {makeOplogEntryObj(1)}))
+        .times(2);
+
+    // This is what we want to test.
+    // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+    FeatureCompatibilityVersionDocument fcvDoc;
+    fcvDoc.setVersion(ServerGlobalParams::FeatureCompatibility::kLastLTS);
+    _mock
+        ->expect([](auto& request) { return request["find"].str() == "system.version"; },
+                 makeCursorResponse(
+                     0LL, NamespaceString::kServerConfigurationNamespace, {fcvDoc.toBSON()}))
+        .times(1);
+
+    FailPointEnableBlock skipReconstructPreparedTransactions("skipReconstructPreparedTransactions");
+    FailPointEnableBlock skipRecoverTenantMigrationAccessBlockers(
+        "skipRecoverTenantMigrationAccessBlockers");
+
+    // Start the real work.
+    ASSERT_OK(initialSyncer->startup(opCtx.get(), initialSyncMaxAttempts));
+
+    _mock->runUntilExpectationsSatisfied();
+
+    // Simulate response to OplogFetcher so it has enough operations to reach end timestamp.
+    getOplogFetcher()->receiveBatch(1LL, {makeOplogEntryObj(1), lastOp.toBSON()});
+    // Simulate a network error response that restarts the OplogFetcher.
+    getOplogFetcher()->simulateResponseError(Status(ErrorCodes::NetworkTimeout, "network error"));
+
+    _mock
+        ->expect([](auto& request) { return request["find"].str() == "oplog.rs"; },
+                 makeCursorResponse(0LL, _options.localOplogNS, {lastOp.toBSON()}))
+        .times(1);
+
+    _mock->runUntilExpectationsSatisfied();
+
+    initialSyncer->join();
+    ASSERT_OK(_lastApplied.getStatus());
 }
 
 TEST_F(InitialSyncerTest,
@@ -3451,6 +3560,10 @@ TEST_F(InitialSyncerTest, LastOpTimeShouldBeSetEvenIfNoOperationsAreAppliedAfter
                              << BSON("readOnly" << false << "uuid" << *_options1.uuid))})
                 .data);
 
+        // The collection cloner pre-stage makes a remote call to collStats to store in-progress
+        // metrics.
+        _mockServer->setCommandReply("collStats", BSON("size" << 10));
+
         // count:a
         _mockServer->setCommandReply("count", BSON("n" << 1 << "ok" << 1));
 
@@ -4125,6 +4238,10 @@ TEST_F(InitialSyncerTest,
                              << BSON("readOnly" << false << "uuid" << *_options1.uuid))})
                 .data);
 
+        // The collection cloner pre-stage makes a remote call to collStats to store in-progress
+        // metrics.
+        _mockServer->setCommandReply("collStats", BSON("size" << 10));
+
         // count:a
         _mockServer->setCommandReply("count", BSON("n" << 1 << "ok" << 1));
 
@@ -4241,6 +4358,148 @@ TEST_F(InitialSyncerTest, OplogOutOfOrderOnOplogFetchFinish) {
     ASSERT_EQUALS(ErrorCodes::OplogOutOfOrder, _lastApplied);
 }
 
+TEST_F(InitialSyncerTest, TestRemainingInitialSyncEstimatedMillisMetric) {
+    auto initialSyncer = &getInitialSyncer();
+    auto opCtx = makeOpCtx();
+    ASSERT_OK(ServerParameterSet::getGlobal()
+                  ->getMap()
+                  .find("collectionClonerBatchSize")
+                  ->second->setFromString("1"));
+
+    _syncSourceSelector->setChooseNewSyncSourceResult_forTest(HostAndPort("localhost", 27017));
+
+    auto net = getNet();
+    int baseRollbackId = 1;
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+        // Set the network clock to the current date to make sure we are not starting up
+        // initial sync at the UNIX epoch time.
+        net->runUntil(Date_t::now());
+    }
+
+    ASSERT_OK(initialSyncer->startup(opCtx.get(), 2U));
+    // Use a big enough data size to explicitly test the case where
+    // (initialSyncElapsedMillis / approxTotalBytesCopied) is less than 1.
+    const auto dbSize = 10000;
+    const auto numDocs = 5;
+    const auto avgObjSize = dbSize / numDocs;
+    NamespaceString nss("a.a");
+
+    auto hangDuringCloningFailPoint =
+        globalFailPointRegistry().find("initialSyncHangDuringCollectionClone");
+    auto timesEntered =
+        hangDuringCloningFailPoint->setMode(FailPoint::alwaysOn, 0, BSON("namespace" << nss.ns()));
+
+    {
+        // Keep the cloner from finishing so end-of-clone-stage network events don't interfere.
+        FailPointEnableBlock clonerFailpoint("hangBeforeClonerStage", kListDatabasesFailPointData);
+        {
+            executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+
+            // Base rollback ID.
+            auto rbidRequest =
+                net->scheduleSuccessfulResponse(makeRollbackCheckerResponse(baseRollbackId));
+            assertRemoteCommandNameEquals("replSetGetRBID", rbidRequest);
+
+            // Oplog entry associated with the defaultBeginFetchingTimestamp.
+            processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
+
+            // Send an empty optime as the response to the beginFetchingOptime find request,
+            // which will cause the beginFetchingTimestamp to be set to the
+            // defaultBeginFetchingTimestamp.
+            auto findRequest = net->scheduleSuccessfulResponse(makeCursorResponse(
+                0LL, NamespaceString::kSessionTransactionsTableNamespace, {}, true));
+            assertRemoteCommandNameEquals("find", findRequest);
+            net->runReadyNetworkOperations();
+
+            // Oplog entry associated with the beginApplyingTimestamp.
+            processSuccessfulLastOplogEntryFetcherResponse({makeOplogEntryObj(1)});
+
+            // Feature Compatibility Version.
+            processSuccessfulFCVFetcherResponseLastLTS();
+        }
+
+        // Set up the successful cloner run.
+        // listDatabases: a, b
+        // We do not populate database 'b' with data as we don't actually complete initial sync in
+        // this test.
+        _mockServer->setCommandReply("listDatabases",
+                                     makeListDatabasesResponse({nss.db().toString(), "b"}));
+        // The AllDatabaseCloner post stage calls dbStats to record initial sync progress
+        // metrics. This will be used to calculate both the data size of "a" and "b".
+        _mockServer->setCommandReply("dbStats", BSON("dataSize" << dbSize));
+
+        // Set up data for "a"
+        _mockServer->assignCollectionUuid(nss.ns(), *_options1.uuid);
+        for (int i = 1; i <= 5; ++i) {
+            _mockServer->insert(nss.ns(), BSON("_id" << i << "a" << i));
+        }
+
+        // listCollections for "a"
+        _mockServer->setCommandReply(
+            "listCollections",
+            makeCursorResponse(
+                0LL,
+                nss,
+                {BSON("name" << nss.coll() << "type"
+                             << "collection"
+                             << "options" << _options1.toBSON() << "info"
+                             << BSON("readOnly" << false << "uuid" << *_options1.uuid))})
+                .data);
+
+        // The collection cloner pre-stage makes a remote call to collStats to store in-progress
+        // metrics.
+        _mockServer->setCommandReply("collStats",
+                                     BSON("size" << dbSize << "avgObjSize" << avgObjSize));
+
+        // count:a
+        _mockServer->setCommandReply("count", BSON("n" << numDocs << "ok" << 1));
+
+        // listIndexes:a
+        _mockServer->setCommandReply(
+            "listIndexes",
+            makeCursorResponse(
+                0LL,
+                NamespaceString(nss.getCommandNS()),
+                {BSON("v" << OplogEntry::kOplogVersion << "key" << BSON("_id" << 1) << "name"
+                          << "_id_"
+                          << "ns" << nss.ns())})
+                .data);
+        // Release the 'hangBeforeCloningFailPoint' to continue the cloning phase.
+    }
+
+    // Wait for the server to have reached the end of cloning collection 'a.a'. The size of this
+    // collection is expected to equal 'dbSize'.
+    hangDuringCloningFailPoint->waitForTimesEntered(timesEntered + 1);
+    auto progress = initialSyncer->getInitialSyncProgress();
+    LOGV2(5301701, "Progress in middle of cloning", "progress"_attr = progress);
+    {
+        ON_BLOCK_EXIT([hangDuringCloningFailPoint]() {
+            hangDuringCloningFailPoint->setMode(FailPoint::off);
+        });
+        const auto initialSyncElapsedMillis = progress.getIntField("totalInitialSyncElapsedMillis");
+        const auto approxTotalDataSize = progress.getIntField("approxTotalDataSize");
+        const auto approxTotalBytesCopied = progress.getIntField("approxTotalBytesCopied");
+        ASSERT_GREATER_THAN(initialSyncElapsedMillis, 0);
+        // Each of the two databases to be cloned have a size of 'dbSize'.
+        ASSERT_EQUALS(approxTotalDataSize, dbSize * 2);
+        ASSERT_EQUALS(approxTotalBytesCopied, dbSize);
+
+        const auto downloadRate = (double)initialSyncElapsedMillis / (double)approxTotalBytesCopied;
+        const auto expectedRemainingTime =
+            downloadRate * (approxTotalDataSize - approxTotalBytesCopied);
+        const auto actualRemainingTime =
+            progress.getIntField("remainingInitialSyncEstimatedMillis");
+        ASSERT_EQUALS(actualRemainingTime, (long long)expectedRemainingTime);
+        ASSERT_GREATER_THAN(actualRemainingTime, 0);
+    }
+
+    ASSERT_OK(initialSyncer->shutdown());
+    // Deliver cancellation signal to callbacks.
+    executor::NetworkInterfaceMock::InNetworkGuard(net)->runReadyNetworkOperations();
+    initialSyncer->join();
+}
+
 TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
     // Skip reconstructing prepared transactions at the end of initial sync because
     // InitialSyncerTest does not construct ServiceEntryPoint and this causes a segmentation fault
@@ -4300,14 +4559,20 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
 
         auto progress = initialSyncer->getInitialSyncProgress();
         LOGV2(24168, "Progress after first failed response", "progress"_attr = progress);
-        ASSERT_EQUALS(progress.nFields(), 8) << progress;
+        ASSERT_EQUALS(progress.nFields(), 11) << progress;
+        ASSERT_FALSE(progress.hasField("remainingInitialSyncEstimatedMillis"));
+        ASSERT_FALSE(progress.hasField("InitialSyncEnd"));
         ASSERT_EQUALS(progress.getIntField("failedInitialSyncAttempts"), 0) << progress;
         ASSERT_EQUALS(progress.getIntField("maxFailedInitialSyncAttempts"), 2) << progress;
+        ASSERT_EQUALS(progress["totalInitialSyncElapsedMillis"].type(), NumberLong) << progress;
+        ASSERT_EQUALS(progress.getIntField("approxTotalDataSize"), 0) << progress;
+        ASSERT_EQUALS(progress.getIntField("approxTotalBytesCopied"), 0) << progress;
         ASSERT_EQUALS(progress["initialSyncStart"].type(), Date) << progress;
         ASSERT_EQUALS(progress["initialSyncOplogStart"].timestamp(), Timestamp(1, 1)) << progress;
         ASSERT_BSONOBJ_EQ(progress.getObjectField("initialSyncAttempts"), BSONObj());
         ASSERT_EQUALS(progress.getIntField("appliedOps"), 0) << progress;
-        ASSERT_BSONOBJ_EQ(progress.getObjectField("databases"), BSON("databasesCloned" << 0));
+        ASSERT_BSONOBJ_EQ(progress.getObjectField("databases"),
+                          BSON("databasesToClone" << 0 << "databasesCloned" << 0));
         ASSERT_EQUALS(progress.getIntField("totalTimeUnreachableMillis"), 0);
 
         // Inject the listDatabases failure.
@@ -4324,6 +4589,8 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
 
     LOGV2(24169, "Done playing failed responses");
 
+    const auto bytesToCopy = 10;
+    const auto avgObjSize = 2;
     {
         FailPointEnableBlock clonerFailpoint("hangBeforeClonerStage", kListDatabasesFailPointData);
         // Play the first 2 responses of the successful round of responses to ensure that the
@@ -4360,13 +4627,19 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
 
         auto progress = initialSyncer->getInitialSyncProgress();
         LOGV2(24171, "Progress after failure", "progress"_attr = progress);
-        ASSERT_EQUALS(progress.nFields(), 8) << progress;
+        ASSERT_EQUALS(progress.nFields(), 11) << progress;
+        ASSERT_FALSE(progress.hasField("remainingInitialSyncEstimatedMillis"));
+        ASSERT_FALSE(progress.hasField("InitialSyncEnd"));
         ASSERT_EQUALS(progress.getIntField("failedInitialSyncAttempts"), 1) << progress;
         ASSERT_EQUALS(progress.getIntField("maxFailedInitialSyncAttempts"), 2) << progress;
+        ASSERT_EQUALS(progress["totalInitialSyncElapsedMillis"].type(), NumberLong) << progress;
+        ASSERT_EQUALS(progress.getIntField("approxTotalDataSize"), 0) << progress;
+        ASSERT_EQUALS(progress.getIntField("approxTotalBytesCopied"), 0) << progress;
         ASSERT_EQUALS(progress["initialSyncStart"].type(), Date) << progress;
         ASSERT_EQUALS(progress["initialSyncOplogStart"].timestamp(), Timestamp(1, 1)) << progress;
         ASSERT_EQUALS(progress.getIntField("appliedOps"), 0) << progress;
-        ASSERT_BSONOBJ_EQ(progress.getObjectField("databases"), BSON("databasesCloned" << 0));
+        ASSERT_BSONOBJ_EQ(progress.getObjectField("databases"),
+                          BSON("databasesToClone" << 0 << "databasesCloned" << 0));
         ASSERT_EQUALS(progress.getIntField("totalTimeUnreachableMillis"), 0);
 
         BSONObj attempts = progress["initialSyncAttempts"].Obj();
@@ -4392,6 +4665,8 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
         NamespaceString nss("a.a");
         _mockServer->setCommandReply("listDatabases",
                                      makeListDatabasesResponse({nss.db().toString()}));
+        // The AllDatabaseCloner post stage calls dbStats to record initial sync progress metrics.
+        _mockServer->setCommandReply("dbStats", BSON("dataSize" << 10));
 
         // Set up data for "a"
         _mockServer->assignCollectionUuid(nss.ns(), *_options1.uuid);
@@ -4410,6 +4685,11 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
                              << "options" << _options1.toBSON() << "info"
                              << BSON("readOnly" << false << "uuid" << *_options1.uuid))})
                 .data);
+
+        // The collection cloner pre-stage makes a remote call to collStats to store in-progress
+        // metrics.
+        _mockServer->setCommandReply("collStats",
+                                     BSON("size" << bytesToCopy << "avgObjSize" << avgObjSize));
 
         // count:a
         _mockServer->setCommandReply("count", BSON("n" << 5 << "ok" << 1));
@@ -4451,17 +4731,22 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
 
     auto progress = initialSyncer->getInitialSyncProgress();
     LOGV2(24173, "Progress after all but last successful response", "progress"_attr = progress);
-    ASSERT_EQUALS(progress.nFields(), 9) << progress;
+    ASSERT_EQUALS(progress.nFields(), 13) << progress;
     ASSERT_EQUALS(progress.getIntField("failedInitialSyncAttempts"), 1) << progress;
     ASSERT_EQUALS(progress.getIntField("maxFailedInitialSyncAttempts"), 2) << progress;
+    ASSERT_EQUALS(progress["totalInitialSyncElapsedMillis"].type(), NumberLong) << progress;
+    ASSERT_EQUALS(progress.getIntField("approxTotalDataSize"), 10) << progress;
+    ASSERT_EQUALS(progress.getIntField("approxTotalBytesCopied"), 10) << progress;
     ASSERT_EQUALS(progress["initialSyncOplogStart"].timestamp(), Timestamp(1, 1)) << progress;
     ASSERT_EQUALS(progress["initialSyncOplogEnd"].timestamp(), Timestamp(7, 1)) << progress;
     ASSERT_EQUALS(progress["initialSyncStart"].type(), Date) << progress;
+    ASSERT_EQUALS(progress.getIntField("remainingInitialSyncEstimatedMillis"), 0) << progress;
     ASSERT_EQUALS(progress.getIntField("totalTimeUnreachableMillis"), 0) << progress;
     // Expected applied ops to be a superset of this range: Timestamp(2,1) ... Timestamp(7,1).
     ASSERT_GREATER_THAN_OR_EQUALS(progress.getIntField("appliedOps"), 6) << progress;
     auto databasesProgress = progress.getObjectField("databases");
     ASSERT_EQUALS(1, databasesProgress.getIntField("databasesCloned")) << databasesProgress;
+    ASSERT_EQUALS(0, databasesProgress.getIntField("databasesToClone")) << databasesProgress;
     auto dbProgress = databasesProgress.getObjectField("a");
     ASSERT_EQUALS(1, dbProgress.getIntField("collections")) << dbProgress;
     ASSERT_EQUALS(1, dbProgress.getIntField("clonedCollections")) << dbProgress;
@@ -4474,6 +4759,8 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
         << collectionProgress;
     ASSERT_EQUALS(1, collectionProgress.getIntField("indexes")) << collectionProgress;
     ASSERT_EQUALS(5, collectionProgress.getIntField("receivedBatches")) << collectionProgress;
+    ASSERT_EQUALS(bytesToCopy, collectionProgress.getIntField("bytesToCopy")) << collectionProgress;
+    ASSERT_EQUALS(10, collectionProgress.getIntField("approxBytesCopied")) << collectionProgress;
 
     auto attempts = progress["initialSyncAttempts"].Obj();
     ASSERT_EQUALS(attempts.nFields(), 1) << progress;
@@ -4495,6 +4782,9 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
     // Play last successful response.
     {
         executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+
+        // Advance the clock by 10 seconds
+        net->advanceTime(net->now() + Seconds(10));
 
         // Last rollback ID.
         assertRemoteCommandNameEquals(
@@ -4518,15 +4808,23 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
 
     progress = initialSyncer->getInitialSyncProgress();
     LOGV2(24175, "Progress at end", "progress"_attr = progress);
-    ASSERT_EQUALS(progress.nFields(), 11) << progress;
+    ASSERT_EQUALS(progress.nFields(), 14) << progress;
     ASSERT_EQUALS(progress.getIntField("failedInitialSyncAttempts"), 1) << progress;
     ASSERT_EQUALS(progress.getIntField("maxFailedInitialSyncAttempts"), 2) << progress;
     ASSERT_EQUALS(progress["initialSyncStart"].type(), Date) << progress;
     ASSERT_EQUALS(progress["initialSyncEnd"].type(), Date) << progress;
     ASSERT_EQUALS(progress["initialSyncOplogStart"].timestamp(), Timestamp(1, 1)) << progress;
     ASSERT_EQUALS(progress["initialSyncOplogEnd"].timestamp(), Timestamp(7, 1)) << progress;
-    ASSERT_EQUALS(progress["initialSyncElapsedMillis"].type(), NumberInt) << progress;
-    ASSERT_EQUALS(progress.getIntField("totalTimeUnreachableMillis"), 0) << progress;
+    const auto initialSyncEnd = progress["initialSyncEnd"].Date();
+    // We should have elapsed 10 secs (from advancing the clock) + 1ms (initialSyncRetry wait time).
+    ASSERT_EQUALS(progress.getIntField("totalInitialSyncElapsedMillis"), 10001) << progress;
+    const auto prevElapsedMillis = progress["totalInitialSyncElapsedMillis"].safeNumberLong();
+    ASSERT_EQUALS(progress["initialSyncEnd"].Date() - progress["initialSyncStart"].Date(),
+                  Milliseconds{10001})
+        << progress;
+    ASSERT_EQUALS(progress.getIntField("remainingInitialSyncEstimatedMillis"), 0) << progress;
+    ASSERT_EQUALS(progress.getIntField("approxTotalDataSize"), 10) << progress;
+    ASSERT_EQUALS(progress.getIntField("approxTotalBytesCopied"), 10) << progress;
     // Expected applied ops to be a superset of this range: Timestamp(2,1) ... Timestamp(7,1).
     ASSERT_GREATER_THAN_OR_EQUALS(progress.getIntField("appliedOps"), 6) << progress;
 
@@ -4555,6 +4853,18 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgress) {
     ASSERT_EQUALS(attempt1.getIntField("rollBackId"), 1) << attempt1;
     ASSERT_EQUALS(attempt1.getIntField("operationsRetried"), 0) << attempt1;
     ASSERT_EQUALS(attempt1.getIntField("totalTimeUnreachableMillis"), 0) << attempt1;
+
+    {
+        executor::NetworkInterfaceMock::InNetworkGuard guard(net);
+
+        // Advance the clock by 100 seconds
+        net->advanceTime(net->now() + Seconds(100));
+    }
+
+    // Check the initial sync progress again to make sure the duration timer has stopped on finish.
+    progress = initialSyncer->getInitialSyncProgress();
+    ASSERT_EQUALS(progress["initialSyncEnd"].Date(), initialSyncEnd);
+    ASSERT_EQUALS(progress["totalInitialSyncElapsedMillis"].safeNumberLong(), prevElapsedMillis);
 }
 
 TEST_F(InitialSyncerTest, GetInitialSyncProgressReturnsCorrectProgressForNetworkError) {
@@ -4754,6 +5064,10 @@ TEST_F(InitialSyncerTest, GetInitialSyncProgressOmitsClonerStatsIfClonerStatsExc
                      .data,
                  makeCursorResponse(0LL, nss.getCommandNS(), collectionInfos[3], notFirstBatch)
                      .data});
+
+            // The collection cloner pre-stage makes a remote call to collStats to store in-progress
+            // metrics.
+            _mockServer->setCommandReply("collStats", BSON("size" << 0));
 
             // All document counts are 0.
             _mockServer->setCommandReply("count", BSON("n" << 0 << "ok" << 1));

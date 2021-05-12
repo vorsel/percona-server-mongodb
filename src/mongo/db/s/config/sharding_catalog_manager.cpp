@@ -34,8 +34,13 @@
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 
 #include "mongo/db/auth/authorization_session_impl.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/ops/write_ops.h"
+#include "mongo/db/query/query_request.h"
 #include "mongo/db/s/balancer/type_migration.h"
+#include "mongo/db/vector_clock.h"
+#include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/config_server_version.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -48,6 +53,7 @@
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/transport/service_entry_point.h"
@@ -86,9 +92,24 @@ OpMsg runCommandInLocalTxn(OperationContext* opCtx,
             .response);
 }
 
-BSONObj runCommitOrAbortTxnForConfigDocument(OperationContext* opCtx,
-                                             TxnNumber txnNumber,
-                                             std::string cmdName) {
+void startTransactionWithNoopFind(OperationContext* opCtx,
+                                  const NamespaceString& nss,
+                                  TxnNumber txnNumber) {
+    BSONObjBuilder findCmdBuilder;
+    QueryRequest qr(nss);
+    qr.setBatchSize(0);
+    qr.setWantMore(false);
+    qr.asFindCommand(&findCmdBuilder);
+
+    auto res = runCommandInLocalTxn(
+                   opCtx, nss.db(), true /*startTransaction*/, txnNumber, findCmdBuilder.done())
+                   .body;
+    uassertStatusOK(getStatusFromCommandResult(res));
+}
+
+BSONObj commitOrAbortTransaction(OperationContext* opCtx,
+                                 TxnNumber txnNumber,
+                                 std::string cmdName) {
     // Swap out the clients in order to get a fresh opCtx. Previous operations in this transaction
     // that have been run on this opCtx would have set the timeout in the locker on the opCtx, but
     // commit should not have a lock timeout.
@@ -122,6 +143,24 @@ BSONObj runCommitOrAbortTxnForConfigDocument(OperationContext* opCtx,
                               .get()
                               .response);
     return replyOpMsg.body;
+}
+
+// Runs commit for the transaction with 'txnNumber'.
+void commitTransaction(OperationContext* opCtx, TxnNumber txnNumber) {
+    auto response = commitOrAbortTransaction(opCtx, txnNumber, "commitTransaction");
+    uassertStatusOK(getStatusFromCommandResult(response));
+    uassertStatusOK(getWriteConcernStatusFromCommandResult(response));
+}
+
+// Runs abort for the transaction with 'txnNumber'.
+void abortTransaction(OperationContext* opCtx, TxnNumber txnNumber) {
+    auto response = commitOrAbortTransaction(opCtx, txnNumber, "abortTransaction");
+
+    auto status = getStatusFromCommandResult(response);
+    if (status.code() != ErrorCodes::NoSuchTransaction) {
+        uassertStatusOK(status);
+        uassertStatusOK(getWriteConcernStatusFromCommandResult(response));
+    }
 }
 
 }  // namespace
@@ -401,6 +440,127 @@ Status ShardingCatalogManager::setFeatureCompatibilityVersionOnShards(OperationC
     return Status::OK();
 }
 
+void ShardingCatalogManager::removePre49LegacyMetadata(OperationContext* opCtx) {
+    const auto catalogClient = Grid::get(opCtx)->catalogClient();
+    DBDirectClient client(opCtx);
+
+    // Delete all documents which have {dropped: true} from config.collections
+    uassertStatusOK(
+        catalogClient->removeConfigDocuments(opCtx,
+                                             CollectionType::ConfigNS,
+                                             BSON("dropped" << true),
+                                             ShardingCatalogClient::kLocalWriteConcern));
+
+    // Clear the {dropped:true} and {distributionMode:sharded} fields from config.collections
+    write_ops::Update clearDroppedAndDistributionMode(CollectionType::ConfigNS, [] {
+        write_ops::UpdateOpEntry u;
+        u.setQ({});
+        u.setU(write_ops::UpdateModification::parseFromClassicUpdate(BSON("$unset"
+                                                                          << BSON("dropped"
+                                                                                  << "")
+                                                                          << "$unset"
+                                                                          << BSON("distributionMode"
+                                                                                  << ""))));
+        u.setMulti(true);
+        return std::vector{u};
+    }());
+    clearDroppedAndDistributionMode.setWriteCommandBase([] {
+        write_ops::WriteCommandBase base;
+        base.setOrdered(false);
+        return base;
+    }());
+
+    auto commandResult = client.runCommand(
+        OpMsgRequest::fromDBAndBody(CollectionType::ConfigNS.db(),
+                                    clearDroppedAndDistributionMode.toBSON(
+                                        ShardingCatalogClient::kMajorityWriteConcern.toBSON())));
+    uassertStatusOK([&] {
+        BatchedCommandResponse response;
+        std::string unusedErrmsg;
+        response.parseBSON(
+            commandResult->getCommandReply(),
+            &unusedErrmsg);  // Return value intentionally ignored, because response.toStatus() will
+                             // contain any errors in more detail
+        return response.toStatus();
+    }());
+    uassertStatusOK(getWriteConcernStatusFromCommandResult(commandResult->getCommandReply()));
+}
+
+void ShardingCatalogManager::createCollectionTimestampsFor49(OperationContext* opCtx) {
+    LOGV2(5258800, "Starting upgrade of config.collections");
+
+    const auto catalogClient = Grid::get(opCtx)->catalogClient();
+    auto const catalogCache = Grid::get(opCtx)->catalogCache();
+    auto const configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+    const auto collectionDocs =
+        uassertStatusOK(configShard->exhaustiveFindOnConfig(
+                            opCtx,
+                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                            repl::ReadConcernLevel::kLocalReadConcern,
+                            CollectionType::ConfigNS,
+                            BSON(CollectionType::kTimestampFieldName << BSON("$exists" << false)),
+                            BSONObj(),
+                            boost::none))
+            .docs;
+
+
+    for (const auto& doc : collectionDocs) {
+        const CollectionType coll(doc);
+        const auto nss = coll.getNss();
+
+        auto now = VectorClock::get(opCtx)->getTime();
+        auto clusterTime = now.clusterTime().asTimestamp();
+
+        uassertStatusOK(catalogClient->updateConfigDocument(
+            opCtx,
+            CollectionType::ConfigNS,
+            BSON(CollectionType::kNssFieldName << nss.ns()),
+            BSON("$set" << BSON(CollectionType::kTimestampFieldName << clusterTime)),
+            false /* upsert */,
+            ShardingCatalogClient::kMajorityWriteConcern));
+
+        catalogCache->invalidateCollectionEntry_LINEARIZABLE(nss);
+    }
+
+    LOGV2(5258801, "Successfully upgraded config.collections");
+}
+
+void ShardingCatalogManager::downgradeConfigCollectionEntriesToPre49(OperationContext* opCtx) {
+    if (feature_flags::gShardingFullDDLSupport.isEnabledAndIgnoreFCV()) {
+        DBDirectClient client(opCtx);
+
+        // Clear the 'timestamp' fields from config.collections
+        write_ops::Update unsetTimestamp(CollectionType::ConfigNS, [] {
+            write_ops::UpdateOpEntry u;
+            u.setQ({});
+            u.setU(write_ops::UpdateModification::parseFromClassicUpdate(
+                BSON("$unset" << BSON(CollectionType::kTimestampFieldName << ""))));
+            u.setMulti(true);
+            return std::vector{u};
+        }());
+        unsetTimestamp.setWriteCommandBase([] {
+            write_ops::WriteCommandBase base;
+            base.setOrdered(false);
+            return base;
+        }());
+
+        auto commandResult = client.runCommand(OpMsgRequest::fromDBAndBody(
+            CollectionType::ConfigNS.db(),
+            unsetTimestamp.toBSON(ShardingCatalogClient::kMajorityWriteConcern.toBSON())));
+
+        uassertStatusOK([&] {
+            BatchedCommandResponse response;
+            std::string unusedErrmsg;
+            response.parseBSON(
+                commandResult->getCommandReply(),
+                &unusedErrmsg);  // Return value intentionally ignored, because response.toStatus()
+                                 // will contain any errors in more detail
+            return response.toStatus();
+        }());
+        uassertStatusOK(getWriteConcernStatusFromCommandResult(commandResult->getCommandReply()));
+    }
+}
+
 Lock::ExclusiveLock ShardingCatalogManager::lockZoneMutex(OperationContext* opCtx) {
     Lock::ExclusiveLock lk(opCtx->lockState(), _kZoneOpLock);
     return lk;
@@ -466,17 +626,21 @@ StatusWith<bool> ShardingCatalogManager::_isShardRequiredByZoneStillInUse(
 BSONObj ShardingCatalogManager::writeToConfigDocumentInTxn(OperationContext* opCtx,
                                                            const NamespaceString& nss,
                                                            const BatchedCommandRequest& request,
-                                                           bool startTransaction,
                                                            TxnNumber txnNumber) {
     invariant(nss.db() == NamespaceString::kConfigDb);
-    return runCommandInLocalTxn(opCtx, nss.db(), startTransaction, txnNumber, request.toBSON())
-        .body;
+    auto response = runCommandInLocalTxn(
+                        opCtx, nss.db(), false /* startTransaction */, txnNumber, request.toBSON())
+                        .body;
+
+    uassertStatusOK(getStatusFromCommandResult(response));
+    uassertStatusOK(getWriteConcernStatusFromCommandResult(response));
+
+    return response;
 }
 
 void ShardingCatalogManager::insertConfigDocumentsInTxn(OperationContext* opCtx,
                                                         const NamespaceString& nss,
                                                         std::vector<BSONObj> docs,
-                                                        bool startTransaction,
                                                         TxnNumber txnNumber) {
     invariant(nss.db() == NamespaceString::kConfigDb);
 
@@ -491,8 +655,7 @@ void ShardingCatalogManager::insertConfigDocumentsInTxn(OperationContext* opCtx,
             return insertOp;
         }());
 
-        uassertStatusOK(getStatusFromWriteCommandReply(
-            writeToConfigDocumentInTxn(opCtx, nss, request, startTransaction, txnNumber)));
+        writeToConfigDocumentInTxn(opCtx, nss, request, txnNumber);
     };
 
     while (!docs.empty()) {
@@ -520,22 +683,29 @@ void ShardingCatalogManager::insertConfigDocumentsInTxn(OperationContext* opCtx,
         doBatchInsert();
 }
 
-void ShardingCatalogManager::commitTxnForConfigDocument(OperationContext* opCtx,
-                                                        TxnNumber txnNumber) {
-    auto response = runCommitOrAbortTxnForConfigDocument(opCtx, txnNumber, "commitTransaction");
-    uassertStatusOK(getStatusFromCommandResult(response));
-    uassertStatusOK(getWriteConcernStatusFromCommandResult(response));
-}
+void ShardingCatalogManager::withTransaction(
+    OperationContext* opCtx,
+    const NamespaceString& namespaceForInitialFind,
+    unique_function<void(OperationContext*, TxnNumber)> func) {
+    AlternativeSessionRegion asr(opCtx);
+    AuthorizationSession::get(asr.opCtx()->getClient())
+        ->grantInternalAuthorization(asr.opCtx()->getClient());
+    TxnNumber txnNumber = 0;
 
-void ShardingCatalogManager::abortTxnForConfigDocument(OperationContext* opCtx,
-                                                       TxnNumber txnNumber) {
-    auto response = runCommitOrAbortTxnForConfigDocument(opCtx, txnNumber, "abortTransaction");
+    auto guard = makeGuard([opCtx = asr.opCtx(), txnNumber] {
+        try {
+            abortTransaction(opCtx, txnNumber);
+        } catch (DBException& e) {
+            LOGV2_WARNING(5192100,
+                          "Failed to abort transaction in AlternativeSessionRegion",
+                          "error"_attr = redact(e));
+        }
+    });
 
-    auto status = getStatusFromCommandResult(response);
-    if (status.code() != ErrorCodes::NoSuchTransaction) {
-        uassertStatusOK(status);
-        uassertStatusOK(getWriteConcernStatusFromCommandResult(response));
-    }
+    startTransactionWithNoopFind(asr.opCtx(), namespaceForInitialFind, txnNumber);
+    func(asr.opCtx(), txnNumber);
+    commitTransaction(asr.opCtx(), txnNumber);
+    guard.dismiss();
 }
 
 }  // namespace mongo

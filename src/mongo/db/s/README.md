@@ -191,7 +191,7 @@ Admin database  | UUID() | 0             |
 
 * [The chunk version class](https://github.com/mongodb/mongo/blob/master/src/mongo/s/chunk_version.h)
 * [The database version IDL](https://github.com/mongodb/mongo/blob/master/src/mongo/s/database_version.idl)
-* [The database version helpers class](https://github.com/mongodb/mongo/blob/master/src/mongo/s/database_version_helpers.h)
+* [The database version class](https://github.com/mongodb/mongo/blob/master/src/mongo/s/database_version.h)
 * [Where shard versions are stored in a routing table cache](https://github.com/mongodb/mongo/blob/1df41757d5d1e04c51eeeee786a17b005e025b93/src/mongo/s/catalog_cache.h#L499-L500)
 * [Where database versions are stored in a routing table cache](https://github.com/mongodb/mongo/blob/1df41757d5d1e04c51eeeee786a17b005e025b93/src/mongo/s/catalog_cache.h#L497-L498)
 * [Method used to attach the shard version to outbound requests](https://github.com/mongodb/mongo/blob/1df41757d5d1e04c51eeeee786a17b005e025b93/src/mongo/s/cluster_commands_helpers.h#L118-L121)
@@ -199,6 +199,9 @@ Admin database  | UUID() | 0             |
 * [Where shard versions are stored in a shard's filtering cache](https://github.com/mongodb/mongo/blob/554ec671f7acb6a4df62664f80f68ec3a85bccac/src/mongo/db/s/collection_sharding_runtime.h#L249-L253)
 * [The method that checks the equality of a shard version on a shard](https://github.com/mongodb/mongo/blob/554ec671f7acb6a4df62664f80f68ec3a85bccac/src/mongo/db/s/collection_sharding_state.h#L126-L131)
 * [The method that checks the equality of a database version on a shard](https://github.com/mongodb/mongo/blob/554ec671f7acb6a4df62664f80f68ec3a85bccac/src/mongo/db/s/database_sharding_state.h#L98-L103)
+* [Where stale config exceptions are handled on a shard](https://github.com/mongodb/mongo/blob/8fb7a62652c5fe54da47eab77e28111f00b99d7f/src/mongo/db/service_entry_point_mongod.cpp#L187-L213)
+* [Where a mongos catches a StaleConfigInfo](https://github.com/mongodb/mongo/blob/5bd87925a006fa591692e097d7929b6764da6d0c/src/mongo/s/commands/strategy.cpp#L723-L780)
+* [Where a cluster find catches a StaleConfigInfo](https://github.com/mongodb/mongo/blob/5bd87925a006fa591692e097d7929b6764da6d0c/src/mongo/s/query/cluster_find.cpp#L578-L585)
 
 ## The shard registry
 

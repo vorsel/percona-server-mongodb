@@ -37,11 +37,11 @@
 #include "mongo/base/status_with.h"
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/command_generic_argument.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/idl/command_generic_argument.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
 
@@ -282,14 +282,14 @@ StatusWith<std::unique_ptr<QueryRequest>> QueryRequest::parseFromFindCommand(
             }
 
             qr->_allowPartialResults = el.boolean();
-        } else if (fieldName == kRuntimeConstantsField) {
+        } else if (fieldName == kLegacyRuntimeConstantsField) {
             Status status = checkFieldType(el, Object);
             if (!status.isOK()) {
                 return status;
             }
-            qr->_runtimeConstants =
-                RuntimeConstants::parse(IDLParserErrorContext(kRuntimeConstantsField),
-                                        cmdObj.getObjectField(kRuntimeConstantsField));
+            qr->_legacyRuntimeConstants =
+                LegacyRuntimeConstants::parse(IDLParserErrorContext(kLegacyRuntimeConstantsField),
+                                              cmdObj.getObjectField(kLegacyRuntimeConstantsField));
         } else if (fieldName == kLetField) {
             if (auto status = checkFieldType(el, Object); !status.isOK())
                 return status;
@@ -516,9 +516,9 @@ void QueryRequest::asFindCommandInternal(BSONObjBuilder* cmdBuilder) const {
         cmdBuilder->append(kPartialResultsField, true);
     }
 
-    if (_runtimeConstants) {
-        BSONObjBuilder rtcBuilder(cmdBuilder->subobjStart(kRuntimeConstantsField));
-        _runtimeConstants->serialize(&rtcBuilder);
+    if (_legacyRuntimeConstants) {
+        BSONObjBuilder rtcBuilder(cmdBuilder->subobjStart(kLegacyRuntimeConstantsField));
+        _legacyRuntimeConstants->serialize(&rtcBuilder);
         rtcBuilder.doneFast();
     }
 
@@ -898,7 +898,7 @@ int QueryRequest::getOptions() const {
         options |= QueryOption_AwaitData;
     }
     if (_slaveOk) {
-        options |= QueryOption_SlaveOk;
+        options |= QueryOption_SecondaryOk;
     }
     if (_noCursorTimeout) {
         options |= QueryOption_NoCursorTimeout;
@@ -916,7 +916,7 @@ void QueryRequest::initFromInt(int options) {
     bool tailable = (options & QueryOption_CursorTailable) != 0;
     bool awaitData = (options & QueryOption_AwaitData) != 0;
     _tailableMode = uassertStatusOK(tailableModeFromBools(tailable, awaitData));
-    _slaveOk = (options & QueryOption_SlaveOk) != 0;
+    _slaveOk = (options & QueryOption_SecondaryOk) != 0;
     _noCursorTimeout = (options & QueryOption_NoCursorTimeout) != 0;
     _exhaust = (options & QueryOption_Exhaust) != 0;
     _allowPartialResults = (options & QueryOption_PartialResults) != 0;
@@ -1062,9 +1062,9 @@ StatusWith<BSONObj> QueryRequest::asAggregationCommand() const {
     if (_allowDiskUse) {
         aggregationBuilder.append(QueryRequest::kAllowDiskUseField, _allowDiskUse);
     }
-    if (_runtimeConstants) {
-        BSONObjBuilder rtcBuilder(aggregationBuilder.subobjStart(kRuntimeConstantsField));
-        _runtimeConstants->serialize(&rtcBuilder);
+    if (_legacyRuntimeConstants) {
+        BSONObjBuilder rtcBuilder(aggregationBuilder.subobjStart(kLegacyRuntimeConstantsField));
+        _legacyRuntimeConstants->serialize(&rtcBuilder);
         rtcBuilder.doneFast();
     }
     if (_letParameters) {

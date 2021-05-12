@@ -42,6 +42,7 @@
 #include "mongo/db/pipeline/document_source_merge.h"
 #include "mongo/db/pipeline/document_source_out.h"
 #include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
@@ -195,6 +196,12 @@ std::unique_ptr<Pipeline, PipelineDeleter> Pipeline::create(
 
 void Pipeline::validateCommon() const {
     size_t i = 0;
+
+    uassert(ErrorCodes::FailedToParse,
+            str::stream() << "Pipeline length must be no longer than "
+                          << internalPipelineLengthLimit << " stages",
+            static_cast<int>(_sources.size()) <= internalPipelineLengthLimit);
+
     for (auto&& stage : _sources) {
         auto constraints = stage->constraints(_splitState);
 
@@ -479,8 +486,7 @@ void Pipeline::addFinalSource(intrusive_ptr<DocumentSource> source) {
 
 DepsTracker Pipeline::getDependencies(QueryMetadataBitSet unavailableMetadata) const {
     DepsTracker deps(unavailableMetadata);
-    const bool scopeHasVariables = pCtx->variablesParseState.hasDefinedVariables();
-    bool skipFieldsAndMetadataDeps = false;
+    bool hasUnsupportedStage = false;
     bool knowAllFields = false;
     bool knowAllMeta = false;
     for (auto&& source : _sources) {
@@ -488,35 +494,27 @@ DepsTracker Pipeline::getDependencies(QueryMetadataBitSet unavailableMetadata) c
         DepsTracker::State status = source->getDependencies(&localDeps);
 
         deps.vars.insert(localDeps.vars.begin(), localDeps.vars.end());
+        deps.needRandomGenerator |= localDeps.needRandomGenerator;
 
-        if ((skipFieldsAndMetadataDeps |= (status == DepsTracker::State::NOT_SUPPORTED))) {
-            // Assume this stage needs everything. We may still know something about our
-            // dependencies if an earlier stage returned EXHAUSTIVE_FIELDS or EXHAUSTIVE_META. If
-            // this scope has variables, we need to keep enumerating the remaining stages but will
-            // skip adding any further field or metadata dependencies.
-            if (scopeHasVariables) {
-                continue;
-            } else {
-                break;
-            }
+        if (status == DepsTracker::State::NOT_SUPPORTED) {
+            // We don't know anything about this stage, so we have to assume it depends on
+            // everything. We may still know something about our dependencies if an earlier stage
+            // returned EXHAUSTIVE_FIELDS or EXHAUSTIVE_META.
+            hasUnsupportedStage = true;
         }
 
-        if (!knowAllFields) {
+        // If we ever saw an unsupported stage, don't bother continuing to track field and metadata
+        // deps: we already have to assume the pipeline depends on everything.
+        if (!hasUnsupportedStage && !knowAllFields) {
             deps.fields.insert(localDeps.fields.begin(), localDeps.fields.end());
             if (localDeps.needWholeDocument)
                 deps.needWholeDocument = true;
             knowAllFields = status & DepsTracker::State::EXHAUSTIVE_FIELDS;
         }
 
-        if (!knowAllMeta) {
+        if (!hasUnsupportedStage && !knowAllMeta) {
             deps.requestMetadata(localDeps.metadataDeps());
             knowAllMeta = status & DepsTracker::State::EXHAUSTIVE_META;
-        }
-
-        // If there are variables defined at this pipeline's scope, there may be dependencies upon
-        // them in subsequent stages. Keep enumerating.
-        if (knowAllMeta && knowAllFields && !scopeHasVariables) {
-            break;
         }
     }
 

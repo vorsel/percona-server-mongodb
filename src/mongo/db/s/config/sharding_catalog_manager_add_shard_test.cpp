@@ -52,7 +52,7 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_identity_loader.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
@@ -296,12 +296,8 @@ protected:
      * corresponding to 'expectedDB'.
      */
     void assertDatabaseExists(const DatabaseType& expectedDB) {
-        auto foundDB =
-            assertGet(catalogClient()->getDatabase(operationContext(),
-                                                   expectedDB.getName(),
-                                                   repl::ReadConcernLevel::kMajorityReadConcern))
-                .value;
-
+        auto foundDB = catalogClient()->getDatabase(
+            operationContext(), expectedDB.getName(), repl::ReadConcernLevel::kMajorityReadConcern);
         ASSERT_EQUALS(expectedDB.getName(), foundDB.getName());
         ASSERT_EQUALS(expectedDB.getPrimary(), foundDB.getPrimary());
         ASSERT_EQUALS(expectedDB.getSharded(), foundDB.getSharded());
@@ -384,9 +380,9 @@ TEST_F(AddShardTest, StandaloneBasicSuccess) {
     expectedShard.setState(ShardType::ShardState::kShardAware);
 
     DatabaseType discoveredDB1(
-        "TestDB1", ShardId("StandaloneShard"), false, databaseVersion::makeNew());
+        "TestDB1", ShardId("StandaloneShard"), false, DatabaseVersion(UUID::gen()));
     DatabaseType discoveredDB2(
-        "TestDB2", ShardId("StandaloneShard"), false, databaseVersion::makeNew());
+        "TestDB2", ShardId("StandaloneShard"), false, DatabaseVersion(UUID::gen()));
 
     auto expectWriteConcern = ShardingCatalogClient::kMajorityWriteConcern;
 
@@ -470,9 +466,9 @@ TEST_F(AddShardTest, StandaloneGenerateName) {
     expectedShard.setState(ShardType::ShardState::kShardAware);
 
     DatabaseType discoveredDB1(
-        "TestDB1", ShardId(expectedShardName), false, databaseVersion::makeNew());
+        "TestDB1", ShardId(expectedShardName), false, DatabaseVersion(UUID::gen()));
     DatabaseType discoveredDB2(
-        "TestDB2", ShardId(expectedShardName), false, databaseVersion::makeNew());
+        "TestDB2", ShardId(expectedShardName), false, DatabaseVersion(UUID::gen()));
 
     auto future = launchAsync([this, &expectedShardName, &shardTarget] {
         ThreadClient tc(getServiceContext());
@@ -521,8 +517,8 @@ TEST_F(AddShardTest, StandaloneGenerateName) {
 TEST_F(AddShardTest, AddSCCCConnectionStringAsShard) {
     std::unique_ptr<RemoteCommandTargeterMock> targeter(
         std::make_unique<RemoteCommandTargeterMock>());
-    auto invalidConn =
-        ConnectionString("host1:12345,host2:12345,host3:12345", ConnectionString::INVALID);
+    auto invalidConn = ConnectionString("host1:12345,host2:12345,host3:12345",
+                                        ConnectionString::ConnectionType::kInvalid);
     targeter->setConnectionStringReturnValue(invalidConn);
 
     auto future = launchAsync([this, invalidConn] {
@@ -814,7 +810,7 @@ TEST_F(AddShardTest, ShardContainsExistingDatabase) {
     std::string expectedShardName = "mySet";
 
     DatabaseType existingDB(
-        "existing", ShardId("existingShard"), false, databaseVersion::makeNew());
+        "existing", ShardId("existingShard"), false, DatabaseVersion(UUID::gen()));
 
     // Add a pre-existing database.
     ASSERT_OK(catalogClient()->insertConfigDocument(operationContext(),
@@ -869,7 +865,7 @@ TEST_F(AddShardTest, SuccessfullyAddReplicaSet) {
     expectedShard.setState(ShardType::ShardState::kShardAware);
 
     DatabaseType discoveredDB(
-        "shardDB", ShardId(expectedShardName), false, databaseVersion::makeNew());
+        "shardDB", ShardId(expectedShardName), false, DatabaseVersion(UUID::gen()));
 
     auto future = launchAsync([this, &expectedShardName, &connString] {
         ThreadClient tc(getServiceContext());
@@ -934,7 +930,7 @@ TEST_F(AddShardTest, ReplicaSetExtraHostsDiscovered) {
     expectedShard.setState(ShardType::ShardState::kShardAware);
 
     DatabaseType discoveredDB(
-        "shardDB", ShardId(expectedShardName), false, databaseVersion::makeNew());
+        "shardDB", ShardId(expectedShardName), false, DatabaseVersion(UUID::gen()));
 
     auto future = launchAsync([this, &expectedShardName, &seedString] {
         ThreadClient tc(getServiceContext());
@@ -1000,9 +996,9 @@ TEST_F(AddShardTest, AddShardSucceedsEvenIfAddingDBsFromNewShardFails) {
     expectedShard.setState(ShardType::ShardState::kShardAware);
 
     DatabaseType discoveredDB1(
-        "TestDB1", ShardId("StandaloneShard"), false, databaseVersion::makeNew());
+        "TestDB1", ShardId("StandaloneShard"), false, DatabaseVersion(UUID::gen()));
     DatabaseType discoveredDB2(
-        "TestDB2", ShardId("StandaloneShard"), false, databaseVersion::makeNew());
+        "TestDB2", ShardId("StandaloneShard"), false, DatabaseVersion(UUID::gen()));
 
     // Enable fail point to cause all updates to fail.  Since we add the databases detected from
     // the shard being added with upserts, but we add the shard document itself via insert, this
@@ -1050,18 +1046,16 @@ TEST_F(AddShardTest, AddShardSucceedsEvenIfAddingDBsFromNewShardFails) {
     assertShardExists(expectedShard);
 
     // Ensure that the databases detected from the shard were *not* added.
-    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  catalogClient()
-                      ->getDatabase(operationContext(),
-                                    discoveredDB1.getName(),
-                                    repl::ReadConcernLevel::kMajorityReadConcern)
-                      .getStatus());
-    ASSERT_EQUALS(ErrorCodes::NamespaceNotFound,
-                  catalogClient()
-                      ->getDatabase(operationContext(),
-                                    discoveredDB2.getName(),
-                                    repl::ReadConcernLevel::kMajorityReadConcern)
-                      .getStatus());
+    ASSERT_THROWS_CODE(catalogClient()->getDatabase(operationContext(),
+                                                    discoveredDB1.getName(),
+                                                    repl::ReadConcernLevel::kMajorityReadConcern),
+                       DBException,
+                       ErrorCodes::NamespaceNotFound);
+    ASSERT_THROWS_CODE(catalogClient()->getDatabase(operationContext(),
+                                                    discoveredDB2.getName(),
+                                                    repl::ReadConcernLevel::kMajorityReadConcern),
+                       DBException,
+                       ErrorCodes::NamespaceNotFound);
 
     assertChangeWasLogged(expectedShard);
 }

@@ -303,8 +303,9 @@ void StorageEngineImpl::_initCollection(OperationContext* opCtx,
     auto collectionFactory = Collection::Factory::get(getGlobalServiceContext());
     auto collection = collectionFactory->make(opCtx, nss, catalogId, uuid, std::move(rs));
 
-    auto& collectionCatalog = CollectionCatalog::get(getGlobalServiceContext());
-    collectionCatalog.registerCollection(uuid, std::move(collection));
+    CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+        catalog.registerCollection(uuid, std::move(collection));
+    });
 }
 
 void StorageEngineImpl::closeCatalog(OperationContext* opCtx) {
@@ -313,7 +314,9 @@ void StorageEngineImpl::closeCatalog(OperationContext* opCtx) {
         LOGV2_FOR_RECOVERY(4615632, kCatalogLogLevel.toInt(), "loadCatalog:");
         _dumpCatalog(opCtx);
     }
-    CollectionCatalog::get(opCtx).deregisterAllCollections();
+
+    CollectionCatalog::write(
+        opCtx, [&](CollectionCatalog& catalog) { catalog.deregisterAllCollections(); });
 
     _catalog.reset();
     _catalogRecordStore.reset();
@@ -679,7 +682,9 @@ void StorageEngineImpl::cleanShutdown() {
         _timestampMonitor->removeListener(&_minOfCheckpointAndOldestTimestampListener);
     }
 
-    CollectionCatalog::get(getGlobalServiceContext()).deregisterAllCollections();
+    CollectionCatalog::write(getGlobalServiceContext(), [](CollectionCatalog& catalog) {
+        catalog.deregisterAllCollections();
+    });
 
     _catalog.reset();
     _catalogRecordStore.reset();
@@ -714,7 +719,7 @@ RecoveryUnit* StorageEngineImpl::newRecoveryUnit() {
 }
 
 std::vector<std::string> StorageEngineImpl::listDatabases() const {
-    return CollectionCatalog::get(getGlobalServiceContext()).getAllDbNames();
+    return CollectionCatalog::get(getGlobalServiceContext())->getAllDbNames();
 }
 
 Status StorageEngineImpl::closeDatabase(OperationContext* opCtx, StringData db) {
@@ -723,15 +728,15 @@ Status StorageEngineImpl::closeDatabase(OperationContext* opCtx, StringData db) 
 }
 
 Status StorageEngineImpl::dropDatabase(OperationContext* opCtx, StringData db) {
+    auto catalog = CollectionCatalog::get(opCtx);
     {
-        auto dbs = CollectionCatalog::get(opCtx).getAllDbNames();
+        auto dbs = catalog->getAllDbNames();
         if (std::count(dbs.begin(), dbs.end(), db.toString()) == 0) {
             return Status(ErrorCodes::NamespaceNotFound, "db not found to drop");
         }
     }
 
-    std::vector<NamespaceString> toDrop =
-        CollectionCatalog::get(opCtx).getAllCollectionNamesFromDb(opCtx, db);
+    std::vector<NamespaceString> toDrop = catalog->getAllCollectionNamesFromDb(opCtx, db);
 
     // Do not timestamp any of the following writes. This will remove entries from the catalog as
     // well as drop any underlying tables. It's not expected for dropping tables to be reversible
@@ -773,8 +778,9 @@ Status StorageEngineImpl::_dropCollectionsNoTimestamp(OperationContext* opCtx,
 
     Status firstError = Status::OK();
     WriteUnitOfWork untimestampedDropWuow(opCtx);
+    auto collectionCatalog = CollectionCatalog::get(opCtx);
     for (auto& nss : toDrop) {
-        auto coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+        auto coll = collectionCatalog->lookupCollectionByNamespace(opCtx, nss);
 
         // No need to remove the indexes from the IndexCatalog because eliminating the Collection
         // will have the same effect.
@@ -787,7 +793,7 @@ Status StorageEngineImpl::_dropCollectionsNoTimestamp(OperationContext* opCtx,
                                  coll->getCatalogId(),
                                  coll->uuid(),
                                  coll->ns(),
-                                 ice->accessMethod()->getSharedIdent());
+                                 ice->getSharedIdent());
         }
 
         Status result = catalog::dropCollection(
@@ -796,10 +802,12 @@ Status StorageEngineImpl::_dropCollectionsNoTimestamp(OperationContext* opCtx,
             firstError = result;
         }
 
-        auto removedColl = CollectionCatalog::get(opCtx).deregisterCollection(opCtx, coll->uuid());
-        opCtx->recoveryUnit()->registerChange(
-            CollectionCatalog::get(opCtx).makeFinishDropCollectionChange(std::move(removedColl),
-                                                                         coll->uuid()));
+        std::shared_ptr<Collection> removedColl;
+        CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+            removedColl = catalog.deregisterCollection(opCtx, coll->uuid());
+        });
+        opCtx->recoveryUnit()->registerChange(CollectionCatalog::makeFinishDropCollectionChange(
+            opCtx, std::move(removedColl), coll->uuid()));
     }
 
     untimestampedDropWuow.commit();
@@ -880,9 +888,10 @@ Status StorageEngineImpl::repairRecordStore(OperationContext* opCtx,
     }
 
     // After repairing, re-initialize the collection with a valid RecordStore.
-    auto& collectionCatalog = CollectionCatalog::get(getGlobalServiceContext());
-    auto uuid = collectionCatalog.lookupUUIDByNSS(opCtx, nss).get();
-    collectionCatalog.deregisterCollection(opCtx, uuid);
+    CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
+        auto uuid = catalog.lookupUUIDByNSS(opCtx, nss).get();
+        catalog.deregisterCollection(opCtx, uuid);
+    });
     _initCollection(opCtx, catalogId, nss, false);
 
     return status;
@@ -1027,10 +1036,6 @@ Timestamp StorageEngineImpl::getAllDurableTimestamp() const {
     return _engine->getAllDurableTimestamp();
 }
 
-Timestamp StorageEngineImpl::getOldestOpenReadTimestamp() const {
-    return _engine->getOldestOpenReadTimestamp();
-}
-
 boost::optional<Timestamp> StorageEngineImpl::getOplogNeededForCrashRecovery() const {
     return _engine->getOplogNeededForCrashRecovery();
 }
@@ -1062,8 +1067,8 @@ void StorageEngineImpl::_dumpCatalog(OperationContext* opCtx) {
 void StorageEngineImpl::addDropPendingIdent(const Timestamp& dropTimestamp,
                                             const NamespaceString& nss,
                                             std::shared_ptr<Ident> ident,
-                                            const DropIdentCallback& onDrop) {
-    _dropPendingIdentReaper.addDropPendingIdent(dropTimestamp, nss, ident, onDrop);
+                                            DropIdentCallback&& onDrop) {
+    _dropPendingIdentReaper.addDropPendingIdent(dropTimestamp, nss, ident, std::move(onDrop));
 }
 
 void StorageEngineImpl::checkpoint() {
@@ -1071,13 +1076,9 @@ void StorageEngineImpl::checkpoint() {
 }
 
 void StorageEngineImpl::_onMinOfCheckpointAndOldestTimestampChanged(const Timestamp& timestamp) {
-    if (timestamp.isNull()) {
-        return;
-    }
-
     // No drop-pending idents present if getEarliestDropTimestamp() returns boost::none.
     if (auto earliestDropTimestamp = _dropPendingIdentReaper.getEarliestDropTimestamp()) {
-        if (timestamp > *earliestDropTimestamp) {
+        if (timestamp >= *earliestDropTimestamp) {
             LOGV2(22260,
                   "Removing drop-pending idents with drop timestamps before timestamp",
                   "timestamp"_attr = timestamp);
@@ -1168,6 +1169,10 @@ void StorageEngineImpl::TimestampMonitor::startup() {
                                    _currentTimestamps.minOfCheckpointAndOldest !=
                                        minOfCheckpointAndOldest) {
                             listener->notify(minOfCheckpointAndOldest);
+                        } else if (stable == Timestamp::min()) {
+                            // Special case notification of all listeners when writes do not have
+                            // timestamps. This handles standalone mode.
+                            listener->notify(Timestamp::min());
                         }
                     }
                 }

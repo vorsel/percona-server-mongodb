@@ -105,6 +105,10 @@ void HashAggStage::open(bool reOpen) {
     _commonStats.opens++;
     _children[0]->open(reOpen);
 
+    if (reOpen) {
+        _ht.clear();
+    }
+
     while (_children[0]->getNext() == PlanState::ADVANCED) {
         value::MaterializedRow key{_inKeyAccessors.size()};
         // Copy keys in order to do the lookup.
@@ -149,9 +153,23 @@ PlanState HashAggStage::getNext() {
     return trackPlanState(PlanState::ADVANCED);
 }
 
-std::unique_ptr<PlanStageStats> HashAggStage::getStats() const {
+std::unique_ptr<PlanStageStats> HashAggStage::getStats(bool includeDebugInfo) const {
     auto ret = std::make_unique<PlanStageStats>(_commonStats);
-    ret->children.emplace_back(_children[0]->getStats());
+
+    if (includeDebugInfo) {
+        DebugPrinter printer;
+        BSONObjBuilder bob;
+        bob.append("groupBySlots", _gbs);
+        if (!_aggs.empty()) {
+            BSONObjBuilder childrenBob(bob.subobjStart("expressions"));
+            for (auto&& [slot, expr] : _aggs) {
+                childrenBob.append(str::stream() << slot, printer.print(expr->debugPrint()));
+            }
+        }
+        ret->debugInfo = bob.obj();
+    }
+
+    ret->children.emplace_back(_children[0]->getStats(includeDebugInfo));
     return ret;
 }
 
@@ -161,6 +179,7 @@ const SpecificStats* HashAggStage::getSpecificStats() const {
 
 void HashAggStage::close() {
     _commonStats.closes++;
+    _ht.clear();
 }
 
 std::vector<DebugPrinter::Block> HashAggStage::debugPrint() const {

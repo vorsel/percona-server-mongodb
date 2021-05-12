@@ -32,6 +32,7 @@ global:
     cpp_namespace: "mongo"
 
 imports:
+    - "mongo/db/keypattern.idl"
     - "mongo/idl/basic_types.idl"
     - "mongo/s/sharding_types.idl"
 
@@ -44,10 +45,10 @@ enums:
             kInitializing: "initializing"
             kPreparingToDonate: "preparing-to-donate"
             kCloning: "cloning"
+            kApplying: "applying"
             kMirroring: "mirroring"
             kCommitted: "committed"
             kRenaming: "renaming"
-            kDropping: "dropping"
             kDone: "done"
             kError: "error"
 
@@ -57,7 +58,9 @@ enums:
         values:
             kUnused: "unused"
             kPreparingToDonate: "preparing-to-donate"
-            kDonating: "donating"
+            kDonatingInitialData: "donating-initial-data"
+            kDonatingOplogEntries: "donating-oplog-entries"
+            kPreparingToMirror: "preparing-to-mirror"
             kMirroring: "mirroring"
             kDropping: "dropping"
             kDone: "done"
@@ -93,7 +96,7 @@ structs:
                 type: uuid
                 description: "The UUID of the original collection being resharded."
             reshardingKey:
-                type: object_owned
+                type: KeyPattern
                 description: "The index specification document to use as the new shard key."
 
     MinFetchTimestamp:
@@ -126,3 +129,13 @@ structs:
                               the original resharding collection will be executed as distributed
                               transactions."
                 optional: true
+
+    ReshardingSourceId:
+        description: "Identifier for a shard involved in a particular resharding operation."
+        fields:
+            reshardingUUID:
+                type: uuid
+                description: "Identifier for a resharding operation."
+            shardId:
+                type: shard_id
+                description: "A shard identifier."

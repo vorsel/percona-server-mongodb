@@ -73,9 +73,16 @@ public:
 
     /**
      * Fulfills the '_allRecipientsFinishedCloning' promise when the last recipient writes that it
-     * is in 'steady-state'.
+     * has finished cloning the collection and is ready to start applying oplog entries missed
+     * during collection cloning.
      */
     SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllRecipientsFinishedCloning();
+
+    /**
+     * Fulfills the '_allRecipientsFinishedApplying' promise when the last recipient writes that it
+     * is in 'steady-state'.
+     */
+    SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllRecipientsFinishedApplying();
 
     /**
      * Fulfills the '_allRecipientsReportedStrictConsistencyTimestamp' promise when the last
@@ -85,16 +92,16 @@ public:
     SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllRecipientsInStrictConsistency();
 
     /**
-     * Fulfills the '_allDonorsDroppedOriginalCollection' promise when the last donor writes that it
-     * is in 'done' state.
-     */
-    SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllDonorsDroppedOriginalCollection();
-
-    /**
      * Fulfills the '_allRecipientsRenamedCollection' promise when the last recipient writes
      * that it is in 'done' state.
      */
     SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllRecipientsRenamedCollection();
+
+    /**
+     * Fulfills the '_allDonorsDroppedOriginalCollection' promise when the last donor writes that it
+     * is in 'done' state.
+     */
+    SharedSemiFuture<ReshardingCoordinatorDocument> awaitAllDonorsDroppedOriginalCollection();
 
     /**
      * Sets errors on any promises that have not yet been fulfilled.
@@ -113,8 +120,9 @@ private:
      * Below are the relationships between promise and expected state in
      * format: {promiseToFulfill, expectedState}
      *
-     *  {_allDonorsReportedMinFetchTimestamp, DonorStateEnum::kDonating}
-     *  {_allRecipientsFinishedCloning, RecipientStateEnum::kSteadyState}
+     *  {_allDonorsReportedMinFetchTimestamp, DonorStateEnum::kDonatingInitialData}
+     *  {_allRecipientsFinishedCloning, RecipientStateEnum::kApplying}
+     *  {_allRecipientsFinishedApplying, RecipientStateEnum::kSteadyState}
      *  {_allRecipientsReportedStrictConsistencyTimestamp, RecipientStateEnum::kStrictConsistency}
      *  {_allRecipientsRenamedCollection, RecipientStateEnum::kDone}
      *  {_allDonorsDroppedOriginalCollection, DonorStateEnum::kDone}
@@ -123,6 +131,8 @@ private:
     SharedPromise<ReshardingCoordinatorDocument> _allDonorsReportedMinFetchTimestamp;
 
     SharedPromise<ReshardingCoordinatorDocument> _allRecipientsFinishedCloning;
+
+    SharedPromise<ReshardingCoordinatorDocument> _allRecipientsFinishedApplying;
 
     SharedPromise<ReshardingCoordinatorDocument> _allRecipientsReportedStrictConsistencyTimestamp;
 

@@ -36,15 +36,14 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/query/cluster_aggregate.h"
+#include "mongo/s/stale_shard_version_helpers.h"
 
 namespace mongo {
-
 namespace {
 
 const auto getPeriodicShardedIndexConsistencyChecker =
@@ -124,17 +123,15 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
 
             try {
                 long long numShardedCollsWithInconsistentIndexes = 0;
-                auto collections =
-                    uassertStatusOK(Grid::get(opCtx)->catalogClient()->getCollections(
-                        opCtx, nullptr, nullptr, repl::ReadConcernLevel::kLocalReadConcern));
+                auto collections = Grid::get(opCtx)->catalogClient()->getCollections(
+                    opCtx, {}, repl::ReadConcernLevel::kLocalReadConcern);
 
                 for (const auto& coll : collections) {
-
                     if (coll.getDropped()) {
                         continue;
                     }
 
-                    auto nss = coll.getNs();
+                    auto nss = coll.getNss();
 
                     // The only sharded collection in the config database with indexes is
                     // config.system.sessions. Unfortunately, the code path to run aggregation
@@ -148,7 +145,7 @@ void PeriodicShardedIndexConsistencyChecker::_launchShardedIndexConsistencyCheck
                         uassertStatusOK(AggregationRequest::parseFromBSON(nss, aggRequestBSON));
 
                     auto catalogCache = Grid::get(opCtx)->catalogCache();
-                    sharded_agg_helpers::shardVersionRetry(
+                    shardVersionRetry(
                         opCtx,
                         catalogCache,
                         nss,

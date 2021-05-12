@@ -126,8 +126,8 @@ BSONObj createCommandForMergingShard(Document serializedCommand,
     mergeCmd["pipeline"] = Value(pipelineForMerging->serialize());
     mergeCmd[AggregationRequest::kFromMongosName] = Value(true);
 
-    mergeCmd[AggregationRequest::kRuntimeConstantsName] =
-        Value(mergeCtx->getRuntimeConstants().toBSON());
+    mergeCmd[AggregationRequest::kLetName] =
+        Value(mergeCtx->variablesParseState.serialize(mergeCtx->variables));
 
     // If the user didn't specify a collation already, make sure there's a collation attached to
     // the merge command, since the merging shard may not have the collection metadata.
@@ -607,13 +607,13 @@ Status runPipelineOnPrimaryShard(const boost::intrusive_ptr<ExpressionContext>& 
 
     // Format the command for the shard. This adds the 'fromMongos' field, wraps the command as an
     // explain if necessary, and rewrites the result into a format safe to forward to shards.
-    BSONObj cmdObj = applyReadWriteConcern(
-        opCtx,
-        true,     /* appendRC */
-        !explain, /* appendWC */
-        CommandHelpers::filterCommandRequestForPassthrough(
-            sharded_agg_helpers::createPassthroughCommandForShard(
-                expCtx, serializedCommand, explain, boost::none, nullptr, BSONObj())));
+    BSONObj cmdObj =
+        applyReadWriteConcern(opCtx,
+                              true,     /* appendRC */
+                              !explain, /* appendWC */
+                              CommandHelpers::filterCommandRequestForPassthrough(
+                                  sharded_agg_helpers::createPassthroughCommandForShard(
+                                      expCtx, serializedCommand, explain, nullptr, BSONObj())));
 
     const auto shardId = cm.dbPrimary();
     const auto cmdObjWithShardVersion = (shardId != ShardRegistry::kConfigServerShardId)
@@ -723,7 +723,9 @@ Status dispatchPipelineAndMerge(OperationContext* opCtx,
 
     // If we sent the entire pipeline to a single shard, store the remote cursor and return.
     if (!shardDispatchResults.splitPipeline) {
-        invariant(shardDispatchResults.remoteCursors.size() == 1);
+        tassert(4457012,
+                "pipeline was split, but more than one remote cursor is present",
+                shardDispatchResults.remoteCursors.size() == 1);
         auto&& remoteCursor = std::move(shardDispatchResults.remoteCursors.front());
         const auto shardId = remoteCursor->getShardId().toString();
         const auto reply = uassertStatusOK(storePossibleCursor(opCtx,

@@ -38,6 +38,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/hasher.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -63,6 +64,7 @@
 #include "mongo/s/request_types/clone_collection_options_from_primary_shard_gen.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/shard_util.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
@@ -108,38 +110,31 @@ boost::optional<CollectionType> checkIfCollectionAlreadyShardedWithSameOptions(
     OperationContext* opCtx, const ShardsvrShardCollectionRequest& request) {
     auto const catalogClient = Grid::get(opCtx)->catalogClient();
 
-    auto swCollStatus = catalogClient->getCollection(opCtx,
-                                                     *request.get_shardsvrShardCollection(),
-                                                     repl::ReadConcernLevel::kMajorityReadConcern);
-    if (swCollStatus == ErrorCodes::NamespaceNotFound) {
+    CollectionType existingColl;
+    try {
+        existingColl = catalogClient->getCollection(opCtx,
+                                                    *request.get_shardsvrShardCollection(),
+                                                    repl::ReadConcernLevel::kMajorityReadConcern);
+    } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
         // Not currently sharded.
         return boost::none;
     }
 
-    const auto existingOptions = uassertStatusOK(std::move(swCollStatus)).value;
-
-    CollectionType requestedOptions;
-    requestedOptions.setNs(*request.get_shardsvrShardCollection());
-    requestedOptions.setKeyPattern(KeyPattern(request.getKey()));
-    requestedOptions.setDefaultCollation(*request.getCollation());
-    requestedOptions.setUnique(request.getUnique());
-
-    // Set the distributionMode to "sharded" because this CollectionType represents the requested
-    // target state for the collection after shardCollection. The requested CollectionType will be
-    // compared with the existing CollectionType below, and if the existing CollectionType either
-    // does not have a distributionMode (FCV 4.2) or has distributionMode "sharded" (FCV 4.4), the
-    // collection will be considered to already be in its target state.
-    requestedOptions.setDistributionMode(CollectionType::DistributionMode::kSharded);
+    CollectionType newColl(
+        *request.get_shardsvrShardCollection(), OID::gen(), Date_t::now(), UUID::gen());
+    newColl.setKeyPattern(KeyPattern(request.getKey()));
+    newColl.setDefaultCollation(*request.getCollation());
+    newColl.setUnique(request.getUnique());
 
     // If the collection is already sharded, fail if the deduced options in this request do not
     // match the options the collection was originally sharded with.
     uassert(ErrorCodes::AlreadyInitialized,
             str::stream() << "sharding already enabled for collection "
                           << *request.get_shardsvrShardCollection() << " with options "
-                          << existingOptions.toString(),
-            requestedOptions.hasSameOptions(existingOptions));
+                          << existingColl.toString(),
+            newColl.hasSameOptions(existingColl));
 
-    return existingOptions;
+    return existingColl;
 }
 
 void checkForExistingChunks(OperationContext* opCtx, const NamespaceString& nss) {
@@ -478,15 +473,18 @@ void updateShardingCatalogEntryForCollection(
                                               ->makeFromBSON(defaultCollation));
     }
 
-    CollectionType coll;
-    coll.setNs(nss);
-    coll.setUUID(prerequisites.uuid);
-    coll.setEpoch(initialChunks.collVersion().epoch());
-    coll.setUpdatedAt(Date_t::fromMillisSinceEpoch(initialChunks.collVersion().toLong()));
+    boost::optional<Timestamp> creationTime;
+    if (feature_flags::gShardingFullDDLSupport.isEnabled(serverGlobalParams.featureCompatibility)) {
+        creationTime = initialChunks.creationTime;
+    }
+
+    CollectionType coll(
+        nss, initialChunks.collVersion().epoch(), creationTime, Date_t::now(), prerequisites.uuid);
     coll.setKeyPattern(prerequisites.shardKeyPattern.toBSON());
-    coll.setDefaultCollation(defaultCollator ? defaultCollator->getSpec().toBSON() : BSONObj());
+    if (defaultCollator) {
+        coll.setDefaultCollation(defaultCollator->getSpec().toBSON());
+    }
     coll.setUnique(unique);
-    coll.setDistributionMode(CollectionType::DistributionMode::kSharded);
 
     uassertStatusOK(ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
         opCtx, nss, coll, true /*upsert*/));
@@ -537,10 +535,7 @@ UUID shardCollection(OperationContext* opCtx,
                      const ShardId& dbPrimaryShardId) {
     // Fast check for whether the collection is already sharded without taking any locks
     if (auto collectionOptional = checkIfCollectionAlreadyShardedWithSameOptions(opCtx, request)) {
-        uassert(ErrorCodes::InvalidUUID,
-                str::stream() << "Collection " << nss << " is sharded without UUID",
-                collectionOptional->getUUID());
-        return *collectionOptional->getUUID();
+        return collectionOptional->getUuid();
     }
 
     auto writeChunkDocumentsAndRefreshShards =
@@ -573,6 +568,15 @@ UUID shardCollection(OperationContext* opCtx,
     std::unique_ptr<InitialSplitPolicy> splitPolicy;
     InitialSplitPolicy::ShardCollectionConfig initialChunks;
 
+    bool shouldUseUUIDForChunkIndexing;
+    {
+        invariant(!opCtx->lockState()->isLocked());
+        Lock::SharedLock fcvLock(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
+        shouldUseUUIDForChunkIndexing = feature_flags::gShardingFullDDLSupport.isEnabled(
+            serverGlobalParams.featureCompatibility);
+        // TODO SERVER-53092: persist FCV placeholder
+    }
+
     {
         pauseShardCollectionBeforeCriticalSection.pauseWhileSet();
 
@@ -584,10 +588,7 @@ UUID shardCollection(OperationContext* opCtx,
 
         if (auto collectionOptional =
                 checkIfCollectionAlreadyShardedWithSameOptions(opCtx, request)) {
-            uassert(ErrorCodes::InvalidUUID,
-                    str::stream() << "Collection " << nss << " is sharded without UUID",
-                    collectionOptional->getUUID());
-            return *collectionOptional->getUUID();
+            return collectionOptional->getUuid();
         }
 
         // Fail if there are partially written chunks from a previous failed shardCollection.
@@ -603,8 +604,14 @@ UUID shardCollection(OperationContext* opCtx,
                                                               targetState->tags,
                                                               getNumShards(opCtx),
                                                               targetState->collectionIsEmpty);
+
+        boost::optional<CollectionUUID> optCollectionUUID;
+        if (shouldUseUUIDForChunkIndexing) {
+            optCollectionUUID = targetState->uuid;
+        }
+
         initialChunks = splitPolicy->createFirstChunks(
-            opCtx, targetState->shardKeyPattern, {nss, dbPrimaryShardId});
+            opCtx, targetState->shardKeyPattern, {nss, optCollectionUUID, dbPrimaryShardId});
 
         logStartShardCollection(opCtx, cmdObj, nss, request, *targetState, dbPrimaryShardId);
 
@@ -626,6 +633,8 @@ UUID shardCollection(OperationContext* opCtx,
     if (!splitPolicy->isOptimized()) {
         writeChunkDocumentsAndRefreshShards(*targetState, initialChunks);
     }
+
+    // TODO SERVER-53092: delete FCV placeholder
 
     LOGV2(22101,
           "Created {numInitialChunks} chunk(s) for: {namespace}, producing collection version "

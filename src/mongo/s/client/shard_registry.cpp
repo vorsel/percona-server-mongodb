@@ -174,10 +174,8 @@ ShardRegistry::Cache::LookupResult ShardRegistry::_lookup(OperationContext* opCt
     auto [latestConnStrings, rsmIncrementForConnStrings] = _getLatestConnStrings();
 
     for (const auto& latestConnString : latestConnStrings) {
-        // TODO SERVER-50909: Optimise by only doing this work if the latest conn string differs.
-
         auto shard = returnData.findByRSName(latestConnString.first.toString());
-        if (!shard) {
+        if (shard == nullptr || shard->getConnString() == latestConnString.second) {
             continue;
         }
 
@@ -330,16 +328,18 @@ std::shared_ptr<Shard> ShardRegistry::getConfigShard() const {
 
 StatusWith<std::shared_ptr<Shard>> ShardRegistry::getShard(OperationContext* opCtx,
                                                            const ShardId& shardId) {
-    // First check if this is a config shard lookup.
+    // First check if this is a non config shard lookup
+    // This call will may be blocking if there is an ongoing or a need of a cache rebuild
+    if (auto shard = _getData(opCtx)->findShard(shardId)) {
+        return shard;
+    }
+
+    // then check if this is a config shard (this call is blocking in any case)
     {
         stdx::lock_guard<Latch> lk(_mutex);
         if (auto shard = _configShardData.findShard(shardId)) {
             return shard;
         }
-    }
-
-    if (auto shard = _getData(opCtx)->findShard(shardId)) {
-        return shard;
     }
 
     // Reload and try again if the shard was not in the registry
@@ -383,76 +383,59 @@ void ShardRegistry::_removeReplicaSet(const std::string& setName) {
 
 void ShardRegistry::updateReplSetHosts(const ConnectionString& givenConnString,
                                        ConnectionStringUpdateType updateType) {
-    invariant(givenConnString.type() == ConnectionString::SET ||
-              givenConnString.type() == ConnectionString::CUSTOM);  // For dbtests
+    invariant(givenConnString.type() == ConnectionString::ConnectionType::kReplicaSet ||
+              givenConnString.type() == ConnectionString::ConnectionType::kCustom);  // For dbtests
 
     auto setName = givenConnString.getSetName();
 
-    stdx::lock_guard<Latch> lk(_mutex);
+    {
+        stdx::lock_guard<Latch> lk(_mutex);
 
-    ConnectionString newConnString = (updateType == ConnectionStringUpdateType::kPossible &&
-                                      _latestConnStrings.find(setName) != _latestConnStrings.end())
-        ? _latestConnStrings[setName].makeUnionWith(givenConnString)
-        : givenConnString;
+        ConnectionString newConnString =
+            (updateType == ConnectionStringUpdateType::kPossible &&
+             _latestConnStrings.find(setName) != _latestConnStrings.end())
+            ? _latestConnStrings[setName].makeUnionWith(givenConnString)
+            : givenConnString;
 
-    LOGV2_DEBUG(5123001,
-                1,
-                "Updating ShardRegistry connection string",
-                "updateType"_attr =
-                    updateType == ConnectionStringUpdateType::kPossible ? "possible" : "confirmed",
-                "currentConnString"_attr = _latestConnStrings[setName].toString(),
-                "givenConnString"_attr = givenConnString.toString(),
-                "newConnString"_attr = newConnString.toString());
+        LOGV2_DEBUG(5123001,
+                    1,
+                    "Updating ShardRegistry connection string",
+                    "updateType"_attr = updateType == ConnectionStringUpdateType::kPossible
+                        ? "possible"
+                        : "confirmed",
+                    "currentConnString"_attr = _latestConnStrings[setName].toString(),
+                    "givenConnString"_attr = givenConnString.toString(),
+                    "newConnString"_attr = newConnString.toString());
 
-    _latestConnStrings[setName] = newConnString;
+        _latestConnStrings[setName] = newConnString;
 
-    if (auto shard = _configShardData.findByRSName(setName)) {
-        auto newData = ShardRegistryData::createFromExisting(
-            _configShardData, newConnString, _shardFactory.get());
-        _configShardData = newData;
+        if (auto shard = _configShardData.findByRSName(setName)) {
+            auto newData = ShardRegistryData::createFromExisting(
+                _configShardData, newConnString, _shardFactory.get());
+            _configShardData = newData;
 
-    } else {
-        auto value = _rsmIncrement.addAndFetch(1);
-        LOGV2_DEBUG(4620252,
-                    2,
-                    "Incrementing the RSM timestamp after receiving updated connection string",
-                    "newConnString"_attr = newConnString,
-                    "newRSMIncrement"_attr = value);
+        } else {
+            auto value = _rsmIncrement.addAndFetch(1);
+            LOGV2_DEBUG(4620252,
+                        2,
+                        "Incrementing the RSM timestamp after receiving updated connection string",
+                        "newConnString"_attr = newConnString,
+                        "newRSMIncrement"_attr = value);
+        }
     }
 
     // Schedule a lookup, to incorporate the new connection string.
-    // TODO SERVER-50910: To avoid needing to use a separate thread to schedule the lookup, make
-    // _getData() async.
-    auto status = Grid::get(_service)->getExecutorPool()->getFixedExecutor()->scheduleWork(
-        [this](const CallbackArgs& cbArgs) {
-            ThreadClient tc("shard-registry-rsm-reload", _service);
-
-            auto opCtx = tc->makeOperationContext();
-
-            try {
-                _getData(opCtx.get());
-            } catch (const DBException& e) {
+    _getDataAsync()
+        .thenRunOn(Grid::get(_service)->getExecutorPool()->getFixedExecutor())
+        .ignoreValue()
+        .getAsync([](const Status& status) {
+            if (!status.isOK()) {
                 LOGV2(4620201,
                       "Error running reload of ShardRegistry for RSM update, caused by {error}",
                       "Error running reload of ShardRegistry for RSM update",
-                      "error"_attr = redact(e));
+                      "error"_attr = redact(status));
             }
         });
-
-    if (status.getStatus() == ErrorCodes::ShutdownInProgress) {
-        LOGV2_DEBUG(
-            4620202,
-            1,
-            "Can't schedule ShardRegistry reload for RSM update, executor shutdown in progress");
-        return;
-    }
-
-    if (!status.isOK()) {
-        LOGV2_FATAL(4620203,
-                    "Error scheduling ShardRegistry reload for RSM update, caused by {error}",
-                    "Error scheduling ShardRegistry reload for RSM update",
-                    "error"_attr = redact(status.getStatus()));
-    }
 }
 
 std::unique_ptr<Shard> ShardRegistry::createConnection(const ConnectionString& connStr) const {
@@ -545,7 +528,7 @@ void ShardRegistry::_initializeCacheIfNecessary() const {
     }
 }
 
-ShardRegistry::Cache::ValueHandle ShardRegistry::_getData(OperationContext* opCtx) {
+SharedSemiFuture<ShardRegistry::Cache::ValueHandle> ShardRegistry::_getDataAsync() {
     _initializeCacheIfNecessary();
 
     // If the forceReloadIncrement is 0, then we've never done a lookup, so we should be sure to do
@@ -554,7 +537,7 @@ ShardRegistry::Cache::ValueHandle ShardRegistry::_getData(OperationContext* opCt
     _forceReloadIncrement.compareAndSwap(&uninitializedIncrement, 1);
 
     // Update the time the cache should be aiming for.
-    auto now = VectorClock::get(opCtx)->getTime();
+    auto now = VectorClock::get(_service)->getTime();
     // The topologyTime should be advanced to either the actual topologyTime (if it is being
     // gossiped), or else the previously cached topologyTime value (so that this part of the cache's
     // time doesn't advance, if topologyTime isn't being gossiped).
@@ -564,7 +547,11 @@ ShardRegistry::Cache::ValueHandle ShardRegistry::_getData(OperationContext* opCt
     _cache->advanceTimeInStore(
         _kSingleton, Time(topologyTime, _rsmIncrement.load(), _forceReloadIncrement.load()));
 
-    return _cache->acquire(opCtx, _kSingleton, CacheCausalConsistency::kLatestKnown);
+    return _cache->acquireAsync(_kSingleton, CacheCausalConsistency::kLatestKnown);
+}
+
+ShardRegistry::Cache::ValueHandle ShardRegistry::_getData(OperationContext* opCtx) {
+    return _getDataAsync().get(opCtx);
 }
 
 // TODO SERVER-50206: Remove usage of these non-causally consistent accessors.
@@ -830,10 +817,10 @@ void ShardRegistryData::_addShard(std::shared_ptr<Shard> shard) {
                 "Adding new shard to shard registry",
                 "shardId"_attr = shard->getId(),
                 "shardConnectionString"_attr = connString);
-    if (connString.type() == ConnectionString::SET) {
+    if (connString.type() == ConnectionString::ConnectionType::kReplicaSet) {
         _rsLookup[connString.getSetName()] = shard;
-    } else if (connString.type() == ConnectionString::CUSTOM) {
-        // CUSTOM connection strings (ie "$dummy:10000) become DBDirectClient connections which
+    } else if (connString.type() == ConnectionString::ConnectionType::kCustom) {
+        // kCustom connection strings (ie "$dummy:10000) become DBDirectClient connections which
         // always return "localhost" as their response to getServerAddress().  This is just for
         // making dbtest work.
         _shardIdLookup[ShardId("localhost")] = shard;

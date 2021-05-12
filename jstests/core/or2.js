@@ -2,9 +2,6 @@ t = db.jstests_or2;
 t.drop();
 
 // Include helpers for analyzing explain output.
-// @tags: [
-//   sbe_incompatible,
-// ]
 load("jstests/libs/analyze_plan.js");
 
 checkArrs = function(a, b) {
@@ -72,17 +69,17 @@ doTest = function(index) {
 
 doTest(false);
 
-t.ensureIndex({x: 1});
+t.createIndex({x: 1});
 doTest();
 
 t.drop();
-t.ensureIndex({x: 1, a: 1});
+t.createIndex({x: 1, a: 1});
 doTest();
 
 t.drop();
-t.ensureIndex({x: 1, b: 1});
+t.createIndex({x: 1, b: 1});
 doTest();
 
 t.drop();
-t.ensureIndex({x: 1, a: 1, b: 1});
+t.createIndex({x: 1, a: 1, b: 1});
 doTest();

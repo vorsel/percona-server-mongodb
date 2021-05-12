@@ -37,10 +37,28 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/resharding_util.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/grid.h"
 
 namespace mongo {
 namespace {
+void refreshTemporaryReshardingCollection(const ReshardingDonorDocument& donorDoc) {
+    auto opCtx = cc().makeOperationContext();
+
+    auto tempNss =
+        constructTemporaryReshardingNss(donorDoc.getNss().db(), donorDoc.getExistingUUID());
+
+    auto tempNssRoutingInfo =
+        Grid::get(opCtx.get())
+            ->catalogCache()
+            ->getShardedCollectionRoutingInfoWithRefresh(opCtx.get(), tempNss);
+    uassertStatusOK(tempNssRoutingInfo);
+    CatalogCacheLoader::get(opCtx.get()).waitForCollectionFlush(opCtx.get(), tempNss);
+}
+
 Timestamp generateMinFetchTimestamp(const ReshardingDonorDocument& donorDoc) {
     auto opCtx = cc().makeOperationContext();
 
@@ -94,19 +112,25 @@ ReshardingDonorService::DonorStateMachine::DonorStateMachine(const BSONObj& dono
 
 ReshardingDonorService::DonorStateMachine::~DonorStateMachine() {
     stdx::lock_guard<Latch> lg(_mutex);
+    invariant(_allRecipientsDoneCloning.getFuture().isReady());
     invariant(_allRecipientsDoneApplying.getFuture().isReady());
     invariant(_coordinatorHasCommitted.getFuture().isReady());
     invariant(_completionPromise.getFuture().isReady());
 }
 
-void ReshardingDonorService::DonorStateMachine::run(
-    std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept {
-    ExecutorFuture<void>(**executor)
-        .then([this] { _transitionToPreparingToDonate(); })
-        .then([this] { _onPreparingToDonateCalculateMinFetchTimestampThenBeginDonating(); })
+SemiFuture<void> ReshardingDonorService::DonorStateMachine::run(
+    std::shared_ptr<executor::ScopedTaskExecutor> executor,
+    const CancelationToken& token) noexcept {
+    return ExecutorFuture<void>(**executor)
+        .then(
+            [this] { _onPreparingToDonateCalculateTimestampThenTransitionToDonatingInitialData(); })
         .then([this, executor] {
-            return _awaitAllRecipientsDoneApplyingThenStartMirroring(executor);
+            return _awaitAllRecipientsDoneCloningThenTransitionToDonatingOplogEntries(executor);
         })
+        .then([this, executor] {
+            return _awaitAllRecipientsDoneApplyingThenTransitionToPreparingToMirror(executor);
+        })
+        .then([this] { _writeTransactionOplogEntryThenTransitionToMirroring(); })
         .then([this, executor] {
             return _awaitCoordinatorHasCommittedThenTransitionToDropping(executor);
         })
@@ -122,7 +146,7 @@ void ReshardingDonorService::DonorStateMachine::run(
             this->_transitionStateToError(status);
             return status;
         })
-        .getAsync([this](Status status) {
+        .onCompletion([this](Status status) {
             stdx::lock_guard<Latch> lg(_mutex);
             if (_completionPromise.getFuture().isReady()) {
                 // interrupt() was called before we got here.
@@ -134,12 +158,17 @@ void ReshardingDonorService::DonorStateMachine::run(
             } else {
                 _completionPromise.setError(status);
             }
-        });
+        })
+        .semi();
 }
 
 void ReshardingDonorService::DonorStateMachine::interrupt(Status status) {
     // Resolve any unresolved promises to avoid hanging.
     stdx::lock_guard<Latch> lg(_mutex);
+    if (!_allRecipientsDoneCloning.getFuture().isReady()) {
+        _allRecipientsDoneCloning.setError(status);
+    }
+
     if (!_allRecipientsDoneApplying.getFuture().isReady()) {
         _allRecipientsDoneApplying.setError(status);
     }
@@ -156,35 +185,61 @@ void ReshardingDonorService::DonorStateMachine::interrupt(Status status) {
 void ReshardingDonorService::DonorStateMachine::onReshardingFieldsChanges(
     boost::optional<TypeCollectionReshardingFields> reshardingFields) {}
 
-void ReshardingDonorService::DonorStateMachine::_transitionToPreparingToDonate() {
-    if (_donorDoc.getState() > DonorStateEnum::kUnused) {
-        return;
-    }
-
-    _transitionState(DonorStateEnum::kPreparingToDonate);
-}
-
 void ReshardingDonorService::DonorStateMachine::
-    _onPreparingToDonateCalculateMinFetchTimestampThenBeginDonating() {
+    _onPreparingToDonateCalculateTimestampThenTransitionToDonatingInitialData() {
     if (_donorDoc.getState() > DonorStateEnum::kPreparingToDonate) {
         invariant(_donorDoc.getMinFetchTimestamp());
         return;
     }
 
+    _insertDonorDocument(_donorDoc);
+
+    // Recipient shards expect to read from the donor shard's existing sharded collection
+    // and the config.cache.chunks collection of the temporary resharding collection using
+    // {atClusterTime: <fetchTimestamp>}. Refreshing the temporary resharding collection on
+    // the donor shards causes them to create the config.cache.chunks collection. Without
+    // this refresh, the {atClusterTime: <fetchTimestamp>} read on the config.cache.chunks
+    // namespace would fail with a SnapshotUnavailable error response.
+    refreshTemporaryReshardingCollection(_donorDoc);
+
     auto minFetchTimestamp = generateMinFetchTimestamp(_donorDoc);
-    _transitionState(DonorStateEnum::kDonating, minFetchTimestamp);
+    _transitionStateAndUpdateCoordinator(DonorStateEnum::kDonatingInitialData, minFetchTimestamp);
+
+    // TODO SERVER-XXXXX Remove this line.
+    interrupt({ErrorCodes::InternalError, "Artificial interruption to enable jsTests"});
 }
 
-ExecutorFuture<void>
-ReshardingDonorService::DonorStateMachine::_awaitAllRecipientsDoneApplyingThenStartMirroring(
-    const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
-    if (_donorDoc.getState() > DonorStateEnum::kDonating) {
+ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::
+    _awaitAllRecipientsDoneCloningThenTransitionToDonatingOplogEntries(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
+    if (_donorDoc.getState() > DonorStateEnum::kDonatingInitialData) {
+        return ExecutorFuture<void>(**executor, Status::OK());
+    }
+
+    return _allRecipientsDoneCloning.getFuture().thenRunOn(**executor).then([this]() {
+        _transitionState(DonorStateEnum::kDonatingOplogEntries);
+    });
+}
+
+ExecutorFuture<void> ReshardingDonorService::DonorStateMachine::
+    _awaitAllRecipientsDoneApplyingThenTransitionToPreparingToMirror(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
+    if (_donorDoc.getState() > DonorStateEnum::kDonatingOplogEntries) {
         return ExecutorFuture<void>(**executor, Status::OK());
     }
 
     return _allRecipientsDoneApplying.getFuture().thenRunOn(**executor).then([this]() {
-        _transitionState(DonorStateEnum::kMirroring);
+        _transitionState(DonorStateEnum::kPreparingToMirror);
     });
+}
+
+void ReshardingDonorService::DonorStateMachine::
+    _writeTransactionOplogEntryThenTransitionToMirroring() {
+    if (_donorDoc.getState() > DonorStateEnum::kPreparingToMirror) {
+        return;
+    }
+
+    _transitionState(DonorStateEnum::kMirroring);
 }
 
 ExecutorFuture<void>
@@ -204,18 +259,13 @@ void ReshardingDonorService::DonorStateMachine::_dropOriginalCollectionThenDelet
         return;
     }
 
-    _transitionState(DonorStateEnum::kDone);
+    _transitionStateAndUpdateCoordinator(DonorStateEnum::kDone);
 }
 
 void ReshardingDonorService::DonorStateMachine::_transitionState(
     DonorStateEnum endState, boost::optional<Timestamp> minFetchTimestamp) {
     ReshardingDonorDocument replacementDoc(_donorDoc);
     replacementDoc.setState(endState);
-    if (endState == DonorStateEnum::kPreparingToDonate) {
-        _insertDonorDocument(std::move(replacementDoc));
-        return;
-    }
-
     if (minFetchTimestamp) {
         auto& minFetchTimestampStruct = replacementDoc.getMinFetchTimestampStruct();
         if (minFetchTimestampStruct.getMinFetchTimestamp())
@@ -226,6 +276,31 @@ void ReshardingDonorService::DonorStateMachine::_transitionState(
     }
 
     _updateDonorDocument(std::move(replacementDoc));
+}
+
+void ReshardingDonorService::DonorStateMachine::_transitionStateAndUpdateCoordinator(
+    DonorStateEnum endState, boost::optional<Timestamp> minFetchTimestamp) {
+    _transitionState(endState, minFetchTimestamp);
+
+    auto opCtx = cc().makeOperationContext();
+    auto shardId = ShardingState::get(opCtx.get())->shardId();
+
+    BSONObjBuilder updateBuilder;
+    updateBuilder.append("donorShards.$.state", DonorState_serializer(endState));
+
+    if (minFetchTimestamp) {
+        updateBuilder.append("donorShards.$.minFetchTimestamp", minFetchTimestamp.get());
+    }
+
+    uassertStatusOK(
+        Grid::get(opCtx.get())
+            ->catalogClient()
+            ->updateConfigDocument(opCtx.get(),
+                                   NamespaceString::kConfigReshardingOperationsNamespace,
+                                   BSON("_id" << _donorDoc.get_id() << "donorShards.id" << shardId),
+                                   BSON("$set" << updateBuilder.done()),
+                                   false /* upsert */,
+                                   ShardingCatalogClient::kMajorityWriteConcern));
 }
 
 void ReshardingDonorService::DonorStateMachine::_transitionStateToError(const Status& status) {

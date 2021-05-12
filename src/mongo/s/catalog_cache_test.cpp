@@ -134,7 +134,7 @@ protected:
         const auto scopedChunksProv = scopedChunksProvider(makeChunks(version));
 
         const auto swChunkManager =
-            _catalogCache->getCollectionRoutingInfo(operationContext(), coll.getNs());
+            _catalogCache->getCollectionRoutingInfo(operationContext(), coll.getNss());
         ASSERT_OK(swChunkManager.getStatus());
     }
 
@@ -158,9 +158,7 @@ protected:
     }
 
     CollectionType makeCollectionType(const ChunkVersion& collVersion) {
-        CollectionType coll;
-        coll.setNs(kNss);
-        coll.setEpoch(collVersion.epoch());
+        CollectionType coll(kNss, collVersion.epoch(), Date_t::now(), UUID::gen());
         coll.setKeyPattern(kShardKeyPattern.getKeyPattern());
         coll.setUnique(false);
         return coll;
@@ -179,7 +177,7 @@ protected:
 
 TEST_F(CatalogCacheTest, GetDatabase) {
     const auto dbName = "testDB";
-    const auto dbVersion = DatabaseVersion(UUID::gen(), 1);
+    const auto dbVersion = DatabaseVersion(UUID::gen());
     _catalogCacheLoader->setDatabaseRefreshReturnValue(
         DatabaseType(dbName, kShards[0], true, dbVersion));
 
@@ -195,7 +193,7 @@ TEST_F(CatalogCacheTest, GetDatabase) {
 
 TEST_F(CatalogCacheTest, GetCachedDatabase) {
     const auto dbName = "testDB";
-    const auto dbVersion = DatabaseVersion(UUID::gen(), 1);
+    const auto dbVersion = DatabaseVersion(UUID::gen());
     loadDatabases({DatabaseType(dbName, kShards[0], true, dbVersion)});
 
     const auto swDatabase = _catalogCache->getDatabase(operationContext(), dbName);
@@ -210,7 +208,7 @@ TEST_F(CatalogCacheTest, GetCachedDatabase) {
 
 TEST_F(CatalogCacheTest, InvalidateSingleDbOnShardRemoval) {
     const auto dbName = "testDB";
-    const auto dbVersion = DatabaseVersion(UUID::gen(), 1);
+    const auto dbVersion = DatabaseVersion(UUID::gen());
     loadDatabases({DatabaseType(dbName, kShards[0], true, dbVersion)});
 
     _catalogCache->invalidateEntriesThatReferenceShard(kShards[0]);
@@ -225,7 +223,7 @@ TEST_F(CatalogCacheTest, InvalidateSingleDbOnShardRemoval) {
 
 TEST_F(CatalogCacheTest, OnStaleDatabaseVersionNoVersion) {
     // onStaleDatabaseVesrsion must invalidate the database entry if invoked with no version
-    const auto dbVersion = DatabaseVersion(UUID::gen(), 1);
+    const auto dbVersion = DatabaseVersion(UUID::gen());
     loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
 
     _catalogCache->onStaleDatabaseVersion(kNss.db(), boost::none);
@@ -235,7 +233,7 @@ TEST_F(CatalogCacheTest, OnStaleDatabaseVersionNoVersion) {
 }
 
 TEST_F(CatalogCacheTest, OnStaleShardVersionWithSameVersion) {
-    const auto dbVersion = DatabaseVersion(UUID::gen(), 1);
+    const auto dbVersion = DatabaseVersion(UUID::gen());
     const auto cachedCollVersion = ChunkVersion(1, 0, OID::gen());
 
     loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
@@ -246,7 +244,7 @@ TEST_F(CatalogCacheTest, OnStaleShardVersionWithSameVersion) {
 }
 
 TEST_F(CatalogCacheTest, OnStaleShardVersionWithNoVersion) {
-    const auto dbVersion = DatabaseVersion(UUID::gen(), 1);
+    const auto dbVersion = DatabaseVersion(UUID::gen());
     const auto cachedCollVersion = ChunkVersion(1, 0, OID::gen());
 
     loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
@@ -259,7 +257,7 @@ TEST_F(CatalogCacheTest, OnStaleShardVersionWithNoVersion) {
 }
 
 TEST_F(CatalogCacheTest, OnStaleShardVersionWithGraterVersion) {
-    const auto dbVersion = DatabaseVersion(UUID::gen(), 1);
+    const auto dbVersion = DatabaseVersion(UUID::gen());
     const auto cachedCollVersion = ChunkVersion(1, 0, OID::gen());
     const auto wantedCollVersion = ChunkVersion(2, 0, cachedCollVersion.epoch());
 
@@ -287,7 +285,7 @@ TEST_F(CatalogCacheTest, CheckEpochNoDatabase) {
 }
 
 TEST_F(CatalogCacheTest, CheckEpochNoCollection) {
-    const auto dbVersion = DatabaseVersion(UUID::gen(), 1);
+    const auto dbVersion = DatabaseVersion(UUID::gen());
     const auto collVersion = ChunkVersion(1, 0, OID::gen());
 
     loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
@@ -304,7 +302,7 @@ TEST_F(CatalogCacheTest, CheckEpochNoCollection) {
 }
 
 TEST_F(CatalogCacheTest, CheckEpochUnshardedCollection) {
-    const auto dbVersion = DatabaseVersion(UUID::gen(), 1);
+    const auto dbVersion = DatabaseVersion(UUID::gen());
     const auto collVersion = ChunkVersion(1, 0, OID::gen());
 
     loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});
@@ -322,7 +320,7 @@ TEST_F(CatalogCacheTest, CheckEpochUnshardedCollection) {
 }
 
 TEST_F(CatalogCacheTest, CheckEpochWithMismatch) {
-    const auto dbVersion = DatabaseVersion(UUID::gen(), 1);
+    const auto dbVersion = DatabaseVersion(UUID::gen());
     const auto wantedCollVersion = ChunkVersion(1, 0, OID::gen());
     const auto receivedCollVersion = ChunkVersion(1, 0, OID::gen());
 
@@ -344,7 +342,7 @@ TEST_F(CatalogCacheTest, CheckEpochWithMismatch) {
 }
 
 TEST_F(CatalogCacheTest, CheckEpochWithMatch) {
-    const auto dbVersion = DatabaseVersion(UUID::gen(), 1);
+    const auto dbVersion = DatabaseVersion(UUID::gen());
     const auto collVersion = ChunkVersion(1, 0, OID::gen());
 
     loadDatabases({DatabaseType(kNss.db().toString(), kShards[0], true, dbVersion)});

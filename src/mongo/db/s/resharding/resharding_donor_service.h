@@ -73,7 +73,8 @@ public:
 
     ~DonorStateMachine();
 
-    void run(std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept override;
+    SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                         const CancelationToken& token) noexcept override;
 
     void interrupt(Status status) override;
 
@@ -101,10 +102,15 @@ private:
     // The following functions correspond to the actions to take at a particular donor state.
     void _transitionToPreparingToDonate();
 
-    void _onPreparingToDonateCalculateMinFetchTimestampThenBeginDonating();
+    void _onPreparingToDonateCalculateTimestampThenTransitionToDonatingInitialData();
 
-    ExecutorFuture<void> _awaitAllRecipientsDoneApplyingThenStartMirroring(
+    ExecutorFuture<void> _awaitAllRecipientsDoneCloningThenTransitionToDonatingOplogEntries(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+
+    ExecutorFuture<void> _awaitAllRecipientsDoneApplyingThenTransitionToPreparingToMirror(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+
+    void _writeTransactionOplogEntryThenTransitionToMirroring();
 
     ExecutorFuture<void> _awaitCoordinatorHasCommittedThenTransitionToDropping(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
@@ -114,6 +120,9 @@ private:
     // Transitions the state on-disk and in-memory to 'endState'.
     void _transitionState(DonorStateEnum endState,
                           boost::optional<Timestamp> minFetchTimestamp = boost::none);
+
+    void _transitionStateAndUpdateCoordinator(
+        DonorStateEnum endState, boost::optional<Timestamp> minFetchTimestamp = boost::none);
 
     // Transitions the state on-disk and in-memory to kError.
     void _transitionStateToError(const Status& status);
@@ -136,6 +145,8 @@ private:
 
     // Each promise below corresponds to a state on the donor state machine. They are listed in
     // ascending order, such that the first promise below will be the first promise fulfilled.
+    SharedPromise<void> _allRecipientsDoneCloning;
+
     SharedPromise<void> _allRecipientsDoneApplying;
 
     SharedPromise<void> _coordinatorHasCommitted;

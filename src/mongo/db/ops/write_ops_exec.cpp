@@ -218,7 +218,7 @@ void makeCollection(OperationContext* opCtx, const NamespaceString& ns) {
         Lock::CollectionLock collLock(opCtx, ns, MODE_IX);
 
         assertCanWrite_inlock(opCtx, ns);
-        if (!CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+        if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
                 opCtx,
                 ns)) {  // someone else may have beat us to it.
             uassertStatusOK(userAllowedCreateNS(ns));
@@ -272,6 +272,13 @@ bool handleError(OperationContext* opCtx,
         // Since this is a routing error, it is guaranteed that all subsequent operations will fail
         // with the same cause, so don't try doing any more operations. The command reply serializer
         // will handle repeating this error for unordered writes.
+        out->results.emplace_back(ex.toStatus());
+        return false;
+    }
+
+    if (ErrorCodes::isTenantMigrationError(ex)) {
+        // If an op fails due to a TenantMigrationError then subsequent ops will also fail due to a
+        // migration blocking, committing, or aborting.
         out->results.emplace_back(ex.toStatus());
         return false;
     }
@@ -394,7 +401,7 @@ bool insertBatchAndHandleErrors(OperationContext* opCtx,
         }
 
         curOp.raiseDbProfileLevel(
-            CollectionCatalog::get(opCtx).getDatabaseProfileLevel(wholeOp.getNamespace().db()));
+            CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(wholeOp.getNamespace().db()));
         assertCanWrite_inlock(opCtx, wholeOp.getNamespace());
 
         CurOpFailpointHelpers::waitWhileFailPointEnabled(
@@ -541,7 +548,7 @@ WriteResult performInserts(OperationContext* opCtx,
 
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
-    DisableDocumentValidationIfTrue docValidationDisabler(
+    DisableDocumentSchemaValidationIfTrue docSchemaValidationDisabler(
         opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
     LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
 
@@ -560,26 +567,24 @@ WriteResult performInserts(OperationContext* opCtx,
 
     for (auto&& doc : wholeOp.getDocuments()) {
         const bool isLastDoc = (&doc == &wholeOp.getDocuments().back());
-        auto fixedDoc = fixDocumentForInsert(opCtx->getServiceContext(), doc);
+        auto fixedDoc = fixDocumentForInsert(opCtx, doc);
+        const StmtId stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
+        const bool wasAlreadyExecuted = opCtx->getTxnNumber() &&
+            !opCtx->inMultiDocumentTransaction() &&
+            txnParticipant.checkStatementExecutedNoOplogEntryFetch(stmtId);
+
         if (!fixedDoc.isOK()) {
             // Handled after we insert anything in the batch to be sure we report errors in the
             // correct order. In an ordered insert, if one of the docs ahead of us fails, we should
             // behave as-if we never got to this document.
+        } else if (wasAlreadyExecuted) {
+            // Similarly, if the insert was already executed as part of a retryable write, flush the
+            // current batch to preserve the error results order.
         } else {
-            const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
-            if (opCtx->getTxnNumber()) {
-                if (!opCtx->inMultiDocumentTransaction() &&
-                    txnParticipant.checkStatementExecutedNoOplogEntryFetch(stmtId)) {
-                    containsRetry = true;
-                    RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
-                    out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
-                    continue;
-                }
-            }
-
             BSONObj toInsert = fixedDoc.getValue().isEmpty() ? doc : std::move(fixedDoc.getValue());
             batch.emplace_back(stmtId, toInsert);
             bytesInBatch += batch.back().doc.objsize();
+
             if (!isLastDoc && batch.size() < maxBatchSize && bytesInBatch < maxBatchBytes)
                 continue;  // Add more to batch before inserting.
         }
@@ -589,7 +594,14 @@ WriteResult performInserts(OperationContext* opCtx,
         batch.clear();  // We won't need the current batch any more.
         bytesInBatch = 0;
 
-        if (canContinue && !fixedDoc.isOK()) {
+        // If the batch had an error and decides to not continue, do not process a current doc that
+        // was unsuccessfully "fixed" or an already executed retryable write.
+        if (!canContinue)
+            break;
+
+        // Revisit any conditions that may have caused the batch to be flushed. In those cases,
+        // append the appropriate result to the output.
+        if (!fixedDoc.isOK()) {
             globalOpCounters.gotInsert();
             ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForInsert(
                 opCtx->getWriteConcern());
@@ -600,11 +612,17 @@ WriteResult performInserts(OperationContext* opCtx,
                 canContinue = handleError(
                     opCtx, ex, wholeOp.getNamespace(), wholeOp.getWriteCommandBase(), &out);
             }
-        }
 
-        if (!canContinue)
-            break;
+            if (!canContinue) {
+                break;
+            }
+        } else if (wasAlreadyExecuted) {
+            containsRetry = true;
+            RetryableWritesStats::get(opCtx)->incrementRetriedStatementsCount();
+            out.results.emplace_back(makeWriteResultForInsertOrDeleteRetry());
+        }
     }
+    invariant(batch.empty());
 
     return out;
 }
@@ -660,7 +678,7 @@ static SingleWriteResult performSingleUpdateOp(OperationContext* opCtx,
     auto& curOp = *CurOp::get(opCtx);
 
     if (collection->getDb()) {
-        curOp.raiseDbProfileLevel(CollectionCatalog::get(opCtx).getDatabaseProfileLevel(ns.db()));
+        curOp.raiseDbProfileLevel(CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(ns.db()));
     }
 
     assertCanWrite_inlock(opCtx, ns);
@@ -714,7 +732,7 @@ static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(
     const NamespaceString& ns,
     StmtId stmtId,
     const write_ops::UpdateOpEntry& op,
-    RuntimeConstants runtimeConstants,
+    LegacyRuntimeConstants runtimeConstants,
     const boost::optional<BSONObj>& letParams) {
     globalOpCounters.gotUpdate();
     ServerWriteConcernMetrics::get(opCtx)->recordWriteConcernForUpdate(opCtx->getWriteConcern());
@@ -734,7 +752,7 @@ static SingleWriteResult performSingleUpdateOpWithDupKeyRetry(
 
     UpdateRequest request(op);
     request.setNamespaceString(ns);
-    request.setRuntimeConstants(std::move(runtimeConstants));
+    request.setLegacyRuntimeConstants(std::move(runtimeConstants));
     if (letParams) {
         request.setLetParameters(std::move(letParams));
     }
@@ -783,7 +801,7 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
               (txnParticipant && opCtx->inMultiDocumentTransaction()));
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
-    DisableDocumentValidationIfTrue docValidationDisabler(
+    DisableDocumentSchemaValidationIfTrue docSchemaValidationDisabler(
         opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
     LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
 
@@ -797,7 +815,7 @@ WriteResult performUpdates(OperationContext* opCtx, const write_ops::Update& who
     // If the update command specified runtime constants, we adopt them. Otherwise, we set them to
     // the current local and cluster time. These constants are applied to each update in the batch.
     const auto& runtimeConstants =
-        wholeOp.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx));
+        wholeOp.getLegacyRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx));
 
     for (auto&& singleOp : wholeOp.getUpdates()) {
         const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);
@@ -846,7 +864,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
                                                const NamespaceString& ns,
                                                StmtId stmtId,
                                                const write_ops::DeleteOpEntry& op,
-                                               const RuntimeConstants& runtimeConstants,
+                                               const LegacyRuntimeConstants& runtimeConstants,
                                                const boost::optional<BSONObj>& letParams) {
     uassert(ErrorCodes::InvalidOptions,
             "Cannot use (or request) retryable writes with limit=0",
@@ -866,7 +884,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
 
     auto request = DeleteRequest{};
     request.setNsString(ns);
-    request.setRuntimeConstants(runtimeConstants);
+    request.setLegacyRuntimeConstants(runtimeConstants);
     if (letParams)
         request.setLet(letParams);
     request.setQuery(op.getQ());
@@ -899,7 +917,7 @@ static SingleWriteResult performSingleDeleteOp(OperationContext* opCtx,
     AutoGetCollection collection(opCtx, ns, fixLockModeForSystemDotViewsChanges(ns, MODE_IX));
 
     if (collection.getDb()) {
-        curOp.raiseDbProfileLevel(CollectionCatalog::get(opCtx).getDatabaseProfileLevel(ns.db()));
+        curOp.raiseDbProfileLevel(CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(ns.db()));
     }
 
     assertCanWrite_inlock(opCtx, ns);
@@ -946,7 +964,7 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
               (txnParticipant && opCtx->inMultiDocumentTransaction()));
     uassertStatusOK(userAllowedWriteNS(wholeOp.getNamespace()));
 
-    DisableDocumentValidationIfTrue docValidationDisabler(
+    DisableDocumentSchemaValidationIfTrue docSchemaValidationDisabler(
         opCtx, wholeOp.getWriteCommandBase().getBypassDocumentValidation());
     LastOpFixer lastOpFixer(opCtx, wholeOp.getNamespace());
 
@@ -960,7 +978,7 @@ WriteResult performDeletes(OperationContext* opCtx, const write_ops::Delete& who
     // If the delete command specified runtime constants, we adopt them. Otherwise, we set them to
     // the current local and cluster time. These constants are applied to each delete in the batch.
     const auto& runtimeConstants =
-        wholeOp.getRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx));
+        wholeOp.getLegacyRuntimeConstants().value_or(Variables::generateRuntimeConstants(opCtx));
 
     for (auto&& singleOp : wholeOp.getDeletes()) {
         const auto stmtId = getStmtIdForWriteOp(opCtx, wholeOp, stmtIdIndex++);

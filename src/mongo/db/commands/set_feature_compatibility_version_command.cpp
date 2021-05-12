@@ -35,6 +35,8 @@
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/drop_indexes.h"
+#include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
@@ -52,12 +54,13 @@
 #include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/migration_util.h"
+#include "mongo/db/s/shard_metadata_util.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
-#include "mongo/s/catalog/type_collection.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 #include "mongo/stdx/unordered_set.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point.h"
@@ -70,8 +73,6 @@ using FeatureCompatibilityParams = ServerGlobalParams::FeatureCompatibility;
 
 namespace {
 
-MONGO_FAIL_POINT_DEFINE(featureCompatibilityDowngrade);
-MONGO_FAIL_POINT_DEFINE(featureCompatibilityUpgrade);
 MONGO_FAIL_POINT_DEFINE(failUpgrading);
 MONGO_FAIL_POINT_DEFINE(hangWhileUpgrading);
 MONGO_FAIL_POINT_DEFINE(failDowngrading);
@@ -236,11 +237,31 @@ public:
                 }
             }
 
-            // Upgrade shards before config finishes its upgrade.
+            // Delete any haystack indexes if we're upgrading to an FCV of 4.9 or higher.
+            // TODO SERVER-51871: This block can removed once 5.0 becomes last-lts.
+            if (requestedVersion >= FeatureCompatibilityParams::Version::kVersion49) {
+                _deleteHaystackIndexesOnUpgrade(opCtx);
+            }
+
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                if (requestedVersion >= FeatureCompatibilityParams::Version::kVersion49) {
+                    // SERVER-52630: Remove once 5.0 becomes the LastLTS
+                    ShardingCatalogManager::get(opCtx)->removePre49LegacyMetadata(opCtx);
+                }
+
+                // Upgrade shards before config finishes its upgrade.
                 uassertStatusOK(
                     ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
                         opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
+
+                // Create a 'timestamp' for the collections that don't have one. This must be done
+                // after all shards have been upgraded in order to guarantee that when
+                // createCollectionTimestampsFor49 starts, no new collections without a timestamp
+                // will be added.
+                if (requestedVersion >= FeatureCompatibilityParams::Version::kVersion49 &&
+                    feature_flags::gShardingFullDDLSupport.isEnabledAndIgnoreFCV()) {
+                    ShardingCatalogManager::get(opCtx)->createCollectionTimestampsFor49(opCtx);
+                }
             }
 
             hangWhileUpgrading.pauseWhileSet(opCtx);
@@ -251,6 +272,24 @@ public:
                 requestedVersion,
                 isFromConfigServer);
         } else {
+            // Time-series collections are only supported in 5.0. If the user tries to downgrade the
+            // cluster to an earlier version, they must first remove all time-series collections.
+            for (const auto& dbName : DatabaseHolder::get(opCtx)->getNames()) {
+                auto viewCatalog = DatabaseHolder::get(opCtx)->getSharedViewCatalog(opCtx, dbName);
+                if (!viewCatalog) {
+                    continue;
+                }
+                viewCatalog->iterate(opCtx, [](const ViewDefinition& view) {
+                    uassert(ErrorCodes::CannotDowngrade,
+                            str::stream()
+                                << "Cannot downgrade the cluster when there are time-series "
+                                   "collections present; drop all time-series collections before "
+                                   "downgrading. First detected time-series collection: "
+                                << view.name(),
+                            !view.timeseries());
+                });
+            }
+
             auto replCoord = repl::ReplicationCoordinator::get(opCtx);
             const bool isReplSet =
                 replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
@@ -296,17 +335,33 @@ public:
             if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
                 LOGV2(20502, "Downgrade: dropping config.rangeDeletions collection");
                 migrationutil::dropRangeDeletionsCollection(opCtx);
+
+                if (requestedVersion < FeatureCompatibilityParams::Version::kVersion49) {
+                    // SERVER-52632: Remove once 5.0 becomes the LastLTS
+                    shardmetadatautil::downgradeShardConfigCollectionEntriesToPre49(opCtx);
+                }
+
+
             } else if (isReplSet || serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
                 // The default rwc document should only be deleted on plain replica sets and the
                 // config server replica set, not on shards or standalones.
                 deletePersistedDefaultRWConcernDocument(opCtx);
             }
 
-            // Downgrade shards before config finishes its downgrade.
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
+                // Downgrade shards before config finishes its downgrade.
                 uassertStatusOK(
                     ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
                         opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
+
+                // Delete the 'timestamp' field in config.collections entries. This must be done
+                // after all shards have been downgraded in order to guarantee that when
+                // downgradeConfigCollectionEntriesToPre49 starts, no new collections with a
+                // timestamp will be added.
+                if (requestedVersion < FeatureCompatibilityParams::Version::kVersion49) {
+                    ShardingCatalogManager::get(opCtx)->downgradeConfigCollectionEntriesToPre49(
+                        opCtx);
+                }
             }
 
             hangWhileDowngrading.pauseWhileSet(opCtx);
@@ -336,6 +391,47 @@ private:
         LOGV2(4975602,
               "Downgrading on-disk format to reflect the last-continuous version.",
               "last_continuous_version"_attr = FCVP::kLastContinuous);
+    }
+
+    /**
+     * Removes all haystack indexes from the catalog.
+     *
+     * TODO SERVER-51871: This method can be removed once 5.0 becomes last-lts.
+     */
+    void _deleteHaystackIndexesOnUpgrade(OperationContext* opCtx) {
+        auto collCatalog = CollectionCatalog::get(opCtx);
+        for (const auto& db : collCatalog->getAllDbNames()) {
+            for (auto collIt = collCatalog->begin(opCtx, db); collIt != collCatalog->end(opCtx);
+                 ++collIt) {
+                NamespaceStringOrUUID collName(
+                    collCatalog->lookupNSSByUUID(opCtx, collIt.uuid().get()).get());
+                AutoGetCollectionForRead coll(opCtx, collName);
+                auto idxCatalog = coll->getIndexCatalog();
+                std::vector<const IndexDescriptor*> haystackIndexes;
+                idxCatalog->findIndexByType(opCtx, IndexNames::GEO_HAYSTACK, haystackIndexes);
+
+                // Continue if 'coll' has no haystack indexes.
+                if (haystackIndexes.empty()) {
+                    continue;
+                }
+
+                // Construct a dropIndexes command to drop the indexes in 'haystackIndexes'.
+                BSONObjBuilder dropIndexesCmd;
+                dropIndexesCmd.append("dropIndexes", collName.nss()->coll());
+                BSONArrayBuilder indexNames;
+                for (auto&& haystackIndex : haystackIndexes) {
+                    indexNames.append(haystackIndex->indexName());
+                }
+                dropIndexesCmd.append("index", indexNames.arr());
+
+                BSONObjBuilder response;  // This response is ignored.
+                uassertStatusOK(
+                    dropIndexes(opCtx,
+                                *collName.nss(),
+                                CommandHelpers::appendMajorityWriteConcern(dropIndexesCmd.obj()),
+                                &response));
+            }
+        }
     }
 
 } setFeatureCompatibilityVersionCommand;

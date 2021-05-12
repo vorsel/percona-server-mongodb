@@ -553,6 +553,14 @@ add_option('enable-usdt-probes',
     const='on',
 )
 
+add_option('libdeps-debug',
+    choices=['on', 'off'],
+    const='off',
+    help='Print way too much debugging information on how libdeps is handling dependencies.',
+    nargs='?',
+    type='choice',
+)
+
 add_option('libdeps-linting',
     choices=['on', 'off', 'print'],
     const='on',
@@ -1760,6 +1768,7 @@ if get_option('build-tools') == 'next':
     libdeps.setup_environment(
         env,
         emitting_shared=(link_model.startswith("dynamic")),
+        debug=get_option('libdeps-debug'),
         linting=get_option('libdeps-linting'),
         sanitize_typeinfo=libdeps_typeinfo)
 else:
@@ -1861,6 +1870,54 @@ def init_no_global_libdeps_tag_expand(source, target, env, for_signature):
     return []
 
 env['LIBDEPS_TAG_EXPANSIONS'].append(init_no_global_libdeps_tag_expand)
+
+link_guard_rules = {
+    "test" : ["dist"]
+}
+
+class LibdepsLinkGuard(SCons.Errors.UserError):
+        pass
+
+def checkComponentType(target_comps, comp, target, lib):
+    """
+    For a libdep and each AIB_COMPONENT its labeled as, check if its violates
+    any of the link gaurd rules.
+    """
+    for target_comp in target_comps:
+        for link_guard_rule in link_guard_rules:
+            if (target_comp in link_guard_rules[link_guard_rule]
+                and link_guard_rule in comp):
+                raise LibdepsLinkGuard(textwrap.dedent(f"""\n
+                    LibdepsLinkGuard:
+                    \tTarget '{target[0]}' links LIBDEP '{lib}'
+                    \tbut is listed as AIB_COMPONENT '{target_comp}' which is not allowed link libraries
+                    \twith AIB_COMPONENTS that include the word '{link_guard_rule}'\n"""))
+
+def get_comps(env):
+    """util function for extracting all AIB_COMPONENTS as a list"""
+    comps = env.get("AIB_COMPONENTS_EXTRA", [])
+    comp = env.get("AIB_COMPONENT", None)
+    if comp:
+        comps += [comp]
+    return comps
+
+def link_guard_libdeps_tag_expand(source, target, env, for_signature):
+    """
+    Callback function called on all binaries to check if a certain binary
+    from a given component is linked to another binary of a given component,
+    the goal being to define rules that prevents test components from being
+    linked into production or releaseable components.
+    """
+    for lib in libdeps.get_libdeps(source, target, env, for_signature):
+        if not lib.env:
+            continue
+
+        for comp in get_comps(lib.env):
+            checkComponentType(get_comps(env), comp, target, lib)
+
+    return []
+
+env['LIBDEPS_TAG_EXPANSIONS'].append(link_guard_libdeps_tag_expand)
 
 if has_option('audit'):
     env.Append( CPPDEFINES=[ 'PERCONA_AUDIT_ENABLED' ] )
@@ -4166,6 +4223,80 @@ if get_option('ninja') != 'disabled':
 
     env['NINJA_REGENERATE_DEPS'] = ninja_generate_deps
 
+    if get_option('build-tools') == 'next' and env.TargetOSIs("windows"):
+        # This is a workaround on windows for SERVER-48691 where the line length
+        # in response files is too long:
+        # https://developercommunity.visualstudio.com/content/problem/441978/fatal-error-lnk1170-line-in-command-file-contains.html
+        #
+        # Ninja currently does not support
+        # storing a newline in the ninja file, and therefore you can not
+        # easily generate it to the response files. The only documented
+        # way to get newlines into the response file is to use the $in_newline
+        # variable in the rule.
+        #
+        # This workaround will move most of the object or lib links into the
+        # inputs and then make the respone file consist of the inputs plus
+        # whatever options are left in the original response content
+        # more info can be found here:
+        # https://github.com/ninja-build/ninja/pull/1223/files/e71bcceefb942f8355aab83ab447d702354ba272#r179526824
+        # https://github.com/ninja-build/ninja/issues/1000
+
+        # we are making a new special rule which will leverage
+        # the $in_newline to get newlines into our response file
+        env.NinjaRule(
+            "WINLINK",
+            "$env$WINLINK @$out.rsp",
+            description="Linking $out",
+            deps=None,
+            pool="local_pool",
+            use_depfile=False,
+            use_response_file=True,
+            response_file_content="$in_newline $rspc")
+
+        # Setup the response file content generation to use our workaround rule
+        # for LINK commands.
+        provider = env.NinjaGenResponseFileProvider(
+            "WINLINK",
+            "$LINK",
+        )
+        env.NinjaRuleMapping("${LINKCOM}", provider)
+        env.NinjaRuleMapping(env["LINKCOM"], provider)
+
+        # The workaround function will move some of the content from the rspc
+        # variable into the nodes inputs. We only want to move build nodes because
+        # inputs must be files, so we make sure the the option in the rspc
+        # file starts with the build directory.
+        def winlink_workaround(env, node, ninja_build):
+            if ninja_build and 'rspc' in ninja_build["variables"]:
+
+                rsp_content = []
+                ninja_build["inputs"] = []
+                for opt in ninja_build["variables"]["rspc"].split():
+
+                    # if its a candidate to go in the inputs add it, else keep it in the non-newline
+                    # rsp_content list
+                    if opt.startswith(str(env.Dir("$BUILD_DIR"))) and opt != str(node):
+                        ninja_build["inputs"].append(opt)
+                    else:
+                        rsp_content.append(opt)
+
+                ninja_build["variables"]["rspc"] = ' '.join(rsp_content)
+                ninja_build["inputs"] += [infile for infile in ninja_build["inputs"] if infile not in ninja_build["inputs"]]
+
+        # We apply the workaround to all Program nodes as they have potential
+        # response files that have lines that are too long.
+        # This will setup a callback function for a node
+        # so that when its been processed, we can make some final adjustments before
+        # its generated to the ninja file.
+        def winlink_workaround_emitter(target, source, env):
+            env.NinjaSetBuildNodeCallback(target[0], winlink_workaround)
+            return target, source
+
+        builder = env['BUILDERS']["Program"]
+        base_emitter = builder.emitter
+        new_emitter = SCons.Builder.ListEmitter([base_emitter, winlink_workaround_emitter])
+        builder.emitter = new_emitter
+
     if libdeps_typeinfo and get_option('build-tools') == 'next':
         # ninja will not handle the list action libdeps creates so in order for
         # to build ubsan with ninja, we need to undo the list action and then
@@ -4906,3 +5037,4 @@ for i, s in enumerate(BUILD_TARGETS):
 # SConscripts have been read but before building begins.
 if get_option('build-tools') == 'next':
     libdeps.LibdepLinter(env).final_checks()
+    libdeps.generate_libdeps_graph(env)

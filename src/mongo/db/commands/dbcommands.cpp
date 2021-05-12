@@ -62,6 +62,8 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
+#include "mongo/db/drop_database_gen.h"
+#include "mongo/db/drop_gen.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -86,6 +88,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/storage_engine_init.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/logv2/log.h"
 #include "mongo/scripting/engine.h"
@@ -154,20 +157,21 @@ public:
                       str::stream()
                           << "Cannot drop '" << dbname << "' database while replication is active");
         }
-        BSONElement e = cmdObj.firstElement();
-        int p = (int)e.number();
-        if (p != 1) {
+
+        auto request = DropDatabase::parse(IDLParserErrorContext("dropDatabase"), cmdObj);
+        if (request.getCommandParameter() != 1) {
             uasserted(ErrorCodes::IllegalOperation, "have to pass 1 as db parameter");
         }
 
         Status status = dropDatabase(opCtx, dbname);
-        if (status == ErrorCodes::NamespaceNotFound) {
-            return true;
+        if (status != ErrorCodes::NamespaceNotFound) {
+            uassertStatusOK(status);
         }
+        DropDatabaseReply reply;
         if (status.isOK()) {
-            result.append("dropped", dbname);
+            reply.setDropped(request.getDbName());
         }
-        uassertStatusOK(status);
+        reply.serialize(&result);
         return true;
     }
 
@@ -248,9 +252,8 @@ public:
                            const BSONObj& cmdObj,
                            string& errmsg,
                            BSONObjBuilder& result) {
-        const NamespaceString nsToDrop(CommandHelpers::parseNsCollectionRequired(dbname, cmdObj));
-
-        if (nsToDrop.isOplog()) {
+        auto parsed = Drop::parse(IDLParserErrorContext("drop"), cmdObj);
+        if (parsed.getNamespace().isOplog()) {
             if (repl::ReplicationCoordinator::get(opCtx)->isReplEnabled()) {
                 errmsg = "can't drop live oplog while replicating";
                 return false;
@@ -270,7 +273,7 @@ public:
 
         uassertStatusOK(
             dropCollection(opCtx,
-                           nsToDrop,
+                           parsed.getNamespace(),
                            result,
                            DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
         return true;
@@ -336,10 +339,10 @@ public:
                      const string& dbname,
                      const BSONObj& cmdObj,
                      BSONObjBuilder& result) {
+        const auto nsToCreate = CommandHelpers::parseNsCollectionRequired(dbname, cmdObj);
+
         IDLParserErrorContext ctx("create");
         CreateCommand cmd = CreateCommand::parse(ctx, cmdObj);
-
-        const NamespaceString ns = cmd.getNamespace();
 
         if (cmd.getAutoIndexId()) {
 #define DEPR_23800 "The autoIndexId option is deprecated and will be removed in a future release"
@@ -370,6 +373,57 @@ public:
                     opCtx->getClient()->isInDirectClient() ||
                         (opCtx->getClient()->session()->getTags() &
                          transport::Session::kInternalClient));
+        }
+
+        if (cmd.getPipeline()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "'pipeline' requires 'viewOn' to also be specified",
+                    cmd.getViewOn());
+        }
+
+        if (auto timeseries = cmd.getTimeseries()) {
+            uassert(ErrorCodes::InvalidOptions,
+                    "Time-series collection is not enabled",
+                    feature_flags::gTimeseriesCollection.isEnabled(
+                        serverGlobalParams.featureCompatibility));
+
+            const auto timeseriesNotAllowedWith = [&nsToCreate](StringData option) -> std::string {
+                return str::stream()
+                    << nsToCreate << ": 'timeseries' is not allowed with '" << option << "'";
+            };
+
+            uassert(
+                ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("capped"), !cmd.getCapped());
+            uassert(ErrorCodes::InvalidOptions,
+                    timeseriesNotAllowedWith("autoIndexId"),
+                    !cmd.getAutoIndexId());
+            uassert(
+                ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("idIndex"), !cmd.getIdIndex());
+            uassert(ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("size"), !cmd.getSize());
+            uassert(ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("max"), !cmd.getMax());
+            uassert(ErrorCodes::InvalidOptions,
+                    timeseriesNotAllowedWith("validator"),
+                    !cmd.getValidator());
+            uassert(ErrorCodes::InvalidOptions,
+                    timeseriesNotAllowedWith("validationLevel"),
+                    !cmd.getValidationLevel());
+            uassert(ErrorCodes::InvalidOptions,
+                    timeseriesNotAllowedWith("validationAction"),
+                    !cmd.getValidationAction());
+            uassert(
+                ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("viewOn"), !cmd.getViewOn());
+            uassert(ErrorCodes::InvalidOptions,
+                    timeseriesNotAllowedWith("pipeline"),
+                    !cmd.getPipeline());
+
+            if (auto metaField = timeseries->getMetaField()) {
+                uassert(ErrorCodes::InvalidOptions,
+                        "'metaField' cannot be \"_id\"",
+                        *metaField != "_id");
+                uassert(ErrorCodes::InvalidOptions,
+                        "'metaField' cannot be the same as 'timeField'",
+                        *metaField != timeseries->getTimeField());
+            }
         }
 
         // Validate _id index spec and fill in missing fields.
@@ -415,15 +469,10 @@ public:
                           "'idIndex' must have the same collation as the collection.");
             }
 
-            // Remove "idIndex" field from command.
-            auto resolvedCmdObj = cmdObj.removeField("idIndex");
-
-            uassertStatusOK(createCollection(opCtx, dbname, resolvedCmdObj, idIndexSpec));
-            return true;
+            cmd.setIdIndex(idIndexSpec);
         }
 
-        BSONObj idIndexSpec;
-        uassertStatusOK(createCollection(opCtx, dbname, cmdObj, idIndexSpec));
+        uassertStatusOK(createCollection(opCtx, nsToCreate, cmd));
         return true;
     }
 } cmdCreate;
@@ -786,7 +835,7 @@ public:
                 stdx::lock_guard<Client> lk(*opCtx->getClient());
                 // TODO: OldClientContext legacy, needs to be removed
                 CurOp::get(opCtx)->enter_inlock(
-                    dbname.c_str(), CollectionCatalog::get(opCtx).getDatabaseProfileLevel(dbname));
+                    dbname.c_str(), CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(dbname));
             }
 
             db->getStats(opCtx, &result, scale);

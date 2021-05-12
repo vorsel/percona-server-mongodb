@@ -8,10 +8,16 @@
 "use strict";
 load("jstests/libs/parallel_shell_helpers.js");
 load("jstests/libs/curop_helpers.js");  // for waitForCurOpByFailPoint().
+load("jstests/replsets/libs/tenant_migration_util.js");
 
-var rst = new ReplSetTest({nodes: 1, nodeOptions: {setParameter: {enableTenantMigrations: true}}});
+var rst = new ReplSetTest({nodes: 1});
 rst.startSet();
 rst.initiate();
+if (!TenantMigrationUtil.isFeatureFlagEnabled(rst.getPrimary())) {
+    jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
+    rst.stopSet();
+    return;
+}
 
 const primary = rst.getPrimary();
 const configDB = primary.getDB("config");
@@ -24,6 +30,7 @@ const readPreference = {
     mode: 'primary'
 };
 
+TestData.stopFailPointErrorCode = 4880402;
 function checkTenantMigrationRecipientStateCollCount(expectedCount) {
     let res = tenantMigrationRecipientStateColl.find().toArray();
     assert.eq(expectedCount,
@@ -34,21 +41,22 @@ function checkTenantMigrationRecipientStateCollCount(expectedCount) {
 function startRecipientSyncDataCmd(migrationUuid, tenantId, connectionString, readPreference) {
     jsTestLog("Starting a recipientSyncDataCmd for migrationUuid: " + migrationUuid +
               " tenantId: '" + tenantId + "'");
-    assert.commandWorkedOrFailedWithCode(db.adminCommand({
-        recipientSyncData: 1,
-        migrationId: migrationUuid,
-        donorConnectionString: connectionString,
-        tenantId: tenantId,
-        readPreference: readPreference
-    }),
-                                         ErrorCodes.ConflictingOperationInProgress);
+    assert.commandFailedWithCode(
+        db.adminCommand({
+            recipientSyncData: 1,
+            migrationId: migrationUuid,
+            donorConnectionString: connectionString,
+            tenantId: tenantId,
+            readPreference: readPreference
+        }),
+        [TestData.stopFailPointErrorCode, ErrorCodes.ConflictingOperationInProgress]);
 }
 
 // Enable the failpoint to stop the tenant migration after persisting the state doc.
 assert.commandWorked(primary.adminCommand({
     configureFailPoint: "fpAfterPersistingTenantMigrationRecipientInstanceStateDoc",
     mode: "alwaysOn",
-    data: {action: "stop"}
+    data: {action: "stop", stopErrorCode: NumberInt(TestData.stopFailPointErrorCode)}
 }));
 
 {

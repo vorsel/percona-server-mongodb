@@ -596,8 +596,12 @@ private:
         _commandOpWrite(
             opCtx, _batchedRequest.getNS(), explainCmd, targetingBatchItem, &shardResponses);
         auto bodyBuilder = result->getBodyBuilder();
-        uassertStatusOK(ClusterExplain::buildExplainResult(
-            opCtx, shardResponses, ClusterExplain::kWriteOnShards, timer.millis(), &bodyBuilder));
+        uassertStatusOK(ClusterExplain::buildExplainResult(opCtx,
+                                                           shardResponses,
+                                                           ClusterExplain::kWriteOnShards,
+                                                           timer.millis(),
+                                                           _request->body,
+                                                           &bodyBuilder));
     }
 
     NamespaceString ns() const override {
@@ -695,8 +699,8 @@ private:
         auto parsedRequest = BatchedCommandRequest::parseUpdate(request);
         uassert(51195,
                 "Cannot specify runtime constants option to a mongos",
-                !parsedRequest.hasRuntimeConstants());
-        parsedRequest.setRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
+                !parsedRequest.hasLegacyRuntimeConstants());
+        parsedRequest.setLegacyRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
         return std::make_unique<Invocation>(
             this, request, std::move(parsedRequest), &_updateMetrics);
     }

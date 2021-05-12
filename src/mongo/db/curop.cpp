@@ -344,14 +344,8 @@ void CurOp::setGenericCursor_inlock(GenericCursor gc) {
     _genericCursor = std::move(gc);
 }
 
-CurOp::CurOp(OperationContext* opCtx) : CurOp(opCtx, &_curopStack(opCtx)) {
-    // If this is a sub-operation, we store the snapshot of lock stats as the base lock stats of the
-    // current operation.
-    if (_parent != nullptr)
-        _lockStatsBase = opCtx->lockState()->getLockerInfo(boost::none)->stats;
-}
-
-CurOp::CurOp(OperationContext* opCtx, CurOpStack* stack) : _stack(stack) {
+void CurOp::_finishInit(OperationContext* opCtx, CurOpStack* stack) {
+    _stack = stack;
     _tickSource = SystemTickSource::get();
 
     if (opCtx) {
@@ -359,6 +353,20 @@ CurOp::CurOp(OperationContext* opCtx, CurOpStack* stack) : _stack(stack) {
     } else {
         _stack->push_nolock(this);
     }
+}
+
+CurOp::CurOp(OperationContext* opCtx) {
+    // If this is a sub-operation, we store the snapshot of lock stats as the base lock stats of the
+    // current operation.
+    if (_parent != nullptr)
+        _lockStatsBase = opCtx->lockState()->getLockerInfo(boost::none)->stats;
+
+    // Add the CurOp object onto the stack of active CurOp objects.
+    _finishInit(opCtx, &_curopStack(opCtx));
+}
+
+CurOp::CurOp(OperationContext* opCtx, CurOpStack* stack) {
+    _finishInit(opCtx, stack);
 }
 
 CurOp::~CurOp() {
@@ -494,7 +502,7 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
     bool shouldLogSlowOp, shouldProfileAtLevel1;
 
     if (auto filter =
-            CollectionCatalog::get(opCtx).getDatabaseProfileSettings(getNSS().db()).filter) {
+            CollectionCatalog::get(opCtx)->getDatabaseProfileSettings(getNSS().db()).filter) {
         bool passesFilter = filter->matches(opCtx, _debug, *this);
 
         shouldLogSlowOp = passesFilter;
@@ -557,7 +565,7 @@ bool CurOp::completeAndLogOperation(OperationContext* opCtx,
         _debug.prepareConflictDurationMillis =
             duration_cast<Milliseconds>(prepareConflictDurationMicros);
 
-        auto operationMetricsPtr = [&]() -> ResourceConsumption::Metrics* {
+        auto operationMetricsPtr = [&]() -> ResourceConsumption::OperationMetrics* {
             auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
             if (metricsCollector.hasCollectedMetrics()) {
                 return &metricsCollector.getMetrics();
@@ -963,7 +971,7 @@ string OpDebug::report(OperationContext* opCtx, const SingleThreadedLockStats* l
 
 void OpDebug::report(OperationContext* opCtx,
                      const SingleThreadedLockStats* lockStats,
-                     const ResourceConsumption::Metrics* operationMetrics,
+                     const ResourceConsumption::OperationMetrics* operationMetrics,
                      logv2::DynamicAttributes* pAttrs) const {
     Client* client = opCtx->getClient();
     auto& curop = *CurOp::get(opCtx);
@@ -1106,8 +1114,12 @@ void OpDebug::report(OperationContext* opCtx,
 
     if (operationMetrics) {
         BSONObjBuilder builder;
-        operationMetrics->toFlatBsonNonZeroFields(&builder);
+        operationMetrics->toBsonNonZeroFields(&builder);
         pAttrs->add("operationMetrics", builder.obj());
+    }
+
+    if (client && client->session()) {
+        pAttrs->add("remote", client->session()->remote());
     }
 
     if (iscommand) {
@@ -1543,7 +1555,7 @@ std::function<BSONObj(ProfileFilter::Args)> OpDebug::appendStaged(StringSet requ
         auto& metricsCollector = ResourceConsumption::MetricsCollector::get(args.opCtx);
         if (metricsCollector.hasCollectedMetrics()) {
             BSONObjBuilder metricsBuilder(b.subobjStart(field));
-            metricsCollector.getMetrics().toFlatBsonAllFields(&metricsBuilder);
+            metricsCollector.getMetrics().toBson(&metricsBuilder);
         }
     });
 

@@ -36,6 +36,8 @@
 
 namespace mongo {
 
+class ReshardingCollectionCloner;
+
 namespace resharding {
 
 /**
@@ -44,7 +46,9 @@ namespace resharding {
  * respectively.
  */
 void createTemporaryReshardingCollectionLocally(OperationContext* opCtx,
-                                                const NamespaceString& reshardingNss,
+                                                const NamespaceString& originalNss,
+                                                const UUID& reshardingUUID,
+                                                const UUID& existingUUID,
                                                 Timestamp fetchTimestamp);
 
 }  // namespace resharding
@@ -87,7 +91,8 @@ public:
 
     ~RecipientStateMachine();
 
-    void run(std::shared_ptr<executor::ScopedTaskExecutor> executor) noexcept override;
+    SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                         const CancelationToken& token) noexcept override;
 
     void interrupt(Status status) override;
 
@@ -117,7 +122,8 @@ private:
 
     void _createTemporaryReshardingCollectionThenTransitionToCloning();
 
-    void _cloneThenTransitionToApplying();
+    ExecutorFuture<void> _cloneThenTransitionToApplying(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
     void _applyThenTransitionToSteadyState();
 
@@ -135,6 +141,8 @@ private:
     void _transitionState(RecipientStateEnum endState,
                           boost::optional<Timestamp> fetchTimestamp = boost::none);
 
+    void _transitionStateAndUpdateCoordinator(RecipientStateEnum endState);
+
     // Transitions the state on-disk and in-memory to kError.
     void _transitionStateToError(const Status& status);
 
@@ -150,6 +158,8 @@ private:
 
     // The id both for the resharding operation and for the primary-only-service instance.
     const UUID _id;
+
+    std::unique_ptr<ReshardingCollectionCloner> _collectionCloner;
 
     // Protects the promises below
     Mutex _mutex = MONGO_MAKE_LATCH("ReshardingRecipient::_mutex");

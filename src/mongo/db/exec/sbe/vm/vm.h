@@ -35,6 +35,8 @@
 
 #include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/exec/sbe/values/value.h"
+#include "mongo/db/exec/sbe/vm/datetime.h"
+#include "mongo/db/query/datetime/date_time_support.h"
 
 namespace mongo {
 namespace sbe {
@@ -151,9 +153,11 @@ struct Instruction {
         isBinData,
         isDate,
         isNaN,
+        isRecordId,
         typeMatch,
 
         function,
+        functionSmall,
 
         jmp,  // offset is calculated from the end of instruction
         jmpTrue,
@@ -174,9 +178,13 @@ static_assert(sizeof(Instruction) == sizeof(uint8_t));
 enum class Builtin : uint8_t {
     split,
     regexMatch,
+    replaceOne,
     dateParts,
     dateToParts,
     isoDateToParts,
+    dayOfYear,
+    dayOfMonth,
+    dayOfWeek,
     datePartsWeekYear,
     dropFields,
     newObj,
@@ -185,6 +193,7 @@ enum class Builtin : uint8_t {
     abs,         // absolute value
     ceil,
     floor,
+    trunc,
     exp,
     ln,
     log10,
@@ -219,7 +228,18 @@ enum class Builtin : uint8_t {
     indexOfBytes,
     indexOfCP,
     isTimezone,
+    setUnion,
+    setIntersection,
+    setDifference,
+    runJsPredicate,
+    regexCompile,  // compile <pattern, options> into value::pcreRegex
+    regexFind,
+    regexFindAll,
+    shardFilter,
 };
+
+using SmallArityType = uint8_t;
+using ArityType = uint32_t;
 
 class CodeFragment {
 public:
@@ -294,8 +314,9 @@ public:
     void appendIsBinData();
     void appendIsDate();
     void appendIsNaN();
+    void appendIsRecordId();
     void appendTypeMatch(uint32_t typeMask);
-    void appendFunction(Builtin f, uint8_t arity);
+    void appendFunction(Builtin f, ArityType arity);
     void appendJump(int jumpOffset);
     void appendJumpTrue(int jumpOffset);
     void appendJumpNothing(int jumpOffset);
@@ -331,7 +352,7 @@ private:
     };
     std::vector<FixUp> _fixUps;
 
-    int _stackSize{0};
+    size_t _stackSize{0};
 };
 
 class ByteCode {
@@ -375,6 +396,8 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> genericCeil(value::TypeTags operandTag,
                                                                 value::Value operandValue);
     std::tuple<bool, value::TypeTags, value::Value> genericFloor(value::TypeTags operandTag,
+                                                                 value::Value operandValue);
+    std::tuple<bool, value::TypeTags, value::Value> genericTrunc(value::TypeTags operandTag,
                                                                  value::Value operandValue);
     std::tuple<bool, value::TypeTags, value::Value> genericExp(value::TypeTags operandTag,
                                                                value::Value operandValue);
@@ -490,54 +513,87 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> genericTanh(value::TypeTags operandTag,
                                                                 value::Value operandValue);
 
-    std::tuple<bool, value::TypeTags, value::Value> builtinSplit(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinDate(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinDateWeekYear(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinDateToParts(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinIsoDateToParts(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinRegexMatch(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinDropFields(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinNewObj(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinKeyStringToString(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinNewKeyString(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinAbs(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinCeil(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinFloor(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinExp(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinLn(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinLog10(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinSqrt(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinAddToArray(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinAddToSet(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinDoubleDoubleSum(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinBitTestZero(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinBitTestMask(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinBitTestPosition(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinBsonSize(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinToUpper(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinToLower(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinCoerceToString(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinAcos(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinAcosh(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinAsin(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinAsinh(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinAtan(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinAtanh(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinAtan2(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinCos(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinCosh(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinDegreesToRadians(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinRadiansToDegrees(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinSin(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinSinh(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinTan(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinTanh(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinConcat(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinIsMember(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinIndexOfBytes(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinIndexOfCP(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinIsTimezone(uint8_t arity);
-    std::tuple<bool, value::TypeTags, value::Value> dispatchBuiltin(Builtin f, uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> genericDayOfYear(value::TypeTags timezoneDBTag,
+                                                                     value::Value timezoneDBValue,
+                                                                     value::TypeTags dateTag,
+                                                                     value::Value dateValue,
+                                                                     value::TypeTags timezoneTag,
+                                                                     value::Value timezoneValue);
+    std::tuple<bool, value::TypeTags, value::Value> genericDayOfMonth(value::TypeTags timezoneDBTag,
+                                                                      value::Value timezoneDBValue,
+                                                                      value::TypeTags dateTag,
+                                                                      value::Value dateValue,
+                                                                      value::TypeTags timezoneTag,
+                                                                      value::Value timezoneValue);
+    std::tuple<bool, value::TypeTags, value::Value> genericDayOfWeek(value::TypeTags timezoneDBTag,
+                                                                     value::Value timezoneDBValue,
+                                                                     value::TypeTags dateTag,
+                                                                     value::Value dateValue,
+                                                                     value::TypeTags timezoneTag,
+                                                                     value::Value timezoneValue);
+
+    std::tuple<bool, value::TypeTags, value::Value> builtinSplit(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDate(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDateWeekYear(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDateToParts(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinIsoDateToParts(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDayOfYear(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDayOfMonth(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDayOfWeek(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinRegexMatch(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinReplaceOne(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDropFields(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinNewObj(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinKeyStringToString(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinNewKeyString(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinAbs(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinCeil(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinFloor(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinTrunc(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinExp(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinLn(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinLog10(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinSqrt(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinAddToArray(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinAddToSet(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDoubleDoubleSum(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinBitTestZero(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinBitTestMask(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinBitTestPosition(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinBsonSize(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinToUpper(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinToLower(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinCoerceToString(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinAcos(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinAcosh(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinAsin(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinAsinh(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinAtan(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinAtanh(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinAtan2(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinCos(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinCosh(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDegreesToRadians(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinRadiansToDegrees(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinSin(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinSinh(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinTan(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinTanh(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinConcat(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinIsMember(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinIndexOfBytes(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinIndexOfCP(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinIsTimezone(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinSetUnion(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinSetIntersection(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinSetDifference(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinRunJsPredicate(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinRegexCompile(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinRegexFind(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinRegexFindAll(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinShardFilter(uint8_t arity);
+
+    std::tuple<bool, value::TypeTags, value::Value> dispatchBuiltin(Builtin f, ArityType arity);
 
     std::tuple<bool, value::TypeTags, value::Value> getFromStack(size_t offset) {
         auto backOffset = _argStackOwned.size() - 1 - offset;

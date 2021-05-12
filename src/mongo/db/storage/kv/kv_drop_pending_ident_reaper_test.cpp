@@ -46,7 +46,9 @@ namespace {
  */
 class KVEngineMock : public KVEngine {
 public:
-    Status dropIdent(RecoveryUnit* ru, StringData ident) override;
+    Status dropIdent(RecoveryUnit* ru,
+                     StringData ident,
+                     StorageEngine::DropIdentCallback&& onDrop) override;
 
     void dropIdentForImport(OperationContext* opCtx, StringData ident) override {}
 
@@ -109,9 +111,6 @@ public:
     Timestamp getAllDurableTimestamp() const override {
         return {};
     }
-    Timestamp getOldestOpenReadTimestamp() const override {
-        return {};
-    }
 
     boost::optional<Timestamp> getOplogNeededForCrashRecovery() const override {
         return boost::none;
@@ -125,7 +124,9 @@ public:
     DropIdentFn dropIdentFn = [](RecoveryUnit*, StringData) { return Status::OK(); };
 };
 
-Status KVEngineMock::dropIdent(RecoveryUnit* ru, StringData ident) {
+Status KVEngineMock::dropIdent(RecoveryUnit* ru,
+                               StringData ident,
+                               StorageEngine::DropIdentCallback&& onDrop) {
     auto status = dropIdentFn(ru, ident);
     if (status.isOK()) {
         droppedIdents.push_back(ident.toString());

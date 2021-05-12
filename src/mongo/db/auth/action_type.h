@@ -96,6 +96,7 @@ namespace mongo {
     X(emptycapped)                                                                    \
     X(enableProfiler)                                                                 \
     X(enableSharding)                                                                 \
+    X(exportCollection)                                                               \
     X(find)                                                                           \
     X(flushRouterConfig)                                                              \
     X(forceUUID)                                                                      \
@@ -113,7 +114,7 @@ namespace mongo {
     X(grantRolesToUser)      /* ID only */                                            \
     X(hostInfo)                                                                       \
     X(impersonate)                                                                    \
-    X(importCollection) /* ID only */                                                 \
+    X(importCollection)                                                               \
     X(indexStats)                                                                     \
     X(inprog)                                                                         \
     X(insert)                                                                         \
@@ -134,6 +135,7 @@ namespace mongo {
     X(logRotate)                                                                      \
     X(moveChunk)                                                                      \
     X(netstat)                                                                        \
+    X(operationMetrics)                                                               \
     X(planCacheIndexFilter) /* view/update index filters */                           \
     X(planCacheRead)        /* view contents of plan cache */                         \
     X(planCacheWrite)       /* clear cache, drop cache entry, pin/unpin/shun plans */ \

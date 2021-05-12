@@ -1,6 +1,5 @@
 // @tags: [
 //   requires_non_retryable_writes,
-//   sbe_incompatible,
 // ]
 
 // Test precision of NumberLong values with v1 index code SERVER-3717
@@ -8,7 +7,7 @@
 t = db.jstests_numberlong2;
 t.drop();
 
-t.ensureIndex({x: 1});
+t.createIndex({x: 1});
 
 function chk(longNum) {
     t.remove({});

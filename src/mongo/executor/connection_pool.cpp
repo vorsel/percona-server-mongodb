@@ -1034,6 +1034,7 @@ void ConnectionPool::SpecificPool::spawnConnections() {
                 "Spawning connections",
                 "connAllowance"_attr = allowance,
                 "hostAndPort"_attr = _hostAndPort);
+
     for (decltype(allowance) i = 0; i < allowance; ++i) {
         OwnedConnection handle;
         try {

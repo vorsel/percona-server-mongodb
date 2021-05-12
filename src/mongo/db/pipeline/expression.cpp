@@ -1849,6 +1849,151 @@ void ExpressionDateToString::_doAddDependencies(DepsTracker* deps) const {
     }
 }
 
+/* ----------------------- ExpressionDateDiff ---------------------------- */
+
+// TODO SERVER-53028: make the expression to be available for any FCV when 5.0 becomes last-lts.
+REGISTER_EXPRESSION_WITH_MIN_VERSION(dateDiff,
+                                     ExpressionDateDiff::parse,
+                                     ServerGlobalParams::FeatureCompatibility::Version::kVersion49);
+
+ExpressionDateDiff::ExpressionDateDiff(ExpressionContext* const expCtx,
+                                       boost::intrusive_ptr<Expression> startDate,
+                                       boost::intrusive_ptr<Expression> endDate,
+                                       boost::intrusive_ptr<Expression> unit,
+                                       boost::intrusive_ptr<Expression> timezone)
+    : Expression{expCtx,
+                 {std::move(startDate), std::move(endDate), std::move(unit), std::move(timezone)}},
+      _startDate{_children[0]},
+      _endDate{_children[1]},
+      _unit{_children[2]},
+      _timeZone{_children[3]} {}
+
+boost::intrusive_ptr<Expression> ExpressionDateDiff::parse(ExpressionContext* const expCtx,
+                                                           BSONElement expr,
+                                                           const VariablesParseState& vps) {
+    invariant(expr.fieldNameStringData() == "$dateDiff");
+    uassert(5166301,
+            "$dateDiff only supports an object as its argument",
+            expr.type() == BSONType::Object);
+    BSONElement startDateElement, endDateElement, unitElement, timezoneElem;
+    for (auto&& element : expr.embeddedObject()) {
+        auto field = element.fieldNameStringData();
+        if ("startDate"_sd == field) {
+            startDateElement = element;
+        } else if ("endDate"_sd == field) {
+            endDateElement = element;
+        } else if ("unit"_sd == field) {
+            unitElement = element;
+        } else if ("timezone"_sd == field) {
+            timezoneElem = element;
+        } else {
+            uasserted(5166302,
+                      str::stream()
+                          << "Unrecognized argument to $dateDiff: " << element.fieldName());
+        }
+    }
+    uassert(5166303, "Missing 'startDate' parameter to $dateDiff", startDateElement);
+    uassert(5166304, "Missing 'endDate' parameter to $dateDiff", endDateElement);
+    uassert(5166305, "Missing 'unit' parameter to $dateDiff", unitElement);
+    return new ExpressionDateDiff(expCtx,
+                                  parseOperand(expCtx, startDateElement, vps),
+                                  parseOperand(expCtx, endDateElement, vps),
+                                  parseOperand(expCtx, unitElement, vps),
+                                  timezoneElem ? parseOperand(expCtx, timezoneElem, vps) : nullptr);
+}
+
+boost::intrusive_ptr<Expression> ExpressionDateDiff::optimize() {
+    _startDate = _startDate->optimize();
+    _endDate = _endDate->optimize();
+    _unit = _unit->optimize();
+    if (_timeZone) {
+        _timeZone = _timeZone->optimize();
+    }
+    if (ExpressionConstant::allNullOrConstant({_startDate, _endDate, _unit, _timeZone})) {
+        // Everything is a constant, so we can turn into a constant.
+        return ExpressionConstant::create(
+            getExpressionContext(), evaluate(Document{}, &(getExpressionContext()->variables)));
+    }
+    return this;
+};
+
+Value ExpressionDateDiff::serialize(bool explain) const {
+    return Value{
+        Document{{"$dateDiff"_sd,
+                  Document{{"startDate"_sd, _startDate->serialize(explain)},
+                           {"endDate"_sd, _endDate->serialize(explain)},
+                           {"unit"_sd, _unit->serialize(explain)},
+                           {"timezone"_sd, _timeZone ? _timeZone->serialize(explain) : Value{}}}}}};
+};
+
+Date_t ExpressionDateDiff::convertToDate(const Value& value, StringData parameterName) {
+    uassert(5166307,
+            str::stream() << "$dateDiff requires '" << parameterName << "' to be a date, but got "
+                          << typeName(value.getType()),
+            value.coercibleToDate());
+    return value.coerceToDate();
+}
+
+/**
+ * Calls function 'function' with zero parameters and returns the result. If AssertionException is
+ * raised during the call of 'function', adds a context 'errorContext' to the exception.
+ */
+template <typename F>
+auto addContextToAssertionException(F&& function, StringData errorContext) {
+    try {
+        return function();
+    } catch (AssertionException& exception) {
+        exception.addContext(str::stream() << errorContext);
+        throw;
+    }
+}
+
+TimeUnit ExpressionDateDiff::convertToTimeUnit(const Value& value) {
+    uassert(5166306,
+            str::stream() << "$dateDiff requires 'unit' to be a string, but got "
+                          << typeName(value.getType()),
+            BSONType::String == value.getType());
+    return addContextToAssertionException([&]() { return parseTimeUnit(value.getString()); },
+                                          "$dateDiff parameter 'unit' value parsing failed"_sd);
+}
+
+Value ExpressionDateDiff::evaluate(const Document& root, Variables* variables) const {
+    const Value startDateValue = _startDate->evaluate(root, variables);
+    if (startDateValue.nullish()) {
+        return Value(BSONNULL);
+    }
+    const Value endDateValue = _endDate->evaluate(root, variables);
+    if (endDateValue.nullish()) {
+        return Value(BSONNULL);
+    }
+    const Value unitValue = _unit->evaluate(root, variables);
+    if (unitValue.nullish()) {
+        return Value(BSONNULL);
+    }
+    const auto timezone = addContextToAssertionException(
+        [&]() {
+            return makeTimeZone(
+                getExpressionContext()->timeZoneDatabase, root, _timeZone.get(), variables);
+        },
+        "$dateDiff parameter 'timezone' value parsing failed"_sd);
+    if (!timezone) {
+        return Value(BSONNULL);
+    }
+    const Date_t startDate = convertToDate(startDateValue, "startDate"_sd);
+    const Date_t endDate = convertToDate(endDateValue, "endDate"_sd);
+    const TimeUnit unit = convertToTimeUnit(unitValue);
+    return Value{dateDiff(startDate, endDate, unit, *timezone)};
+}
+
+void ExpressionDateDiff::_doAddDependencies(DepsTracker* deps) const {
+    _startDate->addDependencies(deps);
+    _endDate->addDependencies(deps);
+    _unit->addDependencies(deps);
+    if (_timeZone) {
+        _timeZone->addDependencies(deps);
+    }
+}
+
 /* ----------------------- ExpressionDivide ---------------------------- */
 
 Value ExpressionDivide::evaluate(const Document& root, Variables* variables) const {
@@ -2584,6 +2729,7 @@ const std::string geoNearPointName = "geoNearPoint";
 const std::string recordIdName = "recordId";
 const std::string indexKeyName = "indexKey";
 const std::string sortKeyName = "sortKey";
+const std::string searchScoreDetailsName = "searchScoreDetails";
 
 using MetaType = DocumentMetadataFields::MetaType;
 const StringMap<DocumentMetadataFields::MetaType> kMetaNameToMetaType = {
@@ -2594,6 +2740,7 @@ const StringMap<DocumentMetadataFields::MetaType> kMetaNameToMetaType = {
     {recordIdName, MetaType::kRecordId},
     {searchHighlightsName, MetaType::kSearchHighlights},
     {searchScoreName, MetaType::kSearchScore},
+    {searchScoreDetailsName, MetaType::kSearchScoreDetails},
     {sortKeyName, MetaType::kSortKey},
     {textScoreName, MetaType::kTextScore},
 };
@@ -2606,6 +2753,7 @@ const stdx::unordered_map<DocumentMetadataFields::MetaType, StringData> kMetaTyp
     {MetaType::kRecordId, recordIdName},
     {MetaType::kSearchHighlights, searchHighlightsName},
     {MetaType::kSearchScore, searchScoreName},
+    {MetaType::kSearchScoreDetails, searchScoreDetailsName},
     {MetaType::kSortKey, sortKeyName},
     {MetaType::kTextScore, textScoreName},
 };
@@ -2663,6 +2811,9 @@ Value ExpressionMeta::evaluate(const Document& root, Variables* variables) const
                 ? Value(DocumentMetadataFields::serializeSortKey(metadata.isSingleElementKey(),
                                                                  metadata.getSortKey()))
                 : Value();
+        case MetaType::kSearchScoreDetails:
+            return metadata.hasSearchScoreDetails() ? Value(metadata.getSearchScoreDetails())
+                                                    : Value();
         default:
             MONGO_UNREACHABLE;
     }
@@ -2670,9 +2821,10 @@ Value ExpressionMeta::evaluate(const Document& root, Variables* variables) const
 }
 
 void ExpressionMeta::_doAddDependencies(DepsTracker* deps) const {
-    if (_metaType == MetaType::kSearchScore || _metaType == MetaType::kSearchHighlights) {
-        // We do not add the dependencies for SEARCH_SCORE or SEARCH_HIGHLIGHTS because those values
-        // are not stored in the collection (or in mongod at all).
+    if (_metaType == MetaType::kSearchScore || _metaType == MetaType::kSearchHighlights ||
+        _metaType == MetaType::kSearchScoreDetails) {
+        // We do not add the dependencies for searchScore, searchHighlights, or searchScoreDetails
+        // because those values are not stored in the collection (or in mongod at all).
         return;
     }
 
@@ -3125,6 +3277,7 @@ Value ExpressionIndexOfCP::evaluate(const Document& root, Variables* variables) 
         if (stringHasTokenAtIndex(byteIx, input, token)) {
             return Value(static_cast<int>(currentCodePointIndex));
         }
+
         byteIx += str::getCodePointLength(input[byteIx]);
     }
 
@@ -4686,9 +4839,13 @@ Value ExpressionSubtract::evaluate(const Document& root, Variables* variables) c
         double left = lhs.coerceToDouble();
         return Value(left - right);
     } else if (diffType == NumberLong) {
-        long long right = rhs.coerceToLong();
-        long long left = lhs.coerceToLong();
-        return Value(left - right);
+        long long result;
+
+        // If there is an overflow, convert the values to doubles.
+        if (overflow::sub(lhs.coerceToLong(), rhs.coerceToLong(), &result)) {
+            return Value(lhs.coerceToDouble() - rhs.coerceToDouble());
+        }
+        return Value(result);
     } else if (diffType == NumberInt) {
         long long right = rhs.coerceToLong();
         long long left = lhs.coerceToLong();
@@ -6324,6 +6481,61 @@ void ExpressionRegex::_doAddDependencies(DepsTracker* deps) const {
     }
 }
 
+std::pair<boost::optional<std::string>, std::string> ExpressionRegex::getConstantPatternAndOptions()
+    const {
+    if (!ExpressionConstant::isNullOrConstant(_regex) ||
+        !ExpressionConstant::isNullOrConstant(_options)) {
+        return {boost::none, ""};
+    }
+    auto patternValue = static_cast<ExpressionConstant*>(_regex.get())->getValue();
+    uassert(5073405,
+            str::stream() << _opName << " needs 'regex' to be of type string or regex",
+            patternValue.nullish() || patternValue.getType() == BSONType::RegEx ||
+                patternValue.getType() == BSONType::String);
+    auto patternStr = [&]() -> boost::optional<std::string> {
+        if (patternValue.getType() == BSONType::RegEx) {
+            StringData flags = patternValue.getRegexFlags();
+            uassert(5073406,
+                    str::stream()
+                        << _opName
+                        << ": found regex options specified in both 'regex' and 'options' fields",
+                    _options.get() == nullptr || flags.empty());
+            return std::string(patternValue.getRegex());
+        } else if (patternValue.getType() == BSONType::String) {
+            return patternValue.getString();
+        } else {
+            return boost::none;
+        }
+    }();
+
+    auto optionsStr = [&]() -> std::string {
+        if (_options.get() != nullptr) {
+            auto optValue = static_cast<ExpressionConstant*>(_options.get())->getValue();
+            if (optValue.getType() == BSONType::String) {
+                return optValue.getString();
+            }
+        }
+        if (patternValue.getType() == BSONType::RegEx) {
+            StringData flags = patternValue.getRegexFlags();
+            if (!flags.empty()) {
+                return flags.toString();
+            }
+        }
+        return {};
+    }();
+
+    uassert(5073407,
+            str::stream() << _opName << ": regular expression cannot contain an embedded null byte",
+            patternStr->find('\0', 0) == std::string::npos);
+
+    uassert(5073408,
+            str::stream() << _opName
+                          << ": regular expression options cannot contain an embedded null byte",
+            optionsStr.find('\0', 0) == std::string::npos);
+
+    return {patternStr, optionsStr};
+}
+
 /* -------------------------- ExpressionRegexFind ------------------------------ */
 
 REGISTER_EXPRESSION(regexFind, ExpressionRegexFind::parse);
@@ -6459,7 +6671,7 @@ intrusive_ptr<Expression> ExpressionRandom::optimize() {
 }
 
 void ExpressionRandom::_doAddDependencies(DepsTracker* deps) const {
-    // Nothing to do.
+    deps->needRandomGenerator = true;
 }
 
 Value ExpressionRandom::serialize(const bool explain) const {

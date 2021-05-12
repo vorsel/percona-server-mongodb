@@ -44,7 +44,7 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache.h"
-#include "mongo/s/database_version_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/scopeguard.h"
@@ -133,14 +133,12 @@ ChunkManager CatalogCacheTestFixture::makeChunkManager(
     ChunkVersion version(1, 0, OID::gen());
 
     const BSONObj databaseBSON = [&]() {
-        DatabaseType db(nss.db().toString(), {"0"}, true, databaseVersion::makeNew());
+        DatabaseType db(nss.db().toString(), {"0"}, true, DatabaseVersion(UUID::gen()));
         return db.toBSON();
     }();
 
     const BSONObj collectionBSON = [&]() {
-        CollectionType coll;
-        coll.setNs(nss);
-        coll.setEpoch(version.epoch());
+        CollectionType coll(nss, version.epoch(), Date_t::now(), UUID::gen());
         coll.setKeyPattern(shardKeyPattern.getKeyPattern());
         coll.setUnique(unique);
 
@@ -190,25 +188,19 @@ ChunkManager CatalogCacheTestFixture::makeChunkManager(
 
 void CatalogCacheTestFixture::expectGetDatabase(NamespaceString nss, std::string shardId) {
     expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
-        DatabaseType db(nss.db().toString(), {shardId}, true, databaseVersion::makeNew());
+        DatabaseType db(nss.db().toString(), {shardId}, true, DatabaseVersion(UUID::gen()));
         return std::vector<BSONObj>{db.toBSON()};
     }());
 }
 
 void CatalogCacheTestFixture::expectGetCollection(NamespaceString nss,
                                                   OID epoch,
-                                                  const ShardKeyPattern& shardKeyPattern,
-                                                  boost::optional<UUID> uuid) {
+                                                  UUID uuid,
+                                                  const ShardKeyPattern& shardKeyPattern) {
     expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
-        CollectionType collType;
-        collType.setNs(nss);
-        collType.setEpoch(epoch);
+        CollectionType collType(nss, epoch, Date_t::now(), uuid);
         collType.setKeyPattern(shardKeyPattern.toBSON());
         collType.setUnique(false);
-        if (uuid) {
-            collType.setUUID(*uuid);
-        }
-
         return std::vector<BSONObj>{collType.toBSON()};
     }());
 }
@@ -231,7 +223,7 @@ ChunkManager CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShardsI
     NamespaceString nss,
     const BSONObj& shardKey,
     boost::optional<std::string> primaryShardId,
-    boost::optional<UUID> uuid) {
+    UUID uuid) {
     const OID epoch = OID::gen();
     const ShardKeyPattern shardKeyPattern(shardKey);
 
@@ -245,7 +237,7 @@ ChunkManager CatalogCacheTestFixture::loadRoutingTableWithTwoChunksAndTwoShardsI
             expectGetDatabase(nss);
         }
     }
-    expectGetCollection(nss, epoch, shardKeyPattern, uuid);
+    expectGetCollection(nss, epoch, uuid, shardKeyPattern);
     expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
         ChunkVersion version(1, 0, epoch);
 

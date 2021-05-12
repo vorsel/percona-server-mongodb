@@ -97,7 +97,8 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
     }
 
     _collLock.emplace(opCtx, nsOrUUID, modeColl, deadline);
-    _resolvedNss = CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(opCtx, nsOrUUID);
+    auto catalog = CollectionCatalog::get(opCtx);
+    _resolvedNss = catalog->resolveNamespaceStringOrUUID(opCtx, nsOrUUID);
 
     // Wait for a configured amount of time after acquiring locks if the failpoint is enabled
     setAutoGetCollectionWait.execute(
@@ -121,7 +122,7 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
     if (!db)
         return;
 
-    _coll = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, _resolvedNss);
+    _coll = catalog->lookupCollectionByNamespace(opCtx, _resolvedNss);
     invariant(!nsOrUUID.uuid() || _coll,
               str::stream() << "Collection for " << _resolvedNss.ns()
                             << " disappeared after successufully resolving "
@@ -135,8 +136,9 @@ AutoGetCollection::AutoGetCollection(OperationContext* opCtx,
             _resolvedNss != NamespaceString::kRsOplogNamespace) {
 
             if (auto minSnapshot = _coll->getMinimumVisibleSnapshot()) {
-                auto mySnapshot = opCtx->recoveryUnit()->getPointInTimeReadTimestamp().get_value_or(
-                    opCtx->recoveryUnit()->getCatalogConflictingTimestamp());
+                auto mySnapshot =
+                    opCtx->recoveryUnit()->getPointInTimeReadTimestamp(opCtx).get_value_or(
+                        opCtx->recoveryUnit()->getCatalogConflictingTimestamp());
 
                 uassert(ErrorCodes::SnapshotUnavailable,
                         str::stream()
@@ -189,10 +191,10 @@ Collection* AutoGetCollection::getWritableCollection(CollectionCatalog::Lifetime
             const Collection* _originalCollection;
         };
 
-        auto& catalog = CollectionCatalog::get(_opCtx);
+        auto catalog = CollectionCatalog::get(_opCtx);
         _writableColl =
-            catalog.lookupCollectionByNamespaceForMetadataWrite(_opCtx, mode, _resolvedNss);
-        if (mode == CollectionCatalog::LifetimeMode::kManagedInWriteUnitOfWork) {
+            catalog->lookupCollectionByNamespaceForMetadataWrite(_opCtx, mode, _resolvedNss);
+        if (mode != CollectionCatalog::LifetimeMode::kInplace) {
             _opCtx->recoveryUnit()->registerChange(
                 std::make_unique<WritableCollectionReset>(*this, _coll.get()));
         }
@@ -205,26 +207,30 @@ Collection* AutoGetCollection::getWritableCollection(CollectionCatalog::Lifetime
 
 AutoGetCollectionLockFree::AutoGetCollectionLockFree(OperationContext* opCtx,
                                                      const NamespaceStringOrUUID& nsOrUUID,
+                                                     RestoreFromYieldFn restoreFromYield,
                                                      AutoGetCollectionViewMode viewMode,
                                                      Date_t deadline)
-    : _globalLock(
+    : _lockFreeReadsBlock(opCtx),
+      _globalLock(
           opCtx, MODE_IS, deadline, Lock::InterruptBehavior::kThrow, true /* skipRSTLLock */) {
 
     // Wait for a configured amount of time after acquiring locks if the failpoint is enabled
     setAutoGetCollectionWait.execute(
         [&](const BSONObj& data) { sleepFor(Milliseconds(data["waitForMillis"].numberInt())); });
 
-    _resolvedNss = CollectionCatalog::get(opCtx).resolveNamespaceStringOrUUID(opCtx, nsOrUUID);
-    _collection =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespaceForRead(opCtx, _resolvedNss);
+    auto catalog = CollectionCatalog::get(opCtx);
+    _resolvedNss = catalog->resolveNamespaceStringOrUUID(opCtx, nsOrUUID);
+    _collection = catalog->lookupCollectionByNamespaceForRead(opCtx, _resolvedNss);
 
     // When we restore from yield on this CollectionPtr we will update _collection above and use its
     // new pointer in the CollectionPtr
-    _collectionPtr = CollectionPtr(
-        opCtx, _collection.get(), [this](OperationContext* opCtx, CollectionUUID uuid) {
-            _collection = CollectionCatalog::get(opCtx).lookupCollectionByUUIDForRead(opCtx, uuid);
-            return _collection.get();
-        });
+    _collectionPtr = CollectionPtr(opCtx,
+                                   _collection.get(),
+                                   [this, restoreFromYield = std::move(restoreFromYield)](
+                                       OperationContext* opCtx, CollectionUUID uuid) {
+                                       restoreFromYield(_collection, opCtx, uuid);
+                                       return _collection.get();
+                                   });
 
     // TODO (SERVER-51319): add DatabaseShardingState::checkDbVersion somewhere.
 
@@ -239,8 +245,6 @@ AutoGetCollectionLockFree::AutoGetCollectionLockFree(OperationContext* opCtx,
         return;
     }
 
-    // TODO (SERVER-51320): this code will invariant in ViewCatalog::lookup() because it takes a
-    // CollectionLock that expects a DBLock to be held on the database already.
     _view = viewCatalog->lookup(opCtx, _resolvedNss.ns());
     uassert(ErrorCodes::CommandNotSupportedOnView,
             str::stream() << "Namespace " << _resolvedNss.ns() << " is a view, not a collection",
@@ -262,10 +266,10 @@ CollectionWriter::CollectionWriter(OperationContext* opCtx,
       _mode(mode),
       _sharedImpl(std::make_shared<SharedImpl>(this)) {
 
-    _storedCollection = CollectionCatalog::get(opCtx).lookupCollectionByUUID(opCtx, uuid);
+    _storedCollection = CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, uuid);
     _sharedImpl->_writableCollectionInitializer = [opCtx,
                                                    uuid](CollectionCatalog::LifetimeMode mode) {
-        return CollectionCatalog::get(opCtx).lookupCollectionByUUIDForMetadataWrite(
+        return CollectionCatalog::get(opCtx)->lookupCollectionByUUIDForMetadataWrite(
             opCtx, mode, uuid);
     };
 }
@@ -277,10 +281,10 @@ CollectionWriter::CollectionWriter(OperationContext* opCtx,
       _opCtx(opCtx),
       _mode(mode),
       _sharedImpl(std::make_shared<SharedImpl>(this)) {
-    _storedCollection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, nss);
+    _storedCollection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
     _sharedImpl->_writableCollectionInitializer = [opCtx,
                                                    nss](CollectionCatalog::LifetimeMode mode) {
-        return CollectionCatalog::get(opCtx).lookupCollectionByNamespaceForMetadataWrite(
+        return CollectionCatalog::get(opCtx)->lookupCollectionByNamespaceForMetadataWrite(
             opCtx, mode, nss);
     };
 }
@@ -307,10 +311,6 @@ CollectionWriter::~CollectionWriter() {
     // Notify shared state that this instance is destroyed
     if (_sharedImpl) {
         _sharedImpl->_parent = nullptr;
-    }
-
-    if (_mode == CollectionCatalog::LifetimeMode::kUnmanagedClone && _writableCollection) {
-        CollectionCatalog::get(_opCtx).discardUnmanagedClone(_opCtx, _writableCollection);
     }
 }
 
@@ -346,7 +346,7 @@ Collection* CollectionWriter::getWritableCollection() {
 
         // If we are using our stored Collection then we are not managed by an AutoGetCollection and
         // we need to manage lifetime here.
-        if (_mode == CollectionCatalog::LifetimeMode::kManagedInWriteUnitOfWork) {
+        if (_mode != CollectionCatalog::LifetimeMode::kInplace) {
             bool usingStoredCollection = *_collection == _storedCollection;
             _opCtx->recoveryUnit()->registerChange(std::make_unique<WritableCollectionReset>(
                 _sharedImpl,
@@ -357,13 +357,6 @@ Collection* CollectionWriter::getWritableCollection() {
         }
     }
     return _writableCollection;
-}
-
-void CollectionWriter::commitToCatalog() {
-    dassert(_mode == CollectionCatalog::LifetimeMode::kUnmanagedClone);
-    dassert(_writableCollection);
-    CollectionCatalog::get(_opCtx).commitUnmanagedClone(_opCtx, _writableCollection);
-    _writableCollection = nullptr;
 }
 
 LockMode fixLockModeForSystemDotViewsChanges(const NamespaceString& nss, LockMode mode) {
@@ -378,23 +371,13 @@ AutoGetOrCreateDb::AutoGetOrCreateDb(OperationContext* opCtx,
     invariant(mode == MODE_IX || mode == MODE_X);
 }
 
-ConcealCollectionCatalogChangesBlock::ConcealCollectionCatalogChangesBlock(OperationContext* opCtx)
-    : _opCtx(opCtx) {
-    CollectionCatalog::get(_opCtx).onCloseCatalog(_opCtx);
-}
-
-ConcealCollectionCatalogChangesBlock::~ConcealCollectionCatalogChangesBlock() {
-    invariant(_opCtx);
-    CollectionCatalog::get(_opCtx).onOpenCatalog(_opCtx);
-}
-
 ReadSourceScope::ReadSourceScope(OperationContext* opCtx,
                                  RecoveryUnit::ReadSource readSource,
                                  boost::optional<Timestamp> provided)
     : _opCtx(opCtx), _originalReadSource(opCtx->recoveryUnit()->getTimestampReadSource()) {
 
     if (_originalReadSource == RecoveryUnit::ReadSource::kProvided) {
-        _originalReadTimestamp = *_opCtx->recoveryUnit()->getPointInTimeReadTimestamp();
+        _originalReadTimestamp = *_opCtx->recoveryUnit()->getPointInTimeReadTimestamp(_opCtx);
     }
 
     _opCtx->recoveryUnit()->abandonSnapshot();

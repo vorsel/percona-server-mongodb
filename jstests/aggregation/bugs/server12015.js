@@ -4,9 +4,6 @@
  * This test executes some simple pipelines and asserts that they have the same results whether or
  * not there are indices that could cover the projection part of the query, or provide a
  * non-blocking sort.
- * @tags: [
- *   sbe_incompatible,
- * ]
  */
 
 load("jstests/aggregation/extras/utils.js");  // For orderedArrayEq.
@@ -36,7 +33,7 @@ function assertResultsMatch(pipeline, ignoreSortOrder) {
     pipeline = [{$match: {a: {$gte: 0}}}].concat(pipeline);
 
     // Once with an index.
-    assert.commandWorked(coll.ensureIndex(indexSpec));
+    assert.commandWorked(coll.createIndex(indexSpec));
     var resultsWithIndex = coll.aggregate(pipeline).toArray();
 
     // Again without an index.

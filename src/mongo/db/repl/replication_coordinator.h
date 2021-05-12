@@ -73,7 +73,7 @@ class ReplSetMetadata;
 namespace repl {
 
 class BackgroundSync;
-class IsMasterResponse;
+class HelloResponse;
 class OpTime;
 class OpTimeAndWallTime;
 class ReadConcernArgs;
@@ -130,9 +130,9 @@ public:
 
     /**
      * We enter quiesce mode during the shutdown process if we are in secondary mode. While in
-     * quiesce mode, we allow reads to continue and accept new reads, but we fail isMaster requests
+     * quiesce mode, we allow reads to continue and accept new reads, but we fail hello requests
      * with ShutdownInProgress. This function causes us to increment the topologyVersion and start
-     * failing isMaster requests with ShutdownInProgress. Returns true if the server entered quiesce
+     * failing hello requests with ShutdownInProgress. Returns true if the server entered quiesce
      * mode.
      *
      * We take in quiesceTime only for reporting purposes. The waiting during quiesce mode happens
@@ -215,10 +215,10 @@ public:
     virtual bool isInPrimaryOrSecondaryState_UNSAFE() const = 0;
 
     /**
-     * Returns how slave delayed this node is configured to be, or 0 seconds if this node is not a
-     * member of the current replica set configuration.
+     * Returns how secondary delayed this node is configured to be, or 0 seconds if this node is not
+     * a member of the current replica set configuration.
      */
-    virtual Seconds getSlaveDelaySecs() const = 0;
+    virtual Seconds getSecondaryDelaySecs() const = 0;
 
     /**
      * Blocks the calling thread for up to writeConcern.wTimeout millis, or until "opTime" has
@@ -250,10 +250,10 @@ public:
                           const Milliseconds& stepdownTime) = 0;
 
     /**
-     * Returns true if the node can be considered master for the purpose of introspective
-     * commands such as isMaster() and rs.status().
+     * Returns true if the primary can be considered writable for the purpose of introspective
+     * commands such as hello() and rs.status().
      */
-    virtual bool isMasterForReportingPurposes() = 0;
+    virtual bool isWritablePrimaryForReportingPurposes() = 0;
 
     /**
      * Returns true if it is valid for this node to accept writes on the given database.  Currently
@@ -322,7 +322,7 @@ public:
      */
     virtual Status checkCanServeReadsFor(OperationContext* opCtx,
                                          const NamespaceString& ns,
-                                         bool slaveOk) = 0;
+                                         bool secondaryOk) = 0;
 
     /**
      * Version which does not check for the RSTL.  Do not use in new code. Without the RSTL held,
@@ -330,7 +330,7 @@ public:
      */
     virtual Status checkCanServeReadsFor_UNSAFE(OperationContext* opCtx,
                                                 const NamespaceString& ns,
-                                                bool slaveOk) = 0;
+                                                bool secondaryOk) = 0;
 
     /**
      * Returns true if this node should ignore index constraints for idempotency reasons.
@@ -532,14 +532,14 @@ public:
      *      |
      *      | applier signals drain is complete
      *      V
-     * - primary is in master mode
+     * - primary is in writable mode
      * (producer: Stopped, applier: Stopped)
      *
      *
      * Step-down
      * =========
      * The state transitions become:
-     * - primary is in master mode
+     * - primary is in writable mode
      * (producer: Stopped, applier: Stopped)
      *      |
      *      | step down
@@ -606,10 +606,10 @@ public:
                                            ReplSetGetStatusResponseStyle responseStyle) = 0;
 
     /**
-     * Adds to "result" a description of the slaveInfo data structure used to map RIDs to their
+     * Adds to "result" a description of the memberData data structure used to map RIDs to their
      * last known optimes.
      */
-    virtual void appendSlaveInfoData(BSONObjBuilder* result) = 0;
+    virtual void appendSecondaryInfoData(BSONObjBuilder* result) = 0;
 
     /**
      * Returns a copy of the current ReplSetConfig.
@@ -977,29 +977,29 @@ public:
 
     /**
      * Increment the server TopologyVersion and fulfill the promise of any currently waiting
-     * isMaster request.
+     * hello request.
      */
     virtual void incrementTopologyVersion() = 0;
 
     /**
-     * Constructs and returns an IsMasterResponse. Will block until the given deadline waiting for a
+     * Constructs and returns a HelloResponse. Will block until the given deadline waiting for a
      * significant topology change if the 'counter' field of 'clientTopologyVersion' is equal to the
      * current TopologyVersion 'counter' from the TopologyCoordinator. Returns immediately if
      * 'clientTopologyVersion' < TopologyVersion of the TopologyCoordinator or if the processId
      * differs.
      */
-    virtual std::shared_ptr<const IsMasterResponse> awaitIsMasterResponse(
+    virtual std::shared_ptr<const HelloResponse> awaitHelloResponse(
         OperationContext* opCtx,
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion,
         boost::optional<Date_t> deadline) = 0;
 
     /**
-     * The futurized version of `awaitIsMasterResponse()`:
-     * * The future is ready for all cases that `awaitIsMasterResponse()` returns immediately.
-     * * For cases that `awaitIsMasterResponse()` blocks, calling `get()` on the future is blocking.
+     * The futurized version of `awaitHelloResponse()`:
+     * * The future is ready for all cases that `awaitHelloResponse()` returns immediately.
+     * * For cases that `awaitHelloResponse()` blocks, calling `get()` on the future is blocking.
      */
-    virtual SharedSemiFuture<std::shared_ptr<const IsMasterResponse>> getIsMasterResponseFuture(
+    virtual SharedSemiFuture<std::shared_ptr<const HelloResponse>> getHelloResponseFuture(
         const SplitHorizon::Parameters& horizonParams,
         boost::optional<TopologyVersion> clientTopologyVersion) = 0;
 
@@ -1047,7 +1047,7 @@ public:
     /**
      * A testing only function that cancels and reschedules replication heartbeats immediately.
      */
-    virtual void restartHeartbeats_forTest() = 0;
+    virtual void restartScheduledHeartbeats_forTest() = 0;
 
 protected:
     ReplicationCoordinator();

@@ -1,12 +1,9 @@
 // SERVER-2585 Test $or clauses within indexed top level $or clauses.
-// @tags: [
-//   sbe_incompatible,
-// ]
 
 t = db.jstests_ork;
 t.drop();
 
-t.ensureIndex({a: 1});
+t.createIndex({a: 1});
 t.save({a: [1, 2], b: 5});
 t.save({a: [2, 4], b: 5});
 

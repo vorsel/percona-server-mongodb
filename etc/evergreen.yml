@@ -1079,7 +1079,6 @@ functions:
   "bypass compile and fetch binaries":
     command: shell.exec
     params:
-      continue_on_err: true
       working_dir: src
       shell: bash
       script: |
@@ -1227,6 +1226,12 @@ functions:
           # Windows path separator
           toolchain_txt="$pip_dir/toolchain-requirements.txt"
           ${activate_virtualenv}
+          packager_arch="${packager_arch}"
+          if [[ $packager_arch != "arm64" ]]; then
+            # For now, skip upgrading pip on ARM variants due to setup tools
+            # issue.
+            python -m pip install --upgrade pip
+          fi
           python -m pip install -r "$toolchain_txt" -q
           python -m pip freeze > pip-requirements.txt
 
@@ -1365,6 +1370,10 @@ functions:
       working_dir: src
       shell: bash
       script: |
+        # Export these before verbose is set to avoid sharing sensitive info.
+        export CEDAR_USERNAME=${cedar_user}
+        export CEDAR_API_KEY=${cedar_api_key}
+
         set -o errexit
         set -o verbose
 
@@ -1559,20 +1568,9 @@ functions:
           set -o verbose
 
           # Only run on master branch
-          if [[ "${project}" != "mongodb-mongo-master" ]]; then
-
-            if [ "${is_patch}" = "true" ]; then
-              echo "Not on master, skipping selected_tests_gen task"
-              exit 1
-            else
-              exit 0
-            fi
-
-          else
-
+          if [ "${project}" == "mongodb-mongo-master" -a "${is_patch}" == "true" ]; then
             ${activate_virtualenv}
             PATH=$PATH:$HOME $python buildscripts/selected_tests.py --expansion-file expansions.yml --selected-tests-config .selected_tests.yml
-
           fi
     - command: archive.targz_pack
       params:
@@ -1889,6 +1887,11 @@ functions:
           extra_args="$extra_args --implicit-cache --build-fast-and-loose=on"
         else
           extra_args="$extra_args --release"
+        fi
+
+        if [ "Windows_NT" = "$OS" ]; then
+          vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"
+          export PATH="$(echo "$(cd "$vcvars" && cmd /C "vcvarsall.bat amd64 && C:/cygwin/bin/bash -c 'echo \$PATH'")" | tail -n +6)":$PATH
         fi
 
         ${activate_virtualenv}
@@ -3525,6 +3528,7 @@ tasks:
           - "src/mongo/util/options_parser/test_config_files/**"
           - "src/third_party/JSON-Schema-Test-Suite/tests/draft4/**"
           - "src/third_party/mock_ocsp_responder/**"
+          - "src/third_party/schemastore.org/**"
         exclude_files:
           - "*_test.pdb"
 
@@ -3576,7 +3580,50 @@ tasks:
       params:
         working_dir: src
         shell: bash
-        script: ninja -f build.ninja
+        script: |
+          ${activate_virtualenv}
+          if [ "Windows_NT" = "$OS" ]; then
+            vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"
+            cd "$vcvars" && cmd /K "vcvarsall.bat amd64 && cd ${workdir}\src"
+          fi
+          python -m pip install ninja
+          ninja install-core
+
+- name: compile_ninja_next
+  commands:
+    - func: "scons compile"
+      vars:
+        task_install_action:
+            default
+        task_compile_flags: >-
+          --build-tools=next
+          --ninja
+        targets:
+          generate-ninja
+    - command: shell.exec
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          ${activate_virtualenv}
+          if [ "Windows_NT" = "$OS" ]; then
+            vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"
+            cd "$vcvars" && cmd /K "vcvarsall.bat amd64 && cd ${workdir}\src"
+          fi
+          python -m pip install ninja
+          ninja install-core
+
+
+- name: compile_build_tools_next
+  commands:
+    - func: "scons compile"
+      vars:
+        task_install_action:
+            default
+        task_compile_flags: >-
+          --build-tools=next
+        targets:
+          install-core
 
 ## compile_all - build all scons targets ##
 - name: compile_all
@@ -3603,7 +3650,7 @@ tasks:
 
 ## clang_tidy - run clang_tidy
 - name: clang_tidy
-  exec_timeout_secs: 14400
+  exec_timeout_secs: 3600 # 1 hour timeout for the task overall
   commands:
     - func: "scons compile"
       vars:
@@ -3611,7 +3658,7 @@ tasks:
         compiling_for_test: true
     - command: shell.exec
       type: test
-      timeout_secs: 14400
+      timeout_secs: 3600 # 1 hour timeout for no output
       params:
         working_dir: "src"
         script: |
@@ -3619,14 +3666,14 @@ tasks:
           set -o verbose
           # TODO SERVER-49884 Remove this when we no longer check in generated Bison.
           BISON_GENERATED_PATTERN=parser_gen\.cpp
-          # This could probably be accelerated with gnu parallel
-          /opt/mongodbtoolchain/v3/bin/clang-tidy \
+          jq -r '.[] | .file' compile_commands.json | \
+            grep src/mongo | \
+            grep -v $BISON_GENERATED_PATTERN | \
+            xargs -n 32 -P $(grep -c ^processor /proc/cpuinfo) -t \
+            /opt/mongodbtoolchain/v3/bin/clang-tidy \
             -p ./compile_commands.json \
             --checks="-*,bugprone-unused-raii,bugprone-use-after-move,readability-const-return-type,readability-avoid-const-params-in-decls" \
-            -warnings-as-errors="*" \
-            $(jq -r '.[] | .file' compile_commands.json | \
-            grep src/mongo | \
-            grep -v $BISON_GENERATED_PATTERN)
+            -warnings-as-errors="*"
 
 ## unittests - run unittests ##
 - name: unittests
@@ -4132,6 +4179,29 @@ tasks:
     - func: "scons lint"
       vars:
         targets: lint-errorcodes
+
+- name: test_api_version_compatibility
+  depends_on:
+    - name: compile
+  commands:
+    - command: manifest.load
+    - func: "git get project"
+    - func: "set task expansion macros"
+    - func: "set up virtualenv"
+    - func: "upload pip requirements"
+    - func: "do setup"
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          set -o errexit
+          set -o verbose
+          ${activate_virtualenv}
+
+          $python buildscripts/idl/check_versioned_api_commands_have_idl_definitions.py -v --include src --include src/mongo/db/modules/enterprise/src --installDir dist-test/bin 1
+          $python buildscripts/idl/checkout_idl_files_from_past_releases.py -v idls
 
 - name: burn_in_tests_gen
   commands:
@@ -5093,7 +5163,7 @@ tasks:
 
 - <<: *task_template
   name: aggregation_one_shard_sharded_collections
-  tags: ["aggregation", "no_async"]
+  tags: ["aggregation", "no_async", "sharded"]
   depends_on:
   - name: aggregation
   commands:
@@ -5129,7 +5199,7 @@ tasks:
 
 - <<: *task_template
   name: aggregation_sharded_collections_passthrough
-  tags: ["aggregation", "common"]
+  tags: ["aggregation", "common", "sharded"]
   depends_on:
   - name: aggregation
   commands:
@@ -5140,7 +5210,7 @@ tasks:
 
 - <<: *task_template
   name: aggregation_sharded_collections_causally_consistent_passthrough
-  tags: ["aggregation", "secondary_reads"]
+  tags: ["aggregation", "secondary_reads", "sharded"]
   depends_on:
   - name: aggregation
   commands:
@@ -5695,6 +5765,42 @@ tasks:
       resmoke_args: --suites=core --storageEngine=wiredTiger
 
 - <<: *task_template
+  name: config_fuzzer_jsCore
+  tags: []
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=core --storageEngine=wiredTiger --fuzzMongodConfigs
+
+- <<: *task_template
+  name: config_fuzzer_concurrency
+  tags: []
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency --storageEngine=wiredTiger --fuzzMongodConfigs
+
+- <<: *task_template
+  name: config_fuzzer_concurrency_replication
+  tags: []
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_replication --storageEngine=wiredTiger --fuzzMongodConfigs
+
+- <<: *task_template
+  name: config_fuzzer_replica_sets_jscore_passthrough
+  tags: []
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=replica_sets_jscore_passthrough --storageEngine=wiredTiger --fuzzMongodConfigs
+
+- <<: *task_template
   name: jsCore_ese
   tags: ["jscore", "encrypt"]
   depends_on:
@@ -6114,6 +6220,17 @@ tasks:
       use_multiversion: /data/multiversion
       fallback_num_sub_suites: 1
 
+# Tests the runFeatureFlagMultiversionTest helper.
+# This requires the 'featureFlagToaster' and 'featureFlagSpoon' parameters to be set to true on
+# build variants that enable this task.
+- name: feature_flag_multiversion_gen
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      resmoke_args: "--storageEngine=wiredTiger"
+      use_multiversion: /data/multiversion
+      fallback_num_sub_suites: 1
+
 - name: unittest_shell_hang_analyzer_gen
   commands:
   - func: "generate resmoke tasks"
@@ -6374,6 +6491,24 @@ tasks:
       resmoke_args: --suites=concurrency --storageEngine=wiredTiger
       resmoke_jobs_max: 1
 
+- <<: *task_template
+  name: concurrency_metrics
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_metrics --storageEngine=wiredTiger
+      resmoke_jobs_max: 1
+
+- <<: *task_template
+  name: concurrency_replication_metrics
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: --suites=concurrency_replication_metrics --storageEngine=wiredTiger
+      resmoke_jobs_max: 1
+
 - name: concurrency_replication_gen
   tags: ["concurrency", "common", "repl"]
   commands:
@@ -6466,7 +6601,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_replication
-  tags: ["concurrency", "common", "read_concern_maj", "large"]
+  tags: ["concurrency", "common", "read_concern_maj", "large", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6487,7 +6622,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_replication_with_balancer
-  tags: ["concurrency", "common", "read_concern_maj", "large"]
+  tags: ["concurrency", "common", "read_concern_maj", "large", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6497,7 +6632,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_replication_no_txns
-  tags: ["concurrency", "no_txns", "large"]
+  tags: ["concurrency", "no_txns", "large", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6507,7 +6642,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_replication_no_txns_with_balancer
-  tags: ["concurrency", "no_txns", "large"]
+  tags: ["concurrency", "no_txns", "large", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6517,7 +6652,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_clusterwide_ops_add_remove_shards
-  tags: ["concurrency", "common", "read_concern_maj", "large"]
+  tags: ["concurrency", "common", "read_concern_maj", "large", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6526,7 +6661,7 @@ tasks:
       resmoke_jobs_max: 1
 
 - name: concurrency_sharded_causal_consistency_gen
-  tags: ["concurrency", "non_live_record"]
+  tags: ["concurrency", "non_live_record", "sharded"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -6537,7 +6672,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_causal_consistency_and_balancer
-  tags: ["concurrency", "large", "non_live_record"]
+  tags: ["concurrency", "large", "non_live_record", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6547,7 +6682,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_with_stepdowns
-  tags: ["concurrency", "stepdowns", "large"]
+  tags: ["concurrency", "stepdowns", "large", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6557,7 +6692,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_with_stepdowns_and_balancer
-  tags: ["concurrency", "stepdowns", "large"]
+  tags: ["concurrency", "stepdowns", "large", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6566,7 +6701,7 @@ tasks:
       resmoke_jobs_max: 1
 
 - name: concurrency_sharded_terminate_primary_with_balancer_gen
-  tags: ["concurrency", "stepdowns", "kill_terminate"]
+  tags: ["concurrency", "stepdowns", "kill_terminate", "sharded"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -6576,7 +6711,7 @@ tasks:
       fallback_num_sub_suites: 3
 
 - name: concurrency_sharded_kill_primary_with_balancer_gen
-  tags: ["concurrency", "stepdowns", "kill_terminate"]
+  tags: ["concurrency", "stepdowns", "kill_terminate", "sharded"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -6587,7 +6722,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_multi_stmt_txn
-  tags: ["concurrency", "large"]
+  tags: ["concurrency", "large", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6597,7 +6732,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_multi_stmt_txn_with_balancer
-  tags: ["concurrency", "large"]
+  tags: ["concurrency", "large", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6607,7 +6742,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_local_read_write_multi_stmt_txn
-  tags: ["concurrency", "large"]
+  tags: ["concurrency", "large", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6617,7 +6752,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
-  tags: ["concurrency", "large"]
+  tags: ["concurrency", "large", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6627,7 +6762,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_multi_stmt_txn_with_stepdowns
-  tags: ["concurrency", "stepdowns", "large"]
+  tags: ["concurrency", "stepdowns", "large", "sharded"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6637,7 +6772,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_multi_stmt_txn_terminate_primary_gen
-  tags: ["concurrency", "stepdowns", "kill_terminate"]
+  tags: ["concurrency", "stepdowns", "kill_terminate", "sharded"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -6648,7 +6783,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_sharded_multi_stmt_txn_kill_primary_gen
-  tags: ["concurrency", "stepdowns", "kill_terminate"]
+  tags: ["concurrency", "stepdowns", "kill_terminate", "sharded"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -7545,6 +7680,8 @@ tasks:
   depends_on: []
   commands:
   - func: "do non-compile setup"
+  - func: "set up remote credentials"
+  - func: "configure evergreen api credentials"
   - func: "do multiversion setup"
   - func: "run tests"
     vars:
@@ -8424,6 +8561,17 @@ task_groups:
   - package
 
 - <<: *compile_task_group_template
+  name: compile_ninja_next_TG
+  tasks:
+  - compile_build_tools_next
+  - compile_ninja_next
+
+- <<: *compile_task_group_template
+  name: compile_build_tools_next_TG
+  tasks:
+  - compile_build_tools_next
+
+- <<: *compile_task_group_template
   name: compile_ninja_TG
   tasks:
   - compile_ninja
@@ -8643,24 +8791,24 @@ buildvariants:
     - rhel62-large
   - name: .integration !.audit
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: jsCore
   - name: jsCore_txns
   - name: .logical_session_cache
   - name: parallel_gen
   - name: .concurrency .common !.kill_terminate
     distros:
-      - rhel62-large
+      - rhel62-medium
   - name: concurrency_replication_causal_consistency
     distros:
-      - rhel62-large
+      - rhel62-medium
 
 - &linux-64-debug-template
   name: linux-64-debug
   display_name: "! Shared Library Linux DEBUG"
   batchtime: 240 # 4 hours
   run_on:
-  - rhel62-large
+  - rhel62-medium
   expansions:
     resmoke_jobs_factor: 0.5  # Avoid starting too many mongod's
     compile_flags: --dbg=on --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --enable-free-mon=on --enable-http-client=on --link-model=dynamic
@@ -8672,8 +8820,14 @@ buildvariants:
     num_scons_link_jobs_available: 0.99
   tasks:
   - name: compile_parallel_TG
+    distros:
+      - rhel62-large
   - name: unittests_parallel_TG
+    distros:
+      - rhel62-large
   - name: dbtest_parallel_TG
+    distros:
+    - rhel62-large
   - name: .aggregation !.encrypt
   - name: .auth !.audit !.gle !.multiversion
   - name: bulk_gle_passthrough
@@ -8689,7 +8843,6 @@ buildvariants:
   - name: libunwind_tests
   - name: .multi_shard
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
-  - name: tenant_migration_jscore_passthrough_gen
   - name: .ocsp
   - name: .read_write_concern
   - name: .replica_sets !.encrypt
@@ -8703,7 +8856,11 @@ buildvariants:
   - name: sharding_gen
   - name: .stitch
   - name: server_discovery_and_monitoring_json_test_TG
+    distros:
+    - rhel62-large
   - name: server_selection_json_test_TG
+    distros:
+    - rhel62-large
 
 - <<: *linux-64-debug-template
   name: linux-64-debug-wtdevelop
@@ -8824,6 +8981,9 @@ buildvariants:
     scons_cache_scope: shared
   tasks:
   - name: compile_all_run_unittests_TG
+    distros:
+    - ubuntu1804-build
+  - name: compile_ninja_next_TG
     distros:
     - ubuntu1804-build
   - name: compile_ninja_TG
@@ -9058,6 +9218,7 @@ buildvariants:
   - enterprise
   run_on:
   - ubuntu1804-power8-test
+  batchtime: 10080 # 7 days
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
     push_path: linux
@@ -9278,6 +9439,9 @@ buildvariants:
     scons_cache_scope: shared
   tasks:
   - name: compile_all_run_unittests_TG
+    distros:
+    - ubuntu2004-large
+  - name: compile_ninja_next_TG
     distros:
     - ubuntu2004-large
   - name: compile_ninja_TG
@@ -9643,6 +9807,9 @@ buildvariants:
   - name: compile_all_run_unittests_TG
     distros:
     - windows-64-vs2019-large
+  - name: compile_build_tools_next_TG
+    distros:
+    - windows-64-vs2019-large
   - name: .aggregation !.auth !.encrypt
   - name: aggregation_expression_multiversion_fuzzer_gen
   - name: aggregation_expression_optimization_fuzzer_gen
@@ -9716,8 +9883,11 @@ buildvariants:
   - name: compile_TG
     distros:
     - windows-64-vs2019-large
-  # - name: burn_in_tests_gen
-  # - name: buildscripts_test
+  - name: compile_build_tools_next_TG
+    distros:
+    - windows-64-vs2019-large
+  - name: burn_in_tests_gen
+  - name: buildscripts_test
   - name: noPassthrough_gen
   - name: server_discovery_and_monitoring_json_test_TG
   - name: server_selection_json_test_TG
@@ -9871,6 +10041,7 @@ buildvariants:
     multiversion_platform: windows_x86_64-2008plus-ssl
     multiversion_platform_42_or_later: windows_x86_64-2012plus
     multiversion_platform_44_or_later: windows
+    multiversion_edition: base
     content_type: application/zip
     compile_flags: --ssl MONGO_DISTMOD=windows -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=win10
     num_scons_link_jobs_available: 0.5
@@ -9904,7 +10075,7 @@ buildvariants:
   - name: .jstestfuzz !.initsync !.flow_control !.stepdowns
   - name: multiversion_gen
   - name: multiversion_auth_gen
-  - name: .powercycle
+#  - name: .powercycle
   - name: .query_fuzzer
   - name: .read_write_concern
   - name: replica_sets
@@ -9939,6 +10110,9 @@ buildvariants:
   # It has a minimal amount of tasks because unoptimized builds are slow, which causes
   # timing-sensitive tests to fail.
   - name: compile_TG
+    distros:
+    - windows-64-vs2019-large
+  - name: compile_ninja_next_TG
     distros:
     - windows-64-vs2019-large
   - name: audit
@@ -10007,6 +10181,7 @@ buildvariants:
     num_scons_link_jobs_available: 0.99
   tasks:
   - name: compile_all_run_unittests_TG
+  - name: compile_build_tools_next_TG
   - name: aggregation
   - name: auth_gen
   - name: causally_consistent_jscore_txns_passthrough
@@ -10038,6 +10213,7 @@ buildvariants:
     resmoke_jobs_max: 6
   tasks:
   - name: compile_all_run_unittests_TG
+  - name: compile_ninja_next_TG
   - name: audit
   - name: auth_audit_gen
   - name: causally_consistent_jscore_txns_passthrough
@@ -10135,7 +10311,7 @@ buildvariants:
     jstestfuzz_concurrent_num_files: 10
     target_resmoke_time: 10
     max_sub_suites: 3
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -10151,14 +10327,14 @@ buildvariants:
   - name: .concurrency !.large !.ubsan !.no_txns !.debug_only
   - name: .concurrency .large !.ubsan !.no_txns !.debug_only
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: disk_wiredtiger
   - name: .encrypt
   - name: idl_tests
   - name: initial_sync_fuzzer_gen
   - name: .integration
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .jscore .common
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
@@ -10174,22 +10350,22 @@ buildvariants:
   - name: .random_multiversion_ds
   - name: .read_write_concern .large
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .read_write_concern !.large
   - name: .replica_sets !.encrypt !.auth
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: replica_sets_reconfig_jscore_passthrough_gen
   - name: replica_sets_reconfig_jscore_stepdown_passthrough
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: replica_sets_reconfig_kill_primary_jscore_passthrough
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: retryable_writes_jscore_passthrough_gen
   - name: retryable_writes_jscore_stepdown_passthrough
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .read_only
   - name: .rollbackfuzzer
   - name: sasl
@@ -10205,7 +10381,11 @@ buildvariants:
   - name: .updatefuzzer
   - name: secondary_reads_passthrough_gen
   - name: server_discovery_and_monitoring_json_test_TG
+    distros:
+      - rhel62-large
   - name: server_selection_json_test_TG
+    distros:
+      - rhel62-large
   - name: test_packages
     distros:
     - ubuntu1604-packer
@@ -10231,7 +10411,7 @@ buildvariants:
     jstestfuzz_concurrent_num_files: 10
     target_resmoke_time: 10
     max_sub_suites: 5
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
     burn_in_tag_buildvariants: enterprise-rhel-62-64-bit-majority-read-concern-off enterprise-rhel-62-64-bit-inmem linux-64-duroff enterprise-rhel-62-64-bit-multiversion
     num_scons_link_jobs_available: 0.99
   tasks:
@@ -10251,6 +10431,7 @@ buildvariants:
   - name: lint_fuzzer_sanity_patch
   - name: lint_yaml
   - name: lint_errorcodes
+  - name: test_api_version_compatibility
   - name: burn_in_tests_gen
   - name: burn_in_tests_multiversion_gen
   - name: .aggfuzzer
@@ -10267,14 +10448,14 @@ buildvariants:
   - name: .concurrency !.large !.ubsan !.no_txns !.debug_only
   - name: .concurrency .large !.ubsan !.no_txns !.debug_only
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: disk_wiredtiger
   - name: .encrypt
   - name: idl_tests
   - name: initial_sync_fuzzer_gen
   - name: .integration
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .jscore .common
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
@@ -10286,28 +10467,27 @@ buildvariants:
   - name: mqlrun
   - name: .multi_shard
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
-  - name: tenant_migration_jscore_passthrough_gen
   - name: multiversion_gen
   - name: .query_fuzzer
   - name: .random_multiversion_ds
   - name: .read_write_concern .large
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .read_write_concern !.large
   - name: .replica_sets !.encrypt !.auth
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: replica_sets_reconfig_jscore_passthrough_gen
   - name: replica_sets_reconfig_jscore_stepdown_passthrough
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: replica_sets_reconfig_kill_primary_jscore_passthrough
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: retryable_writes_jscore_passthrough_gen
   - name: retryable_writes_jscore_stepdown_passthrough
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .read_only
   - name: .rollbackfuzzer
   - name: sasl
@@ -10323,13 +10503,15 @@ buildvariants:
   - name: .updatefuzzer
   - name: secondary_reads_passthrough_gen
   - name: server_discovery_and_monitoring_json_test_TG
+    distros:
+      - rhel62-large
   - name: server_selection_json_test_TG
     distros:
-    - rhel62-large
+      - rhel62-large
   - name: cst_jscore_passthrough
 
 - name: enterprise-rhel-62-64-bit-dynamic-disabled-feature-flags
-  display_name: "~ Shared Library Enterprise RHEL 6.2 (disabled feature flags)"
+  display_name: "! Shared Library Enterprise RHEL 6.2 (disabled feature flags)"
   batchtime: 60 # 1 hour
   stepback: false
   modules:
@@ -10348,11 +10530,11 @@ buildvariants:
     jstestfuzz_concurrent_num_files: 10
     target_resmoke_time: 10
     max_sub_suites: 5
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
     burn_in_tag_buildvariants: enterprise-rhel-62-64-bit-majority-read-concern-off enterprise-rhel-62-64-bit-inmem linux-64-duroff enterprise-rhel-62-64-bit-multiversion
     num_scons_link_jobs_available: 0.99
     test_flags: >-
-        --mongodSetParameters="{featureFlagTimeSeriesCollection: true}"
+        --mongodSetParameters="{featureFlagToaster: true, featureFlagSpoon: true, featureFlagTenantMigrations: true}"
   tasks:
   - name: compile_parallel_TG
     distros:
@@ -10362,7 +10544,7 @@ buildvariants:
       - rhel62-large
   - name: dbtest_parallel_TG
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .aggfuzzer
   - name: .aggregation
   - name: audit
@@ -10374,14 +10556,15 @@ buildvariants:
   - name: .concurrency !.large !.ubsan !.no_txns !.debug_only
   - name: .concurrency .large !.ubsan !.no_txns !.debug_only
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: disk_wiredtiger
   - name: .encrypt
+  - name: feature_flag_multiversion_gen
   - name: idl_tests
   - name: initial_sync_fuzzer_gen
   - name: .integration
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .jscore .common
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
@@ -10398,22 +10581,22 @@ buildvariants:
   - name: .random_multiversion_ds
   - name: .read_write_concern .large
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .read_write_concern !.large
   - name: .replica_sets !.encrypt !.auth
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: replica_sets_reconfig_jscore_passthrough_gen
   - name: replica_sets_reconfig_jscore_stepdown_passthrough
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: replica_sets_reconfig_kill_primary_jscore_passthrough
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: retryable_writes_jscore_passthrough_gen
   - name: retryable_writes_jscore_stepdown_passthrough
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .read_only
   - name: .rollbackfuzzer
   - name: sasl
@@ -10429,9 +10612,11 @@ buildvariants:
   - name: .updatefuzzer
   - name: secondary_reads_passthrough_gen
   - name: server_discovery_and_monitoring_json_test_TG
+    distros:
+      - rhel62-large
   - name: server_selection_json_test_TG
     distros:
-    - rhel62-large
+      - rhel62-large
   - name: cst_jscore_passthrough
 
 - name: enterprise-rhel-62-64-bit-large-txns-format
@@ -10452,7 +10637,7 @@ buildvariants:
     multiversion_edition: enterprise
     repo_edition: enterprise
     scons_cache_scope: shared
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
     test_flags: >-
         --mongodSetParameters="{maxNumberOfTransactionOperationsInSingleOplogEntry: 2}"
         --excludeWithAnyTags=exclude_from_large_txns
@@ -10470,34 +10655,34 @@ buildvariants:
   - name: concurrency_replication_multi_stmt_txn
   - name: concurrency_sharded_replication
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: concurrency_sharded_replication_with_balancer
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: concurrency_sharded_clusterwide_ops_add_remove_shards
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: concurrency_sharded_local_read_write_multi_stmt_txn
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: concurrency_sharded_local_read_write_multi_stmt_txn_with_balancer
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: concurrency_sharded_multi_stmt_txn
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: concurrency_sharded_multi_stmt_txn_with_balancer
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: concurrency_sharded_multi_stmt_txn_with_stepdowns
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: concurrency_sharded_with_stepdowns
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: concurrency_sharded_with_stepdowns_and_balancer
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: initial_sync_fuzzer_gen
   - name: jsCore
   - name: jsCore_txns
@@ -10510,7 +10695,7 @@ buildvariants:
   - name: .replica_sets !.multi_oplog !.large
   - name: .replica_sets !.multi_oplog .large
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .rollbackfuzzer
   - name: .sharding .txns
   - name: sharding_gen
@@ -10521,7 +10706,7 @@ buildvariants:
   - name: sharding_csrs_continuous_config_stepdown_gen
   - name: sharded_multi_stmt_txn_jscore_passthrough
     distros:
-    - rhel62-large
+    - rhel62-medium
 
 - name: enterprise-rhel-62-64-bit-majority-read-concern-off
   display_name: "Enterprise RHEL 6.2 (majority read concern off)"
@@ -10551,7 +10736,7 @@ buildvariants:
     multiversion_edition: enterprise
     repo_edition: enterprise
     scons_cache_scope: shared
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -10570,15 +10755,15 @@ buildvariants:
   - name: concurrency_sharded_causal_consistency_gen
   - name: concurrency_sharded_causal_consistency_and_balancer
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: concurrency_replication_causal_consistency
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: disk_wiredtiger
   - name: .encrypt
   - name: .integration
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .jscore .common
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
@@ -10589,10 +10774,10 @@ buildvariants:
   - name: .random_multiversion_ds
   - name: .read_write_concern .large
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .replica_sets !.auth !.encrypt !.non_maj_read
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: retryable_writes_jscore_passthrough_gen
   - name: .read_only
   - name: .rollbackfuzzer
@@ -10628,7 +10813,7 @@ buildvariants:
     multiversion_edition: enterprise
     repo_edition: enterprise
     scons_cache_scope: shared
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
   tasks:
   - name: burn_in_tests_gen
   - name: compile_TG
@@ -10638,7 +10823,7 @@ buildvariants:
   - name: noPassthroughWithMongod_gen
   - name: replica_sets
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .rollbackfuzzer
 
 # This build variant is used to run multiversion tests as part of burn_in_tags as these tests are
@@ -10663,7 +10848,7 @@ buildvariants:
     scons_cache_scope: shared
     tooltags: "ssl sasl gssapi"
     build_mongoreplay: true
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
     resmoke_jobs_factor: 0.25
   tasks:
   - name: compile_all_run_unittests_TG
@@ -10694,7 +10879,7 @@ buildvariants:
     multiversion_edition: enterprise
     repo_edition: enterprise
     scons_cache_scope: shared
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
   tasks:
   - name: compile_TG
     distros:
@@ -10712,13 +10897,13 @@ buildvariants:
   - name: .concurrency !.ubsan !.no_txns !.debug_only !.large
   - name: .concurrency !.ubsan !.no_txns !.debug_only .large
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: disk_wiredtiger
   - name: .encrypt
   - name: initial_sync_fuzzer_gen
   - name: .integration
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .jscore .common
   - name: jsCore_minimum_batch_size
   - name: jsCore_op_query
@@ -10733,10 +10918,10 @@ buildvariants:
   - name: .read_write_concern !.large !.aggregation
   - name: .read_write_concern .large !.aggregation
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .replica_sets !.encrypt !.auth
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: retryable_writes_jscore_passthrough_gen
   - name: .read_only
   - name: .retry
@@ -10760,7 +10945,7 @@ buildvariants:
   - rhel62-small
   expansions: &enterprise-rhel-62-64-bit-lock-free-reads-expansions
     test_flags: >-
-      --mongodSetParameters="{disableLockFreeReads: false}"
+      --mongodSetParameters="{disableLockFreeReads: false}" --excludeWithAnyTags=incompatible_with_lockfreereads
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
       --ssl
@@ -10771,14 +10956,52 @@ buildvariants:
     repo_edition: enterprise
     scons_cache_scope: shared
     build_mongoreplay: false
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
   tasks:
   - name: compile_TG
     distros:
     - rhel62-large
-  # jsCore does not exercise the lock-free reads feature, as it is overridden to disabled on standalones, but is a pre-req for other tasks.
-  - name: jsCore
+  - name: .aggregation !.sharded
+  - name: .concurrency !.large !.ubsan !.no_txns !.debug_only !.sharded
+  - name: .concurrency .large !.ubsan !.no_txns !.debug_only !.sharded
+    distros:
+    - rhel62-medium
+  - name: .jscore .common !.sharding
+  - name: .misc_js !.sharded
   - name: .replica_sets
+
+- name: enterprise-rhel-62-64-bit-time-series-collection
+  display_name: "Enterprise RHEL 6.2 (Time-series Collection)"
+  modules:
+  - enterprise
+  run_on:
+  - rhel62-small
+  expansions: &enterprise-rhel-62-64-bit-time-series-collection-expansions
+    test_flags: >-
+      --mongodSetParameters="{featureFlagTimeseriesCollection: true}"
+    compile_flags: >-
+      -j$(grep -c ^processor /proc/cpuinfo)
+      --ssl
+      --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+      MONGO_DISTMOD=rhel62
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    build_mongoreplay: false
+    large_distro_name: rhel62-medium
+  tasks:
+  - name: burn_in_tests_gen
+  - name: compile_TG
+    distros:
+    - rhel62-large
+  - name: jsCore
+  - name: jsCore_txns
+  - name: noPassthrough_gen
+  - name: noPassthroughWithMongod_gen
+  - name: .replica_sets
+    distros:
+    - rhel62-medium
 
 - name: enterprise-rhel-62-64-bit-operation-resource-consumption-metrics
   display_name: "Enterprise RHEL 6.2 Shared Library (Operation Resource Consumption Metrics)"
@@ -10801,11 +11024,15 @@ buildvariants:
     repo_edition: enterprise
     scons_cache_scope: shared
     build_mongoreplay: false
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
     - rhel62-large
+  - name: concurrency_metrics
+  - name: concurrency_replication_metrics
+    distros:
+      - rhel62-large
   - name: jsCore
   - name: noPassthrough_gen
   - name: noPassthroughWithMongod_gen
@@ -10814,7 +11041,7 @@ buildvariants:
   - name: .concurrency .common .large
   - name: sharding_jscore_passthrough
     distros:
-    - rhel62-large
+    - rhel62-medium
 
 - name: rhel-62-64-bit-nossl
   display_name: "RHEL 6.2 Shared Library (No SSL)"
@@ -10832,7 +11059,7 @@ buildvariants:
     multiversion_edition: enterprise
     scons_cache_scope: shared
     build_mongoreplay: false
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -10845,7 +11072,7 @@ buildvariants:
   modules:
     - enterprise
   run_on:
-    - rhel62-large
+    - rhel62-medium
   batchtime: 10080 # 7 days
   stepback: false
   expansions:
@@ -10918,7 +11145,7 @@ buildvariants:
   tasks:
     - name: compile_all_run_unittests_TG
       distros:
-        - rhel62-large
+        - rhel62-medium
     - name: .aggregation
     - name: .auth
     - name: unittest_shell_hang_analyzer_gen
@@ -10933,11 +11160,11 @@ buildvariants:
     - name: multiversion_gen
     - name: .read_write_concern .large
       distros:
-        - rhel62-large
+        - rhel62-medium
     - name: .read_write_concern !.large
     - name: .replica_sets !.encrypt !.auth
       distros:
-        - rhel62-large
+        - rhel62-medium
     - name: retryable_writes_jscore_passthrough_gen
     - name: .read_only
     - name: .sharding .jscore !.wo_snapshot !.multi_stmt
@@ -10972,11 +11199,22 @@ buildvariants:
   - name: compile_all_run_unittests_TG
     distros:
     - rhel70
+  - name: compile_build_tools_next_TG
+    distros:
+    - rhel70
   - name: .aggfuzzer
   - name: audit
   - name: auth_audit_gen
   - name: auth_gen
   - name: causally_consistent_jscore_txns_passthrough
+  - name: config_fuzzer_concurrency
+  - name: config_fuzzer_concurrency_replication
+    distros:
+    - rhel70-large
+  - name: config_fuzzer_jsCore
+  - name: config_fuzzer_replica_sets_jscore_passthrough
+    distros:
+    - rhel70-large
   - name: .encrypt !.sharding !.replica_sets !.aggregation !.jscore
   - name: external_auth
   - name: external_auth_aws
@@ -11218,6 +11456,9 @@ buildvariants:
   - name: compile_TG
     distros:
     - ubuntu1604-build
+  - name: compile_build_tools_next_TG
+    distros:
+    - ubuntu1604-build
   - name: jsCore
   - name: .read_write_concern !.write !.aggregation
   - name: replica_sets_jscore_passthrough
@@ -11278,10 +11519,10 @@ buildvariants:
   - name: .concurrency .common !.large
   - name: .concurrency .common .large
     distros:
-      - rhel62-large
+      - rhel62-medium
   - name: concurrency_replication_causal_consistency
     distros:
-      - rhel62-large
+      - rhel62-medium
   - name: disk_wiredtiger
   - name: free_monitoring
   - name: .jscore .common
@@ -11468,6 +11709,7 @@ buildvariants:
   - enterprise
   run_on:
   - rhel71-power8-test
+  batchtime: 10080 # 7 days
   stepback: false
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
@@ -11518,6 +11760,7 @@ buildvariants:
   - enterprise
   run_on:
   - rhel81-power8-small
+  batchtime: 10080 # 7 days
   stepback: false
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
@@ -12350,7 +12593,7 @@ buildvariants:
   tasks:
   - name: compile_benchmarks
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .benchmarks
     distros:
     - centos6-perf
@@ -12368,7 +12611,7 @@ buildvariants:
     multiversion_platform: rhel62
     multiversion_edition: enterprise
     scons_cache_scope: shared
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
   tasks:
   - name: compile_all_run_unittests_TG
     distros:
@@ -12382,11 +12625,11 @@ buildvariants:
   - name: .misc_js
   - name: .concurrency !.ubsan !.no_txns !.debug_only !.kill_terminate
     distros:
-    - rhel62-large  # Some workloads require a lot of memory, use a bigger machine for this suite.
+    - rhel62-medium  # Some workloads require a lot of memory, use a bigger machine for this suite.
   - name: initial_sync_fuzzer_gen
   - name: .integration !.audit
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .jscore .common !.decimal
   - name: jsCore_op_query
   - name: jsCore_txns_large_txns_format
@@ -12401,7 +12644,7 @@ buildvariants:
   - name: replica_sets_multi_stmt_txn_jscore_passthrough
   - name: replica_sets_multi_stmt_txn_stepdown_jscore_passthrough_gen
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .retry
   - name: rollback_fuzzer_gen
   - name: sasl
@@ -12409,7 +12652,7 @@ buildvariants:
   - name: session_jscore_passthrough
   - name: sharded_multi_stmt_txn_jscore_passthrough
     distros:
-    - rhel62-large
+    - rhel62-medium
   - name: .sharding .jscore !.wo_snapshot !.multi_stmt
   - name: .sharding .common !.multiversion !.csrs
   - name: snmp
@@ -12419,7 +12662,7 @@ buildvariants:
 - name: linux-64-ephemeralForTest
   display_name: Linux (ephemeralForTest)
   run_on:
-  - rhel62-large
+  - rhel62-medium
   expansions:
     # Transactions are not explicitly supported on the ephemeralForTest storage engine.
     # Speculative majority reads are currently only allowed for change streams, which are only supported on WiredTiger.
@@ -12802,37 +13045,6 @@ buildvariants:
     distros:
     - ubuntu1804-build
 
-- name: enterprise-ubuntu-scanning-replica-set-monitor-1604-64-bit
-  display_name: "~ Enterprise Ubuntu 16.04 (with ScanningReplicaSetMonitor)"
-  batchtime: 1440 # 1 day
-  run_on:
-    - ubuntu1604-test
-  modules:
-  - enterprise
-  expansions:
-    scons_cache_scope: shared
-    compile_flags: MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-    multiversion_platform: ubuntu1604
-    multiversion_edition: enterprise
-    test_flags: >-
-      --mongosSetParameters="{replicaSetMonitorProtocol: scanning}"
-      --mongodSetParameters="{replicaSetMonitorProtocol: scanning}"
-      --excludeWithAnyTags=requires_streamable_rsm
-
-  tasks:
-  - name: compile_all_run_unittests_TG
-    distros:
-    - ubuntu1604-build
-  - name: .aggregation !.no_async
-  - name: .sharding .auth
-  - name: .sharding .causally_consistent !.wo_snapshot
-  - name: .concurrency .common !.kill_terminate
-  - name: .integration !.audit
-  - name: .jscore .common
-  - name: .logical_session_cache .one_sec
-  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
-  - name: .sharding .common !.csrs
-
 - name: enterprise-ubuntu-sdam-replica-set-monitor-1604-64-bit
   display_name: "~ Enterprise Ubuntu 16.04 (with SdamReplicaSetMonitor)"
   batchtime: 1440 # 1 day
@@ -12939,7 +13151,7 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - rhel62-large
+  - rhel62-medium
   expansions:
     compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --link-model=dynamic
     multiversion_platform: rhel62
@@ -12949,7 +13161,7 @@ buildvariants:
     scons_cache_mode: all
     target_resmoke_time: 10
     max_sub_suites: 3
-    large_distro_name: rhel62-large
+    large_distro_name: rhel62-medium
     num_scons_link_jobs_available: 0.99
     record_with: --recordWith /opt/undodb5/bin/live-record
     resmoke_jobs_factor: 0.3
@@ -12976,7 +13188,6 @@ buildvariants:
 #  - name: multiversion_sanity_check_gen
 #  - name: mqlrun
 #  - name: .multi_shard
-#  - name: tenant_migration_jscore_passthrough_gen
 #  - name: .query_fuzzer
 #  - name: .read_write_concern
 #  - name: .replica_sets !.encrypt !.auth !.non_live_record

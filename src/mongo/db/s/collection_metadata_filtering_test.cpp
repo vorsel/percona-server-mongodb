@@ -71,6 +71,7 @@ protected:
             false,
             epoch,
             boost::none,
+            true,
             [&] {
                 ChunkVersion version(1, 0, epoch);
 
@@ -104,7 +105,7 @@ protected:
             }());
 
         ChunkManager cm(ShardId("0"),
-                        DatabaseVersion(UUID::gen(), 1),
+                        DatabaseVersion(UUID::gen()),
                         makeStandaloneRoutingTableHistory(std::move(rt)),
                         boost::none);
         ASSERT_EQ(4, cm.numChunks());

@@ -82,6 +82,7 @@
 #include "mongo/db/fcv_op_observer.h"
 #include "mongo/db/free_mon/free_mon_mongod.h"
 #include "mongo/db/ftdc/ftdc_mongod.h"
+#include "mongo/db/ftdc/util.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index/index_access_method_factory_impl.h"
 #include "mongo/db/index_builds_coordinator_mongod.h"
@@ -263,7 +264,7 @@ void logStartup(OperationContext* opCtx) {
     AutoGetOrCreateDb autoDb(opCtx, startupLogCollectionName.db(), mongo::MODE_X);
     Database* db = autoDb.getDb();
     CollectionPtr collection =
-        CollectionCatalog::get(opCtx).lookupCollectionByNamespace(opCtx, startupLogCollectionName);
+        CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, startupLogCollectionName);
     WriteUnitOfWork wunit(opCtx);
     if (!collection) {
         BSONObj options = BSON("capped" << true << "size" << 10 * 1024 * 1024);
@@ -271,7 +272,7 @@ void logStartup(OperationContext* opCtx) {
         CollectionOptions collectionOptions = uassertStatusOK(
             CollectionOptions::parse(options, CollectionOptions::ParseKind::parseForCommand));
         uassertStatusOK(db->userCreateNS(opCtx, startupLogCollectionName, collectionOptions));
-        collection = CollectionCatalog::get(opCtx).lookupCollectionByNamespace(
+        collection = CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
             opCtx, startupLogCollectionName);
     }
     invariant(collection);
@@ -753,16 +754,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     // operation context anymore
     startupOpCtx.reset();
 
-    auto start = serviceContext->getServiceExecutor()->start();
-    if (!start.isOK()) {
-        LOGV2_ERROR(20570,
-                    "Error starting service executor: {error}",
-                    "Error starting service executor",
-                    "error"_attr = start);
-        return EXIT_NET_ERROR;
-    }
-
-    start = serviceContext->getServiceEntryPoint()->start();
+    auto start = serviceContext->getServiceEntryPoint()->start();
     if (!start.isOK()) {
         LOGV2_ERROR(20571,
                     "Error starting service entry point: {error}",
@@ -1016,7 +1008,6 @@ void setUpReplication(ServiceContext* serviceContext) {
             serviceContext, makeReplicaSetNodeExecutor(serviceContext));
 
     repl::ReplicationCoordinator::set(serviceContext, std::move(replCoord));
-    repl::setOplogCollectionName(serviceContext);
 
     IndexBuildsCoordinator::set(serviceContext, std::make_unique<IndexBuildsCoordinatorMongod>());
 
@@ -1234,11 +1225,13 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         repl::ReplicationStateTransitionLockGuard rstl(
             opCtx, MODE_X, repl::ReplicationStateTransitionLockGuard::EnqueueOnly());
 
-        // Kill all operations. And, makes all newly created opCtx to be immediately interrupted.
-        // After this point, the opCtx will have been marked as killed and will not be usable other
-        // than to kill all transactions directly below.
+        // Kill all operations except FTDC to continue gathering metrics. This makes all newly
+        // created opCtx to be immediately interrupted. After this point, the opCtx will have been
+        // marked as killed and will not be usable other than to kill all transactions directly
+        // below.
         LOGV2_OPTIONS(4784912, {LogComponent::kDefault}, "Killing all operations for shutdown");
-        serviceContext->setKillAllOperations();
+        const std::set<std::string> excludedClients = {std::string(kFTDCThreadName)};
+        serviceContext->setKillAllOperations(excludedClients);
 
         if (MONGO_unlikely(pauseWhileKillingOperationsAtShutdown.shouldFail())) {
             LOGV2_OPTIONS(4701700,
@@ -1311,11 +1304,6 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         CatalogCacheLoader::get(serviceContext).shutDown();
     }
 
-#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
-    // When running under address sanitizer, we get false positive leaks due to disorder around
-    // the lifecycle of a connection and request. When we are running under ASAN, we try a lot
-    // harder to dry up the server from active connections before going on to really shut down.
-
     // Shutdown the Service Entry Point and its sessions and give it a grace period to complete.
     if (auto sep = serviceContext->getServiceEntryPoint()) {
         LOGV2_OPTIONS(4784923, {LogComponent::kCommand}, "Shutting down the ServiceEntryPoint");
@@ -1326,25 +1314,8 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         }
     }
 
-    // Shutdown and wait for the service executor to exit
-    if (auto svcExec = serviceContext->getServiceExecutor()) {
-        LOGV2_OPTIONS(4784924, {LogComponent::kExecutor}, "Shutting down the service executor");
-        Status status = svcExec->shutdown(Seconds(10));
-        if (!status.isOK()) {
-            LOGV2_OPTIONS(20564,
-                          {LogComponent::kNetwork},
-                          "Service executor did not shutdown within the time limit",
-                          "error"_attr = status);
-        }
-    }
-#endif
-
     LOGV2(4784925, "Shutting down free monitoring");
     stopFreeMonitoring();
-
-    // Shutdown Full-Time Data Capture
-    LOGV2_OPTIONS(4784926, {LogComponent::kFTDC}, "Shutting down full-time data capture");
-    stopMongoDFTDC();
 
     LOGV2(4784927, "Shutting down the HealthLog");
     HealthLog::get(serviceContext).shutdown();
@@ -1374,6 +1345,10 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     // the memory and makes leak sanitizer happy.
     LOGV2_OPTIONS(4784931, {LogComponent::kDefault}, "Dropping the scope cache for shutdown");
     ScriptEngine::dropScopeCache();
+
+    // Shutdown Full-Time Data Capture
+    LOGV2_OPTIONS(4784926, {LogComponent::kFTDC}, "Shutting down full-time data capture");
+    stopMongoDFTDC();
 
     LOGV2(20565, "Now exiting");
 

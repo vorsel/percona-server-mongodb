@@ -157,8 +157,8 @@ ShardingTestFixture::ShardingTestFixture()
     };
 
     ShardFactory::BuildersMap buildersMap{
-        {ConnectionString::SET, std::move(setBuilder)},
-        {ConnectionString::MASTER, std::move(masterBuilder)},
+        {ConnectionString::ConnectionType::kReplicaSet, std::move(setBuilder)},
+        {ConnectionString::ConnectionType::kStandalone, std::move(masterBuilder)},
     };
 
     auto shardFactory =
@@ -172,7 +172,8 @@ ShardingTestFixture::ShardingTestFixture()
     auto catalogCache = std::make_unique<CatalogCache>(service, CatalogCacheLoader::get(service));
     // For now initialize the global grid object. All sharding objects will be accessible from there
     // until we get rid of it.
-    auto const grid = Grid::get(operationContext());
+    auto uniqueOpCtx = makeOperationContext();
+    auto const grid = Grid::get(uniqueOpCtx.get());
     grid->init(makeShardingCatalogClient(std::move(uniqueDistLockManager)),
                std::move(catalogCache),
                std::move(shardRegistry),
@@ -194,7 +195,7 @@ ShardingTestFixture::~ShardingTestFixture() {
             grid->getExecutorPool()->shutdownAndJoin();
         }
         if (grid->catalogClient()) {
-            grid->catalogClient()->shutDown(operationContext());
+            grid->catalogClient()->shutDown(makeOperationContext().get());
         }
         if (grid->shardRegistry()) {
             grid->shardRegistry()->shutdown();
@@ -333,7 +334,8 @@ void ShardingTestFixture::expectUpdateCollection(const HostAndPort& expectedHost
         const auto& update = updates.front();
         ASSERT_EQ(expectUpsert, update.getUpsert());
         ASSERT(!update.getMulti());
-        ASSERT_BSONOBJ_EQ(BSON(CollectionType::fullNs(coll.getNs().toString())), update.getQ());
+        ASSERT_BSONOBJ_EQ(BSON(CollectionType::kNssFieldName << coll.getNss().toString()),
+                          update.getQ());
         ASSERT_BSONOBJ_EQ(coll.toBSON(), update.getU().getUpdateClassic());
 
         BatchedCommandResponse response;
