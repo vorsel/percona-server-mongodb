@@ -103,6 +103,8 @@ private:
 
     int _openWiredTiger(const std::string& path, const std::string& wtOpenConfig);
 
+    StatusWith<std::vector<StorageEngine::BackupBlock>> _disableIncrementalBackup();
+
     void close_handles();
     int store_gcm_iv_reserved();
     int reserve_gcm_iv_range();

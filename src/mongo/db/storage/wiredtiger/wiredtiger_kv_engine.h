@@ -394,6 +394,9 @@ private:
 
     Status _hotBackupPopulateLists(OperationContext* opCtx, const std::string& path, std::vector<DBTuple>& dbList, std::vector<FileTuple>& filesList);
 
+    // auxiliary function for beginNonBlockingBackup
+    StatusWith<std::unique_ptr<StorageEngine::StreamingCursor>> _disableIncrementalBackup();
+
     /**
      * Opens a connection on the WiredTiger database 'path' with the configuration 'wtOpenConfig'.
      * Only returns when successful. Intializes both '_conn' and '_fileVersion'.
