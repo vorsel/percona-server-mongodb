@@ -37,6 +37,9 @@ BuildRoot:      /var/tmp/%{name}-%{version}-%{release}
 %global _dwz_low_mem_die_limit 0
 %endif
 
+%global _dwz_max_die_limit 250000000
+%global _dwz_max_die_limit_x86_64 250000000
+
 %define         src_dir @@SRC_DIR@@
 
 BuildRequires: gcc, make, cmake, gcc-c++, openssl-devel, cyrus-sasl-devel
