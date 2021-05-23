@@ -194,8 +194,13 @@ ChunkVersion getPersistedMaxChunkVersion(OperationContext* opCtx, const Namespac
         return ChunkVersion::UNSHARDED();
     }
 
-    auto statusWithChunk = shardmetadatautil::readShardChunks(
-        opCtx, nss, BSONObj(), BSON(ChunkType::lastmod() << -1), 1LL, cachedCollection.getEpoch());
+    auto statusWithChunk = shardmetadatautil::readShardChunks(opCtx,
+                                                              nss,
+                                                              BSONObj(),
+                                                              BSON(ChunkType::lastmod() << -1),
+                                                              1LL,
+                                                              cachedCollection.getEpoch(),
+                                                              cachedCollection.getTimestamp());
     uassertStatusOKWithContext(
         statusWithChunk,
         str::stream() << "Failed to read highest version persisted chunk for collection '"
@@ -224,12 +229,17 @@ CollectionAndChangedChunks getPersistedMetadataSinceVersion(OperationContext* op
     // If the persisted epoch doesn't match what the CatalogCache requested, read everything.
     ChunkVersion startingVersion = (shardCollectionEntry.getEpoch() == version.epoch())
         ? version
-        : ChunkVersion(0, 0, shardCollectionEntry.getEpoch());
+        : ChunkVersion(0, 0, shardCollectionEntry.getEpoch(), shardCollectionEntry.getTimestamp());
 
     QueryAndSort diff = createShardChunkDiffQuery(startingVersion);
 
-    auto changedChunks = uassertStatusOK(
-        readShardChunks(opCtx, nss, diff.query, diff.sort, boost::none, startingVersion.epoch()));
+    auto changedChunks = uassertStatusOK(readShardChunks(opCtx,
+                                                         nss,
+                                                         diff.query,
+                                                         diff.sort,
+                                                         boost::none,
+                                                         startingVersion.epoch(),
+                                                         startingVersion.getTimestamp()));
 
     return CollectionAndChangedChunks{shardCollectionEntry.getEpoch(),
                                       shardCollectionEntry.getTimestamp(),
@@ -681,7 +691,7 @@ ShardServerCatalogCacheLoader::_schedulePrimaryGetChunksSince(
     }
 
     if ((collAndChunks.epoch != maxLoaderVersion.epoch()) ||
-        (collAndChunks.changedChunks.back().getVersion() > maxLoaderVersion)) {
+        maxLoaderVersion.isOlderThan(collAndChunks.changedChunks.back().getVersion())) {
         _ensureMajorityPrimaryAndScheduleCollAndChunksTask(
             opCtx,
             nss,
@@ -837,17 +847,18 @@ StatusWith<CollectionAndChangedChunks> ShardServerCatalogCacheLoader::_getLoader
         // the overlap.
         auto persistedChangedChunksIt = persisted.changedChunks.begin();
         while (persistedChangedChunksIt != persisted.changedChunks.end() &&
-               persistedChangedChunksIt->getVersion() < minEnqueuedVersion) {
+               persistedChangedChunksIt->getVersion().isOlderThan(minEnqueuedVersion)) {
             ++persistedChangedChunksIt;
         }
         persisted.changedChunks.erase(persistedChangedChunksIt, persisted.changedChunks.end());
 
         // Append 'enqueued's chunks to 'persisted', which no longer overlaps. Also add 'enqueued's
-        // reshardingFields to 'persisted'.
+        // reshardingFields and allowMigrations setting to 'persisted'.
         persisted.changedChunks.insert(persisted.changedChunks.end(),
                                        enqueued.changedChunks.begin(),
                                        enqueued.changedChunks.end());
         persisted.reshardingFields = std::move(enqueued.reshardingFields);
+        persisted.allowMigrations = enqueued.allowMigrations;
 
         return persisted;
     }
@@ -880,7 +891,7 @@ std::pair<bool, CollectionAndChangedChunks> ShardServerCatalogCacheLoader::_getE
 
     auto changedChunksIt = collAndChunks.changedChunks.begin();
     while (changedChunksIt != collAndChunks.changedChunks.end() &&
-           changedChunksIt->getVersion() < catalogCacheSinceVersion) {
+           changedChunksIt->getVersion().isOlderThan(catalogCacheSinceVersion)) {
         ++changedChunksIt;
     }
     collAndChunks.changedChunks.erase(collAndChunks.changedChunks.begin(), changedChunksIt);

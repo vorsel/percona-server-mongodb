@@ -35,7 +35,7 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/read_concern_support_result.h"
 
@@ -53,8 +53,8 @@ public:
      * May throw a AssertionException if there is an invalid stage specification, although full
      * validation happens later, during Pipeline construction.
      */
-    LiteParsedPipeline(const AggregationRequest& request)
-        : LiteParsedPipeline(request.getNamespaceString(), request.getPipeline()) {}
+    LiteParsedPipeline(const AggregateCommand& request)
+        : LiteParsedPipeline(request.getNamespace(), request.getPipeline()) {}
 
     LiteParsedPipeline(const NamespaceString& nss, const std::vector<BSONObj>& pipelineStages) {
         _stageSpecs.reserve(pipelineStages.size());
@@ -94,6 +94,13 @@ public:
      */
     bool startsWithCollStats() const {
         return !_stageSpecs.empty() && _stageSpecs.front()->isCollStats();
+    }
+
+    /**
+     * Returns true if the pipeline begins with a $collStats stage with the count option.
+     */
+    bool startsWithCollStatsWithCount() const {
+        return startsWithCollStats() && _stageSpecs.front()->isCollStatsWithCount();
     }
 
     /**
@@ -161,6 +168,29 @@ public:
      * Increments global stage counters corresponding to the stages in this lite parsed pipeline.
      */
     void tickGlobalStageCounters() const;
+
+    /**
+     * Returns true if 'stageName' is in API Version 1.
+     */
+    bool isStageInAPIVersion1(const std::string& stageName) const {
+        // These stages are excluded from API Version1 with 'apiStrict: true'.
+        static const stdx::unordered_set<std::string> stagesExcluded = {"$collStats",
+                                                                        "$currentOp",
+                                                                        "$indexStats",
+                                                                        "$listLocalSessions",
+                                                                        "$listSessions",
+                                                                        "$planCacheStats",
+                                                                        "$search",
+                                                                        "$searchBeta"};
+
+        return (stagesExcluded.find(stageName) == stagesExcluded.end());
+    }
+
+    /**
+     * Throws 'APIStrictError' if the pipeline contains the stages which are not in API Version
+     * 'version'.
+     */
+    void validatePipelineStagesIfAPIStrict(const std::string& version) const;
 
 private:
     std::vector<std::unique_ptr<LiteParsedDocumentSource>> _stageSpecs;

@@ -65,6 +65,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
@@ -85,6 +86,8 @@
 
 namespace mongo {
 namespace {
+
+constexpr auto kOne = "1"_sd;
 
 Status useDefaultCode(const Status& status, ErrorCodes::Error defaultCode) {
     if (status.code() != ErrorCodes::UnknownError)
@@ -880,6 +883,11 @@ private:
             _sessionInfo.serialize(cmdBuilder);
         }
 
+        if (_state == TransactionState::kInit || !_isReplSet) {
+            // Set a default apiVersion for all UMC commands
+            cmdBuilder->append("apiVersion", kOne);
+        }
+
         auto svcCtx = _client->getServiceContext();
         auto sep = svcCtx->getServiceEntryPoint();
         auto opMsgRequest = OpMsgRequest::fromDBAndBody(kAdminDB, cmdBuilder->obj());
@@ -968,8 +976,8 @@ class CmdCreateUser : public CmdUMCTyped<CreateUserCommand, void> {
 public:
     static constexpr StringData kPwdField = "pwd"_sd;
 
-    StringData sensitiveFieldName() const final {
-        return kPwdField;
+    std::set<StringData> sensitiveFieldNames() const final {
+        return {kPwdField};
     }
 } cmdCreateUser;
 
@@ -1077,8 +1085,8 @@ class CmdUpdateUser : public CmdUMCTyped<UpdateUserCommand, void> {
 public:
     static constexpr StringData kPwdField = "pwd"_sd;
 
-    StringData sensitiveFieldName() const final {
-        return kPwdField;
+    std::set<StringData> sensitiveFieldNames() const final {
+        return {kPwdField};
     }
 } cmdUpdateUser;
 
@@ -1410,13 +1418,13 @@ UsersInfoReply CmdUMCTyped<UsersInfoCommand, UsersInfoReply, UMCInfoParams>::Inv
         DBDirectClient client(opCtx);
 
         rpc::OpMsgReplyBuilder replyBuilder;
-        AggregationRequest aggRequest(AuthorizationManager::usersCollectionNamespace,
-                                      std::move(pipeline));
+        AggregateCommand aggRequest(AuthorizationManager::usersCollectionNamespace,
+                                    std::move(pipeline));
         // Impose no cursor privilege requirements, as cursor is drained internally
         uassertStatusOK(runAggregate(opCtx,
                                      AuthorizationManager::usersCollectionNamespace,
                                      aggRequest,
-                                     aggRequest.serializeToCommandObj().toBson(),
+                                     aggregation_request_helper::serializeToCommandObj(aggRequest),
                                      PrivilegeVector(),
                                      &replyBuilder));
         auto bodyBuilder = replyBuilder.getBodyBuilder();

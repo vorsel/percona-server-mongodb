@@ -35,14 +35,12 @@
 #include <memory>
 #include <vector>
 
-#include "mongo/base/global_initializer_registerer.h"
 #include "mongo/db/logical_session_id.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/unordered_set.h"
-#include "mongo/transport/service_executor.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/concurrency/with_lock.h"
@@ -682,11 +680,6 @@ private:
      * The service entry point
      */
     SyncUnique<ServiceEntryPoint> _serviceEntryPoint;
-
-    /**
-     * The ServiceExecutor
-     */
-    SyncUnique<transport::ServiceExecutor> _serviceExecutor;
 
     /**
      * The storage engine, if any.

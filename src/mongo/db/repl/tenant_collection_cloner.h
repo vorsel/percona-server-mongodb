@@ -90,6 +90,9 @@ public:
     UUID getSourceUuid() const {
         return *_sourceDbAndUuid.uuid();
     }
+    const std::string& getTenantId() const {
+        return _tenantId;
+    }
 
     /**
      * Set the cloner batch size.
@@ -202,6 +205,10 @@ private:
     const CollectionOptions _collectionOptions;  // (R)
     // Despite the type name, this member must always contain a UUID.
     NamespaceStringOrUUID _sourceDbAndUuid;  // (R)
+    // Namespace of the existing collection (with the same UUID as _sourceDbAndUuid) after resuming
+    // the collection cloner. This existing collection normally has the same namespace as _sourceNss
+    // except when the collection has been renamed on the donor.
+    boost::optional<NamespaceString> _existingNss;  // (R)
     // The size of the batches of documents returned in collection cloning.
     int _collectionClonerBatchSize;  // (R)
 
@@ -213,6 +220,8 @@ private:
     ProgressMeter _progressMeter;           // (X) progress meter for this instance.
     std::vector<BSONObj> _readyIndexSpecs;  // (X) Except for _id_
     BSONObj _idIndexSpec;                   // (X)
+
+    BSONObj _lastDocId;  // (X)
     // Function for scheduling database work using the executor.
     ScheduleDbWorkFn _scheduleDbWorkFn;  // (R)
     // Documents read from source to insert.

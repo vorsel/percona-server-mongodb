@@ -42,14 +42,25 @@ function resumeMigrationAfterBlockingRead(host, targetBlockedReads) {
     }));
 
     assert.commandWorked(primary.adminCommand(
-        {configureFailPoint: "pauseTenantMigrationAfterBlockingStarts", mode: "off"}));
+        {configureFailPoint: "pauseTenantMigrationBeforeLeavingBlockingState", mode: "off"}));
 }
 
-function runCommand(db, cmd, expectedError) {
+function runCommand(db, cmd, expectedError, isTransaction) {
     const res = db.runCommand(cmd);
 
     if (expectedError) {
-        assert.commandFailedWithCode(res, expectedError);
+        assert.commandFailedWithCode(res, expectedError, tojson(cmd));
+        // The 'TransientTransactionError' label is attached only in a scope of a transaction.
+        if (isTransaction &&
+            (expectedError == ErrorCodes.TenantMigrationAborted ||
+             expectedError == ErrorCodes.TenantMigrationCommitted)) {
+            assert(res["errorLabels"] != null, "Error labels are absent from " + tojson(res));
+            const expectedErrorLabels = ['TransientTransactionError'];
+            assert.sameMembers(res["errorLabels"],
+                               expectedErrorLabels,
+                               "Error labels " + tojson(res["errorLabels"]) +
+                                   " are different from expected " + expectedErrorLabels);
+        }
     } else {
         assert.commandWorked(res);
     }
@@ -72,7 +83,8 @@ function testReadIsRejectedIfSentAfterMigrationHasCommitted(testCase, dbName, co
     const donorRst = tenantMigrationTest.getDonorRst();
     const donorPrimary = donorRst.getPrimary();
 
-    const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
+    const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(
+        migrationOpts, false /* retryOnRetryableErrors */, false /* automaticForgetMigration */));
     assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
 
     // Wait for the last oplog entry on the primary to be visible in the committed snapshot view of
@@ -90,14 +102,20 @@ function testReadIsRejectedIfSentAfterMigrationHasCommitted(testCase, dbName, co
         if (testCase.requiresReadTimestamp) {
             runCommand(db,
                        testCase.command(collName, donorDoc.blockTimestamp),
-                       ErrorCodes.TenantMigrationCommitted);
+                       ErrorCodes.TenantMigrationCommitted,
+                       testCase.isTransaction);
             runCommand(db,
                        testCase.command(collName, donorDoc.commitOrAbortOpTime.ts),
-                       ErrorCodes.TenantMigrationCommitted);
+                       ErrorCodes.TenantMigrationCommitted,
+                       testCase.isTransaction);
         } else {
-            runCommand(db, testCase.command(collName), ErrorCodes.TenantMigrationCommitted);
+            runCommand(db,
+                       testCase.command(collName),
+                       ErrorCodes.TenantMigrationCommitted,
+                       testCase.isTransaction);
         }
     });
+    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 }
 
 /**
@@ -113,8 +131,10 @@ function testReadIsAcceptedIfSentAfterMigrationHasAborted(testCase, dbName, coll
     const donorRst = tenantMigrationTest.getDonorRst();
     const donorPrimary = donorRst.getPrimary();
 
-    let abortFp = configureFailPoint(donorPrimary, "abortTenantMigrationAfterBlockingStarts");
-    const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
+    let abortFp =
+        configureFailPoint(donorPrimary, "abortTenantMigrationBeforeLeavingBlockingState");
+    const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(
+        migrationOpts, false /* retryOnRetryableErrors */, false /* automaticForgetMigration */));
     assert.eq(stateRes.state, TenantMigrationTest.State.kAborted);
     abortFp.off();
 
@@ -131,12 +151,19 @@ function testReadIsAcceptedIfSentAfterMigrationHasAborted(testCase, dbName, coll
     nodes.forEach(node => {
         const db = node.getDB(dbName);
         if (testCase.requiresReadTimestamp) {
-            runCommand(db, testCase.command(collName, donorDoc.blockTimestamp));
-            runCommand(db, testCase.command(collName, donorDoc.commitOrAbortOpTime.ts));
+            runCommand(db,
+                       testCase.command(collName, donorDoc.blockTimestamp),
+                       null,
+                       testCase.isTransaction);
+            runCommand(db,
+                       testCase.command(collName, donorDoc.commitOrAbortOpTime.ts),
+                       null,
+                       testCase.isTransaction);
         } else {
-            runCommand(db, testCase.command(collName));
+            runCommand(db, testCase.command(collName), null, testCase.isTransaction);
         }
     });
+    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 }
 
 /**
@@ -153,7 +180,8 @@ function testReadBlocksIfMigrationIsInBlocking(testCase, dbName, collName) {
     const donorRst = tenantMigrationTest.getDonorRst();
     const donorPrimary = donorRst.getPrimary();
 
-    let blockingFp = configureFailPoint(donorPrimary, "pauseTenantMigrationAfterBlockingStarts");
+    let blockingFp =
+        configureFailPoint(donorPrimary, "pauseTenantMigrationBeforeLeavingBlockingState");
     assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
 
     // Wait for the migration to enter the blocking state.
@@ -175,13 +203,17 @@ function testReadBlocksIfMigrationIsInBlocking(testCase, dbName, collName) {
     const nodes = testCase.isSupportedOnSecondaries ? donorRst.nodes : [donorPrimary];
     nodes.forEach(node => {
         const db = node.getDB(dbName);
-        runCommand(db, command, testCase.isLinearizableRead ? null : ErrorCodes.MaxTimeMSExpired);
+        runCommand(db,
+                   command,
+                   testCase.isLinearizableRead ? null : ErrorCodes.MaxTimeMSExpired,
+                   testCase.isTransaction);
     });
 
     blockingFp.off();
     const stateRes =
         assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
     assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
+    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 }
 
 /**
@@ -203,7 +235,8 @@ function testBlockedReadGetsUnblockedAndRejectedIfMigrationCommits(testCase, dbN
     const donorRst = tenantMigrationTest.getDonorRst();
     const donorPrimary = donorRst.getPrimary();
 
-    let blockingFp = configureFailPoint(donorPrimary, "pauseTenantMigrationAfterBlockingStarts");
+    let blockingFp =
+        configureFailPoint(donorPrimary, "pauseTenantMigrationBeforeLeavingBlockingState");
     const targetBlockedReads =
         assert
             .commandWorked(donorPrimary.adminCommand(
@@ -236,7 +269,7 @@ function testBlockedReadGetsUnblockedAndRejectedIfMigrationCommits(testCase, dbN
     // is rejected.
     nodes.forEach(node => {
         const db = node.getDB(dbName);
-        runCommand(db, command, ErrorCodes.TenantMigrationCommitted);
+        runCommand(db, command, ErrorCodes.TenantMigrationCommitted, testCase.isTransaction);
     });
 
     // Verify that the migration succeeded.
@@ -244,6 +277,7 @@ function testBlockedReadGetsUnblockedAndRejectedIfMigrationCommits(testCase, dbN
     const stateRes =
         assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
     assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
+    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 }
 
 /**
@@ -265,8 +299,10 @@ function testBlockedReadGetsUnblockedAndSucceedsIfMigrationAborts(testCase, dbNa
     const donorRst = tenantMigrationTest.getDonorRst();
     const donorPrimary = donorRst.getPrimary();
 
-    let blockingFp = configureFailPoint(donorPrimary, "pauseTenantMigrationAfterBlockingStarts");
-    let abortFp = configureFailPoint(donorPrimary, "abortTenantMigrationAfterBlockingStarts");
+    let blockingFp =
+        configureFailPoint(donorPrimary, "pauseTenantMigrationBeforeLeavingBlockingState");
+    let abortFp =
+        configureFailPoint(donorPrimary, "abortTenantMigrationBeforeLeavingBlockingState");
     const targetBlockedReads =
         assert
             .commandWorked(donorPrimary.adminCommand(
@@ -299,7 +335,7 @@ function testBlockedReadGetsUnblockedAndSucceedsIfMigrationAborts(testCase, dbNa
     // unblocks.
     nodes.forEach(node => {
         const db = node.getDB(dbName);
-        runCommand(db, command);
+        runCommand(db, command, null, testCase.isTransaction);
     });
 
     // Verify that the migration failed due to the simulated error.
@@ -308,6 +344,7 @@ function testBlockedReadGetsUnblockedAndSucceedsIfMigrationAborts(testCase, dbNa
     const stateRes =
         assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
     assert.eq(stateRes.state, TenantMigrationTest.State.kAborted);
+    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 }
 
 const testCases = {
@@ -338,6 +375,7 @@ const testCases = {
     snapshotReadWithAtClusterTimeInTxn: {
         isSupportedOnSecondaries: false,
         requiresReadTimestamp: true,
+        isTransaction: true,
         command: function(collName, readTimestamp) {
             return {
                 find: collName,
@@ -351,6 +389,7 @@ const testCases = {
     },
     snapshotReadWithoutAtClusterTimeInTxn: {
         isSupportedOnSecondaries: false,
+        isTransaction: true,
         command: function(collName) {
             return {
                 find: collName,
@@ -368,6 +407,23 @@ const testCases = {
         command: function(collName, readTimestamp) {
             return {
                 find: collName,
+                readConcern: {
+                    afterClusterTime: readTimestamp,
+                }
+            };
+        },
+    },
+    readWithAfterClusterTimeInTxn: {
+        isSupportedOnSecondaries: false,
+        requiresReadTimestamp: true,
+        isTransaction: true,
+        command: function(collName, readTimestamp) {
+            return {
+                find: collName,
+                lsid: {id: UUID()},
+                txnNumber: NumberLong(0),
+                startTransaction: true,
+                autocommit: false,
                 readConcern: {
                     afterClusterTime: readTimestamp,
                 }

@@ -137,7 +137,8 @@ UpdateStage::UpdateStage(ExpressionContext* expCtx,
     const auto request = _params.request;
 
     _isUserInitiatedWrite = opCtx()->writesAreReplicated() &&
-        !(request->isFromOplogApplication() || request->isFromMigration());
+        !(request->isFromOplogApplication() ||
+          params.driver->type() == UpdateDriver::UpdateType::kDelta || request->isFromMigration());
 
     _specificStats.isModUpdate = params.driver->type() == UpdateDriver::UpdateType::kOperator;
 }
@@ -613,8 +614,13 @@ bool UpdateStage::checkUpdateChangesShardKeyFields(const boost::optional<BSONObj
     }
 
     const auto& newObj = newObjCopy ? *newObjCopy : _doc.getObject();
-    return wasExistingShardKeyUpdated(css, collDesc, newObj, oldObj) ||
-        wasReshardingKeyUpdated(collDesc, newObj, oldObj);
+
+    // It is possible that both the existing and new shard keys are being updated, so we do not want
+    // to short-circuit checking whether either is being modified.
+    const auto existingShardKeyUpdated = wasExistingShardKeyUpdated(css, collDesc, newObj, oldObj);
+    const auto reshardingKeyUpdated = wasReshardingKeyUpdated(collDesc, newObj, oldObj);
+
+    return existingShardKeyUpdated || reshardingKeyUpdated;
 }
 
 bool UpdateStage::wasExistingShardKeyUpdated(CollectionShardingState* css,

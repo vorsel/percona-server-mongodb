@@ -501,8 +501,10 @@ void BackgroundSync::_produce() {
         }
 
         if (_replicationProcess->getConsistencyMarkers()->getAppliedThrough(opCtx.get()).isNull()) {
+            // TODO SERVER-53642: With Lock Free Reads we may have readers on lastAppliedOpTime so
+            // we cannot use this timestamp in a write.
             _replicationProcess->getConsistencyMarkers()->setAppliedThrough(
-                opCtx.get(), _replCoord->getMyLastAppliedOpTime());
+                opCtx.get(), _replCoord->getMyLastAppliedOpTime(), false);
         }
     }
 
@@ -529,18 +531,17 @@ void BackgroundSync::_produce() {
             _replicationCoordinatorExternalState->getOplogFetcherSteadyStateMaxFetcherRestarts();
         auto oplogFetcherPtr = std::make_unique<OplogFetcher>(
             _replicationCoordinatorExternalState->getTaskExecutor(),
-            lastOpTimeFetched,
-            source,
-            _replCoord->getConfig(),
             std::make_unique<OplogFetcher::OplogFetcherRestartDecisionDefault>(numRestarts),
-            syncSourceResp.rbid,
-            true /* requireFresherSyncSource */,
             &dataReplicatorExternalState,
             [this](const auto& a1, const auto& a2, const auto& a3) {
                 return this->_enqueueDocuments(a1, a2, a3);
             },
             onOplogFetcherShutdownCallbackFn,
-            bgSyncOplogFetcherBatchSize);
+            OplogFetcher::Config(lastOpTimeFetched,
+                                 source,
+                                 _replCoord->getConfig(),
+                                 syncSourceResp.rbid,
+                                 bgSyncOplogFetcherBatchSize));
         stdx::lock_guard<Latch> lock(_mutex);
         if (_state != ProducerState::Running) {
             return;

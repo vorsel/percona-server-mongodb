@@ -6,6 +6,7 @@
 (function() {
 'use strict';
 load('jstests/libs/fail_point_util.js');
+load("jstests/sharding/libs/find_chunks_util.js");
 
 const st = new ShardingTest({shards: 1});
 const mongos = st.s0;
@@ -58,7 +59,7 @@ assert.eq(oldKeyDoc, oldCollArr[0].key);
 
 // Verify that 'config.chunks' is as expected before refineCollectionShardKey.
 const oldChunkArr =
-    mongos.getCollection(kConfigChunks).find({ns: kNsName}).sort({min: 1}).toArray();
+    findChunksUtil.findChunksByNs(mongos.getDB('config'), kNsName).sort({min: 1}).toArray();
 assert.eq(3, oldChunkArr.length);
 assert.eq({a: MinKey, b: MinKey}, oldChunkArr[0].min);
 assert.eq({a: 0, b: 0}, oldChunkArr[0].max);
@@ -91,7 +92,8 @@ let newCollArr = mongos.getCollection(kConfigCollections).find({_id: kNsName}).t
 assert.sameMembers(oldCollArr, newCollArr);
 
 // Verify that 'config.chunks' has not been updated since we haven't committed the transaction.
-let newChunkArr = mongos.getCollection(kConfigChunks).find({ns: kNsName}).sort({min: 1}).toArray();
+let newChunkArr =
+    findChunksUtil.findChunksByNs(mongos.getDB('config'), kNsName).sort({min: 1}).toArray();
 assert.sameMembers(oldChunkArr, newChunkArr);
 
 // Verify that 'config.tags' has not been updated since we haven't committed the transaction.
@@ -108,7 +110,8 @@ assert.eq(1, newCollArr.length);
 assert.eq(newKeyDoc, newCollArr[0].key);
 
 // Verify that 'config.chunks' is as expected after refineCollectionShardKey.
-newChunkArr = mongos.getCollection(kConfigChunks).find({ns: kNsName}).sort({min: 1}).toArray();
+newChunkArr =
+    findChunksUtil.findChunksByNs(mongos.getDB('config'), kNsName).sort({min: 1}).toArray();
 assert.eq(3, newChunkArr.length);
 assert.eq({a: MinKey, b: MinKey, c: MinKey, d: MinKey}, newChunkArr[0].min);
 assert.eq({a: 0, b: 0, c: MinKey, d: MinKey}, newChunkArr[0].max);
@@ -127,7 +130,7 @@ assert.eq({a: MaxKey, b: MaxKey, c: MaxKey, d: MaxKey}, newTagsArr[1].max);
 
 assert.commandWorked(mongos.getDB(kDbName).dropDatabase());
 
-jsTestLog('********** TEST TRANSACTION FAILS **********');
+jsTestLog('********** TEST TRANSACTION AUTOMATICALLY RETRIES **********');
 
 assert.commandWorked(mongos.adminCommand({enableSharding: kDbName}));
 assert.commandWorked(mongos.adminCommand({shardCollection: kNsName, key: oldKeyDoc}));
@@ -143,15 +146,21 @@ assert.eq(oldKeyDoc, oldCollArr[0].key);
 let hangBeforeUpdatingChunksFailPoint = configureFailPoint(
     st.configRS.getPrimary(), 'hangRefineCollectionShardKeyBeforeUpdatingChunks');
 awaitShellToRefineCollectionShardKey = startParallelShell(() => {
-    assert.commandFailedWithCode(
-        db.adminCommand({refineCollectionShardKey: 'db.foo', key: {a: 1, b: 1, c: 1, d: 1}}),
-        ErrorCodes.WriteConflict);
+    assert.commandWorked(
+        db.adminCommand({refineCollectionShardKey: 'db.foo', key: {a: 1, b: 1, c: 1, d: 1}}));
 }, mongos.port);
 hangBeforeUpdatingChunksFailPoint.wait();
 
 // Manually write to 'config.chunks' to force refineCollectionShardKey to throw a WriteConflict
 // exception.
-assert.writeOK(mongos.getCollection(kConfigChunks).update({ns: kNsName}, {jumbo: true}));
+const coll = mongos.getCollection(kNsName);
+if (coll.timestamp) {
+    assert.writeOK(
+        mongos.getCollection(kConfigChunks).update({uuid: coll.uuid}, {$set: {jumbo: true}}));
+} else {
+    assert.writeOK(
+        mongos.getCollection(kConfigChunks).update({ns: kNsName}, {$set: {jumbo: true}}));
+}
 
 // Disable failpoint 'hangRefineCollectionShardKeyBeforeUpdatingChunks' and await parallel shell.
 hangBeforeUpdatingChunksFailPoint.off();
@@ -159,7 +168,19 @@ awaitShellToRefineCollectionShardKey();
 
 // Verify that 'config.collections' is as expected after refineCollectionShardKey.
 newCollArr = mongos.getCollection(kConfigCollections).find({_id: kNsName}).toArray();
-assert.sameMembers(oldCollArr, newCollArr);
+assert.eq(1, newCollArr.length);
+assert.eq(newKeyDoc, newCollArr[0].key);
+
+// Verify that 'config.chunks' is as expected after refineCollectionShardKey.
+newChunkArr =
+    findChunksUtil.findChunksByNs(mongos.getDB('config'), kNsName).sort({min: 1}).toArray();
+assert.eq(1, newChunkArr.length);
+assert.eq({a: MinKey, b: MinKey, c: MinKey, d: MinKey}, newChunkArr[0].min);
+assert.eq({a: MaxKey, b: MaxKey, c: MaxKey, d: MaxKey}, newChunkArr[0].max);
+
+// Verify that 'config.tags' is as expected after refineCollectionShardKey.
+newTagsArr = mongos.getCollection(kConfigTags).find({ns: kNsName}).sort({min: 1}).toArray();
+assert.eq([], newTagsArr);
 
 st.stop();
 })();

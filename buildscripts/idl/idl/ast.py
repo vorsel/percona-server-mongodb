@@ -87,11 +87,44 @@ class Global(common.SourceLocation):
         super(Global, self).__init__(file_name, line, column)
 
 
+class Type(common.SourceLocation):
+    """
+    IDL type information.
+
+    The type of a struct field or command field, for the sake of C++ code generation.
+    """
+
+    # pylint: disable=too-many-instance-attributes
+
+    def __init__(self, file_name, line, column):
+        # type: (str, int, int) -> None
+        """Construct a Type."""
+        self.name = None  # type: str
+        self.cpp_type = None  # type: str
+        self.bson_serialization_type = None  # type: List[str]
+        self.bindata_subtype = None  # type: str
+        self.serializer = None  # type: str
+        self.deserializer = None  # type: str
+        self.is_enum = False  # type: bool
+        self.is_array = False  # type: bool
+        self.is_variant = False  # type: bool
+        self.is_struct = False  # type: bool
+        self.variant_types = []  # type: List[Type]
+        # A variant can have at most one alternative type which is a struct. Otherwise, if we saw
+        # a sub-object while parsing BSON, we wouldn't know which struct to interpret it as.
+        self.variant_struct_type = None  # type: Type
+        super(Type, self).__init__(file_name, line, column)
+
+
 class Struct(common.SourceLocation):
     """
     IDL struct information.
 
     All fields are either required or have a non-None default.
+
+    NOTE: We use this class to generate a struct's C++ class and method definitions. When a field
+    has a struct type (or a field is an array of structs or a variant that can be a struct), we
+    represent that struct type using ast.Type with is_struct=True.
     """
 
     # pylint: disable=too-many-instance-attributes
@@ -101,12 +134,15 @@ class Struct(common.SourceLocation):
         """Construct a struct."""
         self.name = None  # type: str
         self.cpp_name = None  # type: str
+        self.qualified_cpp_name = None  # type: str
         self.description = None  # type: str
         self.strict = True  # type: bool
         self.immutable = False  # type: bool
         self.inline_chained_structs = False  # type: bool
         self.generate_comparison_operators = False  # type: bool
         self.fields = []  # type: List[Field]
+        self.allow_global_collection_name = False  # type: bool
+        self.non_const_getter = False  # type: bool
         super(Struct, self).__init__(file_name, line, column)
 
 
@@ -152,7 +188,6 @@ class Field(common.SourceLocation):
     An instance of a field in a struct.
 
     Name is always populated.
-    A field will either have a struct_type or a cpp_type, but not both.
     Not all fields are set, it depends on the input document.
     """
 
@@ -170,24 +205,12 @@ class Field(common.SourceLocation):
         self.comparison_order = -1  # type: int
         self.non_const_getter = False  # type: bool
         self.unstable = False  # type: bool
-
-        # Properties specific to fields which are types.
-        self.cpp_type = None  # type: str
-        self.bson_serialization_type = None  # type: List[str]
-        self.serializer = None  # type: str
-        self.deserializer = None  # type: str
-        self.bindata_subtype = None  # type: str
         self.default = None  # type: str
-
-        # Properties specific to fields which are structs.
-        self.struct_type = None  # type: str
+        self.type = None  # type: Type
+        self.always_serialize = False  # type: bool
 
         # Properties specific to fields which are arrays.
-        self.array = False  # type: bool
         self.supports_doc_sequence = False  # type: bool
-
-        # Properties specific to fields which are enums.
-        self.enum_type = False  # type: bool
 
         # Properties specific to fields inlined from chained_structs
         self.chained_struct_field = None  # type: Field
@@ -361,7 +384,7 @@ class ServerParameter(common.SourceLocation):
         self.test_only = False  # type: bool
         self.deprecated_name = []  # type: List[str]
         self.default = None  # type: Expression
-        self.feature_flag = False  # type : bool
+        self.feature_flag = False  # type: bool
 
         # Only valid if cpp_varname is specified.
         self.validator = None  # type: Validator

@@ -179,8 +179,7 @@ void MetadataManager::setFilteringMetadata(CollectionMetadata remoteMetadata) {
     const auto& activeMetadata = _metadata.back()->metadata.get();
 
     // We already have the same or newer version
-    if (activeMetadata.getCollVersion().epoch() == remoteMetadata.getCollVersion().epoch() &&
-        activeMetadata.getCollVersion() >= remoteMetadata.getCollVersion()) {
+    if (remoteMetadata.getCollVersion().isOlderOrEqualThan(activeMetadata.getCollVersion())) {
         LOGV2_DEBUG(21984,
                     1,
                     "Ignoring incoming metadata update {activeMetadata} for {namespace} because "
@@ -375,7 +374,7 @@ SharedSemiFuture<void> MetadataManager::_submitRangeForDeletion(
 
     int maxToDelete = rangeDeleterBatchSize.load();
     if (maxToDelete <= 0) {
-        maxToDelete = std::max(int(internalQueryExecYieldIterations.load()), 1);
+        maxToDelete = kRangeDeleterBatchSizeDefault;
     }
 
     auto cleanupComplete =

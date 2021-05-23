@@ -139,48 +139,6 @@ boost::optional<UUID> checkCollectionOptions(OperationContext* opCtx,
     return uassertStatusOK(UUID::parse(collectionInfo["uuid"]));
 }
 
-BatchedCommandRequest buildUpdateOp(const NamespaceString& nss,
-                                    const BSONObj& query,
-                                    const BSONObj& update,
-                                    bool upsert,
-                                    bool multi) {
-    BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setUpdates({[&] {
-            write_ops::UpdateOpEntry entry;
-            entry.setQ(query);
-            entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
-            entry.setUpsert(upsert);
-            entry.setMulti(multi);
-            return entry;
-        }()});
-        return updateOp;
-    }());
-
-    return request;
-}
-
-BatchedCommandRequest buildPipelineUpdateOp(const NamespaceString& nss,
-                                            const BSONObj& query,
-                                            const std::vector<BSONObj>& updates,
-                                            bool upsert,
-                                            bool useMultiUpdate) {
-    BatchedCommandRequest request([&] {
-        write_ops::Update updateOp(nss);
-        updateOp.setUpdates({[&] {
-            write_ops::UpdateOpEntry entry;
-            entry.setQ(query);
-            entry.setU(write_ops::UpdateModification(updates));
-            entry.setUpsert(upsert);
-            entry.setMulti(useMultiUpdate);
-            return entry;
-        }()});
-        return updateOp;
-    }());
-
-    return request;
-}
-
 void triggerFireAndForgetShardRefreshes(OperationContext* opCtx, const NamespaceString& nss) {
     const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
     const auto allShards = uassertStatusOK(Grid::get(opCtx)->catalogClient()->getAllShards(
@@ -217,40 +175,6 @@ void triggerFireAndForgetShardRefreshes(OperationContext* opCtx, const Namespace
 }
 
 }  // namespace
-
-void checkForExistingChunks(OperationContext* opCtx, const NamespaceString& nss) {
-    BSONObjBuilder countBuilder;
-    countBuilder.append("count", ChunkType::ConfigNS.coll());
-    countBuilder.append("query", BSON(ChunkType::ns(nss.ns())));
-
-    // OK to use limit=1, since if any chunks exist, we will fail.
-    countBuilder.append("limit", 1);
-
-    // Use readConcern local to guarantee we see any chunks that have been written and may
-    // become committed; readConcern majority will not see the chunks if they have not made it
-    // to the majority snapshot.
-    repl::ReadConcernArgs readConcern(repl::ReadConcernLevel::kLocalReadConcern);
-    readConcern.appendInfo(&countBuilder);
-
-    auto cmdResponse = uassertStatusOK(
-        Grid::get(opCtx)->shardRegistry()->getConfigShard()->runCommandWithFixedRetryAttempts(
-            opCtx,
-            kConfigReadSelector,
-            ChunkType::ConfigNS.db().toString(),
-            countBuilder.done(),
-            Shard::kDefaultConfigCommandTimeout,
-            Shard::RetryPolicy::kIdempotent));
-    uassertStatusOK(cmdResponse.commandStatus);
-
-    long long numChunks;
-    uassertStatusOK(bsonExtractIntegerField(cmdResponse.response, "n", &numChunks));
-    uassert(ErrorCodes::ManualInterventionRequired,
-            str::stream() << "A previous attempt to shard collection " << nss.ns()
-                          << " failed after writing some initial chunks to config.chunks. Please "
-                             "manually delete the partially written chunks for collection "
-                          << nss.ns() << " from config.chunks",
-            numChunks == 0);
-}
 
 void sendDropCollectionToAllShards(OperationContext* opCtx, const NamespaceString& nss) {
     const auto catalogClient = Grid::get(opCtx)->catalogClient();
@@ -493,7 +417,9 @@ void ShardingCatalogManager::ensureDropCollectionCompleted(OperationContext* opC
 //    }}
 //  }}]
 std::pair<std::vector<BSONObj>, std::vector<BSONObj>> makeChunkAndTagUpdatesForRefine(
-    const BSONObj& newShardKeyFields, OID newEpoch) {
+    const BSONObj& newShardKeyFields,
+    OID newEpoch,
+    const boost::optional<Timestamp>& newTimestamp) {
     // Make the $literal objects used in the $set below to add new fields to the boundaries of the
     // existing chunks and tags that may include "." characters.
     //
@@ -539,11 +465,16 @@ std::pair<std::vector<BSONObj>, std::vector<BSONObj>> makeChunkAndTagUpdatesForR
                                                      << "then" << literalMaxObject << "else"
                                                      << literalMinObject))))))));
 
-    // The chunk updates change the min and max fields, and additionally set the new epoch and unset
-    // the jumbo field.
+    // The chunk updates change the min and max fields, and additionally set the new epoch and the
+    // new timestamp and unset the jumbo field.
     std::vector<BSONObj> chunkUpdates;
     chunkUpdates.emplace_back(
         BSON("$set" << extendMinAndMaxModifier.addFields(BSON(ChunkType::epoch(newEpoch)))));
+
+    if (newTimestamp) {
+        chunkUpdates.emplace_back(BSON("$set" << extendMinAndMaxModifier.addFields(
+                                           BSON(ChunkType::timestamp(*newTimestamp)))));
+    }
     chunkUpdates.emplace_back(BSON("$unset" << ChunkType::jumbo()));
 
     // The tag updates only change the min and max fields.
@@ -584,10 +515,12 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
     collType.setEpoch(newEpoch);
     collType.setKeyPattern(newShardKeyPattern.getKeyPattern());
 
-    if (feature_flags::gShardingFullDDLSupport.isEnabled(serverGlobalParams.featureCompatibility)) {
+    boost::optional<Timestamp> newTimestamp;
+    if (feature_flags::gShardingFullDDLSupportTimestampedVersion.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
         auto now = VectorClock::get(opCtx)->getTime();
-        auto newClusterTime = now.clusterTime().asTimestamp();
-        collType.setTimestamp(newClusterTime);
+        newTimestamp = now.clusterTime().asTimestamp();
+        collType.setTimestamp(newTimestamp);
     }
 
     auto updateCollectionAndChunksFn = [&](OperationContext* opCtx, TxnNumber txnNumber) {
@@ -609,21 +542,23 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
             hangRefineCollectionShardKeyBeforeUpdatingChunks.pauseWhileSet(opCtx);
         }
 
-        auto [chunkUpdates, tagUpdates] = makeChunkAndTagUpdatesForRefine(newFields, newEpoch);
+        auto [chunkUpdates, tagUpdates] =
+            makeChunkAndTagUpdatesForRefine(newFields, newEpoch, newTimestamp);
 
         // Update all config.chunks entries for the given namespace by setting (i) their epoch
         // to the newly-generated objectid, (ii) their bounds for each new field in the refined
         // key to MinKey (except for the global max chunk where the max bounds are set to
         // MaxKey), and unsetting (iii) their jumbo field.
-        writeToConfigDocumentInTxn(opCtx,
-                                   ChunkType::ConfigNS,
-                                   buildPipelineUpdateOp(ChunkType::ConfigNS,
+        writeToConfigDocumentInTxn(
+            opCtx,
+            ChunkType::ConfigNS,
+            BatchedCommandRequest::buildPipelineUpdateOp(ChunkType::ConfigNS,
                                                          BSON("ns" << nss.ns()),
                                                          chunkUpdates,
                                                          false,  // upsert
                                                          true    // useMultiUpdate
                                                          ),
-                                   txnNumber);
+            txnNumber);
 
         LOGV2(21935,
               "refineCollectionShardKey: updated chunk entries for {namespace}: took "
@@ -637,15 +572,16 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
         // Update all config.tags entries for the given namespace by setting their bounds for
         // each new field in the refined key to MinKey (except for the global max tag where the
         // max bounds are set to MaxKey).
-        writeToConfigDocumentInTxn(opCtx,
-                                   TagsType::ConfigNS,
-                                   buildPipelineUpdateOp(TagsType::ConfigNS,
+        writeToConfigDocumentInTxn(
+            opCtx,
+            TagsType::ConfigNS,
+            BatchedCommandRequest::buildPipelineUpdateOp(TagsType::ConfigNS,
                                                          BSON("ns" << nss.ns()),
                                                          tagUpdates,
                                                          false,  // upsert
                                                          true    // useMultiUpdate
                                                          ),
-                                   txnNumber);
+            txnNumber);
 
 
         LOGV2(21936,
@@ -692,15 +628,16 @@ void ShardingCatalogManager::updateShardingCatalogEntryForCollectionInTxn(
     const bool upsert,
     TxnNumber txnNumber) {
     try {
-        writeToConfigDocumentInTxn(opCtx,
-                                   CollectionType::ConfigNS,
-                                   buildUpdateOp(CollectionType::ConfigNS,
+        writeToConfigDocumentInTxn(
+            opCtx,
+            CollectionType::ConfigNS,
+            BatchedCommandRequest::buildUpdateOp(CollectionType::ConfigNS,
                                                  BSON(CollectionType::kNssFieldName << nss.ns()),
                                                  coll.toBSON(),
                                                  upsert,
                                                  false /* multi */
                                                  ),
-                                   txnNumber);
+            txnNumber);
     } catch (DBException& e) {
         e.addContext("Collection metadata write failed");
         throw;

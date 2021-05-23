@@ -4,6 +4,7 @@
  * @tags: [
  *   requires_replication,
  *   requires_wiredtiger,
+ *   sbe_incompatible,
  * ]
  */
 (function() {
@@ -16,7 +17,6 @@ var rst = new ReplSetTest({
     nodes: 2,
     nodeOptions: {
         setParameter: {
-            "measureOperationResourceConsumption": true,
             "aggregateOperationResourceConsumptionMetrics": true,
             "ttlMonitorSleepSecs": 1,
         }
@@ -32,8 +32,8 @@ const secondary = rst.getSecondary();
 const primaryDB = primary.getDB(dbName);
 const secondaryDB = secondary.getDB(dbName);
 
-const clearMetrics = (db) => {
-    db.aggregate([{$operationMetrics: {clearMetrics: true}}]);
+const clearMetrics = (conn) => {
+    conn.getDB('admin').aggregate([{$operationMetrics: {clearMetrics: true}}]);
 };
 
 // Get aggregated metrics keyed by database name.
@@ -74,7 +74,7 @@ assert.commandWorked(primaryDB[collName].createIndex({x: 1}, {expireAfterSeconds
 let pauseTtl = configureFailPoint(primary, 'hangTTLMonitorWithLock');
 pauseTtl.wait();
 
-clearMetrics(primaryDB);
+clearMetrics(primary);
 
 let now = new Date();
 let later = new Date(now.getTime() + 1000 * 60 * 60);
@@ -91,7 +91,7 @@ assertMetrics(primary, (metrics) => {
 });
 
 // Clear metrics and wait for a TTL pass to delete the documents.
-clearMetrics(primaryDB);
+clearMetrics(primary);
 pauseTtl.off();
 waitForTtlPass(primaryDB);
 

@@ -7,9 +7,10 @@
  */
 (function() {
 "use strict";
-load("jstests/multiVersion/libs/multi_rs.js");       // For 'upgradeSet()'
-load("jstests/multiVersion/libs/multi_cluster.js");  // For 'upgradeCluster()'
-load('jstests/noPassthrough/libs/index_build.js');   // For 'assertIndexes()'
+load("jstests/multiVersion/libs/multi_rs.js");         // For 'upgradeSet()'
+load("jstests/multiVersion/libs/multi_cluster.js");    // For 'upgradeCluster()'
+load('jstests/multiVersion/libs/verify_versions.js');  // For 'assert.binVersion()'
+load('jstests/noPassthrough/libs/index_build.js');     // For 'assertIndexes()'
 
 const dbName = "test";
 const collName = jsTestName();
@@ -81,7 +82,6 @@ function runStandaloneTest() {
  * Verifies that every node in 'replSetTest' has the indexes in 'expectedIndexes'.
  */
 function verifyIndexesPresentOnAllNodes(replSetTest, expectedIndexes) {
-    // Make sure that the replica set is stable.
     replSetTest.awaitNodesAgreeOnPrimary();
     for (const node of [replSetTest.getPrimary(), replSetTest.getSecondary()]) {
         const db = node.getDB(dbName);
@@ -97,7 +97,8 @@ function runReplicaSetTest() {
     rst.startSet();
     rst.initiate();
 
-    const primaryDB = rst.getPrimary().getDB(dbName);
+    const initialPrimary = rst.getPrimary();
+    const primaryDB = initialPrimary.getDB(dbName);
     const primaryColl = primaryDB[collName];
     insertDocuments(primaryColl);
     createIndexes(primaryColl);
@@ -107,17 +108,20 @@ function runReplicaSetTest() {
 
     verifyIndexesPresentOnAllNodes(rst, indexList);
 
-    // Upgrade the secondary.
-    rst.upgradeSecondaries({binVersion: "latest"});
-    verifyIndexesPresentOnAllNodes(rst, indexList);
+    // Upgrade the replica set.
+    rst.upgradeSet({binVersion: "latest"});
+    rst.awaitNodesAgreeOnPrimary();
 
-    // Upgrade the primary.
-    rst.upgradePrimary(rst.getPrimary(), {binVersion: "latest"});
+    // Verify that all nodes are in the latest version.
+    for (const node of rst.nodes) {
+        assert.binVersion(node, "latest");
+    }
+
     verifyIndexesPresentOnAllNodes(rst, indexList);
 
     // Set the FCV.
-    const primary = rst.getPrimary();
-    const adminDB = primary.getDB("admin");
+    const upgradedPrimary = rst.getPrimary();
+    const adminDB = upgradedPrimary.getDB("admin");
     checkFCV(adminDB, lastLTSFCV);
     assert.commandWorked(adminDB.runCommand({setFeatureCompatibilityVersion: latestFCV}));
     checkFCV(adminDB, latestFCV);

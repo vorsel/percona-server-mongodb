@@ -79,14 +79,31 @@ cache of the [durable catalog](#durable-catalog) state. It provides the followin
  * Allow closing/reopening the catalog while still providing limited `UUID` to `NamespaceString`
    lookup to support rollback to a point in time.
 
-All catalog access is internally synchronized, and use of iterators after catalog changes generally
-results in automatic repositioning.
+### Synchronization
+Catalog access is synchronized using [read-copy-update][] where reads operate on an immutable
+instance and writes on a new instance with its contents copied from the previous immutable instance
+used for reads. Readers holding on to a catalog instance will thus not observe any writes that
+happen after requesting an instance. If it is desired to observe writes while holding a catalog
+instance then the reader must refresh it.
+
+Catalog writes are handled with the `CollectionCatalog::write(callback)` interface. It provides the
+necessary [read-copy-update][] abstractions. A writable catalog instance is created by making a
+shallow copy of the existing catalog. The actual write is implemented in the supplied callback which
+is allowed to throw. Execution of the write callbacks are serialized and may run on a different
+thread than the thread calling `CollectionCatalog::write`.
+
+To avoid a bottleneck in the case the catalog contains a large number of collections (being slow to
+copy), concurrent writes are batched together. Any thread that enters `CollectionCatalog::write`
+while a catalog instance is being copied is enqueued. When the copy finishes, all enqueued write
+jobs are run on that catalog instance by the copying thread. 
 
 ### Collection objects
-Objects of the `Collection` class provide access to a collection's main properties across some range
-of time between [DDL](#glossary) operations that may change these properties. Such operations may
-change the collection name for example, resulting in a new `Collection` object. It is possible for
-operations that read at different points in time to use different `Collection` objects.
+Objects of the `Collection` class provide access to a collection's properties between
+[DDL](#glossary) operations that modify these properties. Modifications are synchronized using
+[read-copy-update][]. Reads access immutable `Collection` instances. Writes, such as rename
+collection, apply changes to a clone of the latest `Collection` instance and then atomically install
+the new `Collection` instance in the catalog. It is possible for operations that read at different
+points in time to use different `Collection` objects.
 
 Notable properties of `Collection` objects are:
  * catalog ID - to look up or change information from the DurableCatalog.
@@ -106,14 +123,28 @@ In addition `Collection` objects have shared ownership of:
  * A `RecordStore` - an interface to access and manipulate the documents in the collection as stored
    by the storage engine.
 
+A writable `Collection` may only be requested in an active [WriteUnitOfWork](#WriteUnitOfWork). The
+new `Collection` instance is installed in the catalog when the storage transaction commits, but only
+after all other `onCommit` [Changes](#Changes) have run. This ensures `onCommit` operations can
+write to the writable `Collection` before it becomes visible to readers in the catalog. If the
+storage transaction rolls back then the writable `Collection` object is simply discarded and no
+change is ever made to the catalog.
+
+A writable `Collection` is a clone of the existing `Collection`, members are either deep or
+shallowed copied. Notably, a shallow copy is made for the [`IndexCatalog`](#index-catalog).
+
+The oplog `Collection` follows special rules, it does not use [read-copy-update][] or any other form
+of synchronization. Modifications operate directly on the instance installed in the catalog. It is
+not allowed to read concurrently with writes on the oplog `Collection`. 
+
 Finally, there are two kinds of decorations on `Collection` objects. The `Collection` object derives
-from `Decorable` and can have `Decoration`s that keep non-durable state that is discarded when DDL
-operations occur. This is used for query information. Additionally, there are
+from `DecorableCopyable` and requires `Decoration`s to implement a copy-constructor. Collection
+`Decoration`s are copied with the `Collection` when DDL operations occur. This is used for to keep
+versioned query information per Collection instance. Additionally, there are
 `SharedCollectionDecorations` for storing index usage statistics and query settings that are shared
 between `Collection` instances across DDL operations.
 
 ### Index Catalog
-
 Each `Collection` object owns an `IndexCatalog` object, which in turn has shared ownership of
 `IndexCatalogEntry` objects that each again own an `IndexDescriptor` containing an in-memory
 presentation of the data stored in the [durable catalog](#durable-catalog).
@@ -140,17 +171,25 @@ continue to see the catalog data. The second phase drops the collection or index
 versioned and there is no PIT access that can see it afterwards. WiredTiger versions document
 writes, but not table drops: once a table is gone, the data is gone.
 
-The first phase of drop clears the associated catalog entry, both in-memory and on-disk, and then
-registers the collection or index's ident (identifier) with the reaper. The reaper maintains a list
-of {ident, drop timestamp} pairs and drops the collection or index's data when the drop timestamp
-becomes sufficiently persisted, old and inaccessible to readers. Currently that means that the drop
-timestamp must be both older than the timestamp of the last checkpoint and the oldest_timestamp.
-Requiring the drop timestamp to reach the checkpointed time ensures that startup recovery and
-rollback via recovery to a stable timestamp, which both recover to the last checkpoint, will never
-be missing collection or index data that should still exist at the checkpoint time that is less than
-the drop timestamp. Requiring the drop timestamp to pass (become older) than the oldest_timestamp
-ensures that all reads, which are supported back to the oldest_timestamp, successfully find the
-collection or index data.
+The first phase of drop clears the associated catalog entry, both in the in-memory catalog and in
+the on-disk catalog, and then registers the collection or index's information with the reaper. No
+new operations will find the collection or index in the catalog. Pre-existing operations with
+references to the collection or index state may still be running and will retain their references
+until they complete. The reaper receives the collection or index ident (identifier), along with a
+reference to the in-memory collection or index state, and a drop timestamp.
+
+The second phase of drop deletes the data. The reaper maintains a list of {ident, drop token, drop
+timestamp} sets. A collection or index's data will be dropped when both the drop timestamp becomes
+sufficiently persisted such that the catalog change will not be rolled back and no other reference
+to the collection or index in-memory state (tracked via the drop token) remains. When no concurrent
+readers of the collection or index are left, the drop token will be the only remaining reference to
+the in-memory state. The drop timestamp must be both older than the timestamp of the last checkpoint
+and the oldest_timestamp. Requiring the drop timestamp to reach the checkpointed time ensures that
+startup recovery and rollback via recovery to a stable timestamp, which both recover to the last
+checkpoint, will never be missing collection or index data that should still exist at the checkpoint
+time that is less than the drop timestamp. Requiring the drop timestamp to pass (become older) than
+the oldest_timestamp ensures that all reads, which are supported back to the oldest_timestamp,
+successfully find the collection or index data.
 
 _Code spelunking starting points:_
 
@@ -216,19 +255,24 @@ that all locks are held while a Change's `commit()` or `rollback()` function run
 
 # Read Operations
 
-All read operations on collections and indexes are required to take collection locks. Storage
-engines that provide document-level concurrency require all operations to hold at least a collection
-IS lock. With the WiredTiger storage engine, the MongoDB integration layer implicitly starts a
-storage transaction on the first attempt to read from a collection or index. Unless a read operation
-is part of a larger write operation, the transaction is rolled-back automatically when the last
-GlobalLock is released, explicitly during query yielding, or from a call to abandonSnapshot();
+External reads via the find, count, distint, aggregation and mapReduce cmds do not take collection
+MODE_IS locks (mapReduce does continue to take MODE_IX collection locks for writes). Internal
+operations continue to take collection locks. Lock-free reads (only take the global lock in MODE_IS)
+achieve this by establishing consistent in-memory and storage engine on-disk state at the start of
+their operations. Lock-free reads explicitly open a storage transaction while setting up consistent
+in-memory and on-disk read state. Internal reads with collection level locks implicitly start
+storage transactions later via the MongoDB integration layer on the first attempt to read from a
+collection or index. Unless a read operation is part of a larger write operation, the transaction
+is rolled-back automatically when the last GlobalLock is released, explicitly during query yielding,
+or from a call to abandonSnapshot(). Lock-free read operations must re-establish consistent state
+after a query yield, just as at the start of a read operation.
 
 See
 [WiredTigerCursor](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/storage/wiredtiger/wiredtiger_cursor.cpp#L48),
-[WiredTigerRecoveryUnit::getSession](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.cpp#L303-L305),
-[GlobalLock dtor](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/concurrency/d_concurrency.h#L228-L239),
-[PlanYieldPolicy::_yieldAllLocks](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/query/plan_yield_policy.cpp#L182),
-[RecoveryUnit::abandonSnapshot](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/storage/recovery_unit.h#L217).
+[WiredTigerRecoveryUnit::getSession()](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.cpp#L303-L305),
+[~GlobalLock](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/concurrency/d_concurrency.h#L228-L239),
+[PlanYieldPolicy::_yieldAllLocks()](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/query/plan_yield_policy.cpp#L182),
+[RecoveryUnit::abandonSnapshot()](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/storage/recovery_unit.h#L217).
 
 ## Collection Reads
 
@@ -247,17 +291,61 @@ Index reads act directly on a
 Most readers create cursors rather than interacting with indexes through the
 [IndexAccessMethod](https://github.com/mongodb/mongo/blob/r4.4.0-rc13/src/mongo/db/index/index_access_method.h#L142).
 
-## AutoGetCollectionForRead 
+## Read Locks
+
+### Locked Reads
 
 The
-[AutoGetCollectionForRead](https://github.com/mongodb/mongo/blob/58283ca178782c4d1c4a4d2acd4313f6f6f86fd5/src/mongo/db/db_raii.cpp#L89)
-(AGCFR) RAII type is used by most client read operations. In addition to acquiring all necessary
+[`AutoGetCollectionForRead`](https://github.com/mongodb/mongo/blob/58283ca178782c4d1c4a4d2acd4313f6f6f86fd5/src/mongo/db/db_raii.cpp#L89)
+(`AGCFR`) RAII type is used by most client read operations. In addition to acquiring all necessary
 locks in the hierarchy, it ensures that operations reading at points in time are respecting the
 visibility rules of collection data and metadata.
 
-AGCFR ensures that operations reading at a timestamp do not read at times later than metadata
+`AGCFR` ensures that operations reading at a timestamp do not read at times later than metadata
 changes on the collection (see
 [here](https://github.com/mongodb/mongo/blob/58283ca178782c4d1c4a4d2acd4313f6f6f86fd5/src/mongo/db/db_raii.cpp#L158)).
+
+### Lock-Free Reads (global MODE_IS lock only)
+
+Lock-free reads use the
+[`AutoGetCollectionForReadLockFree`](https://github.com/mongodb/mongo/blob/4363473d75cab2a487c6a6066b601d52230c7e1a/src/mongo/db/db_raii.cpp#L429)
+helper, which, in addition to the logic of `AutoGetCollectionForRead`, will establish consistent
+in-memory and on-disk catalog state and data view. Locks are avoided by comparing in-memory fetched
+state before and after an on-disk storage snapshot is opened. If the in-memory state differs before
+and after, then the storage snapshot is abandoned and the code will retry until before and after
+match. Lock-free reads skip collection and RSTL locks, so
+[the repl mode/state and collection state](https://github.com/mongodb/mongo/blob/4363473d75cab2a487c6a6066b601d52230c7e1a/src/mongo/db/db_raii.cpp#L97-L102)
+are compared before and after. In general, lock-free reads work by acquiring all the 'versioned'
+state needed for the read at the beginning, rather than relying on a collection-level lock to keep
+the state from changing.
+
+Sharding `shardVersion` checks still occur in the appropriate query plan stage code when/if the
+shard filtering metadata is acquired. The `shardVersion` check after
+`AutoGetCollectionForReadLockFree` sets up combined with a read request's `shardVersion` provided
+before `AutoGetCollectionForReadLockFree` runs is effectively a before and after comparison around
+the 'versioned' state setup. The sharding protocol obviates any special changes for lock-free
+reads other than consistently using the same view of the sharding metadata
+[(acquiring it once and then passing it where needed in the read code)](https://github.com/mongodb/mongo/blob/9e1f0ea4f371a8101f96c84d2ecd3811d68cafb6/src/mongo/db/catalog_raii.cpp#L251-L273).
+
+### Consistent Data View with Operations Running Nested Lock-Free Reads
+
+Currently commands that support lock-free reads are `find`, `count`, `distinct`, `aggregate` and
+`mapReduce` --`mapReduce` still takes collection IX locks for its writes. These commands may use
+nested `AutoGetCollection*LockFree` helpers in sub-operations. Therefore, the first lock-free lock
+helper will establish a consistent in-memory and on-disk metadata and data view, and sub-operations
+will use the higher level state rather than establishing their own. This is achieved by the first
+lock helper fetching a complete immutable copy of the `CollectionCatalog` and saving it on the
+`OperationContext`. Subsequent lock free helpers will check an `isLockFreeReadsOp()` flag on the
+`OperationContext` and skip establishing their own state: instead, the `CollectionCatalog` saved on
+the `OperationContext` will be accessed and no new storage snapshot will be opened. Saving a
+complete copy of the entire in-memory catalog provides flexibility for sub-operations that may need
+access to any collection.
+
+_Code spelunking starting points:_
+
+* [_AutoGetCollectionForReadLockFree preserves an immutable CollectionCatalog_](https://github.com/mongodb/mongo/blob/dcf844f384803441b5393664e500008fc6902346/src/mongo/db/db_raii.cpp#L141)
+* [_AutoGetCollectionForReadLockFree returns early if already running lock-free_](https://github.com/mongodb/mongo/blob/dcf844f384803441b5393664e500008fc6902346/src/mongo/db/db_raii.cpp#L108-L112)
+* [_The lock-free operation flag on the OperationContext_](https://github.com/mongodb/mongo/blob/dcf844f384803441b5393664e500008fc6902346/src/mongo/db/operation_context.h#L298-L300)
 
 ## Secondary Reads
 
@@ -658,7 +746,7 @@ index builds are resumable under the following conditions:
 * Majority read concern is enabled.
 
 The [Recover To A Timestamp (RTT) rollback algorithm](https://github.com/mongodb/mongo/blob/04b12743cbdcfea11b339e6ad21fc24dec8f6539/src/mongo/db/repl/README.md#rollback) supports
-resuming index builds interrupted at the collection scan phase. On entering rollback, the resumable
+resuming index builds interrupted at any phase. On entering rollback, the resumable
 index information is persisted to disk using the same mechanism as shutdown. We resume the
 index build using the startup recovery logic that RTT uses to bring the node back to a writable
 state.
@@ -1511,6 +1599,125 @@ Additionally, secondaries apply batches of oplog entries out of order and simila
 `oplogTruncateAfterPoint` to track batch boundaries in order to avoid unknown oplog holes after an
 unclean shutdown.
 
+# Operation Resource Consumption Metrics
+
+MongoDB supports collecting per-operation resource consumption metrics. These metrics reflect the
+impact operations have on the server. They may be aggregated per-database and queried by an
+aggregation pipeline stage `$operationMetrics`.
+
+Per-operation metrics collection may be enabled with the
+`profileOperationResourceConsumptionMetrics` server parameter (default off). When the parameter is
+enabled, operations collect resource consumption metrics and report them in the slow query logs. If
+profiling is enabled, these metrics are also profiled.
+
+Per-database aggregation may be enabled with the `aggregateOperationResourceConsumptionMetrics`
+server parameter (default off). When this parameter is enabled, in addition to the behavior
+described by the profiling server parameter, operations will accumulate metrics to global in-memory
+per-database counters upon completion. Aggregated metrics may be queried by using the
+`$operationMetrics` aggregation pipeline stage. This stage returns an iterable, copied snapshot of
+all metrics, where each document reports metrics for a single database.
+
+Metrics are not cleared for dropped databases, which introduces the potential to slowly leak memory
+over time. Metrics may be cleared globally by supplying the `clearMetrics: true` flag to the
+pipeline stage or restarting the process.
+
+## Limitations
+
+Metrics are not collected for all operations. The following limitations apply:
+
+* Only operations from user connections collect metrics. For example, internal connections from
+  other replica set members do not collect metrics.
+* Metrics are only collected for a specific set of commands. Those commands override the function
+  `Command::collectsResourceConsumptionMetrics()`.
+* Metrics for write operations are only collected on primary nodes.
+  * This includes TTL index deletions.
+* All attempted write operations collect metrics. This includes writes that fail or retry internally
+  due to write conflicts.
+* Read operations are attributed to the replication state of a node. Read metrics are broken down
+  into whether they occurred in the primary or secondary replication states.
+* Index builds collect metrics. Because index builds survive replication state transitions, they
+  only record aggregated metrics if the node is currently primary when the index build completes.
+* Metrics are not collected on `mongos` and are not supported or tested in sharded environments.
+* Storage engines other than WiredTiger do not implement metrics collection.
+* Metrics are not adjusted after replication rollback.
+
+## Document and Index Entry Units
+
+In addition to reporting the number of bytes read to and written from the storage engine, MongoDB
+reports certain derived metrics: units read and units written.
+
+Document units and index entry units are metric calculations that attempt to account for the
+overhead of performing storage engine work by overstating operations on smaller documents and index
+entries. For each observed datum, a document or index entry, a unit is calculated as the following:
+
+```
+units = ceil (datum bytes / unit size in bytes)
+```
+
+This has the tendency to overstate small datums when the unit size is large. These unit sizes are
+tunable with the server parameters `documentUnitSizeBytes` and `indexEntryUnitSizeBytes`.
+
+## CPU Time
+
+Operations that collect metrics will also collect the amount of active CPU time spent on the command
+thread. This is reported as `cpuNanos` and is provided by the `OperationCPUTimer`.
+
+The CPU time metric is only supported on certain flavors of Linux. It is implemented using
+`clock_gettime` and `CLOCK_THREAD_CPUTIME_ID`, which has limitations on certain systems. See the
+[man page for clock_gettime()](https://linux.die.net/man/3/clock_gettime).
+
+## Example output
+
+The $operationMetrics stage behaves like any other pipeline cursor, and will have the following
+schema, per returned document:
+
+```
+{
+  db: "<dbname>",
+  // Metrics recorded while the node was PRIMARY. Summed with secondaryMetrics metrics gives total
+  // metrics in all replication states.
+  primaryMetrics: {
+    // The number of document bytes read from the storage engine
+    docBytesRead: 0,
+    // The number of document units read from the storage engine
+    docUnitsRead: 0,
+    // The number of index entry bytes read from the storage engine
+    idxEntryBytesRead: 0,
+    // The number of index entry units read from the storage engine
+    idxEntryUnitsRead: 0,
+    // The number of random seeks to a position on an index or collection
+    cursorSeeks: 0,
+    // The number of keys sorted for query operations
+    keysSorted: 0,
+    // The number of times an in-memory sort operation had to spill to disk
+    sorterSpills: 0,
+    // The number of document units returned by query operations
+    docUnitsReturned: 0
+  },
+  // Metrics recorded while the node was SECONDARY
+  secondaryMetrics: {
+    docBytesRead: 0,
+    docUnitsRead: 0,
+    idxEntryBytesRead: 0,
+    idxEntryUnitsRead: 0,
+    cursorSeeks: 0,
+    keysSorted: 0,
+    sorterSpills: 0,
+    docUnitsReturned: 0
+  },
+  // The amount of active CPU time used by all operations
+  cpuNanos: 0,
+  // The number of document bytes attempted to be written to or deleted from the storage engine
+  docBytesWritten: 0,
+  // The number of document units attempted to be written to or deleted from the storage engine
+  docUnitsWritten: 0,
+  // The number of index entry bytes attempted to be written to or deleted from the storage engine
+  idxEntryBytesWritten: 0,
+  // The number of index entry units attempted to be written to or deleted from the storage engine
+  idxEntryUnitsWritten: 0,
+}
+```
+
 # Glossary
 **binary comparable**: Two values are binary comparable if the lexicographical order over their byte
 representation, from lower memory addresses to higher addresses, is the same as the defined ordering
@@ -1654,3 +1861,5 @@ oplog.
 - `ops.key` and `ops.value` are the binary representations of the inserted document (`value` is omitted
   for removal).
 - `ops.key-hex` and `ops.value-bson` are specific to the pretty printing tool used.
+
+[read-copy-update]: https://en.wikipedia.org/wiki/Read-copy-update

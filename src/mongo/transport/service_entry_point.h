@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <limits>
+
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/transport/session.h"
@@ -81,10 +83,24 @@ public:
     virtual size_t numOpenSessions() const = 0;
 
     /**
+     * Returns the maximum number of sessions that can be open.
+     */
+    virtual size_t maxOpenSessions() const {
+        return std::numeric_limits<size_t>::max();
+    }
+
+    /**
      * Processes a request and fills out a DbResponse.
      */
     virtual Future<DbResponse> handleRequest(OperationContext* opCtx,
                                              const Message& request) noexcept = 0;
+
+    /**
+     * Optional handler which is invoked after a session ends.
+     *
+     * This function implies that the Session itself will soon be destructed.
+     */
+    virtual void onEndSession(const transport::SessionHandle&) {}
 
 protected:
     ServiceEntryPoint() = default;

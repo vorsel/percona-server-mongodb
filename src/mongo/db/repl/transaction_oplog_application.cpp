@@ -59,6 +59,8 @@ MONGO_FAIL_POINT_DEFINE(skipReconstructPreparedTransactions);
 // conflict error.
 MONGO_FAIL_POINT_DEFINE(applyPrepareTxnOpsFailsWithWriteConflict);
 
+MONGO_FAIL_POINT_DEFINE(hangBeforeSessionCheckOutForApplyPrepare);
+
 // Apply the oplog entries for a prepare or a prepared commit during recovery/initial sync.
 Status _applyOperationsForTransaction(OperationContext* opCtx,
                                       const std::vector<OplogEntry>& ops,
@@ -88,7 +90,7 @@ Status _applyOperationsForTransaction(OperationContext* opCtx,
                     "Error applying operation in transaction. {error}- oplog entry: {oplogEntry}",
                     "Error applying operation in transaction",
                     "error"_attr = redact(ex),
-                    "oplogEntry"_attr = redact(op.toBSON()));
+                    "oplogEntry"_attr = redact(op.toBSONForLogging()));
                 return exceptionToStatus();
             }
             LOGV2_DEBUG(21846,
@@ -99,7 +101,7 @@ Status _applyOperationsForTransaction(OperationContext* opCtx,
                         "Encountered but ignoring error while applying operations for transaction "
                         "because we are either in initial sync or recovering mode",
                         "error"_attr = redact(ex),
-                        "oplogEntry"_attr = redact(op.toBSON()),
+                        "oplogEntry"_attr = redact(op.toBSONForLogging()),
                         "oplogApplicationMode"_attr =
                             repl::OplogApplication::modeToString(oplogApplicationMode));
         }
@@ -297,7 +299,7 @@ std::pair<std::vector<OplogEntry>, bool> _readTransactionOperationsFromOplogChai
     // The non-DurableReplOperation fields of the extracted transaction operations will match those
     // of the lastEntryInTxn. For a prepared commit, this will include the commit oplog entry's
     // 'ts' field, which is what we want.
-    auto lastEntryInTxnObj = lastEntryInTxn.toBSON();
+    auto lastEntryInTxnObj = lastEntryInTxn.getEntry().toBSON();
 
     // First retrieve and transform the ops from the oplog, which will be retrieved in reverse
     // order.
@@ -419,6 +421,7 @@ Status _applyPrepareTransaction(OperationContext* opCtx,
         // The write on transaction table may be applied concurrently, so refreshing state
         // from disk may read that write, causing starting a new transaction on an existing
         // txnNumber. Thus, we start a new transaction without refreshing state from disk.
+        hangBeforeSessionCheckOutForApplyPrepare.pauseWhileSet();
         MongoDOperationContextSessionWithoutRefresh sessionCheckout(opCtx);
 
         auto txnParticipant = TransactionParticipant::get(opCtx);

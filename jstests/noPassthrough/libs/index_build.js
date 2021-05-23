@@ -447,7 +447,8 @@ const ResumableIndexBuildTest = class {
                    failPointsIteration,
                    shouldComplete = true,
                    failPointAfterStartup,
-                   runBeforeStartup) {
+                   runBeforeStartup,
+                   options) {
         clearRawMongoProgramOutput();
 
         const buildUUIDs = ResumableIndexBuildTest.generateFailPointsData(
@@ -507,8 +508,8 @@ const ResumableIndexBuildTest = class {
                 ["failpoint." + failPointAfterStartup]: tojson({mode: "alwaysOn"}),
             });
         }
-
-        rst.start(conn, {noCleanData: true, setParameter: setParameter});
+        const defaultOptions = {noCleanData: true, setParameter: setParameter};
+        rst.start(conn, Object.assign(defaultOptions, options || {}));
 
         if (shouldComplete) {
             // Ensure that the index builds were completed upon the node starting back up.
@@ -552,7 +553,10 @@ const ResumableIndexBuildTest = class {
                 buildUUID: function(uuid) {
                     return uuid["uuid"]["$uuid"] === buildUUIDs[i];
                 },
-                phase: expectedResumePhases[expectedResumePhases.length === 1 ? 0 : i]
+                details: function(details) {
+                    return details.phase ===
+                        expectedResumePhases[expectedResumePhases.length === 1 ? 0 : i];
+                },
             });
 
             const resumeCheck = resumeChecks[resumeChecks.length === 1 ? 0 : i];
@@ -626,7 +630,8 @@ const ResumableIndexBuildTest = class {
                expectedResumePhases,
                resumeChecks,
                sideWrites = [],
-               postIndexBuildInserts = []) {
+               postIndexBuildInserts = [],
+               restartOptions) {
         const primary = rst.getPrimary();
 
         if (!ResumableIndexBuildTest.resumableIndexBuildsEnabled(primary)) {
@@ -643,8 +648,16 @@ const ResumableIndexBuildTest = class {
                 ResumableIndexBuildTest.createIndexesFails(db, collName, indexSpecs, indexNames);
             }, coll, indexSpecs, indexNames, sideWrites, {hangBeforeBuildingIndex: true});
 
-        const buildUUIDs = ResumableIndexBuildTest.restart(
-            rst, primary, coll, indexNames, failPoints, failPointsIteration);
+        const buildUUIDs = ResumableIndexBuildTest.restart(rst,
+                                                           primary,
+                                                           coll,
+                                                           indexNames,
+                                                           failPoints,
+                                                           failPointsIteration,
+                                                           true,
+                                                           undefined,
+                                                           undefined,
+                                                           restartOptions);
 
         for (const awaitCreateIndex of awaitCreateIndexes) {
             awaitCreateIndex();
@@ -937,7 +950,9 @@ const ResumableIndexBuildTest = class {
         };
         checkLog.containsJson(primary, 4841700, {
             buildUUID: equalsBuildUUID,
-            phase: expectedResumePhase,
+            details: function(details) {
+                return details.phase === expectedResumePhase;
+            },
         });
 
         // Ensure that the resumed index build is paused at 'failpointAfterStartup'.

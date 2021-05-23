@@ -99,6 +99,7 @@
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_builder_interface.h"
 #include "mongo/transport/hello_metrics.h"
+#include "mongo/transport/service_executor.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/fail_point.h"
@@ -113,6 +114,7 @@ MONGO_FAIL_POINT_DEFINE(sleepMillisAfterCommandExecutionBegins);
 MONGO_FAIL_POINT_DEFINE(waitAfterNewStatementBlocksBehindPrepare);
 MONGO_FAIL_POINT_DEFINE(waitAfterCommandFinishesExecution);
 MONGO_FAIL_POINT_DEFINE(failWithErrorCodeInRunCommand);
+MONGO_FAIL_POINT_DEFINE(hangBeforeSessionCheckOut);
 
 // Tracks the number of times a legacy unacknowledged write failed due to
 // not primary error resulted in network disconnection.
@@ -614,6 +616,15 @@ private:
             auto command = _execContext->getCommand();
             auto& request = _execContext->getRequest();
 
+            const auto apiParamsFromClient = initializeAPIParameters(request.body, command);
+            Client* client = opCtx->getClient();
+
+            {
+                stdx::lock_guard<Client> lk(*client);
+                CurOp::get(opCtx)->setCommand_inlock(command);
+                APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
+            }
+
             CommandHelpers::uassertShouldAttemptParse(opCtx, command, request);
             _startOperationTime = getClientOperationTime(opCtx);
 
@@ -626,12 +637,6 @@ private:
                     InExhaustHello::get(session.get())
                         ->setInExhaust(false, request.getCommandName());
                 }
-            }
-
-            // Hello should take kMaxAwaitTimeMs at most, log if it takes twice that.
-            if (isHello()) {
-                _execContext->slowMsOverride =
-                    2 * durationCount<Milliseconds>(SingleServerDiscoveryMonitor::kMaxAwaitTime);
             }
         });
         pf.promise.emplaceValue();
@@ -858,6 +863,7 @@ Future<void> InvokeCommand::SessionCheckoutPath::_checkOutSession() {
     // This constructor will check out the session. It handles the appropriate state management
     // for both multi-statement transactions and retryable writes. Currently, only requests with
     // a transaction number will check out the session.
+    hangBeforeSessionCheckOut.pauseWhileSet();
     _sessionTxnState = std::make_unique<MongoDOperationContextSession>(opCtx);
     _txnParticipant.emplace(TransactionParticipant::get(opCtx));
 
@@ -1295,14 +1301,11 @@ Future<void> ExecCommandDatabase::_initiateCommand() try {
     auto command = _execContext->getCommand();
     auto replyBuilder = _execContext->getReplyBuilder();
 
-    const auto apiParamsFromClient = initializeAPIParameters(request.body, command);
-    Client* client = opCtx->getClient();
+    // Record the time here to ensure that maxTimeMS, if set by the command, considers the time
+    // spent before the deadline is set on `opCtx`.
+    const auto startedCommandExecAt = opCtx->getServiceContext()->getFastClockSource()->now();
 
-    {
-        stdx::lock_guard<Client> lk(*client);
-        CurOp::get(opCtx)->setCommand_inlock(command);
-        APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
-    }
+    Client* client = opCtx->getClient();
 
     if (isHello()) {
         // Preload generic ClientMetadata ahead of our first hello request. After the first
@@ -1411,6 +1414,13 @@ Future<void> ExecCommandDatabase::_initiateCommand() try {
     if (!opCtx->getClient()->isInDirectClient() &&
         !MONGO_unlikely(skipCheckingForNotPrimaryInCommandDispatch.shouldFail())) {
         const bool inMultiDocumentTransaction = (_sessionOptions.getAutocommit() == false);
+
+        // Kill this operation on step down even if it hasn't taken write locks yet, because it
+        // could conflict with transactions from a new primary.
+        if (inMultiDocumentTransaction) {
+            opCtx->setAlwaysInterruptAtStepDownOrUp();
+        }
+
         auto allowed = command->secondaryAllowed(opCtx->getServiceContext());
         bool alwaysAllowed = allowed == Command::AllowedOnSecondary::kAlways;
         bool couldHaveOptedIn =
@@ -1472,24 +1482,29 @@ Future<void> ExecCommandDatabase::_initiateCommand() try {
     // TODO SERVER-34277 Remove the special handling for maxTimeMS for getMores. This will require
     // introducing a new 'max await time' parameter for getMore, and eventually banning maxTimeMS
     // altogether on a getMore command.
-    int maxTimeMS = uassertStatusOK(QueryRequest::parseMaxTimeMS(cmdOptionMaxTimeMSField));
-    int maxTimeMSOpOnly = uassertStatusOK(QueryRequest::parseMaxTimeMS(maxTimeMSOpOnlyField));
+    const auto maxTimeMS =
+        Milliseconds{uassertStatusOK(QueryRequest::parseMaxTimeMS(cmdOptionMaxTimeMSField))};
+    const auto maxTimeMSOpOnly =
+        Milliseconds{uassertStatusOK(QueryRequest::parseMaxTimeMS(maxTimeMSOpOnlyField))};
 
-    // The "hello" command should not inherit the deadline from the user op it is operating as a
-    // part of as that can interfere with replica set monitoring and host selection.
-    bool ignoreMaxTimeMSOpOnly = isHello();
-
-    if ((maxTimeMS > 0 || maxTimeMSOpOnly > 0) && command->getLogicalOp() != LogicalOp::opGetMore) {
+    if ((maxTimeMS > Milliseconds::zero() || maxTimeMSOpOnly > Milliseconds::zero()) &&
+        command->getLogicalOp() != LogicalOp::opGetMore) {
         uassert(40119,
                 "Illegal attempt to set operation deadline within DBDirectClient",
                 !opCtx->getClient()->isInDirectClient());
-        if (!ignoreMaxTimeMSOpOnly && maxTimeMSOpOnly > 0 &&
-            (maxTimeMS == 0 || maxTimeMSOpOnly < maxTimeMS)) {
-            opCtx->storeMaxTimeMS(Milliseconds{maxTimeMS});
-            opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMSOpOnly},
-                                         ErrorCodes::MaxTimeMSExpired);
-        } else if (maxTimeMS > 0) {
-            opCtx->setDeadlineAfterNowBy(Milliseconds{maxTimeMS}, ErrorCodes::MaxTimeMSExpired);
+
+        // The "hello" command should not inherit the deadline from the user op it is operating as a
+        // part of as that can interfere with replica set monitoring and host selection.
+        const bool ignoreMaxTimeMSOpOnly = isHello();
+
+        if (!ignoreMaxTimeMSOpOnly && maxTimeMSOpOnly > Milliseconds::zero() &&
+            (maxTimeMS == Milliseconds::zero() || maxTimeMSOpOnly < maxTimeMS)) {
+            opCtx->storeMaxTimeMS(maxTimeMS);
+            opCtx->setDeadlineByDate(startedCommandExecAt + maxTimeMSOpOnly,
+                                     ErrorCodes::MaxTimeMSExpired);
+        } else if (maxTimeMS > Milliseconds::zero()) {
+            opCtx->setDeadlineByDate(startedCommandExecAt + maxTimeMS,
+                                     ErrorCodes::MaxTimeMSExpired);
         }
     }
 
@@ -2343,6 +2358,22 @@ Future<DbResponse> ServiceEntryPointCommon::handleRequest(
                 [execContext = hr->executionContext](DbResponse response) -> void {
                     // Set the response upon successful execution
                     execContext->setResponse(std::move(response));
+
+                    auto opCtx = execContext->getOpCtx();
+
+                    auto seCtx = transport::ServiceExecutorContext::get(opCtx->getClient());
+                    if (!seCtx) {
+                        // We were run by a background worker.
+                        return;
+                    }
+
+                    if (auto invocation = CommandInvocation::get(opCtx);
+                        invocation && !invocation->isSafeForBorrowedThreads()) {
+                        // If the last command wasn't safe for a borrowed thread, then let's move
+                        // off of it.
+                        seCtx->setThreadingModel(
+                            transport::ServiceExecutor::ThreadingModel::kDedicated);
+                    }
                 });
         })
         .then([hr] { return hr->completeOperation(); })

@@ -33,9 +33,5 @@
 #include "mongo/bson/bsonobj.h"
 
 namespace mongo::create_command_validation {
-Status validateCollationNotEmpty(const BSONObj& collation);
-
 Status validateViewOnNotEmpty(const std::string& viewOn);
-
-Status validateStorageEngineOptions(const BSONObj& storageEngine);
 }  // namespace mongo::create_command_validation

@@ -30,6 +30,11 @@ function runInsertUpdateValidationTest(validator) {
 
     // Create a collection with document validator 'validator'.
     assert.commandWorked(db.createCollection(collName, {validator: validator}));
+    // The default validation level/action are OMITTED from "listCollections".
+    // (After a collMod they do appear, see below).
+    let info = db.getCollectionInfos({name: collName})[0];
+    assert.eq(info.options.validationLevel, undefined, info);
+    assert.eq(info.options.validationAction, undefined, info);
 
     // Insert and upsert documents that will pass validation.
     assert.commandWorked(coll.insert({_id: "valid1", a: 1}));
@@ -55,6 +60,10 @@ function runInsertUpdateValidationTest(validator) {
     assert.commandWorked(coll.insert({_id: "valid1", a: 1}));
     assert.commandWorked(coll.insert({_id: "invalid2", b: 1}));
     assert.commandWorked(coll.runCommand("collMod", {validator: validator}));
+    // After collMod, the default validation level/action are INCLUDED in "listCollections".
+    info = db.getCollectionInfos({name: collName})[0];
+    assert.eq(info.options.validationLevel, "strict", info);
+    assert.eq(info.options.validationAction, "error", info);
 
     // Assert that updates on a conforming document succeed when they affect fields not involved
     // in validator.
@@ -184,6 +193,14 @@ assert.commandWorked(db.runCommand({"collMod": collName, "validator": {$expr: {$
 assert.commandWorked(coll.insert({a: 4}));
 assertDocumentValidationFailure(coll.insert({a: 5}), coll);
 
+// The validator will generate detailed errors when $expr throws.
+assert.commandWorked(
+    db.runCommand({"collMod": collName, "validator": {$expr: {$divide: [10, 0]}}}));
+assertDocumentValidationFailure(coll.insert({a: 4}), coll);
+assert.commandWorked(
+    db.runCommand({"collMod": collName, "validator": {$nor: [{$expr: {$divide: [10, 0]}}]}}));
+assertDocumentValidationFailure(coll.insert({a: 4}), coll);
+
 // The validator supports $expr with the date extraction expressions (with a timezone
 // specified).
 coll.drop();
@@ -276,7 +293,7 @@ assert.commandWorked(
 assert.commandWorked(coll.insert({a: 1, b: 1}));
 let res = coll.insert({a: 1, b: 0});
 assert.writeError(res);
-assert.eq(res.getWriteError().code, 16608);
+assert.eq(res.getWriteError().code, ErrorCodes.DocumentValidationFailure);
 assert.commandWorked(coll.insert({a: -1, b: -1}));
 
 // The validator can contain an $expr that respects the collation.

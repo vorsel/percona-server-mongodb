@@ -92,8 +92,10 @@ BSONObj expectInsertsReturnStaleVersionErrorsBase(const NamespaceString& nss,
         WriteErrorDetail* error = new WriteErrorDetail;
         error->setStatus({ErrorCodes::StaleShardVersion, ""});
         error->setErrInfo([&] {
-            StaleConfigInfo sci(
-                nss, ChunkVersion(1, 0, epoch), ChunkVersion(2, 0, epoch), ShardId(kShardName1));
+            StaleConfigInfo sci(nss,
+                                ChunkVersion(1, 0, epoch, boost::none /* timestamp */),
+                                ChunkVersion(2, 0, epoch, boost::none /* timestamp */),
+                                ShardId(kShardName1));
             BSONObjBuilder builder;
             sci.serialize(&builder);
             return builder.obj();
@@ -278,7 +280,9 @@ public:
 
     MockNSTargeter singleShardNSTargeter{
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, OID::gen())),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, OID::gen(), boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << MAXKEY))}};
 };
@@ -347,17 +351,23 @@ TEST_F(BatchWriteExecTest, SingleUpdateTargetsShardWithLet) {
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << 0)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << 0),
                    BSON("x" << MAXKEY))});
 
@@ -431,17 +441,23 @@ TEST_F(BatchWriteExecTest, SingleDeleteTargetsShardWithLet) {
     protected:
         std::vector<ShardEndpoint> targetDelete(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << 0)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << 0),
                    BSON("x" << MAXKEY))});
 
@@ -620,18 +636,26 @@ TEST_F(BatchWriteExecTest, StaleShardVersionReturnedFromBatchWithSingleMultiWrit
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << 0)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << 0),
                    BSON("x" << MAXKEY))});
 
@@ -665,11 +689,12 @@ TEST_F(BatchWriteExecTest, StaleShardVersionReturnedFromBatchWithSingleMultiWrit
             errDetail->setIndex(0);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName2)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName2)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -725,18 +750,26 @@ TEST_F(BatchWriteExecTest,
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << MINKEY),
                    BSON("sk" << 10)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << 10),
                    BSON("sk" << MAXKEY))});
 
@@ -770,11 +803,12 @@ TEST_F(BatchWriteExecTest,
             errDetail->setIndex(0);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName2)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName2)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -786,11 +820,12 @@ TEST_F(BatchWriteExecTest,
             errDetail->setIndex(1);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName2)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName2)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -845,18 +880,26 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1Firs) {
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << MINKEY),
                    BSON("sk" << 10)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << 10),
                    BSON("sk" << MAXKEY))});
 
@@ -880,11 +923,12 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1Firs) {
             errDetail->setIndex(1);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName1)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName1)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -906,11 +950,12 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1Firs) {
             errDetail->setIndex(0);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName2)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName2)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -976,18 +1021,26 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1FirstOK
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << MINKEY),
                    BSON("sk" << 10)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << 10),
                    BSON("sk" << MAXKEY))});
 
@@ -1011,11 +1064,12 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1FirstOK
             errDetail->setIndex(1);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName1)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName1)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -1037,11 +1091,12 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromMultiWriteWithShard1FirstOK
             errDetail->setIndex(1);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName2)),
-                                 "Stale shard version");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName2)),
+                    "Stale shard version");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -1103,12 +1158,18 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromWriteWithShard1SSVShard2OK)
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
             if (targetAll) {
-                return std::vector<ShardEndpoint>{
-                    ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                    ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+                return std::vector{
+                    ShardEndpoint(kShardName1,
+                                  ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                  boost::none),
+                    ShardEndpoint(kShardName2,
+                                  ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                  boost::none)};
             } else {
-                return std::vector<ShardEndpoint>{
-                    ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+                return std::vector{
+                    ShardEndpoint(kShardName2,
+                                  ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                  boost::none)};
             }
         }
 
@@ -1117,10 +1178,14 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromWriteWithShard1SSVShard2OK)
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << MINKEY),
                    BSON("sk" << 10)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("sk" << 10),
                    BSON("sk" << MAXKEY))});
 
@@ -1145,11 +1210,12 @@ TEST_F(BatchWriteExecTest, RetryableErrorReturnedFromWriteWithShard1SSVShard2OK)
             errDetail->setIndex(0);
             errDetail->setStatus({ErrorCodes::StaleShardVersion, "Stale shard version"});
             errDetail->setErrInfo([&] {
-                Status ssvStatus(StaleConfigInfo(nss,
-                                                 ChunkVersion(101, 200, epoch),
-                                                 ChunkVersion(105, 200, epoch),
-                                                 ShardId(kShardName1)),
-                                 "Migration happened");
+                Status ssvStatus(
+                    StaleConfigInfo(nss,
+                                    ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                    ChunkVersion(105, 200, epoch, boost::none /* timestamp */),
+                                    ShardId(kShardName1)),
+                    "Migration happened");
                 BSONObjBuilder builder;
                 ssvStatus.serializeErrorToBSON(&builder);
                 return builder.obj();
@@ -1672,18 +1738,26 @@ TEST_F(BatchWriteExecTargeterErrorTest, TargetedFailedAndErrorResponse) {
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << 0)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << 0),
                    BSON("x" << MAXKEY))});
 
@@ -1810,18 +1884,26 @@ TEST_F(BatchWriteExecTransactionTargeterErrorTest, TargetedFailedAndErrorRespons
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << 0)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << 0),
                    BSON("x" << MAXKEY))});
 
@@ -1951,18 +2033,26 @@ TEST_F(BatchWriteExecTransactionMultiShardTest, TargetedSucceededAndErrorRespons
 
         std::vector<ShardEndpoint> targetUpdate(OperationContext* opCtx,
                                                 const BatchItemRef& itemRef) const override {
-            return std::vector<ShardEndpoint>{
-                ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
-                ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch))};
+            return std::vector{
+                ShardEndpoint(kShardName1,
+                              ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                              boost::none),
+                ShardEndpoint(kShardName2,
+                              ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                              boost::none)};
         }
     };
 
     MultiShardTargeter multiShardNSTargeter(
         nss,
-        {MockRange(ShardEndpoint(kShardName1, ChunkVersion(100, 200, epoch)),
+        {MockRange(ShardEndpoint(kShardName1,
+                                 ChunkVersion(100, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << MINKEY),
                    BSON("x" << 0)),
-         MockRange(ShardEndpoint(kShardName2, ChunkVersion(101, 200, epoch)),
+         MockRange(ShardEndpoint(kShardName2,
+                                 ChunkVersion(101, 200, epoch, boost::none /* timestamp */),
+                                 boost::none),
                    BSON("x" << 0),
                    BSON("x" << MAXKEY))});
 

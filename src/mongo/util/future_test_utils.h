@@ -52,7 +52,7 @@ enum DoExecutorFuture : bool {
     kDoExecutorFuture = true,
 };
 
-class DummyInterruptable final : public Interruptible {
+class DummyInterruptible final : public Interruptible {
     StatusWith<stdx::cv_status> waitForConditionOrInterruptNoAssertUntil(
         stdx::condition_variable& cv, BasicLockableAdapter m, Date_t deadline) noexcept override {
         return Status(ErrorCodes::Interrupted, "");
@@ -61,7 +61,8 @@ class DummyInterruptable final : public Interruptible {
         MONGO_UNREACHABLE;
     }
     Status checkForInterruptNoAssert() noexcept override {
-        MONGO_UNREACHABLE;
+        // Must be implemented because it's called by Interruptible::waitForConditionOrInterrupt.
+        return Status::OK();
     }
     IgnoreInterruptsState pushIgnoreInterrupts() override {
         MONGO_UNREACHABLE;

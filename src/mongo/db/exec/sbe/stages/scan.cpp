@@ -32,7 +32,7 @@
 #include "mongo/db/exec/sbe/stages/scan.h"
 
 #include "mongo/db/exec/sbe/expressions/expression.h"
-#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/exec/trial_run_tracker.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -45,8 +45,8 @@ ScanStage::ScanStage(const NamespaceStringOrUUID& name,
                      boost::optional<value::SlotId> seekKeySlot,
                      bool forward,
                      PlanYieldPolicy* yieldPolicy,
-                     TrialRunProgressTracker* tracker,
                      PlanNodeId nodeId,
+                     LockAcquisitionCallback lockAcquisitionCallback,
                      ScanOpenCallback openCallback)
     : PlanStage(seekKeySlot ? "seek"_sd : "scan"_sd, yieldPolicy, nodeId),
       _name(name),
@@ -56,7 +56,7 @@ ScanStage::ScanStage(const NamespaceStringOrUUID& name,
       _vars(std::move(vars)),
       _seekKeySlot(seekKeySlot),
       _forward(forward),
-      _tracker(tracker),
+      _lockAcquisitionCallback(std::move(lockAcquisitionCallback)),
       _openCallback(openCallback) {
     invariant(_fields.size() == _vars.size());
     invariant(!_seekKeySlot || _forward);
@@ -71,8 +71,8 @@ std::unique_ptr<PlanStage> ScanStage::clone() const {
                                        _seekKeySlot,
                                        _forward,
                                        _yieldPolicy,
-                                       _tracker,
                                        _commonStats.nodeId,
+                                       _lockAcquisitionCallback,
                                        _openCallback);
 }
 
@@ -132,9 +132,9 @@ void ScanStage::doRestoreState() {
     }
 
     _coll.emplace(_opCtx, _name);
-
-    uassertStatusOK(repl::ReplicationCoordinator::get(_opCtx)->checkCanServeReadsFor(
-        _opCtx, _coll->getNss(), true));
+    if (_lockAcquisitionCallback) {
+        _lockAcquisitionCallback(_opCtx, *_coll);
+    }
 
     if (_cursor) {
         const bool couldRestore = _cursor->restore();
@@ -151,10 +151,18 @@ void ScanStage::doDetachFromOperationContext() {
     }
 }
 
-void ScanStage::doAttachFromOperationContext(OperationContext* opCtx) {
+void ScanStage::doAttachToOperationContext(OperationContext* opCtx) {
     if (_cursor) {
         _cursor->reattachToOperationContext(opCtx);
     }
+}
+
+void ScanStage::doDetachFromTrialRunTracker() {
+    _tracker = nullptr;
+}
+
+void ScanStage::doAttachToTrialRunTracker(TrialRunTracker* tracker) {
+    _tracker = tracker;
 }
 
 void ScanStage::open(bool reOpen) {
@@ -164,9 +172,9 @@ void ScanStage::open(bool reOpen) {
         invariant(!_cursor);
         invariant(!_coll);
         _coll.emplace(_opCtx, _name);
-
-        uassertStatusOK(repl::ReplicationCoordinator::get(_opCtx)->checkCanServeReadsFor(
-            _opCtx, _coll->getNss(), true));
+        if (_lockAcquisitionCallback) {
+            _lockAcquisitionCallback(_opCtx, *_coll);
+        }
     } else {
         invariant(_cursor);
         invariant(_coll);
@@ -251,7 +259,7 @@ PlanState ScanStage::getNext() {
         }
     }
 
-    if (_tracker && _tracker->trackProgress<TrialRunProgressTracker::kNumReads>(1)) {
+    if (_tracker && _tracker->trackProgress<TrialRunTracker::kNumReads>(1)) {
         // If we're collecting execution stats during multi-planning and reached the end of the
         // trial period (trackProgress() will return 'true' in this case), then we can reset the
         // tracker. Note that a trial period is executed only once per a PlanStge tree, and once
@@ -448,7 +456,7 @@ void ParallelScanStage::doDetachFromOperationContext() {
     }
 }
 
-void ParallelScanStage::doAttachFromOperationContext(OperationContext* opCtx) {
+void ParallelScanStage::doAttachToOperationContext(OperationContext* opCtx) {
     if (_cursor) {
         _cursor->reattachToOperationContext(opCtx);
     }

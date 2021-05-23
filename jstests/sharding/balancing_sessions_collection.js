@@ -6,18 +6,20 @@
 (function() {
 "use strict";
 
+load("jstests/sharding/libs/find_chunks_util.js");
+
 /*
  * Returns the number of chunks for the sessions collection.
  */
 function getNumTotalChunks() {
-    return configDB.chunks.count({ns: kSessionsNs});
+    return findChunksUtil.countChunksForNs(configDB, kSessionsNs);
 }
 
 /*
  * Returns the number of chunks for the sessions collection that are the given shard.
  */
 function getNumChunksOnShard(shardName) {
-    return configDB.chunks.count({ns: kSessionsNs, shard: shardName});
+    return findChunksUtil.countChunksForNs(configDB, kSessionsNs, {shard: shardName});
 }
 
 /*
@@ -51,6 +53,15 @@ function removeShardFromCluster(shardName) {
     assert.commandWorked(st.s.adminCommand({removeShard: shardName}));
     assert.soon(function() {
         const res = st.s.adminCommand({removeShard: shardName});
+        if (!res.ok && res.code === ErrorCodes.ShardNotFound) {
+            // If the config server primary steps down right after removing the config.shards doc
+            // for the shard but before responding with "state": "completed", the mongos would retry
+            // the _configsvrRemoveShard command against the new config server primary, which would
+            // not find the removed shard in its ShardRegistry if it has done a ShardRegistry reload
+            // after the config.shards doc for the shard was removed. This would cause the command
+            // to fail with ShardNotFound.
+            return true;
+        }
         assert.commandWorked(res);
         return ("completed" == res.state);
     }, "failed to remove shard " + shardName, kBalancerTimeoutMS);

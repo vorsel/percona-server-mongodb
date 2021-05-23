@@ -51,7 +51,8 @@ namespace repl {
  * entries before the applyFromOpTime.
  *
  */
-class TenantOplogApplier : public AbstractAsyncComponent {
+class TenantOplogApplier : public AbstractAsyncComponent,
+                           public std::enable_shared_from_this<TenantOplogApplier> {
 public:
     struct OpTimePair {
         OpTimePair() = default;
@@ -75,7 +76,8 @@ public:
                        OpTime applyFromOpTime,
                        RandomAccessOplogBuffer* oplogBuffer,
                        std::shared_ptr<executor::TaskExecutor> executor,
-                       ThreadPool* writerPool);
+                       ThreadPool* writerPool,
+                       const bool isResuming = false);
 
     virtual ~TenantOplogApplier();
 
@@ -88,13 +90,18 @@ public:
      */
     SemiFuture<OpTimePair> getNotificationForOpTime(OpTime donorOpTime);
 
+    /**
+     * Returns the optime the applier will start applying from. Used for testing.
+     */
+    OpTime getBeginApplyingOpTime_forTest() const;
+
 private:
     Status _doStartup_inlock() noexcept final;
     void _doShutdown_inlock() noexcept final;
     void _finishShutdown(WithLock lk, Status status);
 
     void _applyLoop(TenantOplogBatch batch);
-    void _handleError(Status status);
+    bool _shouldStopApplying(Status status);
 
     void _applyOplogBatch(TenantOplogBatch* batch);
     Status _applyOplogBatchPerWorker(std::vector<const OplogEntry*>* ops);
@@ -116,6 +123,10 @@ private:
     boost::optional<OpTime> _maybeGetRecipientOpTime(const boost::optional<OpTime>);
     // _setRecipientOpTime must be called in optime order.
     void _setRecipientOpTime(const OpTime& donorOpTime, const OpTime& recipientOpTime);
+    /**
+     * Sets the _finalStatus to the new status if and only if the old status is "OK".
+     */
+    void _setFinalStatusIfOk(WithLock, Status newStatus);
 
     Mutex* _getMutex() noexcept final {
         return &_mutex;
@@ -131,7 +142,7 @@ private:
     // (X)  Access only allowed from the main flow of control called from run() or constructor.
 
     // Handles consuming oplog entries from the OplogBuffer for oplog application.
-    std::unique_ptr<TenantOplogBatcher> _oplogBatcher;  // (R)
+    std::shared_ptr<TenantOplogBatcher> _oplogBatcher;  // (R)
     const UUID _migrationUuid;                          // (R)
     const std::string _tenantId;                        // (R)
     const OpTime _beginApplyingAfterOpTime;             // (R)
@@ -147,6 +158,8 @@ private:
     std::map<OpTime, SharedPromise<OpTimePair>> _opTimeNotificationList;  // (M)
     Status _finalStatus = Status::OK();                                   // (M)
     stdx::unordered_set<UUID, UUID::Hash> _knownGoodUuids;                // (X)
+    bool _applyLoopApplyingBatch = false;                                 // (M)
+    const bool _isResuming;                                               // (R)
 };
 
 /**

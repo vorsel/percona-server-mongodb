@@ -99,16 +99,6 @@ env.Library(
     ],
 )
 
-env.Library(
-    target='distinct_command_idl',
-    source=[
-        'distinct_command.idl',
-    ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/idl/idl_parser',
-    ],
-)
-
 # Shared mongod/mongos query code.
 env.Library(
     target="query_common",
@@ -123,7 +113,6 @@ env.Library(
         "collation/collator_factory_icu",
         "collation/collator_icu",
         "datetime/init_timezone_data",
-        "distinct_command_idl",
         "explain_options",
         "query_planner",
         "query_request",
@@ -162,9 +151,7 @@ env.Library(
         "count_request.cpp",
         'cursor_request.cpp',
         'cursor_response.cpp',
-        'find_and_modify_request.cpp',
         'getmore_request.cpp',
-        'killcursors_response.cpp',
         'view_response_formatter.cpp',
         'count_command.idl',
         'kill_cursors.idl',
@@ -187,6 +174,8 @@ env.Library(
 env.Library(
     target="query_request",
     source=[
+        "distinct_command.idl",
+        "find_command.idl",
         "query_request.cpp",
         "tailable_mode.cpp",
         "tailable_mode.idl",
@@ -200,6 +189,7 @@ env.Library(
         "$BUILD_DIR/mongo/db/commands/test_commands_enabled",
         "$BUILD_DIR/mongo/db/pipeline/runtime_constants_idl",
         "$BUILD_DIR/mongo/db/repl/read_concern_args",
+        "hint_parser",
     ],
 )
 
@@ -207,8 +197,10 @@ env.Library(
     target="query_knobs",
     source=[
         'query_knobs.idl',
+        'query_feature_flags.idl',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/idl/feature_flag',
         '$BUILD_DIR/mongo/idl/server_parameter'
     ]
 )
@@ -297,7 +289,6 @@ env.CppUnitTest(
         "count_command_test.cpp",
         "cursor_response_test.cpp",
         "explain_options_test.cpp",
-        "find_and_modify_request_test.cpp",
         "get_executor_test.cpp",
         "getmore_request_test.cpp",
         "hint_parser_test.cpp",
@@ -311,7 +302,6 @@ env.CppUnitTest(
         "index_entry_test.cpp",
         "interval_test.cpp",
         "killcursors_request_test.cpp",
-        "killcursors_response_test.cpp",
         "lru_key_value_test.cpp",
         'map_reduce_output_format_test.cpp',
         "parsed_distinct_test.cpp",
@@ -337,6 +327,7 @@ env.CppUnitTest(
         "query_request_test.cpp",
         "query_settings_test.cpp",
         "query_solution_test.cpp",
+        "sbe_and_hash_test.cpp",
         "sbe_stage_builder_test_fixture.cpp",
         "sbe_stage_builder_test.cpp",
         "sbe_shard_filter_test.cpp",
@@ -347,7 +338,7 @@ env.CppUnitTest(
         "$BUILD_DIR/mongo/db/auth/authmocks",
         "$BUILD_DIR/mongo/db/concurrency/lock_manager",
         "$BUILD_DIR/mongo/db/exec/sbe/sbe_plan_stage_test",
-        "$BUILD_DIR/mongo/db/pipeline/aggregation_request",
+        "$BUILD_DIR/mongo/db/pipeline/aggregation_request_helper",
         "$BUILD_DIR/mongo/db/query_exec",
         "$BUILD_DIR/mongo/db/service_context_d",
         "$BUILD_DIR/mongo/db/service_context_d_test_fixture",

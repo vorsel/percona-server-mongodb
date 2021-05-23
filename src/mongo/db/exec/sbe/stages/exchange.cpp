@@ -45,8 +45,6 @@ MONGO_INITIALIZER(s_globalThreadPool)(InitializerContext* context) {
     options.onCreateThread = [](const std::string& name) { Client::initThread(name); };
     s_globalThreadPool = std::make_unique<ThreadPool>(options);
     s_globalThreadPool->startup();
-
-    return Status::OK();
 }
 
 ExchangePipe::ExchangePipe(size_t size) {
@@ -458,7 +456,7 @@ void ExchangeProducer::start(OperationContext* opCtx,
                              std::unique_ptr<PlanStage> producer) {
     ExchangeProducer* p = static_cast<ExchangeProducer*>(producer.get());
 
-    p->attachFromOperationContext(opCtx);
+    p->attachToOperationContext(opCtx);
 
     try {
         p->prepare(ctx);

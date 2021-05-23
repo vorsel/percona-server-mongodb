@@ -67,7 +67,8 @@ public:
     static constexpr auto kOpMsgDollarDB = "$db"_sd;
     static constexpr auto kOpMsgDollarDBDefault = "admin"_sd;
 
-    IDLParserErrorContext(StringData fieldName) : _currentField(fieldName), _predecessor(nullptr) {}
+    IDLParserErrorContext(StringData fieldName, bool apiStrict = false)
+        : _currentField(fieldName), _apiStrict(apiStrict), _predecessor(nullptr) {}
 
     IDLParserErrorContext(StringData fieldName, const IDLParserErrorContext* predecessor)
         : _currentField(fieldName), _predecessor(predecessor) {}
@@ -153,9 +154,18 @@ public:
     MONGO_COMPILER_NORETURN void throwBadEnumValue(int enumValue) const;
 
     /**
-     * Equivalent to CommandHelpers::parseNsCollectionRequired
+     * Throw an 'APIStrictError' if the user command has 'apiStrict' field as true.
      */
-    static NamespaceString parseNSCollectionRequired(StringData dbName, const BSONElement& element);
+    void throwAPIStrictErrorIfApplicable(StringData fieldName) const;
+    void throwAPIStrictErrorIfApplicable(BSONElement fieldName) const;
+
+    /**
+     * Equivalent to CommandHelpers::parseNsCollectionRequired.
+     * 'allowGlobalCollectionName' allows use of global collection name, e.g. {aggregate: 1}.
+     */
+    static NamespaceString parseNSCollectionRequired(StringData dbName,
+                                                     const BSONElement& element,
+                                                     bool allowGlobalCollectionName);
 
     /**
      * Equivalent to CommandHelpers::parseNsOrUUID
@@ -196,6 +206,9 @@ private:
     // Name of the current field that is being parsed.
     const StringData _currentField;
 
+    // Whether the 'apiStrict' parameter is set in the user request.
+    const bool _apiStrict = false;
+
     // Pointer to a parent parser context.
     // This provides a singly linked list of parent pointers, and use to produce a full path to a
     // field with an error.
@@ -235,5 +248,13 @@ std::vector<StringData> transformVector(const std::vector<std::string>& input);
 std::vector<std::string> transformVector(const std::vector<StringData>& input);
 std::vector<ConstDataRange> transformVector(const std::vector<std::vector<std::uint8_t>>& input);
 std::vector<std::vector<std::uint8_t>> transformVector(const std::vector<ConstDataRange>& input);
+
+void noOpSerializer(bool, StringData fieldName, BSONObjBuilder* bob);
+
+void serializeBSONWhenNotEmpty(BSONObj obj, StringData fieldName, BSONObjBuilder* bob);
+
+BSONObj parseOwnedBSON(BSONElement element);
+
+bool parseBoolean(BSONElement element);
 
 }  // namespace mongo

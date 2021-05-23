@@ -154,11 +154,12 @@ protected:
                 nullptr,
                 false,
                 epoch,
+                boost::none /* timestamp */,
                 boost::none,
                 true,
                 {ChunkType{kNss,
                            ChunkRange{BSON(kShardKey << MINKEY), BSON(kShardKey << MAXKEY)},
-                           ChunkVersion(1, 0, epoch),
+                           ChunkVersion(1, 0, epoch, boost::none /* timestamp */),
                            ShardId("dummyShardId")}});
 
             AutoGetDb autoDb(operationContext(), kNss.db(), MODE_IX);
@@ -187,7 +188,7 @@ protected:
         MoveChunkRequest::appendAsCommand(
             &cmdBuilder,
             kNss,
-            ChunkVersion(1, 0, OID::gen()),
+            ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */),
             kConfigConnStr,
             kDonorConnStr.getSetName(),
             kRecipientConnStr.getSetName(),
@@ -212,11 +213,10 @@ protected:
     TxnNumber _txnNumber{0};
 
 private:
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
-        std::unique_ptr<DistLockManager> distLockManager) override {
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
         class StaticCatalogClient final : public ShardingCatalogClientMock {
         public:
-            StaticCatalogClient() : ShardingCatalogClientMock(nullptr) {}
+            StaticCatalogClient() = default;
 
             StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
                 OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {

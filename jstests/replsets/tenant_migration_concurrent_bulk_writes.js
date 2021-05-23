@@ -28,30 +28,28 @@ const kBatchTypes = {
     remove: 3
 };
 
+const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 const donorRst = new ReplSetTest({
     nodes: 1,
     name: 'donor',
-    nodeOptions: {
+    nodeOptions: Object.assign(migrationX509Options.donor, {
         setParameter: {
             internalInsertMaxBatchSize:
                 kMaxBatchSize /* Decrease internal max batch size so we can still show writes are
                                  batched without inserting hundreds of documents. */
         }
-    }
+    })
 });
 const recipientRst = new ReplSetTest({
     nodes: 1,
     name: 'recipient',
-    nodeOptions: {
+    nodeOptions: Object.assign(migrationX509Options.recipient, {
         setParameter: {
             internalInsertMaxBatchSize:
                 kMaxBatchSize /* Decrease internal max batch size so we can still show writes are
                                  batched without inserting hundreds of documents. */
-            ,
-            // TODO SERVER-51734: Remove the failpoint 'returnResponseOkForRecipientSyncDataCmd'.
-            'failpoint.returnResponseOkForRecipientSyncDataCmd': tojson({mode: 'alwaysOn'})
         },
-    }
+    })
 });
 const kRecipientConnString = recipientRst.getURL();
 
@@ -221,7 +219,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     const bulkWriteThread =
         new Thread(bulkWriteDocsUnordered, primary.host, dbName, kCollName, kNumWriteOps);
 
-    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const migrationThread =
         new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 
@@ -251,7 +249,8 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     writeErrors.forEach((err, index) => {
         assert.eq(err.code, ErrorCodes.TenantMigrationCommitted);
         if (index == 0) {
-            assert.eq(err.errmsg, "Write must be re-routed to the new owner of this tenant");
+            assert.eq(err.errmsg,
+                      "Write or read must be re-routed to the new owner of this tenant");
         } else {
             assert.eq(err.errmsg, "");
         }
@@ -303,12 +302,12 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     const bulkWriteThread =
         new Thread(bulkWriteDocsUnordered, primary.host, dbName, kCollName, kNumWriteOps);
 
-    const abortFp = configureFailPoint(primaryDB, "abortTenantMigrationAfterBlockingStarts");
+    const abortFp = configureFailPoint(primaryDB, "abortTenantMigrationBeforeLeavingBlockingState");
 
     // The failpoint below is used to ensure that a write to throw TenantMigrationConflict in the op
     // observer. Without this failpoint, the migration could have already aborted by the time the
     // write gets to the op observer.
-    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const migrationThread =
         new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 
@@ -453,7 +452,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     const bulkWriteThread =
         new Thread(bulkWriteDocsOrdered, primary.host, dbName, kCollName, kNumWriteOps);
 
-    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const migrationThread =
         new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 
@@ -530,12 +529,12 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     const bulkWriteThread =
         new Thread(bulkWriteDocsOrdered, primary.host, dbName, kCollName, kNumWriteOps);
 
-    const abortFp = configureFailPoint(primaryDB, "abortTenantMigrationAfterBlockingStarts");
+    const abortFp = configureFailPoint(primaryDB, "abortTenantMigrationBeforeLeavingBlockingState");
 
     // The failpoint below is used to ensure that a write to throw TenantMigrationConflict in the op
     // observer. Without this failpoint, the migration could have already aborted by the time the
     // write gets to the op observer.
-    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const migrationThread =
         new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 

@@ -116,7 +116,7 @@ std::unique_ptr<plan_ranker::PlanRankingDecision> createDecision(size_t numPlans
         why->scores.push_back(0U);
         why->candidateOrder.push_back(i);
     }
-    why->getStats<PlanStageStats>() = std::move(stats);
+    why->getStats<PlanStageStats>().candidatePlanStats = std::move(stats);
     return why;
 }
 
@@ -139,7 +139,7 @@ void addQueryShapeToPlanCache(OperationContext* opCtx,
     ASSERT_OK(statusWithCQ.getStatus());
     std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
 
-    QuerySolution qs;
+    QuerySolution qs{QueryPlannerParams::Options::DEFAULT};
     qs.cacheData.reset(new SolutionCacheData());
     qs.cacheData->tree.reset(new PlanCacheIndexTree());
     std::vector<QuerySolution*> solns;

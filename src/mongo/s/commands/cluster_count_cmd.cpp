@@ -53,10 +53,6 @@ class ClusterCountCmd : public ErrmsgCommandDeprecated {
 public:
     ClusterCountCmd() : ErrmsgCommandDeprecated("count") {}
 
-    const std::set<std::string>& apiVersions() const {
-        return kApiVersions1;
-    }
-
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return AllowedOnSecondary::kAlways;
     }
@@ -132,11 +128,13 @@ public:
             auto countRequest = CountCommand::parse(IDLParserErrorContext("count"), cmdObj);
             auto aggCmdOnView =
                 uassertStatusOK(countCommandAsAggregationCommand(countRequest, nss));
+            auto aggCmdOnViewObj = OpMsgRequest::fromDBAndBody(nss.db(), aggCmdOnView).body;
             auto aggRequestOnView =
-                uassertStatusOK(AggregationRequest::parseFromBSON(nss, aggCmdOnView));
+                uassertStatusOK(aggregation_request_helper::parseFromBSON(nss, aggCmdOnViewObj));
 
             auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView);
-            auto resolvedAggCmd = resolvedAggRequest.serializeToCommandObj().toBson();
+            auto resolvedAggCmd =
+                aggregation_request_helper::serializeToCommandObj(resolvedAggRequest);
 
             BSONObj aggResult = CommandHelpers::runCommandDirectly(
                 opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(resolvedAggCmd)));
@@ -240,8 +238,10 @@ public:
                 return aggCmdOnView.getStatus();
             }
 
+            auto aggCmdOnViewObj =
+                OpMsgRequest::fromDBAndBody(nss.db(), aggCmdOnView.getValue()).body;
             auto aggRequestOnView =
-                AggregationRequest::parseFromBSON(nss, aggCmdOnView.getValue(), verbosity);
+                aggregation_request_helper::parseFromBSON(nss, aggCmdOnViewObj, verbosity);
             if (!aggRequestOnView.isOK()) {
                 return aggRequestOnView.getStatus();
             }

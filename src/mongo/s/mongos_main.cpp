@@ -42,7 +42,6 @@
 #include "mongo/client/connpool.h"
 #include "mongo/client/dbclient_rs.h"
 #include "mongo/client/global_conn_pool.h"
-#include "mongo/client/remote_command_targeter.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/config.h"
@@ -63,7 +62,6 @@
 #include "mongo/db/ldap/ldap_manager.h"
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/logical_session_cache_impl.h"
-#include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
@@ -71,6 +69,7 @@
 #include "mongo/db/service_liaison_mongos.h"
 #include "mongo/db/session_killer.h"
 #include "mongo/db/startup_warnings_common.h"
+#include "mongo/db/vector_clock_metadata_hook.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
@@ -349,10 +348,6 @@ void cleanupTask(const ShutdownTaskArgs& shutdownArgs) {
             pool->shutdownAndJoin();
         }
 
-        if (auto catalog = Grid::get(opCtx)->catalogClient()) {
-            catalog->shutDown(opCtx);
-        }
-
         if (auto shardRegistry = Grid::get(opCtx)->shardRegistry()) {
             shardRegistry->shutdown();
         }
@@ -434,13 +429,12 @@ Status initializeSharding(OperationContext* opCtx) {
 
     Status status = initializeGlobalShardingState(
         opCtx,
-        generateDistLockProcessId(opCtx),
         std::move(catalogCache),
         std::move(shardRegistry),
         [opCtx]() {
             auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
             hookList->addHook(
-                std::make_unique<rpc::LogicalTimeMetadataHook>(opCtx->getServiceContext()));
+                std::make_unique<rpc::VectorClockMetadataHook>(opCtx->getServiceContext()));
             hookList->addHook(
                 std::make_unique<rpc::CommittedOpTimeMetadataHook>(opCtx->getServiceContext()));
             hookList->addHook(std::make_unique<rpc::ClientMetadataPropagationEgressHook>());
@@ -488,7 +482,6 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionHandling"))(Ini
     spec.isInternalClient = true;
 
     WireSpec::instance().initialize(std::move(spec));
-    return Status::OK();
 }
 
 class ShardingReplicaSetChangeListener final
@@ -658,6 +651,7 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     ThreadClient tc("mongosMain", serviceContext);
 
     logShardingVersionInfo(nullptr);
+    audit::logStartupOptions(tc.get(), serverGlobalParams.parsedOpts);
 
     // Set up the periodic runner for background job execution
     {
@@ -685,7 +679,7 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     serviceContext->setTransportLayer(std::move(tl));
 
     auto unshardedHookList = std::make_unique<rpc::EgressMetadataHookList>();
-    unshardedHookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
+    unshardedHookList->addHook(std::make_unique<rpc::VectorClockMetadataHook>(serviceContext));
     unshardedHookList->addHook(std::make_unique<rpc::ClientMetadataPropagationEgressHook>());
     unshardedHookList->addHook(
         std::make_unique<rpc::ShardingEgressMetadataHookForMongos>(serviceContext));
@@ -695,7 +689,7 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     globalConnPool.addHook(new ShardingConnectionHook(std::move(unshardedHookList)));
 
     auto shardedHookList = std::make_unique<rpc::EgressMetadataHookList>();
-    shardedHookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
+    shardedHookList->addHook(std::make_unique<rpc::VectorClockMetadataHook>(serviceContext));
     shardedHookList->addHook(std::make_unique<rpc::ClientMetadataPropagationEgressHook>());
     shardedHookList->addHook(
         std::make_unique<rpc::ShardingEgressMetadataHookForMongos>(serviceContext));
@@ -890,7 +884,6 @@ ExitCode main(ServiceContext* serviceContext) {
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 (InitializerContext* context) {
     forkServerOrDie();
-    return Status::OK();
 }
 
 // Initialize the featureCompatibilityVersion server parameter since mongos does not have a
@@ -904,14 +897,12 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(SetFeatureCompatibilityVersionLatest,
 (InitializerContext* context) {
     serverGlobalParams.mutableFeatureCompatibility.setVersion(
         ServerGlobalParams::FeatureCompatibility::kLatest);
-    return Status::OK();
 }
 
 #ifdef MONGO_CONFIG_SSL
-MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManager"))
+MONGO_INITIALIZER_GENERAL(setSSLManagerType, (), ("SSLManager"))
 (InitializerContext* context) {
     isSSLServer = true;
-    return Status::OK();
 }
 #endif
 

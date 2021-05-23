@@ -1067,6 +1067,7 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
     MemberData& hbData = _memberData.at(memberIndex);
     const MemberConfig member = _rsConfig.getMemberAt(memberIndex);
     bool advancedOpTimeOrUpdatedConfig = false;
+    bool becameElectable = false;
     if (!hbResponse.isOK()) {
         if (isUnauthorized) {
             hbData.setAuthIssue(now);
@@ -1093,7 +1094,9 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
                     "setUpValues: heartbeat response good",
                     "memberId"_attr = member.getId());
         pingsInConfig++;
+        auto wasUnelectable = hbData.isUnelectable();
         advancedOpTimeOrUpdatedConfig = hbData.setUpValues(now, std::move(hbr));
+        becameElectable = wasUnelectable && !hbData.isUnelectable();
     }
 
     _updatePrimaryFromHBDataV1(now);
@@ -1107,6 +1110,7 @@ HeartbeatResponseAction TopologyCoordinator::processHeartbeatResponse(
 
     nextAction.setNextHeartbeatStartDate(nextHeartbeatStartDate);
     nextAction.setAdvancedOpTimeOrUpdatedConfig(advancedOpTimeOrUpdatedConfig);
+    nextAction.setBecameElectable(becameElectable);
     return nextAction;
 }
 
@@ -3395,28 +3399,29 @@ TopologyCoordinator::latestKnownOpTimeSinceHeartbeatRestartPerMember() const {
     return opTimesPerMember;
 }
 
-bool TopologyCoordinator::checkIfCommitQuorumCanBeSatisfied(
+Status TopologyCoordinator::checkIfCommitQuorumCanBeSatisfied(
     const CommitQuorumOptions& commitQuorum) const {
     if (!commitQuorum.mode.empty() && commitQuorum.mode != CommitQuorumOptions::kMajority &&
         commitQuorum.mode != CommitQuorumOptions::kVotingMembers) {
         StatusWith<ReplSetTagPattern> tagPatternStatus =
             _rsConfig.findCustomWriteMode(commitQuorum.mode);
         if (!tagPatternStatus.isOK()) {
-            return false;
+            return tagPatternStatus.getStatus();
         }
 
         ReplSetTagMatch matcher(tagPatternStatus.getValue());
         for (auto&& member : _rsConfig.members()) {
             for (MemberConfig::TagIterator it = member.tagsBegin(); it != member.tagsEnd(); ++it) {
                 if (matcher.update(*it)) {
-                    return true;
+                    return Status::OK();
                 }
             }
         }
 
         // Even if all the nodes in the set had a given write it still would not satisfy this
         // commit quorum.
-        return false;
+        return {ErrorCodes::UnsatisfiableCommitQuorum,
+                "Commit quorum cannot be satisfied with the current replica set configuration"};
     }
 
     int nodesRemaining = commitQuorum.numNodes;
@@ -3428,15 +3433,37 @@ bool TopologyCoordinator::checkIfCommitQuorumCanBeSatisfied(
         }
     }
 
+    bool votingBuildIndexesFalseNodes = false;
     for (auto&& member : _rsConfig.members()) {
-        if (!member.isArbiter()) {  // Only count data-bearing nodes
-            --nodesRemaining;
-            if (nodesRemaining <= 0) {
-                return true;
-            }
+        // Only count data-bearing nodes.
+        if (member.isArbiter()) {
+            continue;
+        }
+
+        // Only count voting nodes that build indexes.
+        if (member.isVoter() && !member.shouldBuildIndexes()) {
+            votingBuildIndexesFalseNodes = true;
+            continue;
+        }
+
+        --nodesRemaining;
+        if (nodesRemaining <= 0) {
+            return Status::OK();
         }
     }
-    return false;
+
+    // Voting, buildIndexes:false nodes can be included in a commitQuorum but never actually build
+    // indexes and vote to commit. Provide a helpful error message to prevent users from starting
+    // index builds that will never commit.
+    if (votingBuildIndexesFalseNodes) {
+        return {ErrorCodes::UnsatisfiableCommitQuorum,
+                str::stream()
+                    << "Commit quorum cannot depend on voting buildIndexes:false nodes; "
+                    << "use a commit quorum that excludes these nodes or do not give them votes"};
+    }
+
+    return {ErrorCodes::UnsatisfiableCommitQuorum,
+            "Not enough data-bearing voting nodes to satisfy commit quorum"};
 }
 
 }  // namespace repl

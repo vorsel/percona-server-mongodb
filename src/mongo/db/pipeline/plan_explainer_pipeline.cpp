@@ -32,11 +32,24 @@
 #include "mongo/db/pipeline/plan_explainer_pipeline.h"
 
 #include "mongo/db/pipeline/document_source_cursor.h"
+#include "mongo/db/pipeline/document_source_lookup.h"
 #include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/document_source_union_with.h"
 #include "mongo/db/pipeline/plan_executor_pipeline.h"
 #include "mongo/db/query/explain.h"
 
 namespace mongo {
+/**
+ * Templatized method to get plan summary stats from document source and aggregate it to 'statsOut'.
+ */
+template <typename DocSourceType, typename DocSourceStatType>
+void collectPlanSummaryStats(const DocSourceType& source, PlanSummaryStats* statsOut) {
+    auto specificStats = source.getSpecificStats();
+    invariant(specificStats);
+    auto& docSpecificStats = static_cast<const DocSourceStatType&>(*specificStats);
+    statsOut->accumulate(docSpecificStats.planSummaryStats);
+}
+
 std::string PlanExplainerPipeline::getPlanSummary() const {
     if (auto docSourceCursor =
             dynamic_cast<DocumentSourceCursor*>(_pipeline->getSources().front().get())) {
@@ -55,12 +68,17 @@ void PlanExplainerPipeline::getSummaryStats(PlanSummaryStats* statsOut) const {
     }
 
     for (auto&& source : _pipeline->getSources()) {
-        if (dynamic_cast<DocumentSourceSort*>(source.get()))
-            statsOut->hasSortStage = true;
-
         statsOut->usedDisk = statsOut->usedDisk || source->usedDisk();
-        if (statsOut->usedDisk && statsOut->hasSortStage)
-            break;
+
+        if (dynamic_cast<DocumentSourceSort*>(source.get())) {
+            statsOut->hasSortStage = true;
+        } else if (auto docSourceLookUp = dynamic_cast<DocumentSourceLookUp*>(source.get())) {
+            collectPlanSummaryStats<DocumentSourceLookUp, DocumentSourceLookupStats>(
+                *docSourceLookUp, statsOut);
+        } else if (auto docSourceUnionWith = dynamic_cast<DocumentSourceUnionWith*>(source.get())) {
+            collectPlanSummaryStats<DocumentSourceUnionWith, UnionWithStats>(*docSourceUnionWith,
+                                                                             statsOut);
+        }
     }
 
     if (_nReturned) {

@@ -169,8 +169,12 @@ StatusWith<unique_ptr<PlanExecutor, PlanExecutor::Deleter>> createRandomCursorEx
         trialStage = static_cast<TrialStage*>(root.get());
     }
 
-    auto exec = plan_executor_factory::make(
-        expCtx, std::move(ws), std::move(root), &coll, PlanYieldPolicy::YieldPolicy::YIELD_AUTO);
+    auto exec = plan_executor_factory::make(expCtx,
+                                            std::move(ws),
+                                            std::move(root),
+                                            &coll,
+                                            PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+                                            QueryPlannerParams::RETURN_OWNED_DATA);
 
     // For sharded collections, the root of the plan tree is a TrialStage that may have chosen
     // either a random-sampling cursor trial plan or a COLLSCAN backup plan. We can only optimize
@@ -196,7 +200,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     BSONObj sortObj,
     SkipThenLimit skipThenLimit,
     boost::optional<std::string> groupIdForDistinctScan,
-    const AggregationRequest* aggRequest,
+    const AggregateCommand* aggRequest,
     const size_t plannerOpts,
     const MatchExpressionParser::AllowedFeatureSet& matcherFeatures) {
     auto qr = std::make_unique<QueryRequest>(nss);
@@ -204,11 +208,16 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> attemptToGetExe
     qr->setFilter(queryObj);
     qr->setProj(projectionObj);
     qr->setSort(sortObj);
-    qr->setSkip(skipThenLimit.getSkip());
-    qr->setLimit(skipThenLimit.getLimit());
+    if (auto skip = skipThenLimit.getSkip()) {
+        qr->setSkip(static_cast<std::int64_t>(*skip));
+    }
+    if (auto limit = skipThenLimit.getLimit()) {
+        qr->setLimit(static_cast<std::int64_t>(*limit));
+    }
+
     if (aggRequest) {
         qr->setExplain(static_cast<bool>(aggRequest->getExplain()));
-        qr->setHint(aggRequest->getHint());
+        qr->setHint(aggRequest->getHint().value_or(BSONObj()));
     }
 
     // The collation on the ExpressionContext has been resolved to either the user-specified
@@ -318,7 +327,7 @@ StringData extractGeoNearFieldFromIndexes(OperationContext* opCtx,
 std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
 PipelineD::buildInnerQueryExecutor(const CollectionPtr& collection,
                                    const NamespaceString& nss,
-                                   const AggregationRequest* aggRequest,
+                                   const AggregateCommand* aggRequest,
                                    Pipeline* pipeline) {
     auto expCtx = pipeline->getContext();
 
@@ -328,9 +337,6 @@ PipelineD::buildInnerQueryExecutor(const CollectionPtr& collection,
     if (!sources.empty() && !sources.front()->constraints().requiresInputDocSource) {
         return {};
     }
-
-    // We are going to generate an input cursor, so we need to be holding the collection lock.
-    dassert(expCtx->opCtx->lockState()->isCollectionLockedForMode(nss, MODE_IS));
 
     if (!sources.empty()) {
         auto sampleStage = dynamic_cast<DocumentSourceSample*>(sources.front().get());
@@ -389,7 +395,7 @@ void PipelineD::attachInnerQueryExecutorToPipeline(
 
 void PipelineD::buildAndAttachInnerQueryExecutorToPipeline(const CollectionPtr& collection,
                                                            const NamespaceString& nss,
-                                                           const AggregationRequest* aggRequest,
+                                                           const AggregateCommand* aggRequest,
                                                            Pipeline* pipeline) {
 
     auto callback = PipelineD::buildInnerQueryExecutor(collection, nss, aggRequest, pipeline);
@@ -510,7 +516,7 @@ auto buildProjectionForPushdown(const DepsTracker& deps, Pipeline* pipeline) {
 std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
 PipelineD::buildInnerQueryExecutorGeneric(const CollectionPtr& collection,
                                           const NamespaceString& nss,
-                                          const AggregationRequest* aggRequest,
+                                          const AggregateCommand* aggRequest,
                                           Pipeline* pipeline) {
     // Make a last effort to optimize pipeline stages before potentially detaching them to be pushed
     // down into the query executor.
@@ -599,7 +605,7 @@ PipelineD::buildInnerQueryExecutorGeneric(const CollectionPtr& collection,
 std::pair<PipelineD::AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
 PipelineD::buildInnerQueryExecutorGeoNear(const CollectionPtr& collection,
                                           const NamespaceString& nss,
-                                          const AggregationRequest* aggRequest,
+                                          const AggregateCommand* aggRequest,
                                           Pipeline* pipeline) {
     uassert(ErrorCodes::NamespaceNotFound,
             str::stream() << "$geoNear requires a geo index to run, but " << nss.ns()
@@ -667,11 +673,12 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
     QueryMetadataBitSet unavailableMetadata,
     const BSONObj& queryObj,
     SkipThenLimit skipThenLimit,
-    const AggregationRequest* aggRequest,
+    const AggregateCommand* aggRequest,
     const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
     bool* hasNoRequirements) {
     invariant(hasNoRequirements);
 
+    // Any data returned from the inner executor must be owned.
     size_t plannerOpts = QueryPlannerParams::DEFAULT;
 
     if (pipeline->peekFront() && pipeline->peekFront()->constraints().isChangeStreamStage()) {
@@ -729,6 +736,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> PipelineD::prep
         // projection at the front of the pipeline, it will be removed and handled by the PlanStage
         // layer. If a projection cannot be pushed down, an empty BSONObj will be returned.
         projObj = buildProjectionForPushdown(deps, pipeline);
+        plannerOpts |= QueryPlannerParams::RETURN_OWNED_DATA;
     }
 
     if (rewrittenGroupStage) {

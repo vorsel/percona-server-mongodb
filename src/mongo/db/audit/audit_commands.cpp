@@ -137,8 +137,6 @@ namespace mongo {
             // Leaked intentionally: a Command registers itself when constructed.
             new AuditGetOptionsCommand();
         }
-
-        return Status::OK();
     }
 
 }  // namespace mongo

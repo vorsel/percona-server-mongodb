@@ -36,8 +36,8 @@
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
@@ -121,17 +121,10 @@ public:
         setDropCollDistLockWait.execute(
             [&](const BSONObj& data) { waitFor = Seconds(data["waitForSecs"].numberInt()); });
 
-        auto const catalogClient = Grid::get(opCtx)->catalogClient();
-
-        auto scopedDbLock =
-            ShardingCatalogManager::get(opCtx)->serializeCreateOrDropDatabase(opCtx, nss.db());
-        auto scopedCollLock =
-            ShardingCatalogManager::get(opCtx)->serializeCreateOrDropCollection(opCtx, nss);
-
         auto dbDistLock = uassertStatusOK(
-            catalogClient->getDistLockManager()->lock(opCtx, nss.db(), "dropCollection", waitFor));
+            DistLockManager::get(opCtx)->lock(opCtx, nss.db(), "dropCollection", waitFor));
         auto collDistLock = uassertStatusOK(
-            catalogClient->getDistLockManager()->lock(opCtx, nss.ns(), "dropCollection", waitFor));
+            DistLockManager::get(opCtx)->lock(opCtx, nss.ns(), "dropCollection", waitFor));
 
         ON_BLOCK_EXIT([opCtx, nss] {
             Grid::get(opCtx)->catalogCache()->invalidateCollectionEntry_LINEARIZABLE(nss);
@@ -171,7 +164,7 @@ private:
             // the config server, run the drop only against the config server unless the collection
             // is config.system.sessions, since no other collections whose primary shard is the
             // config server can have been sharded.
-            if (dbt.getPrimary() == ShardRegistry::kConfigServerShardId &&
+            if (dbt.getPrimary() == ShardId::kConfigServerId &&
                 nss != NamespaceString::kLogicalSessionsNamespace) {
                 auto cmdDropResult =
                     uassertStatusOK(Grid::get(opCtx)

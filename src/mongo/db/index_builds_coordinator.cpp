@@ -268,10 +268,10 @@ void logFailure(Status status,
                 const NamespaceString& nss,
                 std::shared_ptr<ReplIndexBuildState> replState) {
     LOGV2(20649,
-          "Index build failed",
+          "Index build: failed",
           "buildUUID"_attr = replState->buildUUID,
-          "namespace"_attr = nss,
-          "uuid"_attr = replState->collectionUUID,
+          "collectionUUID"_attr = replState->collectionUUID,
+          logAttrs(nss),
           "error"_attr = status);
 }
 
@@ -393,11 +393,6 @@ bool isIndexBuildResumable(OperationContext* opCtx,
         return false;
     }
 
-    // TODO(SERVER-50479): Remove this check when resumable index builds work with ESE in GCM mode.
-    if (EncryptionHooks::get(opCtx->getServiceContext())->enabled()) {
-        return false;
-    }
-
     if (!opCtx->getServiceContext()->getStorageEngine()->supportsResumableIndexBuilds()) {
         return false;
     }
@@ -418,8 +413,7 @@ bool isIndexBuildResumable(OperationContext* opCtx,
         auto swCommitQuorum = indexbuildentryhelpers::getCommitQuorum(opCtx, replState.buildUUID);
         if (!swCommitQuorum.isOK()) {
             LOGV2(5044600,
-                  "Index build: cannot read commit quorum from config db. "
-                  "Index build will not be resumable.",
+                  "Index build: cannot read commit quorum from config db, will not be resumable",
                   "buildUUID"_attr = replState.buildUUID,
                   "error"_attr = swCommitQuorum.getStatus());
             return false;
@@ -559,8 +553,6 @@ Status IndexBuildsCoordinator::_startIndexBuildForRecovery(OperationContext* opC
             if (!DurableCatalog::get(opCtx)->isIndexPresent(
                     opCtx, collection->getCatalogId(), indexNames[i])) {
                 LOGV2(20652,
-                      "The index for build {buildUUID} was not found while trying to drop the "
-                      "index during recovery: {index}",
                       "An index was not found in the catalog while trying to drop the index during "
                       "recovery",
                       "buildUUID"_attr = buildUUID,
@@ -706,13 +698,6 @@ Status IndexBuildsCoordinator::_setUpResumeIndexBuild(OperationContext* opCtx,
     status = _indexBuildsManager.setUpIndexBuild(
         opCtx, collection, specs, buildUUID, MultiIndexBlock::kNoopOnInitFn, options, resumeInfo);
     if (!status.isOK()) {
-        LOGV2(4841705,
-              "Failed to resume index build",
-              "buildUUID"_attr = buildUUID,
-              logAttrs(collection->ns()),
-              "collectionUUID"_attr = collectionUUID,
-              "error"_attr = status);
-
         activeIndexBuilds.unregisterIndexBuild(&_indexBuildsManager, replIndexBuildState);
     }
 
@@ -870,6 +855,12 @@ void IndexBuildsCoordinator::applyCommitIndexBuild(OperationContext* opCtx,
 
     updateCurOpForCommitOrAbort(opCtx, kCommitIndexBuildFieldName, buildUUID);
 
+    // If this node's replica set config uses buildIndexes:false, then do not attempt to commit an
+    // index that would have never been started.
+    if (!repl::ReplicationCoordinator::get(opCtx)->buildsIndexes()) {
+        return;
+    }
+
     uassert(31417,
             str::stream()
                 << "No commit timestamp set while applying commitIndexBuild operation. Build UUID: "
@@ -987,8 +978,6 @@ boost::optional<UUID> IndexBuildsCoordinator::abortIndexBuildByIndexNames(
         }
 
         LOGV2(23880,
-              "About to abort index builder: {buildUUID} on collection: "
-              "{collectionUUID}. First index: {firstIndex}",
               "About to abort index builder",
               "buildUUID"_attr = replState->buildUUID,
               "collectionUUID"_attr = collectionUUID,
@@ -1049,7 +1038,6 @@ bool IndexBuildsCoordinator::abortIndexBuildByBuildUUID(OperationContext* opCtx,
         auto replStateResult = _getIndexBuild(buildUUID);
         if (!replStateResult.isOK()) {
             LOGV2(20656,
-                  "ignoring error while aborting index build {buildUUID}: {error}",
                   "Ignoring error while aborting index build",
                   "buildUUID"_attr = buildUUID,
                   "error"_attr = replStateResult.getStatus());
@@ -1368,11 +1356,9 @@ void IndexBuildsCoordinator::restartIndexBuildsForRecovery(
 
         LOGV2(4841700,
               "Index build: resuming",
-              logAttrs(nss.get()),
-              "collectionUUID"_attr = collUUID,
               "buildUUID"_attr = buildUUID,
-              "specs"_attr = indexSpecs,
-              "phase"_attr = IndexBuildPhase_serializer(resumeInfo.getPhase()),
+              "collectionUUID"_attr = collUUID,
+              logAttrs(nss.get()),
               "details"_attr = resumeInfo.toBSON());
 
         try {
@@ -1383,8 +1369,10 @@ void IndexBuildsCoordinator::restartIndexBuildsForRecovery(
             successfullyResumed.insert(buildUUID);
         } catch (const DBException& e) {
             LOGV2(4841701,
-                  "Failed to resume index build, restarting instead",
+                  "Index build: failed to resume, restarting instead",
                   "buildUUID"_attr = buildUUID,
+                  "collectionUUID"_attr = collUUID,
+                  logAttrs(*nss),
                   "error"_attr = e);
 
             // Clean up the persisted Sorter data since resuming failed.
@@ -1394,9 +1382,11 @@ void IndexBuildsCoordinator::restartIndexBuildsForRecovery(
                 }
 
                 LOGV2(5043100,
-                      "Removing resumable index build temp file",
-                      "file"_attr = index.getFileName(),
-                      "buildUUID"_attr = buildUUID);
+                      "Index build: removing resumable temp file",
+                      "buildUUID"_attr = buildUUID,
+                      "collectionUUID"_attr = collUUID,
+                      logAttrs(*nss),
+                      "file"_attr = index.getFileName());
 
                 boost::system::error_code ec;
                 boost::filesystem::remove(
@@ -1404,9 +1394,11 @@ void IndexBuildsCoordinator::restartIndexBuildsForRecovery(
 
                 if (ec) {
                     LOGV2(5043101,
-                          "Failed to remove resumable index build temp file",
-                          "file"_attr = index.getFileName(),
+                          "Index build: failed to remove resumable temp file",
                           "buildUUID"_attr = buildUUID,
+                          "collectionUUID"_attr = collUUID,
+                          logAttrs(*nss),
+                          "file"_attr = index.getFileName(),
                           "error"_attr = ec.message());
                 }
             }
@@ -1424,9 +1416,9 @@ void IndexBuildsCoordinator::restartIndexBuildsForRecovery(
 
         LOGV2(20660,
               "Index build: restarting",
-              logAttrs(nss.get()),
+              "buildUUID"_attr = buildUUID,
               "collectionUUID"_attr = build.collUUID,
-              "buildUUID"_attr = buildUUID);
+              logAttrs(nss.get()));
         IndexBuildsCoordinator::IndexBuildOptions indexBuildOptions;
         // Indicate that the initialization should not generate oplog entries or timestamps for the
         // first catalog write, and that the original durable catalog entries should be dropped and
@@ -2079,13 +2071,26 @@ void IndexBuildsCoordinator::_runIndexBuildInner(
         return;
     }
 
-    {
-        // If the index build has already been cleaned-up because it encountered an error at
-        // commit-time, there is no work to do. This is the most routine case, since index
-        // constraint checking happens at commit-time for index builds.
-        if (replState->isAborted()) {
-            uassertStatusOK(status);
+    if (status.code() == ErrorCodes::IndexBuildAborted) {
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        auto& collector = ResourceConsumption::MetricsCollector::get(opCtx);
+
+        // Only report metrics for index builds on primaries. We are being aborted by an external
+        // thread, thus we can assume it is holding the RSTL while waiting for us to exit.
+        bool wasCollecting = collector.endScopedCollecting();
+        bool isPrimary = replCoord->canAcceptWritesFor_UNSAFE(
+            opCtx, {replState->dbName, replState->collectionUUID});
+        if (isPrimary && wasCollecting && ResourceConsumption::isMetricsAggregationEnabled()) {
+            ResourceConsumption::get(opCtx).merge(
+                opCtx, collector.getDbName(), collector.getMetrics());
         }
+    }
+
+    // If the index build has already been cleaned-up because it encountered an error at
+    // commit-time, there is no work to do. This is the most routine case, since index
+    // constraint checking happens at commit-time for index builds.
+    if (replState->isAborted()) {
+        uassertStatusOK(status);
     }
 
     // We do not hold a collection lock here, but we are protected against the collection being
@@ -2192,6 +2197,7 @@ void IndexBuildsCoordinator::_awaitLastOpTimeBeforeInterceptorsMajorityCommitted
     LOGV2(4847600,
           "Index build: waiting for last optime before interceptors to be majority committed",
           "buildUUID"_attr = replState->buildUUID,
+          "collectionUUID"_attr = replState->collectionUUID,
           "deadline"_attr = deadline,
           "timeout"_attr = timeout,
           "lastOpTime"_attr = lastOpTimeBeforeInterceptors);
@@ -2219,8 +2225,9 @@ void IndexBuildsCoordinator::_awaitLastOpTimeBeforeInterceptorsMajorityCommitted
         replState->clearLastOpTimeBeforeInterceptors();
         LOGV2(5053900,
               "Index build: timed out waiting for the last optime before interceptors to be "
-              "majority committed. Continuing as a non-resumable index build.",
+              "majority committed, continuing as a non-resumable index build",
               "buildUUID"_attr = replState->buildUUID,
+              "collectionUUID"_attr = replState->collectionUUID,
               "deadline"_attr = deadline,
               "timeout"_attr = timeout,
               "lastOpTime"_attr = lastOpTimeBeforeInterceptors,
@@ -2450,13 +2457,9 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
     // While we are still holding the RSTL and before returning, ensure the metrics collected for
     // this index build are attributed to the primary that commits or aborts the index build.
     auto metricsGuard = makeGuard([&]() {
-        if (!isPrimary) {
-            return;
-        }
-
         auto& collector = ResourceConsumption::MetricsCollector::get(opCtx);
         bool wasCollecting = collector.endScopedCollecting();
-        if (!wasCollecting || !ResourceConsumption::isMetricsAggregationEnabled()) {
+        if (!isPrimary || !wasCollecting || !ResourceConsumption::isMetricsAggregationEnabled()) {
             return;
         }
 
@@ -2577,9 +2580,9 @@ IndexBuildsCoordinator::CommitResult IndexBuildsCoordinator::_insertKeysFromSide
     LOGV2(20663,
           "Index build: completed successfully",
           "buildUUID"_attr = replState->buildUUID,
-          "namespace"_attr = collection->ns(),
-          "uuid"_attr = replState->collectionUUID,
-          "indexesBuilt"_attr = replState->indexSpecs.size(),
+          "collectionUUID"_attr = replState->collectionUUID,
+          logAttrs(collection->ns()),
+          "indexesBuilt"_attr = replState->indexNames,
           "numIndexesBefore"_attr = replState->stats.numIndexesBefore,
           "numIndexesAfter"_attr = replState->stats.numIndexesAfter);
     return CommitResult::kSuccess;
@@ -2608,11 +2611,7 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::_runIndexReb
     indexCatalogStats.numIndexesBefore = getNumIndexesTotal(opCtx, collection.get());
 
     try {
-        LOGV2(20673,
-              "Index builds manager starting: {buildUUID}: {namespace}",
-              "Index builds manager starting",
-              "buildUUID"_attr = buildUUID,
-              logAttrs(nss));
+        LOGV2(20673, "Index builds manager starting", "buildUUID"_attr = buildUUID, logAttrs(nss));
 
         std::tie(numRecords, dataSize) =
             uassertStatusOK(_indexBuildsManager.startBuildingIndexForRecovery(
@@ -2640,9 +2639,6 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::_runIndexReb
         indexCatalogStats.numIndexesAfter = getNumIndexesTotal(opCtx, collection.get());
 
         LOGV2(20674,
-              "Index builds manager completed successfully: {buildUUID}: {namespace}. Index specs "
-              "requested: {indexSpecsRequested}. Indexes in catalog before build: "
-              "{numIndexesBefore}. Indexes in catalog after build: {numIndexesAfter}",
               "Index builds manager completed successfully",
               "buildUUID"_attr = buildUUID,
               logAttrs(nss),
@@ -2653,7 +2649,6 @@ StatusWith<std::pair<long long, long long>> IndexBuildsCoordinator::_runIndexReb
         status = ex.toStatus();
         invariant(status != ErrorCodes::IndexAlreadyExists);
         LOGV2(20675,
-              "Index builds manager failed: {buildUUID}: {namespace}: {error}",
               "Index builds manager failed",
               "buildUUID"_attr = buildUUID,
               logAttrs(nss),

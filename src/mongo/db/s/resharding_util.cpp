@@ -49,7 +49,7 @@
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/document_source_unwind.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/db/storage/write_unit_of_work.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
@@ -91,11 +91,7 @@ DonorShardEntry makeDonorShard(ShardId shardId,
                                boost::optional<Timestamp> minFetchTimestamp) {
     DonorShardEntry entry(shardId);
     entry.setState(donorState);
-    if (minFetchTimestamp) {
-        auto minFetchTimestampStruct = MinFetchTimestamp();
-        minFetchTimestampStruct.setMinFetchTimestamp(minFetchTimestamp);
-        entry.setMinFetchTimestampStruct(minFetchTimestampStruct);
-    }
+    emplaceMinFetchTimestampIfExists(entry, minFetchTimestamp);
     return entry;
 }
 
@@ -104,11 +100,7 @@ RecipientShardEntry makeRecipientShard(ShardId shardId,
                                        boost::optional<Timestamp> strictConsistencyTimestamp) {
     RecipientShardEntry entry(shardId);
     entry.setState(recipientState);
-    if (strictConsistencyTimestamp) {
-        auto strictConsistencyTimestampStruct = StrictConsistencyTimestamp();
-        strictConsistencyTimestampStruct.setStrictConsistencyTimestamp(strictConsistencyTimestamp);
-        entry.setStrictConsistencyTimestampStruct(strictConsistencyTimestampStruct);
-    }
+    emplaceStrictConsistencyTimestampIfExists(entry, strictConsistencyTimestamp);
     return entry;
 }
 
@@ -144,12 +136,17 @@ void tellShardsToRefresh(OperationContext* opCtx,
     }
 
     if (!requests.empty()) {
+        // The _flushRoutingTableCacheUpdatesWithWriteConcern command will fail with a
+        // QueryPlanKilled error response if the config.cache.chunks collection is dropped
+        // concurrently. The config.cache.chunks collection is dropped by the shard when it detects
+        // the sharded collection's epoch having changed. We use kIdempotentOrCursorInvalidated so
+        // the ARS automatically retries in that situation.
         AsyncRequestsSender ars(opCtx,
                                 executor,
                                 "admin",
                                 requests,
                                 ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-                                Shard::RetryPolicy::kIdempotent);
+                                Shard::RetryPolicy::kIdempotentOrCursorInvalidated);
 
         while (!ars.done()) {
             // Retrieve the responses and throw at the first failure.
@@ -264,52 +261,6 @@ void validateZones(const std::vector<mongo::BSONObj>& zones,
     checkForOverlappingZones(validZones);
 }
 
-std::unique_ptr<Pipeline, PipelineDeleter> createAggForReshardingOplogBuffer(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const boost::optional<ReshardingDonorOplogId>& resumeToken,
-    bool doAttachDocumentCursor) {
-    Pipeline::SourceContainer stages;
-
-    if (resumeToken) {
-        stages.emplace_back(DocumentSourceMatch::create(
-            BSON("_id" << BSON("$gt" << resumeToken->toBSON())), expCtx));
-    }
-
-    stages.emplace_back(DocumentSourceSort::create(expCtx, BSON("_id" << 1)));
-
-    BSONObjBuilder lookupBuilder;
-    lookupBuilder.append("from", expCtx->ns.coll());
-    lookupBuilder.append("let",
-                         BSON("preImageId" << BSON("clusterTime"
-                                                   << "$preImageOpTime.ts"
-                                                   << "ts"
-                                                   << "$preImageOpTime.ts")
-                                           << "postImageId"
-                                           << BSON("clusterTime"
-                                                   << "$postImageOpTime.ts"
-                                                   << "ts"
-                                                   << "$postImageOpTime.ts")));
-    lookupBuilder.append("as", kReshardingOplogPrePostImageOps);
-
-    BSONArrayBuilder lookupPipelineBuilder(lookupBuilder.subarrayStart("pipeline"));
-    lookupPipelineBuilder.append(
-        BSON("$match" << BSON(
-                 "$expr" << BSON("$in" << BSON_ARRAY("$_id" << BSON_ARRAY("$$preImageId"
-                                                                          << "$$postImageId"))))));
-    lookupPipelineBuilder.done();
-
-    BSONObj lookupBSON(BSON("" << lookupBuilder.obj()));
-    stages.emplace_back(DocumentSourceLookUp::createFromBson(lookupBSON.firstElement(), expCtx));
-
-    auto pipeline = Pipeline::create(std::move(stages), expCtx);
-    if (doAttachDocumentCursor) {
-        pipeline = expCtx->mongoProcessInterface->attachCursorSourceToPipeline(
-            pipeline.release(), false /* allowTargetingShards */);
-    }
-
-    return pipeline;
-}
-
 void createSlimOplogView(OperationContext* opCtx, Database* db) {
     writeConflictRetry(
         opCtx, "createReshardingSlimOplog", "local.system.resharding.slimOplogForGraphLookup", [&] {
@@ -344,18 +295,21 @@ void createSlimOplogView(OperationContext* opCtx, Database* db) {
 }
 
 BSONObj getSlimOplogPipeline() {
-    return BSON("$project" << BSON(
-                    "_id"
-                    << "$ts"
-                    << "op" << 1 << "o"
-                    << BSON("applyOps" << BSON("ui" << 1 << "destinedRecipient" << 1)) << "ts" << 1
-                    << "prevOpTime.ts"
-                    << BSON("$cond" << BSON("if" << BSON("$eq" << BSON_ARRAY(BSON("$type"
-                                                                                  << "$stmtId")
-                                                                             << "missing"))
-                                                 << "then"
-                                                 << "$prevOpTime.ts"
-                                                 << "else" << Timestamp::min()))));
+    return fromjson(
+        "{$project: {\
+            _id: '$ts',\
+            op: 1,\
+            o: {\
+                applyOps: {ui: 1, destinedRecipient: 1},\
+                abortTransaction: 1\
+            },\
+            ts: 1,\
+            'prevOpTime.ts': {$cond: {\
+                if: {$eq: [{$type: '$stmtId'}, 'missing']},\
+                then: '$prevOpTime.ts',\
+                else: Timestamp(0, 0)\
+            }}\
+        }}");
 }
 
 std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForResharding(
@@ -364,7 +318,6 @@ std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForReshard
     UUID collUUID,
     const ShardId& recipientShard,
     bool doesDonorOwnMinKeyChunk) {
-
     using Doc = Document;
     using Arr = std::vector<Value>;
     using V = Value;
@@ -541,6 +494,12 @@ std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForReshard
 boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
                                               const NamespaceString& sourceNss,
                                               const BSONObj& fullDocument) {
+    if (!ShardingState::get(opCtx)->enabled()) {
+        // Don't bother looking up the sharding state for the collection if the server isn't even
+        // running with sharding enabled. We know there couldn't possibly be any resharding fields.
+        return boost::none;
+    }
+
     auto css = CollectionShardingState::get(opCtx, sourceNss);
 
     auto reshardingKeyPattern =
@@ -580,7 +539,7 @@ bool isFinalOplog(const repl::OplogEntry& oplog) {
         return false;
     }
 
-    return o2Field->getField("type").valueStringDataSafe() == "reshardFinalOp"_sd;
+    return o2Field->getField("type").valueStringDataSafe() == kReshardFinalOpLogType;
 }
 
 bool isFinalOplog(const repl::OplogEntry& oplog, UUID reshardingUUID) {

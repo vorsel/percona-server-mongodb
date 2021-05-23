@@ -107,13 +107,18 @@ void IndexCatalogImpl::setCollection(Collection* collection) {
     _collection = collection;
 }
 
-
 Status IndexCatalogImpl::init(OperationContext* opCtx) {
     vector<string> indexNames;
     auto durableCatalog = DurableCatalog::get(opCtx);
     durableCatalog->getAllIndexes(opCtx, _collection->getCatalogId(), &indexNames);
     const bool replSetMemberInStandaloneMode =
         getReplSetMemberInStandaloneMode(opCtx->getServiceContext());
+
+    boost::optional<Timestamp> recoveryTs = boost::none;
+    if (auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+        storageEngine->supportsRecoveryTimestamp()) {
+        recoveryTs = storageEngine->getRecoveryTimestamp();
+    }
 
     for (size_t i = 0; i < indexNames.size(); i++) {
         const string& indexName = indexNames[i];
@@ -162,6 +167,13 @@ Status IndexCatalogImpl::init(OperationContext* opCtx) {
             auto flags = CreateIndexEntryFlags::kInitFromDisk | CreateIndexEntryFlags::kIsReady;
             IndexCatalogEntry* entry = createIndexEntry(opCtx, std::move(descriptor), flags);
             fassert(17340, entry->isReady(opCtx));
+
+            // When initializing indexes from disk, we conservatively set the minimumVisibleSnapshot
+            // to non _id indexes to the recovery timestamp. The _id index is left visible. It's
+            // assumed if the collection is visible, it's _id is valid to be used.
+            if (recoveryTs && !entry->descriptor()->isIdIndex()) {
+                entry->setMinimumVisibleSnapshot(recoveryTs.get());
+            }
         }
     }
 
@@ -440,7 +452,7 @@ IndexCatalogEntry* IndexCatalogImpl::createIndexEntry(OperationContext* opCtx,
 
     IndexDescriptor* desc = entry->descriptor();
     std::unique_ptr<SortedDataInterface> sdi =
-        engine->getEngine()->getGroupedSortedDataInterface(opCtx, ident, desc, entry->getPrefix());
+        engine->getEngine()->getSortedDataInterface(opCtx, ident, desc);
 
     std::unique_ptr<IndexAccessMethod> accessMethod =
         IndexAccessMethodFactory::get(opCtx)->make(entry.get(), std::move(sdi));
@@ -728,6 +740,12 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
     }
 
     if (IndexDescriptor::isIdIndexPattern(key)) {
+        if (nss.isTimeseriesBucketsCollection()) {
+            // Time-series collections have a clustered index on _id.
+            return Status(ErrorCodes::CannotCreateIndex,
+                          "cannot have an _id index on a time-series bucket collection");
+        }
+
         BSONElement uniqueElt = spec["unique"];
         if (uniqueElt && !uniqueElt.trueValue()) {
             return Status(ErrorCodes::CannotCreateIndex, "_id index cannot be non-unique");

@@ -91,7 +91,7 @@ protected:
 
     boost::intrusive_ptr<ExpressionContext> _expCtx;
 
-    boost::optional<AutoGetCollectionForRead> _autoColl;
+    boost::optional<AutoGetCollectionForReadMaybeLockFree> _autoColl;
     const IndexDescriptor* _mockGeoIndex;
 };
 
@@ -233,7 +233,7 @@ TEST_F(QueryStageNearTest, EmptyResults) {
     vector<BSONObj> mockData;
     WorkingSet workingSet;
 
-    AutoGetCollectionForRead autoColl(_opCtx, NamespaceString{kTestNamespace});
+    AutoGetCollectionForReadMaybeLockFree autoColl(_opCtx, NamespaceString{kTestNamespace});
     const auto& coll = autoColl.getCollection();
     ASSERT(coll);
 

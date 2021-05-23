@@ -67,6 +67,10 @@ static std::pair<TypeTags, Value> deserializeTagVal(BufReader& buf) {
             val = bitcastFrom<bool>(buf.read<char>());
             break;
         case TypeTags::Null:
+        case TypeTags::MinKey:
+        case TypeTags::MaxKey:
+        case TypeTags::bsonUndefined:
+            val = 0;
             break;
         case TypeTags::StringSmall:
         case TypeTags::StringBig:
@@ -126,19 +130,12 @@ static std::pair<TypeTags, Value> deserializeTagVal(BufReader& buf) {
             val = objIdVal;
             break;
         }
-        case TypeTags::bsonObject: {
-            auto size = buf.peek<LittleEndian<uint32_t>>();
-            auto bson = new uint8_t[size];
-            memcpy(bson, buf.skip(size), size);
-            val = bitcastFrom<uint8_t*>(bson);
-            break;
-        }
+        case TypeTags::bsonObject:
         case TypeTags::bsonArray: {
             auto size = buf.peek<LittleEndian<uint32_t>>();
-            auto arr = new uint8_t[size];
-            memcpy(arr, buf.skip(size), size);
-            val = bitcastFrom<uint8_t*>(arr);
-            break;
+            auto buffer = UniqueBuffer::allocate(size);
+            memcpy(buffer.get(), buf.skip(size), size);
+            return {tag, bitcastFrom<char*>(buffer.release())};
         }
         case TypeTags::bsonBinData: {
             auto binDataSize = buf.peek<LittleEndian<uint32_t>>();
@@ -205,6 +202,12 @@ static void serializeTagValue(BufBuilder& buf, TypeTags tag, Value val) {
             buf.appendNum(static_cast<char>(bitcastTo<bool>(val)));
             break;
         case TypeTags::Null:
+            break;
+        case TypeTags::MinKey:
+            break;
+        case TypeTags::MaxKey:
+            break;
+        case TypeTags::bsonUndefined:
             break;
         case TypeTags::StringSmall:
         case TypeTags::StringBig:
@@ -303,6 +306,9 @@ static int getApproximateSize(TypeTags tag, Value val) {
         case TypeTags::Boolean:
         case TypeTags::StringSmall:
         case TypeTags::RecordId:
+        case TypeTags::MinKey:
+        case TypeTags::MaxKey:
+        case TypeTags::bsonUndefined:
             break;
         // There are deep types.
         case TypeTags::NumberDecimal:
@@ -310,8 +316,7 @@ static int getApproximateSize(TypeTags tag, Value val) {
             break;
         case TypeTags::StringBig:
         case TypeTags::bsonString: {
-            auto sv = getStringView(tag, val);
-            result += sv.size();
+            result += sizeof(uint32_t) + getStringLength(tag, val) + sizeof(char);
             break;
         }
         case TypeTags::Array: {

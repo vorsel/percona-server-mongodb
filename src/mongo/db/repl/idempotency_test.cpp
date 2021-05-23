@@ -134,7 +134,7 @@ BSONObj RandomizedIdempotencyTest::getDoc() {
 }
 
 std::vector<OplogEntry> RandomizedIdempotencyTest::createUpdateSequence(
-    const UpdateSequenceGenerator& generator, size_t length) {
+    const UpdateSequenceGenerator& generator, const size_t length) {
     // for each document enumerated & inserted generate a sequence of updates to apply to it.
     std::vector<OplogEntry> updateSequence;
     updateSequence.reserve(length);
@@ -163,7 +163,7 @@ std::string RandomizedIdempotencyTest::getStatesString(const std::vector<Collect
         } else {
             firstIter = false;
         }
-        sb << op.toString();
+        sb << op.toStringForLogging();
     }
     sb << " ]\n";
 

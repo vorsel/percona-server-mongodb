@@ -34,7 +34,9 @@
 #include <algorithm>
 
 #include "mongo/base/string_data.h"
+#include "mongo/db/catalog/collection_options_validation.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/commands/create_gen.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/idl/command_generic_argument.h"
@@ -136,7 +138,7 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
                 return {ErrorCodes::TypeMismatch, "'storageEngine' must be a document"};
             }
 
-            auto status = create_command_validation::validateStorageEngineOptions(e.Obj());
+            auto status = collection_options_validation::validateStorageEngineOptions(e.Obj());
             if (!status.isOK()) {
                 return status;
             }
@@ -164,13 +166,23 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
                 return Status(ErrorCodes::BadValue, "'validationAction' has to be a string.");
             }
 
-            collectionOptions.validationAction = e.String();
+            try {
+                collectionOptions.validationAction =
+                    ValidationAction_parse({"validationAction"}, e.String());
+            } catch (const DBException& exc) {
+                return exc.toStatus();
+            }
         } else if (fieldName == "validationLevel") {
             if (e.type() != mongo::String) {
                 return Status(ErrorCodes::BadValue, "'validationLevel' has to be a string.");
             }
 
-            collectionOptions.validationLevel = e.String();
+            try {
+                collectionOptions.validationLevel =
+                    ValidationLevel_parse({"validationLevel"}, e.String());
+            } catch (const DBException& exc) {
+                return exc.toStatus();
+            }
         } else if (fieldName == "collation") {
             if (e.type() != mongo::Object) {
                 return Status(ErrorCodes::BadValue, "'collation' has to be a document.");
@@ -233,9 +245,11 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
     return collectionOptions;
 }
 
-CollectionOptions CollectionOptions::parse(const CreateCommand& cmd) {
+CollectionOptions CollectionOptions::fromCreateCommand(const CreateCommand& cmd) {
     CollectionOptions options;
 
+    options.validationLevel = cmd.getValidationLevel();
+    options.validationAction = cmd.getValidationAction();
     options.capped = cmd.getCapped();
     if (auto size = cmd.getSize()) {
         options.cappedSize = adjustCappedSize(*size);
@@ -255,12 +269,6 @@ CollectionOptions CollectionOptions::parse(const CreateCommand& cmd) {
     if (auto validator = cmd.getValidator()) {
         options.validator = std::move(*validator);
     }
-    if (auto validationLevel = cmd.getValidationLevel()) {
-        options.validationLevel = validationLevel->toString();
-    }
-    if (auto validationAction = cmd.getValidationAction()) {
-        options.validationAction = validationAction->toString();
-    }
     if (auto indexOptionDefaults = cmd.getIndexOptionDefaults()) {
         options.indexOptionDefaults = std::move(*indexOptionDefaults);
     }
@@ -275,7 +283,7 @@ CollectionOptions CollectionOptions::parse(const CreateCommand& cmd) {
         options.pipeline = std::move(builder.arr());
     }
     if (auto collation = cmd.getCollation()) {
-        options.collation = std::move(*collation);
+        options.collation = collation->toBSON();
     }
     if (auto recordPreImages = cmd.getRecordPreImages()) {
         options.recordPreImages = *recordPreImages;
@@ -331,12 +339,12 @@ void CollectionOptions::appendBSON(BSONObjBuilder* builder) const {
         builder->append("validator", validator);
     }
 
-    if (!validationLevel.empty()) {
-        builder->append("validationLevel", validationLevel);
+    if (validationLevel) {
+        builder->append("validationLevel", ValidationLevel_serializer(*validationLevel));
     }
 
-    if (!validationAction.empty()) {
-        builder->append("validationAction", validationAction);
+    if (validationAction) {
+        builder->append("validationAction", ValidationAction_serializer(*validationAction));
     }
 
     if (!collation.isEmpty()) {

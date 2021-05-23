@@ -276,7 +276,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                     2,
                     "Updating rollback FixUpInfo for nested applyOps oplog entry: {oplogEntry}",
                     "Updating rollback FixUpInfo for nested applyOps oplog entry",
-                    "oplogEntry"_attr = redact(oplogEntry.toBSON()));
+                    "oplogEntry"_attr = redact(oplogEntry.toBSONForLogging()));
     }
 
     // Extract the op's collection namespace and UUID.
@@ -288,13 +288,13 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
 
     if (oplogEntry.getNss().isEmpty()) {
         throw RSFatalException(str::stream() << "Local op on rollback has no ns: "
-                                             << redact(oplogEntry.toBSON()));
+                                             << redact(oplogEntry.toBSONForLogging()));
     }
 
     auto obj = oplogEntry.getOperationToApply();
     if (obj.isEmpty()) {
         throw RSFatalException(str::stream() << "Local op on rollback has no object field: "
-                                             << redact(oplogEntry.toBSON()));
+                                             << redact(oplogEntry.toBSONForLogging()));
     }
 
     // If the operation being rolled back has a txnNumber, then the corresponding entry in the
@@ -320,7 +320,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
             throw RSFatalException(
                 str::stream() << NamespaceString::kSessionTransactionsTableNamespace.ns()
                               << " does not have a UUID, but local op has a transaction number: "
-                              << redact(oplogEntry.toBSON()));
+                              << redact(oplogEntry.toBSONForLogging()));
         }
         if (oplogEntry.isPartialTransaction()) {
             // If this is a transaction which did not commit, we need do nothing more than
@@ -397,7 +397,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                                          "Missing index name in dropIndexes operation on rollback, "
                                          "document: {oplogEntry}",
                                          "Missing index name in dropIndexes operation on rollback",
-                                         "oplogEntry"_attr = redact(oplogEntry.toBSON()));
+                                         "oplogEntry"_attr = redact(oplogEntry.toBSONForLogging()));
                     throw RSFatalException(
                         "Missing index name in dropIndexes operation on rollback.");
                 }
@@ -438,7 +438,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
                         "Missing index name in createIndexes operation on rollback, "
                         "document: {oplogEntry}",
                         "Missing index name in createIndexes operation on rollback",
-                        "oplogEntry"_attr = redact(oplogEntry.toBSON()));
+                        "oplogEntry"_attr = redact(oplogEntry.toBSONForLogging()));
                     throw RSFatalException(
                         "Missing index name in createIndexes operation on rollback.");
                 }
@@ -791,7 +791,7 @@ Status rollback_internal::updateFixUpInfoFromLocalOplogEntry(OperationContext* o
         LOGV2_FATAL_CONTINUE(21737,
                              message,
                              "namespace"_attr = nss.ns(),
-                             "oplogEntry"_attr = redact(oplogEntry.toBSON()));
+                             "oplogEntry"_attr = redact(oplogEntry.toBSONForLogging()));
         throw RSFatalException(str::stream() << message << ". ns: " << nss.ns());
     }
     fixUpInfo.docsToRefetch.insert(doc);
@@ -1318,7 +1318,6 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
 
     // UUID -> doc id -> doc
     stdx::unordered_map<UUID, std::map<DocID, BSONObj>, UUID::Hash> goodVersions;
-    auto catalog = CollectionCatalog::get(opCtx);
 
     // Fetches all the goodVersions of each document from the current sync source.
     unsigned long long numFetched = 0;
@@ -1329,7 +1328,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         invariant(!doc._id.eoo());  // This is checked when we insert to the set.
 
         UUID uuid = doc.uuid;
-        boost::optional<NamespaceString> nss = catalog->lookupNSSByUUID(opCtx, uuid);
+        boost::optional<NamespaceString> nss =
+            CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, uuid);
 
         try {
             if (nss) {
@@ -1479,7 +1479,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
                                fixUpInfo.indexBuildsToRestart.end(),
                                [&](auto build) { return build.second.collUUID == uuid; }));
 
-        boost::optional<NamespaceString> nss = catalog->lookupNSSByUUID(opCtx, uuid);
+        boost::optional<NamespaceString> nss =
+            CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, uuid);
         // Do not attempt to acquire the database lock with an empty namespace. We should survive
         // an attempt to drop a non-existent collection.
         if (!nss) {
@@ -1556,7 +1557,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         // occurs and then the collection is dropped. If we do not first re-create the
         // collection, we will not be able to retrieve the collection's catalog entries.
         for (auto uuid : fixUpInfo.collectionsToResyncMetadata) {
-            boost::optional<NamespaceString> nss = catalog->lookupNSSByUUID(opCtx, uuid);
+            boost::optional<NamespaceString> nss =
+                CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, uuid);
             invariant(nss);
 
             LOGV2(21702,
@@ -1686,7 +1688,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         unique_ptr<RemoveSaver> removeSaver;
         invariant(!fixUpInfo.collectionsToDrop.count(uuid));
 
-        boost::optional<NamespaceString> nss = catalog->lookupNSSByUUID(opCtx, uuid);
+        boost::optional<NamespaceString> nss =
+            CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, uuid);
         if (!nss) {
             nss = NamespaceString();
         }
@@ -1946,7 +1949,8 @@ void rollback_internal::syncFixUp(OperationContext* opCtx,
         Lock::DBLock oplogDbLock(opCtx, oplogNss.db(), MODE_IX);
         Lock::CollectionLock oplogCollectionLoc(opCtx, oplogNss, MODE_X);
         OldClientContext ctx(opCtx, oplogNss.ns());
-        auto oplogCollection = catalog->lookupCollectionByNamespace(opCtx, oplogNss);
+        auto oplogCollection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, oplogNss);
         if (!oplogCollection) {
             fassertFailedWithStatusNoTrace(
                 40495,

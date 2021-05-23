@@ -275,6 +275,7 @@ jsTestOptions = function() {
                 : true,
             setParameters: TestData.setParameters,
             setParametersMongos: TestData.setParametersMongos,
+            setParametersMongocryptd: TestData.setParametersMongocryptd,
             storageEngine: TestData.storageEngine,
             storageEngineCacheSizeGB: TestData.storageEngineCacheSizeGB,
             transportLayer: TestData.transportLayer,
@@ -1588,7 +1589,8 @@ rs.add = function(hostport, arb) {
         if (res.ok) {
             return true;
         }
-        if (res.code === ErrorCodes.ConfigurationInProgress) {
+        if (res.code === ErrorCodes.ConfigurationInProgress ||
+            res.code === ErrorCodes.CurrentConfigNotCommittedYet) {
             return false;  // keep retrying
         }
         if (res.code === ErrorCodes.NewReplicaSetConfigurationIncompatible) {

@@ -138,6 +138,8 @@ namespace {
 MONGO_FAIL_POINT_DEFINE(WTPreserveSnapshotHistoryIndefinitely);
 MONGO_FAIL_POINT_DEFINE(WTSetOldestTSToStableTS);
 
+const std::string kPinOldestTimestampAtStartupName = "_wt_startup";
+
 }  // namespace
 
 bool WiredTigerFileVersion::shouldDowngrade(bool readOnly,
@@ -641,6 +643,35 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                            "recoveryTimestamp"_attr = _recoveryTimestamp);
     }
 
+    {
+        char buf[(2 * 8 /*bytes in hex*/) + 1 /*nul terminator*/];
+        int ret = _conn->query_timestamp(_conn, buf, "get=oldest");
+        if (ret != WT_NOTFOUND) {
+            invariantWTOK(ret);
+
+            std::uint64_t tmp;
+            fassert(5380107, NumberParser().base(16)(buf, &tmp));
+            LOGV2_FOR_RECOVERY(
+                5380106, 0, "WiredTiger oldestTimestamp", "oldestTimestamp"_attr = Timestamp(tmp));
+            // The oldest timestamp is set in WT. Only set the in-memory variable.
+            _oldestTimestamp.store(tmp);
+            setInitialDataTimestamp(Timestamp(tmp));
+        }
+    }
+
+    // If there's no recovery timestamp, MDB has not produced a consistent snapshot of
+    // data. `_oldestTimestamp` and `_initialDataTimestamp` are only meaningful when there's a
+    // consistent snapshot of data.
+    //
+    // Note, this code is defensive (i.e: protects against a theorized, unobserved case) and is
+    // primarily concerned with restarts of a process that was performing an eMRC=off rollback via
+    // refetch.
+    if (_recoveryTimestamp.isNull() && _oldestTimestamp.load() > 0) {
+        LOGV2_FOR_RECOVERY(5380108, 0, "There is an oldestTimestamp without a recoveryTimestamp");
+        _oldestTimestamp.store(0);
+        _initialDataTimestamp.store(0);
+    }
+
     _sessionCache.reset(new WiredTigerSessionCache(this));
 
     _sessionSweeper = std::make_unique<WiredTigerSessionSweeper>(_sessionCache.get());
@@ -652,8 +683,25 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
 
     if (!_readOnly && !_ephemeral) {
         if (!_recoveryTimestamp.isNull()) {
-            setInitialDataTimestamp(_recoveryTimestamp);
-            setOldestTimestamp(_recoveryTimestamp, false);
+            // If the oldest/initial data timestamps were unset (there was no persisted durable
+            // history), initialize them to the recovery timestamp.
+            if (_oldestTimestamp.load() == 0) {
+                setInitialDataTimestamp(_recoveryTimestamp);
+                // Communicate the oldest timestamp to WT.
+                setOldestTimestamp(_recoveryTimestamp, false);
+            }
+
+            // Pin the oldest timestamp prior to calling `setStableTimestamp` as that attempts to
+            // advance the oldest timestamp. We do this pinning to give features such as resharding
+            // an opportunity to re-pin the oldest timestamp after a restart. The assumptions this
+            // relies on are that:
+            //
+            // 1) The feature stores the desired pin timestamp in some local collection.
+            // 2) This temporary pinning lasts long enough for the catalog to be loaded and
+            //    accessed.
+            uassertStatusOK(pinOldestTimestamp(
+                kPinOldestTimestampAtStartupName, Timestamp(_oldestTimestamp.load()), false));
+
             setStableTimestamp(_recoveryTimestamp, false);
 
             _sessionCache->snapshotManager().setLastApplied(_recoveryTimestamp);
@@ -702,6 +750,7 @@ WiredTigerKVEngine::~WiredTigerKVEngine() {
 }
 
 void WiredTigerKVEngine::notifyStartupComplete() {
+    unpinOldestTimestamp(kPinOldestTimestampAtStartupName);
     WiredTigerUtil::notifyStartupComplete();
 }
 
@@ -827,6 +876,7 @@ void WiredTigerKVEngine::cleanShutdown() {
     }
 
     // these must be the last things we do before _conn->close();
+    haltOplogManager(/*oplogRecordStore=*/nullptr, /*shuttingDown=*/true);
     if (_sessionSweeper) {
         LOGV2(22318, "Shutting down session sweeper thread");
         _sessionSweeper->shutdown();
@@ -836,7 +886,8 @@ void WiredTigerKVEngine::cleanShutdown() {
                        2,
                        "Shutdown timestamps.",
                        "Stable Timestamp"_attr = Timestamp(_stableTimestamp.load()),
-                       "Initial Data Timestamp"_attr = Timestamp(_initialDataTimestamp.load()));
+                       "Initial Data Timestamp"_attr = Timestamp(_initialDataTimestamp.load()),
+                       "Oldest Timestamp"_attr = Timestamp(_oldestTimestamp.load()));
 
     _sizeStorer.reset();
     _sessionCache->shuttingDown();
@@ -2165,17 +2216,15 @@ void WiredTigerKVEngine::setSortedDataInterfaceExtraOptions(const std::string& o
     _indexOptions = options;
 }
 
-Status WiredTigerKVEngine::createGroupedRecordStore(OperationContext* opCtx,
-                                                    StringData ns,
-                                                    StringData ident,
-                                                    const CollectionOptions& options,
-                                                    KVPrefix prefix) {
+Status WiredTigerKVEngine::createRecordStore(OperationContext* opCtx,
+                                             StringData ns,
+                                             StringData ident,
+                                             const CollectionOptions& options) {
     _ensureIdentPath(ident);
     WiredTigerSession session(_conn);
 
-    const bool prefixed = prefix.isPrefixed();
-    StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
-        _canonicalName, ns, options, _rsOptions, prefixed);
+    StatusWith<std::string> result =
+        WiredTigerRecordStore::generateCreateString(_canonicalName, ns, options, _rsOptions);
     if (!result.isOK()) {
         return result.getStatus();
     }
@@ -2251,7 +2300,7 @@ Status WiredTigerKVEngine::recoverOrphanedIdent(OperationContext* opCtx,
           "namespace"_attr = nss,
           "uuid"_attr = options.uuid);
 
-    status = createGroupedRecordStore(opCtx, nss.ns(), ident, options, KVPrefix::kNotPrefixed);
+    status = createRecordStore(opCtx, nss.ns(), ident, options);
     if (!status.isOK()) {
         return status;
     }
@@ -2295,12 +2344,10 @@ Status WiredTigerKVEngine::recoverOrphanedIdent(OperationContext* opCtx,
 #endif
 }
 
-std::unique_ptr<RecordStore> WiredTigerKVEngine::getGroupedRecordStore(
-    OperationContext* opCtx,
-    StringData ns,
-    StringData ident,
-    const CollectionOptions& options,
-    KVPrefix prefix) {
+std::unique_ptr<RecordStore> WiredTigerKVEngine::getRecordStore(OperationContext* opCtx,
+                                                                StringData ns,
+                                                                StringData ident,
+                                                                const CollectionOptions& options) {
 
     WiredTigerRecordStore::Params params;
     params.ns = ns;
@@ -2326,11 +2373,7 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::getGroupedRecordStore(
         params.cappedMaxDocs = options.cappedMaxDocs;
 
     std::unique_ptr<WiredTigerRecordStore> ret;
-    if (prefix == KVPrefix::kNotPrefixed) {
-        ret = std::make_unique<StandardWiredTigerRecordStore>(this, opCtx, params);
-    } else {
-        ret = std::make_unique<PrefixedWiredTigerRecordStore>(this, opCtx, params, prefix);
-    }
+    ret = std::make_unique<StandardWiredTigerRecordStore>(this, opCtx, params);
     ret->postConstructorInit(opCtx);
 
     // Sizes should always be checked when creating a collection during rollback or replication
@@ -2351,11 +2394,10 @@ string WiredTigerKVEngine::_uri(StringData ident) const {
     return kTableUriPrefix + ident.toString();
 }
 
-Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* opCtx,
-                                                            const CollectionOptions& collOptions,
-                                                            StringData ident,
-                                                            const IndexDescriptor* desc,
-                                                            KVPrefix prefix) {
+Status WiredTigerKVEngine::createSortedDataInterface(OperationContext* opCtx,
+                                                     const CollectionOptions& collOptions,
+                                                     StringData ident,
+                                                     const IndexDescriptor* desc) {
     _ensureIdentPath(ident);
 
     std::string collIndexOptions;
@@ -2371,7 +2413,7 @@ Status WiredTigerKVEngine::createGroupedSortedDataInterface(OperationContext* op
         : NamespaceString();
 
     StatusWith<std::string> result = WiredTigerIndex::generateCreateString(
-        _canonicalName, _indexOptions, collIndexOptions, ns, *desc, prefix.isPrefixed());
+        _canonicalName, _indexOptions, collIndexOptions, ns, *desc);
     if (!result.isOK()) {
         return result.getStatus();
     }
@@ -2405,20 +2447,20 @@ Status WiredTigerKVEngine::importSortedDataInterface(OperationContext* opCtx,
     return wtRCToStatus(WiredTigerIndex::Create(opCtx, _uri(ident), config));
 }
 
-Status WiredTigerKVEngine::dropGroupedSortedDataInterface(OperationContext* opCtx,
-                                                          StringData ident) {
+Status WiredTigerKVEngine::dropSortedDataInterface(OperationContext* opCtx, StringData ident) {
     return wtRCToStatus(WiredTigerIndex::Drop(opCtx, _uri(ident)));
 }
 
-std::unique_ptr<SortedDataInterface> WiredTigerKVEngine::getGroupedSortedDataInterface(
-    OperationContext* opCtx, StringData ident, const IndexDescriptor* desc, KVPrefix prefix) {
+std::unique_ptr<SortedDataInterface> WiredTigerKVEngine::getSortedDataInterface(
+    OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) {
+    if (desc->isIdIndex()) {
+        return std::make_unique<WiredTigerIdIndex>(opCtx, _uri(ident), ident, desc, _readOnly);
+    }
     if (desc->unique()) {
-        return std::make_unique<WiredTigerIndexUnique>(
-            opCtx, _uri(ident), ident, desc, prefix, _readOnly);
+        return std::make_unique<WiredTigerIndexUnique>(opCtx, _uri(ident), ident, desc, _readOnly);
     }
 
-    return std::make_unique<WiredTigerIndexStandard>(
-        opCtx, _uri(ident), ident, desc, prefix, _readOnly);
+    return std::make_unique<WiredTigerIndexStandard>(opCtx, _uri(ident), ident, desc, _readOnly);
 }
 
 std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
@@ -2430,7 +2472,7 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
 
     CollectionOptions noOptions;
     StatusWith<std::string> swConfig = WiredTigerRecordStore::generateCreateString(
-        _canonicalName, "" /* internal table */, noOptions, _rsOptions, false /* prefixed */);
+        _canonicalName, "" /* internal table */, noOptions, _rsOptions);
     uassertStatusOK(swConfig.getStatus());
 
     std::string config = swConfig.getValue();
@@ -2853,7 +2895,6 @@ void WiredTigerKVEngine::setStableTimestamp(Timestamp stableTimestamp, bool forc
     // `CheckpointThread` is to transition it from a state of not taking any checkpoints, to
     // taking "stable checkpoints". In the transitioning case, it's imperative for the "stable
     // timestamp" to have first been communicated to WiredTiger.
-    using namespace fmt::literals;
     std::string stableTSConfigString;
     auto ts = stableTimestamp.asULL();
     if (force) {
@@ -2908,6 +2949,27 @@ void WiredTigerKVEngine::setOldestTimestamp(Timestamp newOldestTimestamp, bool f
         return;
     }
 
+    // This mutex is not intended to synchronize updates to the oldest timestamp, but to ensure that
+    // there are no races with pinning the oldest timestamp.
+    stdx::lock_guard<Latch> lock(_oldestTimestampPinRequestsMutex);
+    const Timestamp currOldestTimestamp = Timestamp(_oldestTimestamp.load());
+    for (auto it : _oldestTimestampPinRequests) {
+        invariant(it.second >= currOldestTimestamp);
+        newOldestTimestamp = std::min(newOldestTimestamp, it.second);
+    }
+
+    if (force) {
+        // Forcing the oldest timestamp backwards (e.g: eMRC=off rollback) to a value of T
+        // invalidates all snapshots > T. Components that register a pinned timestamp must
+        // synchronize with events that invalidate their snapshots, unpin themselves and either
+        // fail themselves, or reacquire a new snapshot after the rollback event.
+        //
+        // Forcing the oldest timestamp forward -- potentially past a pin request raises the
+        // question of whether the pin should be honored. For now we will invariant there is no pin,
+        // but the invariant can be relaxed if there's a use-case to support.
+        invariant(_oldestTimestampPinRequests.empty());
+    }
+
     if (force) {
         auto oldestTSConfigString =
             "force=true,oldest_timestamp={0:x},commit_timestamp={0:x}"_format(
@@ -2958,6 +3020,11 @@ Timestamp WiredTigerKVEngine::_calculateHistoryLagFromStableTimestamp(Timestamp 
         // The stable_timestamp is not far enough ahead of the oldest_timestamp for the
         // oldest_timestamp to be moved forward: the window is still too small.
         return Timestamp();
+    }
+
+    // The oldest timestamp cannot be set behind the `_initialDataTimestamp`.
+    if (calculatedOldestTimestamp.asULL() <= _initialDataTimestamp.load()) {
+        calculatedOldestTimestamp = Timestamp(_initialDataTimestamp.load());
     }
 
     return calculatedOldestTimestamp;
@@ -3182,6 +3249,53 @@ Timestamp WiredTigerKVEngine::getPinnedOplog() const {
     return Timestamp::min();
 }
 
+StatusWith<Timestamp> WiredTigerKVEngine::pinOldestTimestamp(
+    const std::string& requestingServiceName, Timestamp requestedTimestamp, bool roundUpIfTooOld) {
+    stdx::lock_guard<Latch> lock(_oldestTimestampPinRequestsMutex);
+    Timestamp oldest = getOldestTimestamp();
+    LOGV2(5380104,
+          "Pin oldest timestamp request",
+          "service"_attr = requestingServiceName,
+          "requestedTs"_attr = requestedTimestamp,
+          "roundUpIfTooOld"_attr = roundUpIfTooOld,
+          "currOldestTs"_attr = oldest);
+
+    if (requestedTimestamp < oldest) {
+        if (roundUpIfTooOld) {
+            requestedTimestamp = oldest;
+        } else {
+            return {ErrorCodes::SnapshotTooOld,
+                    "Requested timestamp: {} Current oldest timestamp: {}"_format(
+                        requestedTimestamp.toString(), oldest.toString())};
+        }
+    }
+
+    _oldestTimestampPinRequests[requestingServiceName] = requestedTimestamp;
+
+    return {requestedTimestamp};
+}
+
+void WiredTigerKVEngine::unpinOldestTimestamp(const std::string& requestingServiceName) {
+    stdx::lock_guard<Latch> lock(_oldestTimestampPinRequestsMutex);
+    auto it = _oldestTimestampPinRequests.find(requestingServiceName);
+    if (it == _oldestTimestampPinRequests.end()) {
+        LOGV2_WARNING(5380105,
+                      "The requested service had nothing to unpin",
+                      "service"_attr = requestingServiceName);
+        return;
+    }
+    LOGV2(5380103,
+          "Unpin oldest timestamp request",
+          "service"_attr = requestingServiceName,
+          "requestedTs"_attr = it->second);
+    _oldestTimestampPinRequests.erase(it);
+}
+
+std::map<std::string, Timestamp> WiredTigerKVEngine::getPinnedTimestampRequests() {
+    stdx::lock_guard<Latch> lock(_oldestTimestampPinRequestsMutex);
+    return _oldestTimestampPinRequests;
+}
+
 bool WiredTigerKVEngine::supportsReadConcernSnapshot() const {
     return true;
 }
@@ -3206,10 +3320,12 @@ void WiredTigerKVEngine::startOplogManager(OperationContext* opCtx,
     _oplogRecordStore = oplogRecordStore;
 }
 
-void WiredTigerKVEngine::haltOplogManager(WiredTigerRecordStore* oplogRecordStore) {
+void WiredTigerKVEngine::haltOplogManager(WiredTigerRecordStore* oplogRecordStore,
+                                          bool shuttingDown) {
     stdx::unique_lock<Latch> lock(_oplogManagerMutex);
-    // Halt visibility thread if the request match current
-    if (_oplogRecordStore == oplogRecordStore) {
+    // Halt the visibility thread if we're in shutdown or the request matches the current record
+    // store.
+    if (shuttingDown || _oplogRecordStore == oplogRecordStore) {
         _oplogManager->haltVisibilityThread();
         _oplogRecordStore = nullptr;
     }

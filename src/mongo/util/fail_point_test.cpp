@@ -39,11 +39,14 @@
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/thread.h"
+#include "mongo/unittest/thread_assertion_monitor.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/clock_source_mock.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/tick_source_mock.h"
 #include "mongo/util/time_support.h"
 
@@ -55,6 +58,13 @@ namespace stdx = mongo::stdx;
 
 namespace mongo_test {
 namespace {
+
+#if 0  // Uncomment this block to manually test the _valid flag operation
+extern FailPoint notYetFailPointTest;
+[[maybe_unused]] bool expectAnInvariantViolation = notYetFailPointTest.shouldFail();
+MONGO_FAIL_POINT_DEFINE(notYetFailPointTest);
+#endif
+
 // Used by tests in this file that need access to a failpoint that is a registered in the
 // FailPointRegistry.
 MONGO_FAIL_POINT_DEFINE(dummy2);
@@ -191,118 +201,54 @@ TEST(FailPoint, DisableAllFailpoints) {
     registry.disableAllFailpoints();
 }
 
-class FailPointStress : public mongo::unittest::Test {
-public:
-    void setUp() {
-        _fp = std::make_unique<FailPoint>("testFP");
-        _fp->setMode(FailPoint::alwaysOn, 0, BSON("a" << 44));
-    }
-
-    void tearDown() {
-        // Note: This can loop indefinitely if reference counter was off
-        _fp->setMode(FailPoint::off, 0, BSON("a" << 66));
-    }
-
-    void startTest() {
-        ASSERT_EQUALS(0U, _tasks.size());
-
-        _tasks.emplace_back(&FailPointStress::blockTask, this);
-        _tasks.emplace_back(&FailPointStress::blockWithExceptionTask, this);
-        _tasks.emplace_back(&FailPointStress::simpleTask, this);
-        _tasks.emplace_back(&FailPointStress::flipTask, this);
-    }
-
-    void stopTest() {
-        {
-            stdx::lock_guard<mongo::Latch> lk(_mutex);
-            _inShutdown = true;
-        }
-        for (auto& t : _tasks) {
-            t.join();
-        }
-        _tasks.clear();
-    }
-
-private:
-    void blockTask() {
-        while (true) {
-            _fp->execute([](const BSONObj& data) {
-                // Expanded ASSERT_EQUALS since the error is not being
-                // printed out properly
-                if (data["a"].numberInt() != 44) {
-                    using namespace mongo::literals;
-                    LOGV2_ERROR(24129,
-                                "blockTask thread detected anomaly - data: {data}",
-                                "blockTask thread detected anomaly",
-                                "data"_attr = data);
-                    ASSERT(false);
+TEST(FailPoint, Stress) {
+    mongo::unittest::ThreadAssertionMonitor monitor;
+    monitor
+        .spawnController([&] {
+            mongo::AtomicWord<bool> done{false};
+            FailPoint fp("testFP");
+            fp.setMode(FailPoint::alwaysOn, 0, BSON("a" << 44));
+            auto fpGuard =
+                mongo::makeGuard([&] { fp.setMode(FailPoint::off, 0, BSON("a" << 66)); });
+            std::vector<stdx::thread> tasks;
+            auto joinGuard = mongo::makeGuard([&] {
+                for (auto&& t : tasks)
+                    if (t.joinable())
+                        t.join();
+            });
+            auto launchLoop = [&](auto&& f) {
+                tasks.push_back(monitor.spawn([&, f] {
+                    while (!done.load())
+                        f();
+                }));
+            };
+            launchLoop([&] {
+                fp.execute([](const BSONObj& data) {
+                    ASSERT_EQ(data["a"].numberInt(), 44) << "blockTask" << data.toString();
+                });
+            });
+            launchLoop([&] {
+                try {
+                    fp.execute([](const BSONObj& data) {
+                        ASSERT_EQ(data["a"].numberInt(), 44)
+                            << "blockWithExceptionTask" << data.toString();
+                        throw std::logic_error("blockWithExceptionTask threw");
+                    });
+                } catch (const std::logic_error&) {
                 }
             });
-
-            stdx::lock_guard<mongo::Latch> lk(_mutex);
-            if (_inShutdown)
-                break;
-        }
-    }
-
-    void blockWithExceptionTask() {
-        while (true) {
-            try {
-                _fp->execute([](const BSONObj& data) {
-                    if (data["a"].numberInt() != 44) {
-                        using namespace mongo::literals;
-                        LOGV2_ERROR(24130,
-                                    "blockWithExceptionTask thread detected anomaly - data: {data}",
-                                    "blockWithExceptionTask thread detected anomaly",
-                                    "data"_attr = data);
-                        ASSERT(false);
-                    }
-
-                    throw std::logic_error("blockWithExceptionTask threw");
-                });
-            } catch (const std::logic_error&) {
-            }
-
-            stdx::lock_guard<mongo::Latch> lk(_mutex);
-            if (_inShutdown)
-                break;
-        }
-    }
-
-    void simpleTask() {
-        while (true) {
-            static_cast<void>(MONGO_unlikely(_fp->shouldFail()));
-            stdx::lock_guard<mongo::Latch> lk(_mutex);
-            if (_inShutdown)
-                break;
-        }
-    }
-
-    void flipTask() {
-        while (true) {
-            if (_fp->shouldFail()) {
-                _fp->setMode(FailPoint::off, 0);
-            } else {
-                _fp->setMode(FailPoint::alwaysOn, 0, BSON("a" << 44));
-            }
-
-            stdx::lock_guard<mongo::Latch> lk(_mutex);
-            if (_inShutdown)
-                break;
-        }
-    }
-
-    std::unique_ptr<FailPoint> _fp;
-    std::vector<stdx::thread> _tasks;
-
-    mongo::Mutex _mutex = MONGO_MAKE_LATCH();
-    bool _inShutdown = false;
-};
-
-TEST_F(FailPointStress, Basic) {
-    startTest();
-    mongo::sleepsecs(5);
-    stopTest();
+            launchLoop([&] { fp.shouldFail(); });
+            launchLoop([&] {
+                if (fp.shouldFail()) {
+                    fp.setMode(FailPoint::off, 0);
+                } else {
+                    fp.setMode(FailPoint::alwaysOn, 0, BSON("a" << 44));
+                }
+            });
+            mongo::sleepsecs(5);
+            done.store(true);
+        })
+        .join();
 }
 
 static void parallelFailPointTestThread(FailPoint* fp,
@@ -508,7 +454,7 @@ namespace mongo {
  * Runs the given function with an operation context that has a deadline and asserts that
  * the function is interruptible.
  */
-void assertFunctionInterruptable(std::function<void(Interruptible* interruptible)> f) {
+void assertFunctionInterruptible(std::function<void(Interruptible* interruptible)> f) {
     const auto service = ServiceContext::make();
     const std::shared_ptr<ClockSourceMock> mockClock = std::make_shared<ClockSourceMock>();
     service->setFastClockSource(std::make_unique<SharedClockSourceAdapter>(mockClock));
@@ -531,7 +477,7 @@ TEST(FailPoint, PauseWhileSetInterruptibility) {
     FailPoint failPoint("testFP");
     failPoint.setMode(FailPoint::alwaysOn);
 
-    assertFunctionInterruptable(
+    assertFunctionInterruptible(
         [&failPoint](Interruptible* interruptible) { failPoint.pauseWhileSet(interruptible); });
 
     failPoint.setMode(FailPoint::off);
@@ -541,7 +487,7 @@ TEST(FailPoint, WaitForFailPointTimeout) {
     FailPoint failPoint("testFP");
     failPoint.setMode(FailPoint::alwaysOn);
 
-    assertFunctionInterruptable([&failPoint](Interruptible* interruptible) {
+    assertFunctionInterruptible([&failPoint](Interruptible* interruptible) {
         failPoint.waitForTimesEntered(interruptible, 1);
     });
 

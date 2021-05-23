@@ -197,6 +197,7 @@ env.Library(
     target="authentication_commands",
     source=[
         'authentication_commands.cpp',
+        'authentication_commands.idl',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/audit',
@@ -275,6 +276,8 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/catalog/collection_options_idl',
+        '$BUILD_DIR/mongo/idl/basic_types',
         '$BUILD_DIR/mongo/idl/idl_parser',
     ],
 )
@@ -327,9 +330,11 @@ env.Library(
         '$BUILD_DIR/mongo/db/commands',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
+        '$BUILD_DIR/mongo/db/create_indexes_idl',
         '$BUILD_DIR/mongo/db/curop_failpoint_helpers',
         '$BUILD_DIR/mongo/db/index_builds_coordinator_interface',
         '$BUILD_DIR/mongo/db/ops/write_ops_exec',
+        '$BUILD_DIR/mongo/db/pipeline/aggregation_request_helper',
         '$BUILD_DIR/mongo/db/pipeline/process_interface/mongo_process_interface',
         '$BUILD_DIR/mongo/db/query/command_request_response',
         '$BUILD_DIR/mongo/db/query_exec',
@@ -343,6 +348,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/timeseries/bucket_catalog',
         '$BUILD_DIR/mongo/db/transaction',
         '$BUILD_DIR/mongo/db/views/views_mongod',
+        '$BUILD_DIR/mongo/executor/async_request_executor',
         '$BUILD_DIR/mongo/idl/feature_flag',
         '$BUILD_DIR/mongo/util/log_and_backoff',
         '$BUILD_DIR/mongo/util/net/http_client',
@@ -510,7 +516,6 @@ env.Library(
 env.Library(
     target='kill_common',
     source=[
-        'killcursors_common.cpp',
         'kill_op_cmd_base.cpp',
         'kill_operations.idl',
     ],
@@ -534,7 +539,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/namespace_string',
-        '$BUILD_DIR/mongo/db/pipeline/aggregation_request',
+        '$BUILD_DIR/mongo/db/pipeline/aggregation_request_helper',
         '$BUILD_DIR/mongo/db/query/command_request_response',
         '$BUILD_DIR/mongo/db/service_context',
         'test_commands_enabled'
@@ -653,6 +658,23 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/commands/standalone',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/unittest/unittest',
+    ],
+)
+
+env.CppUnitTest(
+    target="async_command_execution_test",
+    source=[
+        "async_command_execution_test.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/auth/authmocks",
+        "$BUILD_DIR/mongo/db/auth/authorization_manager_global",
+        "$BUILD_DIR/mongo/db/commands",
+        "$BUILD_DIR/mongo/db/commands/standalone",
+        "$BUILD_DIR/mongo/db/service_context_test_fixture",
+        "$BUILD_DIR/mongo/unittest/unittest",
+        "$BUILD_DIR/mongo/util/version_impl",
     ],
 )
 

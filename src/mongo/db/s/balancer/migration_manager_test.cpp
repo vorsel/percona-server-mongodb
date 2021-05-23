@@ -29,14 +29,12 @@
 
 #include "mongo/platform/basic.h"
 
-#include <memory>
-
 #include "mongo/db/commands.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/read_write_concern_defaults_cache_lookup_mock.h"
 #include "mongo/db/s/balancer/migration_manager.h"
 #include "mongo/db/s/balancer/migration_test_fixture.h"
-#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/s/request_types/move_chunk_request.h"
 
 namespace mongo {
@@ -117,7 +115,7 @@ TEST_F(MigrationManagerTest, OneCollectionTwoMigrations) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(2, 0, OID::gen());
+    ChunkVersion version(2, 0, OID::gen(), boost::none /* timestamp */);
 
     setUpDatabase(dbName, kShardId0);
     setUpCollection(collName, version);
@@ -175,8 +173,8 @@ TEST_F(MigrationManagerTest, TwoCollectionsTwoMigrationsEach) {
     std::string dbName = "foo";
     const NamespaceString collName1(dbName, "bar");
     const NamespaceString collName2(dbName, "baz");
-    ChunkVersion version1(2, 0, OID::gen());
-    ChunkVersion version2(2, 0, OID::gen());
+    ChunkVersion version1(2, 0, OID::gen(), boost::none /* timestamp */);
+    ChunkVersion version2(2, 0, OID::gen(), boost::none /* timestamp */);
 
     setUpDatabase(dbName, kShardId0);
     setUpCollection(collName1, version1);
@@ -252,7 +250,7 @@ TEST_F(MigrationManagerTest, SourceShardNotFound) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(2, 0, OID::gen());
+    ChunkVersion version(2, 0, OID::gen(), boost::none /* timestamp */);
 
     setUpDatabase(dbName, kShardId0);
     setUpCollection(collName, version);
@@ -309,7 +307,7 @@ TEST_F(MigrationManagerTest, JumboChunkResponseBackwardsCompatibility) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(2, 0, OID::gen());
+    ChunkVersion version(2, 0, OID::gen(), boost::none /* timestamp */);
 
     setUpDatabase(dbName, kShardId0);
     setUpCollection(collName, version);
@@ -354,7 +352,7 @@ TEST_F(MigrationManagerTest, InterruptMigration) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(2, 0, OID::gen());
+    ChunkVersion version(2, 0, OID::gen(), boost::none /* timestamp */);
 
     setUpDatabase(dbName, kShardId0);
     setUpCollection(collName, version);
@@ -450,7 +448,7 @@ TEST_F(MigrationManagerTest, RestartMigrationManager) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(2, 0, OID::gen());
+    ChunkVersion version(2, 0, OID::gen(), boost::none /* timestamp */);
 
     setUpDatabase(dbName, kShardId0);
     setUpCollection(collName, version);
@@ -501,7 +499,7 @@ TEST_F(MigrationManagerTest, MigrationRecovery) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(1, 0, OID::gen());
+    ChunkVersion version(1, 0, OID::gen(), boost::none /* timestamp */);
 
     setUpDatabase(dbName, kShardId0);
     setUpCollection(collName, version);
@@ -521,8 +519,7 @@ TEST_F(MigrationManagerTest, MigrationRecovery) {
     setUpMigration(chunk2, kShardId3.toString());
 
     // Mimic all config distlocks being released on config server stepup to primary.
-    auto distLockManager = catalogClient()->getDistLockManager();
-    distLockManager->unlockAll(operationContext(), distLockManager->getProcessID());
+    DistLockManager::get(operationContext())->unlockAll(operationContext());
 
     _migrationManager->startRecoveryAndAcquireDistLocks(operationContext());
 
@@ -556,7 +553,7 @@ TEST_F(MigrationManagerTest, FailMigrationRecovery) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(1, 0, OID::gen());
+    ChunkVersion version(1, 0, OID::gen(), boost::none /* timestamp */);
 
     setUpDatabase(dbName, kShardId0);
     setUpCollection(collName, version);
@@ -588,12 +585,11 @@ TEST_F(MigrationManagerTest, FailMigrationRecovery) {
     // Take the distributed lock for the collection, which should be released during recovery when
     // it fails. Any dist lock held by the config server will be released via proccessId, so the
     // session ID used here doesn't matter.
-    ASSERT_OK(catalogClient()->getDistLockManager()->lockWithSessionID(
-        operationContext(),
-        collName.ns(),
-        "MigrationManagerTest",
-        OID::gen(),
-        DistLockManager::kSingleLockAttemptTimeout));
+    ASSERT_OK(DistLockManager::get(operationContext())
+                  ->lockDirect(operationContext(),
+                               collName.ns(),
+                               "MigrationManagerTest",
+                               DistLockManager::kSingleLockAttemptTimeout));
 
     _migrationManager->startRecoveryAndAcquireDistLocks(operationContext());
     _migrationManager->finishRecovery(operationContext(), 0, kDefaultSecondaryThrottle);
@@ -615,7 +611,7 @@ TEST_F(MigrationManagerTest, RemoteCallErrorConversionToOperationFailed) {
     // Set up the database and collection as sharded in the metadata.
     const std::string dbName = "foo";
     const NamespaceString collName(dbName, "bar");
-    ChunkVersion version(1, 0, OID::gen());
+    ChunkVersion version(1, 0, OID::gen(), boost::none /* timestamp */);
 
     setUpDatabase(dbName, kShardId0);
     setUpCollection(collName, version);

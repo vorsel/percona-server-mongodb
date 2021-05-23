@@ -14,15 +14,29 @@ env.SConscript(
 )
 
 env.Library(
+    target='collection_options_idl',
+    source=[
+        'collection_options.idl',
+        'collection_options_validation.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
+)
+
+env.Library(
     target='collection_options',
     source=[
         'collection_options.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base',
+        'collection_options_idl',
+    ],
+    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/create_command',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface',
-        '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/idl/basic_types',
     ],
 )
 
@@ -493,6 +507,7 @@ env.CppUnitTest(
         'collection_options_test.cpp',
         'collection_test.cpp',
         'collection_validation_test.cpp',
+        'collection_writer_test.cpp',
         'commit_quorum_options_test.cpp',
         'create_collection_test.cpp',
         'database_test.cpp',
@@ -528,7 +543,6 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
-        '$BUILD_DIR/mongo/db/storage/kv/kv_prefix',
         '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger',
         '$BUILD_DIR/mongo/unittest/unittest',
         '$BUILD_DIR/mongo/util/clock_source_mock',

@@ -99,7 +99,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/collection_options',
         '$BUILD_DIR/mongo/db/common',
         '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/db/storage/kv/kv_prefix',
         ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/server_options',
@@ -515,12 +514,12 @@ env.Library(
         '$BUILD_DIR/mongo/db/index_names',
         '$BUILD_DIR/mongo/db/namespace_string',
         '$BUILD_DIR/mongo/db/storage/bson_collection_catalog_entry',
-        '$BUILD_DIR/mongo/db/storage/kv/kv_prefix',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/server_options_core',
+        '$BUILD_DIR/mongo/db/storage/storage_options'
     ],
 )
 
@@ -567,6 +566,7 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/catalog/catalog_control',
+        '$BUILD_DIR/mongo/db/catalog_raii',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/storage/durable_catalog_impl',
         '$BUILD_DIR/mongo/db/storage/kv/kv_drop_pending_ident_reaper',

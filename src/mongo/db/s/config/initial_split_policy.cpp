@@ -40,6 +40,7 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_util.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 
 namespace mongo {
 namespace {
@@ -87,7 +88,7 @@ StringMap<std::vector<ShardId>> buildTagsToShardIdsMap(OperationContext* opCtx,
                                              ShardType::ConfigNS,
                                              BSONObj(),
                                              BSONObj(),
-                                             0));
+                                             boost::none));
     uassert(50986, str::stream() << "Could not find any shard documents", !shardDocs.docs.empty());
 
     for (const auto& tag : tags) {
@@ -110,7 +111,13 @@ InitialSplitPolicy::ShardCollectionConfig createChunks(const ShardKeyPattern& sh
                                                        const std::vector<ShardId>& allShardIds,
                                                        std::vector<BSONObj>& finalSplitPoints,
                                                        const Timestamp& validAfter) {
-    ChunkVersion version(1, 0, OID::gen());
+    boost::optional<Timestamp> timestamp;
+    if (feature_flags::gShardingFullDDLSupportTimestampedVersion.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
+        timestamp = validAfter;
+    }
+
+    ChunkVersion version(1, 0, OID::gen(), timestamp);
     const auto& keyPattern(shardKeyPattern.getKeyPattern());
 
     std::vector<ChunkType> chunks;
@@ -277,9 +284,18 @@ std::unique_ptr<InitialSplitPolicy> InitialSplitPolicy::calculateOptimizationStr
 InitialSplitPolicy::ShardCollectionConfig SingleChunkOnPrimarySplitPolicy::createFirstChunks(
     OperationContext* opCtx, const ShardKeyPattern& shardKeyPattern, SplitPolicyParams params) {
     ShardCollectionConfig initialChunks;
-    ChunkVersion version(1, 0, OID::gen());
-    const auto& keyPattern = shardKeyPattern.getKeyPattern();
+
     const auto currentTime = VectorClock::get(opCtx)->getTime();
+    const auto clusterTime = currentTime.clusterTime().asTimestamp();
+
+    boost::optional<Timestamp> timestamp;
+    if (feature_flags::gShardingFullDDLSupportTimestampedVersion.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
+        timestamp = clusterTime;
+    }
+
+    ChunkVersion version(1, 0, OID::gen(), timestamp);
+    const auto& keyPattern = shardKeyPattern.getKeyPattern();
     appendChunk(params.nss,
                 params.collectionUUID,
                 keyPattern.globalMin(),
@@ -288,7 +304,7 @@ InitialSplitPolicy::ShardCollectionConfig SingleChunkOnPrimarySplitPolicy::creat
                 currentTime.clusterTime().asTimestamp(),
                 params.primaryShardId,
                 &initialChunks.chunks);
-    initialChunks.creationTime = currentTime.clusterTime().asTimestamp();
+    initialChunks.creationTime = clusterTime;
     return initialChunks;
 }
 
@@ -323,11 +339,8 @@ InitialSplitPolicy::ShardCollectionConfig UnoptimizedSplitPolicy::createFirstChu
 InitialSplitPolicy::ShardCollectionConfig SplitPointsBasedSplitPolicy::createFirstChunks(
     OperationContext* opCtx, const ShardKeyPattern& shardKeyPattern, SplitPolicyParams params) {
 
-    const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
-
     // On which shards are the generated chunks allowed to be placed.
-    std::vector<ShardId> shardIds;
-    shardRegistry->getAllShardIdsNoReload(&shardIds);
+    const auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload();
 
     const auto currentTime = VectorClock::get(opCtx)->getTime();
     return generateShardCollectionInitialChunks(params,
@@ -359,10 +372,7 @@ InitialSplitPolicy::ShardCollectionConfig AbstractTagsBasedSplitPolicy::createFi
     OperationContext* opCtx, const ShardKeyPattern& shardKeyPattern, SplitPolicyParams params) {
     invariant(!_tags.empty());
 
-    const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
-
-    std::vector<ShardId> shardIds;
-    shardRegistry->getAllShardIdsNoReload(&shardIds);
+    const auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload();
     const auto currentTime = VectorClock::get(opCtx)->getTime();
     const auto validAfter = currentTime.clusterTime().asTimestamp();
     const auto& keyPattern = shardKeyPattern.getKeyPattern();
@@ -373,7 +383,13 @@ InitialSplitPolicy::ShardCollectionConfig AbstractTagsBasedSplitPolicy::createFi
         return shardIds[indx++ % shardIds.size()];
     };
 
-    ChunkVersion version(1, 0, OID::gen());
+    boost::optional<Timestamp> timestamp;
+    if (feature_flags::gShardingFullDDLSupportTimestampedVersion.isEnabled(
+            serverGlobalParams.featureCompatibility)) {
+        timestamp = validAfter;
+    }
+
+    ChunkVersion version(1, 0, OID::gen(), timestamp);
     auto lastChunkMax = keyPattern.globalMin();
     std::vector<ChunkType> chunks;
     for (const auto& tag : _tags) {

@@ -78,9 +78,8 @@ public:
                                                            const std::string& ns) final {
         std::string ident = ns;
         std::string uri = WiredTigerKVEngine::kTableUriPrefix + ns;
-        const bool prefixed = false;
         StatusWith<std::string> result = WiredTigerRecordStore::generateCreateString(
-            kWiredTigerEngineName, ns, CollectionOptions(), "", prefixed);
+            kWiredTigerEngineName, ns, CollectionOptions(), "");
         ASSERT_TRUE(result.isOK());
         std::string config = result.getValue();
 
@@ -127,7 +126,6 @@ std::unique_ptr<RecoveryUnitHarnessHelper> makeWTRUHarnessHelper() {
 
 MONGO_INITIALIZER(RegisterHarnessFactory)(InitializerContext* const) {
     mongo::registerRecoveryUnitHarnessHelperFactory(makeWTRUHarnessHelper);
-    return Status::OK();
 }
 
 class WiredTigerRecoveryUnitTestFixture : public unittest::Test {

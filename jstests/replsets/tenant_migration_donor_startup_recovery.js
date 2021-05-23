@@ -18,10 +18,10 @@ load("jstests/replsets/libs/tenant_migration_test.js");
 const donorRst = new ReplSetTest({
     nodes: 1,
     name: 'donor',
-    nodeOptions: {
+    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor, {
         setParameter:
             {"failpoint.PrimaryOnlyServiceSkipRebuildingInstances": tojson({mode: "alwaysOn"})}
-    }
+    })
 });
 
 donorRst.startSet();
@@ -43,9 +43,9 @@ let configDonorsColl = donorPrimary.getCollection(TenantMigrationTest.kConfigDon
 // Force the migration to pause after entering a randomly selected state to simulate a failure.
 Random.setRandomSeed();
 const kMigrationFpNames = [
-    "pauseTenantMigrationAfterDataSync",
-    "pauseTenantMigrationAfterBlockingStarts",
-    "abortTenantMigrationAfterBlockingStarts"
+    "pauseTenantMigrationBeforeLeavingDataSyncState",
+    "pauseTenantMigrationBeforeLeavingBlockingState",
+    "abortTenantMigrationBeforeLeavingBlockingState"
 ];
 const index = Random.randInt(kMigrationFpNames.length + 1);
 if (index < kMigrationFpNames.length) {
@@ -102,13 +102,15 @@ if (donorDoc) {
             assert.soon(
                 () => bsonWoCompare(tenantMigrationTest
                                         .getTenantMigrationAccessBlocker(donorPrimary, kTenantId)
-                                        .commitOrAbortOpTime,
+                                        .commitOpTime,
                                     donorDoc.commitOrAbortOpTime) == 0);
             assert.soon(
                 () => bsonWoCompare(tenantMigrationTest
                                         .getTenantMigrationAccessBlocker(donorPrimary, kTenantId)
                                         .blockTimestamp,
                                     donorDoc.blockTimestamp) == 0);
+            assert.commandWorked(
+                tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
             break;
         case TenantMigrationTest.State.kAborted:
             assert.soon(
@@ -117,13 +119,15 @@ if (donorDoc) {
             assert.soon(
                 () => bsonWoCompare(tenantMigrationTest
                                         .getTenantMigrationAccessBlocker(donorPrimary, kTenantId)
-                                        .commitOrAbortOpTime,
+                                        .abortOpTime,
                                     donorDoc.commitOrAbortOpTime) == 0);
             assert.soon(
                 () => bsonWoCompare(tenantMigrationTest
                                         .getTenantMigrationAccessBlocker(donorPrimary, kTenantId)
                                         .blockTimestamp,
                                     donorDoc.blockTimestamp) == 0);
+            assert.commandWorked(
+                tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
             break;
         default:
             throw new Error(`Invalid state "${state}" from donor doc.`);

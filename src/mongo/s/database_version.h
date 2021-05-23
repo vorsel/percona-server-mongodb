@@ -45,7 +45,13 @@ namespace mongo {
  */
 class DatabaseVersion : private DatabaseVersionBase {
 public:
+    // Make field names accessible
+    using DatabaseVersionBase::kTimestampFieldName;
+
+    // Make getters and setters accessible
     using DatabaseVersionBase::getLastMod;
+    using DatabaseVersionBase::getTimestamp;
+    using DatabaseVersionBase::serialize;
     using DatabaseVersionBase::toBSON;
 
     // It returns a new DatabaseVersion marked as fixed. A fixed database version is used to
@@ -76,6 +82,9 @@ public:
 
     DatabaseVersion makeUpdated() const;
 
+    /**
+     * It returns true if the uuid and lastmod of both versions are the same.
+     */
     bool operator==(const DatabaseVersion& other) const {
         return getUuid() == other.getUuid() && getLastMod() == other.getLastMod();
     }

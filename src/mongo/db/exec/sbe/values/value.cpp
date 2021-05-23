@@ -116,18 +116,20 @@ void releaseValue(TypeTags tag, Value val) noexcept {
         case TypeTags::Object:
             delete getObjectView(val);
             break;
-        case TypeTags::StringBig:
-            delete[] getBigStringView(val);
-            break;
         case TypeTags::ObjectId:
             delete getObjectIdView(val);
             break;
-        case TypeTags::bsonObject:
-        case TypeTags::bsonArray:
+        case TypeTags::StringBig:
         case TypeTags::bsonObjectId:
         case TypeTags::bsonBinData:
             delete[] getRawPointerView(val);
             break;
+
+        case TypeTags::bsonArray:
+        case TypeTags::bsonObject: {
+            UniqueBuffer::reclaim(getRawPointerView(val));
+            break;
+        }
         case TypeTags::ksValue:
             delete getKeyStringView(val);
             break;
@@ -193,6 +195,12 @@ void writeTagToStream(T& stream, const TypeTags tag) {
         case TypeTags::ObjectId:
             stream << "ObjectId";
             break;
+        case TypeTags::MinKey:
+            stream << "MinKey";
+            break;
+        case TypeTags::MaxKey:
+            stream << "MaxKey";
+            break;
         case TypeTags::bsonObject:
             stream << "bsonObject";
             break;
@@ -207,6 +215,9 @@ void writeTagToStream(T& stream, const TypeTags tag) {
             break;
         case TypeTags::bsonBinData:
             stream << "bsonBinData";
+            break;
+        case TypeTags::bsonUndefined:
+            stream << "bsonUndefined";
             break;
         case TypeTags::ksValue:
             stream << "KeyString";
@@ -256,21 +267,6 @@ void writeValueToStream(T& stream, TypeTags tag, Value val) {
         case value::TypeTags::Null:
             stream << "null";
             break;
-        case value::TypeTags::StringSmall:
-            stream << '"' << getSmallStringView(val) << '"';
-            break;
-        case value::TypeTags::StringBig: {
-            auto sb = getBigStringView(val);
-            if (strlen(sb) <= kStringMaxDisplayLength) {
-                stream << '"' << sb << '"';
-            } else {
-                char truncated[kStringMaxDisplayLength + 1];
-                strncpy(truncated, sb, kStringMaxDisplayLength);
-                truncated[kStringMaxDisplayLength] = '\0';
-                stream << '"' << truncated << '"' << "...";
-            }
-            break;
-        }
         case value::TypeTags::Array: {
             auto arr = getArrayView(val);
             stream << '[';
@@ -321,6 +317,12 @@ void writeValueToStream(T& stream, TypeTags tag, Value val) {
         case value::TypeTags::Nothing:
             stream << "---===*** NOTHING ***===---";
             break;
+        case value::TypeTags::MinKey:
+            stream << "minKey";
+            break;
+        case value::TypeTags::MaxKey:
+            stream << "maxKey";
+            break;
         case value::TypeTags::bsonArray: {
             const char* be = getRawPointerView(val);
             const char* end = be + ConstDataView(be).read<LittleEndian<uint32_t>>();
@@ -369,12 +371,15 @@ void writeValueToStream(T& stream, TypeTags tag, Value val) {
             stream << '}';
             break;
         }
+        case value::TypeTags::StringSmall:
+        case value::TypeTags::StringBig:
         case value::TypeTags::bsonString: {
-            auto bs = std::string(getStringView(value::TypeTags::bsonString, val));
-            if (bs.length() <= kStringMaxDisplayLength) {
-                stream << '"' << bs << '"';
+            auto sv = getStringView(tag, val);
+            if (sv.length() <= kStringMaxDisplayLength) {
+                stream << '"' << StringData{sv.data(), sv.size()} << '"';
             } else {
-                stream << '"' << bs.substr(0, kStringMaxDisplayLength) << '"' << "...";
+                auto sub = sv.substr(0, kStringMaxDisplayLength);
+                stream << '"' << StringData{sub.data(), sub.size()} << '"' << "...";
             }
             break;
         }
@@ -382,16 +387,10 @@ void writeValueToStream(T& stream, TypeTags tag, Value val) {
             stream << "---===*** bsonObjectId ***===---";
             break;
         case value::TypeTags::bsonBinData: {
-            auto data =
-                reinterpret_cast<const char*>(getBSONBinData(value::TypeTags::bsonBinData, val));
-            auto len = getBSONBinDataSize(value::TypeTags::bsonBinData, val);
+            auto data = reinterpret_cast<const char*>(
+                getBSONBinDataCompat(value::TypeTags::bsonBinData, val));
+            auto len = getBSONBinDataSizeCompat(value::TypeTags::bsonBinData, val);
             auto type = getBSONBinDataSubtype(value::TypeTags::bsonBinData, val);
-
-            if (type == ByteArrayDeprecated) {
-                // Skip extra size
-                len -= 4;
-                data += 4;
-            }
 
             // If the BinData is a correctly sized newUUID, display it as such.
             if (type == newUUID && len == kNewUUIDLength) {
@@ -413,6 +412,9 @@ void writeValueToStream(T& stream, TypeTags tag, Value val) {
             }
             break;
         }
+        case value::TypeTags::bsonUndefined:
+            stream << "undefined";
+            break;
         case value::TypeTags::ksValue: {
             auto ks = getKeyStringView(val);
             stream << "KS(" << ks->toString() << ")";
@@ -503,6 +505,10 @@ BSONType tagToType(TypeTags tag) noexcept {
             return BSONType::Object;
         case TypeTags::ObjectId:
             return BSONType::jstOID;
+        case TypeTags::MinKey:
+            return BSONType::MinKey;
+        case TypeTags::MaxKey:
+            return BSONType::MaxKey;
         case TypeTags::bsonObject:
             return BSONType::Object;
         case TypeTags::bsonArray:
@@ -513,6 +519,8 @@ BSONType tagToType(TypeTags tag) noexcept {
             return BSONType::jstOID;
         case TypeTags::bsonBinData:
             return BSONType::BinData;
+        case TypeTags::bsonUndefined:
+            return BSONType::Undefined;
         case TypeTags::ksValue:
             // This is completely arbitrary.
             return BSONType::EOO;
@@ -557,6 +565,9 @@ std::size_t hashValue(TypeTags tag, Value val) noexcept {
         case TypeTags::Boolean:
             return bitcastTo<bool>(val);
         case TypeTags::Null:
+        case TypeTags::MinKey:
+        case TypeTags::MaxKey:
+        case TypeTags::bsonUndefined:
             return 0;
         case TypeTags::StringSmall:
         case TypeTags::StringBig:
@@ -686,6 +697,12 @@ std::pair<TypeTags, Value> compareValue(TypeTags lhsTag,
         return {TypeTags::NumberInt32, bitcastFrom<int32_t>(result)};
     } else if (lhsTag == TypeTags::Null && rhsTag == TypeTags::Null) {
         return {TypeTags::NumberInt32, bitcastFrom<int32_t>(0)};
+    } else if (lhsTag == TypeTags::MinKey && rhsTag == TypeTags::MinKey) {
+        return {TypeTags::NumberInt32, bitcastFrom<int32_t>(0)};
+    } else if (lhsTag == TypeTags::MaxKey && rhsTag == TypeTags::MaxKey) {
+        return {TypeTags::NumberInt32, bitcastFrom<int32_t>(0)};
+    } else if (lhsTag == TypeTags::bsonUndefined && rhsTag == TypeTags::bsonUndefined) {
+        return {TypeTags::NumberInt32, bitcastFrom<int32_t>(0)};
     } else if (isArray(lhsTag) && isArray(rhsTag)) {
         // ArraySets carry semantics of an unordered set, so we cannot define a deterministic less
         // or greater operations on them, but only compare for equality. Comparing an ArraySet with
@@ -777,9 +794,10 @@ std::pair<TypeTags, Value> compareValue(TypeTags lhsTag,
         return {TypeTags::NumberInt32, bitcastFrom<int32_t>(result)};
     } else {
         // Different types.
-        auto result =
-            canonicalizeBSONType(tagToType(lhsTag)) - canonicalizeBSONType(tagToType(rhsTag));
-        invariant(result != 0);
+        auto lhsType = tagToType(lhsTag);
+        auto rhsType = tagToType(rhsTag);
+        tassert(5365500, "values cannot have the same type", lhsType != rhsType);
+        auto result = canonicalizeBSONType(lhsType) - canonicalizeBSONType(rhsType);
         return {TypeTags::NumberInt32, bitcastFrom<int32_t>(compareHelper(result, 0))};
     }
 }

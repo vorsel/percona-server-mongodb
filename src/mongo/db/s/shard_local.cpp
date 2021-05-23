@@ -83,16 +83,26 @@ std::string ShardLocal::toString() const {
 }
 
 bool ShardLocal::isRetriableError(ErrorCodes::Error code, RetryPolicy options) {
-    if (options == RetryPolicy::kNoRetry) {
-        return false;
+    switch (options) {
+        case Shard::RetryPolicy::kNoRetry: {
+            return false;
+        } break;
+
+        case Shard::RetryPolicy::kIdempotent: {
+            return code == ErrorCodes::WriteConcernFailed;
+        } break;
+
+        case Shard::RetryPolicy::kIdempotentOrCursorInvalidated: {
+            return isRetriableError(code, Shard::RetryPolicy::kIdempotent) ||
+                ErrorCodes::isCursorInvalidatedError(code);
+        } break;
+
+        case Shard::RetryPolicy::kNotIdempotent: {
+            return false;
+        } break;
     }
 
-    if (options == RetryPolicy::kIdempotent) {
-        return code == ErrorCodes::WriteConcernFailed;
-    } else {
-        invariant(options == RetryPolicy::kNotIdempotent);
-        return false;
-    }
+    MONGO_UNREACHABLE;
 }
 
 StatusWith<Shard::CommandResponse> ShardLocal::_runCommand(OperationContext* opCtx,
@@ -202,7 +212,7 @@ void ShardLocal::runFireAndForgetCommand(OperationContext* opCtx,
 }
 
 Status ShardLocal::runAggregation(OperationContext* opCtx,
-                                  const AggregationRequest& aggRequest,
+                                  const AggregateCommand& aggRequest,
                                   std::function<bool(const std::vector<BSONObj>& batch)> callback) {
     MONGO_UNREACHABLE;
 }

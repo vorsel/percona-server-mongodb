@@ -26,12 +26,12 @@ const kTenantDefinedDbName = "0";
 const donorRst = new ReplSetTest({
     nodes: 1,
     name: 'donor',
-    nodeOptions: {
+    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor, {
         setParameter: {
             tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
             ttlMonitorSleepSecs: kTTLMonitorSleepSecs,
         }
-    }
+    })
 });
 
 function insertDocument(primaryHost, dbName, collName) {
@@ -48,7 +48,8 @@ function insertDocument(primaryHost, dbName, collName) {
     donorRst.startSet();
     donorRst.initiate();
 
-    const tenantMigrationTest = new TenantMigrationTest({name: jsTestName(), donorRst});
+    const tenantMigrationTest =
+        new TenantMigrationTest({name: jsTestName(), donorRst, enableRecipientTesting: false});
     if (!tenantMigrationTest.isFeatureFlagEnabled()) {
         jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
         donorRst.stopSet();
@@ -73,7 +74,7 @@ function insertDocument(primaryHost, dbName, collName) {
 
     assert.commandWorked(primaryDB.runCommand({create: kCollName}));
 
-    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const migrationThread =
         new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 
@@ -135,8 +136,8 @@ function insertDocument(primaryHost, dbName, collName) {
 
     assert.commandWorked(primaryDB.runCommand({create: kCollName}));
 
-    const abortFp = configureFailPoint(primaryDB, "abortTenantMigrationAfterBlockingStarts");
-    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+    const abortFp = configureFailPoint(primaryDB, "abortTenantMigrationBeforeLeavingBlockingState");
+    const blockFp = configureFailPoint(primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const migrationThread =
         new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 

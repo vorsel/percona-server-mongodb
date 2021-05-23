@@ -57,6 +57,7 @@ commands:
     command_name: donorStartMigration
     strict: true
     namespace: ignored
+    api_version: ""
     fields:
       migrationId:
         description: "Unique identifier for the tenant migration."
@@ -74,12 +75,34 @@ commands:
       readPreference:
         description: "The read preference settings that the donor will pass on to the recipient."
         type: readPreference
+      donorCertificateForRecipient:
+        description: >-
+          The SSL certificate and private key that the donor should use to authenticate to the
+          recipient.
+        type: TenantMigrationPEMPayload
+      recipientCertificateForDonor:
+        description: >-
+          The SSL certificate and private key that the recipient should use to authenticate to the
+          donor.
+        type: TenantMigrationPEMPayload
 
   donorForgetMigration:
     description: "Parser for the 'donorForgetMigration' command."
     command_name: donorForgetMigration
     strict: true
     namespace: ignored
+    api_version: ""
+    fields:
+      migrationId:
+        description: "Unique identifier for the tenant migration."
+        type: uuid
+
+  donorAbortMigration:
+    description: "Parser for the 'donorAbortMigration' command."
+    command_name: donorAbortMigration
+    strict: true
+    namespace: ignored
+    api_version: ""
     fields:
       migrationId:
         description: "Unique identifier for the tenant migration."

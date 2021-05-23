@@ -5,6 +5,7 @@
  * @tags: [
  *   requires_replication,
  *   requites_wiredtiger,
+ *   sbe_incompatible,
  * ]
  */
 
@@ -49,7 +50,6 @@ const getDBMetrics = (adminDB) => {
 };
 
 const setParams = {
-    "measureOperationResourceConsumption": true,
     "aggregateOperationResourceConsumptionMetrics": true,
 };
 

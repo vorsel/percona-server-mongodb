@@ -204,14 +204,14 @@ function extractTenantMigrationAbortedError(resObj) {
 function modifyCmdObjForRetry(cmdObj, resObj) {
     if (cmdObj.insert) {
         let retryOps = [];
-        if (cmdObj.ordered) {
-            retryOps = cmdObj.documents.slice(resObj.writeErrors[0].index);
-        } else {
+        if (cmdObj.ordered === false) {
             for (let writeError of resObj.writeErrors) {
                 if (writeError.code == ErrorCodes.TenantMigrationAborted) {
                     retryOps.push(cmdObj.documents[writeError.index]);
                 }
             }
+        } else {
+            retryOps = cmdObj.documents.slice(resObj.writeErrors[0].index);
         }
         cmdObj.documents = retryOps;
     }
@@ -219,28 +219,28 @@ function modifyCmdObjForRetry(cmdObj, resObj) {
     // findAndModify may also have an update field, but is not a batched command.
     if (cmdObj.update && !cmdObj.findAndModify && !cmdObj.findandmodify) {
         let retryOps = [];
-        if (cmdObj.ordered) {
-            retryOps = cmdObj.updates.slice(resObj.writeErrors[0].index);
-        } else {
+        if (cmdObj.ordered === false) {
             for (let writeError of resObj.writeErrors) {
                 if (writeError.code == ErrorCodes.TenantMigrationAborted) {
                     retryOps.push(cmdObj.updates[writeError.index]);
                 }
             }
+        } else {
+            retryOps = cmdObj.updates.slice(resObj.writeErrors[0].index);
         }
         cmdObj.updates = retryOps;
     }
 
     if (cmdObj.delete) {
         let retryOps = [];
-        if (cmdObj.ordered) {
-            retryOps = cmdObj.deletes.slice(resObj.writeErrors[0].index);
-        } else {
+        if (cmdObj.ordered === false) {
             for (let writeError of resObj.writeErrors) {
                 if (writeError.code == ErrorCodes.TenantMigrationAborted) {
                     retryOps.push(cmdObj.deletes[writeError.index]);
                 }
             }
+        } else {
+            retryOps = cmdObj.deletes.slice(resObj.writeErrors[0].index);
         }
         cmdObj.deletes = retryOps;
     }
@@ -346,6 +346,8 @@ Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
 
             if (resObj.upserted) {
                 for (let upsert of resObj.upserted) {
+                    let currentUpsertedIndex = upsert.index;
+
                     // Set the entry's index to the write's index in the original cmdObj.
                     upsert.index = indexMap[upsert.index];
 
@@ -353,7 +355,7 @@ Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
                     upserted.push(upsert);
 
                     // This write will not need to be retried, so remove it from 'indexMap'.
-                    delete indexMap[upsert.index];
+                    delete indexMap[currentUpsertedIndex];
                 }
             }
             if (resObj.writeErrors) {
@@ -364,6 +366,8 @@ Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
                         break;
                     }
 
+                    let currentWriteErrorIndex = writeError.index;
+
                     // Set the entry's index to the write's index in the original cmdObj.
                     writeError.index = indexMap[writeError.index];
 
@@ -371,7 +375,7 @@ Mongo.prototype.runCommand = function(dbName, cmdObj, options) {
                     nonRetryableWriteErrors.push(writeError);
 
                     // This write will not need to be retried, so remove it from 'indexMap'.
-                    delete indexMap[writeError.index];
+                    delete indexMap[currentWriteErrorIndex];
                 }
             }
         }
@@ -468,6 +472,8 @@ Mongo.prototype.runCommandWithMetadata = function(dbName, metadata, commandArgs)
 
             if (resObj.upserted) {
                 for (let upsert of resObj.upserted) {
+                    let currentUpsertedIndex = upsert.index;
+
                     // Set the entry's index to the write's index in the original cmdObj.
                     upsert.index = indexMap[upsert.index];
 
@@ -475,7 +481,7 @@ Mongo.prototype.runCommandWithMetadata = function(dbName, metadata, commandArgs)
                     upserted.push(upsert);
 
                     // This write will not need to be retried, so remove it from 'indexMap'.
-                    delete indexMap[upsert.index];
+                    delete indexMap[currentUpsertedIndex];
                 }
             }
             if (resObj.writeErrors) {
@@ -486,6 +492,8 @@ Mongo.prototype.runCommandWithMetadata = function(dbName, metadata, commandArgs)
                         break;
                     }
 
+                    let currentWriteErrorIndex = writeError.index;
+
                     // Set the entry's index to the write's index in the original cmdObj.
                     writeError.index = indexMap[writeError.index];
 
@@ -493,7 +501,7 @@ Mongo.prototype.runCommandWithMetadata = function(dbName, metadata, commandArgs)
                     nonRetryableWriteErrors.push(writeError);
 
                     // This write will not need to be retried, so remove it from 'indexMap'.
-                    delete indexMap[writeError.index];
+                    delete indexMap[currentWriteErrorIndex];
                 }
             }
         }

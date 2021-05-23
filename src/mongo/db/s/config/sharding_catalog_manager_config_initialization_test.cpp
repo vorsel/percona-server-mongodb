@@ -41,12 +41,12 @@
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/s/config/config_server_test_fixture.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/s/type_lockpings.h"
+#include "mongo/db/s/type_locks.h"
 #include "mongo/s/catalog/config_server_version.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_config_version.h"
-#include "mongo/s/catalog/type_lockpings.h"
-#include "mongo/s/catalog/type_locks.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/client/shard.h"
@@ -64,10 +64,13 @@ void assertBSONObjsSame(const std::vector<BSONObj>& expectedBSON,
                         const std::vector<BSONObj>& foundBSON) {
     ASSERT_EQUALS(expectedBSON.size(), foundBSON.size());
 
+    auto flags =
+        BSONObj::ComparisonRules::kIgnoreFieldOrder | BSONObj::ComparisonRules::kConsiderFieldName;
+
     for (const auto& expectedObj : expectedBSON) {
         bool wasFound = false;
         for (const auto& foundObj : foundBSON) {
-            if (expectedObj.woCompare(foundObj) == 0) {
+            if (expectedObj.woCompare(foundObj, {}, flags) == 0) {
                 wasFound = true;
                 break;
             }

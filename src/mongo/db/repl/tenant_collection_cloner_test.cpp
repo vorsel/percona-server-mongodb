@@ -148,13 +148,14 @@ protected:
         }
     }
     std::unique_ptr<TenantCollectionCloner> makeCollectionCloner(
-        CollectionOptions options = CollectionOptions()) {
+        CollectionOptions options = CollectionOptions(),
+        TenantMigrationSharedData* sharedData = nullptr) {
         options.uuid = _collUuid;
         _options = options;
         return std::make_unique<TenantCollectionCloner>(
             _nss,
             options,
-            getSharedData(),
+            sharedData ? sharedData : getSharedData(),
             _source,
             _mockClient.get(),
             repl::StorageInterface::get(getServiceContext()),
@@ -183,6 +184,10 @@ protected:
 
     BSONObj& getIdIndexSpec(TenantCollectionCloner* cloner) {
         return cloner->_idIndexSpec;
+    }
+
+    BSONObj& getLastDocId(TenantCollectionCloner* cloner) {
+        return cloner->_lastDocId;
     }
 
     long long _term = 0;
@@ -321,11 +326,6 @@ TEST_F(TenantCollectionClonerTest, ListIndexesRecordsCorrectOperationTime) {
 }
 
 TEST_F(TenantCollectionClonerTest, BeginCollection) {
-    NamespaceString collNss;
-    CollectionOptions collOptions;
-    BSONObj collIdIndexSpec;
-    std::vector<BSONObj> collSecondaryIndexSpecs;
-
     auto cloner = makeCollectionCloner();
     cloner->setStopAfterStage_forTest("createCollection");
     _mockServer->setCommandReply("count", createCountResponse(1));
@@ -352,11 +352,6 @@ TEST_F(TenantCollectionClonerTest, BeginCollection) {
 }
 
 TEST_F(TenantCollectionClonerTest, BeginCollectionFailed) {
-    _storageInterface.createCollFn =
-        [&](OperationContext* opCtx, const NamespaceString& nss, const CollectionOptions& options) {
-            return Status(ErrorCodes::OperationFailed, "");
-        };
-
     auto createCollectionFp =
         globalFailPointRegistry().find("hangAndFailAfterCreateCollectionReservesOpTime");
     auto initialTimesEntered =
@@ -610,6 +605,343 @@ TEST_F(TenantCollectionClonerTest, QueryFailure) {
     beforeStageFailPoint->setMode(FailPoint::off, 0);
 
     clonerThread.join();
+}
+
+// On NamespaceNotFound, the TenantCollectionCloner should exit without doing anything.
+TEST_F(TenantCollectionClonerTest, CountStageNamespaceNotFound) {
+    auto cloner = makeCollectionCloner();
+    // The tenant collection cloner pre-stage makes a remote call to collStats to store in-progress
+    // metrics.
+    _mockServer->setCommandReply("collStats", BSON("size" << 10000));
+    _mockServer->setCommandReply("count", Status(ErrorCodes::NamespaceNotFound, "NoSuchUuid"));
+    ASSERT_OK(cloner->run());
+}
+
+// NamespaceNotFound is treated the same as no indexes.
+TEST_F(TenantCollectionClonerTest, ListIndexesReturnedNamespaceNotFound) {
+    auto cloner = makeCollectionCloner();
+    _mockServer->setCommandReply("collStats", BSON("size" << 10));
+    _mockServer->setCommandReply("count", createCountResponse(1));
+    _mockServer->setCommandReply("listIndexes",
+                                 Status(ErrorCodes::NamespaceNotFound, "No indexes here."));
+
+    // We expect the collection to *not* be created.
+    ASSERT_OK(cloner->run());
+    ASSERT_FALSE(_opObserver->collCreated);
+    ASSERT(getIdIndexSpec(cloner.get()).isEmpty());
+    ASSERT(getIndexSpecs(cloner.get()).empty());
+    ASSERT_EQ(0, cloner->getStats().indexes);
+}
+
+TEST_F(TenantCollectionClonerTest, QueryStageNamespaceNotFoundOnFirstBatch) {
+    // Set up data for preliminary stages.
+    _mockServer->setCommandReply("count", createCountResponse(2));
+    _mockServer->setCommandReply("listIndexes",
+                                 createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+    _mockServer->setCommandReply("find", createFindResponse());  // majority read after listIndexes
+
+    // Set up before-stage failpoint.
+    auto beforeStageFailPoint = globalFailPointRegistry().find("hangBeforeClonerStage");
+    auto timesEnteredBeforeStage = beforeStageFailPoint->setMode(
+        FailPoint::alwaysOn, 0, fromjson("{cloner: 'TenantCollectionCloner', stage: 'query'}"));
+
+    // Set up documents to be returned from upstream node.
+    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+
+    auto cloner = makeCollectionCloner();
+
+    // Run the cloner in a separate thread. The cloner should detect the drop at the beginning
+    // of the query stage and exit normally, without copying over any documents.
+    stdx::thread clonerThread([&] {
+        Client::initThread("ClonerRunner");
+        ASSERT_OK(cloner->run());
+        ASSERT_EQ(0, cloner->getStats().documentsCopied);
+    });
+
+    // Wait until we get to the query stage.
+    beforeStageFailPoint->waitForTimesEntered(timesEnteredBeforeStage + 1);
+
+    // Verify we've made no progress yet.
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(0, stats.receivedBatches);
+
+    // Despite the name, this will also trigger on the initial batch.
+    auto failNextBatch = globalFailPointRegistry().find("mockCursorThrowErrorOnGetMore");
+    failNextBatch->setMode(FailPoint::nTimes, 1, fromjson("{errorType: 'NamespaceNotFound'}"));
+
+    // Proceed with the query stage.
+    beforeStageFailPoint->setMode(FailPoint::off, 0);
+    clonerThread.join();
+    ASSERT_EQUALS(0, _opObserver->numDocsInserted);
+}
+
+TEST_F(TenantCollectionClonerTest, QueryStageNamespaceNotFoundOnSubsequentBatch) {
+    // Set up data for preliminary stages.
+    _mockServer->setCommandReply("count", createCountResponse(2));
+    _mockServer->setCommandReply("listIndexes",
+                                 createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+    _mockServer->setCommandReply("find", createFindResponse());  // majority read after listIndexes
+
+    // Set up after-first-batch failpoint.
+    auto afterBatchFailpoint = globalFailPointRegistry().find(
+        "tenantMigrationHangCollectionClonerAfterHandlingBatchResponse");
+    auto timesEnteredAfterBatch = afterBatchFailpoint->setMode(FailPoint::alwaysOn, 0);
+
+    // Set up documents to be returned from upstream node.
+    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 4));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 5));
+
+    auto cloner = makeCollectionCloner();
+    cloner->setBatchSize_forTest(2);
+
+    // Run the cloner in a separate thread. The cloner should detect the drop on the second query
+    // batch and exit normally.
+    stdx::thread clonerThread([&] {
+        Client::initThread("ClonerRunner");
+        ASSERT_OK(cloner->run());
+        // We cloned two documents before we registered the drop.
+        ASSERT_EQ(2, cloner->getStats().documentsCopied);
+    });
+
+    // Wait until we get to the query stage.
+    afterBatchFailpoint->waitForTimesEntered(timesEnteredAfterBatch + 1);
+
+    // Verify we've processed exactly one batch.
+    auto stats = cloner->getStats();
+    ASSERT_EQUALS(1, stats.receivedBatches);
+
+    // Trigger drop before second batch.
+    auto failNextBatch = globalFailPointRegistry().find("mockCursorThrowErrorOnGetMore");
+    failNextBatch->setMode(FailPoint::nTimes, 1, fromjson("{errorType: 'NamespaceNotFound'}"));
+
+    // Proceed with the query stage.
+    afterBatchFailpoint->setMode(FailPoint::off, 0);
+    clonerThread.join();
+    ASSERT_EQUALS(2, _opObserver->numDocsInserted);
+}
+
+// TODO(SERVER-53282): Enable this test.
+// // We receive a QueryPlanKilled error, then a NamespaceNotFound error, indicating that the
+// // collection no longer exists in the database.
+// TEST_F(TenantCollectionClonerTest, QueryStageCursorDropOK) {
+//     // Set up data for preliminary stages.
+//     _mockServer->setCommandReply("count", createCountResponse(2));
+//     _mockServer->setCommandReply("listIndexes",
+//                                  createCursorResponse(_nss.ns(), BSON_ARRAY(_idIndexSpec)));
+//     _mockServer->setCommandReply("find", createFindResponse());  // maj read after listIndexes
+
+//     auto beforeStageFailPoint = globalFailPointRegistry().find("hangBeforeClonerStage");
+//     auto timesEnteredBeforeStage = beforeStageFailPoint->setMode(
+//         FailPoint::alwaysOn, 0, fromjson("{cloner: 'CollectionCloner', stage: 'query'}"));
+
+//     auto beforeRetryFailPoint = globalFailPointRegistry().find("hangBeforeRetryingClonerStage");
+//     auto timesEnteredBeforeRetry = beforeRetryFailPoint->setMode(
+//         FailPoint::alwaysOn, 0, fromjson("{cloner: 'TenantCollectionCloner', stage: 'query'}"));
+
+//     // Set up documents to be returned from upstream node.
+//     _mockServer->insert(_nss.ns(), BSON("_id" << 1));
+//     _mockServer->insert(_nss.ns(), BSON("_id" << 2));
+//     _mockServer->insert(_nss.ns(), BSON("_id" << 3));
+
+//     auto cloner = makeCollectionCloner();
+
+//     // Run the cloner in a separate thread. The cloner should detect the drop at the beginning
+//     // of the query stage and exit normally, without copying over any documents.
+//     stdx::thread clonerThread([&] {
+//         Client::initThread("ClonerRunner");
+//         ASSERT_OK(cloner->run());
+//     });
+
+//     // Wait until we get to the query stage.
+//     beforeStageFailPoint->waitForTimesEntered(timesEnteredBeforeStage + 1);
+
+//     // Verify we've processed exactly one batch.
+//     auto stats = cloner->getStats();
+//     ASSERT_EQUALS(1, stats.receivedBatches);
+
+//     // Trigger drop after this batch. This is the error we will observe.
+//     auto failNextBatch = globalFailPointRegistry().find("mockCursorThrowErrorOnGetMore");
+//     failNextBatch->setMode(FailPoint::nTimes, 1, fromjson("{errorType: 'NamespaceNotFound'}"));
+
+//     // Resume cloning.
+//     beforeStageFailPoint->setMode(FailPoint::off, 0);
+//     beforeRetryFailPoint->waitForTimesEntered(timesEnteredBeforeRetry + 1);
+
+//     // Follow-up the QueryPlanKilled error with a NamespaceNotFound.
+//     failNextBatch->setMode(FailPoint::nTimes, 1, fromjson("{errorType: 'NamespaceNotFound'}"));
+
+//     beforeRetryFailPoint->setMode(FailPoint::off, 0);
+//     clonerThread.join();
+// }
+
+TEST_F(TenantCollectionClonerTest, ResumeFromEmptyCollectionMissingAllSecondaryIndexes) {
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    auto cloner = makeCollectionCloner(CollectionOptions(), &resumingSharedData);
+
+    // Simulate that the collection already exists with no data and no secondary index.
+    ASSERT_OK(createCollection(_nss, _options));
+    ASSERT_TRUE(_opObserver->collCreated);
+    ASSERT_EQUALS(0, _opObserver->secondaryIndexSpecs.size());
+
+    cloner->setStopAfterStage_forTest("createCollection");
+    _mockServer->setCommandReply("count", createCountResponse(1));
+    BSONArrayBuilder indexSpecs;
+    indexSpecs.append(_idIndexSpec);
+    for (const auto& secondaryIndexSpec : _secondaryIndexSpecs) {
+        indexSpecs.append(secondaryIndexSpec);
+    }
+    _mockServer->setCommandReply("listIndexes", createCursorResponse(_nss.ns(), indexSpecs.arr()));
+    _mockServer->setCommandReply("find", createFindResponse());
+
+    ASSERT_EQUALS(Status::OK(), cloner->run());
+
+    // We should create the missing secondary indexes on the empty collection.
+    ASSERT_EQ(2, getIndexSpecs(cloner.get()).size());
+    ASSERT_BSONOBJ_EQ(_secondaryIndexSpecs[0], getIndexSpecs(cloner.get())[0]);
+    ASSERT_BSONOBJ_EQ(_secondaryIndexSpecs[1], getIndexSpecs(cloner.get())[1]);
+
+    ASSERT_EQUALS(_secondaryIndexSpecs.size(), _opObserver->secondaryIndexSpecs.size());
+    for (std::vector<BSONObj>::size_type i = 0; i < _secondaryIndexSpecs.size(); ++i) {
+        ASSERT_BSONOBJ_EQ(_secondaryIndexSpecs[i], _opObserver->secondaryIndexSpecs[i]);
+    }
+}
+
+TEST_F(TenantCollectionClonerTest, ResumeFromEmptyCollectionMissingSomeSecondaryIndexes) {
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    auto cloner = makeCollectionCloner(CollectionOptions(), &resumingSharedData);
+
+    // Simulate that the collection already exists with no data and some secondary indexes.
+    ASSERT_OK(createCollection(_nss, _options));
+    ASSERT_OK(createIndexesOnEmptyCollection(_nss,
+                                             {_secondaryIndexSpecs[0],
+                                              // An index that has been dropped on the donor.
+                                              BSON("v" << 1 << "key" << BSON("c" << 1) << "name"
+                                                       << "c_1")}));
+    ASSERT_TRUE(_opObserver->collCreated);
+    ASSERT_EQUALS(2, _opObserver->secondaryIndexSpecs.size());
+
+    cloner->setStopAfterStage_forTest("createCollection");
+    _mockServer->setCommandReply("count", createCountResponse(1));
+    BSONArrayBuilder indexSpecs;
+    indexSpecs.append(_idIndexSpec);
+    for (const auto& secondaryIndexSpec : _secondaryIndexSpecs) {
+        indexSpecs.append(secondaryIndexSpec);
+    }
+    _mockServer->setCommandReply("listIndexes", createCursorResponse(_nss.ns(), indexSpecs.arr()));
+    _mockServer->setCommandReply("find", createFindResponse());
+
+    ASSERT_EQUALS(Status::OK(), cloner->run());
+
+    // We should create the other missing secondary indexes on the empty collection.
+    ASSERT_EQ(1, getIndexSpecs(cloner.get()).size());
+    ASSERT_BSONOBJ_EQ(_secondaryIndexSpecs[1], getIndexSpecs(cloner.get())[0]);
+
+    ASSERT_EQUALS(3, _opObserver->secondaryIndexSpecs.size());
+    ASSERT_BSONOBJ_EQ(_secondaryIndexSpecs[1], _opObserver->secondaryIndexSpecs[2]);
+}
+
+TEST_F(TenantCollectionClonerTest, ResumeFromEmptyCollectionMissingNoSecondaryIndexes) {
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    auto cloner = makeCollectionCloner(CollectionOptions(), &resumingSharedData);
+
+    // Simulate that the collection already exists with no data and all matching secondary indexes.
+    ASSERT_OK(createCollection(_nss, _options));
+    ASSERT_OK(createIndexesOnEmptyCollection(_nss, _secondaryIndexSpecs));
+    ASSERT_TRUE(_opObserver->collCreated);
+    ASSERT_EQUALS(2, _opObserver->secondaryIndexSpecs.size());
+
+    cloner->setStopAfterStage_forTest("createCollection");
+    _mockServer->setCommandReply("count", createCountResponse(1));
+    BSONArrayBuilder indexSpecs;
+    indexSpecs.append(_idIndexSpec);
+    for (const auto& secondaryIndexSpec : _secondaryIndexSpecs) {
+        indexSpecs.append(secondaryIndexSpec);
+    }
+    _mockServer->setCommandReply("listIndexes", createCursorResponse(_nss.ns(), indexSpecs.arr()));
+    _mockServer->setCommandReply("find", createFindResponse());
+
+    ASSERT_EQUALS(Status::OK(), cloner->run());
+
+    // We shouldn't need to create any secondary index.
+    ASSERT_EQ(0, getIndexSpecs(cloner.get()).size());
+}
+
+TEST_F(TenantCollectionClonerTest, ResumeFromNonEmptyCollection) {
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    auto cloner = makeCollectionCloner(CollectionOptions(), &resumingSharedData);
+
+    // Simulate that the collection already exists with some data.
+    ASSERT_OK(createCollection(_nss, _options));
+    ASSERT_OK(createIndexesOnEmptyCollection(_nss, _secondaryIndexSpecs));
+    {
+        auto storage = StorageInterface::get(serviceContext);
+        auto opCtx = cc().makeOperationContext();
+        ASSERT_OK(storage->insertDocument(opCtx.get(), _nss, {BSON("_id" << 1)}, 0));
+    }
+    ASSERT_TRUE(_opObserver->collCreated);
+    ASSERT_EQUALS(2, _opObserver->secondaryIndexSpecs.size());
+
+    cloner->setStopAfterStage_forTest("createCollection");
+    _mockServer->setCommandReply("count", createCountResponse(1));
+    BSONArrayBuilder indexSpecs;
+    indexSpecs.append(_idIndexSpec);
+    for (const auto& secondaryIndexSpec : _secondaryIndexSpecs) {
+        indexSpecs.append(secondaryIndexSpec);
+    }
+    _mockServer->setCommandReply("listIndexes", createCursorResponse(_nss.ns(), indexSpecs.arr()));
+    _mockServer->setCommandReply("find", createFindResponse());
+
+    ASSERT_EQUALS(Status::OK(), cloner->run());
+
+    // We shouldn't need to create any secondary index.
+    ASSERT_EQ(0, getIndexSpecs(cloner.get()).size());
+    // Test that we have updated the stats.
+    ASSERT_EQ(1, cloner->getStats().documentsCopied);
+}
+
+TEST_F(TenantCollectionClonerTest, ResumeFromRenamedCollection) {
+    TenantMigrationSharedData resumingSharedData(&_clock, _migrationId, /*resuming=*/true);
+    auto cloner = makeCollectionCloner(CollectionOptions(), &resumingSharedData);
+
+    // Simulate that the collection already exists under a different name with no index and no data.
+    const NamespaceString oldNss = {_nss.db(), "testcoll_old"};
+    ASSERT_OK(createCollection(oldNss, _options));
+
+    _mockServer->setCommandReply("count", createCountResponse(1));
+    BSONArrayBuilder indexSpecs;
+    indexSpecs.append(_idIndexSpec);
+    for (const auto& secondaryIndexSpec : _secondaryIndexSpecs) {
+        indexSpecs.append(secondaryIndexSpec);
+    }
+    _mockServer->setCommandReply("listIndexes", createCursorResponse(_nss.ns(), indexSpecs.arr()));
+    _mockServer->setCommandReply("find", createFindResponse());
+
+    // Set up documents to be returned from upstream node.
+    _mockServer->insert(_nss.ns(), BSON("_id" << 1));
+    _mockServer->insert(_nss.ns(), BSON("_id" << 2));
+
+    auto opObserver = std::make_unique<TenantCollectionClonerTestOpObserver>(oldNss);
+    auto oldNssOpObserver = opObserver.get();
+    auto opObserverRegistry = dynamic_cast<OpObserverRegistry*>(serviceContext->getOpObserver());
+    opObserverRegistry->addObserver(std::move(opObserver));
+
+    ASSERT_OK(cloner->run());
+
+    // We should re-create the secondary indexes using the old ns.
+    ASSERT_EQ(_secondaryIndexSpecs.size(), getIndexSpecs(cloner.get()).size());
+    ASSERT_EQUALS(_secondaryIndexSpecs.size(), oldNssOpObserver->secondaryIndexSpecs.size());
+    for (std::vector<BSONObj>::size_type i = 0; i < _secondaryIndexSpecs.size(); ++i) {
+        ASSERT_BSONOBJ_EQ(_secondaryIndexSpecs[i], oldNssOpObserver->secondaryIndexSpecs[i]);
+    }
+
+    // We should insert documents into the old ns.
+    ASSERT_EQ(2, oldNssOpObserver->numDocsInserted);
+    ASSERT_EQ(2, cloner->getStats().documentsCopied);
 }
 
 }  // namespace repl

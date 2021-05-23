@@ -47,7 +47,7 @@
 
 namespace mongo {
 
-constexpr auto kReshardingOplogPrePostImageOps = "prePostImageOps"_sd;
+constexpr auto kReshardFinalOpLogType = "reshardFinalOp"_sd;
 
 /**
  * Emplaces the 'fetchTimestamp' onto the ClassWithFetchTimestamp if the timestamp has been
@@ -69,6 +69,50 @@ void emplaceFetchTimestampIfExists(ClassWithFetchTimestamp& c,
     FetchTimestamp fetchTimestampStruct;
     fetchTimestampStruct.setFetchTimestamp(std::move(fetchTimestamp));
     c.setFetchTimestampStruct(std::move(fetchTimestampStruct));
+}
+/**
+ * Emplaces the 'minFetchTimestamp' onto the ClassWithFetchTimestamp if the timestamp has been
+ * emplaced inside the boost::optional.
+ */
+template <class ClassWithMinFetchTimestamp>
+void emplaceMinFetchTimestampIfExists(ClassWithMinFetchTimestamp& c,
+                                      boost::optional<Timestamp> minFetchTimestamp) {
+    if (!minFetchTimestamp) {
+        return;
+    }
+
+    invariant(!minFetchTimestamp->isNull());
+
+    if (auto alreadyExistingMinFetchTimestamp = c.getMinFetchTimestamp()) {
+        invariant(minFetchTimestamp == alreadyExistingMinFetchTimestamp);
+    }
+
+    MinFetchTimestamp minFetchTimestampStruct;
+    minFetchTimestampStruct.setMinFetchTimestamp(std::move(minFetchTimestamp));
+    c.setMinFetchTimestampStruct(std::move(minFetchTimestampStruct));
+}
+
+/**
+ * Emplaces the 'strictConsistencyTimestamp' onto the ClassWithStrictConsistencyTimestamp if the
+ * timestamp has been emplaced inside the boost::optional.
+ */
+template <class ClassWithStrictConsistencyTimestamp>
+void emplaceStrictConsistencyTimestampIfExists(
+    ClassWithStrictConsistencyTimestamp& c, boost::optional<Timestamp> strictConsistencyTimestamp) {
+    if (!strictConsistencyTimestamp) {
+        return;
+    }
+
+    invariant(!strictConsistencyTimestamp->isNull());
+
+    if (auto alreadyExistingStrictConsistencyTimestamp = c.getStrictConsistencyTimestamp()) {
+        invariant(strictConsistencyTimestamp == alreadyExistingStrictConsistencyTimestamp);
+    }
+
+    StrictConsistencyTimestamp strictConsistencyTimestampStruct;
+    strictConsistencyTimestampStruct.setStrictConsistencyTimestamp(
+        std::move(strictConsistencyTimestamp));
+    c.setStrictConsistencyTimestampStruct(std::move(strictConsistencyTimestampStruct));
 }
 
 /**
@@ -144,19 +188,6 @@ void checkForOverlappingZones(std::vector<TagsType>& zones);
  */
 void validateZones(const std::vector<mongo::BSONObj>& zones,
                    const std::vector<TagsType>& authoritativeTags);
-
-/**
- * Create pipeline stages for iterating the buffered copy of the donor oplog and link together the
- * oplog entries with their preImage/postImage oplog. Note that caller is responsible for making
- * sure that the donorOplogNS is properly resolved and ns is set in the expCtx.
- *
- * If doAttachDocumentCursor is false, the caller will need to manually set the initial stage of the
- * pipeline with a source. This is mostly useful for testing.
- */
-std::unique_ptr<Pipeline, PipelineDeleter> createAggForReshardingOplogBuffer(
-    const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    const boost::optional<ReshardingDonorOplogId>& resumeToken,
-    bool doAttachDocumentCursor);
 
 /**
  * Creates a view on the oplog that facilitates the specialized oplog tailing a resharding

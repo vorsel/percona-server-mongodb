@@ -108,6 +108,8 @@ int Instruction::stackOffset[Instruction::Tags::lastInstruction] = {
     0,  // isDate
     0,  // isNaN
     0,  // isRecordId
+    0,  // isMinKey
+    0,  // isMaxKey
     0,  // typeMatch
 
     0,  // function is special, the stack offset is encoded in the instruction itself
@@ -1232,6 +1234,51 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDate(ArityType 
         timezoneTuple);
 }
 
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDateDiff(ArityType arity) {
+    invariant(arity == 5);
+
+    auto [timezoneDBOwn, timezoneDBTag, timezoneDBValue] = getFromStack(0);
+    if (timezoneDBTag != value::TypeTags::timeZoneDB) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto timezoneDB = value::getTimeZoneDBView(timezoneDBValue);
+
+    // Get startDate.
+    auto [startDateOwn, startDateTag, startDateValue] = getFromStack(1);
+    if (!coercibleToDate(startDateTag)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto startDate = getDate(startDateTag, startDateValue);
+
+    // Get endDate.
+    auto [endDateOwn, endDateTag, endDateValue] = getFromStack(2);
+    if (!coercibleToDate(endDateTag)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto endDate = getDate(endDateTag, endDateValue);
+
+    // Get unit.
+    auto [unitOwn, unitTag, unitValue] = getFromStack(3);
+    if (!value::isString(unitTag)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto unitString = value::getStringView(unitTag, unitValue);
+    if (!isValidTimeUnit(unitString)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto unit = parseTimeUnit(unitString);
+
+    // Get timezone.
+    auto [timezoneOwn, timezoneTag, timezoneValue] = getFromStack(4);
+    if (!isValidTimezone(timezoneTag, timezoneValue, timezoneDB)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto timezone = getTimezone(timezoneTag, timezoneValue, timezoneDB);
+
+    auto result = dateDiff(startDate, endDate, unit, timezone);
+    return {false, value::TypeTags::NumberInt64, value::bitcastFrom<int64_t>(result)};
+}
+
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDateWeekYear(ArityType arity) {
     auto timeZoneDBTuple = getFromStack(0);
     auto yearTuple = getFromStack(1);
@@ -1504,10 +1551,10 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinToUpper(ArityTy
     auto [_, operandTag, operandVal] = getFromStack(0);
 
     if (value::isString(operandTag)) {
-        auto strView = value::getStringView(operandTag, operandVal);
-        auto [strTag, strVal] = value::makeNewString(strView);
-        char* str = value::getRawStringView(strTag, strVal);
-        boost::to_upper(str);
+        auto [strTag, strVal] = value::copyValue(operandTag, operandVal);
+        auto buf = value::getRawStringView(strTag, strVal);
+        auto range = std::make_pair(buf, buf + value::getStringLength(strTag, strVal));
+        boost::to_upper(range);
         return {true, strTag, strVal};
     }
     return {false, value::TypeTags::Nothing, 0};
@@ -1517,10 +1564,10 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinToLower(ArityTy
     auto [_, operandTag, operandVal] = getFromStack(0);
 
     if (value::isString(operandTag)) {
-        auto strView = value::getStringView(operandTag, operandVal);
-        auto [strTag, strVal] = value::makeNewString(strView);
-        char* str = value::getRawStringView(strTag, strVal);
-        boost::to_lower(str);
+        auto [strTag, strVal] = value::copyValue(operandTag, operandVal);
+        auto buf = value::getRawStringView(strTag, strVal);
+        auto range = std::make_pair(buf, buf + value::getStringLength(strTag, strVal));
+        boost::to_lower(range);
         return {true, strTag, strVal};
     }
     return {false, value::TypeTags::Nothing, 0};
@@ -1660,7 +1707,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinConcat(ArityTyp
         if (!value::isString(tag)) {
             return {false, value::TypeTags::Nothing, 0};
         }
-        result << sbe::value::getRawStringView(tag, value);
+        auto sv = sbe::value::getStringView(tag, value);
+        result << StringData{sv.data(), sv.size()};
     }
 
     auto [strTag, strValue] = sbe::value::makeNewString(result.str());
@@ -1826,6 +1874,18 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinIndexOfCP(Arity
         byteIndex += str::getCodePointLength(str[byteIndex]);
     }
     return {false, value::TypeTags::NumberInt32, value::bitcastFrom<int32_t>(-1)};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinIsTimeUnit(ArityType arity) {
+    invariant(arity == 1);
+    auto [timeUnitOwn, timeUnitTag, timeUnitValue] = getFromStack(0);
+    if (!value::isString(timeUnitTag)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    return {false,
+            value::TypeTags::Boolean,
+            value::bitcastFrom<bool>(
+                isValidTimeUnit(value::getStringView(timeUnitTag, timeUnitValue)))};
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinIsTimezone(ArityType arity) {
@@ -2247,7 +2307,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinRegexFindAll(Ar
     return {true, arrTag, arrVal};
 }
 
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinShardFilter(uint8_t arity) {
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinShardFilter(ArityType arity) {
     invariant(arity == 2);
 
     auto [ownedFilter, filterTag, filterValue] = getFromStack(0);
@@ -2274,9 +2334,184 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinShardFilter(uin
                 value::getShardFiltererView(filterValue)->keyBelongsToMe(bob.done()))};
 }
 
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinExtractSubArray(ArityType arity) {
+    // We need to ensure that 'size_t' is wide enough to store 32-bit index.
+    static_assert(sizeof(size_t) >= sizeof(int32_t), "size_t must be at least 32-bits");
+
+    auto [arrayOwned, arrayTag, arrayValue] = getFromStack(0);
+    auto [limitOwned, limitTag, limitValue] = getFromStack(1);
+
+    if (!value::isArray(arrayTag) || limitTag != value::TypeTags::NumberInt32) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+
+    auto limit = value::bitcastTo<int32_t>(limitValue);
+
+    auto absWithSign = [](int32_t value) -> std::pair<bool, size_t> {
+        if (value < 0) {
+            // Upcast 'value' to 'int64_t' prevent overflow during the sign change.
+            return {true, -static_cast<int64_t>(value)};
+        }
+        return {false, value};
+    };
+
+    size_t start = 0;
+    bool isNegativeStart = false;
+    size_t length = 0;
+    if (arity == 2) {
+        std::tie(isNegativeStart, start) = absWithSign(limit);
+        length = start;
+        if (!isNegativeStart) {
+            start = 0;
+        }
+    } else {
+        if (limit < 0) {
+            return {false, value::TypeTags::Nothing, 0};
+        }
+        length = limit;
+
+        auto [skipOwned, skipTag, skipValue] = getFromStack(2);
+        if (skipTag != value::TypeTags::NumberInt32) {
+            return {false, value::TypeTags::Nothing, 0};
+        }
+
+        auto skip = value::bitcastTo<int32_t>(skipValue);
+        std::tie(isNegativeStart, start) = absWithSign(skip);
+    }
+
+    auto [resultTag, resultValue] = value::makeNewArray();
+    value::ValueGuard resultGuard{resultTag, resultValue};
+    auto resultView = value::getArrayView(resultValue);
+
+    if (arrayTag == value::TypeTags::Array) {
+        auto arrayView = value::getArrayView(arrayValue);
+        auto arraySize = arrayView->size();
+
+        auto convertedStart = [&]() -> size_t {
+            if (isNegativeStart) {
+                if (start > arraySize) {
+                    return 0;
+                } else {
+                    return arraySize - start;
+                }
+            } else {
+                return std::min(start, arraySize);
+            }
+        }();
+
+        size_t end = convertedStart + std::min(length, arraySize - convertedStart);
+
+        for (size_t i = convertedStart; i < end; i++) {
+            auto [tag, value] = arrayView->getAt(i);
+            auto [copyTag, copyValue] = value::copyValue(tag, value);
+            resultView->push_back(copyTag, copyValue);
+        }
+    } else {
+        auto advance = [](value::ArrayEnumerator& enumerator, size_t offset) {
+            size_t i = 0;
+            while (i < offset && !enumerator.atEnd()) {
+                i++;
+                enumerator.advance();
+            }
+        };
+
+        value::ArrayEnumerator startEnumerator{arrayTag, arrayValue};
+        if (isNegativeStart) {
+            value::ArrayEnumerator windowEndEnumerator{arrayTag, arrayValue};
+            advance(windowEndEnumerator, start);
+
+            while (!startEnumerator.atEnd() && !windowEndEnumerator.atEnd()) {
+                startEnumerator.advance();
+                windowEndEnumerator.advance();
+            }
+            invariant(windowEndEnumerator.atEnd());
+        } else {
+            advance(startEnumerator, start);
+        }
+
+        size_t i = 0;
+        while (i < length && !startEnumerator.atEnd()) {
+            auto [tag, value] = startEnumerator.getViewOfValue();
+            auto [copyTag, copyValue] = value::copyValue(tag, value);
+            resultView->push_back(copyTag, copyValue);
+
+            i++;
+            startEnumerator.advance();
+        }
+    }
+
+    resultGuard.reset();
+    return {true, resultTag, resultValue};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinIsArrayEmpty(ArityType arity) {
+    invariant(arity == 1);
+    auto [arrayOwned, arrayType, arrayValue] = getFromStack(0);
+
+    if (!value::isArray(arrayType)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+
+    if (arrayType == value::TypeTags::Array) {
+        auto arrayView = value::getArrayView(arrayValue);
+        return {false, value::TypeTags::Boolean, value::bitcastFrom<bool>(arrayView->size() == 0)};
+    } else if (arrayType == value::TypeTags::bsonArray || arrayType == value::TypeTags::ArraySet) {
+        value::ArrayEnumerator enumerator(arrayType, arrayValue);
+        return {false, value::TypeTags::Boolean, value::bitcastFrom<bool>(enumerator.atEnd())};
+    } else {
+        // Earlier in this function we bailed out if the `arrayType` wasn't Array, ArraySet or
+        // bsonArray, so it should be impossible to reach this point.
+        MONGO_UNREACHABLE
+    }
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDateAdd(ArityType arity) {
+    invariant(arity == 5);
+
+    auto [timezoneDBOwn, timezoneDBTag, timezoneDBVal] = getFromStack(0);
+    if (timezoneDBTag != value::TypeTags::timeZoneDB) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto timezoneDB = value::getTimeZoneDBView(timezoneDBVal);
+
+    auto [startDateOwn, startDateTag, startDateVal] = getFromStack(1);
+    if (!coercibleToDate(startDateTag)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto startDate = getDate(startDateTag, startDateVal);
+
+    auto [unitOwn, unitTag, unitVal] = getFromStack(2);
+    if (!value::isString(unitTag)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    std::string unitStr{value::getStringView(unitTag, unitVal)};
+    if (!isValidTimeUnit(unitStr)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto unit = parseTimeUnit(unitStr);
+
+    auto [amountOwn, amountTag, amountVal] = getFromStack(3);
+    if (amountTag != value::TypeTags::NumberInt64) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto amount = value::bitcastTo<int64_t>(amountVal);
+
+    auto [timezoneOwn, timezoneTag, timezoneVal] = getFromStack(4);
+    if (!value::isString(timezoneTag) || !isValidTimezone(timezoneTag, timezoneVal, timezoneDB)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+    auto timezone = getTimezone(timezoneTag, timezoneVal, timezoneDB);
+
+    auto resDate = dateAdd(startDate, unit, amount, timezone);
+    return {
+        false, value::TypeTags::Date, value::bitcastFrom<int64_t>(resDate.toMillisSinceEpoch())};
+}
+
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builtin f,
                                                                           ArityType arity) {
     switch (f) {
+        case Builtin::dateDiff:
+            return builtinDateDiff(arity);
         case Builtin::dateParts:
             return builtinDate(arity);
         case Builtin::datePartsWeekYear:
@@ -2379,6 +2614,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builti
             return builtinIndexOfBytes(arity);
         case Builtin::indexOfCP:
             return builtinIndexOfCP(arity);
+        case Builtin::isTimeUnit:
+            return builtinIsTimeUnit(arity);
         case Builtin::isTimezone:
             return builtinIsTimezone(arity);
         case Builtin::setUnion:
@@ -2397,6 +2634,12 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builti
             return builtinRegexFindAll(arity);
         case Builtin::shardFilter:
             return builtinShardFilter(arity);
+        case Builtin::extractSubArray:
+            return builtinExtractSubArray(arity);
+        case Builtin::isArrayEmpty:
+            return builtinIsArrayEmpty(arity);
+        case Builtin::dateAdd:
+            return builtinDateAdd(arity);
     }
 
     MONGO_UNREACHABLE;
@@ -3013,6 +3256,34 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                         topStack(false,
                                  value::TypeTags::Boolean,
                                  value::bitcastFrom<bool>(value::isRecordId(tag)));
+                    }
+
+                    if (owned) {
+                        value::releaseValue(tag, val);
+                    }
+                    break;
+                }
+                case Instruction::isMinKey: {
+                    auto [owned, tag, val] = getFromStack(0);
+
+                    if (tag != value::TypeTags::Nothing) {
+                        topStack(false,
+                                 value::TypeTags::Boolean,
+                                 value::bitcastFrom<bool>(tag == value::TypeTags::MinKey));
+                    }
+
+                    if (owned) {
+                        value::releaseValue(tag, val);
+                    }
+                    break;
+                }
+                case Instruction::isMaxKey: {
+                    auto [owned, tag, val] = getFromStack(0);
+
+                    if (tag != value::TypeTags::Nothing) {
+                        topStack(false,
+                                 value::TypeTags::Boolean,
+                                 value::bitcastFrom<bool>(tag == value::TypeTags::MaxKey));
                     }
 
                     if (owned) {

@@ -369,13 +369,20 @@ public:
         return _options.directoryPerDB;
     }
 
+    StatusWith<Timestamp> pinOldestTimestamp(const std::string& requestingServiceName,
+                                             Timestamp requestedTimestamp,
+                                             bool roundUpIfTooOld) override;
+
+    void unpinOldestTimestamp(const std::string& requestingServiceName) override;
+
 private:
     using CollIter = std::list<std::string>::iterator;
 
     void _initCollection(OperationContext* opCtx,
                          RecordId catalogId,
                          const NamespaceString& nss,
-                         bool forRepair);
+                         bool forRepair,
+                         Timestamp minVisibleTs);
 
     Status _dropCollectionsNoTimestamp(OperationContext* opCtx,
                                        std::vector<NamespaceString>& toDrop);

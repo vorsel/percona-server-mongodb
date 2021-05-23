@@ -41,6 +41,7 @@
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/variables.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/cursor_response.h"
@@ -51,6 +52,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/stats/server_read_concern_metrics.h"
 #include "mongo/db/storage/storage_engine.h"
 #include "mongo/db/transaction_participant.h"
@@ -68,8 +70,7 @@ std::unique_ptr<QueryRequest> parseCmdObjectToQueryRequest(OperationContext* opC
                                                            NamespaceString nss,
                                                            BSONObj cmdObj,
                                                            bool isExplain) {
-    auto qr = uassertStatusOK(
-        QueryRequest::makeFromFindCommand(std::move(nss), std::move(cmdObj), isExplain));
+    auto qr = QueryRequest::makeFromFindCommand(std::move(cmdObj), isExplain, std::move(nss));
     if (!qr->getLegacyRuntimeConstants()) {
         qr->setLegacyRuntimeConstants(Variables::generateRuntimeConstants(opCtx));
     }
@@ -266,16 +267,17 @@ public:
                 const auto& qr = cq->getQueryRequest();
                 auto viewAggregationCommand = uassertStatusOK(qr.asAggregationCommand());
 
+                auto viewAggCmd = OpMsgRequest::fromDBAndBody(_dbName, viewAggregationCommand).body;
                 // Create the agg request equivalent of the find operation, with the explain
                 // verbosity included.
                 auto aggRequest = uassertStatusOK(
-                    AggregationRequest::parseFromBSON(nss, viewAggregationCommand, verbosity));
+                    aggregation_request_helper::parseFromBSON(nss, viewAggCmd, verbosity));
 
                 try {
                     // An empty PrivilegeVector is acceptable because these privileges are only
                     // checked on getMore and explain will not open a cursor.
                     uassertStatusOK(runAggregate(
-                        opCtx, nss, aggRequest, viewAggregationCommand, PrivilegeVector(), result));
+                        opCtx, nss, aggRequest, viewAggCmd, PrivilegeVector(), result));
                 } catch (DBException& error) {
                     if (error.code() == ErrorCodes::InvalidPipelineOperator) {
                         uasserted(ErrorCodes::InvalidPipelineOperator,
@@ -465,6 +467,7 @@ public:
             PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
             std::uint64_t numResults = 0;
             bool stashedResult = false;
+            ResourceConsumption::DocumentUnitCounter docUnitsReturned;
 
             try {
                 while (!FindCommon::enoughForFirstBatch(originalQR, numResults) &&
@@ -483,6 +486,7 @@ public:
                     // Add result to output buffer.
                     firstBatch.append(obj);
                     numResults++;
+                    docUnitsReturned.observeOne(obj.objsize());
                 }
             } catch (DBException& exception) {
                 firstBatch.abandon();
@@ -549,6 +553,11 @@ public:
 
             // Generate the response object to send to the client.
             firstBatch.done(cursorId, nss.ns());
+
+            // Increment this metric once we have generated a response and we know it will return
+            // documents.
+            auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+            metricsCollector.incrementDocUnitsReturned(docUnitsReturned);
         }
 
         void appendMirrorableRequest(BSONObjBuilder* bob) const override {

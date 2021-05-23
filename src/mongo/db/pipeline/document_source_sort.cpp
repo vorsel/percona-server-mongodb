@@ -97,15 +97,9 @@ DocumentSource::GetNextResult DocumentSourceSort::doGetNext() {
 void DocumentSourceSort::serializeToArray(
     std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
     uint64_t limit = _sortExecutor->getLimit();
-    if (explain) {  // always one Value for combined $sort + $limit
-        array.push_back(Value(DOC(
-            kStageName << DOC("sortKey"
-                              << _sortExecutor->sortPattern().serialize(
-                                     SortPattern::SortKeySerialization::kForExplain)
-                              << "limit"
-                              << (_sortExecutor->hasLimit() ? Value(static_cast<long long>(limit))
-                                                            : Value())))));
-    } else {  // one Value for $sort and maybe a Value for $limit
+
+
+    if (!explain) {  // one Value for $sort and maybe a Value for $limit
         MutableDocument inner(_sortExecutor->sortPattern().serialize(
             SortPattern::SortKeySerialization::kForPipelineSerialization));
         array.push_back(Value(DOC(kStageName << inner.freeze())));
@@ -114,7 +108,26 @@ void DocumentSourceSort::serializeToArray(
             auto limitSrc = DocumentSourceLimit::create(pExpCtx, limit);
             limitSrc->serializeToArray(array);
         }
+        return;
     }
+
+    MutableDocument mutDoc(
+        DOC(kStageName << DOC("sortKey"
+                              << _sortExecutor->sortPattern().serialize(
+                                     SortPattern::SortKeySerialization::kForExplain)
+                              << "limit"
+                              << (_sortExecutor->hasLimit() ? Value(static_cast<long long>(limit))
+                                                            : Value()))));
+
+    if (explain >= ExplainOptions::Verbosity::kExecStats) {
+        auto& stats = _sortExecutor->stats();
+
+        mutDoc["totalDataSizeSortedBytesEstimate"] =
+            Value(static_cast<long long>(stats.totalDataSizeBytes));
+        mutDoc["usedDisk"] = Value(stats.spills > 0 ? true : false);
+    }
+
+    array.push_back(Value(mutDoc.freeze()));
 }
 
 boost::optional<long long> DocumentSourceSort::getLimit() const {

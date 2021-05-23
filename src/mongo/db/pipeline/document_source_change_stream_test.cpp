@@ -205,7 +205,7 @@ public:
                              const boost::optional<Document> expectedInvalidate = {},
                              const std::vector<repl::OplogEntry> transactionEntries = {},
                              std::vector<Document> documentsForLookup = {}) {
-        vector<intrusive_ptr<DocumentSource>> stages = makeStages(entry.toBSON(), spec);
+        vector<intrusive_ptr<DocumentSource>> stages = makeStages(entry.getEntry().toBSON(), spec);
         auto closeCursor = stages.back();
 
         getExpCtx()->mongoProcessInterface = std::make_unique<MockMongoInterface>(
@@ -273,7 +273,7 @@ public:
     }
 
     vector<intrusive_ptr<DocumentSource>> makeStages(const OplogEntry& entry) {
-        return makeStages(entry.toBSON(), kDefaultSpec);
+        return makeStages(entry.getEntry().toBSON(), kDefaultSpec);
     }
 
     OplogEntry createCommand(const BSONObj& oField,
@@ -319,7 +319,7 @@ public:
                                              testUuid(),
                                              boost::none,  // fromMigrate
                                              BSONObj());
-        BSONObjBuilder builder(baseOplogEntry.toBSON());
+        BSONObjBuilder builder(baseOplogEntry.getEntry().toBSON());
         builder.append("lsid", lsid.toBSON());
         builder.append("txnNumber", 0LL);
         BSONObj oplogEntry = builder.done();
@@ -371,24 +371,25 @@ public:
         boost::optional<repl::OpTime> prevOpTime = {},
         boost::optional<repl::OpTime> preImageOpTime = boost::none) {
         long long hash = 1LL;
-        return repl::OplogEntry(opTime ? *opTime : kDefaultOpTime,  // optime
-                                hash,                               // hash
-                                opType,                             // opType
-                                nss,                                // namespace
-                                uuid,                               // uuid
-                                fromMigrate,                        // fromMigrate
-                                repl::OplogEntry::kOplogVersion,    // version
-                                object,                             // o
-                                object2,                            // o2
-                                sessionInfo,                        // sessionInfo
-                                boost::none,                        // upsert
-                                Date_t(),                           // wall clock time
-                                boost::none,                        // statement id
-                                prevOpTime,      // optime of previous write within same transaction
-                                preImageOpTime,  // pre-image optime
-                                boost::none,     // post-image optime
-                                boost::none,     // ShardId of resharding recipient
-                                boost::none);    // _id
+        return {
+            repl::DurableOplogEntry(opTime ? *opTime : kDefaultOpTime,  // optime
+                                    hash,                               // hash
+                                    opType,                             // opType
+                                    nss,                                // namespace
+                                    uuid,                               // uuid
+                                    fromMigrate,                        // fromMigrate
+                                    repl::OplogEntry::kOplogVersion,    // version
+                                    object,                             // o
+                                    object2,                            // o2
+                                    sessionInfo,                        // sessionInfo
+                                    boost::none,                        // upsert
+                                    Date_t(),                           // wall clock time
+                                    boost::none,                        // statement id
+                                    prevOpTime,  // optime of previous write within same transaction
+                                    preImageOpTime,  // pre-image optime
+                                    boost::none,     // post-image optime
+                                    boost::none,     // ShardId of resharding recipient
+                                    boost::none)};   // _id
     }
 
     /**
@@ -480,7 +481,7 @@ TEST_F(ChangeStreamStageTest, ShouldRejectBothStartAtOperationTimeAndResumeAfter
     // Need to put the collection in the collection catalog so the resume token is valid.
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(expCtx->opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(testUuid(), std::move(collection));
+        catalog.registerCollection(expCtx->opCtx, testUuid(), std::move(collection));
     });
 
     ASSERT_THROWS_CODE(
@@ -502,7 +503,7 @@ TEST_F(ChangeStreamStageTest, ShouldRejectBothStartAfterAndResumeAfterOptions) {
     // Need to put the collection in the collection catalog so the resume token is validcollection
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(testUuid(), std::move(collection));
+        catalog.registerCollection(opCtx, testUuid(), std::move(collection));
     });
 
     ASSERT_THROWS_CODE(
@@ -525,7 +526,7 @@ TEST_F(ChangeStreamStageTest, ShouldRejectBothStartAtOperationTimeAndStartAfterO
     // Need to put the collection in the collection catalog so the resume token is valid.
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(testUuid(), std::move(collection));
+        catalog.registerCollection(opCtx, testUuid(), std::move(collection));
     });
 
     ASSERT_THROWS_CODE(
@@ -547,7 +548,7 @@ TEST_F(ChangeStreamStageTest, ShouldRejectResumeAfterWithResumeTokenMissingUUID)
     // Need to put the collection in the collection catalog so the resume token is valid.
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(testUuid(), std::move(collection));
+        catalog.registerCollection(opCtx, testUuid(), std::move(collection));
     });
 
     ASSERT_THROWS_CODE(
@@ -1213,24 +1214,24 @@ TEST_F(ChangeStreamStageTest, CommitCommandReturnsOperationsFromPreparedTransact
     sessionInfo.setTxnNumber(1);
     sessionInfo.setSessionId(makeLogicalSessionIdForTest());
     auto oplogEntry =
-        repl::OplogEntry(kDefaultOpTime,                   // optime
-                         1LL,                              // hash
-                         OpTypeEnum::kCommand,             // opType
-                         nss.getCommandNS(),               // namespace
-                         boost::none,                      // uuid
-                         boost::none,                      // fromMigrate
-                         repl::OplogEntry::kOplogVersion,  // version
-                         BSON("commitTransaction" << 1),   // o
-                         boost::none,                      // o2
-                         sessionInfo,                      // sessionInfo
-                         boost::none,                      // upsert
-                         Date_t(),                         // wall clock time
-                         boost::none,                      // statement id
-                         applyOpsOpTime,  // optime of previous write within same transaction
-                         boost::none,     // pre-image optime
-                         boost::none,     // post-image optime
-                         boost::none,     // ShardId of resharding recipient
-                         boost::none);    // _id
+        repl::DurableOplogEntry(kDefaultOpTime,                   // optime
+                                1LL,                              // hash
+                                OpTypeEnum::kCommand,             // opType
+                                nss.getCommandNS(),               // namespace
+                                boost::none,                      // uuid
+                                boost::none,                      // fromMigrate
+                                repl::OplogEntry::kOplogVersion,  // version
+                                BSON("commitTransaction" << 1),   // o
+                                boost::none,                      // o2
+                                sessionInfo,                      // sessionInfo
+                                boost::none,                      // upsert
+                                Date_t(),                         // wall clock time
+                                boost::none,                      // statement id
+                                applyOpsOpTime,  // optime of previous write within same transaction
+                                boost::none,     // pre-image optime
+                                boost::none,     // post-image optime
+                                boost::none,     // ShardId of resharding recipient
+                                boost::none);    // _id
 
     // When the DocumentSourceChangeStreamTransform sees the "commitTransaction" oplog entry, we
     // expect it to return the insert op within our 'preparedApplyOps' oplog entry.
@@ -1286,7 +1287,7 @@ TEST_F(ChangeStreamStageTest, TransactionWithMultipleOplogEntries) {
          V{std::vector<Document>{
              D{{"op", "i"_sd}, {"ns", nss.ns()}, {"ui", testUuid()}, {"o", V{D{{"_id", 789}}}}},
          }}},
-        /* The abscence of the "partialTxn" and "prepare" fields indicates that this command commits
+        /* The absence of the "partialTxn" and "prepare" fields indicates that this command commits
            the transaction. */
     };
 
@@ -1365,6 +1366,216 @@ TEST_F(ChangeStreamStageTest, TransactionWithMultipleOplogEntries) {
                                        2));
 }
 
+TEST_F(ChangeStreamStageTest, TransactionWithEmptyOplogEntries) {
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setTxnNumber(1);
+    sessionInfo.setSessionId(makeLogicalSessionIdForTest());
+
+    // Create a transaction that is chained across 5 applyOps oplog entries. The first, third, and
+    // final oplog entries in the transaction chain contain empty applyOps arrays. The test verifies
+    // that change streams (1) correctly detect the transaction chain despite the fact that the
+    // final applyOps, which implicitly commits the transaction, is empty; and (2) behaves correctly
+    // upon encountering empty applyOps at other stages of the transaction chain.
+    repl::OpTime applyOpsOpTime1(Timestamp(100, 1), 1);
+    Document applyOps1{
+        {"applyOps", V{std::vector<Document>{}}},
+        {"partialTxn", true},
+    };
+
+    auto transactionEntry1 = makeOplogEntry(OpTypeEnum::kCommand,
+                                            nss.getCommandNS(),
+                                            applyOps1.toBson(),
+                                            testUuid(),
+                                            boost::none,  // fromMigrate
+                                            boost::none,  // o2 field
+                                            applyOpsOpTime1,
+                                            sessionInfo,
+                                            repl::OpTime());
+
+    repl::OpTime applyOpsOpTime2(Timestamp(100, 2), 1);
+    Document applyOps2{
+        {"applyOps",
+         V{std::vector<Document>{
+             D{{"op", "i"_sd},
+               {"ns", nss.ns()},
+               {"ui", testUuid()},
+               {"o", V{Document{{"_id", 123}}}}},
+         }}},
+        {"partialTxn", true},
+    };
+
+    auto transactionEntry2 = makeOplogEntry(OpTypeEnum::kCommand,
+                                            nss.getCommandNS(),
+                                            applyOps2.toBson(),
+                                            testUuid(),
+                                            boost::none,  // fromMigrate
+                                            boost::none,  // o2 field
+                                            applyOpsOpTime2,
+                                            sessionInfo,
+                                            applyOpsOpTime1);
+
+    repl::OpTime applyOpsOpTime3(Timestamp(100, 3), 1);
+    Document applyOps3{
+        {"applyOps", V{std::vector<Document>{}}},
+        {"partialTxn", true},
+    };
+
+    auto transactionEntry3 = makeOplogEntry(OpTypeEnum::kCommand,
+                                            nss.getCommandNS(),
+                                            applyOps3.toBson(),
+                                            testUuid(),
+                                            boost::none,  // fromMigrate
+                                            boost::none,  // o2 field
+                                            applyOpsOpTime3,
+                                            sessionInfo,
+                                            applyOpsOpTime2);
+
+    repl::OpTime applyOpsOpTime4(Timestamp(100, 4), 1);
+    Document applyOps4{
+        {"applyOps",
+         V{std::vector<Document>{D{{"op", "i"_sd},
+                                   {"ns", nss.ns()},
+                                   {"ui", testUuid()},
+                                   {"o", V{Document{{"_id", 456}}}}}}}},
+        {"partialTxn", true},
+    };
+
+    auto transactionEntry4 = makeOplogEntry(OpTypeEnum::kCommand,
+                                            nss.getCommandNS(),
+                                            applyOps4.toBson(),
+                                            testUuid(),
+                                            boost::none,  // fromMigrate
+                                            boost::none,  // o2 field
+                                            applyOpsOpTime4,
+                                            sessionInfo,
+                                            applyOpsOpTime3);
+
+    repl::OpTime applyOpsOpTime5(Timestamp(100, 5), 1);
+    Document applyOps5{
+        {"applyOps", V{std::vector<Document>{}}},
+        /* The absence of the "partialTxn" and "prepare" fields indicates that this command commits
+           the transaction. */
+    };
+
+    auto transactionEntry5 = makeOplogEntry(OpTypeEnum::kCommand,
+                                            nss.getCommandNS(),
+                                            applyOps5.toBson(),
+                                            testUuid(),
+                                            boost::none,  // fromMigrate
+                                            boost::none,  // o2 field
+                                            applyOpsOpTime5,
+                                            sessionInfo,
+                                            applyOpsOpTime4);
+
+    // We do not use the checkTransformation() pattern that other tests use since we expect multiple
+    // documents to be returned from one applyOps.
+    auto stages = makeStages(transactionEntry5);
+    auto transform = stages[2].get();
+    invariant(dynamic_cast<DocumentSourceChangeStreamTransform*>(transform) != nullptr);
+
+    // Populate the MockTransactionHistoryEditor in reverse chronological order.
+    getExpCtx()->mongoProcessInterface =
+        std::make_unique<MockMongoInterface>(std::vector<FieldPath>{},
+                                             std::vector<repl::OplogEntry>{transactionEntry5,
+                                                                           transactionEntry4,
+                                                                           transactionEntry3,
+                                                                           transactionEntry2,
+                                                                           transactionEntry1});
+
+    // We should get three documents from the change stream, based on the documents in the two
+    // applyOps entries.
+    auto next = transform->getNext();
+    ASSERT(next.isAdvanced());
+    auto nextDoc = next.releaseDocument();
+    ASSERT_EQ(nextDoc[DSChangeStream::kTxnNumberField].getLong(), *sessionInfo.getTxnNumber());
+    ASSERT_EQ(nextDoc[DSChangeStream::kOperationTypeField].getString(),
+              DSChangeStream::kInsertOpType);
+    ASSERT_EQ(nextDoc[DSChangeStream::kFullDocumentField]["_id"].getInt(), 123);
+    ASSERT_EQ(
+        nextDoc["lsid"].getDocument().toBson().woCompare(sessionInfo.getSessionId()->toBSON()), 0);
+    auto resumeToken = ResumeToken::parse(nextDoc["_id"].getDocument()).toDocument();
+    ASSERT_DOCUMENT_EQ(resumeToken,
+                       makeResumeToken(applyOpsOpTime5.getTimestamp(),
+                                       testUuid(),
+                                       V{D{}},
+                                       ResumeTokenData::FromInvalidate::kNotFromInvalidate,
+                                       0));
+
+    next = transform->getNext();
+    ASSERT(next.isAdvanced());
+    nextDoc = next.releaseDocument();
+    ASSERT_EQ(nextDoc[DSChangeStream::kTxnNumberField].getLong(), *sessionInfo.getTxnNumber());
+    ASSERT_EQ(nextDoc[DSChangeStream::kOperationTypeField].getString(),
+              DSChangeStream::kInsertOpType);
+    ASSERT_EQ(nextDoc[DSChangeStream::kFullDocumentField]["_id"].getInt(), 456);
+    ASSERT_EQ(
+        nextDoc["lsid"].getDocument().toBson().woCompare(sessionInfo.getSessionId()->toBSON()), 0);
+    resumeToken = ResumeToken::parse(nextDoc["_id"].getDocument()).toDocument();
+    ASSERT_DOCUMENT_EQ(resumeToken,
+                       makeResumeToken(applyOpsOpTime5.getTimestamp(),
+                                       testUuid(),
+                                       V{D{}},
+                                       ResumeTokenData::FromInvalidate::kNotFromInvalidate,
+                                       1));
+}
+
+TEST_F(ChangeStreamStageTest, TransactionWithOnlyEmptyOplogEntries) {
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setTxnNumber(1);
+    sessionInfo.setSessionId(makeLogicalSessionIdForTest());
+
+    // Create a transaction that is chained across 2 applyOps oplog entries. This test verifies that
+    // a change stream correctly reads an empty transaction and does not observe any events from it.
+    repl::OpTime applyOpsOpTime1(Timestamp(100, 1), 1);
+    Document applyOps1{
+        {"applyOps", V{std::vector<Document>{}}},
+        {"partialTxn", true},
+    };
+
+    auto transactionEntry1 = makeOplogEntry(OpTypeEnum::kCommand,
+                                            nss.getCommandNS(),
+                                            applyOps1.toBson(),
+                                            testUuid(),
+                                            boost::none,  // fromMigrate
+                                            boost::none,  // o2 field
+                                            applyOpsOpTime1,
+                                            sessionInfo,
+                                            repl::OpTime());
+
+    repl::OpTime applyOpsOpTime2(Timestamp(100, 2), 1);
+    Document applyOps2{
+        {"applyOps", V{std::vector<Document>{}}},
+        /* The absence of the "partialTxn" and "prepare" fields indicates that this command commits
+           the transaction. */
+    };
+
+    auto transactionEntry2 = makeOplogEntry(OpTypeEnum::kCommand,
+                                            nss.getCommandNS(),
+                                            applyOps2.toBson(),
+                                            testUuid(),
+                                            boost::none,  // fromMigrate
+                                            boost::none,  // o2 field
+                                            applyOpsOpTime2,
+                                            sessionInfo,
+                                            applyOpsOpTime1);
+
+    // We do not use the checkTransformation() pattern that other tests use since we expect multiple
+    // documents to be returned from one applyOps.
+    auto stages = makeStages(transactionEntry2);
+    auto transform = stages[2].get();
+    invariant(dynamic_cast<DocumentSourceChangeStreamTransform*>(transform) != nullptr);
+
+    // Populate the MockTransactionHistoryEditor in reverse chronological order.
+    getExpCtx()->mongoProcessInterface = std::make_unique<MockMongoInterface>(
+        std::vector<FieldPath>{},
+        std::vector<repl::OplogEntry>{transactionEntry2, transactionEntry1});
+
+    // We should get three documents from the change stream, based on the documents in the two
+    // applyOps entries.
+    auto next = transform->getNext();
+    ASSERT(!next.isAdvanced());
+}
+
 TEST_F(ChangeStreamStageTest, PreparedTransactionWithMultipleOplogEntries) {
     OperationSessionInfo sessionInfo;
     sessionInfo.setTxnNumber(1);
@@ -1411,25 +1622,25 @@ TEST_F(ChangeStreamStageTest, PreparedTransactionWithMultipleOplogEntries) {
                                             applyOpsOpTime1);
 
     // Create an oplog entry representing the commit for the prepared transaction.
-    auto commitEntry =
-        repl::OplogEntry(kDefaultOpTime,                   // optime
-                         1LL,                              // hash
-                         OpTypeEnum::kCommand,             // opType
-                         nss.getCommandNS(),               // namespace
-                         boost::none,                      // uuid
-                         boost::none,                      // fromMigrate
-                         repl::OplogEntry::kOplogVersion,  // version
-                         BSON("commitTransaction" << 1),   // o
-                         boost::none,                      // o2
-                         sessionInfo,                      // sessionInfo
-                         boost::none,                      // upsert
-                         Date_t(),                         // wall clock time
-                         boost::none,                      // statement id
-                         applyOpsOpTime2,  // optime of previous write within same transaction
-                         boost::none,      // pre-image optime
-                         boost::none,      // post-image optime
-                         boost::none,      // ShardId of resharding recipient
-                         boost::none);     // _id
+    auto commitEntry = repl::DurableOplogEntry(
+        kDefaultOpTime,                   // optime
+        1LL,                              // hash
+        OpTypeEnum::kCommand,             // opType
+        nss.getCommandNS(),               // namespace
+        boost::none,                      // uuid
+        boost::none,                      // fromMigrate
+        repl::OplogEntry::kOplogVersion,  // version
+        BSON("commitTransaction" << 1),   // o
+        boost::none,                      // o2
+        sessionInfo,                      // sessionInfo
+        boost::none,                      // upsert
+        Date_t(),                         // wall clock time
+        boost::none,                      // statement id
+        applyOpsOpTime2,                  // optime of previous write within same transaction
+        boost::none,                      // pre-image optime
+        boost::none,                      // post-image optime
+        boost::none,                      // ShardId of resharding recipient
+        boost::none);                     // _id
 
     // We do not use the checkTransformation() pattern that other tests use since we expect multiple
     // documents to be returned from one applyOps.
@@ -1497,6 +1708,126 @@ TEST_F(ChangeStreamStageTest, PreparedTransactionWithMultipleOplogEntries) {
                         V{D{}},
                         ResumeTokenData::FromInvalidate::kNotFromInvalidate,
                         2));
+
+    next = transform->getNext();
+    ASSERT(!next.isAdvanced());
+}
+
+TEST_F(ChangeStreamStageTest, PreparedTransactionEndingWithEmptyApplyOps) {
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setTxnNumber(1);
+    sessionInfo.setSessionId(makeLogicalSessionIdForTest());
+
+    // Create two applyOps entries that together represent a whole transaction.
+    repl::OpTime applyOpsOpTime1(Timestamp(99, 1), 1);
+    Document applyOps1{
+        {"applyOps",
+         V{std::vector<Document>{
+             D{{"op", "i"_sd}, {"ns", nss.ns()}, {"ui", testUuid()}, {"o", V{D{{"_id", 123}}}}},
+             D{{"op", "i"_sd}, {"ns", nss.ns()}, {"ui", testUuid()}, {"o", V{D{{"_id", 456}}}}},
+         }}},
+        {"partialTxn", true},
+    };
+
+    auto transactionEntry1 = makeOplogEntry(OpTypeEnum::kCommand,
+                                            nss.getCommandNS(),
+                                            applyOps1.toBson(),
+                                            testUuid(),
+                                            boost::none,  // fromMigrate
+                                            boost::none,  // o2 field
+                                            applyOpsOpTime1,
+                                            sessionInfo,
+                                            repl::OpTime());
+
+    repl::OpTime applyOpsOpTime2(Timestamp(99, 2), 1);
+    Document applyOps2{
+        {"applyOps", V{std::vector<Document>{}}},
+        {"prepare", true},
+    };
+
+    // The second applyOps is empty.
+    auto transactionEntry2 = makeOplogEntry(OpTypeEnum::kCommand,
+                                            nss.getCommandNS(),
+                                            applyOps2.toBson(),
+                                            testUuid(),
+                                            boost::none,  // fromMigrate
+                                            boost::none,  // o2 field
+                                            applyOpsOpTime2,
+                                            sessionInfo,
+                                            applyOpsOpTime1);
+
+    // Create an oplog entry representing the commit for the prepared transaction.
+    auto commitEntry = repl::DurableOplogEntry(
+        kDefaultOpTime,                   // optime
+        1LL,                              // hash
+        OpTypeEnum::kCommand,             // opType
+        nss.getCommandNS(),               // namespace
+        boost::none,                      // uuid
+        boost::none,                      // fromMigrate
+        repl::OplogEntry::kOplogVersion,  // version
+        BSON("commitTransaction" << 1),   // o
+        boost::none,                      // o2
+        sessionInfo,                      // sessionInfo
+        boost::none,                      // upsert
+        Date_t(),                         // wall clock time
+        boost::none,                      // statement id
+        applyOpsOpTime2,                  // optime of previous write within same transaction
+        boost::none,                      // pre-image optime
+        boost::none,                      // post-image optime
+        boost::none,                      // ShardId of resharding recipient
+        boost::none);                     // _id
+
+    // We do not use the checkTransformation() pattern that other tests use since we expect multiple
+    // documents to be returned from one applyOps.
+    auto stages = makeStages(commitEntry);
+    auto transform = stages[2].get();
+    invariant(dynamic_cast<DocumentSourceChangeStreamTransform*>(transform) != nullptr);
+
+    // Populate the MockTransactionHistoryEditor in reverse chronological order.
+    getExpCtx()->mongoProcessInterface = std::make_unique<MockMongoInterface>(
+        std::vector<FieldPath>{},
+        std::vector<repl::OplogEntry>{commitEntry, transactionEntry2, transactionEntry1});
+
+    // We should get two documents from the change stream, based on the documents in the non-empty
+    // applyOps entry.
+    auto next = transform->getNext();
+    ASSERT(next.isAdvanced());
+    auto nextDoc = next.releaseDocument();
+    ASSERT_EQ(nextDoc[DSChangeStream::kTxnNumberField].getLong(), *sessionInfo.getTxnNumber());
+    ASSERT_EQ(nextDoc[DSChangeStream::kOperationTypeField].getString(),
+              DSChangeStream::kInsertOpType);
+    ASSERT_EQ(nextDoc[DSChangeStream::kFullDocumentField]["_id"].getInt(), 123);
+    ASSERT_EQ(
+        nextDoc["lsid"].getDocument().toBson().woCompare(sessionInfo.getSessionId()->toBSON()), 0);
+    auto resumeToken = ResumeToken::parse(nextDoc["_id"].getDocument()).toDocument();
+    ASSERT_DOCUMENT_EQ(
+        resumeToken,
+        makeResumeToken(kDefaultOpTime.getTimestamp(),  // Timestamp of the commitCommand.
+                        testUuid(),
+                        V{D{}},
+                        ResumeTokenData::FromInvalidate::kNotFromInvalidate,
+                        0));
+
+    next = transform->getNext();
+    ASSERT(next.isAdvanced());
+    nextDoc = next.releaseDocument();
+    ASSERT_EQ(nextDoc[DSChangeStream::kTxnNumberField].getLong(), *sessionInfo.getTxnNumber());
+    ASSERT_EQ(nextDoc[DSChangeStream::kOperationTypeField].getString(),
+              DSChangeStream::kInsertOpType);
+    ASSERT_EQ(nextDoc[DSChangeStream::kFullDocumentField]["_id"].getInt(), 456);
+    ASSERT_EQ(
+        nextDoc["lsid"].getDocument().toBson().woCompare(sessionInfo.getSessionId()->toBSON()), 0);
+    resumeToken = ResumeToken::parse(nextDoc["_id"].getDocument()).toDocument();
+    ASSERT_DOCUMENT_EQ(
+        resumeToken,
+        makeResumeToken(kDefaultOpTime.getTimestamp(),  // Timestamp of the commitCommand.
+                        testUuid(),
+                        V{D{}},
+                        ResumeTokenData::FromInvalidate::kNotFromInvalidate,
+                        1));
+
+    next = transform->getNext();
+    ASSERT(!next.isAdvanced());
 }
 
 TEST_F(ChangeStreamStageTest, TransformApplyOps) {
@@ -1710,7 +2041,7 @@ TEST_F(ChangeStreamStageTest, DocumentKeyShouldIncludeShardKeyFromResumeToken) {
 
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(uuid, std::move(collection));
+        catalog.registerCollection(getExpCtx()->opCtx, uuid, std::move(collection));
     });
 
 
@@ -1758,7 +2089,7 @@ TEST_F(ChangeStreamStageTest, DocumentKeyShouldNotIncludeShardKeyFieldsIfNotPres
 
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(uuid, std::move(collection));
+        catalog.registerCollection(getExpCtx()->opCtx, uuid, std::move(collection));
     });
 
     BSONObj o2 = BSON("_id" << 1 << "shardKey" << 2);
@@ -1802,7 +2133,7 @@ TEST_F(ChangeStreamStageTest, ResumeAfterFailsIfResumeTokenDoesNotContainUUID) {
 
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(uuid, std::move(collection));
+        catalog.registerCollection(getExpCtx()->opCtx, uuid, std::move(collection));
     });
 
     // Create a resume token from only the timestamp.
@@ -1857,7 +2188,7 @@ TEST_F(ChangeStreamStageTest, ResumeAfterWithTokenFromInvalidateShouldFail) {
     // Need to put the collection in the collection catalog so the resume token is valid.
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(expCtx->opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(testUuid(), std::move(collection));
+        catalog.registerCollection(getExpCtx()->opCtx, testUuid(), std::move(collection));
     });
 
     const auto resumeTokenInvalidate =
@@ -1884,7 +2215,7 @@ TEST_F(ChangeStreamStageTest, UsesResumeTokenAsSortKeyIfNeedsMergeIsFalse) {
                                  boost::none,                   // fromMigrate
                                  boost::none);                  // o2
 
-    auto stages = makeStages(insert.toBSON(), kDefaultSpec);
+    auto stages = makeStages(insert.getEntry().toBSON(), kDefaultSpec);
 
     getExpCtx()->mongoProcessInterface =
         std::make_unique<MockMongoInterface>(std::vector<FieldPath>{{"x"}, {"_id"}});
@@ -2212,7 +2543,7 @@ TEST_F(ChangeStreamStageTest, TransformPreImageForDelete) {
     // entry before it so that we know we are finding the pre-image based on the given timestamp.
     repl::OpTime dummyOpTime{preImageOpTime.getTimestamp(), repl::OpTime::kInitialTerm};
     std::vector<Document> documentsForLookup = {Document{dummyOpTime.toBSON()},
-                                                Document{preImageEntry.toBSON()}};
+                                                Document{preImageEntry.getEntry().toBSON()}};
 
     // When run with {fullDocumentBeforeChange: "off"}, we do not see a pre-image even if available.
     auto spec = BSON("$changeStream" << BSON("fullDocumentBeforeChange"
@@ -2301,7 +2632,7 @@ TEST_F(ChangeStreamStageTest, TransformPreImageForUpdate) {
     // entry before it so that we know we are finding the pre-image based on the given timestamp.
     repl::OpTime dummyOpTime{preImageOpTime.getTimestamp(), repl::OpTime::kInitialTerm};
     std::vector<Document> documentsForLookup = {Document{dummyOpTime.toBSON()},
-                                                Document{preImageEntry.toBSON()}};
+                                                Document{preImageEntry.getEntry().toBSON()}};
 
     // When run with {fullDocumentBeforeChange: "off"}, we do not see a pre-image even if available.
     auto spec = BSON("$changeStream" << BSON("fullDocumentBeforeChange"
@@ -2398,7 +2729,7 @@ TEST_F(ChangeStreamStageTest, TransformPreImageForReplace) {
     // entry before it so that we know we are finding the pre-image based on the given timestamp.
     repl::OpTime dummyOpTime{preImageOpTime.getTimestamp(), repl::OpTime::kInitialTerm};
     std::vector<Document> documentsForLookup = {Document{dummyOpTime.toBSON()},
-                                                Document{preImageEntry.toBSON()}};
+                                                Document{preImageEntry.getEntry().toBSON()}};
 
     // When run with {fullDocumentBeforeChange: "off"}, we do not see a pre-image even if available.
     auto spec = BSON("$changeStream" << BSON("fullDocumentBeforeChange"
@@ -2519,7 +2850,7 @@ TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldIncludeShardKeyFromResumeToken)
 
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(uuid, std::move(collection));
+        catalog.registerCollection(getExpCtx()->opCtx, uuid, std::move(collection));
     });
 
     BSONObj o2 = BSON("_id" << 1 << "shardKey" << 2);
@@ -2557,7 +2888,7 @@ TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldNotIncludeShardKeyFieldsIfNotPr
 
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(uuid, std::move(collection));
+        catalog.registerCollection(getExpCtx()->opCtx, uuid, std::move(collection));
     });
 
     BSONObj o2 = BSON("_id" << 1 << "shardKey" << 2);
@@ -2596,7 +2927,7 @@ TEST_F(ChangeStreamStageDBTest, DocumentKeyShouldNotIncludeShardKeyIfResumeToken
 
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(uuid, std::move(collection));
+        catalog.registerCollection(getExpCtx()->opCtx, uuid, std::move(collection));
     });
 
     // Create a resume token from only the timestamp.
@@ -2634,7 +2965,7 @@ TEST_F(ChangeStreamStageDBTest, ResumeAfterWithTokenFromInvalidateShouldFail) {
     // Need to put the collection in the collection catalog so the resume token is valid.
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(expCtx->opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(testUuid(), std::move(collection));
+        catalog.registerCollection(getExpCtx()->opCtx, testUuid(), std::move(collection));
     });
 
     const auto resumeTokenInvalidate =
@@ -2657,7 +2988,7 @@ TEST_F(ChangeStreamStageDBTest, ResumeAfterWithTokenFromDropDatabase) {
 
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(uuid, std::move(collection));
+        catalog.registerCollection(getExpCtx()->opCtx, uuid, std::move(collection));
     });
 
     // Create a resume token from only the timestamp, similar to a 'dropDatabase' entry.
@@ -2688,7 +3019,7 @@ TEST_F(ChangeStreamStageDBTest, StartAfterSucceedsEvenIfResumeTokenDoesNotContai
 
     std::shared_ptr<Collection> collection = std::make_shared<CollectionMock>(nss);
     CollectionCatalog::write(getExpCtx()->opCtx, [&](CollectionCatalog& catalog) {
-        catalog.registerCollection(uuid, std::move(collection));
+        catalog.registerCollection(getExpCtx()->opCtx, uuid, std::move(collection));
     });
 
     // Create a resume token from only the timestamp, similar to a 'dropDatabase' entry.

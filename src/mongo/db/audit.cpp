@@ -138,7 +138,14 @@ void mongo::audit::logReplSetReconfig(Client* client,
 
 void mongo::audit::logApplicationMessage(Client* client, StringData msg) {}
 
+void mongo::audit::logStartupOptions(Client* client, const BSONObj& startupOptions) {}
+
 void mongo::audit::logShutdown(Client* client) {}
+
+void mongo::audit::logLogout(Client* client,
+                             StringData reason,
+                             const BSONArray& initialUsers,
+                             const BSONArray& updatedUsers) {}
 
 void mongo::audit::logCreateIndex(Client* client,
                                   const BSONObj* indexSpec,

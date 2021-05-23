@@ -52,8 +52,6 @@ MONGO_INITIALIZER(SetupOpenSSL)(InitializerContext*) {
     //SSL_library_init();
     //SSL_load_error_strings();
     ERR_load_crypto_strings();
-
-    return Status::OK();
 }
 
 namespace {

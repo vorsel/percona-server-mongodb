@@ -84,24 +84,24 @@ BSONObj concatenate(BSONObj a, const BSONObj& b) {
 
 BSONObj makeNoopOplogEntry(OpTime opTime) {
     auto oplogEntry =
-        repl::OplogEntry(opTime,                           // optime
-                         boost::none,                      // hash
-                         OpTypeEnum ::kNoop,               // opType
-                         NamespaceString("test.t"),        // namespace
-                         boost::none,                      // uuid
-                         boost::none,                      // fromMigrate
-                         repl::OplogEntry::kOplogVersion,  // version
-                         BSONObj(),                        // o
-                         boost::none,                      // o2
-                         {},                               // sessionInfo
-                         boost::none,                      // upsert
-                         Date_t(),                         // wall clock time
-                         boost::none,                      // statement id
-                         boost::none,   // optime of previous write within same transaction
-                         boost::none,   // pre-image optime
-                         boost::none,   // post-image optime
-                         boost::none,   // ShardId of resharding recipient
-                         boost::none);  // _id
+        repl::DurableOplogEntry(opTime,                           // optime
+                                boost::none,                      // hash
+                                OpTypeEnum ::kNoop,               // opType
+                                NamespaceString("test.t"),        // namespace
+                                boost::none,                      // uuid
+                                boost::none,                      // fromMigrate
+                                repl::OplogEntry::kOplogVersion,  // version
+                                BSONObj(),                        // o
+                                boost::none,                      // o2
+                                {},                               // sessionInfo
+                                boost::none,                      // upsert
+                                Date_t(),                         // wall clock time
+                                boost::none,                      // statement id
+                                boost::none,   // optime of previous write within same transaction
+                                boost::none,   // pre-image optime
+                                boost::none,   // post-image optime
+                                boost::none,   // ShardId of resharding recipient
+                                boost::none);  // _id
     return oplogEntry.toBSON();
 }
 
@@ -458,22 +458,26 @@ std::unique_ptr<OplogFetcher> OplogFetcherTest::makeOplogFetcherWithDifferentExe
     BSONObj filter,
     ReadConcernArgs readConcern,
     bool requestResumeToken) {
-    auto oplogFetcher = std::make_unique<OplogFetcher>(
-        executor,
+    OplogFetcher::Config oplogFetcherConfig(
         lastFetched,
         source,
         _createConfig(),
-        std::make_unique<OplogFetcher::OplogFetcherRestartDecisionDefault>(numRestarts),
         requiredRBID,
-        requireFresherSyncSource,
+        defaultBatchSize,
+        requireFresherSyncSource
+            ? OplogFetcher::RequireFresherSyncSource::kRequireFresherSyncSource
+            : OplogFetcher::RequireFresherSyncSource::kDontRequireFresherSyncSource);
+    oplogFetcherConfig.startingPoint = startingPoint;
+    oplogFetcherConfig.queryFilter = filter;
+    oplogFetcherConfig.queryReadConcern = readConcern;
+    oplogFetcherConfig.requestResumeToken = requestResumeToken;
+    auto oplogFetcher = std::make_unique<OplogFetcher>(
+        executor,
+        std::make_unique<OplogFetcher::OplogFetcherRestartDecisionDefault>(numRestarts),
         dataReplicatorExternalState.get(),
         enqueueDocumentsFn,
         fn,
-        defaultBatchSize,
-        startingPoint,
-        filter,
-        readConcern,
-        requestResumeToken);
+        std::move(oplogFetcherConfig));
     oplogFetcher->setCreateClientFn_forTest([this]() {
         const auto autoReconnect = true;
         return std::unique_ptr<DBClientConnection>(

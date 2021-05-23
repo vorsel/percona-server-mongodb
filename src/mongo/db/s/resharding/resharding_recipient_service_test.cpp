@@ -52,6 +52,8 @@ namespace {
 class ReshardingRecipientServiceTest : public CatalogCacheTestFixture,
                                        public ServiceContextMongoDTest {
 public:
+    const ShardKeyPattern kShardKey = ShardKeyPattern(BSON("oldKey" << 1));
+    const OID kOrigEpoch = OID::gen();
     const UUID kOrigUUID = UUID::gen();
     const NamespaceString kOrigNss = NamespaceString("db.foo");
     const ShardKeyPattern kReshardingKey = ShardKeyPattern(BSON("newKey" << 1));
@@ -154,7 +156,7 @@ public:
             return std::vector<BSONObj>{coll.toBSON()};
         }());
         expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
-            ChunkVersion version(1, 0, epoch);
+            ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
 
             ChunkType chunk(tempNss,
                             {skey.getKeyPattern().globalMin(), skey.getKeyPattern().globalMax()},
@@ -167,6 +169,31 @@ public:
         }());
 
         future.default_timed_get();
+    }
+
+    void expectRefreshReturnForOriginalColl(const NamespaceString& origNss,
+                                            const ShardKeyPattern& skey,
+                                            UUID uuid,
+                                            OID epoch) {
+        expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
+            CollectionType coll(origNss, epoch, Date_t::now(), uuid);
+            coll.setKeyPattern(skey.getKeyPattern());
+            coll.setUnique(false);
+            return std::vector<BSONObj>{coll.toBSON()};
+        }());
+
+        expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
+            ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
+
+            ChunkType chunk(origNss,
+                            {skey.getKeyPattern().globalMin(), skey.getKeyPattern().globalMax()},
+                            version,
+                            {"0"});
+            chunk.setName(OID::gen());
+            version.incMinor();
+
+            return std::vector<BSONObj>{chunk.toConfigBSON()};
+        }());
     }
 
     void expectStaleDbVersionError(const NamespaceString& nss, StringData expectedCmdName) {
@@ -240,6 +267,7 @@ TEST_F(ReshardingRecipientServiceTest, CreateLocalReshardingCollectionBasic) {
                                                    << "name"
                                                    << "indexOne")};
     auto future = launchAsync([&] {
+        expectRefreshReturnForOriginalColl(kOrigNss, kShardKey, kOrigUUID, kOrigEpoch);
         expectListCollections(
             kOrigNss,
             kOrigUUID,
@@ -251,8 +279,12 @@ TEST_F(ReshardingRecipientServiceTest, CreateLocalReshardingCollectionBasic) {
         expectListIndexes(kOrigNss, kOrigUUID, indexes, HostAndPort(shards[0].getHost()));
     });
 
-    resharding::createTemporaryReshardingCollectionLocally(
-        operationContext(), kOrigNss, kReshardingUUID, kOrigUUID, kDefaultFetchTimestamp);
+    resharding::createTemporaryReshardingCollectionLocally(operationContext(),
+                                                           kOrigNss,
+                                                           kReshardingNss,
+                                                           kReshardingUUID,
+                                                           kOrigUUID,
+                                                           kDefaultFetchTimestamp);
 
     future.default_timed_get();
 
@@ -286,8 +318,10 @@ TEST_F(ReshardingRecipientServiceTest,
                                                    << "name"
                                                    << "indexOne")};
     auto future = launchAsync([&] {
+        expectRefreshReturnForOriginalColl(kOrigNss, kShardKey, kOrigUUID, kOrigEpoch);
         expectStaleDbVersionError(kOrigNss, "listCollections");
         expectGetDatabase(kOrigNss, shards[1].getHost());
+        expectRefreshReturnForOriginalColl(kOrigNss, kShardKey, kOrigUUID, kOrigEpoch);
         expectListCollections(
             kOrigNss,
             kOrigUUID,
@@ -301,8 +335,12 @@ TEST_F(ReshardingRecipientServiceTest,
         expectListIndexes(kOrigNss, kOrigUUID, indexes, HostAndPort(shards[0].getHost()));
     });
 
-    resharding::createTemporaryReshardingCollectionLocally(
-        operationContext(), kOrigNss, kReshardingUUID, kOrigUUID, kDefaultFetchTimestamp);
+    resharding::createTemporaryReshardingCollectionLocally(operationContext(),
+                                                           kOrigNss,
+                                                           kReshardingNss,
+                                                           kReshardingUUID,
+                                                           kOrigUUID,
+                                                           kDefaultFetchTimestamp);
 
     future.default_timed_get();
 
@@ -351,6 +389,7 @@ TEST_F(ReshardingRecipientServiceTest,
     }
 
     auto future = launchAsync([&] {
+        expectRefreshReturnForOriginalColl(kOrigNss, kShardKey, kOrigUUID, kOrigEpoch);
         expectListCollections(
             kOrigNss,
             kOrigUUID,
@@ -362,8 +401,12 @@ TEST_F(ReshardingRecipientServiceTest,
         expectListIndexes(kOrigNss, kOrigUUID, indexes, HostAndPort(shards[0].getHost()));
     });
 
-    resharding::createTemporaryReshardingCollectionLocally(
-        operationContext(), kOrigNss, kReshardingUUID, kOrigUUID, kDefaultFetchTimestamp);
+    resharding::createTemporaryReshardingCollectionLocally(operationContext(),
+                                                           kOrigNss,
+                                                           kReshardingNss,
+                                                           kReshardingUUID,
+                                                           kOrigUUID,
+                                                           kDefaultFetchTimestamp);
 
     future.default_timed_get();
 
@@ -414,6 +457,7 @@ TEST_F(ReshardingRecipientServiceTest,
     }
 
     auto future = launchAsync([&] {
+        expectRefreshReturnForOriginalColl(kOrigNss, kShardKey, kOrigUUID, kOrigEpoch);
         expectListCollections(
             kOrigNss,
             kOrigUUID,
@@ -425,8 +469,12 @@ TEST_F(ReshardingRecipientServiceTest,
         expectListIndexes(kOrigNss, kOrigUUID, indexes, HostAndPort(shards[0].getHost()));
     });
 
-    resharding::createTemporaryReshardingCollectionLocally(
-        operationContext(), kOrigNss, kReshardingUUID, kOrigUUID, kDefaultFetchTimestamp);
+    resharding::createTemporaryReshardingCollectionLocally(operationContext(),
+                                                           kOrigNss,
+                                                           kReshardingNss,
+                                                           kReshardingUUID,
+                                                           kOrigUUID,
+                                                           kDefaultFetchTimestamp);
 
     future.default_timed_get();
 
@@ -467,6 +515,7 @@ TEST_F(ReshardingRecipientServiceTest,
         operationContext(), kReshardingNss, optionsAndIndexes);
 
     auto future = launchAsync([&] {
+        expectRefreshReturnForOriginalColl(kOrigNss, kShardKey, kOrigUUID, kOrigEpoch);
         expectListCollections(
             kOrigNss,
             kOrigUUID,
@@ -478,8 +527,12 @@ TEST_F(ReshardingRecipientServiceTest,
         expectListIndexes(kOrigNss, kOrigUUID, indexes, HostAndPort(shards[0].getHost()));
     });
 
-    resharding::createTemporaryReshardingCollectionLocally(
-        operationContext(), kOrigNss, kReshardingUUID, kOrigUUID, kDefaultFetchTimestamp);
+    resharding::createTemporaryReshardingCollectionLocally(operationContext(),
+                                                           kOrigNss,
+                                                           kReshardingNss,
+                                                           kReshardingUUID,
+                                                           kOrigUUID,
+                                                           kDefaultFetchTimestamp);
 
     future.default_timed_get();
 

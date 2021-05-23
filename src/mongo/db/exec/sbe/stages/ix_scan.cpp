@@ -34,8 +34,8 @@
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/values/bson.h"
+#include "mongo/db/exec/trial_run_tracker.h"
 #include "mongo/db/index/index_access_method.h"
-#include "mongo/db/repl/replication_coordinator.h"
 
 namespace mongo::sbe {
 IndexScanStage::IndexScanStage(const NamespaceStringOrUUID& name,
@@ -48,8 +48,8 @@ IndexScanStage::IndexScanStage(const NamespaceStringOrUUID& name,
                                boost::optional<value::SlotId> seekKeySlotLow,
                                boost::optional<value::SlotId> seekKeySlotHigh,
                                PlanYieldPolicy* yieldPolicy,
-                               TrialRunProgressTracker* tracker,
-                               PlanNodeId nodeId)
+                               PlanNodeId nodeId,
+                               LockAcquisitionCallback lockAcquisitionCallback)
     : PlanStage(seekKeySlotLow ? "ixseek"_sd : "ixscan"_sd, yieldPolicy, nodeId),
       _name(name),
       _indexName(indexName),
@@ -60,7 +60,7 @@ IndexScanStage::IndexScanStage(const NamespaceStringOrUUID& name,
       _vars(std::move(vars)),
       _seekKeySlotLow(seekKeySlotLow),
       _seekKeySlotHigh(seekKeySlotHigh),
-      _tracker(tracker) {
+      _lockAcquisitionCallback(std::move(lockAcquisitionCallback)) {
     // The valid state is when both boundaries, or none is set, or only low key is set.
     invariant((_seekKeySlotLow && _seekKeySlotHigh) || (!_seekKeySlotLow && !_seekKeySlotHigh) ||
               (_seekKeySlotLow && !_seekKeySlotHigh));
@@ -79,8 +79,8 @@ std::unique_ptr<PlanStage> IndexScanStage::clone() const {
                                             _seekKeySlotLow,
                                             _seekKeySlotHigh,
                                             _yieldPolicy,
-                                            _tracker,
-                                            _commonStats.nodeId);
+                                            _commonStats.nodeId,
+                                            _lockAcquisitionCallback);
 }
 
 void IndexScanStage::prepare(CompileCtx& ctx) {
@@ -129,6 +129,7 @@ void IndexScanStage::doSaveState() {
 
     _coll.reset();
 }
+
 void IndexScanStage::doRestoreState() {
     invariant(_opCtx);
     invariant(!_coll);
@@ -139,9 +140,9 @@ void IndexScanStage::doRestoreState() {
     }
 
     _coll.emplace(_opCtx, _name);
-
-    uassertStatusOK(repl::ReplicationCoordinator::get(_opCtx)->checkCanServeReadsFor(
-        _opCtx, _coll->getNss(), true));
+    if (_lockAcquisitionCallback) {
+        _lockAcquisitionCallback(_opCtx, *_coll);
+    }
 
     if (_cursor) {
         _cursor->restore();
@@ -153,10 +154,19 @@ void IndexScanStage::doDetachFromOperationContext() {
         _cursor->detachFromOperationContext();
     }
 }
-void IndexScanStage::doAttachFromOperationContext(OperationContext* opCtx) {
+
+void IndexScanStage::doAttachToOperationContext(OperationContext* opCtx) {
     if (_cursor) {
         _cursor->reattachToOperationContext(opCtx);
     }
+}
+
+void IndexScanStage::doDetachFromTrialRunTracker() {
+    _tracker = nullptr;
+}
+
+void IndexScanStage::doAttachToTrialRunTracker(TrialRunTracker* tracker) {
+    _tracker = tracker;
 }
 
 void IndexScanStage::open(bool reOpen) {
@@ -167,9 +177,9 @@ void IndexScanStage::open(bool reOpen) {
         invariant(!_cursor);
         invariant(!_coll);
         _coll.emplace(_opCtx, _name);
-
-        uassertStatusOK(repl::ReplicationCoordinator::get(_opCtx)->checkCanServeReadsFor(
-            _opCtx, _coll->getNss(), true));
+        if (_lockAcquisitionCallback) {
+            _lockAcquisitionCallback(_opCtx, *_coll);
+        }
     } else {
         invariant(_cursor);
         invariant(_coll);
@@ -284,7 +294,7 @@ PlanState IndexScanStage::getNext() {
             _nextRecord->keyString, *_ordering, &_valuesBuffer, &_accessors, _indexKeysToInclude);
     }
 
-    if (_tracker && _tracker->trackProgress<TrialRunProgressTracker::kNumReads>(1)) {
+    if (_tracker && _tracker->trackProgress<TrialRunTracker::kNumReads>(1)) {
         // If we're collecting execution stats during multi-planning and reached the end of the
         // trial period (trackProgress() will return 'true' in this case), then we can reset the
         // tracker. Note that a trial period is executed only once per a PlanStge tree, and once

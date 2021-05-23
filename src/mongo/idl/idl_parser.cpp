@@ -63,6 +63,7 @@ std::string toCommaDelimitedList(const std::vector<BSONType>& types) {
 
 constexpr StringData IDLParserErrorContext::kOpMsgDollarDBDefault;
 constexpr StringData IDLParserErrorContext::kOpMsgDollarDB;
+constexpr auto collectionlessAggregateCursorCol = "$cmd.aggregate"_sd;
 
 bool IDLParserErrorContext::checkAndAssertTypeSlowPath(const BSONElement& element,
                                                        BSONType type) const {
@@ -224,14 +225,35 @@ void IDLParserErrorContext::throwBadEnumValue(StringData enumValue) const {
                             << "' is not a valid value.");
 }
 
+void IDLParserErrorContext::throwAPIStrictErrorIfApplicable(BSONElement field) const {
+    throwAPIStrictErrorIfApplicable(field.fieldNameStringData());
+}
+
+void IDLParserErrorContext::throwAPIStrictErrorIfApplicable(StringData fieldName) const {
+    uassert(ErrorCodes::APIStrictError,
+            str::stream() << "BSON field '" << getElementPath(fieldName)
+                          << "' is not allowed with apiStrict:true.",
+            !_apiStrict);
+}
+
 NamespaceString IDLParserErrorContext::parseNSCollectionRequired(StringData dbName,
-                                                                 const BSONElement& element) {
+                                                                 const BSONElement& element,
+                                                                 bool allowGlobalCollectionName) {
     const bool isUUID = (element.canonicalType() == canonicalizeBSONType(mongo::BinData) &&
                          element.binDataType() == BinDataType::newUUID);
     uassert(ErrorCodes::BadValue,
             str::stream() << "Collection name must be provided. UUID is not valid in this "
                           << "context",
             !isUUID);
+
+    if (allowGlobalCollectionName && element.isNumber()) {
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Invalid command format: the '" << element.fieldNameStringData()
+                              << "' field must specify a collection name or 1",
+                element.number() == 1);
+        return NamespaceString(dbName, collectionlessAggregateCursorCol);
+    }
+
     uassert(ErrorCodes::BadValue,
             str::stream() << "collection name has invalid type " << typeName(element.type()),
             element.canonicalType() == canonicalizeBSONType(mongo::String));
@@ -251,7 +273,7 @@ NamespaceStringOrUUID IDLParserErrorContext::parseNsOrUUID(StringData dbname,
         return {dbname.toString(), uassertStatusOK(UUID::parse(element))};
     } else {
         // Ensure collection identifier is not a Command
-        const NamespaceString nss(parseNSCollectionRequired(dbname, element));
+        const NamespaceString nss(parseNSCollectionRequired(dbname, element, false));
         return nss;
     }
 }
@@ -313,4 +335,29 @@ std::vector<std::vector<std::uint8_t>> transformVector(const std::vector<ConstDa
 
     return output;
 }
+
+void noOpSerializer(bool, StringData fieldName, BSONObjBuilder* bob) {}
+
+void serializeBSONWhenNotEmpty(BSONObj obj, StringData fieldName, BSONObjBuilder* bob) {
+    if (!obj.isEmpty()) {
+        bob->append(fieldName, obj);
+    }
+}
+
+BSONObj parseOwnedBSON(BSONElement element) {
+    uassert(ErrorCodes::TypeMismatch,
+            str::stream() << "Expected field " << element.fieldNameStringData()
+                          << "to be of type object",
+            element.type() == BSONType::Object);
+    return element.Obj().getOwned();
+}
+
+bool parseBoolean(BSONElement element) {
+    uassert(ErrorCodes::TypeMismatch,
+            str::stream() << "Expected field " << element.fieldNameStringData()
+                          << "to be of type object",
+            element.type() == BSONType::Bool);
+    return element.boolean();
+}
+
 }  // namespace mongo

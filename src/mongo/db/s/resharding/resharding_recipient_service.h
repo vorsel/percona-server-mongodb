@@ -31,8 +31,10 @@
 
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/recipient_document_gen.h"
+#include "mongo/db/s/resharding/resharding_oplog_applier.h"
 #include "mongo/db/s/resharding/resharding_oplog_fetcher.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
+#include "mongo/util/concurrency/thread_pool.h"
 
 namespace mongo {
 
@@ -47,6 +49,7 @@ namespace resharding {
  */
 void createTemporaryReshardingCollectionLocally(OperationContext* opCtx,
                                                 const NamespaceString& originalNss,
+                                                const NamespaceString& reshardingNss,
                                                 const UUID& reshardingUUID,
                                                 const UUID& existingUUID,
                                                 Timestamp fetchTimestamp);
@@ -113,8 +116,7 @@ public:
         return boost::none;
     }
 
-    void onReshardingFieldsChanges(
-        boost::optional<TypeCollectionReshardingFields> reshardingFields);
+    void onReshardingFieldsChanges(const TypeCollectionReshardingFields& reshardingFields);
 
 private:
     // The following functions correspond to the actions to take at a particular recipient state.
@@ -123,17 +125,18 @@ private:
     void _createTemporaryReshardingCollectionThenTransitionToCloning();
 
     ExecutorFuture<void> _cloneThenTransitionToApplying(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancelationToken& cancelToken);
 
     void _applyThenTransitionToSteadyState();
 
     ExecutorFuture<void> _awaitAllDonorsMirroringThenTransitionToStrictConsistency(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
-    ExecutorFuture<void> _awaitCoordinatorHasCommittedThenTransitionToRenaming(
+    ExecutorFuture<void> __awaitCoordinatorHasDecisionPersistedThenTransitionToRenaming(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
-    void _renameTemporaryReshardingCollectionThenDeleteLocalState();
+    void _renameTemporaryReshardingCollection();
 
     void _fulfillAllDonorsPreparedToDonate(Timestamp);
 
@@ -152,6 +155,9 @@ private:
     // Updates the recipient document on-disk and in-memory with the 'replacementDoc.'
     void _updateRecipientDocument(ReshardingRecipientDocument&& replacementDoc);
 
+    // Removes the local recipient document from disk and clears the in-memory state.
+    void _removeRecipientDocument();
+
     // The in-memory representation of the underlying document in
     // config.localReshardingOperations.recipient.
     ReshardingRecipientDocument _recipientDoc;
@@ -161,14 +167,21 @@ private:
 
     std::unique_ptr<ReshardingCollectionCloner> _collectionCloner;
 
+    std::vector<std::unique_ptr<ReshardingOplogApplier>> _oplogAppliers;
+    std::vector<std::unique_ptr<ThreadPool>> _oplogApplierWorkers;
+
+    // The ReshardingOplogFetcher must be destructed before the corresponding ReshardingOplogApplier
+    // to ensure the future returned by awaitInsert() is always eventually readied.
+    std::vector<std::unique_ptr<ReshardingOplogFetcher>> _oplogFetchers;
+    std::shared_ptr<executor::TaskExecutor> _oplogFetcherExecutor;
+    std::vector<ExecutorFuture<void>> _oplogFetcherFutures;
+
     // Protects the promises below
     Mutex _mutex = MONGO_MAKE_LATCH("ReshardingRecipient::_mutex");
 
     // Each promise below corresponds to a state on the recipient state machine. They are listed in
     // ascending order, such that the first promise below will be the first promise fulfilled.
-    SharedPromise<void> _allDonorsMirroring;
-
-    SharedPromise<void> _coordinatorHasCommitted;
+    SharedPromise<void> _coordinatorHasDecisionPersisted;
 
     SharedPromise<void> _completionPromise;
 };

@@ -33,8 +33,8 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/ops/find_and_modify_command_gen.h"
 #include "mongo/db/query/cursor_response.h"
-#include "mongo/db/query/find_and_modify_request.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/s/shard_local.h"
@@ -82,7 +82,7 @@ void ShardLocalTest::setUp() {
     ServiceContextMongoDTest::setUp();
     _opCtx = getGlobalServiceContext()->makeOperationContext(&cc());
     serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
-    _shardLocal = std::make_unique<ShardLocal>(ShardRegistry::kConfigServerShardId);
+    _shardLocal = std::make_unique<ShardLocal>(ShardId::kConfigServerId);
     const repl::ReplSettings replSettings = {};
     repl::ReplicationCoordinator::set(
         getGlobalServiceContext(),
@@ -101,12 +101,15 @@ void ShardLocalTest::tearDown() {
 StatusWith<Shard::CommandResponse> ShardLocalTest::runFindAndModifyRunCommand(NamespaceString nss,
                                                                               BSONObj find,
                                                                               BSONObj set) {
-    FindAndModifyRequest findAndModifyRequest = FindAndModifyRequest::makeUpdate(
-        nss, find, write_ops::UpdateModification::parseFromClassicUpdate(set));
+    auto findAndModifyRequest = write_ops::FindAndModifyCommand(nss);
+    findAndModifyRequest.setQuery(find);
+    findAndModifyRequest.setUpdate(write_ops::UpdateModification::parseFromClassicUpdate(set));
     findAndModifyRequest.setUpsert(true);
-    findAndModifyRequest.setShouldReturnNew(true);
-    findAndModifyRequest.setWriteConcern(WriteConcernOptions(
-        WriteConcernOptions::kMajority, WriteConcernOptions::SyncMode::UNSET, Seconds(15)));
+    findAndModifyRequest.setNew(true);
+    findAndModifyRequest.setWriteConcern(WriteConcernOptions(WriteConcernOptions::kMajority,
+                                                             WriteConcernOptions::SyncMode::UNSET,
+                                                             Seconds(15))
+                                             .toBSON());
 
     return _shardLocal->runCommandWithFixedRetryAttempts(
         _opCtx.get(),

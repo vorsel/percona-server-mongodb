@@ -46,13 +46,6 @@
 namespace mongo {
 namespace {
 const auto grid = ServiceContext::declareDecoration<Grid>();
-
-// TODO SERVER-50675: Remove this FVC function when 5.0 becomes last-lts.
-bool fcvGreaterThanOrEqualTo47() {
-    auto& fcv = serverGlobalParams.featureCompatibility;
-    return fcv.isVersionInitialized() &&
-        fcv.isGreaterThanOrEqualTo(ServerGlobalParams::FeatureCompatibility::Version::kVersion47);
-}
 }  // namespace
 
 Grid::Grid() = default;
@@ -123,47 +116,49 @@ void Grid::setAllowLocalHost(bool allow) {
 
 repl::ReadConcernArgs Grid::readConcernWithConfigTime(
     repl::ReadConcernLevel readConcernLevel) const {
-    if (fcvGreaterThanOrEqualTo47()) {
-        const auto currentTime = VectorClock::get(grid.owner(this))->getTime();
-        if (auto configTime = currentTime.configTime(); !configTime.asTimestamp().isNull()) {
-            // TODO SERVER-44097: investigate why not using a term (e.g. with a LogicalTime)
-            // can lead - upon CSRS stepdowns - to a last applied opTime lower than the
-            // previous primary's committed opTime
-            auto opTime = mongo::repl::OpTime(configTime.asTimestamp(),
-                                              mongo::repl::OpTime::kUninitializedTerm);
-            return ReadConcernArgs(opTime, readConcernLevel);
-        }
-    }
     return ReadConcernArgs(configOpTime(), readConcernLevel);
 }
 
 ReadPreferenceSetting Grid::readPreferenceWithConfigTime(
     const ReadPreferenceSetting& readPreference) const {
-    if (fcvGreaterThanOrEqualTo47()) {
-        const auto currentTime = VectorClock::get(grid.owner(this))->getTime();
-        if (auto configTime = currentTime.configTime(); !configTime.asTimestamp().isNull()) {
-            ReadPreferenceSetting readPrefToReturn(readPreference);
-            readPrefToReturn.minClusterTime = configTime.asTimestamp();
-            return readPrefToReturn;
-        }
-    }
     ReadPreferenceSetting readPrefToReturn(readPreference);
     readPrefToReturn.minClusterTime = configOpTime().getTimestamp();
     return readPrefToReturn;
 }
 
+// TODO SERVER-50675: directly use VectorClock's configTime once 5.0 becomes last-lts.
 repl::OpTime Grid::configOpTime() const {
     invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
 
-    stdx::lock_guard<Latch> lk(_mutex);
-    return _configOpTime;
+    auto configTime = [this] {
+        stdx::lock_guard<Latch> lk(_mutex);
+        return _configOpTime;
+    }();
+
+    const auto& fcv = serverGlobalParams.featureCompatibility;
+    if (fcv.isVersionInitialized() &&
+        fcv.isGreaterThanOrEqualTo(ServerGlobalParams::FeatureCompatibility::Version::kVersion47)) {
+        const auto currentTime = VectorClock::get(grid.owner(this))->getTime();
+        const auto vcConfigTimeTs = currentTime.configTime().asTimestamp();
+        if (!vcConfigTimeTs.isNull() && vcConfigTimeTs >= configTime.getTimestamp()) {
+            // TODO SERVER-44097: investigate why not using a term (e.g. with a LogicalTime)
+            // can lead - upon CSRS stepdowns - to a last applied opTime lower than the
+            // previous primary's committed opTime
+            configTime =
+                mongo::repl::OpTime(vcConfigTimeTs, mongo::repl::OpTime::kUninitializedTerm);
+        }
+    }
+
+    return configTime;
 }
 
 boost::optional<repl::OpTime> Grid::advanceConfigOpTime(OperationContext* opCtx,
                                                         repl::OpTime opTime,
                                                         StringData what) {
     const auto prevOpTime = _advanceConfigOpTime(opTime);
-    if (prevOpTime && prevOpTime->getTerm() != opTime.getTerm()) {
+    if (prevOpTime && prevOpTime->getTerm() != mongo::repl::OpTime::kUninitializedTerm &&
+        opTime.getTerm() != mongo::repl::OpTime::kUninitializedTerm &&
+        prevOpTime->getTerm() != opTime.getTerm()) {
         std::string clientAddr = "(unknown)";
         if (opCtx && opCtx->getClient()) {
             clientAddr = opCtx->getClient()->clientAddress(true);
@@ -192,8 +187,8 @@ boost::optional<repl::OpTime> Grid::_advanceConfigOpTime(const repl::OpTime& opT
 }
 
 void Grid::clearForUnitTests() {
-    _catalogClient.reset();
     _catalogCache.reset();
+    _catalogClient.reset();
     _shardRegistry.reset();
     _cursorManager.reset();
     _balancerConfig.reset();

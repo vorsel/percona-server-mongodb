@@ -35,8 +35,8 @@
 
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/client.h"
-#include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/vector_clock.h"
+#include "mongo/db/vector_clock_metadata_hook.h"
 #include "mongo/executor/network_interface_factory.h"
 #include "mongo/executor/network_interface_thread_pool.h"
 #include "mongo/executor/task_executor_pool.h"
@@ -67,8 +67,6 @@ bool useActualTopologyTime() {
 }  // namespace
 
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
-
-const ShardId ShardRegistry::kConfigServerShardId = ShardId("config");
 
 ShardRegistry::ShardRegistry(std::unique_ptr<ShardFactory> shardFactory,
                              const ConnectionString& configServerCS,
@@ -114,7 +112,7 @@ void ShardRegistry::init(ServiceContext* service) {
     {
         stdx::lock_guard<Latch> lk(_mutex);
         _configShardData = ShardRegistryData::createWithConfigShardOnly(
-            _shardFactory->createShard(kConfigServerShardId, _initConfigServerCS));
+            _shardFactory->createShard(ShardId::kConfigServerId, _initConfigServerCS));
         _latestConnStrings[_initConfigServerCS.getSetName()] = _initConfigServerCS;
     }
 
@@ -221,7 +219,7 @@ void ShardRegistry::startupPeriodicReloader(OperationContext* opCtx) {
     invariant(!_executor);
 
     auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
-    hookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(opCtx->getServiceContext()));
+    hookList->addHook(std::make_unique<rpc::VectorClockMetadataHook>(opCtx->getServiceContext()));
 
     // construct task executor
     auto net = executor::makeNetworkInterface("ShardRegistryUpdater", nullptr, std::move(hookList));
@@ -323,7 +321,7 @@ ConnectionString ShardRegistry::getConfigServerConnectionString() const {
 
 std::shared_ptr<Shard> ShardRegistry::getConfigShard() const {
     stdx::lock_guard<Latch> lk(_mutex);
-    return _configShardData.findShard(kConfigServerShardId);
+    return _configShardData.findShard(ShardId::kConfigServerId);
 }
 
 StatusWith<std::shared_ptr<Shard>> ShardRegistry::getShard(OperationContext* opCtx,
@@ -351,23 +349,19 @@ StatusWith<std::shared_ptr<Shard>> ShardRegistry::getShard(OperationContext* opC
     return {ErrorCodes::ShardNotFound, str::stream() << "Shard " << shardId << " not found"};
 }
 
-void ShardRegistry::getAllShardIds(OperationContext* opCtx, std::vector<ShardId>* all) {
-    std::set<ShardId> seen;
-    auto data = _getData(opCtx);
-    data->getAllShardIds(seen);
-    if (seen.empty()) {
+std::vector<ShardId> ShardRegistry::getAllShardIds(OperationContext* opCtx) {
+    auto shardIds = _getData(opCtx)->getAllShardIds();
+    if (shardIds.empty()) {
         reload(opCtx);
-        data = _getData(opCtx);
-        data->getAllShardIds(seen);
+        shardIds = _getData(opCtx)->getAllShardIds();
     }
-    all->assign(seen.begin(), seen.end());
+    // Many logic in the codebase rely on this vector to be sorted.
+    std::sort(shardIds.begin(), shardIds.end());
+    return shardIds;
 }
 
 int ShardRegistry::getNumShards(OperationContext* opCtx) {
-    std::set<ShardId> seen;
-    auto data = _getData(opCtx);
-    data->getAllShardIds(seen);
-    return seen.size();
+    return _getData(opCtx)->getAllShardIds().size();
 }
 
 std::pair<std::vector<ShardRegistry::LatestConnStrings::value_type>, ShardRegistry::Increment>
@@ -461,15 +455,13 @@ void ShardRegistry::toBSON(BSONObjBuilder* result) const {
     result->append("connStrings", connStrings.obj());
 }
 
-bool ShardRegistry::reload(OperationContext* opCtx) {
+void ShardRegistry::reload(OperationContext* opCtx) {
     // Make the next acquire do a lookup.
     auto value = _forceReloadIncrement.addAndFetch(1);
     LOGV2_DEBUG(4620253, 2, "Forcing ShardRegistry reload", "newForceReloadIncrement"_attr = value);
 
     // Force it to actually happen now.
     _getData(opCtx);
-
-    return true;
 }
 
 void ShardRegistry::clearEntries() {
@@ -585,18 +577,15 @@ std::shared_ptr<Shard> ShardRegistry::getShardForHostNoReload(const HostAndPort&
     return data->findByHostAndPort(host);
 }
 
-void ShardRegistry::getAllShardIdsNoReload(std::vector<ShardId>* all) const {
-    std::set<ShardId> seen;
-    auto data = _getCachedData();
-    data->getAllShardIds(seen);
-    all->assign(seen.begin(), seen.end());
+std::vector<ShardId> ShardRegistry::getAllShardIdsNoReload() const {
+    auto shardIds = _getCachedData()->getAllShardIds();
+    // Many logic in the codebase rely on this vector to be sorted.
+    std::sort(shardIds.begin(), shardIds.end());
+    return shardIds;
 }
 
 int ShardRegistry::getNumShardsNoReload() const {
-    std::set<ShardId> seen;
-    auto data = _getCachedData();
-    data->getAllShardIds(seen);
-    return seen.size();
+    return _getCachedData()->getAllShardIds().size();
 }
 
 std::shared_ptr<Shard> ShardRegistry::_getShardForRSNameNoReload(const std::string& name) const {
@@ -739,7 +728,7 @@ std::shared_ptr<Shard> ShardRegistryData::findByRSName(const std::string& name) 
 }
 
 std::shared_ptr<Shard> ShardRegistryData::_findByConnectionString(
-    const ConnectionString& connectionString) const {
+    const std::string& connectionString) const {
     auto i = _connStringLookup.find(connectionString);
     return (i != _connStringLookup.end()) ? i->second : nullptr;
 }
@@ -760,12 +749,9 @@ std::shared_ptr<Shard> ShardRegistryData::findShard(const ShardId& shardId) cons
         return shard;
     }
 
-    StatusWith<ConnectionString> swConnString = ConnectionString::parse(shardId.toString());
-    if (swConnString.isOK()) {
-        shard = _findByConnectionString(swConnString.getValue());
-        if (shard) {
-            return shard;
-        }
+    shard = _findByConnectionString(shardId.toString());
+    if (shard) {
+        return shard;
     }
 
     StatusWith<HostAndPort> swHostAndPort = HostAndPort::parse(shardId.toString());
@@ -779,21 +765,23 @@ std::shared_ptr<Shard> ShardRegistryData::findShard(const ShardId& shardId) cons
     return nullptr;
 }
 
-void ShardRegistryData::getAllShards(std::vector<std::shared_ptr<Shard>>& result) const {
+std::vector<std::shared_ptr<Shard>> ShardRegistryData::getAllShards() const {
+    std::vector<std::shared_ptr<Shard>> result;
     result.reserve(_shardIdLookup.size());
     for (auto&& shard : _shardIdLookup) {
         result.emplace_back(shard.second);
     }
+    return result;
 }
 
-void ShardRegistryData::getAllShardIds(std::set<ShardId>& seen) const {
-    for (auto i = _shardIdLookup.begin(); i != _shardIdLookup.end(); ++i) {
-        const auto& s = i->second;
-        if (s->getId().toString() == "config") {
-            continue;
-        }
-        seen.insert(s->getId());
-    }
+std::vector<ShardId> ShardRegistryData::getAllShardIds() const {
+    std::vector<ShardId> shardIds;
+    shardIds.reserve(_shardIdLookup.size());
+    std::transform(_shardIdLookup.begin(),
+                   _shardIdLookup.end(),
+                   std::back_inserter(shardIds),
+                   [](const auto& shard) { return shard.second->getId(); });
+    return shardIds;
 }
 
 void ShardRegistryData::_addShard(std::shared_ptr<Shard> shard) {
@@ -805,7 +793,7 @@ void ShardRegistryData::_addShard(std::shared_ptr<Shard> shard) {
         for (const auto& host : connString.getServers()) {
             _hostLookup.erase(host);
         }
-        _connStringLookup.erase(connString);
+        _connStringLookup.erase(connString.toString());
     }
 
     _shardIdLookup[shard->getId()] = shard;
@@ -827,7 +815,7 @@ void ShardRegistryData::_addShard(std::shared_ptr<Shard> shard) {
         _hostLookup[HostAndPort("localhost")] = shard;
     }
 
-    _connStringLookup[connString] = shard;
+    _connStringLookup[connString.toString()] = shard;
 
     for (const HostAndPort& hostAndPort : connString.getServers()) {
         _hostLookup[hostAndPort] = shard;
@@ -837,8 +825,7 @@ void ShardRegistryData::_addShard(std::shared_ptr<Shard> shard) {
 void ShardRegistryData::toBSON(BSONObjBuilder* map,
                                BSONObjBuilder* hosts,
                                BSONObjBuilder* connStrings) const {
-    std::vector<std::shared_ptr<Shard>> shards;
-    getAllShards(shards);
+    auto shards = getAllShards();
 
     std::sort(std::begin(shards),
               std::end(shards),
@@ -860,14 +847,13 @@ void ShardRegistryData::toBSON(BSONObjBuilder* map,
 
     if (connStrings) {
         for (const auto& connStringIt : _connStringLookup) {
-            connStrings->append(connStringIt.first.toString(), connStringIt.second->getId());
+            connStrings->append(connStringIt.first, connStringIt.second->getId());
         }
     }
 }
 
 void ShardRegistryData::toBSON(BSONObjBuilder* result) const {
-    std::vector<std::shared_ptr<Shard>> shards;
-    getAllShards(shards);
+    auto shards = getAllShards();
 
     std::sort(std::begin(shards),
               std::end(shards),
@@ -889,7 +875,7 @@ void ShardRegistryData::toBSON(BSONObjBuilder* result) const {
 
     BSONObjBuilder connStringsBob(result->subobjStart("connStrings"));
     for (const auto& connStringIt : _connStringLookup) {
-        connStringsBob.append(connStringIt.first.toString(), connStringIt.second->getId());
+        connStringsBob.append(connStringIt.first, connStringIt.second->getId());
     }
     connStringsBob.done();
 }

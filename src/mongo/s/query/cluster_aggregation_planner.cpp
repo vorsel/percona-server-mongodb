@@ -124,9 +124,9 @@ BSONObj createCommandForMergingShard(Document serializedCommand,
     MutableDocument mergeCmd(serializedCommand);
 
     mergeCmd["pipeline"] = Value(pipelineForMerging->serialize());
-    mergeCmd[AggregationRequest::kFromMongosName] = Value(true);
+    mergeCmd[AggregateCommand::kFromMongosFieldName] = Value(true);
 
-    mergeCmd[AggregationRequest::kLetName] =
+    mergeCmd[AggregateCommand::kLetFieldName] =
         Value(mergeCtx->variablesParseState.serialize(mergeCtx->variables));
 
     // If the user didn't specify a collation already, make sure there's a collation attached to
@@ -616,7 +616,7 @@ Status runPipelineOnPrimaryShard(const boost::intrusive_ptr<ExpressionContext>& 
                                       expCtx, serializedCommand, explain, nullptr, BSONObj())));
 
     const auto shardId = cm.dbPrimary();
-    const auto cmdObjWithShardVersion = (shardId != ShardRegistry::kConfigServerShardId)
+    const auto cmdObjWithShardVersion = (shardId != ShardId::kConfigServerId)
         ? appendShardVersion(std::move(cmdObj), ChunkVersion::UNSHARDED())
         : std::move(cmdObj);
 

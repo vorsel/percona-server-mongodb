@@ -86,6 +86,7 @@ env.Library(
 tlEnv.Library(
     target='service_executor',
     source=[
+        'service_executor.cpp',
         'service_executor_fixed.cpp',
         'service_executor_reserved.cpp',
         'service_executor_synchronous.cpp',
@@ -187,6 +188,7 @@ tlEnv.CppUnitTest(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/dbmessage',
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/rpc/protocol',
         '$BUILD_DIR/mongo/rpc/rpc',
         '$BUILD_DIR/mongo/unittest/unittest',

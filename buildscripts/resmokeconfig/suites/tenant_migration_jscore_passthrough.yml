@@ -13,9 +13,12 @@ selector:
   - jstests/core/views/views_stats.js
   # These tests contain assertions on the number of executed operations and this suite retries
   # operations on TenantMigrationAborted errors.
+  - jstests/core/find_and_modify_metrics.js
+  - jstests/core/update_metrics.js
   - jstests/core/operation_latency_histogram.js
   - jstests/core/top.js
   - jstests/core/profile_sampling.js
+  - jstests/core/profile_hide_index.js
   # The override cannot deep copy very large or small dates.
   - jstests/core/index_large_and_small_dates.js
   # These tests are not expected to pass with replica-sets.
@@ -115,18 +118,19 @@ executor:
     mongod_options:
       set_parameters:
         enableTestCommands: 1
-        failpoint.abortTenantMigrationAfterBlockingStarts:
+        failpoint.abortTenantMigrationBeforeLeavingBlockingState:
             mode: alwaysOn
             data:
               blockTimeMS: 250
-        # TODO SERVER-51734: Remove the failpoint 'returnResponseOkForRecipientSyncDataCmd'.
-        failpoint.returnResponseOkForRecipientSyncDataCmd:
-            mode: alwaysOn
         # Set the delay before migration state machine is garbage collected to be short to avoid
         # migration conflicts since the ContinuousTenantMigration hook migrates a single tenant
         # between the replica sets in the fixture.
         tenantMigrationGarbageCollectionDelayMS: 100
         ttlMonitorSleepSecs: 1
+      tlsMode: allowTLS
+      tlsCAFile: jstests/libs/ca.pem
+      tlsCertificateKeyFile: jstests/libs/rs0.pem
+      tlsAllowInvalidHostnames: ''
     num_replica_sets: 2
     num_nodes_per_replica_set: 3
     use_replica_set_connection_string: true

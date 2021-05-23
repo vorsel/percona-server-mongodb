@@ -82,7 +82,7 @@ public:
                                      const IndexDescriptor* desc) override {
         return Status::OK();
     }
-    Status dropGroupedSortedDataInterface(OperationContext* opCtx, StringData ident) override {
+    Status dropSortedDataInterface(OperationContext* opCtx, StringData ident) override {
         return Status::OK();
     }
     int64_t getIdentSize(OperationContext* opCtx, StringData ident) override {
@@ -113,6 +113,14 @@ public:
     }
 
     boost::optional<Timestamp> getOplogNeededForCrashRecovery() const override {
+        return boost::none;
+    }
+
+    Timestamp getOldestTimestamp() const override {
+        return Timestamp();
+    }
+
+    boost::optional<Timestamp> getRecoveryTimestamp() const {
         return boost::none;
     }
 

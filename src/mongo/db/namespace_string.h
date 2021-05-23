@@ -148,6 +148,13 @@ public:
     // Namespace for storing config.transactions cloner progress for resharding.
     static const NamespaceString kReshardingTxnClonerProgressNamespace;
 
+    // Namespace for storing keys for signing and validating cluster times created by the cluster
+    // that this node is in.
+    static const NamespaceString kKeysCollectionNamespace;
+
+    // Namespace for storing keys for validating cluster times created by other clusters.
+    static const NamespaceString kExternalKeysCollectionNamespace;
+
     /**
      * Constructs an empty NamespaceString.
      */
@@ -395,6 +402,8 @@ public:
         return {db(), "$cmd"};
     }
 
+    void serializeCollectionName(BSONObjBuilder* builder, StringData fieldName) const;
+
     /**
      * @return true if the ns is an oplog one, otherwise false.
      */
@@ -496,6 +505,10 @@ public:
         return _nss;
     }
 
+    void setNss(const NamespaceString& nss) {
+        _nss = nss;
+    }
+
     const boost::optional<UUID>& uuid() const {
         return _uuid;
     }
@@ -507,6 +520,10 @@ public:
         return _dbname;
     }
 
+    void preferNssForSerialization() {
+        _preferNssForSerialization = true;
+    }
+
     /**
      * Returns database name derived from either '_nss' or '_dbname'.
      */
@@ -516,10 +533,15 @@ public:
 
     std::string toString() const;
 
+    void serialize(BSONObjBuilder* builder, StringData fieldName) const;
+
 private:
-    // At any given time exactly one of these optionals will be initialized
+    // At any given time exactly one of these optionals will be initialized.
     boost::optional<NamespaceString> _nss;
     boost::optional<UUID> _uuid;
+
+    // When seralizing, if both '_nss' and '_uuid' are present, use '_nss'.
+    bool _preferNssForSerialization = false;
 
     // Empty string when '_nss' is non-none, and contains the database name when '_uuid' is
     // non-none. Although the UUID specifies a collection uniquely, we must later verify that the

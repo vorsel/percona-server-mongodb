@@ -29,14 +29,22 @@
 
 #pragma once
 
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/db/ops/single_write_result_gen.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/util/string_map.h"
 
+#include <queue>
+
 namespace mongo {
 class BucketCatalog {
 public:
+    // This set of constants define limits on the measurements held in a bucket.
+    static constexpr int kTimeseriesBucketMaxCount = 1000;
+    static constexpr int kTimeseriesBucketMaxSizeBytes = 125 * 1024;  // 125 KB
+    static constexpr auto kTimeseriesBucketMaxTimeRange = Hours(1);
+
     struct CommitInfo {
         StatusWith<SingleWriteResult> result;
         boost::optional<repl::OpTime> opTime;
@@ -50,7 +58,12 @@ public:
 
     struct CommitData {
         std::vector<BSONObj> docs;
+        BSONObj bucketMin;  // The full min/max if this is the bucket's first commit, or the updates
+        BSONObj bucketMax;  // since the previous commit if not.
         uint16_t numCommittedMeasurements;
+        StringSet newFieldNamesToBeInserted;
+
+        BSONObj toBSON() const;
     };
 
     static BucketCatalog& get(ServiceContext* svcCtx);
@@ -60,6 +73,16 @@ public:
 
     BucketCatalog(const BucketCatalog&) = delete;
     BucketCatalog operator=(const BucketCatalog&) = delete;
+
+    /**
+     * Returns the metadata for the given bucket in the following format:
+     *     {<metadata field name>: <value>}
+     * All measurements in the given bucket share same metadata value.
+     *
+     * Returns an empty document if the given bucket cannot be found or if this time-series
+     * collection was not created with a metadata field name.
+     */
+    BSONObj getMetadata(const OID& bucketId) const;
 
     /**
      * Returns the id of the bucket that the document belongs in, and a Future to wait on if the
@@ -86,6 +109,11 @@ public:
      */
     void clear(StringData dbName);
 
+    /**
+     * Appends the execution stats for the given namespace to the builder.
+     */
+    void appendExecutionStats(const NamespaceString& ns, BSONObjBuilder* builder) const;
+
 private:
     struct BucketMetadata {
         bool operator<(const BucketMetadata& other) const;
@@ -93,12 +121,74 @@ private:
 
         template <typename H>
         friend H AbslHashValue(H h, const BucketMetadata& metadata) {
-            // TODO (SERVER-52967): Hash the metadata in a way that does not depend on its ordering.
-            SimpleBSONObjComparator::Hasher hasher;
-            return H::combine(std::move(h), hasher(metadata.metadata));
+            return H::combine(std::move(h),
+                              UnorderedFieldsBSONObjComparator().hash(metadata.metadata));
         }
 
         BSONObj metadata;
+    };
+
+    class MinMax {
+    public:
+        /*
+         * Updates the min/max according to 'comp', ignoring the 'metaField' field.
+         */
+        void update(const BSONObj& doc,
+                    boost::optional<StringData> metaField,
+                    const std::function<bool(int, int)>& comp);
+
+        /**
+         * Returns the full min/max object.
+         */
+        BSONObj toBSON() const;
+
+        /**
+         * Returns the updates since the previous time this function was called in the format for
+         * an update op.
+         */
+        BSONObj getUpdates();
+
+        /*
+         * Returns the approximate memory usage of this MinMax.
+         */
+        uint64_t getMemoryUsage() const;
+
+    private:
+        enum class Type {
+            kObject,
+            kArray,
+            kValue,
+            kUnset,
+        };
+
+        void _update(BSONElement elem, const std::function<bool(int, int)>& comp);
+        void _updateWithMemoryUsage(MinMax* minMax,
+                                    BSONElement elem,
+                                    const std::function<bool(int, int)>& comp);
+
+        void _append(BSONObjBuilder* builder) const;
+        void _append(BSONArrayBuilder* builder) const;
+
+        /*
+         * Appends updates, if any, to the builder. Returns whether any updates were appended by
+         * this MinMax or any MinMaxes below it.
+         */
+        bool _appendUpdates(BSONObjBuilder* builder);
+
+        /*
+         * Clears the '_updated' flag on this MinMax and all MinMaxes below it.
+         */
+        void _clearUpdated();
+
+        StringMap<MinMax> _object;
+        std::vector<MinMax> _array;
+        BSONObj _value;
+
+        Type _type = Type::kUnset;
+
+        bool _updated = false;
+
+        uint64_t _memoryUsage = 0;
     };
 
     struct Bucket {
@@ -116,6 +206,12 @@ private:
 
         // Top-level field names of the measurements that have been inserted into the bucket.
         StringSet fieldNames;
+
+        // The minimum values for each field in the bucket.
+        MinMax min;
+
+        // The maximum values for each field in the bucket.
+        MinMax max;
 
         // The total size in bytes of the bucket's BSON serialization, including measurements to be
         // inserted.
@@ -136,14 +232,49 @@ private:
 
         // Promises for committers to fulfill in order to signal to waiters that their measurements
         // have been committed.
-        stdx::unordered_map<uint16_t, Promise<CommitInfo>> promises;
+        std::queue<Promise<CommitInfo>> promises;
 
         // Whether the bucket is full. This can be due to number of measurements, size, or time
         // range.
         bool full = false;
+
+        // Approximate memory usage of this bucket.
+        uint64_t memoryUsage = sizeof(*this);
+
+        /**
+         * Determines the effect of adding 'doc' to this bucket If adding 'doc' causes this bucket
+         * to overflow, we will create a new bucket and recalculate the change to the bucket size
+         * and data fields.
+         */
+        void calculateBucketFieldsAndSizeChange(const BSONObj& doc,
+                                                boost::optional<StringData> metaField,
+                                                StringSet* newFieldNamesToBeInserted,
+                                                uint32_t* newFieldNamesSize,
+                                                uint32_t* sizeToBeAdded) const;
     };
 
-    Mutex _mutex = MONGO_MAKE_LATCH("BucketCatalog");
+    struct ExecutionStats {
+        long long numBucketInserts = 0;
+        long long numBucketUpdates = 0;
+        long long numBucketsOpenedDueToMetadata = 0;
+        long long numBucketsClosedDueToCount = 0;
+        long long numBucketsClosedDueToSize = 0;
+        long long numBucketsClosedDueToTimeForward = 0;
+        long long numBucketsClosedDueToTimeBackward = 0;
+        long long numBucketsClosedDueToMemoryThreshold = 0;
+        long long numCommits = 0;
+        long long numWaits = 0;
+        long long numMeasurementsCommitted = 0;
+    };
+
+    class ServerStatus;
+
+    /**
+     * Expires idle buckets until the bucket catalog's memory usage is below the expiry threshold.
+     */
+    void _expireIdleBuckets(ExecutionStats* stats);
+
+    mutable Mutex _mutex = MONGO_MAKE_LATCH("BucketCatalog");
 
     // All buckets currently in the catalog, including buckets which are full but not yet committed.
     stdx::unordered_map<OID, Bucket, OID::Hasher> _buckets;
@@ -156,5 +287,11 @@ private:
 
     // Buckets that do not have any writers.
     std::set<OID> _idleBuckets;
+
+    // Per-collection execution stats.
+    stdx::unordered_map<NamespaceString, ExecutionStats> _executionStats;
+
+    // Approximate memory usage of the bucket catalog.
+    uint64_t _memoryUsage = 0;
 };
 }  // namespace mongo

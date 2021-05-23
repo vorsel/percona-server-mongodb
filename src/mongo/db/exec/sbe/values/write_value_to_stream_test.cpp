@@ -92,29 +92,41 @@ TEST(WriteValueToStream, ByteArrayDeprecatedBSONBinDataTest) {
     ASSERT_EQUALS(expectedString, oss.str());
 }
 
-TEST(WriteValueToStream, ShortStringBigTest) {
-    auto val = value::bitcastFrom<const char*>(kStringShort);
-    const std::pair<value::TypeTags, value::Value> value(value::TypeTags::StringBig, val);
+TEST(WriteValueToStream, MalformedByteArrayDeprecatedBSONBinDataTest) {
+    uint8_t array[] = {0, 1};
+    auto bsonString = BSON("binData" << BSONBinData(array, 2, ByteArrayDeprecated));
+    auto val = value::bitcastFrom<const char*>(bsonString["binData"].value());
+    const std::pair<value::TypeTags, value::Value> value(value::TypeTags::bsonBinData, val);
     std::ostringstream oss;
     writeToStream(oss, value);
+    auto expectedString = "BinData(2, )";
+    ASSERT_EQUALS(expectedString, oss.str());
+}
+
+TEST(WriteValueToStream, ShortStringBigTest) {
+    auto [tag, val] = value::makeNewString(kStringShort);
+    value::ValueGuard guard{tag, val};
+    std::ostringstream oss;
+    writeToStream(oss, {tag, val});
     auto expectedString = "\"" + std::string(kStringShort) + "\"";
     ASSERT_EQUALS(expectedString, oss.str());
 }
 
 TEST(WriteValueToStream, LongStringBigTest) {
-    auto val = value::bitcastFrom<const char*>(kStringLong);
-    const std::pair<value::TypeTags, value::Value> value(value::TypeTags::StringBig, val);
+    auto [tag, val] = value::makeNewString(kStringLong);
+    value::ValueGuard guard{tag, val};
     std::ostringstream oss;
-    writeToStream(oss, value);
+    writeToStream(oss, {tag, val});
     auto expectedString =
         "\"" + std::string(kStringLong).substr(0, value::kStringMaxDisplayLength) + "\"" + "...";
     ASSERT_EQUALS(expectedString, oss.str());
 }
 
 TEST(WriteValueToStream, StringSmallTest) {
-    auto value = value::makeSmallString("F");
+    auto [tag, val] = value::makeNewString("F");
+    value::ValueGuard guard{tag, val};
     std::ostringstream oss;
-    writeToStream(oss, value);
+    writeToStream(oss, {tag, val});
     ASSERT_EQUALS("\"F\"", oss.str());
 }
 

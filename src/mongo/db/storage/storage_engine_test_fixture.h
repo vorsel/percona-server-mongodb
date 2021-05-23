@@ -71,7 +71,7 @@ public:
         }
         std::shared_ptr<Collection> coll = std::make_shared<CollectionMock>(ns, catalogId);
         CollectionCatalog::write(opCtx, [&](CollectionCatalog& catalog) {
-            catalog.registerCollection(options.uuid.get(), std::move(coll));
+            catalog.registerCollection(opCtx, options.uuid.get(), std::move(coll));
         });
 
         return {{_storageEngine->getCatalog()->getEntry(catalogId)}};
@@ -86,8 +86,8 @@ public:
      */
     Status createCollTable(OperationContext* opCtx, NamespaceString collName) {
         const std::string identName = "collection-" + collName.ns();
-        return _storageEngine->getEngine()->createGroupedRecordStore(
-            opCtx, collName.ns(), identName, CollectionOptions(), KVPrefix::kNotPrefixed);
+        return _storageEngine->getEngine()->createRecordStore(
+            opCtx, collName.ns(), identName, CollectionOptions());
     }
 
     Status dropIndexTable(OperationContext* opCtx, NamespaceString nss, std::string indexName) {

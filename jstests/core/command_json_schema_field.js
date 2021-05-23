@@ -21,16 +21,16 @@ function assertCommandFailsWithCorrectError(command, code) {
 // Aggregate
 assertCommandFailsWithCorrectError(
     {aggregate: coll.getName(), pipeline: [], cursor: {}, jsonSchema: {}},
-    ErrorCodes.FailedToParse);
+    [ErrorCodes.FailedToParse, 4662500]);
 
 // Find
 assertCommandFailsWithCorrectError({find: coll.getName(), jsonSchema: {}},
-                                   ErrorCodes.FailedToParse);
+                                   [ErrorCodes.FailedToParse, 4662500]);
 
 // FindAndModify
 assertCommandFailsWithCorrectError(
     {findAndModify: coll.getName(), query: {_id: 0}, remove: true, jsonSchema: {}},
-    ErrorCodes.FailedToParse);
+    [ErrorCodes.FailedToParse, 4662500]);
 
 // Count
 assertCommandFailsWithCorrectError({count: coll.getName(), jsonSchema: {}}, 4662500);
@@ -48,5 +48,5 @@ assertCommandFailsWithCorrectError(
 
 // Explain
 assertCommandFailsWithCorrectError({explain: {count: coll.getName()}, jsonSchema: {}},
-                                   ErrorCodes.FailedToParse);
+                                   [ErrorCodes.FailedToParse, 40415]);
 }());

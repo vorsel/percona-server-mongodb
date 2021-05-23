@@ -51,13 +51,14 @@ const std::string ChunkType::ShardNSPrefix = "config.cache.chunks.";
 const BSONField<OID> ChunkType::name("_id");
 const BSONField<BSONObj> ChunkType::minShardID("_id");
 const BSONField<std::string> ChunkType::ns("ns");
-const BSONField<std::string> ChunkType::collectionUUID("uuid");
+const BSONField<UUID> ChunkType::collectionUUID("uuid");
 const BSONField<BSONObj> ChunkType::min("min");
 const BSONField<BSONObj> ChunkType::max("max");
 const BSONField<std::string> ChunkType::shard("shard");
 const BSONField<bool> ChunkType::jumbo("jumbo");
 const BSONField<Date_t> ChunkType::lastmod("lastmod");
 const BSONField<OID> ChunkType::epoch("lastmodEpoch");
+const BSONField<Timestamp> ChunkType::timestamp("lastmodTimestamp");
 const BSONField<BSONObj> ChunkType::history("history");
 
 namespace {
@@ -211,7 +212,7 @@ ChunkType::ChunkType(NamespaceString nss, ChunkRange range, ChunkVersion version
     : _nss(std::move(nss)),
       _min(range.getMin()),
       _max(range.getMax()),
-      _version(version),
+      _version(std::move(version)),
       _shard(std::move(shardId)) {}
 
 ChunkType::ChunkType(NamespaceString nss,
@@ -223,7 +224,7 @@ ChunkType::ChunkType(NamespaceString nss,
       _collectionUUID(collectionUUID),
       _min(range.getMin()),
       _max(range.getMax()),
-      _version(version),
+      _version(std::move(version)),
       _shard(std::move(shardId)) {}
 
 StatusWith<ChunkType> ChunkType::parseFromConfigBSONCommand(const BSONObj& source) {
@@ -251,15 +252,14 @@ StatusWith<ChunkType> ChunkType::parseFromConfigBSONCommand(const BSONObj& sourc
     }
 
     {
-        std::string collectionUUIDString;
-        Status status =
-            bsonExtractStringField(source, collectionUUID.name(), &collectionUUIDString);
-        if (status.isOK() && !collectionUUIDString.empty()) {
-            auto swUUID = CollectionUUID::parse(collectionUUIDString);
+        BSONElement collectionUUIDElem;
+        Status status = bsonExtractField(source, collectionUUID.name(), &collectionUUIDElem);
+        if (status.isOK()) {
+            auto swUUID = UUID::parse(collectionUUIDElem);
             if (!swUUID.isOK()) {
                 return swUUID.getStatus();
             }
-            chunk._collectionUUID = std::move(swUUID.getValue());
+            chunk._collectionUUID = swUUID.getValue();
         }
     }
 
@@ -350,7 +350,7 @@ BSONObj ChunkType::toConfigBSON() const {
     if (_nss)
         builder.append(ns.name(), getNS().ns());
     if (_collectionUUID)
-        builder.append(collectionUUID.name(), getCollectionUUID().toString());
+        _collectionUUID->appendToBuilder(&builder, collectionUUID.name());
     if (_min)
         builder.append(min.name(), getMin());
     if (_max)
@@ -365,7 +365,9 @@ BSONObj ChunkType::toConfigBSON() const {
     return builder.obj();
 }
 
-StatusWith<ChunkType> ChunkType::fromShardBSON(const BSONObj& source, const OID& epoch) {
+StatusWith<ChunkType> ChunkType::fromShardBSON(const BSONObj& source,
+                                               const OID& epoch,
+                                               const boost::optional<Timestamp>& timestamp) {
     ChunkType chunk;
 
     {
@@ -406,7 +408,8 @@ StatusWith<ChunkType> ChunkType::fromShardBSON(const BSONObj& source, const OID&
             return statusWithChunkVersion.getStatus();
         }
         auto version = std::move(statusWithChunkVersion.getValue());
-        chunk._version = ChunkVersion(version.majorVersion(), version.minorVersion(), epoch);
+        chunk._version =
+            ChunkVersion(version.majorVersion(), version.minorVersion(), epoch, timestamp);
     }
 
     {

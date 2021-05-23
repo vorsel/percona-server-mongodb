@@ -42,6 +42,7 @@
 #include "mongo/client/remote_command_targeter.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/read_concern_level.h"
 #include "mongo/db/s/resharding_util.h"
@@ -49,6 +50,7 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
+#include "mongo/stdx/mutex.h"
 
 namespace mongo {
 namespace {
@@ -87,39 +89,101 @@ ReshardingOplogFetcher::ReshardingOplogFetcher(UUID reshardingUUID,
       _donorShard(donorShard),
       _recipientShard(recipientShard),
       _doesDonorOwnMinKeyChunk(doesDonorOwnMinKeyChunk),
-      _toWriteInto(toWriteInto) {}
-
-Future<void> ReshardingOplogFetcher::schedule(executor::TaskExecutor* executor) {
-    auto pf = makePromiseFuture<void>();
-    _fetchedFinishPromise = std::move(pf.promise);
-
-    _reschedule(executor);
-
-    return std::move(pf.future);
+      _toWriteInto(toWriteInto) {
+    auto [p, f] = makePromiseFuture<void>();
+    stdx::lock_guard lk(_mutex);
+    _onInsertPromise = std::move(p);
+    _onInsertFuture = std::move(f);
 }
 
-void ReshardingOplogFetcher::_reschedule(executor::TaskExecutor* executor) {
-    executor->schedule([this, executor](Status status) {
-        ThreadClient client(
-            fmt::format("OplogFetcher-{}-{}", _reshardingUUID.toString(), _donorShard.toString()),
-            getGlobalServiceContext());
-        if (!status.isOK()) {
-            LOGV2_INFO(5192101, "Resharding oplog fetcher aborting.", "reason"_attr = status);
-            _fetchedFinishPromise.setError(status);
-            return;
-        }
+ReshardingOplogFetcher::~ReshardingOplogFetcher() {
+    stdx::lock_guard lk(_mutex);
+    _onInsertPromise.setError(
+        {ErrorCodes::CallbackCanceled, "explicitly breaking promise from ReshardingOplogFetcher"});
+}
 
-        try {
-            if (iterate(client.get())) {
-                _reschedule(executor);
-            } else {
-                _fetchedFinishPromise.emplaceValue();
+Future<void> ReshardingOplogFetcher::awaitInsert(const ReshardingDonorOplogId& lastSeen) {
+    // `lastSeen` is the _id of the document ReshardingDonorOplogIterator::getNextBatch() has last
+    // read from the oplog buffer collection.
+    //
+    // `_startAt` is updated after each insert into the oplog buffer collection by
+    // ReshardingOplogFetcher to reflect the newer resume point if a new aggregation request was
+    // being issued.
+
+    stdx::lock_guard lk(_mutex);
+    if (_interruptStatus) {
+        return Future<void>::makeReady(*_interruptStatus);
+    }
+
+    if (lastSeen < _startAt) {
+        // `lastSeen < _startAt` means there's at least one document which has been inserted by
+        // ReshardingOplogFetcher and hasn't been returned by
+        // ReshardingDonorOplogIterator::getNextBatch(). The caller has no reason to wait until yet
+        // another document has been inserted before reading from the oplog buffer collection.
+        return Future<void>::makeReady();
+    }
+
+    // `lastSeen == _startAt` means the last document inserted by ReshardingOplogFetcher has already
+    // been returned by ReshardingDonorOplogIterator::getNextBatch() and so
+    // ReshardingDonorOplogIterator would want to wait until ReshardingOplogFetcher does another
+    // insert.
+    //
+    // `lastSeen > _startAt` isn't expected to happen in practice because
+    // ReshardingDonorOplogIterator only uses _id's from documents that it actually read from the
+    // oplog buffer collection for `lastSeen`, but would also mean the caller wants to wait.
+    return std::move(_onInsertFuture);
+}
+
+void ReshardingOplogFetcher::interrupt(Status status) {
+    invariant(!status.isOK());
+
+    // We replace the promise/future pair with a fresh one because consume() won't know an error has
+    // already been set and would otherwise attempt to fulfill the promise again. Later calls to
+    // awaitInsert() won't ever look at `_onInsertFuture` though.
+    auto [p, f] = makePromiseFuture<void>();
+    stdx::lock_guard lk(_mutex);
+    _interruptStatus = status;
+    _onInsertPromise.setError(*_interruptStatus);
+    _onInsertPromise = std::move(p);
+    _onInsertFuture = std::move(f);
+}
+
+ExecutorFuture<void> ReshardingOplogFetcher::schedule(
+    std::shared_ptr<executor::TaskExecutor> executor, const CancelationToken& cancelToken) {
+    return ExecutorFuture(executor)
+        .then(
+            [this, executor, cancelToken] { return _reschedule(std::move(executor), cancelToken); })
+        .onError([](Status status) {
+            LOGV2_INFO(5192101, "Resharding oplog fetcher aborting", "reason"_attr = status);
+            return status;
+        });
+}
+
+ExecutorFuture<void> ReshardingOplogFetcher::_reschedule(
+    std::shared_ptr<executor::TaskExecutor> executor, const CancelationToken& cancelToken) {
+    return ExecutorFuture(executor)
+        .then([this, executor, cancelToken] {
+            ThreadClient client(fmt::format("OplogFetcher-{}-{}",
+                                            _reshardingUUID.toString(),
+                                            _donorShard.toString()),
+                                getGlobalServiceContext());
+
+            return iterate(client.get());
+        })
+        .then([executor, cancelToken](bool moreToCome) {
+            // Wait a little before re-running the aggregation pipeline on the donor's oplog. The
+            // 1-second value was chosen to match the default awaitData timeout that would have been
+            // used if the aggregation cursor was TailableModeEnum::kTailableAndAwaitData.
+            return executor->sleepFor(Seconds{1}, cancelToken).then([moreToCome] {
+                return moreToCome;
+            });
+        })
+        .then([this, executor, cancelToken](bool moreToCome) {
+            if (!moreToCome) {
+                return ExecutorFuture(std::move(executor));
             }
-        } catch (...) {
-            LOGV2_INFO(5192102, "Error.", "reason"_attr = exceptionToStatus());
-            _fetchedFinishPromise.setError(exceptionToStatus());
-        }
-    });
+            return _reschedule(std::move(executor), cancelToken);
+        });
 }
 
 bool ReshardingOplogFetcher::iterate(Client* client) {
@@ -128,8 +192,6 @@ bool ReshardingOplogFetcher::iterate(Client* client) {
         auto opCtxRaii = client->makeOperationContext();
         opCtxRaii->checkForInterrupt();
 
-        const Seconds maxStaleness(10);
-        ReadPreferenceSetting readPref(ReadPreference::Nearest, maxStaleness);
         StatusWith<std::shared_ptr<Shard>> swDonor =
             Grid::get(opCtxRaii.get())->shardRegistry()->getShard(opCtxRaii.get(), _donorShard);
         if (!swDonor.isOK()) {
@@ -142,10 +204,7 @@ bool ReshardingOplogFetcher::iterate(Client* client) {
     }
 
     try {
-        // Consume will throw if there's oplog entries to be copied. It only returns cleanly when
-        // the final oplog has been seen and copied.
-        consume(client, targetShard.get());
-        return false;
+        return consume(client, targetShard.get());
     } catch (const ExceptionForCat<ErrorCategory::Interruption>&) {
         return false;
     } catch (const ExceptionFor<ErrorCodes::OplogQueryMinTsMissing>&) {
@@ -180,21 +239,17 @@ void ReshardingOplogFetcher::_ensureCollection(Client* client, const NamespaceSt
     });
 }
 
-std::vector<BSONObj> ReshardingOplogFetcher::_makePipeline(Client* client) {
+AggregateCommand ReshardingOplogFetcher::_makeAggregateCommand(Client* client) {
     auto opCtxRaii = client->makeOperationContext();
     auto opCtx = opCtxRaii.get();
     auto expCtx = _makeExpressionContext(opCtx);
 
-    return createOplogFetchingPipelineForResharding(
-               expCtx, _startAt, _collUUID, _recipientShard, _doesDonorOwnMinKeyChunk)
-        ->serializeToBson();
-}
+    auto serializedPipeline =
+        createOplogFetchingPipelineForResharding(
+            expCtx, _startAt, _collUUID, _recipientShard, _doesDonorOwnMinKeyChunk)
+            ->serializeToBson();
 
-void ReshardingOplogFetcher::consume(Client* client, Shard* shard) {
-    _ensureCollection(client, _toWriteInto);
-    std::vector<BSONObj> serializedPipeline = _makePipeline(client);
-
-    AggregationRequest aggRequest(NamespaceString::kRsOplogNamespace, serializedPipeline);
+    AggregateCommand aggRequest(NamespaceString::kRsOplogNamespace, std::move(serializedPipeline));
     if (_useReadConcern) {
         auto readConcernArgs = repl::ReadConcernArgs(
             boost::optional<LogicalTime>(_startAt.getTs()),
@@ -202,20 +257,38 @@ void ReshardingOplogFetcher::consume(Client* client, Shard* shard) {
         aggRequest.setReadConcern(readConcernArgs.toBSONInner());
     }
 
+    ReadPreferenceSetting readPref(ReadPreference::Nearest,
+                                   ReadPreferenceSetting::kMinimalMaxStalenessValue);
+    aggRequest.setUnwrappedReadPref(readPref.toContainingBSON());
+
+    aggRequest.setWriteConcern(WriteConcernOptions());
     aggRequest.setHint(BSON("$natural" << 1));
     aggRequest.setRequestReshardingResumeToken(true);
 
     if (_initialBatchSize) {
-        aggRequest.setBatchSize(_initialBatchSize);
+        SimpleCursorOptions cursor;
+        cursor.setBatchSize(_initialBatchSize);
+        aggRequest.setCursor(cursor);
     }
+
+    return aggRequest;
+}
+
+bool ReshardingOplogFetcher::consume(Client* client, Shard* shard) {
+    _ensureCollection(client, _toWriteInto);
+
+    auto aggRequest = _makeAggregateCommand(client);
 
     auto opCtxRaii = client->makeOperationContext();
     int batchesProcessed = 0;
+    bool moreToCome = true;
     auto svcCtx = client->getServiceContext();
+    // Note that the oplog entries are *not* being copied with a tailable cursor.
+    // Shard::runAggregation() will instead return upon hitting the end of the donor's oplog.
     uassertStatusOK(shard->runAggregation(
         opCtxRaii.get(),
         aggRequest,
-        [this, svcCtx, &batchesProcessed](const std::vector<BSONObj>& batch) {
+        [this, svcCtx, &batchesProcessed, &moreToCome](const std::vector<BSONObj>& batch) {
             ThreadClient client(fmt::format("ReshardingFetcher-{}-{}",
                                             _reshardingUUID.toString(),
                                             _donorShard.toString()),
@@ -235,13 +308,23 @@ void ReshardingOplogFetcher::consume(Client* client, Shard* shard) {
                 WriteUnitOfWork wuow(opCtx);
                 auto nextOplog = uassertStatusOK(repl::OplogEntry::parse(doc));
 
-                _startAt = ReshardingDonorOplogId::parse(
+                auto startAt = ReshardingDonorOplogId::parse(
                     {"OplogFetcherParsing"}, nextOplog.get_id()->getDocument().toBson());
                 uassertStatusOK(toWriteTo->insertDocument(opCtx, InsertStatement{doc}, nullptr));
                 wuow.commit();
                 ++_numOplogEntriesCopied;
 
+                auto [p, f] = makePromiseFuture<void>();
+                {
+                    stdx::lock_guard lk(_mutex);
+                    _startAt = startAt;
+                    _onInsertPromise.emplaceValue();
+                    _onInsertPromise = std::move(p);
+                    _onInsertFuture = std::move(f);
+                }
+
                 if (isFinalOplog(nextOplog, _reshardingUUID)) {
+                    moreToCome = false;
                     return false;
                 }
             }
@@ -252,6 +335,8 @@ void ReshardingOplogFetcher::consume(Client* client, Shard* shard) {
 
             return true;
         }));
+
+    return moreToCome;
 }
 
 }  // namespace mongo

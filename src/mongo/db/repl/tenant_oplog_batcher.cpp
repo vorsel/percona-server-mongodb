@@ -41,10 +41,12 @@ namespace mongo {
 namespace repl {
 TenantOplogBatcher::TenantOplogBatcher(const std::string& tenantId,
                                        RandomAccessOplogBuffer* oplogBuffer,
-                                       std::shared_ptr<executor::TaskExecutor> executor)
+                                       std::shared_ptr<executor::TaskExecutor> executor,
+                                       Timestamp resumeBatchingTs)
     : AbstractAsyncComponent(executor.get(), std::string("TenantOplogBatcher_") + tenantId),
       _oplogBuffer(oplogBuffer),
-      _executor(executor) {}
+      _executor(executor),
+      _resumeBatchingTs(resumeBatchingTs) {}
 
 TenantOplogBatcher::~TenantOplogBatcher() {
     shutdown();
@@ -56,7 +58,7 @@ void TenantOplogBatcher::_pushEntry(OperationContext* opCtx,
                                     OplogEntry&& op) {
     uassert(4885606,
             str::stream() << "Prepared transactions are not supported for tenant migration."
-                          << redact(op.toBSON()),
+                          << redact(op.toBSONForLogging()),
             !op.isPreparedCommit() &&
                 (op.getCommandType() != OplogEntry::CommandType::kApplyOps || !op.shouldPrepare()));
     if (op.isTerminalApplyOps()) {
@@ -65,7 +67,7 @@ void TenantOplogBatcher::_pushEntry(OperationContext* opCtx,
         // This applies to both multi-document transactions and atomic applyOps.
         auto expansionsIndex = batch->expansions.size();
         auto& curExpansion = batch->expansions.emplace_back();
-        auto lastOpInTransactionBson = op.toBSON();
+        auto lastOpInTransactionBson = op.getEntry().toBSON();
         repl::ApplyOps::extractOperationsTo(op, lastOpInTransactionBson, &curExpansion);
         auto oplogPrevTsOption = op.getPrevWriteOpTimeInTransaction();
         if (oplogPrevTsOption && !oplogPrevTsOption->isNull()) {
@@ -165,20 +167,26 @@ SemiFuture<TenantOplogBatch> TenantOplogBatcher::_scheduleNextBatch(WithLock, Ba
             Status(ErrorCodes::CallbackCanceled, "Tenant oplog batcher has been shut down."));
     }
     auto pf = makePromiseFuture<TenantOplogBatch>();
-    _promise = std::move(pf.promise);
+    auto taskCompletionPromise = std::make_shared<Promise<TenantOplogBatch>>(std::move(pf.promise));
     _batchRequested = true;
     auto statusWithCbh =
-        _executor->scheduleWork([this, limits](const executor::TaskExecutor::CallbackArgs& args) {
+        _executor->scheduleWork([this, limits, taskCompletionPromise, self = shared_from_this()](
+                                    const executor::TaskExecutor::CallbackArgs& args) {
             if (!args.status.isOK()) {
-                stdx::lock_guard lk(_mutex);
-                _promise->setError(args.status);
+                taskCompletionPromise->setError(args.status);
                 return;
             }
+
             // Using makeReadyFutureWith here allows capturing exceptions.
-            auto result = makeReadyFutureWith([this, &limits] { return _readNextBatch(limits); });
+            auto result = makeReadyFutureWith(
+                [this, &limits, self = shared_from_this()] { return _readNextBatch(limits); });
+
             stdx::lock_guard lk(_mutex);
+            // Fulfilling 'taskCompletionPromise' and resetting '_batchRequested' have to be done in
+            // a single critical section to avoid failure due to "Cannot ask for already-requested
+            // oplog fetcher batch".
             _batchRequested = false;
-            _promise->setFrom(std::move(result));
+            taskCompletionPromise->setFrom(std::move(result));
             if (_isShuttingDown_inlock()) {
                 _transitionToComplete_inlock();
             }
@@ -186,7 +194,7 @@ SemiFuture<TenantOplogBatch> TenantOplogBatcher::_scheduleNextBatch(WithLock, Ba
 
     // If the batch fails to schedule, ensure we get a valid error code instead of a broken promise.
     if (!statusWithCbh.isOK()) {
-        _promise->setError(statusWithCbh.getStatus());
+        taskCompletionPromise->setError(statusWithCbh.getStatus());
     }
     return std::move(pf.future).semi();
 }
@@ -202,6 +210,27 @@ SemiFuture<TenantOplogBatch> TenantOplogBatcher::getNextBatch(BatchLimits limits
 Status TenantOplogBatcher::_doStartup_inlock() noexcept {
     LOGV2_DEBUG(
         4885604, 1, "Tenant Oplog Batcher starting up", "component"_attr = _getComponentName());
+    if (!_resumeBatchingTs.isNull()) {
+        auto opCtx = cc().makeOperationContext();
+        uassert(5272303,
+                str::stream() << "Error resuming oplog batcher",
+                _oplogBuffer
+                    ->seekToTimestamp(opCtx.get(),
+                                      _resumeBatchingTs,
+                                      RandomAccessOplogBuffer::SeekStrategy::kInexact)
+                    .isOK());
+        // Doing a 'seekToTimestamp' will not set the '_lastPoppedKey' on its own if a document
+        // with '_resumeBatchingTs' exists in the buffer collection. We do a 'tryPop' here to set
+        // '_lastPoppedKey' to equal '_resumeBatchingTs'.
+        if (_oplogBuffer->findByTimestamp(opCtx.get(), _resumeBatchingTs).isOK()) {
+            BSONObj opToPopAndDiscard;
+            _oplogBuffer->tryPop(opCtx.get(), &opToPopAndDiscard);
+        }
+        LOGV2_DEBUG(5272306,
+                    1,
+                    "Tenant Oplog Batcher will resume batching from after timestamp",
+                    "timestamp"_attr = _resumeBatchingTs);
+    }
     return Status::OK();
 }
 

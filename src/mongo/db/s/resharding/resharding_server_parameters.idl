@@ -46,11 +46,63 @@ server_parameters:
             expr: 100 * 1024
         validator:
             gte: 1
-    useReshardingOplogApplicationRules:
+
+    reshardingTxnClonerProgressBatchSize:
         description: >-
-            Whether or not the ReshardingOplogApplier should use ReshardingOplogApplicationRules
-            when applying operations during. If false, will use standard oplog application rules.
-        set_at: "startup"
-        cpp_vartype: bool
-        cpp_varname: gUseReshardingOplogApplicationRules
-        default: false
+            Number of config.transactions records from a donor shard to process before recording the
+            lsid locally to resume from on primary failover or server restart.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: gReshardingTxnClonerProgressBatchSize
+        default: 1000
+        validator:
+            gte: 1
+
+    reshardingWriterThreadCount:
+        description: >-
+            The number of threads in the thread pool used by *each* ReshardingOplogApplier to apply
+            oplog entries from the corresponding donor shard. There is one ReshardingOplogApplier
+            instance per donor shard.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: gReshardingWriterThreadCount
+        default: 4
+        validator:
+            gte: 1
+            lte: 256
+
+    reshardingBatchLimitOperations:
+        description: >-
+            The maximum number of operations for ReshardingOplogApplier to apply in a single batch.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: gReshardingBatchLimitOperations
+        default:
+            expr: 5 * 1000
+        validator:
+            gte: 1
+            lte:
+                expr: 1000 * 1000
+
+    reshardingBatchLimitBytes:
+        description: >-
+            The maximum size in bytes for ReshardingOplogApplier to apply in a single batch.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: gReshardingBatchLimitBytes
+        default:
+            expr: 100 * 1024 * 1024
+        validator:
+            gte:
+                expr: 16 * 1024 * 1024
+            lte:
+                expr: 100 * 1024 * 1024
+
+    reshardingOplogApplierMaxLockRequestTimeoutMillis:
+        description: >-
+            The max number of milliseconds that the resharding oplog applier will wait for lock
+            acquisition.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: gReshardingOplogApplierMaxLockRequestTimeoutMillis
+        default: 5

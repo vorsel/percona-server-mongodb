@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <fmt/format.h>
@@ -377,6 +378,13 @@ public:
      */
     int numberInt() const;
 
+    /** Like numberInt() but with well-defined behavior for doubles that
+     *  are NaNs, or too large/small to be represented as int.
+     *  NaNs -> 0
+     *  very large doubles -> INT_MAX
+     *  very small doubles -> INT_MIN  */
+    int safeNumberInt() const;
+
     /**
      * Retrieves the value of this element as a 64 bit integer. If the BSON type is non-numeric,
      * returns zero. If the element holds a double, truncates the fractional part.
@@ -398,6 +406,10 @@ public:
      *  preserves edge-case behavior from older versions.
      */
     long long safeNumberLongForHash() const;
+
+    /** Convert a numeric field to long long, and uassert the conversion is exact.
+     */
+    long long exactNumberLong() const;
 
     /**
      * Parses a BSONElement of any numeric type into a positive long long, failing if the value
@@ -946,6 +958,11 @@ inline int BSONElement::numberInt() const {
     }
 }
 
+inline int BSONElement::safeNumberInt() const {
+    return static_cast<int>(std::clamp<long long>(
+        safeNumberLong(), std::numeric_limits<int>::min(), std::numeric_limits<int>::max()));
+}
+
 inline long long BSONElement::numberLong() const {
     switch (type()) {
         case NumberDouble:
@@ -1076,6 +1093,10 @@ inline long long BSONElement::safeNumberLongForHash() const {
     } else {
         return safeNumberLong();
     }
+}
+
+inline long long BSONElement::exactNumberLong() const {
+    return uassertStatusOK(parseIntegerElementToLong());
 }
 
 inline BSONElement::BSONElement() {

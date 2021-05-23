@@ -62,7 +62,7 @@ function resumeMigrationAfterBlockingWrite(host, targetBlockedWrites) {
     }));
 
     assert.commandWorked(primary.adminCommand(
-        {configureFailPoint: "pauseTenantMigrationAfterBlockingStarts", mode: "off"}));
+        {configureFailPoint: "pauseTenantMigrationBeforeLeavingBlockingState", mode: "off"}));
 }
 
 function createCollectionAndInsertDocs(primaryDB, collName, isCapped, numDocs = kNumInitialDocs) {
@@ -215,6 +215,17 @@ function runCommand(testOpts, expectedError) {
 
     if (expectedError) {
         assert.commandFailedWithCode(res, expectedError);
+        // The 'TransientTransactionError' label is attached only in a scope of a transaction.
+        if (testOpts.testInTransaction &&
+            (expectedError == ErrorCodes.TenantMigrationAborted ||
+             expectedError == ErrorCodes.TenantMigrationCommitted)) {
+            assert(res["errorLabels"] != null, "Error labels are absent from " + tojson(res));
+            const expectedErrorLabels = ['TransientTransactionError'];
+            assert.sameMembers(res["errorLabels"],
+                               expectedErrorLabels,
+                               "Error labels " + tojson(res["errorLabels"]) +
+                                   " are different from expected " + expectedErrorLabels);
+        }
     } else {
         assert.commandWorked(res);
     }
@@ -238,11 +249,13 @@ function testWriteIsRejectedIfSentAfterMigrationHasCommitted(testCase, testOpts)
         tenantId,
     };
 
-    const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
+    const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(
+        migrationOpts, false /* retryOnRetryableErrors */, false /* automaticForgetMigration */));
     assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
 
     runCommand(testOpts, ErrorCodes.TenantMigrationCommitted);
     testCase.assertCommandFailed(testOpts.primaryDB, testOpts.dbName, testOpts.collName);
+    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 }
 
 /**
@@ -255,8 +268,10 @@ function testWriteIsAcceptedIfSentAfterMigrationHasAborted(testCase, testOpts) {
         tenantId,
     };
 
-    let abortFp = configureFailPoint(testOpts.primaryDB, "abortTenantMigrationAfterBlockingStarts");
-    const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
+    let abortFp =
+        configureFailPoint(testOpts.primaryDB, "abortTenantMigrationBeforeLeavingBlockingState");
+    const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(
+        migrationOpts, false /* retryOnRetryableErrors */, false /* automaticForgetMigration */));
     assert.eq(stateRes.state, TenantMigrationTest.State.kAborted);
     abortFp.off();
 
@@ -271,6 +286,7 @@ function testWriteIsAcceptedIfSentAfterMigrationHasAborted(testCase, testOpts) {
 
     runCommand(testOpts);
     testCase.assertCommandSucceeded(testOpts.primaryDB, testOpts.dbName, testOpts.collName);
+    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 }
 
 /**
@@ -284,7 +300,7 @@ function testWriteBlocksIfMigrationIsInBlocking(testCase, testOpts) {
     };
 
     let blockingFp =
-        configureFailPoint(testOpts.primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+        configureFailPoint(testOpts.primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
 
     assert.commandWorked(tenantMigrationTest.startMigration(migrationOpts));
 
@@ -295,11 +311,12 @@ function testWriteBlocksIfMigrationIsInBlocking(testCase, testOpts) {
 
     // Allow the migration to complete.
     blockingFp.off();
-    const stateRes =
-        assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
+    const stateRes = assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(
+        migrationOpts, false /* retryOnRetryableErrors */));
     assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
 
     testCase.assertCommandFailed(testOpts.primaryDB, testOpts.dbName, testOpts.collName);
+    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 }
 
 /**
@@ -314,7 +331,7 @@ function testBlockedWriteGetsUnblockedAndRejectedIfMigrationCommits(testCase, te
     };
 
     let blockingFp =
-        configureFailPoint(testOpts.primaryDB, "pauseTenantMigrationAfterBlockingStarts");
+        configureFailPoint(testOpts.primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
     const targetBlockedWrites =
         assert
             .commandWorked(testOpts.primaryDB.adminCommand(
@@ -336,11 +353,12 @@ function testBlockedWriteGetsUnblockedAndRejectedIfMigrationCommits(testCase, te
 
     // Verify that the migration succeeded.
     resumeMigrationThread.join();
-    const stateRes =
-        assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
+    const stateRes = assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(
+        migrationOpts, false /* retryOnRetryableErrors */));
     assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
 
     testCase.assertCommandFailed(testOpts.primaryDB, testOpts.dbName, testOpts.collName);
+    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 }
 
 /**
@@ -355,8 +373,9 @@ function testBlockedWriteGetsUnblockedAndRejectedIfMigrationAborts(testCase, tes
     };
 
     let blockingFp =
-        configureFailPoint(testOpts.primaryDB, "pauseTenantMigrationAfterBlockingStarts");
-    let abortFp = configureFailPoint(testOpts.primaryDB, "abortTenantMigrationAfterBlockingStarts");
+        configureFailPoint(testOpts.primaryDB, "pauseTenantMigrationBeforeLeavingBlockingState");
+    let abortFp =
+        configureFailPoint(testOpts.primaryDB, "abortTenantMigrationBeforeLeavingBlockingState");
     const targetBlockedWrites =
         assert
             .commandWorked(testOpts.primaryDB.adminCommand(
@@ -378,12 +397,13 @@ function testBlockedWriteGetsUnblockedAndRejectedIfMigrationAborts(testCase, tes
 
     // Verify that the migration aborted due to the simulated error.
     resumeMigrationThread.join();
-    const stateRes =
-        assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
+    const stateRes = assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(
+        migrationOpts, false /* retryOnRetryableErrors */));
     abortFp.off();
     assert.eq(stateRes.state, TenantMigrationTest.State.kAborted);
 
     testCase.assertCommandFailed(testOpts.primaryDB, testOpts.dbName, testOpts.collName);
+    assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 }
 
 const isNotWriteCommand = "not a write command";
@@ -434,6 +454,7 @@ const testCases = {
     _recvChunkStart: {skip: isNotRunOnUserDatabase},
     _recvChunkStatus: {skip: isNotRunOnUserDatabase},
     _shardsvrCloneCatalogData: {skip: isNotRunOnUserDatabase},
+    _shardsvrCreateCollection: {skip: isOnlySupportedOnShardedCluster},
     _shardsvrMovePrimary: {skip: isNotRunOnUserDatabase},
     _shardsvrShardCollection: {skip: isNotRunOnUserDatabase},
     _shardsvrRenameCollection: {skip: isOnlySupportedOnShardedCluster},
@@ -864,7 +885,6 @@ const testCases = {
     startSession: {skip: isNotRunOnUserDatabase},
     stopRecordingTraffic: {skip: isNotRunOnUserDatabase},
     top: {skip: isNotRunOnUserDatabase},
-    unsetSharding: {skip: isNotRunOnUserDatabase},
     update: {
         testInTransaction: true,
         testAsRetryableWrite: true,

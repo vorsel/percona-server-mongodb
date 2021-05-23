@@ -85,6 +85,7 @@
 #include "mongo/s/stale_exception.h"
 #include "mongo/s/transaction_router.h"
 #include "mongo/transport/hello_metrics.h"
+#include "mongo/transport/service_executor.h"
 #include "mongo/transport/session.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/scopeguard.h"
@@ -320,8 +321,6 @@ void ExecCommandClient::_onCompletion() {
     auto body = _rec->getReplyBuilder()->getBodyBuilder();
     appendRequiredFieldsToResponse(opCtx, &body);
 
-    // TODO SERVER-49109 enable the following code-path.
-    /*
     auto seCtx = transport::ServiceExecutorContext::get(opCtx->getClient());
     if (!seCtx) {
         // We were run by a background worker.
@@ -329,10 +328,10 @@ void ExecCommandClient::_onCompletion() {
     }
 
     if (!_invocation->isSafeForBorrowedThreads()) {
-        // If the last command wasn't safe for a borrowed thread, then let's move off of it.
+        // If the last command wasn't safe for a borrowed thread, then let's move
+        // off of it.
         seCtx->setThreadingModel(transport::ServiceExecutor::ThreadingModel::kDedicated);
     }
-    */
 }
 
 Future<void> ExecCommandClient::run() {
@@ -521,6 +520,16 @@ Status ParseAndRunCommand::_prologue() {
         opCtx->setComment(commentField.wrap());
     }
 
+    Client* client = opCtx->getClient();
+    auto const apiParamsFromClient = initializeAPIParameters(request.body, command);
+
+    {
+        // We must obtain the client lock to set APIParameters on the operation context, as it may
+        // be concurrently read by CurrentOp.
+        stdx::lock_guard<Client> lk(*client);
+        APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
+    }
+
     _invocation = command->parse(opCtx, request);
     CommandInvocation::set(opCtx, _invocation);
 
@@ -547,16 +556,12 @@ Status ParseAndRunCommand::_prologue() {
 
     _wc.emplace(uassertStatusOK(WriteConcernOptions::extractWCFromCommand(request.body)));
 
-    Client* client = opCtx->getClient();
-    auto const apiParamsFromClient = initializeAPIParameters(request.body, command);
-
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     Status readConcernParseStatus = Status::OK();
     {
-        // We must obtain the client lock to set APIParameters and ReadConcernArgs on the operation
-        // context, as it may be concurrently read by CurrentOp.
+        // We must obtain the client lock to set ReadConcernArgs on the operation context, as it may
+        // be concurrently read by CurrentOp.
         stdx::lock_guard<Client> lk(*client);
-        APIParameters::get(opCtx) = APIParameters::fromClient(apiParamsFromClient);
         readConcernParseStatus = readConcernArgs.initialize(request.body);
     }
 

@@ -33,6 +33,8 @@
 
 #include "mongo/db/s/collection_metadata.h"
 
+#include <fmt/format.h>
+
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/bson/dotted_path_support.h"
@@ -40,6 +42,8 @@
 #include "mongo/util/str.h"
 
 namespace mongo {
+
+using namespace fmt::literals;
 
 CollectionMetadata::CollectionMetadata(ChunkManager cm, const ShardId& thisShardId)
     : _cm(std::move(cm)), _thisShardId(thisShardId) {}
@@ -68,8 +72,7 @@ boost::optional<ShardKeyPattern> CollectionMetadata::getReshardingKeyIfShouldFor
         case CoordinatorStateEnum::kUnused:
         case CoordinatorStateEnum::kInitializing:
         case CoordinatorStateEnum::kMirroring:
-        case CoordinatorStateEnum::kCommitted:
-        case CoordinatorStateEnum::kRenaming:
+        case CoordinatorStateEnum::kDecisionPersisted:
         case CoordinatorStateEnum::kDone:
         case CoordinatorStateEnum::kError:
             return boost::none;
@@ -90,9 +93,11 @@ boost::optional<ShardKeyPattern> CollectionMetadata::getReshardingKeyIfShouldFor
     return ShardKeyPattern(donorFields->getReshardingKey());
 }
 
-bool CollectionMetadata::writesShouldRunInDistributedTransaction(const OID& originalEpoch,
-                                                                 const OID& reshardingEpoch) const {
-    auto reshardingFields = getReshardingFields();
+bool CollectionMetadata::disallowWritesForResharding(const UUID& currentCollectionUUID) const {
+    if (!isSharded())
+        return false;
+
+    const auto& reshardingFields = getReshardingFields();
     if (!reshardingFields)
         return false;
 
@@ -104,35 +109,38 @@ bool CollectionMetadata::writesShouldRunInDistributedTransaction(const OID& orig
         case CoordinatorStateEnum::kApplying:
             return false;
         case CoordinatorStateEnum::kMirroring:
-        case CoordinatorStateEnum::kCommitted:
-            return true;
-        case CoordinatorStateEnum::kRenaming:
+            // Only return true if this is also the donor shard.
+            return reshardingFields->getDonorFields() != boost::none;
+        case CoordinatorStateEnum::kDecisionPersisted:
             break;
         case CoordinatorStateEnum::kDone:
         case CoordinatorStateEnum::kError:
             return false;
     }
 
-    // Handle kRenaming:
-    auto chunkVersion = getCollVersion();
-    uassert(ErrorCodes::NamespaceNotSharded,
-            str::stream() << "Collection is not sharded, original epoch: " << originalEpoch,
-            chunkVersion != ChunkVersion::UNSHARDED());
+    const auto& recipientFields = reshardingFields->getRecipientFields();
+    uassert(5325800,
+            "Missing 'recipientFields' in collection metadata for resharding operation that has "
+            "decision persisted",
+            recipientFields);
 
-    const auto& collectionCurrentEpoch = chunkVersion.epoch();
+    const auto& originalUUID = recipientFields->getExistingUUID();
+    const auto& reshardingUUID = reshardingFields->getUuid();
 
-    // Renaming has not completed:
-    if (collectionCurrentEpoch == originalEpoch)
+    if (currentCollectionUUID == originalUUID) {
+        // This shard must be both a donor and recipient. Neither the drop or renameCollection have
+        // happened yet. Writes should continue to be disallowed.
         return true;
+    } else if (currentCollectionUUID == reshardingUUID) {
+        // The renameCollection has happened. Writes no longer need be disallowed on this shard.
+        return false;
+    }
 
-    // Else, renaming must have completed, and myEpoch must be equal to reshardingEpoch.
-    uassert(5169400,
-            str::stream() << "Invalid epoch; current epoch " << collectionCurrentEpoch
-                          << " does not match original epoch " << originalEpoch
-                          << " or resharding epoch " << reshardingEpoch,
-            collectionCurrentEpoch == reshardingEpoch);
-
-    return false;
+    uasserted(ErrorCodes::InvalidUUID,
+              "Expected collection to have either the original UUID {} or the resharding UUID {}, "
+              "but the collection instead has UUID {}"_format(originalUUID.toString(),
+                                                              reshardingUUID.toString(),
+                                                              currentCollectionUUID.toString()));
 }
 
 BSONObj CollectionMetadata::extractDocumentKey(const BSONObj& doc) const {

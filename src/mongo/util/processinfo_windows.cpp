@@ -113,12 +113,29 @@ ProcessInfo::~ProcessInfo() {}
 boost::optional<unsigned long> ProcessInfo::getNumCoresForProcess() {
     DWORD_PTR process_mask, system_mask;
 
-    if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask)) {
-        std::bitset<sizeof(process_mask) * 8> mask(process_mask);
-        if (mask.count() > 0)
-            return mask.count();
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask))
+        return boost::none;
+
+    std::bitset<sizeof(process_mask) * 8> mask(process_mask);
+    auto num = mask.count();
+    if (num == 0)
+        return boost::none;
+
+    // If we are running in a Windows Container using process isolation this process is
+    // associated with a job object we can query for the cpu limit
+    // https://docs.microsoft.com/en-us/virtualization/windowscontainers/manage-containers/resource-controls
+    // https://docs.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_cpu_rate_control_information
+    JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuInfo;
+    ZeroMemory(&cpuInfo, sizeof(cpuInfo));
+    if (QueryInformationJobObject(
+            NULL, JobObjectCpuRateControlInformation, &cpuInfo, sizeof(cpuInfo), NULL) &&
+        (cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE) &&
+        (cpuInfo.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP)) {
+        // CpuRate is a percentage times 100
+        num = std::ceil(num * (static_cast<double>(cpuInfo.CpuRate) / 10000));
     }
-    return boost::none;
+
+    return num;
 }
 
 bool ProcessInfo::supported() {
@@ -237,7 +254,21 @@ void ProcessInfo::SystemInfo::collectSystemInfo() {
     mse.dwLength = sizeof(mse);
     if (GlobalMemoryStatusEx(&mse)) {
         memSize = mse.ullTotalPhys;
-        memLimit = memSize;
+
+        // If we are running in a Windows Container using process isolation this process is
+        // associated with a job object we can query for the memory limit
+        // https://docs.microsoft.com/en-us/virtualization/windowscontainers/manage-containers/resource-controls
+        // https://docs.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobInfo;
+        ZeroMemory(&jobInfo, sizeof(jobInfo));
+        if (QueryInformationJobObject(
+                NULL, JobObjectExtendedLimitInformation, &jobInfo, sizeof(jobInfo), NULL) &&
+            (jobInfo.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_JOB_MEMORY) &&
+            jobInfo.JobMemoryLimit != 0) {
+            memLimit = jobInfo.JobMemoryLimit;
+        } else {
+            memLimit = memSize;
+        }
     }
 
     // get OS version info
@@ -338,57 +369,4 @@ bool ProcessInfo::checkNumaEnabled() {
     return numaNodeCount > 1;
 }
 
-bool ProcessInfo::blockCheckSupported() {
-    return true;
-}
-
-bool ProcessInfo::blockInMemory(const void* start) {
-#if 0
-        // code for printing out page fault addresses and pc's --
-        // this could be useful for targetting heavy pagefault locations in the code
-        static BOOL bstat = InitializeProcessForWsWatch( GetCurrentProcess() );
-        PSAPI_WS_WATCH_INFORMATION_EX wiex[30];
-        DWORD bufsize =  sizeof(wiex);
-        bstat = GetWsChangesEx( GetCurrentProcess(), &wiex[0], &bufsize );
-        if (bstat) {
-            for (int i=0; i<30; i++) {
-                if (wiex[i].BasicInfo.FaultingPc == 0) break;
-                LOGV2(677707,
-                      "Encountered a page fault",
-                      "faulting_pc"_attr = wiex[i].BasicInfo.FaultingPcm,
-                      "address"_attr = wiex[i].BasicInfo.FaultingVa,
-                      "thread_id"_attr = wiex[i].FaultingThreadId);
-            }
-        }
-#endif
-    PSAPI_WORKING_SET_EX_INFORMATION wsinfo;
-    wsinfo.VirtualAddress = const_cast<void*>(start);
-    BOOL result = QueryWorkingSetEx(GetCurrentProcess(), &wsinfo, sizeof(wsinfo));
-    if (result)
-        if (wsinfo.VirtualAttributes.Valid)
-            return true;
-    return false;
-}
-
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<char>* out) {
-    out->resize(numPages);
-    std::unique_ptr<PSAPI_WORKING_SET_EX_INFORMATION[]> wsinfo(
-        new PSAPI_WORKING_SET_EX_INFORMATION[numPages]);
-
-    const void* startOfFirstPage = alignToStartOfPage(start);
-    for (size_t i = 0; i < numPages; i++) {
-        wsinfo[i].VirtualAddress = reinterpret_cast<void*>(
-            reinterpret_cast<unsigned long long>(startOfFirstPage) + i * getPageSize());
-    }
-
-    BOOL result = QueryWorkingSetEx(
-        GetCurrentProcess(), wsinfo.get(), sizeof(PSAPI_WORKING_SET_EX_INFORMATION) * numPages);
-
-    if (!result)
-        return false;
-    for (size_t i = 0; i < numPages; ++i) {
-        (*out)[i] = wsinfo[i].VirtualAttributes.Valid ? 1 : 0;
-    }
-    return true;
-}
 }  // namespace mongo

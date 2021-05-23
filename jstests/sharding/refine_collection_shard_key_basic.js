@@ -13,6 +13,7 @@ load('jstests/libs/fail_point_util.js');
 load('jstests/libs/profiler.js');
 load('jstests/sharding/libs/shard_versioning_util.js');
 load('jstests/sharding/libs/sharded_transactions_helpers.js');
+load("jstests/sharding/libs/find_chunks_util.js");
 
 const st = new ShardingTest({mongos: 2, shards: 2, rs: {nodes: 3}});
 const mongos = st.s0;
@@ -178,12 +179,12 @@ function setupConfigChunksBeforeRefine() {
     assert.commandWorked(mongos.adminCommand({split: kNsName, middle: {a: 0, b: 0}}));
     assert.commandWorked(mongos.adminCommand({split: kNsName, middle: {a: 5, b: 5}}));
 
-    return mongos.getCollection(kConfigChunks).findOne({ns: kNsName}).lastmodEpoch;
+    return findChunksUtil.findOneChunkByNs(mongos.getDB('config'), kNsName).lastmodEpoch;
 }
 
 function validateConfigChunksAfterRefine(oldEpoch) {
     const chunkArr =
-        mongos.getCollection(kConfigChunks).find({ns: kNsName}).sort({min: 1}).toArray();
+        findChunksUtil.findChunksByNs(mongos.getDB('config'), kNsName).sort({min: 1}).toArray();
     assert.eq(3, chunkArr.length);
     assert.eq({a: MinKey, b: MinKey, c: MinKey, d: MinKey}, chunkArr[0].min);
     assert.eq({a: 0, b: 0, c: MinKey, d: MinKey}, chunkArr[0].max);
@@ -234,7 +235,8 @@ function validateUnrelatedCollAfterRefine(oldCollArr, oldChunkArr, oldTagsArr) {
     assert.eq(1, collArr.length);
     assert.sameMembers(oldCollArr, collArr);
 
-    const chunkArr = mongos.getCollection(kConfigChunks).find({ns: kUnrelatedName}).toArray();
+    const chunkArr =
+        findChunksUtil.findChunksByNs(mongos.getDB('config'), kUnrelatedName).toArray();
     assert.eq(3, chunkArr.length);
     assert.sameMembers(oldChunkArr, chunkArr);
 
@@ -324,26 +326,6 @@ dropAndRecreateColl({aKey: 1});
 // is thrown in ConfigsvrRefineCollectionShardKeyCommand.
 hangAfterRefreshFailPoint.off();
 awaitShellToTriggerNamespaceNotSharded();
-
-assert.commandWorked(mongos.adminCommand({shardCollection: kNsName, key: {_id: 1}}));
-
-// Configure failpoint 'hangRefineCollectionShardKeyAfterRefresh' on staleMongos and run
-// refineCollectionShardKey against this mongos in a parallel thread.
-hangAfterRefreshFailPoint =
-    configureFailPoint(staleMongos, 'hangRefineCollectionShardKeyAfterRefresh');
-const awaitShellToTriggerStaleEpoch = startParallelShell(() => {
-    assert.commandFailedWithCode(
-        db.adminCommand({refineCollectionShardKey: 'db.foo', key: {_id: 1, aKey: 1}}),
-        ErrorCodes.StaleEpoch);
-}, staleMongos.port);
-hangAfterRefreshFailPoint.wait();
-
-// Drop and re-shard namespace 'db.foo' without staleMongos refreshing its metadata.
-dropAndReshardColl({_id: 1});
-
-// Should fail because staleMongos has a stale epoch.
-hangAfterRefreshFailPoint.off();
-awaitShellToTriggerStaleEpoch();
 
 assert.commandWorked(mongos.getDB(kDbName).dropDatabase());
 
@@ -628,7 +610,7 @@ assert.commandWorked(mongos.adminCommand({
 }));
 
 const oldCollArr = mongos.getCollection(kConfigCollections).find({_id: kUnrelatedName}).toArray();
-const oldChunkArr = mongos.getCollection(kConfigChunks).find({ns: kUnrelatedName}).toArray();
+const oldChunkArr = findChunksUtil.findChunksByNs(mongos.getDB('config'), kUnrelatedName).toArray();
 const oldTagsArr = mongos.getCollection(kConfigTags).find({ns: kUnrelatedName}).toArray();
 assert.eq(1, oldCollArr.length);
 assert.eq(3, oldChunkArr.length);
@@ -774,9 +756,9 @@ function compareMinAndMaxFields(shardedArr, refinedArr) {
 function compareBoundaries(conn, shardedNs, refinedNs) {
     // Compare chunks.
     const shardedChunks =
-        conn.getDB("config").chunks.find({ns: shardedNs}).sort({max: 1}).toArray();
+        findChunksUtil.findChunksByNs(conn.getDB("config"), shardedNs).sort({max: 1}).toArray();
     const refinedChunks =
-        conn.getDB("config").chunks.find({ns: refinedNs}).sort({max: 1}).toArray();
+        findChunksUtil.findChunksByNs(conn.getDB("config"), refinedNs).sort({max: 1}).toArray();
     compareMinAndMaxFields(shardedChunks, refinedChunks);
 
     // Compare tags.

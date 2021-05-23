@@ -3,6 +3,7 @@
  * @tags: [
  *   requires_replication,
  *   requires_wiredtiger,
+ *   sbe_incompatible,
  * ]
  */
 (function() {
@@ -10,12 +11,7 @@
 
 var rst = new ReplSetTest({
     nodes: 2,
-    nodeOptions: {
-        setParameter: {
-            "measureOperationResourceConsumption": true,
-            "aggregateOperationResourceConsumptionMetrics": true
-        }
-    }
+    nodeOptions: {setParameter: {"aggregateOperationResourceConsumptionMetrics": true}}
 });
 rst.startSet();
 rst.initiate();
@@ -62,15 +58,30 @@ let getDBMetrics = (adminDB) => {
     return allMetrics;
 };
 
-let getGlobalCpuTime = (db) => {
-    let ss = db.serverStatus({resourceConsumption: true});
+let getServerStatusMetrics = (db) => {
+    let ss = db.serverStatus();
     assert(ss.hasOwnProperty('resourceConsumption'), ss);
-    return ss.resourceConsumption.cpuNanos;
+    return ss.resourceConsumption;
 };
+
+const primary = rst.getPrimary();
+
+// $operationMetrics may only be run against the admin database and in a 'collectionless' form.
+assert.commandFailedWithCode(primary.getDB('invalid').runCommand({
+    aggregate: 1,
+    pipeline: [{$operationMetrics: {}}],
+    cursor: {},
+}),
+                             ErrorCodes.InvalidNamespace);
+assert.commandFailedWithCode(primary.getDB('admin').runCommand({
+    aggregate: 'test',
+    pipeline: [{$operationMetrics: {}}],
+    cursor: {},
+}),
+                             ErrorCodes.InvalidNamespace);
 
 // Perform very basic reads and writes on two different databases.
 const db1Name = 'db1';
-const primary = rst.getPrimary();
 const db1 = primary.getDB(db1Name);
 assert.commandWorked(db1.coll1.insert({a: 1}));
 assert.commandWorked(db1.coll2.insert({a: 1}));
@@ -79,10 +90,6 @@ const db2Name = 'db2';
 const db2 = primary.getDB(db2Name);
 assert.commandWorked(db2.coll1.insert({a: 1}));
 assert.commandWorked(db2.coll2.insert({a: 1}));
-
-// The 'resourceConsumption' field should not be included in serverStatus by default.
-let ss = db1.serverStatus();
-assert(!ss.hasOwnProperty('resourceConsumption'), ss);
 
 const secondary = rst.getSecondary();
 [primary, secondary].forEach(function(node) {
@@ -93,7 +100,7 @@ const secondary = rst.getSecondary();
     rst.awaitReplication();
     const adminDB = node.getDB('admin');
 
-    let initialCpuTime = getGlobalCpuTime(adminDB);
+    let initialCpuTime = getServerStatusMetrics(adminDB).cpuNanos;
 
     adminDB.aggregate([{$operationMetrics: {clearMetrics: true}}]);
 
@@ -121,6 +128,10 @@ const secondary = rst.getSecondary();
     // Ensure the two user database have present metrics.
     assertMetricsExist(allMetrics[db1Name]);
     assertMetricsExist(allMetrics[db2Name]);
+
+    let ssMetrics = getServerStatusMetrics(adminDB);
+    assert.eq(ssMetrics.numMetrics, 2);
+    assert.gt(ssMetrics.memUsage, 0);
 
     // Ensure read metrics are attributed to the correct replication state.
     let lastDocBytesRead;
@@ -153,7 +164,7 @@ const secondary = rst.getSecondary();
     // CPU time aggregation is only supported on Linux.
     if (isLinux) {
         // Ensure the CPU time is increasing.
-        let lastCpuTime = getGlobalCpuTime(adminDB);
+        let lastCpuTime = getServerStatusMetrics(adminDB).cpuNanos;
         assert.gt(lastCpuTime, initialCpuTime);
 
         // Ensure the global CPU time matches the aggregated time for both databases.
@@ -178,8 +189,8 @@ const secondary = rst.getSecondary();
     // No results from the aggregation because of the $out.
     assert.eq(cursor.itcount(), 0);
 
-    // TODO (SERVER-51176): Ensure metrics are properly recorded for $out.
-    // This new database should appear with metrics, but it does not.
+    // There are no additional metrics for the new database because the command was run on the
+    // 'admin' database and it does not collect metrics.
     cursor = adminDB.aggregate([{$operationMetrics: {}}]);
     assert.eq(cursor.itcount(), 2);
 
@@ -211,6 +222,16 @@ const secondary = rst.getSecondary();
     // Ensure no metrics are reported.
     cursor = adminDB.aggregate([{$operationMetrics: {}}]);
     assert.eq(cursor.itcount(), 0);
+
+    // Ensure the serverStatus metrics are cleared except for cpuNanos.
+    ssMetrics = getServerStatusMetrics(adminDB);
+    assert.eq(0, ssMetrics.numMetrics);
+    assert.eq(0, ssMetrics.memUsage);
+    if (isLinux) {
+        assert.neq(0, ssMetrics.cpuNanos);
+    } else {
+        assert.eq(0, ssMetrics.cpuNanos);
+    }
 
     // Insert something and ensure metrics are still reporting.
     assert.commandWorked(db1.coll3.insert({a: 1}));

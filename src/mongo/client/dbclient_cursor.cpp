@@ -43,6 +43,8 @@
 #include "mongo/db/client.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/getmore_request.h"
 #include "mongo/db/query/query_request.h"
@@ -131,34 +133,32 @@ Message DBClientCursor::_assembleInit() {
                 // Legacy queries don't handle readOnce.
                 qr.getValue()->setReadOnce(true);
             }
-            if (query.getBoolField("$_requestResumeToken")) {
+            if (query.getBoolField(FindCommand::kRequestResumeTokenFieldName)) {
                 // Legacy queries don't handle requestResumeToken.
                 qr.getValue()->setRequestResumeToken(true);
             }
-            if (query.hasField("$_resumeAfter")) {
+            if (query.hasField(FindCommand::kResumeAfterFieldName)) {
                 // Legacy queries don't handle resumeAfter.
-                qr.getValue()->setResumeAfter(query.getObjectField("$_resumeAfter"));
+                qr.getValue()->setResumeAfter(
+                    query.getObjectField(FindCommand::kResumeAfterFieldName));
             }
-            if (auto replTerm = query[QueryRequest::kTermField]) {
+            if (auto replTerm = query[FindCommand::kTermFieldName]) {
                 // Legacy queries don't handle term.
                 qr.getValue()->setReplicationTerm(replTerm.numberLong());
             }
+            // Legacy queries don't handle readConcern.
+            // We prioritize the readConcern parsed from the query object over '_readConcernObj'.
             if (auto readConcern = query[repl::ReadConcernArgs::kReadConcernFieldName]) {
-                // Legacy queries don't handle readConcern.
                 qr.getValue()->setReadConcern(readConcern.Obj());
+            } else if (_readConcernObj) {
+                qr.getValue()->setReadConcern(*_readConcernObj);
             }
-            BSONObj cmd = _nsOrUuid.uuid() ? qr.getValue()->asFindCommandWithUuid()
-                                           : qr.getValue()->asFindCommand();
+            BSONObj cmd = qr.getValue()->asFindCommand();
+
             if (auto readPref = query["$readPreference"]) {
                 // QueryRequest doesn't handle $readPreference.
                 cmd = BSONObjBuilder(std::move(cmd)).append(readPref).obj();
             }
-            if (!cmd.hasField(repl::ReadConcernArgs::kReadConcernFieldName) && _readConcernObj) {
-                cmd = BSONObjBuilder(std::move(cmd))
-                          .append(repl::ReadConcernArgs::kReadConcernFieldName, *_readConcernObj)
-                          .obj();
-            }
-
             return assembleCommandRequest(_client, ns.db(), opts, std::move(cmd));
         }
         // else use legacy OP_QUERY request.
@@ -596,11 +596,11 @@ DBClientCursor::DBClientCursor(DBClientBase* client,
 
 /* static */
 StatusWith<std::unique_ptr<DBClientCursor>> DBClientCursor::fromAggregationRequest(
-    DBClientBase* client, AggregationRequest aggRequest, bool secondaryOk, bool useExhaust) {
+    DBClientBase* client, AggregateCommand aggRequest, bool secondaryOk, bool useExhaust) {
     BSONObj ret;
     try {
-        if (!client->runCommand(aggRequest.getNamespaceString().db().toString(),
-                                aggRequest.serializeToCommandObj().toBson(),
+        if (!client->runCommand(aggRequest.getNamespace().db().toString(),
+                                aggregation_request_helper::serializeToCommandObj(aggRequest),
                                 ret,
                                 secondaryOk ? QueryOption_SecondaryOk : 0)) {
             return {ErrorCodes::CommandFailed, ret.toString()};
@@ -615,7 +615,7 @@ StatusWith<std::unique_ptr<DBClientCursor>> DBClientCursor::fromAggregationReque
     }
 
     return {std::make_unique<DBClientCursor>(client,
-                                             aggRequest.getNamespaceString(),
+                                             aggRequest.getNamespace(),
                                              cursorId,
                                              0,
                                              useExhaust ? QueryOption_Exhaust : 0,

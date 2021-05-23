@@ -108,6 +108,12 @@ const NamespaceString NamespaceString::kReshardingApplierProgressNamespace(
 const NamespaceString NamespaceString::kReshardingTxnClonerProgressNamespace(
     NamespaceString::kConfigDb, "localReshardingOperations.recipient.progress_txn_cloner");
 
+const NamespaceString NamespaceString::kKeysCollectionNamespace(NamespaceString::kAdminDb,
+                                                                "system.keys");
+
+const NamespaceString NamespaceString::kExternalKeysCollectionNamespace(
+    NamespaceString::kAdminDb, "system.external_validation_keys");
+
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
 }
@@ -126,6 +132,12 @@ bool NamespaceString::isLegalClientSystemNS() const {
             return true;
         if (coll() == "system.backup_users")
             return true;
+        if (coll() == kExternalKeysCollectionNamespace.coll()) {
+            // TODO (SERVER-53404): This was added to allow client in an integration test to
+            // manually insert the key document into this system collection. Remove this when the
+            // tenant migration donor does the copying by itself.
+            return true;
+        }
     } else if (db() == kConfigDb) {
         if (coll() == "system.sessions")
             return true;
@@ -185,6 +197,14 @@ NamespaceString NamespaceString::makeCollectionlessAggregateNSS(StringData dbnam
 std::string NamespaceString::getSisterNS(StringData local) const {
     verify(local.size() && local[0] != '.');
     return db().toString() + "." + local.toString();
+}
+
+void NamespaceString::serializeCollectionName(BSONObjBuilder* builder, StringData fieldName) const {
+    if (isCollectionlessAggregateNS()) {
+        builder->append(fieldName, 1);
+    } else {
+        builder->append(fieldName, coll());
+    }
 }
 
 bool NamespaceString::isDropPendingNamespace() const {
@@ -287,8 +307,7 @@ bool NamespaceString::isTimeseriesBucketsCollection() const {
 }
 
 NamespaceString NamespaceString::makeTimeseriesBucketsNamespace() const {
-    auto bucketsColl = kTimeseriesBucketsCollectionPrefix.toString() + coll();
-    return {db(), bucketsColl};
+    return {db(), kTimeseriesBucketsCollectionPrefix.toString() + coll()};
 }
 
 bool NamespaceString::isReplicated() const {
@@ -315,6 +334,23 @@ std::string NamespaceStringOrUUID::toString() const {
         return _nss->toString();
     else
         return _uuid->toString();
+}
+
+void NamespaceStringOrUUID::serialize(BSONObjBuilder* builder, StringData fieldName) const {
+    invariant(_uuid || _nss);
+    if (_preferNssForSerialization) {
+        if (_nss) {
+            builder->append(fieldName, _nss->coll());
+        } else {
+            _uuid->appendToBuilder(builder, fieldName);
+        }
+    } else {
+        if (_uuid) {
+            _uuid->appendToBuilder(builder, fieldName);
+        } else {
+            builder->append(fieldName, _nss->coll());
+        }
+    }
 }
 
 std::ostream& operator<<(std::ostream& stream, const NamespaceString& nss) {

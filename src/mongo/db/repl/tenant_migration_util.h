@@ -33,7 +33,9 @@
 #include "mongo/base/status.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/client/mongo_uri.h"
+#include "mongo/config.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/util/net/ssl_util.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -61,11 +63,25 @@ inline Status validateTimestampNotNull(const Timestamp& ts) {
 }
 
 inline Status validateConnectionString(const StringData& donorOrRecipientConnectionString) {
-    // Sanity check to make sure that donor and recipient do not share any of the same hosts
-    // for tenant migration.
-    const auto donorOrRecipientServers =
-        uassertStatusOK(MongoURI::parse(donorOrRecipientConnectionString.toString())).getServers();
+    const auto donorOrRecipientUri =
+        uassertStatusOK(MongoURI::parse(donorOrRecipientConnectionString.toString()));
+    const auto donorOrRecipientServers = donorOrRecipientUri.getServers();
 
+    // Sanity check to make sure that the given donor or recipient connection string corresponds
+    // to a replica set connection string with at least one host.
+    try {
+        const auto donorOrRecipientRsConnectionString = ConnectionString::forReplicaSet(
+            donorOrRecipientUri.getSetName(),
+            std::vector<HostAndPort>(donorOrRecipientServers.begin(),
+                                     donorOrRecipientServers.end()));
+    } catch (const ExceptionFor<ErrorCodes::FailedToParse>& ex) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream()
+                          << "Donor and recipient must be a replica set with at least one host: "
+                          << ex.toStatus());
+    }
+
+    // Sanity check to make sure that donor and recipient do not share any hosts.
     const auto servers = repl::ReplicationCoordinator::get(cc().getServiceContext())
                              ->getConfig()
                              .getConnectionString()
@@ -82,6 +98,28 @@ inline Status validateConnectionString(const StringData& donorOrRecipientConnect
         }
     }
     return Status::OK();
+}
+
+inline Status validateCertificatePEMPayload(const StringData& payload) {
+#ifndef MONGO_CONFIG_SSL
+    return {ErrorCodes::InternalError,
+            "Could not validate certificate field as SSL is not supported"};
+#else
+    auto swBlob =
+        ssl_util::findPEMBlob(payload, "CERTIFICATE"_sd, 0 /* position */, false /* allowEmpty */);
+    return swBlob.getStatus().withContext("Invalid certificate field");
+#endif
+}
+
+inline Status validatePrivateKeyPEMPayload(const StringData& payload) {
+#ifndef MONGO_CONFIG_SSL
+    return {ErrorCodes::InternalError,
+            "Could not validate certificate field as SSL is not supported"};
+#else
+    auto swBlob =
+        ssl_util::findPEMBlob(payload, "PRIVATE KEY"_sd, 0 /* position */, false /* allowEmpty */);
+    return swBlob.getStatus().withContext("Invalid private key field");
+#endif
 }
 
 }  // namespace mongo

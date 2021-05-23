@@ -1,4 +1,4 @@
-"""Interactions with the undodb tool-suite."""
+"""Set up powercycle remote operations."""
 import getpass
 import os
 import re
@@ -8,10 +8,9 @@ import sys
 import shlex
 import yaml
 
-from buildscripts.powercycle.run import RemoteOperations, SSHOperation
+from buildscripts.powercycle.remote_operations import RemoteOperations, SSHOperation
 from buildscripts.resmokelib.plugin import PluginInterface, Subcommand
-
-_EXPANSIONS_FILE = 'expansions.yml'
+from buildscripts.resmokelib.powertest import powercycle_constants
 
 
 class PowercycleCommand(Subcommand):  # pylint: disable=abstract-method, too-many-instance-attributes
@@ -20,7 +19,7 @@ class PowercycleCommand(Subcommand):  # pylint: disable=abstract-method, too-man
     def __init__(self):
         """Initialize PowercycleCommand."""
 
-        self.expansions = yaml.safe_load(open(_EXPANSIONS_FILE))
+        self.expansions = yaml.safe_load(open(powercycle_constants.EXPANSIONS_FILE))
 
         self.exe = ".exe" if self.is_windows() else ""
         self.retries = 0 if "ssh_retries" not in self.expansions else int(
@@ -36,7 +35,6 @@ class PowercycleCommand(Subcommand):  # pylint: disable=abstract-method, too-man
         self.remote_op = RemoteOperations(
             user_host=self.user_host,
             ssh_connection_options=self.ssh_connection_options,
-            retries=self.retries,
         )
 
     @staticmethod
@@ -73,60 +71,37 @@ class SetUpEC2Instance(PowercycleCommand):
 
     def execute(self) -> None:  # pylint: disable=too-many-instance-attributes, too-many-locals, too-many-statements
         """:return: None."""
+
         # First operation -
-        # Copy mount_drives.sh script to remote host.
-        # last arg is "operation_dir", which for the COPY_TO action, is the remote
-        # directory. We just have it default to the home directory instead of setting
-        # one explicitly.
-        self.remote_op.operation(SSHOperation.COPY_TO, 'buildscripts/mount_drives.sh', None)
-
-        # Second operation -
-        # Mount /data on the attached drive(s), more than 1 indicates a RAID set.
-        script_opts = f"-d '{self.expansions['data_device_names']}'"
-        if "raid_data_device_name" in self.expansions:
-            script_opts = f"{script_opts} -r {self.expansions['raid_data_device_name']}"
-        if "fstype" in self.expansions:
-            script_opts = f"{script_opts} -t {self.expansions['fstype']}"
-        if "fs_options" in self.expansions:
-            script_opts = f"{script_opts} -o '{self.expansions['fs_options']}'"
-        script_opts = f"{script_opts} -l '{self.expansions['log_device_name']}'"
-
-        log = "/log"
+        # Create remote_dir.
         group_cmd = f"id -Gn {self.user}"
         _, group = self._call(group_cmd)
         group = group.split(" ")[0]
         user_group = f"{self.user}:{group}"
-        script_opts = f"{script_opts} -u {user_group}"
-        data_db = "/data/db"
-        cmds = f"{self.sudo} bash mount_drives.sh {script_opts}; mount; ls -ld {data_db} {log}; df"
+
+        remote_dir = powercycle_constants.REMOTE_DIR
+        db_path = powercycle_constants.DB_PATH
+
+        set_permission_stmt = f"chmod -R 777"
+        if self.is_windows():
+            set_permission_stmt = f"setfacl -s user::rwx,group::rwx,other::rwx"
+        cmds = f"{self.sudo} mkdir -p {remote_dir}; {self.sudo} chown -R {user_group} {remote_dir}; {set_permission_stmt} {remote_dir}; ls -ld {remote_dir}"
+        cmds = f"{cmds}; {self.sudo} mkdir -p {db_path}; {self.sudo} chown -R {user_group} {db_path}; {set_permission_stmt} {db_path}; ls -ld {db_path}"
+
         self.remote_op.operation(SSHOperation.SHELL, cmds, None)
 
-        # Third operation -
-        # Create remote_dir, if not '.' (pwd).
-        if 'remote_dir' not in self.expansions:
-            raise ValueError("The 'remote_dir' expansion must be set.")
-
-        remote_dir = self.expansions['remote_dir']
-        if self.expansions['remote_dir'] != ".":
-            set_permission = f"chmod 777 {self.expansions['remote_dir']}"
-            if self.is_windows():
-                set_permission = f"setfacl -s user::rwx,group::rwx,other::rwx {remote_dir}"
-            cmds = f"{self.sudo} mkdir -p {remote_dir}; {self.sudo} chown {user_group} {remote_dir}; {set_permission}; ls -ld {remote_dir}"
-            self.remote_op.operation(SSHOperation.SHELL, cmds, None)
-
-        # Fourth operation -
-        # Copy buildscripts, pytests and mongoDB executables to the remote host.
-        files = ['etc', 'buildscripts', 'pytests']
+        # Second operation -
+        # Copy buildscripts and mongoDB executables to the remote host.
+        files = ['etc', 'buildscripts']
         mongo_executables = ["mongo", "mongod", "mongos"]
         for executable in mongo_executables:
             files.append(f"dist-test/bin/{executable}{self.exe}")
 
         self.remote_op.operation(SSHOperation.COPY_TO, files, remote_dir)
 
-        # Fifth operation -
+        # Third operation -
         # Set up virtualenv on remote.
-        venv = "venv" if "virtualenv_dir" not in self.expansions else self.expansions[
-            "virtualenv_dir"]
+        venv = powercycle_constants.VIRTUALENV_DIR
         python = "/opt/mongodbtoolchain/v3/bin/python3" if "python" not in self.expansions else self.expansions[
             "python"]
 
@@ -140,7 +115,7 @@ class SetUpEC2Instance(PowercycleCommand):
 
         self.remote_op.operation(SSHOperation.SHELL, cmds, None)
 
-        # Sixth operation -
+        # Fourth operation -
         # Enable core dumps on non-Windows remote hosts.
         # The core pattern must specify a director, since mongod --fork will chdir("/")
         # and cannot generate a core dump there (see SERVER-21635).
@@ -164,7 +139,7 @@ class SetUpEC2Instance(PowercycleCommand):
             cmds = f"{cmds}; nohup {self.sudo} reboot &>/dev/null & exit"
             self.remote_op.operation(SSHOperation.SHELL, cmds, None)
 
-        # Seventh operation -
+        # Fifth operation -
         # Print the ulimit & kernel.core_pattern
         if not self.is_windows():
             # Always exit successfully, as this is just informational.
@@ -174,19 +149,16 @@ class SetUpEC2Instance(PowercycleCommand):
             cmds = f"{cmds}; then /sbin/sysctl kernel.core_pattern"
             cmds = f"{cmds}; fi"
 
-            remote_op_special_retry = self.remote_op if "ssh_retries" in self.expansions else RemoteOperations(
-                user_host=self.user_host, ssh_connection_options=self.ssh_connection_options,
-                retries=3, debug=True)
-            remote_op_special_retry.operation(SSHOperation.SHELL, cmds, None, True)
+            self.remote_op.operation(SSHOperation.SHELL, cmds, None, True)
 
-        # Eighth operation -
+        # Sixth operation -
         # Set up curator to collect system & process stats on remote.
         variant = "windows" if self.is_windows() else "ubuntu1604"
-        curator_hash = "117d1a65256ff78b6d15ab79a1c7088443b936d0"
+        curator_hash = "b0c3c0fc68bce26d9572796d6bed3af4a298e30e"
         curator_url = f"https://s3.amazonaws.com/boxes.10gen.com/build/curator/curator-dist-{variant}-{curator_hash}.tar.gz"
         cmds = f"curl -s {curator_url} | tar -xzv"
-        monitor_system_file = self.expansions["monitor_system_file"]
-        monitor_proc_file = self.expansions["monitor_proc_file"]
+        monitor_system_file = powercycle_constants.MONITOR_SYSTEM_FILE
+        monitor_proc_file = powercycle_constants.MONITOR_PROC_FILE
         if self.is_windows():
             # Since curator runs as SYSTEM user, ensure the output files can be accessed.
             cmds = f"{cmds}; touch {monitor_system_file}; chmod 777 {monitor_system_file}"
@@ -196,6 +168,7 @@ class SetUpEC2Instance(PowercycleCommand):
             cmds = f"{cmds}; cygrunsrv --start curator_sys"
             cmds = f"{cmds}; cygrunsrv --start curator_proc"
         else:
+            cmds = f"{cmds}; touch {monitor_system_file} {monitor_proc_file}"
             cmds = f"{cmds}; cmd=\"@reboot cd $HOME && {self.sudo} ./curator stat system >> {monitor_system_file}\""
             cmds = f"{cmds}; (crontab -l ; echo \"$cmd\") | crontab -"
             cmds = f"{cmds}; cmd=\"@reboot cd $HOME && $sudo ./curator stat process-all >> {monitor_proc_file}\""
@@ -205,73 +178,12 @@ class SetUpEC2Instance(PowercycleCommand):
 
         self.remote_op.operation(SSHOperation.SHELL, cmds, retry=True)
 
-        # Ninth operation -
-        def configure_firewall():
-            # Many systems have the firewall disabled, by default. In case the firewall is
-            # enabled we add rules for the mongod ports on the remote.
-            standard_port = self.expansions["standard_port"]
-            secret_port = self.expansions["secret_port"]
-            # RHEL 7 firewall rules
-            firewall_cmd = self._call("which firewall-cmd")
-            if firewall_cmd[1] and "no firewall-cmd in" not in firewall_cmd[1]:
-                cmds = f"{self.sudo} firewall-cmd --permanent --zone=public --add-port=ssh/tcp"
-                cmds = f"{cmds}; {self.sudo} firewall-cmd --permanent --zone=public --add-port={standard_port}/tcp"
-                cmds = f"{cmds}; {self.sudo} firewall-cmd --permanent --zone=public --add-port={secret_port}/tcp"
-                cmds = f"{cmds}; {self.sudo} firewall-cmd --reload"
-                cmds = f"{cmds}; {self.sudo} firewall-cmd --list-all"
-            elif self._call(f"{self.sudo} iptables --list")[1]:
-                cmds = f"{self.sudo} iptables -I INPUT 1 -p tcp --dport ssh -j ACCEPT"
-                cmds = f"{cmds}; {self.sudo} iptables -I INPUT 1 -p tcp --dport {standard_port} -j ACCEPT"
-                cmds = f"{cmds}; {self.sudo} iptables -I INPUT 1 -p tcp --dport {secret_port} -j ACCEPT"
-                if os.path.exists("/etc/iptables") and os.path.isdir("/etc/iptables"):
-                    rules_file = "/etc/iptables/iptables.rules"
-                elif os.path.exists("/etc/sysconfig/iptables") and os.path.isfile(
-                        "/etc/sysconfig/iptables"):
-                    rules_file = "/etc/sysconfig/iptables"
-                else:
-                    rules_file = "/etc/iptables.up.rules"
-                cmds = f"{cmds}; {self.sudo} iptables-save | {self.sudo} tee {rules_file}"
-                cmds = f"{cmds}; {self.sudo} iptables --list-rules"
-            elif self._call(f"{self.sudo} service iptables status")[1]:
-                cmds = f"{self.sudo} iptables -I INPUT 1 -p tcp --dport ssh -j ACCEPT"
-                cmds = f"{cmds}; {self.sudo} iptables -I INPUT 1 -p tcp --dport {standard_port} -j ACCEPT"
-                cmds = f"{cmds}; {self.sudo} iptables -I INPUT 1 -p tcp --dport {secret_port} -j ACCEPT"
-                cmds = f"{cmds}; {self.sudo} service iptables save"
-                cmds = f"{cmds}; {self.sudo} service iptables status"
-            # Ubuntu firewall rules
-            elif self._call(f"{self.sudo} ufw status")[1]:
-                cmds = f"{self.sudo} ufw allow ssh/tcp"
-                cmds = f"{cmds}; {self.sudo} ufw allow {standard_port}/tcp"
-                cmds = f"{cmds}; {self.sudo} ufw allow {secret_port}/tcp"
-                cmds = f"{cmds}; {self.sudo} ufw reload"
-                cmds = f"{cmds}; {self.sudo} ufw status"
-            # SuSE firewall rules
-            # TODO: Add firewall rules using SuSEfirewall2
-            elif self._call(f"{self.sudo} /sbin/SuSEfirewall2 help")[1]:
-                cmds = f"{self.sudo} /sbin/SuSEfirewall2 stop"
-                cmds = f"{cmds}; {self.sudo} /sbin/SuSEfirewall2 off"
-            # Windows firewall rules
-            elif self._call(f"netsh advfirewall show store")[1]:
-                add_rule = "netsh advfirewall firewall add rule"
-                cmds = f"{add_rule} name='MongoDB port {standard_port} in' dir=in action=allow protocol=TCP localport={standard_port}"
-                cmds = f"{cmds}; {add_rule} name='MongoDB port {standard_port} out' dir=in action=allow protocol=TCP localport={standard_port}"
-                cmds = f"{cmds}; {add_rule} name='MongoDB port {secret_port} in' dir=in action=allow protocol=TCP localport={secret_port}"
-                cmds = f"{cmds}; {add_rule} name='MongoDB port {secret_port} out' dir=in action=allow protocol=TCP localport={secret_port}"
-                cmds = f"{cmds}; netsh advfirewall firewall show rule name=all | grep -A 13 'MongoDB'"
-            else:
-                print("Firewall not active or unkown firewall command on this platform")
-                return
-
-            self.remote_op.operation(SSHOperation.SHELL, cmds, None)
-
-        configure_firewall()
-
-        # Tenth operation -
+        # Seventh operation -
         # Install NotMyFault, used to crash Windows.
-        if self.is_windows() and "windows_crash_zip" in self.expansions:
-            windows_crash_zip = self.expansions["windows_crash_zip"]
-            windows_crash_dl = self.expansions["windows_crash_dl"]
-            windows_crash_dir = self.expansions["windows_crash_dir"]
+        if self.is_windows():
+            windows_crash_zip = powercycle_constants.WINDOWS_CRASH_ZIP
+            windows_crash_dl = powercycle_constants.WINDOWS_CRASH_DL
+            windows_crash_dir = powercycle_constants.WINDOWS_CRASH_DIR
 
             cmds = f"curl -s -o {windows_crash_zip} {windows_crash_dl}"
             cmds = f"{cmds}; unzip -q {windows_crash_zip} -d {windows_crash_dir}"
@@ -286,10 +198,13 @@ class TarEC2Artifacts(PowercycleCommand):
 
     def execute(self) -> None:
         """:return: None."""
-        if "ec2_artifacts" not in self.expansions or "ec2_ssh_failure" in self.expansions:
+        if "ec2_ssh_failure" in self.expansions:
             return
         tar_cmd = "tar" if "tar" not in self.expansions else self.expansions["tar"]
-        cmd = f"{tar_cmd} czf ec2_artifacts.tgz {self.expansions['ec2_artifacts']}"
+        ec2_artifacts = powercycle_constants.EC2_ARTIFACTS
+        if self.expansions.get("ec2_artifacts", "") == "mongod_log_only":
+            ec2_artifacts = powercycle_constants.LOG_PATH
+        cmd = f"{tar_cmd} czf ec2_artifacts.tgz {ec2_artifacts}"
 
         self.remote_op.operation(SSHOperation.SHELL, cmd, None)
 
@@ -301,7 +216,7 @@ class CopyEC2Artifacts(PowercycleCommand):
 
     def execute(self) -> None:
         """:return: None."""
-        if "ec2_artifacts" not in self.expansions or "ec2_ssh_failure" in self.expansions:
+        if "ec2_ssh_failure" in self.expansions:
             return
 
         self.remote_op.operation(SSHOperation.COPY_FROM, "ec2_artifacts.tgz", None)
@@ -322,14 +237,14 @@ class GatherRemoteEventLogs(PowercycleCommand):
 
     def execute(self) -> None:
         """:return: None."""
-        if not self.is_windows() or not os.path.exists(self.expansions.get(
-                "aws_ec2_yml", "")) or self.expansions.get("ec2_ssh_failure", ""):
+        if not self.is_windows() or self.expansions.get("ec2_ssh_failure", ""):
             return
 
-        cmds = f"mkdir -p {self.expansions['event_logpath']}"
-        cmds = f"{cmds}; wevtutil qe Application /c:10000 /rd:true /f:Text > {self.expansions['event_logpath']}/application.log"
-        cmds = f"{cmds}; wevtutil qe Security    /c:10000 /rd:true /f:Text > {self.expansions['event_logpath']}/security.log"
-        cmds = f"{cmds}; wevtutil qe System      /c:10000 /rd:true /f:Text > {self.expansions['event_logpath']}/system.log"
+        event_logpath = powercycle_constants.EVENT_LOGPATH
+        cmds = f"mkdir -p {event_logpath}"
+        cmds = f"{cmds}; wevtutil qe Application /c:10000 /rd:true /f:Text > {event_logpath}/application.log"
+        cmds = f"{cmds}; wevtutil qe Security    /c:10000 /rd:true /f:Text > {event_logpath}/security.log"
+        cmds = f"{cmds}; wevtutil qe System      /c:10000 /rd:true /f:Text > {event_logpath}/system.log"
 
         self.remote_op.operation(SSHOperation.SHELL, cmds, None)
 
@@ -341,12 +256,10 @@ class GatherRemoteMongoCoredumps(PowercycleCommand):
 
     def execute(self) -> None:
         """:return: None."""
-        aws_ec2_yml = self.expansions["aws_ec2_yml"]
-        if os.path.exists(aws_ec2_yml) and os.path.isfile(
-                aws_ec2_yml) or "ec2_ssh_failure" in self.expansions:
+        if "ec2_ssh_failure" in self.expansions:
             return
 
-        remote_dir = "." if "remote_dir" not in self.expansions else self.expansions["remote_dir"]
+        remote_dir = powercycle_constants.REMOTE_DIR
         # Find all core files and move to $remote_dir
         cmds = "core_files=$(/usr/bin/find -H . ( -name '*.core' -o -name '*.mdmp' ) 2> /dev/null)"
         cmds = f"{cmds}; if [ -z \"$core_files\" ]; then exit 0; fi"
@@ -366,8 +279,7 @@ class CopyRemoteMongoCoredumps(PowercycleCommand):
 
     def execute(self) -> None:
         """:return: None."""
-        if not os.path.exists(self.expansions.get("aws_ec2_yml", "")) or self.expansions.get(
-                "ec2_ssh_failure", ""):
+        if self.expansions.get("ec2_ssh_failure", ""):
             return
 
         if self.is_windows():
@@ -375,10 +287,9 @@ class CopyRemoteMongoCoredumps(PowercycleCommand):
         else:
             core_suffix = "core"
 
+        remote_dir = powercycle_constants.REMOTE_DIR
         # Core file may not exist so we ignore the return code.
-        self.remote_op.operation(SSHOperation.SHELL,
-                                 f"{self.expansions.get('remote_dir', '.')}/*.{core_suffix}", None,
-                                 True)
+        self.remote_op.operation(SSHOperation.SHELL, f"{remote_dir}/*.{core_suffix}", None, True)
 
 
 class CopyEC2MonitorFiles(PowercycleCommand):
@@ -389,7 +300,7 @@ class CopyEC2MonitorFiles(PowercycleCommand):
     def execute(self) -> None:
         """:return: None."""
         tar_cmd = "tar" if "tar" not in self.expansions else self.expansions["tar"]
-        cmd = f"{tar_cmd} czf ec2_monitor_files.tgz {self.expansions['ec2_monitor_files']}"
+        cmd = f"{tar_cmd} czf ec2_monitor_files.tgz {powercycle_constants.EC2_MONITOR_FILES}"
 
         self.remote_op.operation(SSHOperation.SHELL, cmd, None)
         self.remote_op.operation(SSHOperation.COPY_FROM, 'ec2_monitor_files.tgz', None)
@@ -415,7 +326,7 @@ class RunHangAnalyzerOnRemoteInstance(PowercycleCommand):
         core_ext = "core"
         if self.is_windows():
             core_ext = "mdmp"
-        remote_dir = "." if "remote_dir" not in self.expansions else self.expansions["remote_dir"]
+        remote_dir = powercycle_constants.REMOTE_DIR
         files = self._call("ls")[1].split("\n")
         dbg_regex = re.compile(r"(\.debug$)|(\.dSYM$)|(\.pdb$)")
         debug_files = [f for f in files if dbg_regex.match(f)]
@@ -427,8 +338,7 @@ class RunHangAnalyzerOnRemoteInstance(PowercycleCommand):
 
         # Activate virtualenv on remote host. The virtualenv bin_dir is different for Linux and
         # Windows.
-        venv = "venv" if "virtualenv_dir" not in self.expansions else self.expansions[
-            "virtualenv_dir"]
+        venv = powercycle_constants.VIRTUALENV_DIR
         virtual_env = os.environ["VIRTUAL_ENV"]
         _, activate_loc = self._call(f"find {virtual_env} -name activate")
         bin_dir_regex = re.compile(f"{re.escape(virtual_env)}/(.*)/activate")
@@ -486,8 +396,8 @@ class PowercyclePlugin(PluginInterface):
         :return: None or a Subcommand
         """
         # Only return subcommand if expansion file has been written.
-        if not os.path.exists(_EXPANSIONS_FILE):
-            print(f"Did not find {_EXPANSIONS_FILE}, skipping {subcommand}.")
+        if not os.path.exists(powercycle_constants.EXPANSIONS_FILE):
+            print(f"Did not find {powercycle_constants.EXPANSIONS_FILE}, skipping {subcommand}.")
             return NoOp()
 
         if subcommand == SetUpEC2Instance.COMMAND:

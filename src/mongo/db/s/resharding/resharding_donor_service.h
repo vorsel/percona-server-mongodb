@@ -95,8 +95,9 @@ public:
         return boost::none;
     }
 
-    void onReshardingFieldsChanges(
-        boost::optional<TypeCollectionReshardingFields> reshardingFields);
+    void onReshardingFieldsChanges(const TypeCollectionReshardingFields& reshardingFields);
+
+    SharedSemiFuture<void> awaitFinalOplogEntriesWritten();
 
 private:
     // The following functions correspond to the actions to take at a particular donor state.
@@ -112,10 +113,12 @@ private:
 
     void _writeTransactionOplogEntryThenTransitionToMirroring();
 
-    ExecutorFuture<void> _awaitCoordinatorHasCommittedThenTransitionToDropping(
+    ExecutorFuture<void> _awaitCoordinatorHasDecisionPersistedThenTransitionToDropping(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
-    void _dropOriginalCollectionThenDeleteLocalState();
+    // Drops the original collection and throws if the returned status is not either Status::OK()
+    // or NamespaceNotFound.
+    void _dropOriginalCollection();
 
     // Transitions the state on-disk and in-memory to 'endState'.
     void _transitionState(DonorStateEnum endState,
@@ -133,6 +136,9 @@ private:
     // Updates the donor document on-disk and in-memory with the 'replacementDoc.'
     void _updateDonorDocument(ReshardingDonorDocument&& replacementDoc);
 
+    // Removes the local donor document from disk and clears the in-memory state.
+    void _removeDonorDocument();
+
     // The in-memory representation of the underlying document in
     // config.localReshardingOperations.donor.
     ReshardingDonorDocument _donorDoc;
@@ -149,7 +155,9 @@ private:
 
     SharedPromise<void> _allRecipientsDoneApplying;
 
-    SharedPromise<void> _coordinatorHasCommitted;
+    SharedPromise<void> _finalOplogEntriesWritten;
+
+    SharedPromise<void> _coordinatorHasDecisionPersisted;
 
     SharedPromise<void> _completionPromise;
 };

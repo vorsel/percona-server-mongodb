@@ -111,14 +111,14 @@ public:
     std::shared_ptr<Shard> findByHostAndPort(const HostAndPort&) const;
 
     /**
-     * Returns the set of all known shard ids.
+     * Returns an unsorted vector of all known shard ids.
      */
-    void getAllShardIds(std::set<ShardId>& result) const;
+    std::vector<ShardId> getAllShardIds() const;
 
     /**
-     * Returns the set of all known shard objects.
+     * Returns an unsorted vector of all known shard objects.
      */
-    void getAllShards(std::vector<std::shared_ptr<Shard>>& result) const;
+    std::vector<std::shared_ptr<Shard>> getAllShards() const;
 
     void toBSON(BSONObjBuilder* result) const;
     void toBSON(BSONObjBuilder* map, BSONObjBuilder* hosts, BSONObjBuilder* connStrings) const;
@@ -133,7 +133,7 @@ private:
     /**
      * Returns the shard with the given connection string, or nullptr if no such shard.
      */
-    std::shared_ptr<Shard> _findByConnectionString(const ConnectionString& connectionString) const;
+    std::shared_ptr<Shard> _findByConnectionString(const std::string& connectionString) const;
 
     /**
      * Puts the given shard object into the lookup maps.
@@ -150,7 +150,7 @@ private:
     stdx::unordered_map<HostAndPort, std::shared_ptr<Shard>> _hostLookup;
 
     // Map of connection string to Shard
-    std::map<ConnectionString, std::shared_ptr<Shard>> _connStringLookup;
+    std::map<std::string, std::shared_ptr<Shard>> _connStringLookup;
 };
 
 /**
@@ -164,11 +164,6 @@ class ShardRegistry {
     ShardRegistry& operator=(const ShardRegistry&) = delete;
 
 public:
-    /**
-     * A ShardId for the config servers.
-     */
-    static const ShardId kConfigServerShardId;
-
     /**
      * A callback type for functions that can be called on shard removal.
      */
@@ -243,9 +238,9 @@ public:
     StatusWith<std::shared_ptr<Shard>> getShard(OperationContext* opCtx, const ShardId& shardId);
 
     /**
-     * Populates all known shard ids into the given vector.
+     * Return a sorted vector containing all known shard ids.
      */
-    void getAllShardIds(OperationContext* opCtx, std::vector<ShardId>* all);
+    std::vector<ShardId> getAllShardIds(OperationContext* opCtx);
 
     /**
      * Returns the number of shards.
@@ -279,14 +274,10 @@ public:
     void toBSON(BSONObjBuilder* result) const;
 
     /**
-     * Reloads the ShardRegistry based on the contents of the config server's config.shards
-     * collection. Returns true if this call performed a reload and false if this call only waited
-     * for another thread to perform the reload and did not actually reload. Because of this, it is
-     * possible that calling reload once may not result in the most up to date view. If strict
-     * reloading is required, the caller should call this method one more time if the first call
-     * returned false.
+     * Force a reload of the ShardRegistry based on the contents of the config server's
+     * config.shards collection.
      */
-    bool reload(OperationContext* opCtx);
+    void reload(OperationContext* opCtx);
 
     /**
      * Clears all entries from the shard registry entries, which will force the registry to do a
@@ -323,7 +314,7 @@ public:
      */
     std::shared_ptr<Shard> getShardForHostNoReload(const HostAndPort& shardHost) const;
 
-    void getAllShardIdsNoReload(std::vector<ShardId>* all) const;
+    std::vector<ShardId> getAllShardIdsNoReload() const;
 
     int getNumShardsNoReload() const;
 

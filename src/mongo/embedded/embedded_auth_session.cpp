@@ -139,12 +139,12 @@ public:
     }
 
     StatusWith<PrivilegeVector> getPrivilegesForAggregate(const NamespaceString&,
-                                                          const AggregationRequest&,
+                                                          const AggregateCommand&,
                                                           bool) override {
         return PrivilegeVector();
     }
 
-    Status checkAuthForCreate(const NamespaceString&, const BSONObj&, bool) override {
+    Status checkAuthForCreate(const CreateCommand&, bool) override {
         return Status::OK();
     }
 

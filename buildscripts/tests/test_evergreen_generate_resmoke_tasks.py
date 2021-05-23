@@ -562,6 +562,15 @@ class CalculateTimeoutTest(unittest.TestCase):
             under_test.calculate_timeout(30, scaling_factor))
 
 
+class TimeoutEstimateTest(unittest.TestCase):
+    def test_too_high_a_timeout_raises_errors(self):
+        timeout_est = under_test.TimeoutEstimate(
+            max_test_runtime=5, expected_task_runtime=under_test.MAX_EXPECTED_TIMEOUT)
+
+        with self.assertRaises(ValueError):
+            timeout_est.generate_timeout_cmd(is_patch=True, repeat_factor=1)
+
+
 class EvergreenConfigGeneratorTest(unittest.TestCase):
     @staticmethod
     def generate_mock_suites(count):
@@ -571,6 +580,8 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
             suite.name = "suite {0}".format(idx)
             suite.max_runtime = 5.28
             suite.get_runtime = lambda: 100.874
+            suite.get_timeout_estimate.return_value = under_test.TimeoutEstimate(
+                max_test_runtime=5.28, expected_task_runtime=100.874)
             suites.append(suite)
 
         return suites
@@ -649,6 +660,36 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         self.assertEqual(options.large_distro_name,
                          config["buildvariants"][0]["tasks"][0]["distros"][0])
 
+    def test_build_variant_without_large_distro_defined_fails(self):
+        options = self.generate_mock_options()
+        options.use_large_distro = "true"
+        options.large_distro_name = None
+        suites = self.generate_mock_suites(3)
+        build_variant = BuildVariant("variant")
+
+        generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
+        with self.assertRaises(ValueError):
+            generator.generate_config(build_variant)
+
+    def test_build_variant_without_large_distro_defined_can_be_ignored(self):
+        options = self.generate_mock_options()
+        options.use_large_distro = "true"
+        options.large_distro_name = None
+        suites = self.generate_mock_suites(3)
+        build_variant = BuildVariant("variant")
+        generate_config = under_test.GenerationConfiguration(
+            build_variant_large_distro_exceptions={"variant"})
+
+        generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock(),
+                                                        generate_config)
+        generator.generate_config(build_variant)
+
+        shrub_project = ShrubProject.empty().add_build_variant(build_variant)
+        config = shrub_project.as_dict()
+
+        self.assertEqual(len(config["tasks"]), len(suites) + 1)
+        self.assertIsNone(config["buildvariants"][0]["tasks"][0].get("distros"))
+
     def test_selecting_tasks(self):
         is_task_dependency = under_test.EvergreenConfigGenerator._is_task_dependency
         self.assertFalse(is_task_dependency("sharding", "sharding"))
@@ -722,15 +763,6 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         expected_exec_timeout = under_test.calculate_timeout(suites[0].get_runtime(), 3) * 5
         self.assertEqual(expected_exec_timeout, timeout_cmd["params"]["exec_timeout_secs"])
 
-    def test_evg_config_has_fails_if_timeout_too_high(self):
-        options = self.generate_mock_options()
-        options.repeat_suites = under_test.MAX_EXPECTED_TIMEOUT
-        suites = self.generate_mock_suites(3)
-
-        with self.assertRaises(ValueError):
-            generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
-            generator.generate_config(MagicMock())
-
     def test_evg_config_does_not_fails_if_timeout_too_high_on_mainline(self):
         options = self.generate_mock_options()
         options.is_patch = False
@@ -779,7 +811,9 @@ class EvergreenConfigGeneratorTest(unittest.TestCase):
         suite_without_timing_info = 1
         options = self.generate_mock_options()
         suites = self.generate_mock_suites(3)
-        suites[suite_without_timing_info].should_overwrite_timeout.return_value = False
+        suites[
+            suite_without_timing_info].get_timeout_estimate.return_value = under_test.TimeoutEstimate.no_timeouts(
+            )
         build_variant = BuildVariant("variant")
 
         generator = under_test.EvergreenConfigGenerator(suites, options, MagicMock())
@@ -822,7 +856,9 @@ class GenerateSubSuitesTest(unittest.TestCase):
     def get_test_list(n_tests):
         return [f"test{i}.js" for i in range(n_tests)]
 
-    def test_calculate_suites(self):
+    @patch(ns("read_suite_config"))
+    def test_calculate_suites(self, mock_read_suite_config):
+        mock_read_suite_config.return_value = {}
         evg = MagicMock()
         evg.test_stats_by_project.return_value = [
             tst_stat_mock(f"test{i}.js", 60, 1) for i in range(100)
@@ -945,7 +981,9 @@ class GenerateSubSuitesTest(unittest.TestCase):
         with self.assertRaises(requests.HTTPError):
             gen_sub_suites.calculate_suites(_DATE, _DATE)
 
-    def test_calculate_suites_with_selected_tests_to_run(self):
+    @patch(ns("read_suite_config"))
+    def test_calculate_suites_with_selected_tests_to_run(self, mock_read_suite_config):
+        mock_read_suite_config.return_value = {}
         evg = MagicMock()
         evg.test_stats_by_project.return_value = [
             tst_stat_mock(f"test{i}.js", 60, 1) for i in range(100)
@@ -1044,6 +1082,107 @@ class GenerateSubSuitesTest(unittest.TestCase):
             self.assertIn(tests_runtimes[2], filtered_list)
             self.assertIn(tests_runtimes[0], filtered_list)
             self.assertEqual(2, len(filtered_list))
+
+    def test_is_asan_build_on_asan_builds(self):
+        evg = MagicMock()
+        config_options = MagicMock(
+            suite="suite",
+            san_options="ASAN_OPTIONS=\"detect_leaks=1:check_initialization_order=true\"")
+
+        gen_sub_suites = under_test.GenerateSubSuites(evg, config_options)
+
+        self.assertTrue(gen_sub_suites._is_asan_build())
+
+    def test_is_asan_build_with_no_san_options(self):
+        evg = MagicMock()
+        config_options = MagicMock(suite="suite", san_options=None)
+
+        gen_sub_suites = under_test.GenerateSubSuites(evg, config_options)
+
+        self.assertFalse(gen_sub_suites._is_asan_build())
+
+    def test_is_asan_build_with_san_options_non_asan(self):
+        evg = MagicMock()
+        config_options = MagicMock(suite="suite",
+                                   san_options="SAN_OPTIONS=\"check_initialization_order=true\"")
+
+        gen_sub_suites = under_test.GenerateSubSuites(evg, config_options)
+
+        self.assertFalse(gen_sub_suites._is_asan_build())
+
+    def test_clean_every_n_cadence_on_asan(self):
+        evg = MagicMock()
+        config_options = MagicMock(
+            suite="suite",
+            san_options="ASAN_OPTIONS=\"detect_leaks=1:check_initialization_order=true\"")
+
+        gen_sub_suites = under_test.GenerateSubSuites(evg, config_options)
+
+        cadence = gen_sub_suites._get_clean_every_n_cadence()
+
+        self.assertEqual(1, cadence)
+
+    @patch(ns("read_suite_config"))
+    def test_clean_every_n_cadence_from_hook_config(self, mock_read_suite_config):
+        evg = MagicMock()
+        config_options = MagicMock(
+            suite="suite",
+            san_options=None,
+        )
+        expected_n = 42
+        mock_read_suite_config.return_value = {
+            "executor": {
+                "hooks": [{
+                    "class": "hook1",
+                }, {
+                    "class": under_test.CLEAN_EVERY_N_HOOK,
+                    "n": expected_n,
+                }]
+            }
+        }
+
+        gen_sub_suites = under_test.GenerateSubSuites(evg, config_options)
+        cadence = gen_sub_suites._get_clean_every_n_cadence()
+
+        self.assertEqual(expected_n, cadence)
+
+    @patch(ns("read_suite_config"))
+    def test_clean_every_n_cadence_no_n_in_hook_config(self, mock_read_suite_config):
+        evg = MagicMock()
+        config_options = MagicMock(
+            suite="suite",
+            san_options=None,
+        )
+        mock_read_suite_config.return_value = {
+            "executor": {
+                "hooks": [{
+                    "class": "hook1",
+                }, {
+                    "class": under_test.CLEAN_EVERY_N_HOOK,
+                }]
+            }
+        }
+
+        gen_sub_suites = under_test.GenerateSubSuites(evg, config_options)
+        cadence = gen_sub_suites._get_clean_every_n_cadence()
+
+        self.assertEqual(1, cadence)
+
+    @patch(ns("read_suite_config"))
+    def test_clean_every_n_cadence_no_hook_config(self, mock_read_suite_config):
+        evg = MagicMock()
+        config_options = MagicMock(
+            suite="suite",
+            san_options=None,
+        )
+        mock_read_suite_config.return_value = {"executor": {"hooks": [{
+            "class": "hook1",
+        }, ]}}
+
+        gen_sub_suites = under_test.GenerateSubSuites(evg, config_options)
+        cadence = gen_sub_suites._get_clean_every_n_cadence()
+
+        self.assertEqual(1, cadence)
 
 
 class TestShouldTasksBeGenerated(unittest.TestCase):

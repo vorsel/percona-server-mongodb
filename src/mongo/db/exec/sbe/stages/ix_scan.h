@@ -31,13 +31,12 @@
 
 #include "mongo/bson/ordering.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/sbe/stages/lock_acquisition_callback.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
-#include "mongo/db/exec/trial_run_progress_tracker.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 
 namespace mongo::sbe {
-
 /**
  * A stage that iterates the entries of a collection index, starting from a bound specified by the
  * value in 'seekKeySlotLow' and ending (via IS_EOF) with the 'seekKeySlotHigh' bound. (An
@@ -70,8 +69,8 @@ public:
                    boost::optional<value::SlotId> seekKeySlotLow,
                    boost::optional<value::SlotId> seekKeySlotHigh,
                    PlanYieldPolicy* yieldPolicy,
-                   TrialRunProgressTracker* tracker,
-                   PlanNodeId nodeId);
+                   PlanNodeId nodeId,
+                   LockAcquisitionCallback lockAcquisitionCallback);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -89,7 +88,9 @@ protected:
     void doSaveState() override;
     void doRestoreState() override;
     void doDetachFromOperationContext() override;
-    void doAttachFromOperationContext(OperationContext* opCtx) override;
+    void doAttachToOperationContext(OperationContext* opCtx) override;
+    void doDetachFromTrialRunTracker() override;
+    void doAttachToTrialRunTracker(TrialRunTracker* tracker) override;
 
 private:
     const NamespaceStringOrUUID _name;
@@ -101,6 +102,8 @@ private:
     const value::SlotVector _vars;
     const boost::optional<value::SlotId> _seekKeySlotLow;
     const boost::optional<value::SlotId> _seekKeySlotHigh;
+
+    LockAcquisitionCallback _lockAcquisitionCallback;
 
     std::unique_ptr<value::ViewOfValueAccessor> _recordAccessor;
     std::unique_ptr<value::ViewOfValueAccessor> _recordIdAccessor;
@@ -120,7 +123,7 @@ private:
     std::unique_ptr<SortedDataInterface::Cursor> _cursor;
     std::weak_ptr<const IndexCatalogEntry> _weakIndexCatalogEntry;
     boost::optional<Ordering> _ordering{boost::none};
-    boost::optional<AutoGetCollectionForRead> _coll;
+    boost::optional<AutoGetCollectionForReadMaybeLockFree> _coll;
     boost::optional<KeyStringEntry> _nextRecord;
 
     // This buffer stores values that are projected out of the index entry. Values in the
@@ -133,6 +136,6 @@ private:
 
     // If provided, used during a trial run to accumulate certain execution stats. Once the trial
     // run is complete, this pointer is reset to nullptr.
-    TrialRunProgressTracker* _tracker{nullptr};
+    TrialRunTracker* _tracker{nullptr};
 };
 }  // namespace mongo::sbe

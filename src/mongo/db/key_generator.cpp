@@ -34,6 +34,7 @@
 #include "mongo/client/read_preference.h"
 #include "mongo/db/keys_collection_client.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/time_proof_service.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/util/fail_point.h"
@@ -56,7 +57,9 @@ Status insertNewKey(OperationContext* opCtx,
                     long long keyId,
                     const std::string& purpose,
                     const LogicalTime& expiresAt) {
-    KeysCollectionDocument newKey(keyId, purpose, TimeProofService::generateRandomKey(), expiresAt);
+    KeysCollectionDocument newKey(keyId);
+    newKey.setKeysCollectionDocumentBase(
+        {purpose, TimeProofService::generateRandomKey(), expiresAt});
     return client->insertNewKey(opCtx, newKey.toBSON());
 }
 
@@ -81,7 +84,7 @@ Status KeyGenerator::generateNewKeysIfNeeded(OperationContext* opCtx) {
     }
 
     const auto currentTime = VectorClock::get(opCtx)->getTime();
-    auto keyStatus = _client->getNewKeys(opCtx, _purpose, currentTime.clusterTime(), false);
+    auto keyStatus = _client->getNewInternalKeys(opCtx, _purpose, currentTime.clusterTime(), false);
 
     if (!keyStatus.isOK()) {
         return keyStatus.getStatus();

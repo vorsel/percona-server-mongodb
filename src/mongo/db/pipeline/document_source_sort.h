@@ -134,6 +134,10 @@ public:
         return _sortExecutor->hasLimit();
     }
 
+    const SpecificStats* getSpecificStats() const final {
+        return &_sortExecutor->stats();
+    }
+
 protected:
     GetNextResult doGetNext() final;
     /**

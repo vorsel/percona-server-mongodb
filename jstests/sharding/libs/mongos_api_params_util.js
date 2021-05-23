@@ -223,13 +223,13 @@ let MongosAPIParametersUtil = (function() {
         {
             commandName: "count",
             run: {
-                inAPIVersion1: true,
+                inAPIVersion1: false,
                 shardCommandName: "count",
                 permittedInTxn: false,
                 command: () => ({count: "collection"})
             },
             explain: {
-                inAPIVersion1: true,
+                inAPIVersion1: false,
                 shardCommandName: "explain",
                 permittedInTxn: false,
                 command: () => ({explain: {count: "collection"}})
@@ -238,13 +238,13 @@ let MongosAPIParametersUtil = (function() {
         {
             commandName: "count",
             run: {
-                inAPIVersion1: true,
+                inAPIVersion1: false,
                 shardCommandName: "count",
                 permittedInTxn: false,
                 command: () => ({count: "collection", query: {x: 1}})
             },
             explain: {
-                inAPIVersion1: true,
+                inAPIVersion1: false,
                 shardCommandName: "explain",
                 permittedInTxn: false,
                 command: () => ({explain: {count: "collection", query: {x: 1}}})
@@ -350,7 +350,7 @@ let MongosAPIParametersUtil = (function() {
             commandName: "drop",
             run: {
                 inAPIVersion1: true,
-                shardCommandName: "drop",
+                shardCommandName: "_shardsvrDropCollection",
                 permittedInTxn: false,
                 command: () => ({drop: "collection"})
             }
@@ -883,7 +883,7 @@ let MongosAPIParametersUtil = (function() {
             commandName: "refineCollectionShardKey",
             run: {
                 inAPIVersion1: false,
-                configServerCommandName: "_configsvrRefineCollectionShardKey",
+                shardCommandName: "_shardsvrRefineCollectionShardKey",
                 runsAgainstAdminDb: true,
                 permittedInTxn: false,
                 requiresShardedCollection: true,
@@ -1095,8 +1095,7 @@ let MongosAPIParametersUtil = (function() {
             commandName: "shardCollection",
             run: {
                 inAPIVersion1: false,
-                configServerCommandName: "_configsvrShardCollection",
-                shardCommandName: "_shardsvrShardCollection",
+                shardCommandName: "_shardsvrCreateCollection",
                 runsAgainstAdminDb: true,
                 permittedInTxn: false,
                 permittedOnShardedCollection: false,

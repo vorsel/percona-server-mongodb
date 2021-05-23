@@ -27,7 +27,8 @@
  *    it in the license file.
  */
 
-#include "mongo/base/init.h"
+#include "mongo/platform/basic.h"
+
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/mutable/document.h"
 #include "mongo/bson/mutable/element.h"
@@ -49,6 +50,7 @@
 #include "mongo/db/ops/parsed_update.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/ops/write_ops_exec.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/get_executor.h"
@@ -57,18 +59,22 @@
 #include "mongo/db/repl/tenant_migration_access_blocker_registry.h"
 #include "mongo/db/repl/tenant_migration_committed_info.h"
 #include "mongo/db/repl/tenant_migration_conflict_info.h"
+#include "mongo/db/retryable_writes_stats.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/timeseries/bucket_catalog.h"
+#include "mongo/db/transaction_participant.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/s/stale_exception.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(hangWriteBeforeWaitingForMigrationDecision);
+MONGO_FAIL_POINT_DEFINE(hangTimeseriesInsertBeforeCommit);
 
 void redactTooLongLog(mutablebson::Document* cmdObj, StringData fieldName) {
     namespace mmb = mutablebson;
@@ -97,7 +103,7 @@ bool shouldSkipOutput(OperationContext* opCtx) {
  * Returns true if 'ns' refers to a time-series collection.
  */
 bool isTimeseries(OperationContext* opCtx, const NamespaceString& ns) {
-    auto viewCatalog = DatabaseHolder::get(opCtx)->getSharedViewCatalog(opCtx, ns.db());
+    auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, ns.db());
     if (!viewCatalog) {
         return false;
     }
@@ -114,86 +120,138 @@ bool isTimeseries(OperationContext* opCtx, const NamespaceString& ns) {
 const int kTimeseriesControlVersion = 1;
 
 /**
- * Returns min/max $set expressions for the bucket's control field.
- */
-BSONObj makeTimeseriesControlMinMaxStages(const std::vector<BSONObj>& docs) {
-    struct MinMaxBuilders {
-        BSONArrayBuilder min;
-        BSONArrayBuilder max;
-    };
-    StringDataMap<MinMaxBuilders> minMaxBuilders;
-
-    for (const auto& doc : docs) {
-        for (const auto& elem : doc) {
-            auto key = elem.fieldNameStringData();
-            auto [it, created] = minMaxBuilders.insert({key, MinMaxBuilders{}});
-            if (created) {
-                it->second.min.append("$control.min." + key);
-                it->second.max.append("$control.max." + key);
-            }
-            it->second.min.append(elem);
-            it->second.max.append(elem);
-        }
-    }
-
-    BSONObjBuilder builder;
-    for (auto& builders : minMaxBuilders) {
-        builder.append("control.min." + builders.first, BSON("$min" << builders.second.min.arr()));
-        builder.append("control.max." + builders.first, BSON("$max" << builders.second.max.arr()));
-    }
-
-    return builder.obj();
-}
-
-/**
  * Returns $set expressions for the bucket's data field.
+ * If 'metadataElem' is not empty, the time-series collection was created with a metadata field.
+ * All measurements in a bucket share the same value in the 'meta' field, so there is no need to add
+ * the metadata to the data field.
  */
-BSONObj makeTimeseriesDataStages(const std::vector<BSONObj>& docs, uint16_t count) {
-    StringDataMap<BSONArrayBuilder> measurements;
+void appendTimeseriesDataFields(const std::vector<BSONObj>& docs,
+                                BSONElement metadataElem,
+                                uint16_t count,
+                                BSONObjBuilder* builder) {
     for (const auto& doc : docs) {
         for (const auto& elem : doc) {
             auto key = elem.fieldNameStringData();
-            measurements[key].append(
-                BSON("k" << std::to_string(count) << elem.wrap("v").firstElement()));
+            if (metadataElem && key == metadataElem.fieldNameStringData()) {
+                continue;
+            }
+            builder->appendAs(elem, str::stream() << "data." << key << "." << count);
         }
         count++;
     }
-
-    BSONObjBuilder builder;
-    for (auto& field : measurements) {
-        builder.append(
-            "data." + field.first,
-            BSON("$arrayToObject" << BSON(
-                     "$setUnion" << BSON_ARRAY(
-                         BSON("$objectToArray" << BSON(
-                                  "$ifNull" << BSON_ARRAY(("$data." + field.first) << BSONObj())))
-                         << field.second.arr()))));
-    }
-
-    return builder.obj();
 }
 
 /**
- * Transforms a single time-series insert to an upsert request.
+ * Transforms a single time-series insert to an update request on an existing bucket.
  */
-BSONObj makeTimeseriesUpsertRequest(const OID& oid,
-                                    const std::vector<BSONObj>& docs,
-                                    uint16_t count) {
-    BSONObjBuilder builder;
-    builder.append(write_ops::UpdateOpEntry::kQFieldName, BSON("_id" << oid));
-    builder.append(write_ops::UpdateOpEntry::kMultiFieldName, false);
-    builder.append(write_ops::UpdateOpEntry::kUpsertFieldName, true);
+write_ops::UpdateOpEntry makeTimeseriesUpdateOpEntry(const OID& bucketId,
+                                                     const BucketCatalog::CommitData& data,
+                                                     const BSONObj& metadata) {
+    BSONObjBuilder updateBuilder;
     {
-        BSONArrayBuilder stagesBuilder(
-            builder.subarrayStart(write_ops::UpdateOpEntry::kUFieldName));
-        stagesBuilder.append(
-            BSON("$set" << BSON("control.version"
-                                << BSON("$ifNull" << BSON_ARRAY("$control.version"
-                                                                << kTimeseriesControlVersion)))));
-        stagesBuilder.append(BSON("$set" << makeTimeseriesControlMinMaxStages(docs)));
-        stagesBuilder.append(BSON("$set" << makeTimeseriesDataStages(docs, count)));
+        if (!data.bucketMin.isEmpty() || !data.bucketMax.isEmpty()) {
+            BSONObjBuilder controlBuilder(updateBuilder.subobjStart(
+                str::stream() << doc_diff::kSubDiffSectionFieldPrefix << "control"));
+            if (!data.bucketMin.isEmpty()) {
+                controlBuilder.append(
+                    str::stream() << doc_diff::kSubDiffSectionFieldPrefix << "min", data.bucketMin);
+            }
+            if (!data.bucketMax.isEmpty()) {
+                controlBuilder.append(
+                    str::stream() << doc_diff::kSubDiffSectionFieldPrefix << "max", data.bucketMax);
+            }
+        }
     }
-    return builder.obj();
+    {
+        // doc_diff::kSubDiffSectionFieldPrefix + <field name> => {<index_0>: ..., <index_1>: ...}
+        StringDataMap<BSONObjBuilder> dataFieldBuilders;
+        auto metadataElem = metadata.firstElement();
+        auto count = data.numCommittedMeasurements;
+        for (const auto& doc : data.docs) {
+            for (const auto& elem : doc) {
+                auto key = elem.fieldNameStringData();
+                if (metadataElem && key == metadataElem.fieldNameStringData()) {
+                    continue;
+                }
+                auto& builder = dataFieldBuilders[key];
+                builder.appendAs(elem, std::to_string(count));
+            }
+            count++;
+        }
+
+        // doc_diff::kSubDiffSectionFieldPrefix + <field name>
+        BSONObjBuilder dataBuilder(updateBuilder.subobjStart("sdata"));
+        BSONObjBuilder newDataFieldsBuilder;
+        for (auto& pair : dataFieldBuilders) {
+            // Existing 'data' fields with measurements require different treatment from fields
+            // not observed before (missing from control.min and control.max).
+            if (data.newFieldNamesToBeInserted.count(pair.first)) {
+                newDataFieldsBuilder.append(pair.first, pair.second.obj());
+            }
+        }
+        auto newDataFields = newDataFieldsBuilder.obj();
+        if (!newDataFields.isEmpty()) {
+            dataBuilder.append(doc_diff::kInsertSectionFieldName, newDataFields);
+        }
+        for (auto& pair : dataFieldBuilders) {
+            // Existing 'data' fields with measurements require different treatment from fields
+            // not observed before (missing from control.min and control.max).
+            if (!data.newFieldNamesToBeInserted.count(pair.first)) {
+                dataBuilder.append(doc_diff::kSubDiffSectionFieldPrefix + pair.first.toString(),
+                                   BSON(doc_diff::kInsertSectionFieldName << pair.second.obj()));
+            }
+        }
+    }
+    write_ops::UpdateModification u(updateBuilder.obj(), write_ops::UpdateModification::DiffTag{});
+    write_ops::UpdateOpEntry update(BSON("_id" << bucketId), std::move(u));
+    invariant(!update.getMulti(), bucketId.toString());
+    invariant(!update.getUpsert(), bucketId.toString());
+    return update;
+}
+
+/**
+ * Returns the single-element array to use as the vector of documents for inserting a new bucket.
+ */
+BSONArray makeTimeseriesInsertDocument(const OID& bucketId,
+                                       const BucketCatalog::CommitData& data,
+                                       const BSONObj& metadata) {
+    auto metadataElem = metadata.firstElement();
+
+    StringDataMap<BSONObjBuilder> dataBuilders;
+    uint16_t count = 0;
+    for (const auto& doc : data.docs) {
+        auto countFieldName = std::to_string(count++);
+        for (const auto& elem : doc) {
+            auto key = elem.fieldNameStringData();
+            if (metadataElem && key == metadataElem.fieldNameStringData()) {
+                continue;
+            }
+            dataBuilders[key].appendAs(elem, countFieldName);
+        }
+    }
+
+    BSONArrayBuilder builder;
+    {
+        BSONObjBuilder bucketBuilder(builder.subobjStart());
+        bucketBuilder.append("_id", bucketId);
+        {
+            BSONObjBuilder bucketControlBuilder(bucketBuilder.subobjStart("control"));
+            bucketControlBuilder.append("version", kTimeseriesControlVersion);
+            bucketControlBuilder.append("min", data.bucketMin);
+            bucketControlBuilder.append("max", data.bucketMax);
+        }
+        if (metadataElem) {
+            bucketBuilder.appendAs(metadataElem, "meta");
+        }
+        {
+            BSONObjBuilder bucketDataBuilder(bucketBuilder.subobjStart("data"));
+            for (auto& dataBuilder : dataBuilders) {
+                bucketDataBuilder.append(dataBuilder.first, dataBuilder.second.obj());
+            }
+        }
+    }
+
+    return builder.arr();
 }
 
 void appendOpTime(const repl::OpTime& opTime, BSONObjBuilder* out) {
@@ -202,6 +260,53 @@ void appendOpTime(const repl::OpTime& opTime, BSONObjBuilder* out) {
     } else {
         opTime.append(out, "opTime");
     }
+}
+
+/**
+ * Returns true if the retryable time-series write has been executed.
+ */
+bool isRetryableTimeseriesWriteExecuted(OperationContext* opCtx,
+                                        const write_ops::Insert& insert,
+                                        BSONObjBuilder* result) {
+    if (!opCtx->getTxnNumber()) {
+        return false;
+    }
+
+    if (opCtx->inMultiDocumentTransaction()) {
+        return false;
+    }
+
+    if (insert.getDocuments().empty()) {
+        return false;
+    }
+
+    auto txnParticipant = TransactionParticipant::get(opCtx);
+    const auto& writeCommandBase = insert.getWriteCommandBase();
+
+    uassert(ErrorCodes::OperationFailed,
+            str::stream() << "Retryable time-series insert operations are limited to one document "
+                             "per command request",
+            insert.getDocuments().size() == 1U);
+
+    auto stmtId = write_ops::getStmtIdForWriteAt(writeCommandBase, 0);
+    if (!txnParticipant.checkStatementExecutedNoOplogEntryFetch(stmtId)) {
+        return false;
+    }
+
+    // This retryable write has been executed previously. Fill in command result before returning.
+    result->appendNumber("n", 1);
+
+    auto* replCoord = repl::ReplicationCoordinator::get(opCtx->getServiceContext());
+    if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet) {
+        appendOpTime(repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(), result);
+        result->append("electionId", replCoord->getElectionId());
+    }
+
+    auto retryStats = RetryableWritesStats::get(opCtx);
+    retryStats->incrementRetriedStatementsCount();
+    retryStats->incrementRetriedCommandsCount();
+
+    return true;
 }
 
 boost::optional<BSONObj> generateError(OperationContext* opCtx,
@@ -470,6 +575,10 @@ private:
          * Writes to the underlying system.buckets collection.
          */
         void _performTimeseriesWrites(OperationContext* opCtx, BSONObjBuilder* result) const {
+            if (isRetryableTimeseriesWriteExecuted(opCtx, _batch, result)) {
+                return;
+            }
+
             auto ns = _batch.getNamespace();
             auto bucketsNs = ns.makeTimeseriesBucketsNamespace();
 
@@ -486,35 +595,54 @@ private:
                 }
             }
 
+            hangTimeseriesInsertBeforeCommit.pauseWhileSet();
+
             std::vector<BSONObj> errors;
             boost::optional<repl::OpTime> opTime;
             boost::optional<OID> electionId;
 
             for (const auto& [bucketId, index] : bucketsToCommit) {
+                auto metadata = bucketCatalog.getMetadata(bucketId);
                 auto data = bucketCatalog.commit(bucketId);
                 while (!data.docs.empty()) {
-                    BSONObjBuilder builder;
-                    builder.append(write_ops::Update::kCommandName, bucketsNs.coll());
-                    // The schema validation configured in the bucket collection is intended for
-                    // direct operations by end users and is not applicable here.
-                    builder.append(write_ops::Update::kBypassDocumentValidationFieldName, true);
-                    builder.append(write_ops::Update::kOrderedFieldName, _batch.getOrdered());
-                    if (auto stmtId = _batch.getStmtId()) {
-                        builder.append(write_ops::Update::kStmtIdFieldName, *stmtId);
-                    } else if (auto stmtIds = _batch.getStmtIds()) {
-                        builder.append(write_ops::Update::kStmtIdsFieldName, *stmtIds);
-                    }
+                    write_ops_exec::WriteResult reply;
+                    if (data.numCommittedMeasurements == 0) {
+                        BSONObjBuilder builder;
+                        builder.append(write_ops::Insert::kCommandName, bucketsNs.coll());
+                        // The schema validation configured in the bucket collection is intended for
+                        // direct operations by end users and is not applicable here.
+                        builder.append(write_ops::Insert::kBypassDocumentValidationFieldName, true);
+                        builder.append(write_ops::Insert::kOrderedFieldName, _batch.getOrdered());
+                        if (auto stmtId = _batch.getStmtId()) {
+                            builder.append(write_ops::Insert::kStmtIdFieldName, *stmtId);
+                        } else if (auto stmtIds = _batch.getStmtIds()) {
+                            builder.append(write_ops::Insert::kStmtIdsFieldName, *stmtIds);
+                        }
+                        builder.append(write_ops::Insert::kDocumentsFieldName,
+                                       makeTimeseriesInsertDocument(bucketId, data, metadata));
 
-                    {
-                        BSONArrayBuilder updatesBuilder(
-                            builder.subarrayStart(write_ops::Update::kUpdatesFieldName));
-                        updatesBuilder.append(makeTimeseriesUpsertRequest(
-                            bucketId, data.docs, data.numCommittedMeasurements));
-                    }
+                        auto request = OpMsgRequest::fromDBAndBody(bucketsNs.db(), builder.obj());
+                        auto timeseriesInsertBatch = InsertOp::parse(request);
+                        reply = write_ops_exec::performInserts(opCtx, timeseriesInsertBatch);
+                    } else {
+                        auto update = makeTimeseriesUpdateOpEntry(bucketId, data, metadata);
+                        write_ops::Update timeseriesUpdateBatch(bucketsNs, {update});
+                        {
+                            write_ops::WriteCommandBase writeCommandBase;
+                            // The schema validation configured in the bucket collection is intended
+                            // for direct operations by end users and is not applicable here.
+                            writeCommandBase.setBypassDocumentValidation(true);
+                            writeCommandBase.setOrdered(_batch.getOrdered());
+                            if (auto stmtId = _batch.getStmtId()) {
+                                writeCommandBase.setStmtId(*stmtId);
+                            } else if (auto stmtIds = _batch.getStmtIds()) {
+                                writeCommandBase.setStmtIds(*stmtIds);
+                            }
+                            timeseriesUpdateBatch.setWriteCommandBase(std::move(writeCommandBase));
+                        }
 
-                    auto request = OpMsgRequest::fromDBAndBody(bucketsNs.db(), builder.obj());
-                    auto timeseriesUpsertBatch = UpdateOp::parse(request);
-                    auto reply = write_ops_exec::performUpdates(opCtx, timeseriesUpsertBatch);
+                        reply = write_ops_exec::performUpdates(opCtx, timeseriesUpdateBatch);
+                    }
 
                     invariant(reply.results.size() == 1,
                               str::stream()
@@ -691,8 +819,7 @@ private:
                 // which stages were being used.
                 auto& updateMod = update.getU();
                 if (updateMod.type() == write_ops::UpdateModification::Type::kPipeline) {
-                    AggregationRequest request(_batch.getNamespace(),
-                                               updateMod.getUpdatePipeline());
+                    AggregateCommand request(_batch.getNamespace(), updateMod.getUpdatePipeline());
                     LiteParsedPipeline pipeline(request);
                     pipeline.tickGlobalStageCounters();
                     _updateMetrics->incrementExecutedWithAggregationPipeline();

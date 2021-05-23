@@ -40,7 +40,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/read_preference.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/keys_collection_document.h"
+#include "mongo/db/keys_collection_document_gen.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/service_context.h"
@@ -72,13 +72,35 @@ bool isRetriableError(ErrorCodes::Error code, Shard::RetryPolicy options) {
 
 KeysCollectionClientDirect::KeysCollectionClientDirect() : _rsLocalClient() {}
 
-StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientDirect::getNewKeys(
+StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientDirect::getNewInternalKeys(
     OperationContext* opCtx,
     StringData purpose,
     const LogicalTime& newerThanThis,
     bool useMajority) {
+    return _getNewKeys<KeysCollectionDocument>(
+        opCtx, NamespaceString::kKeysCollectionNamespace, purpose, newerThanThis, useMajority);
+}
 
+StatusWith<std::vector<ExternalKeysCollectionDocument>>
+KeysCollectionClientDirect::getNewExternalKeys(OperationContext* opCtx,
+                                               StringData purpose,
+                                               const LogicalTime& newerThanThis,
+                                               bool useMajority) {
+    return _getNewKeys<ExternalKeysCollectionDocument>(
+        opCtx,
+        NamespaceString::kExternalKeysCollectionNamespace,
+        purpose,
+        newerThanThis,
+        useMajority);
+}
 
+template <typename KeyDocumentType>
+StatusWith<std::vector<KeyDocumentType>> KeysCollectionClientDirect::_getNewKeys(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    StringData purpose,
+    const LogicalTime& newerThanThis,
+    bool useMajority) {
     BSONObjBuilder queryBuilder;
     queryBuilder.append("purpose", purpose);
     queryBuilder.append("expiresAt", BSON("$gt" << newerThanThis.asTimestamp()));
@@ -91,7 +113,7 @@ StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientDirect::getN
     auto findStatus = _query(opCtx,
                              ReadPreferenceSetting(ReadPreference::Nearest, TagSet{}),
                              readConcern,
-                             KeysCollectionDocument::ConfigNS,
+                             nss,
                              queryBuilder.obj(),
                              BSON("expiresAt" << 1),
                              boost::none);
@@ -101,14 +123,15 @@ StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionClientDirect::getN
     }
 
     const auto& keyDocs = findStatus.getValue().docs;
-    std::vector<KeysCollectionDocument> keys;
+    std::vector<KeyDocumentType> keys;
     for (auto&& keyDoc : keyDocs) {
-        auto parseStatus = KeysCollectionDocument::fromBSON(keyDoc);
-        if (!parseStatus.isOK()) {
-            return parseStatus.getStatus();
+        KeyDocumentType key;
+        try {
+            key = KeyDocumentType::parse(IDLParserErrorContext("keyDoc"), keyDoc);
+        } catch (...) {
+            return exceptionToStatus();
         }
-
-        keys.push_back(std::move(parseStatus.getValue()));
+        keys.push_back(std::move(key));
     }
 
     return keys;
@@ -173,8 +196,10 @@ Status KeysCollectionClientDirect::_insert(OperationContext* opCtx,
 }
 
 Status KeysCollectionClientDirect::insertNewKey(OperationContext* opCtx, const BSONObj& doc) {
-    return _insert(
-        opCtx, KeysCollectionDocument::ConfigNS, doc, ShardingCatalogClient::kMajorityWriteConcern);
+    return _insert(opCtx,
+                   NamespaceString::kKeysCollectionNamespace,
+                   doc,
+                   ShardingCatalogClient::kMajorityWriteConcern);
 }
 
 }  // namespace mongo

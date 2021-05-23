@@ -41,7 +41,7 @@
 #include "mongo/bson/json.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
-#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/document_source_bucket_auto.h"
 #include "mongo/db/pipeline/document_source_facet.h"
 #include "mongo/db/pipeline/document_source_graph_lookup.h"
@@ -77,10 +77,9 @@ protected:
         const auto inputBson = fromjson("{pipeline: " + jsonArray + "}");
 
         ASSERT_EQUALS(inputBson["pipeline"].type(), BSONType::Array);
-        auto rawPipeline =
-            uassertStatusOK(AggregationRequest::parsePipelineFromBSON(inputBson["pipeline"]));
+        auto rawPipeline = parsePipelineFromBSON(inputBson["pipeline"]);
         NamespaceString testNss("test", "collection");
-        AggregationRequest request(testNss, rawPipeline);
+        AggregateCommand request(testNss, rawPipeline);
         getExpCtx()->ns = testNss;
 
         return Pipeline::parse(request.getPipeline(), getExpCtx());
@@ -202,7 +201,7 @@ TEST_F(PipelineMetadataTreeTest, BranchingPipelinesConstructProperTrees) {
         if (typeid(source) == typeid(DocumentSourceGroup))
             return {previousThing.string + "g"};
         if (auto lookupSource = dynamic_cast<const DocumentSourceLookUp*>(&source)) {
-            if (lookupSource->wasConstructedWithPipelineSyntax())
+            if (lookupSource->hasPipeline())
                 return {previousThing.string + "l[" + extraThings.front().string + "]"};
             else
                 return {previousThing.string + "l"};

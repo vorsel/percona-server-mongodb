@@ -24,8 +24,6 @@ all:
     test_file: jstests/replsets/apply_prepare_txn_write_conflict_robustness.js
   - ticket: SERVER-47645
     test_file: jstests/replsets/invalidate_sessions_on_stepdown.js
-  - ticket: SERVER-48518
-    test_file: jstests/replsets/rollback_via_refetch_anomaly.js
   - ticket: SERVER-47773
     test_file: jstests/core/geo_near_tailable.js
   - ticket: SERVER-47469
@@ -106,8 +104,24 @@ all:
     test_file: jstests/replsets/not_primary_errors_returned_if_client_sends_helloOk.js
   - ticket: SERVER-50412
     test_file: jstests/sharding/mongos_helloOk_protocol.js
+  - ticket: SERVER-51049
+    test_file: jstests/replsets/node_restarts_no_oplog_entry_at_stable.js
   - ticket: SERVER-50414
     test_file: jstests/replsets/not_primary_errors_returned_during_rollback_if_helloOk.js
+  - ticket: SERVER-50769
+    test_file: jstests/sharding/change_stream_empty_apply_ops.js
+  - ticket: SERVER-52547
+    test_file: jstests/core/txns/errors_on_committed_transaction.js
+  - ticket: SERVER-53612
+    test_file: jstests/replsets/election_handoff_not_immediately_electable.js
+  - ticket: SERVER-50486
+    test_file: jstests/replsets/dont_refresh_session_prepare_secondary.js
+  - ticket: SERVER-53932
+    test_file: jstests/replsets/rollback_reconstructs_transactions_prepared_before_stable.js
+  - ticket: SERVER-53431
+    test_file: jstests/replsets/stepdown_kill_other_ops.js
+  - ticket: SERVER-53394
+    test_file: jstests/sharding/sharding_task_executor_pool_matching_policy.js
 
 # Tests that should only be excluded from particular suites should be listed under that suite.
 suites:

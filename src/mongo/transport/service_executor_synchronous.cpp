@@ -37,15 +37,17 @@
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/service_executor_gen.h"
 #include "mongo/transport/service_executor_utils.h"
-#include "mongo/util/processinfo.h"
 #include "mongo/util/thread_safety_context.h"
 
 namespace mongo {
 namespace transport {
 namespace {
-constexpr auto kThreadsRunning = "threadsRunning"_sd;
-constexpr auto kExecutorLabel = "executor"_sd;
 constexpr auto kExecutorName = "passthrough"_sd;
+
+constexpr auto kThreadsRunning = "threadsRunning"_sd;
+constexpr auto kClientsInTotal = "clientsInTotal"_sd;
+constexpr auto kClientsRunning = "clientsRunning"_sd;
+constexpr auto kClientsWaiting = "clientsWaitingForData"_sd;
 
 const auto getServiceExecutorSynchronous =
     ServiceContext::declareDecoration<std::unique_ptr<ServiceExecutorSynchronous>>();
@@ -64,8 +66,6 @@ ServiceExecutorSynchronous::ServiceExecutorSynchronous(ServiceContext* ctx)
     : _shutdownCondition(std::make_shared<stdx::condition_variable>()) {}
 
 Status ServiceExecutorSynchronous::start() {
-    _numHardwareCores = static_cast<size_t>(ProcessInfo::getNumAvailableCores());
-
     _stillRunning.store(true);
 
     return Status::OK();
@@ -99,15 +99,8 @@ Status ServiceExecutorSynchronous::scheduleTask(Task task, ScheduleFlags flags) 
     }
 
     if (!_localWorkQueue.empty()) {
-        /*
-         * In perf testing we found that yielding after running a each request produced
-         * at 5% performance boost in microbenchmarks if the number of worker threads
-         * was greater than the number of available cores.
-         */
         if (flags & ScheduleFlags::kMayYieldBeforeSchedule) {
-            if (_numRunningWorkerThreads.loadRelaxed() > _numHardwareCores) {
-                stdx::this_thread::yield();
-            }
+            yieldIfAppropriate();
         }
 
         // Execute task directly (recurse) if allowed by the caller as it produced better
@@ -152,13 +145,22 @@ Status ServiceExecutorSynchronous::scheduleTask(Task task, ScheduleFlags flags) 
 }
 
 void ServiceExecutorSynchronous::appendStats(BSONObjBuilder* bob) const {
-    *bob << kExecutorLabel << kExecutorName << kThreadsRunning
-         << static_cast<int>(_numRunningWorkerThreads.loadRelaxed());
+    // The ServiceExecutorSynchronous has one client per thread and waits synchronously on thread.
+    auto threads = static_cast<int>(_numRunningWorkerThreads.loadRelaxed());
+
+    BSONObjBuilder subbob = bob->subobjStart(kExecutorName);
+    subbob.append(kThreadsRunning, threads);
+    subbob.append(kClientsInTotal, threads);
+    subbob.append(kClientsRunning, threads);
+    subbob.append(kClientsWaiting, 0);
 }
 
-void ServiceExecutorSynchronous::runOnDataAvailable(Session* session,
-                                                    OutOfLineExecutor::Task onCompletionCallback) {
-    scheduleCallbackOnDataAvailable(session, std::move(onCompletionCallback), this);
+void ServiceExecutorSynchronous::runOnDataAvailable(const SessionHandle& session,
+                                                    OutOfLineExecutor::Task callback) {
+    invariant(session);
+    yieldIfAppropriate();
+
+    schedule([callback = std::move(callback)](Status status) { callback(std::move(status)); });
 }
 
 

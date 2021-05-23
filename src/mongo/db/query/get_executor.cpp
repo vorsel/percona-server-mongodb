@@ -77,6 +77,7 @@
 #include "mongo/db/query/planner_ixselect.h"
 #include "mongo/db/query/planner_wildcard_helpers.h"
 #include "mongo/db/query/projection_parser.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
@@ -303,10 +304,8 @@ void fillOutPlannerParams(OperationContext* opCtx,
 
     // If the caller wants a shard filter, make sure we're actually sharded.
     if (plannerParams->options & QueryPlannerParams::INCLUDE_SHARD_FILTER) {
-        auto collDesc = CollectionShardingState::get(opCtx, canonicalQuery->nss())
-                            ->getCollectionDescription(opCtx);
-        if (collDesc.isSharded()) {
-            const auto& keyPattern = collDesc.getKeyPattern();
+        if (collection.isSharded()) {
+            const auto& keyPattern = collection.getShardKeyPattern();
             ShardKeyPattern shardKeyPattern(keyPattern);
 
             // If the shard key is specified exactly, the query is guaranteed to only target one
@@ -552,7 +551,7 @@ public:
                         "namespace"_attr = _cq->ns(),
                         "canonicalQuery"_attr = redact(_cq->toStringShort()));
 
-            auto solution = std::make_unique<QuerySolution>();
+            auto solution = std::make_unique<QuerySolution>(_plannerOptions);
             solution->setRoot(std::make_unique<EofNode>());
 
             auto root = buildExecutableTree(*solution);
@@ -901,7 +900,8 @@ public:
 protected:
     std::pair<std::unique_ptr<sbe::PlanStage>, stage_builder::PlanStageData> buildExecutableTree(
         const QuerySolution& solution) const final {
-        return buildExecutableTree(solution, false);
+        return stage_builder::buildSlotBasedExecutableTree(
+            _opCtx, _collection, *_cq, solution, _yieldPolicy);
     }
 
     std::unique_ptr<SlotBasedPrepareExecutionResult> buildIdHackPlan(
@@ -920,7 +920,7 @@ protected:
         const QueryPlannerParams& plannerParams,
         size_t decisionWorks) final {
         auto result = makeResult();
-        auto execTree = buildExecutableTree(*solution, true);
+        auto execTree = buildExecutableTree(*solution);
         result->emplace(std::move(execTree), std::move(solution));
         result->setDecisionWorks(decisionWorks);
         return result;
@@ -943,17 +943,10 @@ protected:
                 solutions[ix]->cacheData->indexFilterApplied = plannerParams.indexFiltersApplied;
             }
 
-            auto execTree = buildExecutableTree(*solutions[ix], true);
+            auto execTree = buildExecutableTree(*solutions[ix]);
             result->emplace(std::move(execTree), std::move(solutions[ix]));
         }
         return result;
-    }
-
-private:
-    std::pair<std::unique_ptr<sbe::PlanStage>, stage_builder::PlanStageData> buildExecutableTree(
-        const QuerySolution& solution, bool needsTrialRunProgressTracker) const {
-        return stage_builder::buildSlotBasedExecutableTree(
-            _opCtx, _collection, *_cq, solution, _yieldPolicy, needsTrialRunProgressTracker);
     }
 };
 
@@ -980,6 +973,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getClassicExecu
                                        std::move(root),
                                        collection,
                                        yieldPolicy,
+                                       plannerOptions,
                                        {},
                                        result->solution());
 }
@@ -1088,6 +1082,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getSlotBasedExe
                                            std::move(cq),
                                            std::move(candidates),
                                            collection,
+                                           plannerOptions,
                                            std::move(nss),
                                            std::move(yieldPolicy));
     }
@@ -1098,6 +1093,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getSlotBasedExe
                                        std::move(solutions[0]),
                                        std::move(roots[0]),
                                        collection,
+                                       plannerOptions,
                                        std::move(nss),
                                        std::move(yieldPolicy));
 }
@@ -1109,7 +1105,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutor(
     std::unique_ptr<CanonicalQuery> canonicalQuery,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions) {
-    return internalQueryEnableSlotBasedExecutionEngine.load()
+    return feature_flags::gSBE.isEnabledAndIgnoreFCV()
         ? getSlotBasedExecutor(
               opCtx, collection, std::move(canonicalQuery), yieldPolicy, plannerOptions)
         : getClassicExecutor(
@@ -1264,6 +1260,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
                                            std::make_unique<EOFStage>(expCtx.get()),
                                            &CollectionPtr::null,
                                            policy,
+                                           false, /* whether we must return owned data */
                                            nss);
     }
 
@@ -1302,8 +1299,12 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
                                                   ws.get(),
                                                   collection,
                                                   idHackStage.release());
-                return plan_executor_factory::make(
-                    expCtx, std::move(ws), std::move(root), &collection, policy);
+                return plan_executor_factory::make(expCtx,
+                                                   std::move(ws),
+                                                   std::move(root),
+                                                   &collection,
+                                                   policy,
+                                                   false /* whether owned BSON must be returned */);
             }
         }
 
@@ -1364,6 +1365,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDele
                                        std::move(root),
                                        &collection,
                                        policy,
+                                       defaultPlannerOptions,
                                        NamespaceString(),
                                        std::move(querySolution));
 }
@@ -1438,6 +1440,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpda
                                            std::make_unique<EOFStage>(expCtx.get()),
                                            &CollectionPtr::null,
                                            policy,
+                                           false, /* whether owned BSON must be returned */
                                            nss);
     }
 
@@ -1535,6 +1538,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorUpda
                                        std::move(root),
                                        &collection,
                                        policy,
+                                       defaultPlannerOptions,
                                        NamespaceString(),
                                        std::move(querySolution));
 }
@@ -1721,8 +1725,13 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCoun
         // this case we put a CountStage on top of an EOFStage.
         std::unique_ptr<PlanStage> root = std::make_unique<CountStage>(
             expCtx.get(), collection, limit, skip, ws.get(), new EOFStage(expCtx.get()));
-        return plan_executor_factory::make(
-            expCtx, std::move(ws), std::move(root), &CollectionPtr::null, yieldPolicy, nss);
+        return plan_executor_factory::make(expCtx,
+                                           std::move(ws),
+                                           std::move(root),
+                                           &CollectionPtr::null,
+                                           yieldPolicy,
+                                           false, /* whether we must return owned BSON */
+                                           nss);
     }
 
     // If the query is empty, then we can determine the count by just asking the collection
@@ -1737,8 +1746,13 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCoun
     if (useRecordStoreCount) {
         std::unique_ptr<PlanStage> root =
             std::make_unique<RecordStoreFastCountStage>(expCtx.get(), collection, skip, limit);
-        return plan_executor_factory::make(
-            expCtx, std::move(ws), std::move(root), &CollectionPtr::null, yieldPolicy, nss);
+        return plan_executor_factory::make(expCtx,
+                                           std::move(ws),
+                                           std::move(root),
+                                           &CollectionPtr::null,
+                                           yieldPolicy,
+                                           false, /* whether we must returned owned BSON */
+                                           nss);
     }
 
     size_t plannerOptions = QueryPlannerParams::IS_COUNT;
@@ -1767,6 +1781,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorCoun
                                        std::move(root),
                                        coll,
                                        yieldPolicy,
+                                       plannerOptions,
                                        NamespaceString(),
                                        std::move(querySolution));
 }
@@ -2082,6 +2097,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorForS
                                             std::move(root),
                                             coll,
                                             yieldPolicy,
+                                            plannerParams.options,
                                             NamespaceString(),
                                             std::move(soln));
     if (exec.isOK()) {
@@ -2113,8 +2129,9 @@ getExecutorDistinctFromIndexSolutions(OperationContext* opCtx,
                                       std::vector<std::unique_ptr<QuerySolution>> solutions,
                                       PlanYieldPolicy::YieldPolicy yieldPolicy,
                                       ParsedDistinct* parsedDistinct,
-                                      bool strictDistinctOnly) {
+                                      size_t plannerOptions) {
     const auto& collection = *coll;
+    const bool strictDistinctOnly = (plannerOptions & QueryPlannerParams::STRICT_DISTINCT_ONLY);
 
     // We look for a solution that has an ixscan we can turn into a distinctixscan
     for (size_t i = 0; i < solutions.size(); ++i) {
@@ -2131,6 +2148,7 @@ getExecutorDistinctFromIndexSolutions(OperationContext* opCtx,
                                                     std::move(root),
                                                     coll,
                                                     yieldPolicy,
+                                                    plannerOptions,
                                                     NamespaceString(),
                                                     std::move(currentSolution));
             if (exec.isOK()) {
@@ -2194,7 +2212,8 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDist
                                            std::make_unique<WorkingSet>(),
                                            std::make_unique<EOFStage>(expCtx.get()),
                                            coll,
-                                           yieldPolicy);
+                                           yieldPolicy,
+                                           plannerOptions);
     }
 
     // TODO: check for idhack here?
@@ -2259,12 +2278,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorDist
     // but not all duplicate values of the distinct field, meaning that the output from this
     // executor will still need deduplication.
     executorWithStatus = getExecutorDistinctFromIndexSolutions(
-        opCtx,
-        coll,
-        std::move(solutions),
-        yieldPolicy,
-        parsedDistinct,
-        (plannerOptions & QueryPlannerParams::STRICT_DISTINCT_ONLY));
+        opCtx, coll, std::move(solutions), yieldPolicy, parsedDistinct, plannerOptions);
     if (!executorWithStatus.isOK() || executorWithStatus.getValue()) {
         // We either got a DISTINCT plan or a fatal error.
         return executorWithStatus;

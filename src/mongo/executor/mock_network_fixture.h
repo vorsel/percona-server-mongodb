@@ -42,9 +42,69 @@ using executor::RemoteCommandResponse;
 namespace test {
 namespace mock {
 
-// MockNetwork wraps the NetworkInterfaceMock to provide a declarative approach
-// to specify expected behaviors on the network and to hide the interaction with
-// the NetworkInterfaceMock.
+/**
+ * MockNetwork wraps the NetworkInterfaceMock to provide a declarative approach to specify
+ * expected behaviors on the network and to hide the interaction with NetworkInterfaceMock.
+ * We refer to the behaviors we are testing as "expectations".
+ *
+ * Expectations:
+ * All expectations are unordered by default, unless otherwise specified (see Sequences below).
+ * There are two types of expectations: default expectations and user expectations.
+ * The purpose of default expectations is to cover uninteresting calls that are typically
+ * repeated throughout a set of tests, so that individual tests can focus on the specific
+ * behaviors they are meant to evaluate. Default expectations may be matched any number of times
+ * (including zero).
+ * User expectations represent the concrete requirements of a test. They must all be matched
+ * the exact number of times required. For example:
+ *
+ *      // Earlier in the test fixture
+ *      mock.defaultExpect(...); // A
+ *      mock.defaultExpect(...); // B
+ *
+ *      ...
+ *
+ *      // In individual tests
+ *      mock.expect(...).times(...); // C
+ *      mock.expect(...).times(...); // D
+ *
+ *      ...
+ *
+ *      // Later in those tests
+ *      mock.runUntilExpectationsSatisfied();
+ *
+ * We have no requirements here on matching A or B, but C and D must be satisfied in full.
+ * You may omit the times() call if you would like to use the default of 1 "times".
+ *
+ * To run expectations, use runUntilExpectationsSatisfied(), which will block until all
+ * expectations have been fully satisfied. You may also use runUntil() if you only want to
+ * advance to a particular time. If you would like to still check that your expectations have
+ * been satisfied (or explicitly demonstrate that they haven't), call verifyExpectations().
+ *
+ * Sequences:
+ * The Sequence class provides a way to specify order of expectations. A test may have all
+ * expectations in a sequence, or a subset, or none at all. It may also include any number of
+ * sequences. Note that sequences only specify partial ordering, which means it is acceptable to
+ * interleave other expectations in between sequence members (including expectations belonging to
+ * other sequences) so long as all sequences are run in their required order. We enforce ordering
+ * by refusing to match an expectation if it has unsatisfied prerequisites.
+ *
+ * To specify a sequence, use the InSequence RAII type, which will add all Expectations in its
+ * scope to an anonymous sequence. For example:
+ *
+ *
+ *      {
+ *          MockNetwork::InSequence seq(mock);
+ *
+ *          mock.expect(...); // A
+ *          mock.expect(...); // B
+ *      }
+ *
+ *      mock.expect(...); // C
+ *
+ *
+ * In this example, we only require that A comes before B. We have no requirements for when C
+ * is executed. Therefore, all of {ABC, ACB, CAB} are valid, but {BAC, BCA, CBA} are not valid.
+ */
 class MockNetwork {
 public:
     using MatcherFunc = std::function<bool(const BSONObj&)>;
@@ -99,6 +159,14 @@ public:
             : _matcher(std::move(matcher)), _action(std::move(action)) {}
         virtual ~Expectation() {}
 
+        // We should only try to match an expectation if all its prerequisites in the sequence are
+        // satisfied (or if it is not part of a sequence in the first place).
+        // Default expectations should always match, as they cannot form sequences, and because we
+        // generally have no restrictions on when and how many times they match.
+        virtual bool prerequisitesMet() {
+            return true;
+        }
+
         bool match(const BSONObj& request) {
             return _matcher(request);
         }
@@ -136,6 +204,17 @@ public:
             _allowedTimes = 1;
         }
 
+        // We forbid matching if we have unsatisfied prerequisites and allow it otherwise.
+        bool prerequisitesMet() override {
+            // No prerequisites at all - okay to match.
+            if (!_prevInSequence) {
+                return true;
+            }
+            // If this expectation's immediate prerequisite is satisfied, that implies the
+            // previous ones in the chain have also been satisfied.
+            return _prevInSequence->isSatisfied();
+        }
+
         Expectation& times(int t) {
             _allowedTimes = t;
             return *this;
@@ -148,6 +227,9 @@ public:
         void checkSatisfied() override {
             uassert(5015501, "UserExpectation not satisfied", isSatisfied());
         }
+
+        // The expectation that comes before this on in the sequence, if applicable.
+        UserExpectation* _prevInSequence = nullptr;
     };
 
     class DefaultExpectation : public Expectation {
@@ -157,6 +239,32 @@ public:
         bool isDefault() const override {
             return true;
         }
+    };
+
+    class Sequence {
+    public:
+        void addExpectation(UserExpectation& exp) {
+            exp._prevInSequence = _lastExpectation;
+            _lastExpectation = &exp;
+        }
+
+    private:
+        UserExpectation* _lastExpectation = nullptr;
+    };
+
+    // RAII construct to handle expectations declared as part of a sequence.
+    class InSequence {
+    public:
+        InSequence(MockNetwork& mock) : _mock(mock) {
+            invariant(!_mock._activeSequence);
+            _mock._activeSequence = std::make_unique<Sequence>();
+        };
+        ~InSequence() {
+            _mock._activeSequence.reset();
+        };
+
+    private:
+        MockNetwork& _mock;
     };
 
     explicit MockNetwork(executor::NetworkInterfaceMock* net) : _net(net) {}
@@ -170,6 +278,11 @@ public:
                                                      std::move(action));
         auto& ref = *exp;
         _expectations.emplace_back(std::move(exp));
+
+        if (_activeSequence) {
+            _activeSequence.get()->addExpectation(ref);
+        }
+
         return ref;
     }
 
@@ -229,6 +342,7 @@ private:
     bool _allExpectationsSatisfied() const;
 
     std::vector<std::unique_ptr<Expectation>> _expectations;
+    std::unique_ptr<Sequence> _activeSequence;
     executor::NetworkInterfaceMock* _net;
 };
 

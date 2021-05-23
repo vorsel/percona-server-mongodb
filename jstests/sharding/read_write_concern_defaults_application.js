@@ -114,11 +114,14 @@ let testCases = {
     _recvChunkStart: {skip: "internal command"},
     _recvChunkStatus: {skip: "internal command"},
     _shardsvrCloneCatalogData: {skip: "internal command"},
+    _shardsvrCreateCollection: {skip: "internal command"},
     _shardsvrDropCollection: {skip: "internal command"},
+    _shardsvrDropCollectionParticipant: {skip: "internal command"},
+    _shardsvrDropDatabase: {skip: "internal command"},
     _shardsvrMovePrimary: {skip: "internal command"},
+    _shardsvrRefineCollectionShardKey: {skip: "internal command"},
     _shardsvrRenameCollection: {skip: "internal command"},
     _shardsvrShardCollection: {skip: "internal command"},
-    _shardsvrDropDatabase: {skip: "internal command"},
     _transferMods: {skip: "internal command"},
     _vectorClockPersist: {skip: "internal command"},
     abortTransaction: {
@@ -296,6 +299,7 @@ let testCases = {
         checkReadConcern: true,
         checkWriteConcern: false,
     },
+    donorAbortMigration: {skip: "does not accept read or write concern"},
     donorForgetMigration: {skip: "does not accept read or write concern"},
     donorStartMigration: {skip: "does not accept read or write concern"},
     donorWaitForMigrationToCommit: {skip: "does not accept read or write concern"},
@@ -621,7 +625,6 @@ let testCases = {
     testVersions1And2: {skip: "does not accept read or write concern"},
     testVersion2: {skip: "does not accept read or write concern"},
     top: {skip: "does not accept read or write concern"},
-    unsetSharding: {skip: "internal command"},
     update: {
         setUp: function(conn) {
             assert.commandWorked(conn.getCollection(nss).insert({x: 1}, {writeConcern: {w: 1}}));

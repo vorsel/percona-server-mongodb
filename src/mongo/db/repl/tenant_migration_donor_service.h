@@ -32,6 +32,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/client/remote_command_targeter_rs.h"
 #include "mongo/db/repl/primary_only_service.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/tenant_migration_donor_util.h"
 #include "mongo/util/cancelation.h"
 #include "mongo/util/string_map.h"
@@ -57,8 +58,9 @@ public:
     }
 
     ThreadPool::Limits getThreadPoolLimits() const override {
-        // TODO (SERVER-50438): Limit the size of TenantMigrationDonorService thread pool.
-        return ThreadPool::Limits();
+        ThreadPool::Limits limits;
+        limits.maxThreads = repl::maxTenantMigrationDonorServiceThreadPoolSize;
+        return limits;
     }
 
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(
@@ -74,7 +76,7 @@ public:
             boost::optional<Status> abortReason;
         };
 
-        Instance(ServiceContext* serviceContext, const BSONObj& initialState);
+        explicit Instance(ServiceContext* serviceContext, const BSONObj& initialState);
 
         ~Instance();
 
@@ -110,7 +112,38 @@ public:
             return _completionPromise.getFuture();
         }
 
+        /**
+         * Returns a Future that will be resolved when an abort or commit decision has been reached.
+         */
+        SharedSemiFuture<void> getDecisionFuture() const {
+            return _decisionPromise.getFuture();
+        }
+
+        /**
+         * Returns a Future that will be resolved when the donor has majority-committed the write to
+         * insert the donor state doc for the migration.
+         */
+        SharedSemiFuture<void> getInitialDonorStateDurableFuture() const {
+            return _initialDonorStateDurablePromise.getFuture();
+        }
+
+        /**
+         * Kicks off work for the donorAbortMigration command.
+         */
+        void onReceiveDonorAbortMigration();
+
+        /**
+         * Kicks off the work for the donorForgetMigration command.
+         */
         void onReceiveDonorForgetMigration();
+
+        StringData getTenantId() const {
+            return _stateDoc.getTenantId();
+        }
+
+        StringData getRecipientConnectionString() const {
+            return _stateDoc.getRecipientConnectionString();
+        }
 
     private:
         const NamespaceString _stateDocumentsNS = NamespaceString::kTenantMigrationDonorsNamespace;
@@ -151,28 +184,38 @@ public:
         ExecutorFuture<void> _sendCommandToRecipient(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
             std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
-            const BSONObj& cmdObj,
-            const CancelationToken& token);
+            const BSONObj& cmdObj);
 
         /**
          * Sends the recipientSyncData command to the recipient replica set.
          */
         ExecutorFuture<void> _sendRecipientSyncDataCommand(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
-            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
-            const CancelationToken& token);
+            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS);
 
         /**
          * Sends the recipientForgetMigration command to the recipient replica set.
          */
         ExecutorFuture<void> _sendRecipientForgetMigrationCommand(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
-            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
-            const CancelationToken& token);
+            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS);
 
         ServiceContext* _serviceContext;
 
         TenantMigrationDonorDocument _stateDoc;
+        const std::string _instanceName;
+        const MongoURI _recipientUri;
+
+        // Task executor used for executing commands against the recipient using SSL connection
+        // created using the migration-specific certificate.
+        std::shared_ptr<executor::TaskExecutor> _recipientCmdExecutor;
+
+        ThreadPool::Limits getRecipientCmdThreadPoolLimits() const {
+            ThreadPool::Limits recipientCmdThreadPoolLimits;
+            recipientCmdThreadPoolLimits.maxThreads = 1;
+            return recipientCmdThreadPoolLimits;
+        }
+
         boost::optional<Status> _abortReason;
 
         // Protects the durable state and the promises below.
@@ -190,11 +233,19 @@ public:
 
         // Promise that is resolved when the chain of work kicked off by run() has completed.
         SharedPromise<void> _completionPromise;
+
+        // Promise that is resolved when the donor has majority-committed the write to commit or
+        // abort.
+        SharedPromise<void> _decisionPromise;
+
+        // This CancelationSource is instantiated from CancelationToken that is passed into run().
+        // It allows for manual cancelation of work from the instance.
+        CancelationSource _instanceCancelationSource;
     };
 
 private:
-    ExecutorFuture<void> _rebuildService(
-        std::shared_ptr<executor::ScopedTaskExecutor> executor) override;
+    ExecutorFuture<void> _rebuildService(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                         const CancelationToken& token) override;
 
     ServiceContext* _serviceContext;
 };

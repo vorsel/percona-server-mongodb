@@ -131,9 +131,14 @@ void EncryptionKeyDB::close_handles() {
     }
 }
 
+void EncryptionKeyDB::generate_secure_key(unsigned char* key) {
+    stdx::lock_guard<Latch> lk(_lock_key);
+    _srng->fill(key, _key_len);
+}
+
 // this function uses _srng without synchronization
 // caller must ensure it is safe
-void EncryptionKeyDB::generate_secure_key(char key[]) {
+void EncryptionKeyDB::generate_secure_key_inlock(char key[]) {
     _srng->fill(key, _key_len);
 }
 
@@ -169,7 +174,7 @@ void EncryptionKeyDB::init_masterkey() {
         if (_rotation) {
             // generate new key
             char newkey[_key_len];
-            generate_secure_key(newkey);
+            generate_secure_key_inlock(newkey);
             encoded_key = base64::encode(StringData{newkey, _key_len});
         } else {
             // read key from the Vault
@@ -183,7 +188,7 @@ void EncryptionKeyDB::init_masterkey() {
                 }
                 LOGV2(29036, "Master key is absent in the Vault. Generating and writing one.");
                 char newkey[_key_len];
-                generate_secure_key(newkey);
+                generate_secure_key_inlock(newkey);
                 encoded_key = base64::encode(StringData{newkey, _key_len});
                 vaultWriteKey(encoded_key);
             }
@@ -619,6 +624,11 @@ extern "C" int get_key_by_id(const char *keyid, size_t len, unsigned char *key, 
 extern "C" int rotation_get_key_by_id(const char *keyid, size_t len, unsigned char *key, void *pe) {
     invariant(rotationKeyDB);
     return rotationKeyDB->get_key_by_id(keyid, len, key, pe);
+}
+
+extern "C" void generate_secure_key(unsigned char* key) {
+    invariant(encryptionKeyDB);
+    encryptionKeyDB->generate_secure_key(key);
 }
 
 }  // namespace mongo

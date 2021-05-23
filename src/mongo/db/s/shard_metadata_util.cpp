@@ -134,7 +134,7 @@ StatusWith<RefreshState> getPersistedRefreshFlags(OperationContext* opCtx,
                         entry.getRefreshing() ? *entry.getRefreshing() : true,
                         entry.getLastRefreshedCollectionVersion()
                             ? *entry.getLastRefreshedCollectionVersion()
-                            : ChunkVersion(0, 0, entry.getEpoch())};
+                            : ChunkVersion(0, 0, entry.getEpoch(), entry.getTimestamp())};
 }
 
 StatusWith<ShardCollectionType> readShardCollectionsEntry(OperationContext* opCtx,
@@ -292,7 +292,8 @@ StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
                                                    const BSONObj& query,
                                                    const BSONObj& sort,
                                                    boost::optional<long long> limit,
-                                                   const OID& epoch) {
+                                                   const OID& epoch,
+                                                   const boost::optional<Timestamp>& timestamp) {
     try {
         Query fullQuery(query);
         fullQuery.sort(sort);
@@ -311,7 +312,7 @@ StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
         std::vector<ChunkType> chunks;
         while (cursor->more()) {
             BSONObj document = cursor->nextSafe().getOwned();
-            auto statusWithChunk = ChunkType::fromShardBSON(document, epoch);
+            auto statusWithChunk = ChunkType::fromShardBSON(document, epoch, timestamp);
             if (!statusWithChunk.isOK()) {
                 return statusWithChunk.getStatus().withContext(
                     str::stream() << "Failed to parse chunk '" << document.toString() << "'");
@@ -486,13 +487,41 @@ Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName) {
     }
 }
 
+void downgradeShardConfigDatabasesEntriesToPre49(OperationContext* opCtx) {
+    LOGV2(5258804, "Starting downgrade of config.cache.databases");
+    if (feature_flags::gShardingFullDDLSupportTimestampedVersion.isEnabledAndIgnoreFCV()) {
+        write_ops::Update clearFields(NamespaceString::kShardConfigDatabasesNamespace, [] {
+            write_ops::UpdateOpEntry u;
+            u.setQ({});
+            u.setU(write_ops::UpdateModification::parseFromClassicUpdate(
+                BSON("$unset" << BSON(
+                         ShardDatabaseType::version() + "." + DatabaseVersion::kTimestampFieldName
+                         << ""))));
+            u.setMulti(true);
+            return std::vector{u};
+        }());
+
+        clearFields.setWriteCommandBase([] {
+            write_ops::WriteCommandBase base;
+            base.setOrdered(false);
+            return base;
+        }());
+
+        DBDirectClient client(opCtx);
+        const auto commandResult = client.runCommand(clearFields.serialize({}));
+
+        uassertStatusOK(getStatusFromWriteCommandResponse(commandResult->getCommandReply()));
+        LOGV2(5258805, "Successfully downgraded config.cache.databases");
+    }
+}
+
 void downgradeShardConfigCollectionEntriesToPre49(OperationContext* opCtx) {
     // Clear the 'allowMigrations' and 'timestamp' fields from config.cache.collections
     LOGV2(5189100, "Starting downgrade of config.cache.collections");
     write_ops::Update clearFields(NamespaceString::kShardConfigCollectionsNamespace, [] {
         BSONObj unsetFields =
             BSON(ShardCollectionType::kPre50CompatibleAllowMigrationsFieldName << "");
-        if (feature_flags::gShardingFullDDLSupport.isEnabledAndIgnoreFCV()) {
+        if (feature_flags::gShardingFullDDLSupportTimestampedVersion.isEnabledAndIgnoreFCV()) {
             unsetFields = unsetFields.addFields(BSON(CollectionType::kTimestampFieldName << ""));
         }
 

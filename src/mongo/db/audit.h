@@ -62,7 +62,7 @@ namespace audit {
 class CommandInterface {
 public:
     virtual ~CommandInterface() = default;
-    virtual StringData sensitiveFieldName() const = 0;
+    virtual std::set<StringData> sensitiveFieldNames() const = 0;
     virtual void snipForLogging(mutablebson::Document* cmdObj) const = 0;
     virtual StringData getName() const = 0;
     virtual NamespaceString ns() const = 0;
@@ -252,9 +252,22 @@ void logReplSetReconfig(Client* client, const BSONObj* oldConfig, const BSONObj*
 void logApplicationMessage(Client* client, StringData msg);
 
 /**
+ * Logs the options associated with a startup event.
+ */
+void logStartupOptions(Client* client, const BSONObj& startupOptions);
+
+/**
  * Logs the result of a shutdown command.
  */
 void logShutdown(Client* client);
+
+/**
+ * Logs the users authenticated to a session before and after a logout command.
+ */
+void logLogout(Client* client,
+               StringData reason,
+               const BSONArray& initialUsers,
+               const BSONArray& updatedUsers);
 
 /**
  * Logs the result of a createIndex command.

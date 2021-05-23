@@ -9,6 +9,9 @@
 
 #include "wt_internal.h"
 
+static int __curhs_prev_visible(WT_SESSION_IMPL *, WT_CURSOR_HS *);
+static int __curhs_next_visible(WT_SESSION_IMPL *, WT_CURSOR_HS *);
+
 /*
  * __hs_cursor_open_int --
  *     Open a new history store table cursor, internal function.
@@ -143,6 +146,68 @@ __wt_hs_cursor_search_near(WT_SESSION_IMPL *session, WT_CURSOR *cursor, int *exa
 }
 
 /*
+ * __curhs_next --
+ *     WT_CURSOR->next method for the hs cursor type.
+ */
+static int
+__curhs_next(WT_CURSOR *cursor)
+{
+    WT_CURSOR *file_cursor;
+    WT_CURSOR_HS *hs_cursor;
+    WT_DECL_RET;
+    WT_SESSION_IMPL *session;
+
+    hs_cursor = (WT_CURSOR_HS *)cursor;
+    file_cursor = hs_cursor->file_cursor;
+    CURSOR_API_CALL_PREPARE_ALLOWED(cursor, session, next, CUR2BT(file_cursor));
+
+    WT_ERR(__wt_hs_cursor_next(session, file_cursor));
+    /*
+     * We need to check if the history store record is visible to the current session. If not, the
+     * __curhs_next_visible() will also keep iterating forward through the records until it finds a
+     * visible record or bail out if records stop satisfying the fields set in cursor.
+     */
+    WT_ERR(__curhs_next_visible(session, hs_cursor));
+
+    if (0) {
+err:
+        WT_TRET(cursor->reset(cursor));
+    }
+    API_END_RET(session, ret);
+}
+
+/*
+ * __curhs_prev --
+ *     WT_CURSOR->prev method for the hs cursor type.
+ */
+static int
+__curhs_prev(WT_CURSOR *cursor)
+{
+    WT_CURSOR *file_cursor;
+    WT_CURSOR_HS *hs_cursor;
+    WT_DECL_RET;
+    WT_SESSION_IMPL *session;
+
+    hs_cursor = (WT_CURSOR_HS *)cursor;
+    file_cursor = hs_cursor->file_cursor;
+    CURSOR_API_CALL_PREPARE_ALLOWED(cursor, session, prev, CUR2BT(file_cursor));
+
+    WT_ERR(__wt_hs_cursor_prev(session, file_cursor));
+    /*
+     * We need to check if the history store record is visible to the current session. If not, the
+     * __curhs_prev_visible() will also keep iterating backwards through the records until it finds
+     * a visible record or bail out if records stop satisfying the fields set in cursor.
+     */
+    WT_ERR(__curhs_prev_visible(session, hs_cursor));
+
+    if (0) {
+err:
+        WT_TRET(cursor->reset(cursor));
+    }
+    API_END_RET(session, ret);
+}
+
+/*
  * __curhs_close --
  *     WT_CURSOR->close method for the hs cursor type.
  */
@@ -186,7 +251,6 @@ __curhs_reset(WT_CURSOR *cursor)
     CURSOR_API_CALL_PREPARE_ALLOWED(cursor, session, reset, CUR2BT(file_cursor));
 
     ret = file_cursor->reset(file_cursor);
-    F_CLR(cursor, WT_CURSTD_KEY_SET | WT_CURSTD_VALUE_SET);
     WT_TIME_WINDOW_INIT(&hs_cursor->time_window);
     hs_cursor->btree_id = 0;
     hs_cursor->datastore_key.data = NULL;
@@ -285,7 +349,7 @@ __curhs_prev_visible(WT_SESSION_IMPL *session, WT_CURSOR_HS *hs_cursor)
         /* Stop before crossing over to the next btree. */
         if (F_ISSET(hs_cursor, WT_HS_CUR_BTREE_ID_SET) && btree_id != hs_cursor->btree_id) {
             ret = WT_NOTFOUND;
-            goto done;
+            goto err;
         }
 
         /*
@@ -296,7 +360,7 @@ __curhs_prev_visible(WT_SESSION_IMPL *session, WT_CURSOR_HS *hs_cursor)
             WT_ERR(__wt_compare(session, NULL, datastore_key, &hs_cursor->datastore_key, &cmp));
             if (cmp != 0) {
                 ret = WT_NOTFOUND;
-                goto done;
+                goto err;
             }
         }
 
@@ -305,8 +369,7 @@ __curhs_prev_visible(WT_SESSION_IMPL *session, WT_CURSOR_HS *hs_cursor)
          * we can skip it.
          */
         if (__wt_txn_tw_stop_visible_all(session, &cbt->upd_value->tw)) {
-            WT_STAT_CONN_INCR(session, cursor_prev_hs_tombstone);
-            WT_STAT_DATA_INCR(session, cursor_prev_hs_tombstone);
+            WT_STAT_CONN_DATA_INCR(session, cursor_prev_hs_tombstone);
             continue;
         }
 
@@ -324,7 +387,7 @@ __curhs_prev_visible(WT_SESSION_IMPL *session, WT_CURSOR_HS *hs_cursor)
              */
             if (F_ISSET(hs_cursor, WT_HS_CUR_KEY_SET)) {
                 ret = WT_NOTFOUND;
-                goto done;
+                goto err;
             } else
                 continue;
         }
@@ -334,7 +397,6 @@ __curhs_prev_visible(WT_SESSION_IMPL *session, WT_CURSOR_HS *hs_cursor)
             break;
     }
 
-done:
 err:
     __wt_scr_free(session, &datastore_key);
     return (ret);
@@ -370,7 +432,7 @@ __curhs_next_visible(WT_SESSION_IMPL *session, WT_CURSOR_HS *hs_cursor)
         /* Stop before crossing over to the next btree. */
         if (F_ISSET(hs_cursor, WT_HS_CUR_BTREE_ID_SET) && btree_id != hs_cursor->btree_id) {
             ret = WT_NOTFOUND;
-            goto done;
+            goto err;
         }
 
         /*
@@ -381,7 +443,7 @@ __curhs_next_visible(WT_SESSION_IMPL *session, WT_CURSOR_HS *hs_cursor)
             WT_ERR(__wt_compare(session, NULL, datastore_key, &hs_cursor->datastore_key, &cmp));
             if (cmp != 0) {
                 ret = WT_NOTFOUND;
-                goto done;
+                goto err;
             }
         }
 
@@ -390,8 +452,7 @@ __curhs_next_visible(WT_SESSION_IMPL *session, WT_CURSOR_HS *hs_cursor)
          * we can skip it.
          */
         if (__wt_txn_tw_stop_visible_all(session, &cbt->upd_value->tw)) {
-            WT_STAT_CONN_INCR(session, cursor_next_hs_tombstone);
-            WT_STAT_DATA_INCR(session, cursor_next_hs_tombstone);
+            WT_STAT_CONN_DATA_INCR(session, cursor_next_hs_tombstone);
             continue;
         }
 
@@ -413,7 +474,6 @@ __curhs_next_visible(WT_SESSION_IMPL *session, WT_CURSOR_HS *hs_cursor)
             break;
     }
 
-done:
 err:
     __wt_scr_free(session, &datastore_key);
     return (ret);
@@ -445,11 +505,8 @@ __curhs_search_near(WT_CURSOR *cursor, int *exactp)
     /* At least we have the btree id set. */
     WT_ASSERT(session, F_ISSET(hs_cursor, WT_HS_CUR_BTREE_ID_SET));
     WT_ERR(__wt_buf_set(session, srch_key, file_cursor->key.data, file_cursor->key.size));
-    WT_ERR_NOTFOUND_OK(__wt_hs_cursor_search_near(session, file_cursor, &exact), true);
-
-    /* Empty history store is fine. */
-    if (ret == WT_NOTFOUND)
-        goto done;
+    /* Reset cursor if we get WT_NOTFOUND. */
+    WT_ERR(__wt_hs_cursor_search_near(session, file_cursor, &exact));
 
     /*
      * There are some key fields missing so we are searching a range of keys. Place the cursor at
@@ -470,10 +527,11 @@ __curhs_search_near(WT_CURSOR *cursor, int *exactp)
                 if (cmp >= 0)
                     break;
             }
-            /* No entries greater than or equal to the key we searched for. */
-            WT_ERR_NOTFOUND_OK(ret, true);
-            if (ret == WT_NOTFOUND)
-                goto done;
+            /*
+             * No entries greater than or equal to the key we searched for. Reset cursor if we get
+             * WT_NOTFOUND.
+             */
+            WT_ERR(ret);
 
             *exactp = cmp;
         } else
@@ -501,9 +559,8 @@ __curhs_search_near(WT_CURSOR *cursor, int *exactp)
              * be more than one record away the end of our target key/timestamp range. Keep
              * iterating backwards until we land on our key.
              */
-            while ((ret = file_cursor->prev(cursor)) == 0) {
-                WT_STAT_CONN_INCR(session, cursor_skip_hs_cur_position);
-                WT_STAT_DATA_INCR(session, cursor_skip_hs_cur_position);
+            while ((ret = __wt_hs_cursor_prev(session, file_cursor)) == 0) {
+                WT_STAT_CONN_DATA_INCR(session, cursor_skip_hs_cur_position);
 
                 WT_ERR(__wt_compare(session, NULL, &file_cursor->key, srch_key, &cmp));
                 if (cmp <= 0)
@@ -523,8 +580,11 @@ __curhs_search_near(WT_CURSOR *cursor, int *exactp)
         WT_ERR(__curhs_prev_visible(session, hs_cursor));
     }
 
-done:
+    if (0) {
 err:
+        WT_TRET(cursor->reset(cursor));
+    }
+
     __wt_scr_free(session, &srch_key);
     API_END_RET(session, ret);
 }
@@ -654,12 +714,13 @@ retry:
         goto retry;
     WT_ERR(ret);
 
+    /* Insert doesn't maintain a position across calls, clear resources. */
     if (0) {
 err:
         __wt_free(session, hs_tombstone);
         __wt_free(session, hs_upd);
     }
-
+    WT_TRET(cursor->reset(cursor));
     API_END_RET(session, ret);
 }
 
@@ -703,9 +764,13 @@ __curhs_remove(WT_CURSOR *cursor)
 
     WT_ERR(ret);
 
+    /* Invalidate the previous value but we will hold on to the position of the key. */
+    F_CLR(file_cursor, WT_CURSTD_VALUE_SET);
+
     if (0) {
 err:
         __wt_free(session, hs_tombstone);
+        WT_TRET(cursor->reset(cursor));
     }
 
     API_END_RET(session, ret);
@@ -725,6 +790,7 @@ __curhs_update(WT_CURSOR *cursor)
     WT_DECL_RET;
     WT_SESSION_IMPL *session;
     WT_UPDATE *hs_tombstone, *hs_upd;
+    bool retry;
 
     uint64_t hs_upd_type;
     wt_timestamp_t hs_durable_ts, hs_stop_durable_ts;
@@ -733,6 +799,7 @@ __curhs_update(WT_CURSOR *cursor)
     file_cursor = hs_cursor->file_cursor;
     cbt = (WT_CURSOR_BTREE *)file_cursor;
     hs_tombstone = hs_upd = NULL;
+    retry = false;
 
     CURSOR_API_CALL_PREPARE_ALLOWED(cursor, session, update, CUR2BT(file_cursor));
 
@@ -784,10 +851,17 @@ __curhs_update(WT_CURSOR *cursor)
     /* Connect the tombstone to the update. */
     hs_tombstone->next = hs_upd;
 
-    /* Insert the updates and if we fail, search and try again. */
+    /* Make the updates and if we fail, search and try again. */
     while ((ret = __wt_hs_modify(cbt, hs_tombstone)) == WT_RESTART) {
-        WT_WITH_PAGE_INDEX(session, ret = __wt_hs_row_search(cbt, &file_cursor->key, true));
+        WT_WITH_PAGE_INDEX(session, ret = __wt_hs_row_search(cbt, &file_cursor->key, false));
         WT_ERR(ret);
+        retry = true;
+    }
+
+    /* If we retry, search again to point to the updated value. */
+    if (retry) {
+        WT_WITH_PAGE_INDEX(session, ret = __wt_hs_row_search(cbt, &file_cursor->key, false));
+        WT_TRET(ret);
     }
 
     if (0) {
@@ -795,6 +869,7 @@ err:
         __wt_free(session, hs_tombstone);
         __wt_free(session, hs_upd);
         __wt_scr_free(session, &hs_value);
+        WT_TRET(cursor->reset(cursor));
     }
     API_END_RET(session, ret);
 }
@@ -812,8 +887,8 @@ __wt_curhs_open(WT_SESSION_IMPL *session, WT_CURSOR *owner, WT_CURSOR **cursorp)
       __curhs_set_value,                          /* set-value */
       __wt_cursor_compare_notsup,                 /* compare */
       __wt_cursor_equals_notsup,                  /* equals */
-      __wt_cursor_notsup,                         /* next */
-      __wt_cursor_notsup,                         /* prev */
+      __curhs_next,                               /* next */
+      __curhs_prev,                               /* prev */
       __curhs_reset,                              /* reset */
       __wt_cursor_notsup,                         /* search */
       __curhs_search_near,                        /* search-near */

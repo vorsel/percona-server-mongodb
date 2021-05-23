@@ -35,19 +35,19 @@
 
 #include "mongo/client/connection_string.h"
 #include "mongo/client/global_conn_pool.h"
-#include "mongo/client/remote_command_targeter.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client_metadata_propagation_egress_hook.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/chunk_splitter.h"
+#include "mongo/db/s/dist_lock_catalog_replset.h"
+#include "mongo/db/s/dist_lock_manager_replset.h"
 #include "mongo/db/s/periodic_balancer_config_refresher.h"
 #include "mongo/db/s/read_only_catalog_cache_loader.h"
 #include "mongo/db/s/shard_local.h"
@@ -55,6 +55,7 @@
 #include "mongo/db/s/sharding_config_optime_gossip.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/vector_clock_metadata_hook.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
@@ -64,7 +65,6 @@
 #include "mongo/s/client/sharding_connection_hook.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/sharding_initialization.h"
 
 namespace mongo {
 
@@ -77,7 +77,7 @@ const auto getInstance = ServiceContext::declareDecoration<ShardingInitializatio
 
 auto makeEgressHooksList(ServiceContext* service) {
     auto unshardedHookList = std::make_unique<rpc::EgressMetadataHookList>();
-    unshardedHookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(service));
+    unshardedHookList->addHook(std::make_unique<rpc::VectorClockMetadataHook>(service));
     unshardedHookList->addHook(std::make_unique<rpc::ClientMetadataPropagationEgressHook>());
     unshardedHookList->addHook(std::make_unique<rpc::ShardingEgressMetadataHookForMongod>(service));
 
@@ -258,42 +258,9 @@ private:
 
 }  // namespace
 
-void ShardingInitializationMongoD::initializeShardingEnvironmentOnShardServer(
-    OperationContext* opCtx, const ShardIdentity& shardIdentity, StringData distLockProcessId) {
-
-    _replicaSetChangeListener =
-        ReplicaSetMonitor::getNotifier().makeListener<ShardingReplicaSetChangeListener>(
-            opCtx->getServiceContext());
-
-    initializeGlobalShardingStateForMongoD(
-        opCtx, shardIdentity.getConfigsvrConnectionString(), distLockProcessId);
-
-
-    // Determine primary/secondary/standalone state in order to properly initialize sharding
-    // components.
-    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
-    bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
-    bool isStandaloneOrPrimary =
-        !isReplSet || (replCoord->getMemberState() == repl::MemberState::RS_PRIMARY);
-
-    CatalogCacheLoader::get(opCtx).initializeReplicaSetRole(isStandaloneOrPrimary);
-    ChunkSplitter::get(opCtx).onShardingInitialization(isStandaloneOrPrimary);
-    PeriodicBalancerConfigRefresher::get(opCtx).onShardingInitialization(opCtx->getServiceContext(),
-                                                                         isStandaloneOrPrimary);
-
-    // Start the transaction coordinator service only if the node is the primary of a replica set
-    TransactionCoordinatorService::get(opCtx)->onShardingInitialization(
-        opCtx, isReplSet && isStandaloneOrPrimary);
-
-    LOGV2(22071,
-          "Finished initializing sharding components for {memberState} node.",
-          "Finished initializing sharding components",
-          "memberState"_attr = (isStandaloneOrPrimary ? "primary" : "secondary"));
-}
-
 ShardingInitializationMongoD::ShardingInitializationMongoD()
     : _initFunc([this](auto... args) {
-          this->initializeShardingEnvironmentOnShardServer(std::forward<decltype(args)>(args)...);
+          _initializeShardingEnvironmentOnShardServer(std::forward<decltype(args)>(args)...);
       }) {}
 
 ShardingInitializationMongoD::~ShardingInitializationMongoD() = default;
@@ -308,13 +275,14 @@ ShardingInitializationMongoD* ShardingInitializationMongoD::get(ServiceContext* 
 
 void ShardingInitializationMongoD::shutDown(OperationContext* opCtx) {
     auto const shardingState = ShardingState::get(opCtx);
-    auto const grid = Grid::get(opCtx);
-
     if (!shardingState->enabled())
         return;
 
-    grid->catalogClient()->shutDown(opCtx);
+    DistLockManager::get(opCtx)->shutDown(opCtx);
+
+    auto const grid = Grid::get(opCtx);
     grid->shardRegistry()->shutdown();
+
     _replicaSetChangeListener.reset();
 }
 
@@ -460,12 +428,13 @@ void ShardingInitializationMongoD::initializeFromShardIdentity(
             !initializationStatus);
 
     try {
-        _initFunc(opCtx, shardIdentity, shardIdentity.getShardName().toString());
+        _initFunc(opCtx, shardIdentity);
         shardingState->setInitialized(shardIdentity.getShardName().toString(),
                                       shardIdentity.getClusterId());
     } catch (const DBException& ex) {
         shardingState->setInitialized(ex.toStatus());
     }
+
     Grid::get(opCtx)->setShardingInitialized();
 }
 
@@ -512,38 +481,35 @@ void ShardingInitializationMongoD::updateShardIdentityConfigString(
 }
 
 void initializeGlobalShardingStateForMongoD(OperationContext* opCtx,
-                                            const ConnectionString& configCS,
-                                            StringData distLockProcessId) {
+                                            const ShardId& shardId,
+                                            const ConnectionString& configCS) {
+    uassert(ErrorCodes::BadValue, "Unrecognized connection string.", configCS);
+
     auto targeterFactory = std::make_unique<RemoteCommandTargeterFactoryImpl>();
     auto targeterFactoryPtr = targeterFactory.get();
 
-    ShardFactory::BuilderCallable setBuilder = [targeterFactoryPtr](
-                                                   const ShardId& shardId,
-                                                   const ConnectionString& connStr) {
-        return std::make_unique<ShardRemote>(shardId, connStr, targeterFactoryPtr->create(connStr));
-    };
-
-    ShardFactory::BuilderCallable masterBuilder = [targeterFactoryPtr](
-                                                      const ShardId& shardId,
-                                                      const ConnectionString& connStr) {
-        return std::make_unique<ShardRemote>(shardId, connStr, targeterFactoryPtr->create(connStr));
-    };
-
-    ShardFactory::BuilderCallable localBuilder = [](const ShardId& shardId,
-                                                    const ConnectionString& connStr) {
-        return std::make_unique<ShardLocal>(shardId);
-    };
-
     ShardFactory::BuildersMap buildersMap{
-        {ConnectionString::ConnectionType::kReplicaSet, std::move(setBuilder)},
-        {ConnectionString::ConnectionType::kStandalone, std::move(masterBuilder)},
-        {ConnectionString::ConnectionType::kLocal, std::move(localBuilder)},
+        {ConnectionString::ConnectionType::kReplicaSet,
+         [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+             return std::make_unique<ShardRemote>(
+                 shardId, connStr, targeterFactoryPtr->create(connStr));
+         }},
+        {ConnectionString::ConnectionType::kLocal,
+         [](const ShardId& shardId, const ConnectionString& connStr) {
+             return std::make_unique<ShardLocal>(shardId);
+         }},
+        {ConnectionString::ConnectionType::kStandalone,
+         [targeterFactoryPtr](const ShardId& shardId, const ConnectionString& connStr) {
+             return std::make_unique<ShardRemote>(
+                 shardId, connStr, targeterFactoryPtr->create(connStr));
+         }},
     };
 
     auto shardFactory =
         std::make_unique<ShardFactory>(std::move(buildersMap), std::move(targeterFactory));
 
     auto const service = opCtx->getServiceContext();
+
     if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
         if (storageGlobalParams.readOnly) {
             CatalogCacheLoader::set(service, std::make_unique<ReadOnlyCatalogCacheLoader>());
@@ -552,8 +518,10 @@ void initializeGlobalShardingStateForMongoD(OperationContext* opCtx,
                                     std::make_unique<ShardServerCatalogCacheLoader>(
                                         std::make_unique<ConfigServerCatalogCacheLoader>()));
         }
-    } else {
+    } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         CatalogCacheLoader::set(service, std::make_unique<ConfigServerCatalogCacheLoader>());
+    } else {
+        MONGO_UNREACHABLE;
     }
 
     auto validator = LogicalTimeValidator::get(service);
@@ -575,14 +543,11 @@ void initializeGlobalShardingStateForMongoD(OperationContext* opCtx,
             catCache->invalidateEntriesThatReferenceShard(removedShard);
         }};
 
-    uassert(ErrorCodes::BadValue, "Unrecognized connection string.", configCS);
-
     auto shardRegistry = std::make_unique<ShardRegistry>(
         std::move(shardFactory), configCS, std::move(shardRemovalHooks));
 
     uassertStatusOK(
         initializeGlobalShardingState(opCtx,
-                                      distLockProcessId,
                                       std::move(catalogCache),
                                       std::move(shardRegistry),
                                       [service] { return makeEgressHooksList(service); },
@@ -590,11 +555,53 @@ void initializeGlobalShardingStateForMongoD(OperationContext* opCtx,
                                       // executors aren't used for user queries in mongod.
                                       1));
 
+    DistLockManager::create(
+        service,
+        std::make_unique<ReplSetDistLockManager>(service,
+                                                 shardId,
+                                                 std::make_unique<DistLockCatalogImpl>(),
+                                                 ReplSetDistLockManager::kDistLockPingInterval,
+                                                 ReplSetDistLockManager::kDistLockExpirationTime));
+    DistLockManager::get(opCtx)->startUp();
+
     auto const replCoord = repl::ReplicationCoordinator::get(service);
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
         replCoord->getMemberState().primary()) {
         LogicalTimeValidator::get(opCtx)->enableKeyGenerator(opCtx, true);
     }
+}
+
+void ShardingInitializationMongoD::_initializeShardingEnvironmentOnShardServer(
+    OperationContext* opCtx, const ShardIdentity& shardIdentity) {
+
+    _replicaSetChangeListener =
+        ReplicaSetMonitor::getNotifier().makeListener<ShardingReplicaSetChangeListener>(
+            opCtx->getServiceContext());
+
+    initializeGlobalShardingStateForMongoD(opCtx,
+                                           shardIdentity.getShardName().toString(),
+                                           shardIdentity.getConfigsvrConnectionString());
+
+    // Determine primary/secondary/standalone state in order to properly initialize sharding
+    // components.
+    const auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+    bool isReplSet = replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
+    bool isStandaloneOrPrimary =
+        !isReplSet || (replCoord->getMemberState() == repl::MemberState::RS_PRIMARY);
+
+    CatalogCacheLoader::get(opCtx).initializeReplicaSetRole(isStandaloneOrPrimary);
+    ChunkSplitter::get(opCtx).onShardingInitialization(isStandaloneOrPrimary);
+    PeriodicBalancerConfigRefresher::get(opCtx).onShardingInitialization(opCtx->getServiceContext(),
+                                                                         isStandaloneOrPrimary);
+
+    // Start the transaction coordinator service only if the node is the primary of a replica set
+    TransactionCoordinatorService::get(opCtx)->onShardingInitialization(
+        opCtx, isReplSet && isStandaloneOrPrimary);
+
+    LOGV2(22071,
+          "Finished initializing sharding components for {memberState} node.",
+          "Finished initializing sharding components",
+          "memberState"_attr = (isStandaloneOrPrimary ? "primary" : "secondary"));
 }
 
 }  // namespace mongo

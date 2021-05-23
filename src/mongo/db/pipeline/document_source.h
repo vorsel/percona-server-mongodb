@@ -61,18 +61,20 @@
 
 namespace mongo {
 
-class AggregationRequest;
 class Document;
 
 /**
  * Registers a DocumentSource to have the name 'key'.
  *
- * 'liteParser' takes an AggregationRequest and a BSONElement and returns a
+ * 'liteParser' takes an AggregateCommand and a BSONElement and returns a
  * LiteParsedDocumentSource. This is used for checks that need to happen before a full parse,
  * such as checks about which namespaces are referenced by this aggregation.
  *
- * 'fullParser' takes a BSONElement and an ExpressionContext and returns a fully-executable
- * DocumentSource. This will be used for optimization and execution.
+ * 'fullParser' is either a DocumentSource::SimpleParser or a DocumentSource::Parser.
+ * In both cases, it takes a BSONElement and an ExpressionContext and returns fully-executable
+ * DocumentSource(s), for optimization and execution. In the common case it's a SimpleParser,
+ * which returns a single DocumentSource; in the general case it's a Parser, which returns a whole
+ * std::list to support "multi-stage aliases" like $bucket.
  *
  * Stages that do not require any special pre-parse checks can use
  * LiteParsedDocumentSourceDefault::parse as their 'liteParser'.
@@ -83,58 +85,54 @@ class Document;
  * REGISTER_DOCUMENT_SOURCE(foo,
  *                          LiteParsedDocumentSourceDefault::parse,
  *                          DocumentSourceFoo::createFromBson);
- *
- * If your stage is actually an alias which needs to return more than one stage (such as
- * $sortByCount), you should use the REGISTER_MULTI_STAGE_ALIAS macro instead.
  */
-#define REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key, liteParser, fullParser, minVersion, ...) \
-    MONGO_INITIALIZER(addToDocSourceParserMap_##key)(InitializerContext*) {                  \
-        if (!__VA_ARGS__) {                                                                  \
-            return Status::OK();                                                             \
-        }                                                                                    \
-        auto fullParserWrapper = [](BSONElement stageSpec,                                   \
-                                    const boost::intrusive_ptr<ExpressionContext>& expCtx) { \
-            return std::list<boost::intrusive_ptr<DocumentSource>>{                          \
-                (fullParser)(stageSpec, expCtx)};                                            \
-        };                                                                                   \
-        LiteParsedDocumentSource::registerParser("$" #key, liteParser);                      \
-        DocumentSource::registerParser("$" #key, fullParserWrapper, minVersion);             \
-        return Status::OK();                                                                 \
-    }
-
 #define REGISTER_DOCUMENT_SOURCE(key, liteParser, fullParser) \
     REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key, liteParser, fullParser, boost::none, true)
 
-#define REGISTER_TEST_DOCUMENT_SOURCE(key, liteParser, fullParser) \
-    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                        \
-        key, liteParser, fullParser, boost::none, ::mongo::getTestCommandsEnabled())
-
+/**
+ * Like REGISTER_DOCUMENT_SOURCE, except the parser will only be enabled when FCV >= minVersion.
+ * We store minVersion in the parserMap, so that changing FCV at runtime correctly enables/disables
+ * the parser.
+ */
 #define REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(key, liteParser, fullParser, minVersion) \
     REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key, liteParser, fullParser, minVersion, true)
 
 /**
- * Registers a multi-stage alias (such as $sortByCount) to have the single name 'key'. When a stage
- * with name '$key' is found, 'liteParser' will be used to produce a LiteParsedDocumentSource,
- * while 'fullParser' will be called to construct a vector of DocumentSources. See the comments on
- * REGISTER_DOCUMENT_SOURCE for more information.
+ * Like REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION, except you can also specify a condition,
+ * evaluated during startup, that decides whether to register the parser.
  *
- * As an example, if your stage alias looks like {$foo: <args>} and does *not* require any special
- * pre-parse checks, you should implement a static parser like DocumentSourceFoo::createFromBson(),
- * and register it like so:
- * REGISTER_MULTI_STAGE_ALIAS(foo,
- *                            LiteParsedDocumentSourceDefault::parse,
- *                            DocumentSourceFoo::createFromBson);
+ * For example, you could check a feature flag, and register the parser only when it's enabled.
+ *
+ * Note that the condition is evaluated only once, during a MONGO_INITIALIZER. Don't specify
+ * a condition that can change at runtime, such as FCV. (Feature flags are ok, because they
+ * cannot be toggled at runtime.)
+ *
+ * This is the most general REGISTER_DOCUMENT_SOURCE* macro, which all others should delegate to.
  */
-#define REGISTER_MULTI_STAGE_ALIAS(key, liteParser, fullParser)                  \
-    MONGO_INITIALIZER(addAliasToDocSourceParserMap_##key)(InitializerContext*) { \
-        LiteParsedDocumentSource::registerParser("$" #key, (liteParser));        \
-        DocumentSource::registerParser("$" #key, (fullParser), boost::none);     \
-        return Status::OK();                                                     \
+#define REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key, liteParser, fullParser, minVersion, ...) \
+    MONGO_INITIALIZER(addToDocSourceParserMap_##key)(InitializerContext*) {                  \
+        if (!__VA_ARGS__) {                                                                  \
+            return;                                                                          \
+        }                                                                                    \
+        LiteParsedDocumentSource::registerParser("$" #key, liteParser);                      \
+        DocumentSource::registerParser("$" #key, fullParser, minVersion);                    \
     }
+
+/**
+ * Like REGISTER_DOCUMENT_SOURCE, except the parser is only enabled when test-commands are enabled.
+ */
+#define REGISTER_TEST_DOCUMENT_SOURCE(key, liteParser, fullParser) \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                        \
+        key, liteParser, fullParser, boost::none, ::mongo::getTestCommandsEnabled())
 
 class DocumentSource : public RefCountable {
 public:
+    // In general a parser returns a list of DocumentSources, to accomodate "multi-stage aliases"
+    // like $bucket.
     using Parser = std::function<std::list<boost::intrusive_ptr<DocumentSource>>(
+        BSONElement, const boost::intrusive_ptr<ExpressionContext>&)>;
+    // But in the common case a parser returns only one DocumentSource.
+    using SimpleParser = std::function<boost::intrusive_ptr<DocumentSource>(
         BSONElement, const boost::intrusive_ptr<ExpressionContext>&)>;
 
     using ChangeStreamRequirement = StageConstraints::ChangeStreamRequirement;
@@ -305,6 +303,14 @@ public:
     }
 
     /**
+     * Get the stats specific to the DocumentSource. It is legal for the DocumentSource to return
+     * nullptr to indicate that no specific stats are available.
+     */
+    virtual const SpecificStats* getSpecificStats() const {
+        return nullptr;
+    }
+
+    /**
      * Get the stage's name.
      */
     virtual const char* getSourceName() const;
@@ -361,6 +367,17 @@ public:
     static void registerParser(
         std::string name,
         Parser parser,
+        boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion);
+    /**
+     * Convenience wrapper for the common case, when DocumentSource::Parser returns a list of one
+     * DocumentSource.
+     *
+     * DO NOT call this method directly. Instead, use the REGISTER_DOCUMENT_SOURCE macro defined in
+     * this file.
+     */
+    static void registerParser(
+        std::string name,
+        SimpleParser simpleParser,
         boost::optional<ServerGlobalParams::FeatureCompatibility::Version> requiredMinVersion);
 
     /**

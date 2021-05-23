@@ -70,7 +70,7 @@ void _createSystemDotViewsIfNecessary(OperationContext* opCtx, const Database* d
 Status _createView(OperationContext* opCtx,
                    const NamespaceString& nss,
                    CollectionOptions&& collectionOptions,
-                   const BSONObj& idIndex) {
+                   boost::optional<BSONObj> idIndex) {
     return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
         AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
@@ -107,7 +107,13 @@ Status _createView(OperationContext* opCtx,
 
         // Even though 'collectionOptions' is passed by rvalue reference, it is not safe to move
         // because 'userCreateNS' may throw a WriteConflictException.
-        Status status = db->userCreateNS(opCtx, nss, collectionOptions, true, idIndex);
+        Status status = Status::OK();
+        if (idIndex == boost::none) {
+            status = db->userCreateNS(opCtx, nss, collectionOptions, /*createIdIndex=*/false);
+        } else {
+            status =
+                db->userCreateNS(opCtx, nss, collectionOptions, /*createIdIndex=*/true, *idIndex);
+        }
         if (!status.isOK()) {
             return status;
         }
@@ -124,39 +130,17 @@ Status _createTimeseries(OperationContext* opCtx,
 
     options.viewOn = bucketsNs.coll().toString();
 
-    // The time field cannot be sparse, so we use it as the exit condition for the loop.
-    auto assembleData =
-        "function(dataArray) { \
-                const assembledData = []; \
-                if (dataArray.length === 0) { \
-                    return assembledData; \
-                } \
-                for (let i = 0;;i++) { \
-                    const assembledObj = {}; \
-                    for (const elem of dataArray) { \
-                        if (elem.v.hasOwnProperty(i)) { \
-                            assembledObj[elem.k] = elem.v[i]; \
-                        } else if (elem.k === '" +
-        options.timeseries->getTimeField() +
-        "') { \
-                            return assembledData; \
-                        } \
-                    } \
-                    assembledData.push(assembledObj); \
-                } \
-            }";
-    options.pipeline =
-        BSON_ARRAY(BSON("$project" << BSON("dataArray" << BSON("$objectToArray"
-                                                               << "$data")))
-                   << BSON("$project" << BSON(
-                               "assembledData" << BSON(
-                                   "$function" << BSON("body" << assembleData << "args"
-                                                              << BSON_ARRAY("$dataArray") << "lang"
-                                                              << "js"))))
-                   << BSON("$unwind"
-                           << "$assembledData")
-                   << BSON("$replaceWith"
-                           << "$assembledData"));
+    if (options.timeseries->getMetaField()) {
+        options.pipeline =
+            BSON_ARRAY(BSON("$_internalUnpackBucket"
+                            << BSON("timeField" << options.timeseries->getTimeField() << "metaField"
+                                                << *options.timeseries->getMetaField() << "exclude"
+                                                << BSONArray())));
+    } else {
+        options.pipeline = BSON_ARRAY(
+            BSON("$_internalUnpackBucket" << BSON("timeField" << options.timeseries->getTimeField()
+                                                              << "exclude" << BSONArray())));
+    }
 
     return writeConflictRetry(opCtx, "create", ns.ns(), [&]() -> Status {
         AutoGetCollection autoColl(opCtx, ns, MODE_IX, AutoGetCollectionViewMode::kViewsPermitted);
@@ -253,8 +237,11 @@ Status _createTimeseries(OperationContext* opCtx,
                                                          timeField,
                                                          timeField));
 
-        // Create the buckets collection that will back the view.
-        auto bucketsCollection = db->createCollection(opCtx, bucketsNs, bucketsOptions);
+        // Create the buckets collection that will back the view. Do not create the _id index as the
+        // buckets collection will have a clustered index on _id.
+        const bool createIdIndex = false;
+        auto bucketsCollection =
+            db->createCollection(opCtx, bucketsNs, bucketsOptions, createIdIndex);
         invariant(bucketsCollection,
                   str::stream() << "Failed to create buckets collection " << bucketsNs
                                 << " for time-series collection " << ns);
@@ -301,7 +288,7 @@ Status _createTimeseries(OperationContext* opCtx,
 Status _createCollection(OperationContext* opCtx,
                          const NamespaceString& nss,
                          CollectionOptions&& collectionOptions,
-                         const BSONObj& idIndex) {
+                         boost::optional<BSONObj> idIndex) {
     return writeConflictRetry(opCtx, "create", nss.ns(), [&] {
         AutoGetOrCreateDb autoDb(opCtx, nss.db(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, nss, MODE_IX);
@@ -340,7 +327,14 @@ Status _createCollection(OperationContext* opCtx,
 
         // Even though 'collectionOptions' is passed by rvalue reference, it is not safe to move
         // because 'userCreateNS' may throw a WriteConflictException.
-        Status status = autoDb.getDb()->userCreateNS(opCtx, nss, collectionOptions, true, idIndex);
+        Status status = Status::OK();
+        if (idIndex == boost::none) {
+            status = autoDb.getDb()->userCreateNS(
+                opCtx, nss, collectionOptions, /*createIdIndex=*/false);
+        } else {
+            status = autoDb.getDb()->userCreateNS(
+                opCtx, nss, collectionOptions, /*createIdIndex=*/true, *idIndex);
+        }
         if (!status.isOK()) {
             return status;
         }
@@ -356,7 +350,7 @@ Status _createCollection(OperationContext* opCtx,
 Status createCollection(OperationContext* opCtx,
                         const NamespaceString& ns,
                         CollectionOptions&& options,
-                        const BSONObj& idIndex) {
+                        boost::optional<BSONObj> idIndex) {
     auto status = userAllowedCreateNS(ns);
     if (!status.isOK()) {
         return status;
@@ -390,7 +384,7 @@ Status createCollection(OperationContext* opCtx,
 Status createCollection(OperationContext* opCtx,
                         const NamespaceString& nss,
                         const BSONObj& cmdObj,
-                        const BSONObj& idIndex,
+                        boost::optional<BSONObj> idIndex,
                         CollectionOptions::ParseKind kind) {
     BSONObjIterator it(cmdObj);
 
@@ -443,7 +437,7 @@ Status createCollection(OperationContext* opCtx,
 Status createCollection(OperationContext* opCtx,
                         const NamespaceString& ns,
                         const CreateCommand& cmd) {
-    auto options = CollectionOptions::parse(cmd);
+    auto options = CollectionOptions::fromCreateCommand(cmd);
     auto idIndex = std::exchange(options.idIndex, {});
     return createCollection(opCtx, ns, std::move(options), idIndex);
 }
@@ -603,6 +597,16 @@ Status createCollectionForApplyOps(OperationContext* opCtx,
         newCmd = cmdObj.addField(uuidObj.firstElement());
     }
 
+    // Secondaries replicate two create oplog entries for new time-series collections, a view and
+    // the underlying buckets collection. The underlying buckets collection must not create an _id
+    // index as it has a clustered index on _id.
+    if (newCollName.isTimeseriesBucketsCollection()) {
+        return createCollection(opCtx,
+                                newCollName,
+                                newCmd,
+                                /*idIndex=*/boost::none,
+                                CollectionOptions::parseForStorage);
+    }
     return createCollection(
         opCtx, newCollName, newCmd, idIndex, CollectionOptions::parseForStorage);
 }

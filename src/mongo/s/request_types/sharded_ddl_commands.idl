@@ -35,6 +35,7 @@ imports:
     - "mongo/idl/basic_types.idl"
     - "mongo/s/database_version.idl"
     - "mongo/s/chunk_version.idl"
+    - "mongo/db/keypattern.idl"
 
 structs:
     RenameCollectionResponse:
@@ -46,11 +47,58 @@ structs:
                 description: "Latest version of the collection"
                 optional: false
 
+    CreateCollectionResponse:
+        description: "Response of the create collection command"
+        strict: false
+        fields:
+            collectionUUID:
+                type: uuid
+                description: "UUID of the created collection"
+                optional: true
+            collectionVersion:
+                type: ChunkVersion
+                description: "Latest version of the collection"
+                optional: false
+
 commands:
+    _shardsvrCreateCollection:
+        command_name: _shardsvrCreateCollection
+        cpp_name: ShardsvrCreateCollection
+        description: "The internal createCollection command for a shard."
+        strict: false
+        namespace: concatenate_with_db
+        api_version: ""
+        fields:
+            shardKey:
+                type: object
+                description: "The index specification document to use as the shard key."
+                optional: true
+            unique:
+                type: bool
+                description: "Whether the shard key index should enforce a unique constraint"
+                optional: true
+            numInitialChunks:
+                type: safeInt64
+                description: "The number of chunks to create initially when sharding an empty collection with a hashed shard key."
+                optional: true
+            presplitHashedZones:
+                type: bool
+                description: "True if the chunks should be pre-split based on the existing zones when sharding a collection with hashed shard key"
+                optional: true
+            initialSplitPoints:
+                type: array<object>
+                description: "A specific set of points to create initial splits at, currently used only by mapReduce"
+                optional: true
+            collation:
+                type: object
+                description: "The collation to use for the shard key index."
+                optional: true
+
     _shardsvrDropDatabase:
         description: "Parser for the shardDropDatabase command"
         command_name: _shardsvrDropDatabase
         namespace: type
+        api_version: ""
         type: safeInt64
         cpp_name: ShardsvrDropDatabase
         reply_type: DropDatabaseReply
@@ -59,9 +107,17 @@ commands:
         description: "Parser for the _shardsvrDropCollection command"
         command_name: _shardsvrDropCollection
         namespace: concatenate_with_db
+        api_version: ""
         cpp_name: ShardsvrDropCollection
-        strict: true
-        reply_type: DropDatabaseReply
+        strict: false
+
+    _shardsvrDropCollectionParticipant:
+        description: "Parser for the _shardsvrDropCollectionParticipant command"
+        command_name: _shardsvrDropCollectionParticipant
+        namespace: concatenate_with_db
+        api_version: ""
+        cpp_name: ShardsvrDropCollectionParticipant
+        strict: false
 
     _shardsvrRenameCollection:
         command_name: _shardsvrRenameCollection
@@ -69,6 +125,7 @@ commands:
         description: "Internal renameCollection command for a shard."
         strict: false
         namespace: concatenate_with_db
+        api_version: ""
         fields:
             to:
                 type: namespacestring
@@ -83,3 +140,15 @@ commands:
                 description: "If true, the original collection will remain temp if it was temp
                 before the rename."
                 default: false
+
+    _shardsvrRefineCollectionShardKey:
+        description: "Parser for the _shardsvrRefineCollectionShardKey command"
+        command_name: _shardsvrRefineCollectionShardKey
+        namespace: concatenate_with_db
+        api_version: ""
+        fields:
+            newShardKey:
+                type: KeyPattern
+                description: "The index specification document to use as the new shard key."
+                optional: false
+        cpp_name: ShardsvrRefineCollectionShardKey

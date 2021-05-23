@@ -34,7 +34,6 @@
 #include "mongo/base/status_with.h"
 #include "mongo/db/storage/index_entry_comparison.h"
 #include "mongo/db/storage/key_string.h"
-#include "mongo/db/storage/kv/kv_prefix.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_prepare_conflict.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
@@ -77,8 +76,7 @@ public:
                                                         const std::string& sysIndexConfig,
                                                         const std::string& collIndexConfig,
                                                         const NamespaceString& collectionNamespace,
-                                                        const IndexDescriptor& desc,
-                                                        bool isPrefixed);
+                                                        const IndexDescriptor& desc);
 
     /**
      * Creates a WiredTiger table suitable for implementing a MongoDB index.
@@ -95,7 +93,6 @@ public:
                     const std::string& uri,
                     StringData ident,
                     const IndexDescriptor* desc,
-                    KVPrefix prefix,
                     bool readOnly);
 
     virtual Status insert(OperationContext* opCtx,
@@ -130,8 +127,6 @@ public:
 
     // WiredTigerIndex additions
 
-    virtual bool isDup(OperationContext* opCtx, WT_CURSOR* c, const KeyString::Value& keyString);
-
     uint64_t tableId() const {
         return _tableId;
     }
@@ -146,10 +141,13 @@ public:
         return _keyPattern;
     }
 
-    bool isIdIndex() const {
-        return _isIdIndex;
+    virtual bool isIdIndex() const {
+        return false;
     }
 
+    virtual bool isDup(OperationContext* opCtx,
+                       WT_CURSOR* c,
+                       const KeyString::Value& keyString) = 0;
     virtual bool unique() const = 0;
     virtual bool isTimestampSafeUniqueIdx() const = 0;
 
@@ -177,6 +175,7 @@ protected:
                                           bool isReadOnly);
 
     class BulkBuilder;
+    class IdBulkBuilder;
     class StandardBulkBuilder;
     class UniqueBulkBuilder;
 
@@ -191,8 +190,6 @@ protected:
     const std::string _indexName;
     const BSONObj _keyPattern;
     const BSONObj _collation;
-    KVPrefix _prefix;
-    bool _isIdIndex;
 };
 
 class WiredTigerIndexUnique : public WiredTigerIndex {
@@ -201,13 +198,13 @@ public:
                           const std::string& uri,
                           StringData ident,
                           const IndexDescriptor* desc,
-                          KVPrefix prefix,
                           bool readOnly = false);
 
     std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx,
                                                            bool forward) const override;
 
-    SortedDataBuilderInterface* getBulkBuilder(OperationContext* opCtx, bool dupsAllowed) override;
+    std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx,
+                                                                bool dupsAllowed) override;
 
     bool unique() const override {
         return true;
@@ -217,35 +214,16 @@ public:
 
     bool isDup(OperationContext* opCtx, WT_CURSOR* c, const KeyString::Value& keyString) override;
 
+protected:
     Status _insert(OperationContext* opCtx,
                    WT_CURSOR* c,
                    const KeyString::Value& keyString,
                    bool dupsAllowed) override;
 
-    Status _insertTimestampUnsafe(OperationContext* opCtx,
-                                  WT_CURSOR* c,
-                                  const KeyString::Value& keyString,
-                                  bool dupsAllowed);
-
-    Status _insertTimestampSafe(OperationContext* opCtx,
-                                WT_CURSOR* c,
-                                const KeyString::Value& keyString,
-                                bool dupsAllowed);
-
     void _unindex(OperationContext* opCtx,
                   WT_CURSOR* c,
                   const KeyString::Value& keyString,
                   bool dupsAllowed) override;
-
-    void _unindexTimestampUnsafe(OperationContext* opCtx,
-                                 WT_CURSOR* c,
-                                 const KeyString::Value& keyString,
-                                 bool dupsAllowed);
-
-    void _unindexTimestampSafe(OperationContext* opCtx,
-                               WT_CURSOR* c,
-                               const KeyString::Value& keyString,
-                               bool dupsAllowed);
 
 private:
     /**
@@ -256,19 +234,62 @@ private:
     bool _partial;
 };
 
+class WiredTigerIdIndex : public WiredTigerIndex {
+public:
+    WiredTigerIdIndex(OperationContext* ctx,
+                      const std::string& uri,
+                      StringData ident,
+                      const IndexDescriptor* desc,
+                      bool readOnly = false);
+
+    std::unique_ptr<Cursor> newCursor(OperationContext* opCtx,
+                                      bool isForward = true) const override;
+
+    std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx,
+                                                                bool dupsAllowed) override;
+
+    bool unique() const override {
+        return true;
+    }
+
+    bool isIdIndex() const override {
+        return true;
+    }
+
+    bool isTimestampSafeUniqueIdx() const override {
+        return false;
+    }
+
+    bool isDup(OperationContext* opCtx, WT_CURSOR* c, const KeyString::Value& keyString) override {
+        // Unimplemented by _id indexes for lack of need
+        MONGO_UNREACHABLE;
+    }
+
+protected:
+    Status _insert(OperationContext* opCtx,
+                   WT_CURSOR* c,
+                   const KeyString::Value& keyString,
+                   bool dupsAllowed) override;
+
+    void _unindex(OperationContext* opCtx,
+                  WT_CURSOR* c,
+                  const KeyString::Value& keyString,
+                  bool dupsAllowed) override;
+};
+
 class WiredTigerIndexStandard : public WiredTigerIndex {
 public:
     WiredTigerIndexStandard(OperationContext* ctx,
                             const std::string& uri,
                             StringData ident,
                             const IndexDescriptor* desc,
-                            KVPrefix prefix,
                             bool readOnly = false);
 
     std::unique_ptr<SortedDataInterface::Cursor> newCursor(OperationContext* opCtx,
                                                            bool forward) const override;
 
-    SortedDataBuilderInterface* getBulkBuilder(OperationContext* opCtx, bool dupsAllowed) override;
+    std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx,
+                                                                bool dupsAllowed) override;
 
     bool unique() const override {
         return false;
@@ -278,6 +299,12 @@ public:
         return false;
     }
 
+    bool isDup(OperationContext* opCtx, WT_CURSOR* c, const KeyString::Value& keyString) override {
+        // Unimplemented by non-unique indexes
+        MONGO_UNREACHABLE;
+    }
+
+protected:
     Status _insert(OperationContext* opCtx,
                    WT_CURSOR* c,
                    const KeyString::Value& keyString,

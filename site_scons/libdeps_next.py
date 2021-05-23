@@ -72,6 +72,7 @@ class Constants:
     LibdepsCached = "LIBDEPS_cached"
     LibdepsDependents = "LIBDEPS_DEPENDENTS"
     LibdepsGlobal = "LIBDEPS_GLOBAL"
+    LibdepsNoInherit = "LIBDEPS_NO_INHERIT"
     LibdepsInterface ="LIBDEPS_INTERFACE"
     LibdepsPrivate = "LIBDEPS_PRIVATE"
     LibdepsTypeinfo = "LIBDEPS_TYPEINFO"
@@ -580,8 +581,8 @@ class LibdepLinter:
 
                 target_type = self.target[0].builder.get_name(self.env)
                 self._raise_libdep_lint_exception(textwrap.dedent(f"""\
-                    Found non-list type '{libdeps_list}' while evaluating {dep_type_val} for {target_type} '{self.target[0]}'
-                    {dep_type_val} must be setup as a list."""
+                    Found non-list type '{libdeps_list}' while evaluating {dep_type_val[1]} for {target_type} '{self.target[0]}'
+                    {dep_type_val[1]} must be setup as a list."""
                 ))
 
 dependency_visibility_ignored = {
@@ -732,6 +733,8 @@ def update_scanner(env, builder_name=None, debug=False):
             print(f"    public: {env.get(Constants.Libdeps, None)}")
             print(f"    interface: {env.get(Constants.LibdepsInterface, None)}")
             print(f"    typeinfo: {env.get(Constants.LibdepsTypeinfo, None)}")
+            print(f"    no_inherit: {env.get(Constants.LibdepsNoInherit, None)}")
+
         if old_scanner:
             result = old_scanner.function(node, env, path)
         else:
@@ -879,14 +882,41 @@ def _get_node_with_ixes(env, node, node_builder_type):
 
 _get_node_with_ixes.node_type_ixes = dict()
 
+def add_node_from(env, node):
+    from buildscripts.libdeps.libdeps_graph_enums import NodeProps
+
+    env.GetLibdepsGraph().add_nodes_from([(
+        str(node.abspath),
+        {
+            NodeProps.bin_type.name: node.builder.get_name(env),
+            NodeProps.shim.name: getattr(node.attributes, "is_shim", False)
+        })])
+
+def add_edge_from(env, depender_node, dependent_node, visibility, direct):
+    from buildscripts.libdeps.libdeps_graph_enums import EdgeProps
+
+    env.GetLibdepsGraph().add_edges_from([(
+        dependent_node,
+        depender_node,
+        {
+            EdgeProps.direct.name: direct,
+            EdgeProps.visibility.name: int(visibility)
+        })])
 
 def add_libdeps_node(env, target, libdeps):
+
     if str(target).endswith(env["SHLIBSUFFIX"]):
-        t_str = _get_node_with_ixes(env, str(target.abspath), target.get_builder().get_name(env)).abspath
-        env.GetLibdepsGraph().add_node(t_str)
+        node = _get_node_with_ixes(env, str(target.abspath), target.get_builder().get_name(env))
+        add_node_from(env, node)
+
         for libdep in libdeps:
             if str(libdep.target_node).endswith(env["SHLIBSUFFIX"]):
-                env.GetLibdepsGraph().add_edge(str(libdep.target_node.abspath), t_str, visibility=libdep.dependency_type)
+                add_edge_from(
+                    env,
+                    str(node.abspath),
+                    str(libdep.target_node.abspath),
+                    visibility=libdep.dependency_type,
+                    direct=True)
 
 
 def get_libdeps_nodes(env, target, builder, debug=False, visibility_map=None):
@@ -896,10 +926,14 @@ def get_libdeps_nodes(env, target, builder, debug=False, visibility_map=None):
     if not SCons.Util.is_List(target):
         target = [target]
 
+    # Get the current list of nodes not to inherit on each target
+    no_inherit = set(env.get(Constants.LibdepsNoInherit, []))
+
     # Get all the libdeps from the env so we can
     # can append them to the current target_node.
     libdeps = []
     for dep_type in sorted(visibility_map.keys()):
+
         if dep_type == deptype.Global:
             if any("conftest" in str(t) for t in target):
                 # Ignore global dependencies for conftests
@@ -915,11 +949,17 @@ def get_libdeps_nodes(env, target, builder, debug=False, visibility_map=None):
             if not lib:
                 continue
 
-            if debug and not any("conftest" in str(t) for t in target):
-                print(f"     {dep_type} => {lib}")
-
             lib_with_ixes = _get_node_with_ixes(env, lib, builder)
-            libdeps.append(dependency(lib_with_ixes, dep_type, lib))
+
+            if lib in no_inherit:
+                if debug and not any("conftest" in str(t) for t in target):
+                    print(f"     {dep_type[1]} =/> {lib}")
+
+            else:
+                if debug and not any("conftest" in str(t) for t in target):
+                    print(f"     {dep_type[1]} => {lib}")
+
+                libdeps.append(dependency(lib_with_ixes, dep_type, lib))
 
     return libdeps
 
@@ -953,8 +993,11 @@ def libdeps_emitter(target, source, env, debug=False, builder=None, visibility_m
         print(f"    public: {env.get(Constants.Libdeps, None)}")
         print(f"    interface: {env.get(Constants.LibdepsInterface, None)}")
         print(f"    typeinfo: {env.get(Constants.LibdepsTypeinfo, None)}")
+        print(f"    no_inherit: {env.get(Constants.LibdepsNoInherit, None)}")
         print(f"  Edges:")
+
     libdeps = get_libdeps_nodes(env, target, builder, debug, visibility_map)
+
     if debug and not any("conftest" in str(t) for t in target):
         print(f"\n")
 
@@ -1077,29 +1120,36 @@ def expand_libdeps_with_flags(source, target, env, for_signature):
 def generate_libdeps_graph(env):
     if env.get('SYMBOLDEPSSUFFIX', None):
         import glob
-        from buildscripts.libdeps.graph_analyzer import EdgeProps
         find_symbols = env.Dir("$BUILD_DIR").path + "/libdeps/find_symbols"
+
+        env.GetLibdepsGraph().graph['invocation'] = " ".join([env['ESCAPE'](str(sys.executable))] + [env['ESCAPE'](arg) for arg in sys.argv])
+        env.GetLibdepsGraph().graph['git_hash'] = env['MONGO_GIT_HASH']
+        env.GetLibdepsGraph().graph['graph_schema_version'] = env['LIBDEPS_GRAPH_SCHEMA_VERSION']
+        env.GetLibdepsGraph().graph['build_dir'] = env.Dir('$BUILD_DIR').path
+
         symbol_deps = []
         for target, source in env.get('LIBDEPS_SYMBOL_DEP_FILES', []):
+
             direct_libdeps = []
             for direct_libdep in _get_sorted_direct_libdeps(source):
-                env.GetLibdepsGraph().add_edges_from([(
-                    str(direct_libdep.target_node.abspath),
+                add_node_from(env, direct_libdep.target_node)
+                add_edge_from(
+                    env,
                     str(source.abspath),
-                    {
-                        EdgeProps.direct.name: 1,
-                        EdgeProps.visibility.name: int(direct_libdep.dependency_type)
-                    })])
+                    str(direct_libdep.target_node.abspath),
+                    visibility=int(direct_libdep.dependency_type),
+                    direct=True)
                 direct_libdeps.append(direct_libdep.target_node.abspath)
+
             for libdep in _get_libdeps(source):
                 if libdep.abspath not in direct_libdeps:
-                    env.GetLibdepsGraph().add_edges_from([(
-                        str(libdep.abspath),
+                    add_node_from(env, libdep)
+                    add_edge_from(
+                        env,
                         str(source.abspath),
-                        {
-                            EdgeProps.direct.name: 0,
-                            EdgeProps.visibility.name: int(deptype.Public)
-                        })])
+                        str(libdep.abspath),
+                        visibility=int(deptype.Public),
+                        direct=False)
 
             ld_path = ":".join([os.path.dirname(str(libdep)) for libdep in _get_libdeps(source)])
             symbol_deps.append(env.Command(
@@ -1118,13 +1168,15 @@ def generate_libdeps_graph(env):
                 f.write(hashlib.sha256(json_str).hexdigest())
 
         graph_hash = env.Command(target="$BUILD_DIR/libdeps/graph_hash.sha256",
-                    source=symbol_deps + [
-                        env.File("#SConstruct")] +
-                        glob.glob("**/SConscript", recursive=True) +
-                        [os.path.abspath(__file__)],
+                    source=symbol_deps,
                     action=SCons.Action.FunctionAction(
                         write_graph_hash,
                         {"cmdstr": None}))
+        env.Depends(graph_hash, [
+                        env.File("#SConstruct")] +
+                        glob.glob("**/SConscript", recursive=True) +
+                        [os.path.abspath(__file__),
+                        env.File('$BUILD_DIR/mongo/util/version_constants.h')])
 
         graph_node = env.Command(
             target=env.get('LIBDEPS_GRAPH_FILE', None),
@@ -1192,6 +1244,7 @@ def generate_graph(env, target, source):
     import fileinput
     import networkx
     import json
+    from buildscripts.libdeps.libdeps_graph_enums import EdgeProps, NodeProps
 
     for symbol_deps_file in source:
         with open(str(symbol_deps_file)) as f:
@@ -1205,11 +1258,13 @@ def generate_graph(env, target, source):
                     symbols[lib].append(symbol)
 
             for lib in symbols:
+
                 env.GetLibdepsGraph().add_edges_from([(
                     os.path.abspath(lib).strip(),
                     os.path.abspath(str(symbol_deps_file)[:-len(env['SYMBOLDEPSSUFFIX'])]),
-                    {"symbols": " ".join(symbols[lib]) })])
-
+                    {EdgeProps.symbols.name: " ".join(symbols[lib]) })])
+                node = env.File(str(symbol_deps_file)[:-len(env['SYMBOLDEPSSUFFIX'])])
+                add_node_from(env, node)
 
     libdeps_graph_file = f"{env.Dir('$BUILD_DIR').path}/libdeps/libdeps.graphml"
     networkx.write_graphml(env.GetLibdepsGraph(), libdeps_graph_file, named_key_ids=True)
@@ -1311,6 +1366,7 @@ def setup_environment(env, emitting_shared=False, debug='off', linting='on', san
 
         env['LIBDEPS_SYMBOL_DEP_FILES'] = symbol_deps
         env['LIBDEPS_GRAPH_FILE'] = env.File("${BUILD_DIR}/libdeps/libdeps.graphml")
+        env['LIBDEPS_GRAPH_SCHEMA_VERSION'] = 1
         env["SYMBOLDEPSSUFFIX"] = '.symbol_deps'
 
         # Now we will setup an emitter, and an additional action for several

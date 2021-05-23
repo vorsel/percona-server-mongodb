@@ -31,25 +31,21 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/util/processinfo.h"
+
 #include <boost/none.hpp>
 #include <boost/optional.hpp>
 
-#include <iostream>
-#include <mach/mach_host.h>
 #include <mach/mach_init.h>
 #include <mach/mach_traps.h>
 #include <mach/task.h>
 #include <mach/task_info.h>
-#include <mach/vm_map.h>
-#include <mach/vm_statistics.h>
 
-#include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
 
-#include "mongo/db/jsobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/processinfo.h"
 
 namespace mongo {
 
@@ -216,32 +212,4 @@ bool ProcessInfo::checkNumaEnabled() {
     return false;
 }
 
-bool ProcessInfo::blockCheckSupported() {
-    return true;
-}
-
-bool ProcessInfo::blockInMemory(const void* start) {
-    char x = 0;
-    if (mincore(alignToStartOfPage(start), getPageSize(), &x)) {
-        LOGV2(23354,
-              "mincore failed: {errnoWithDescription}",
-              "errnoWithDescription"_attr = errnoWithDescription());
-        return 1;
-    }
-    return x & 0x1;
-}
-
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<char>* out) {
-    out->resize(numPages);
-    if (mincore(alignToStartOfPage(start), numPages * getPageSize(), &out->front())) {
-        LOGV2(23355,
-              "mincore failed: {errnoWithDescription}",
-              "errnoWithDescription"_attr = errnoWithDescription());
-        return false;
-    }
-    for (size_t i = 0; i < numPages; ++i) {
-        (*out)[i] &= 0x1;
-    }
-    return true;
-}
 }  // namespace mongo

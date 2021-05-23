@@ -57,6 +57,7 @@
 #include "mongo/db/server_options_base.h"
 #include "mongo/db/server_options_nongeneral_gen.h"
 #include "mongo/db/server_options_server_helpers.h"
+#include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_domain_global.h"
 #include "mongo/logv2/log_manager.h"
@@ -144,6 +145,12 @@ bool handlePreValidationMongodOptions(const moe::Environment& params,
 
     if (params.count("master") || params.count("slave")) {
         LOGV2_FATAL_CONTINUE(20881, "Master/slave replication is no longer supported");
+        return false;
+    }
+
+    if (params.count("replication.enableMajorityReadConcern") &&
+        params["replication.enableMajorityReadConcern"].as<bool>() == false) {
+        LOGV2_FATAL_CONTINUE(5324700, "enableMajorityReadConcern:false is no longer supported");
         return false;
     }
 
@@ -359,8 +366,6 @@ Status canonicalizeMongodOptions(moe::Environment* params) {
     return Status::OK();
 }
 
-bool gIgnoreEnableMajorityReadConcernWarning = false;
-
 Status storeMongodOptions(const moe::Environment& params) {
     Status ret = storeServerOptions(params);
     if (!ret.isOK()) {
@@ -539,6 +544,11 @@ Status storeMongodOptions(const moe::Environment& params) {
         storageGlobalParams.noTableScan.store(params["notablescan"].as<bool>());
     }
 
+    // Initialize lock-free reads support from feature flag. This may be adjusted later based on
+    // replica set config.
+    storageGlobalParams.disableLockFreeReads =
+        !feature_flags::gLockFreeReads.isEnabledAndIgnoreFCV();
+
     repl::ReplSettings replSettings;
     if (params.count("replication.replSet")) {
         /* seed list of hosts for the repl set */
@@ -568,6 +578,7 @@ Status storeMongodOptions(const moe::Environment& params) {
     if (!replSettings.getReplSetString().empty() &&
         (params.count("security.authorization") &&
          params["security.authorization"].as<std::string>() == "enabled") &&
+        serverGlobalParams.clusterAuthMode.load() != ServerGlobalParams::ClusterAuthMode_x509 &&
         !params.count("security.keyFile")) {
         return Status(
             ErrorCodes::BadValue,
@@ -575,29 +586,29 @@ Status storeMongodOptions(const moe::Environment& params) {
                 << "security.keyFile is required when authorization is enabled with replica sets");
     }
 
-    if (params.count("replication.enableMajorityReadConcern")) {
-        serverGlobalParams.enableMajorityReadConcern =
-            params["replication.enableMajorityReadConcern"].as<bool>();
+    serverGlobalParams.enableMajorityReadConcern = true;
 
-        if (!serverGlobalParams.enableMajorityReadConcern) {
-            // Lock-free reads are not supported with enableMajorityReadConcern=false, so we disable
-            // them. If the user tries to explicitly enable lock-free reads by specifying
-            // disableLockFreeReads=false, log a warning so that the user knows these are not
-            // compatible settings.
-            if (!storageGlobalParams.disableLockFreeReads) {
-                LOGV2_WARNING(4788401,
-                              "Lock-free reads is not compatible with "
-                              "enableMajorityReadConcern=false: disabling lock-free reads.");
-                storageGlobalParams.disableLockFreeReads = true;
-            }
-        }
+    if (storageGlobalParams.engineSetByUser &&
+        (storageGlobalParams.engine == "ephemeralForTest" ||
+         storageGlobalParams.engine == "devnull")) {
+        LOGV2(5324701,
+              "Test storage engine does not support enableMajorityReadConcern=true, forcibly "
+              "setting to false",
+              "storageEngine"_attr = storageGlobalParams.engine);
+        serverGlobalParams.enableMajorityReadConcern = false;
     }
 
-    // TODO (SERVER-49464): remove this development only extra logging.
-    if (storageGlobalParams.disableLockFreeReads) {
-        LOGV2(4788402, "Lock-free reads is disabled.");
-    } else {
-        LOGV2(4788403, "Lock-free reads is enabled.");
+    if (!serverGlobalParams.enableMajorityReadConcern) {
+        // Lock-free reads are not supported with enableMajorityReadConcern=false, so we disable
+        // them. If the user tries to explicitly enable lock-free reads by specifying
+        // disableLockFreeReads=false, log a warning so that the user knows these are not
+        // compatible settings.
+        if (!storageGlobalParams.disableLockFreeReads) {
+            LOGV2_WARNING(4788401,
+                          "Lock-free reads is not compatible with "
+                          "enableMajorityReadConcern=false: disabling lock-free reads.");
+            storageGlobalParams.disableLockFreeReads = true;
+        }
     }
 
     if (params.count("replication.oplogSizeMB")) {
@@ -659,12 +670,11 @@ Status storeMongodOptions(const moe::Environment& params) {
         auto clusterRoleParam = params["sharding.clusterRole"].as<std::string>();
         if (clusterRoleParam == "configsvr") {
             serverGlobalParams.clusterRole = ClusterRole::ConfigServer;
-
-            if (params.count("replication.enableMajorityReadConcern") &&
-                !params["replication.enableMajorityReadConcern"].as<bool>()) {
-                gIgnoreEnableMajorityReadConcernWarning = true;
-            }
-            serverGlobalParams.enableMajorityReadConcern = true;
+            // Config server requires majority read concern.
+            uassert(5324702,
+                    str::stream() << "Cannot initialize config server with "
+                                  << "enableMajorityReadConcern=false",
+                    serverGlobalParams.enableMajorityReadConcern);
 
             // If we haven't explicitly specified a journal option, default journaling to true for
             // the config server role
@@ -737,22 +747,6 @@ Status storeMongodOptions(const moe::Environment& params) {
     }
 
     setGlobalReplSettings(replSettings);
-    return Status::OK();
-}
-
-// This warning must be deferred until after ServerLogRedirection has started up so that it goes to
-// the right place. This initializer depends on the "default" initializer, which in turn depends on
-// the "ServerLogRedirection". This ensures that when this initializer is run, the log redirection
-// to file, if any, is ready. The reason for depending on "default" instead of
-// "ServerLogRedirection" is that this way we avoid having to add a dummy "ServerLogRedirection"
-// initializer in each one of the unit tests that depend on mongod_options.
-MONGO_INITIALIZER(IgnoreEnableMajorityReadConcernWarning)
-(InitializerContext*) {
-    if (gIgnoreEnableMajorityReadConcernWarning) {
-        LOGV2_WARNING(20879,
-                      "Ignoring read concern override as config server requires majority read "
-                      "concern");
-    }
     return Status::OK();
 }
 

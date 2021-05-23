@@ -53,24 +53,24 @@ OplogEntry createOplogEntryForTransactionTableUpdate(repl::OpTime opTime,
                                                      const BSONObj& updateBSON,
                                                      const BSONObj& o2Field,
                                                      Date_t wallClockTime) {
-    return repl::OplogEntry(opTime,
-                            boost::none,  // hash
-                            repl::OpTypeEnum::kUpdate,
-                            NamespaceString::kSessionTransactionsTableNamespace,
-                            boost::none,  // uuid
-                            false,        // fromMigrate
-                            repl::OplogEntry::kOplogVersion,
-                            updateBSON,
-                            o2Field,
-                            {},    // sessionInfo
-                            true,  // upsert
-                            wallClockTime,
-                            boost::none,   // statementId
-                            boost::none,   // prevWriteOpTime
-                            boost::none,   // preImageOpTime
-                            boost::none,   // postImageOpTime
-                            boost::none,   // destinedRecipient
-                            boost::none);  // _id
+    return {repl::DurableOplogEntry(opTime,
+                                    boost::none,  // hash
+                                    repl::OpTypeEnum::kUpdate,
+                                    NamespaceString::kSessionTransactionsTableNamespace,
+                                    boost::none,  // uuid
+                                    false,        // fromMigrate
+                                    repl::OplogEntry::kOplogVersion,
+                                    updateBSON,
+                                    o2Field,
+                                    {},    // sessionInfo
+                                    true,  // upsert
+                                    wallClockTime,
+                                    boost::none,    // statementId
+                                    boost::none,    // prevWriteOpTime
+                                    boost::none,    // preImageOpTime
+                                    boost::none,    // postImageOpTime
+                                    boost::none,    // destinedRecipient
+                                    boost::none)};  // _id
 }
 
 /**
@@ -168,9 +168,7 @@ void SessionUpdateTracker::_updateSessionInfo(const OplogEntry& entry) {
     const auto& lsid = sessionInfo.getSessionId();
     invariant(lsid);
 
-    // Ignore any no-op oplog entries, except for the ones generated from session migration
-    // of CRUD ops. These entries will have an o2 field that contains the original CRUD
-    // oplog entry.
+    // Ignore pre/post image no-op oplog entries. These entries will not have an o2 field.
     if (entry.getOpType() == OpTypeEnum::kNoop) {
         if (!entry.getFromMigrate() || !*entry.getFromMigrate()) {
             return;
@@ -201,8 +199,8 @@ void SessionUpdateTracker::_updateSessionInfo(const OplogEntry& entry) {
                         "sessionInfo_getTxnNumber"_attr = *sessionInfo.getTxnNumber(),
                         "existingSessionInfo_getTxnNumber"_attr =
                             *existingSessionInfo.getTxnNumber(),
-                        "newEntry"_attr = redact(entry.toString()),
-                        "existingEntry"_attr = redact(iter->second.toString()));
+                        "newEntry"_attr = redact(entry.toBSONForLogging()),
+                        "existingEntry"_attr = redact(iter->second.toBSONForLogging()));
 }
 
 std::vector<OplogEntry> SessionUpdateTracker::_flush(const OplogEntry& entry) {

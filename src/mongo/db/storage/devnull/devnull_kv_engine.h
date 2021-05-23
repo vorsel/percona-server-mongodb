@@ -71,7 +71,7 @@ public:
         return Status::OK();
     }
 
-    virtual Status dropGroupedSortedDataInterface(OperationContext* opCtx, StringData ident) {
+    virtual Status dropSortedDataInterface(OperationContext* opCtx, StringData ident) {
         return Status::OK();
     }
 
@@ -144,6 +144,14 @@ public:
         OperationContext* opCtx) override;
 
     virtual boost::optional<Timestamp> getLastStableRecoveryTimestamp() const override {
+        return boost::none;
+    }
+
+    virtual Timestamp getOldestTimestamp() const override {
+        return Timestamp();
+    }
+
+    virtual boost::optional<Timestamp> getRecoveryTimestamp() const {
         return boost::none;
     }
 

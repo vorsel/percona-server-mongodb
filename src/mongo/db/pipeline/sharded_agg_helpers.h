@@ -198,12 +198,30 @@ std::unique_ptr<Pipeline, PipelineDeleter> attachCursorToPipeline(Pipeline* owne
  * beginning with that DocumentSourceMergeCursors stage. Note that one of the 'remote' cursors might
  * be this node itself.
  *
- * Use the AggregationRequest alternative for 'targetRequest' to explicitly specify command options
+ * Use the AggregateCommand alternative for 'targetRequest' to explicitly specify command options
  * (e.g. read concern) to the shards when establishing remote cursors. Note that doing so incurs the
  * cost of parsing the pipeline.
  */
 std::unique_ptr<Pipeline, PipelineDeleter> targetShardsAndAddMergeCursors(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
-    stdx::variant<std::unique_ptr<Pipeline, PipelineDeleter>, AggregationRequest> targetRequest);
+    stdx::variant<std::unique_ptr<Pipeline, PipelineDeleter>, AggregateCommand> targetRequest,
+    boost::optional<BSONObj> shardCursorsSortSpec = boost::none);
+
+/**
+ * For a sharded or unsharded collection, establishes a remote cursor on only the specified shard,
+ * and creates a DocumentSourceMergeCursors stage to consume the remote cursor. Returns a pipeline
+ * beginning with that DocumentSourceMergeCursors stage.
+ *
+ * This function bypasses normal shard targeting for sharded and unsharded collections. It is
+ * especially useful for reading from unsharded collections such as config.transactions and
+ * local.oplog.rs that cannot be targeted by targetShardsAndAddMergeCursors().
+ *
+ * Note that the specified AggregateCommand must not be for an explain command.
+ */
+std::unique_ptr<Pipeline, PipelineDeleter> runPipelineDirectlyOnSingleShard(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    AggregateCommand request,
+    ShardId shardId);
+
 }  // namespace sharded_agg_helpers
 }  // namespace mongo

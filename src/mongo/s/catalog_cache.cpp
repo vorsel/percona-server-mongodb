@@ -71,6 +71,24 @@ const OperationContext::Decoration<bool> operationBlockedBehindCatalogCacheRefre
 
 }  // namespace
 
+CachedDatabaseInfo::CachedDatabaseInfo(DatabaseTypeValueHandle&& dbt) : _dbt(std::move(dbt)){};
+
+DatabaseType CachedDatabaseInfo::getDatabaseType() const {
+    return *_dbt;
+}
+
+const ShardId& CachedDatabaseInfo::primaryId() const {
+    return _dbt->getPrimary();
+}
+
+bool CachedDatabaseInfo::shardingEnabled() const {
+    return _dbt->getSharded();
+}
+
+DatabaseVersion CachedDatabaseInfo::databaseVersion() const {
+    return _dbt->getVersion();
+}
+
 CatalogCache::CatalogCache(ServiceContext* const service, CatalogCacheLoader& cacheLoader)
     : _cacheLoader(cacheLoader),
       _executor(std::make_shared<ThreadPool>([] {
@@ -110,7 +128,7 @@ StatusWith<CachedDatabaseInfo> CatalogCache::getDatabase(OperationContext* opCtx
                 str::stream() << "database " << dbName << " not found",
                 dbEntry);
 
-        return {CachedDatabaseInfo(*dbEntry)};
+        return {CachedDatabaseInfo(std::move(dbEntry))};
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
@@ -227,6 +245,17 @@ StatusWith<ChunkManager> CatalogCache::getCollectionRoutingInfoWithRefresh(
     _collectionCache.invalidate(nss);
     setOperationShouldBlockBehindCatalogCacheRefresh(opCtx, true);
     return getCollectionRoutingInfo(opCtx, nss);
+}
+
+ChunkManager CatalogCache::getShardedCollectionRoutingInfo(OperationContext* opCtx,
+                                                           const NamespaceString& nss) {
+    auto cm = uassertStatusOK(getCollectionRoutingInfo(opCtx, nss));
+
+    uassert(ErrorCodes::NamespaceNotSharded,
+            str::stream() << "Expected collection " << nss << " to be sharded",
+            cm.isSharded());
+
+    return cm;
 }
 
 StatusWith<ChunkManager> CatalogCache::getShardedCollectionRoutingInfoWithRefresh(
@@ -403,6 +432,10 @@ void CatalogCache::checkAndRecordOperationBlockedByRefresh(OperationContext* opC
     }
 }
 
+void CatalogCache::invalidateDatabaseEntry_LINEARIZABLE(const StringData& dbName) {
+    _databaseCache.invalidate(dbName);
+}
+
 void CatalogCache::invalidateCollectionEntry_LINEARIZABLE(const NamespaceString& nss) {
     _collectionCache.invalidate(nss);
 }
@@ -465,6 +498,7 @@ CatalogCache::DatabaseCache::LookupResult CatalogCache::DatabaseCache::_lookupDa
 
         auto newDbVersion =
             ComparableDatabaseVersion::makeComparableDatabaseVersion(newDb.getVersion());
+
         LOGV2_FOR_CATALOG_REFRESH(24101,
                                   1,
                                   "Refreshed cached database entry",
@@ -562,6 +596,7 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
             // updating. Otherwise, we're making a whole new routing table.
             if (isIncremental &&
                 existingHistory->optRt->getVersion().epoch() == collectionAndChunks.epoch) {
+
                 return existingHistory->optRt->makeUpdated(collectionAndChunks.reshardingFields,
                                                            collectionAndChunks.allowMigrations,
                                                            collectionAndChunks.changedChunks);
@@ -583,6 +618,7 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
                                                 std::move(defaultCollator),
                                                 collectionAndChunks.shardKeyIsUnique,
                                                 collectionAndChunks.epoch,
+                                                collectionAndChunks.creationTime,
                                                 std::move(collectionAndChunks.reshardingFields),
                                                 collectionAndChunks.allowMigrations,
                                                 collectionAndChunks.changedChunks);
@@ -601,6 +637,15 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
 
         const auto newVersion =
             ComparableChunkVersion::makeComparableChunkVersion(newRoutingHistory.getVersion());
+
+        invariant(isIncremental == false ||
+                      (existingHistory->optRt->getVersion().epoch() !=
+                           newRoutingHistory.getVersion().epoch() ||
+                       existingHistory->optRt->getVersion().isOlderThan(
+                           newRoutingHistory.getVersion())) ||
+                      (newRoutingHistory.sameAllowMigrations(*existingHistory->optRt) &&
+                       newRoutingHistory.sameReshardingFields(*existingHistory->optRt)),
+                  "Unconsistent routing table info value for collections of the same version");
 
         LOGV2_FOR_CATALOG_REFRESH(4619901,
                                   isIncremental || newVersion != previousVersion ? 0 : 1,
@@ -637,20 +682,6 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
 
         throw;
     }
-}
-
-CachedDatabaseInfo::CachedDatabaseInfo(DatabaseType dbt) : _dbt(std::move(dbt)) {}
-
-const ShardId& CachedDatabaseInfo::primaryId() const {
-    return _dbt.getPrimary();
-}
-
-bool CachedDatabaseInfo::shardingEnabled() const {
-    return _dbt.getSharded();
-}
-
-DatabaseVersion CachedDatabaseInfo::databaseVersion() const {
-    return _dbt.getVersion();
 }
 
 }  // namespace mongo

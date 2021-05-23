@@ -7,12 +7,11 @@
 (function() {
 "use strict";
 
-load("jstests/aggregation/extras/utils.js");
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
 load("jstests/replsets/libs/tenant_migration_test.js");
 
-const tenantMigrationTest = new TenantMigrationTest(jsTestName());
+const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 if (!tenantMigrationTest.isFeatureFlagEnabled()) {
     jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
     return;
@@ -41,7 +40,7 @@ assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
 
 for (const db of [...tenantDBs, ...nonTenantDBs]) {
     for (const coll of collNames) {
-        tenantMigrationTest.verifyReceipientDB(tenantId, db, coll);
+        tenantMigrationTest.verifyRecipientDB(tenantId, db, coll);
     }
 }
 

@@ -34,6 +34,8 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
@@ -42,20 +44,34 @@
 namespace mongo {
 namespace {
 
+bool isCollectionSharded(OperationContext* opCtx, const NamespaceString& nss) {
+    AutoGetCollectionForRead lock(opCtx, nss);
+    return opCtx->writesAreReplicated() &&
+        CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx).isSharded();
+}
+
 RenameCollectionResponse renameCollectionLegacy(OperationContext* opCtx,
                                                 const ShardsvrRenameCollection& request,
                                                 const NamespaceString& fromNss) {
     const auto toNss = request.getTo();
 
-    const auto fromCM =
-        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, fromNss));
+    const auto fromDB = uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, fromNss.db()));
 
-    const auto toCM =
-        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, toNss));
+    const auto toDB = uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, toNss.db()));
 
     uassert(13137,
             "Source and destination collections must be on same shard",
-            fromCM.dbPrimary() == toCM.dbPrimary());
+            fromDB.primaryId() == toDB.primaryId());
+
+    // Make sure that source and target collection are not sharded
+    uassert(ErrorCodes::IllegalOperation,
+            str::stream() << "source namespace '" << fromNss << "' must not be sharded",
+            !isCollectionSharded(opCtx, fromNss));
+    uassert(ErrorCodes::IllegalOperation,
+            str::stream() << "cannot rename to sharded collection '" << toNss << "'",
+            !isCollectionSharded(opCtx, toNss));
 
     RenameCollectionOptions options;
     options.dropTarget = request.getDropTarget();

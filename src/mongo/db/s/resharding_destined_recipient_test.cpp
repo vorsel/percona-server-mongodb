@@ -125,8 +125,7 @@ public:
 
     class StaticCatalogClient final : public ShardingCatalogClientMock {
     public:
-        StaticCatalogClient(std::vector<ShardType> shards)
-            : ShardingCatalogClientMock(nullptr), _shards(std::move(shards)) {}
+        StaticCatalogClient(std::vector<ShardType> shards) : _shards(std::move(shards)) {}
 
         StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
             OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
@@ -149,18 +148,23 @@ public:
         std::vector<CollectionType> _colls;
     };
 
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
-        std::unique_ptr<DistLockManager> distLockManager) override {
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
         return std::make_unique<StaticCatalogClient>(kShardList);
     }
 
 protected:
     std::vector<ChunkType> createChunks(const OID& epoch, const std::string& shardKey) {
         auto range1 = ChunkRange(BSON(shardKey << MINKEY), BSON(shardKey << 5));
-        ChunkType chunk1(kNss, range1, ChunkVersion(1, 0, epoch), kShardList[0].getName());
+        ChunkType chunk1(kNss,
+                         range1,
+                         ChunkVersion(1, 0, epoch, boost::none /* timestamp */),
+                         kShardList[0].getName());
 
         auto range2 = ChunkRange(BSON(shardKey << 5), BSON(shardKey << MAXKEY));
-        ChunkType chunk2(kNss, range2, ChunkVersion(1, 0, epoch), kShardList[1].getName());
+        ChunkType chunk2(kNss,
+                         range2,
+                         ChunkVersion(1, 0, epoch, boost::none /* timestamp */),
+                         kShardList[1].getName());
 
         return {chunk1, chunk2};
     }
@@ -182,7 +186,7 @@ protected:
 
         ReshardingEnv env(CollectionCatalog::get(opCtx)->lookupUUIDByNSS(opCtx, kNss).value());
         env.destShard = kShardList[1].getName();
-        env.version = ChunkVersion(1, 0, OID::gen());
+        env.version = ChunkVersion(1, 0, OID::gen(), boost::none /* timestamp */);
         env.dbVersion = DatabaseVersion(UUID::gen());
 
         env.tempNss =

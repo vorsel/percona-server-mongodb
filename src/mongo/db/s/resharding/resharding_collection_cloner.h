@@ -30,10 +30,11 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 
-#include "mongo/base/string_data.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/pipeline.h"
@@ -49,6 +50,7 @@ class TaskExecutor;
 
 }  // namespace executor
 
+class OperationContext;
 class ServiceContext;
 
 class ReshardingCollectionCloner {
@@ -61,12 +63,16 @@ public:
                                NamespaceString outputNss);
 
     std::unique_ptr<Pipeline, PipelineDeleter> makePipeline(
-        OperationContext* opCtx, std::shared_ptr<MongoProcessInterface> mongoProcessInterface);
+        OperationContext* opCtx,
+        std::shared_ptr<MongoProcessInterface> mongoProcessInterface,
+        Value resumeId = Value());
 
-    ExecutorFuture<void> run(ServiceContext* serviceContext,
-                             std::shared_ptr<executor::TaskExecutor>);
+    ExecutorFuture<void> run(std::shared_ptr<executor::TaskExecutor> executor,
+                             CancelationToken cancelToken);
 
 private:
+    Value _findHighestInsertedId(OperationContext* opCtx);
+
     std::unique_ptr<Pipeline, PipelineDeleter> _targetAggregationRequest(OperationContext* opCtx,
                                                                          const Pipeline& pipeline);
 
@@ -74,12 +80,7 @@ private:
     void _insertBatch(OperationContext* opCtx, std::vector<InsertStatement>& batch);
 
     template <typename Callable>
-    auto _withTemporaryOperationContext(ServiceContext* serviceContext, Callable&& callable);
-
-    ExecutorFuture<void> _insertBatchesUntilPipelineExhausted(
-        ServiceContext* serviceContext,
-        std::shared_ptr<executor::TaskExecutor> executor,
-        std::unique_ptr<Pipeline, PipelineDeleter> pipeline);
+    auto _withTemporaryOperationContext(Callable&& callable);
 
     const ShardKeyPattern _newShardKeyPattern;
     const NamespaceString _sourceNss;

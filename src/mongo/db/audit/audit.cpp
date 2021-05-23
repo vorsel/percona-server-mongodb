@@ -495,17 +495,17 @@ namespace audit {
         (InitializerContext *context) {
         // Sets the audit log in the general logging framework which
         // will rotate() the audit log when the server log rotates.
-        logv2::addLogRotator([](bool renameFiles, StringData suffix) {
-                if (_auditLog) {
-                    return _auditLog->rotate(renameFiles, suffix);
-                }
-                return Status::OK();
+        logv2::addLogRotator(logv2::kAuditLogTag, [](bool renameFiles, StringData suffix) {
+            if (_auditLog) {
+                return _auditLog->rotate(renameFiles, suffix);
+            }
+            return Status::OK();
         });
-        return initialize();
+        uassertStatusOK(initialize());
     }
 
 ///////////////////////// audit.h functions ////////////////////////////
-    
+
     namespace AuditFields {
         // Common fields
         BSONField<StringData> type("atype");
@@ -786,6 +786,14 @@ namespace audit {
         _auditEvent(client, "applicationMessage", params, ErrorCodes::OK, false);
     }
 
+    void logStartupOptions(Client* client, const BSONObj& startupOptions) {
+        if (!_auditLog) {
+            return;
+        }
+
+        _auditEvent(client, "startupOptions", startupOptions, ErrorCodes::OK, false);
+    }
+
     void logShutdown(Client* client) {
         if (!_auditLog) {
             return;
@@ -797,6 +805,19 @@ namespace audit {
         // This is always the last event
         // Destroy audit log here
         _setGlobalAuditLog(nullptr);
+    }
+
+    void logLogout(Client* client,
+                   StringData reason,
+                   const BSONArray& initialUsers,
+                   const BSONArray& updatedUsers) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("reason" << reason << "initialUsers" << initialUsers
+                                             << "updatedUsers" << updatedUsers);
+        _auditEvent(client, "logout", params, ErrorCodes::OK, false);
     }
 
     void logCreateIndex(Client* client,

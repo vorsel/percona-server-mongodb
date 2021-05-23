@@ -27,91 +27,9 @@
  *    it in the license file.
  */
 
-#include "mongo/bson/timestamp.h"
-#include "mongo/db/auth/authorization_manager_impl.h"
-#include "mongo/db/auth/authorization_session_for_test.h"
-#include "mongo/db/auth/authz_manager_external_state_local.h"
-#include "mongo/db/auth/authz_manager_external_state_mock.h"
-#include "mongo/db/client.h"
-#include "mongo/db/logical_time.h"
-#include "mongo/db/operation_context.h"
-#include "mongo/db/repl/repl_client_info.h"
-#include "mongo/db/repl/replication_coordinator_mock.h"
-#include "mongo/db/service_context.h"
-#include "mongo/db/service_entry_point_common.h"
-#include "mongo/db/service_entry_point_mongod.h"
-#include "mongo/db/vector_clock_mutable.h"
-#include "mongo/platform/basic.h"
-#include "mongo/transport/service_entry_point_impl.h"
-#include "mongo/transport/session.h"
-#include "mongo/transport/transport_layer_mock.h"
-#include "mongo/unittest/unittest.h"
+#include "mongo/db/op_msg_fuzzer_fixture.h"
 
 extern "C" int LLVMFuzzerTestOneInput(const char* Data, size_t Size) {
-    static mongo::ServiceContext* serviceContext;
-    static mongo::ServiceContext::UniqueClient client;
-    static mongo::transport::TransportLayerMock transportLayer;
-    static mongo::transport::SessionHandle session;
-    static std::unique_ptr<mongo::AuthzManagerExternalStateMock> localExternalState;
-    static mongo::AuthzManagerExternalStateMock* externalState;
-    static std::unique_ptr<mongo::AuthorizationManagerImpl> localAuthzManager;
-    static mongo::AuthorizationManagerImpl* authzManager;
-
-    static std::unique_ptr<mongo::repl::ReplicationCoordinatorMock> replCoord;
-    static const mongo::LogicalTime kInMemoryLogicalTime =
-        mongo::LogicalTime(mongo::Timestamp(3, 1));
-
-    static const auto ret = [&]() {
-        auto ret = mongo::runGlobalInitializers(std::vector<std::string>{});
-        invariant(ret.isOK());
-
-        setGlobalServiceContext(mongo::ServiceContext::make());
-        session = transportLayer.createSession();
-
-        serviceContext = mongo::getGlobalServiceContext();
-        serviceContext->setServiceEntryPoint(
-            std::make_unique<mongo::ServiceEntryPointMongod>(serviceContext));
-        client = serviceContext->makeClient("test", session);
-        // opCtx = serviceContext->makeOperationContext(client.get());
-
-        localExternalState = std::make_unique<mongo::AuthzManagerExternalStateMock>();
-        externalState = localExternalState.get();
-        localAuthzManager = std::make_unique<mongo::AuthorizationManagerImpl>(
-            serviceContext, std::move(localExternalState));
-
-        authzManager = localAuthzManager.get();
-        externalState->setAuthorizationManager(authzManager);
-        authzManager->setAuthEnabled(true);
-        mongo::AuthorizationManager::set(serviceContext, std::move(localAuthzManager));
-
-        replCoord = std::make_unique<mongo::repl::ReplicationCoordinatorMock>(serviceContext);
-        ASSERT_OK(replCoord->setFollowerMode(mongo::repl::MemberState::RS_PRIMARY));
-        mongo::repl::ReplicationCoordinator::set(mongo::getGlobalServiceContext(),
-                                                 std::move(replCoord));
-
-        return ret;
-    }();
-
-    if (Size < sizeof(mongo::MSGHEADER::Value)) {
-        return 0;
-    }
-    mongo::ServiceContext::UniqueOperationContext opCtx =
-        serviceContext->makeOperationContext(client.get());
-    mongo::VectorClockMutable::get(serviceContext)->tickClusterTimeTo(kInMemoryLogicalTime);
-
-    int new_size = Size + sizeof(int);
-    auto sb = mongo::SharedBuffer::allocate(new_size);
-    memcpy(sb.get(), &new_size, sizeof(int));
-    memcpy(sb.get() + sizeof(int), Data, Size);
-    mongo::Message msg(std::move(sb));
-
-    try {
-        // TODO SERVER-51278: Replace `AlternativeClientRegion` with `ClientStrand`.
-        mongo::AlternativeClientRegion acr(client);
-        serviceContext->getServiceEntryPoint()->handleRequest(opCtx.get(), msg).get();
-    } catch (const mongo::AssertionException&) {
-        // We need to catch exceptions caused by invalid inputs
-    }
-
-    return 0;
+    static auto fixture = mongo::OpMsgFuzzerFixture();
+    return fixture.testOneInput(Data, Size);
 }

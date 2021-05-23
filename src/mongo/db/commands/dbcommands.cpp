@@ -53,6 +53,7 @@
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/coll_mod_gen.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/create_gen.h"
 #include "mongo/db/commands/profile_common.h"
@@ -85,14 +86,17 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/request_execution_context.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/executor/async_request_executor.h"
 #include "mongo/logv2/log.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/util/fail_point.h"
+#include "mongo/util/future.h"
 #include "mongo/util/md5.hpp"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/version.h"
@@ -106,75 +110,68 @@ using std::unique_ptr;
 
 namespace {
 
-class CmdDropDatabase : public BasicCommand {
+class CmdDropDatabase : public DropDatabaseCmdVersion1Gen<CmdDropDatabase> {
 public:
-    const std::set<std::string>& apiVersions() const {
-        return kApiVersions1;
-    }
-
-    std::string help() const override {
+    std::string help() const final {
         return "drop (delete) this database";
     }
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kNever;
     }
-
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::dropDatabase);
-        out->push_back(Privilege(ResourcePattern::forDatabaseName(dbname), actions));
-    }
-
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool collectsResourceConsumptionMetrics() const final {
         return true;
     }
-
-    bool collectsResourceConsumptionMetrics() const override {
-        return true;
-    }
-
-    CmdDropDatabase() : BasicCommand("dropDatabase") {}
-
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& cmdObj,
-             BSONObjBuilder& result) {
-        // disallow dropping the config database
-        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
-            (dbname == NamespaceString::kConfigDb)) {
-            uasserted(ErrorCodes::IllegalOperation,
-                      "Cannot drop 'config' database if mongod started "
-                      "with --configsvr");
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
+        bool supportsWriteConcern() const final {
+            return true;
         }
-
-        if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
-             repl::ReplicationCoordinator::modeNone) &&
-            (dbname == NamespaceString::kLocalDb)) {
-            uasserted(ErrorCodes::IllegalOperation,
-                      str::stream()
-                          << "Cannot drop '" << dbname << "' database while replication is active");
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName());
         }
-
-        auto request = DropDatabase::parse(IDLParserErrorContext("dropDatabase"), cmdObj);
-        if (request.getCommandParameter() != 1) {
-            uasserted(ErrorCodes::IllegalOperation, "have to pass 1 as db parameter");
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            uassert(ErrorCodes::Unauthorized,
+                    str::stream() << "Not authorized to drop database '" << request().getDbName()
+                                  << "'",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnNamespace(NamespaceString(request().getDbName()),
+                                                            ActionType::dropDatabase));
         }
+        Reply typedRun(OperationContext* opCtx) final {
+            auto dbName = request().getDbName();
+            // disallow dropping the config database
+            if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
+                (dbName == NamespaceString::kConfigDb)) {
+                uasserted(ErrorCodes::IllegalOperation,
+                          "Cannot drop 'config' database if mongod started "
+                          "with --configsvr");
+            }
 
-        Status status = dropDatabase(opCtx, dbname);
-        if (status != ErrorCodes::NamespaceNotFound) {
-            uassertStatusOK(status);
-        }
-        DropDatabaseReply reply;
-        if (status.isOK()) {
-            reply.setDropped(request.getDbName());
-        }
-        reply.serialize(&result);
-        return true;
-    }
+            if ((repl::ReplicationCoordinator::get(opCtx)->getReplicationMode() !=
+                 repl::ReplicationCoordinator::modeNone) &&
+                (dbName == NamespaceString::kLocalDb)) {
+                uasserted(ErrorCodes::IllegalOperation,
+                          str::stream() << "Cannot drop '" << dbName
+                                        << "' database while replication is active");
+            }
 
+            if (request().getCommandParameter() != 1) {
+                uasserted(5255100, "Have to pass 1 as 'drop' parameter");
+            }
+
+            Status status = dropDatabase(opCtx, dbName.toString());
+            DropDatabaseReply reply;
+            if (status == ErrorCodes::NamespaceNotFound) {
+                reply.setInfo("database does not exist"_sd);
+            } else {
+                uassertStatusOK(status);
+                reply.setDropped(request().getDbName());
+            }
+
+            return reply;
+        }
+    };
 } cmdDropDatabase;
 
 static const char* repairRemovedMessage =
@@ -213,268 +210,263 @@ public:
 } cmdRepairDatabase;
 
 /* drop collection */
-class CmdDrop : public ErrmsgCommandDeprecated {
+class CmdDrop : public DropCmdVersion1Gen<CmdDrop> {
 public:
-    CmdDrop() : ErrmsgCommandDeprecated("drop") {}
-
-    virtual const std::set<std::string>& apiVersions() const {
-        return kApiVersions1;
-    }
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kNever;
     }
-    virtual bool adminOnly() const {
+    bool adminOnly() const final {
         return false;
     }
-    virtual void addRequiredPrivileges(const std::string& dbname,
-                                       const BSONObj& cmdObj,
-                                       std::vector<Privilege>* out) const {
-        ActionSet actions;
-        actions.addAction(ActionType::dropCollection);
-        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
-    }
-    std::string help() const override {
+    std::string help() const final {
         return "drop a collection\n{drop : <collectionName>}";
     }
-
-
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool collectsResourceConsumptionMetrics() const final {
         return true;
     }
-
-    bool collectsResourceConsumptionMetrics() const override {
-        return true;
-    }
-
-    virtual bool errmsgRun(OperationContext* opCtx,
-                           const string& dbname,
-                           const BSONObj& cmdObj,
-                           string& errmsg,
-                           BSONObjBuilder& result) {
-        auto parsed = Drop::parse(IDLParserErrorContext("drop"), cmdObj);
-        if (parsed.getNamespace().isOplog()) {
-            if (repl::ReplicationCoordinator::get(opCtx)->isReplEnabled()) {
-                errmsg = "can't drop live oplog while replicating";
-                return false;
-            }
-
-            auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
-            invariant(storageEngine);
-            if (storageEngine->supportsRecoveryTimestamp()) {
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
+        bool supportsWriteConcern() const final {
+            return true;
+        }
+        NamespaceString ns() const final {
+            return request().getNamespace();
+        }
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            auto ns = request().getNamespace();
+            uassert(ErrorCodes::Unauthorized,
+                    str::stream() << "Not authorized to drop collection '" << ns << "'",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForActionsOnNamespace(ns, ActionType::dropCollection));
+        }
+        Reply typedRun(OperationContext* opCtx) final {
+            if (request().getNamespace().isOplog()) {
+                uassert(5255000,
+                        "can't drop live oplog while replicating",
+                        !repl::ReplicationCoordinator::get(opCtx)->isReplEnabled());
+                auto storageEngine = opCtx->getServiceContext()->getStorageEngine();
+                invariant(storageEngine);
                 // We use the method supportsRecoveryTimestamp() to detect whether we are using
                 // the WiredTiger storage engine, which is currently only storage engine that
                 // supports the replSetResizeOplog command.
-                errmsg =
-                    "can't drop oplog on storage engines that support replSetResizeOplog command";
-                return false;
+                uassert(
+                    5255001,
+                    "can't drop oplog on storage engines that support replSetResizeOplog command",
+                    !storageEngine->supportsRecoveryTimestamp());
             }
+
+            Reply reply;
+            uassertStatusOK(
+                dropCollection(opCtx,
+                               request().getNamespace(),
+                               &reply,
+                               DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
+            return reply;
         }
-
-        uassertStatusOK(
-            dropCollection(opCtx,
-                           parsed.getNamespace(),
-                           result,
-                           DropCollectionSystemCollectionMode::kDisallowSystemCollectionDrops));
-        return true;
-    }
-
+    };
 } cmdDrop;
 
+constexpr auto kCreateCommandHelp =
+    "explicitly creates a collection or view\n"
+    "{\n"
+    "  create: <string: collection or view name> [,\n"
+    "  capped: <bool: capped collection>,\n"
+    "  autoIndexId: <bool: automatic creation of _id index>,\n"
+    "  idIndex: <document: _id index specification>,\n"
+    "  size: <int: size in bytes of the capped collection>,\n"
+    "  max: <int: max number of documents in the capped collection>,\n"
+    "  storageEngine: <document: storage engine configuration>,\n"
+    "  validator: <document: validation rules>,\n"
+    "  validationLevel: <string: validation level>,\n"
+    "  validationAction: <string: validation action>,\n"
+    "  indexOptionDefaults: <document: default configuration for indexes>,\n"
+    "  viewOn: <string: name of source collection or view>,\n"
+    "  pipeline: <array<object>: aggregation pipeline stage>,\n"
+    "  collation: <document: default collation for the collection or view>,\n"
+    "  writeConcern: <document: write concern expression for the operation>]\n"
+    "}"_sd;
+
 /* create collection */
-class CmdCreate : public BasicCommand {
+class CmdCreate final : public CreateCmdVersion1Gen<CmdCreate> {
 public:
-    CmdCreate() : BasicCommand("create") {}
-
-    virtual const std::set<std::string>& apiVersions() const {
-        return kApiVersions1;
-    }
-
-    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
         return AllowedOnSecondary::kNever;
     }
 
-    virtual bool adminOnly() const {
+    bool adminOnly() const final {
         return false;
     }
 
-    virtual bool supportsWriteConcern(const BSONObj& cmd) const override {
+    bool collectsResourceConsumptionMetrics() const final {
         return true;
     }
 
-    bool collectsResourceConsumptionMetrics() const override {
-        return true;
+    std::string help() const final {
+        return kCreateCommandHelp.toString();
     }
 
-    std::string help() const override {
-        return str::stream()
-            << "explicitly creates a collection or view\n"
-            << "{\n"
-            << "  create: <string: collection or view name> [,\n"
-            << "  capped: <bool: capped collection>,\n"
-            << "  autoIndexId: <bool: automatic creation of _id index>,\n"
-            << "  idIndex: <document: _id index specification>,\n"
-            << "  size: <int: size in bytes of the capped collection>,\n"
-            << "  max: <int: max number of documents in the capped collection>,\n"
-            << "  storageEngine: <document: storage engine configuration>,\n"
-            << "  validator: <document: validation rules>,\n"
-            << "  validationLevel: <string: validation level>,\n"
-            << "  validationAction: <string: validation action>,\n"
-            << "  indexOptionDefaults: <document: default configuration for indexes>,\n"
-            << "  viewOn: <string: name of source collection or view>,\n"
-            << "  pipeline: <array<object>: aggregation pipeline stage>,\n"
-            << "  collation: <document: default collation for the collection or view>,\n"
-            << "  writeConcern: <document: write concern expression for the operation>]\n"
-            << "}";
-    }
+    class Invocation final : public InvocationBaseGen {
+    public:
+        using InvocationBaseGen::InvocationBaseGen;
 
-    virtual Status checkAuthForCommand(Client* client,
-                                       const std::string& dbname,
-                                       const BSONObj& cmdObj) const {
-        const NamespaceString nss(parseNs(dbname, cmdObj));
-        return AuthorizationSession::get(client)->checkAuthForCreate(nss, cmdObj, false);
-    }
+        bool supportsWriteConcern() const final {
+            return true;
+        }
 
-    virtual bool run(OperationContext* opCtx,
-                     const string& dbname,
-                     const BSONObj& cmdObj,
-                     BSONObjBuilder& result) {
-        const auto nsToCreate = CommandHelpers::parseNsCollectionRequired(dbname, cmdObj);
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
+                                ->checkAuthForCreate(request(), false));
+        }
 
-        IDLParserErrorContext ctx("create");
-        CreateCommand cmd = CreateCommand::parse(ctx, cmdObj);
+        NamespaceString ns() const final {
+            return request().getNamespace();
+        }
 
-        if (cmd.getAutoIndexId()) {
+        CreateCommandReply typedRun(OperationContext* opCtx) final {
+            auto cmd = request();
+
+            CreateCommandReply reply;
+            if (cmd.getAutoIndexId()) {
 #define DEPR_23800 "The autoIndexId option is deprecated and will be removed in a future release"
-            LOGV2_WARNING(23800, DEPR_23800);
-            result.append("note", DEPR_23800);
+                LOGV2_WARNING(23800, DEPR_23800);
+                reply.setNote(StringData(DEPR_23800));
 #undef DEPR_23800
-        }
+            }
 
-        // Ensure that the 'size' field is present if 'capped' is set to true.
-        if (cmd.getCapped()) {
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "the 'size' field is required when 'capped' is true",
-                    cmd.getSize());
-        }
-
-        // If the 'size' or 'max' fields are present, then 'capped' must be set to true.
-        if (cmd.getSize() || cmd.getMax()) {
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "the 'capped' field needs to be true when either the 'size'"
-                                  << " or 'max' fields are present",
-                    cmd.getCapped());
-        }
-
-        // The 'temp' field is only allowed to be used internally and isn't available to clients.
-        if (cmd.getTemp()) {
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "the 'temp' field is an invalid option",
-                    opCtx->getClient()->isInDirectClient() ||
-                        (opCtx->getClient()->session()->getTags() &
-                         transport::Session::kInternalClient));
-        }
-
-        if (cmd.getPipeline()) {
-            uassert(ErrorCodes::InvalidOptions,
-                    "'pipeline' requires 'viewOn' to also be specified",
-                    cmd.getViewOn());
-        }
-
-        if (auto timeseries = cmd.getTimeseries()) {
-            uassert(ErrorCodes::InvalidOptions,
-                    "Time-series collection is not enabled",
-                    feature_flags::gTimeseriesCollection.isEnabled(
-                        serverGlobalParams.featureCompatibility));
-
-            const auto timeseriesNotAllowedWith = [&nsToCreate](StringData option) -> std::string {
-                return str::stream()
-                    << nsToCreate << ": 'timeseries' is not allowed with '" << option << "'";
-            };
-
-            uassert(
-                ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("capped"), !cmd.getCapped());
-            uassert(ErrorCodes::InvalidOptions,
-                    timeseriesNotAllowedWith("autoIndexId"),
-                    !cmd.getAutoIndexId());
-            uassert(
-                ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("idIndex"), !cmd.getIdIndex());
-            uassert(ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("size"), !cmd.getSize());
-            uassert(ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("max"), !cmd.getMax());
-            uassert(ErrorCodes::InvalidOptions,
-                    timeseriesNotAllowedWith("validator"),
-                    !cmd.getValidator());
-            uassert(ErrorCodes::InvalidOptions,
-                    timeseriesNotAllowedWith("validationLevel"),
-                    !cmd.getValidationLevel());
-            uassert(ErrorCodes::InvalidOptions,
-                    timeseriesNotAllowedWith("validationAction"),
-                    !cmd.getValidationAction());
-            uassert(
-                ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("viewOn"), !cmd.getViewOn());
-            uassert(ErrorCodes::InvalidOptions,
-                    timeseriesNotAllowedWith("pipeline"),
-                    !cmd.getPipeline());
-
-            if (auto metaField = timeseries->getMetaField()) {
+            // Ensure that the 'size' field is present if 'capped' is set to true.
+            if (cmd.getCapped()) {
                 uassert(ErrorCodes::InvalidOptions,
-                        "'metaField' cannot be \"_id\"",
-                        *metaField != "_id");
+                        str::stream() << "the 'size' field is required when 'capped' is true",
+                        cmd.getSize());
+            }
+
+            // If the 'size' or 'max' fields are present, then 'capped' must be set to true.
+            if (cmd.getSize() || cmd.getMax()) {
                 uassert(ErrorCodes::InvalidOptions,
-                        "'metaField' cannot be the same as 'timeField'",
-                        *metaField != timeseries->getTimeField());
+                        str::stream()
+                            << "the 'capped' field needs to be true when either the 'size'"
+                            << " or 'max' fields are present",
+                        cmd.getCapped());
             }
+
+            // The 'temp' field is only allowed to be used internally and isn't available to
+            // clients.
+            if (cmd.getTemp()) {
+                uassert(ErrorCodes::InvalidOptions,
+                        str::stream() << "the 'temp' field is an invalid option",
+                        opCtx->getClient()->isInDirectClient() ||
+                            (opCtx->getClient()->session()->getTags() &
+                             transport::Session::kInternalClient));
+            }
+
+            if (cmd.getPipeline()) {
+                uassert(ErrorCodes::InvalidOptions,
+                        "'pipeline' requires 'viewOn' to also be specified",
+                        cmd.getViewOn());
+            }
+
+            if (auto timeseries = cmd.getTimeseries()) {
+                uassert(ErrorCodes::InvalidOptions,
+                        "Time-series collection is not enabled",
+                        feature_flags::gTimeseriesCollection.isEnabled(
+                            serverGlobalParams.featureCompatibility));
+
+                const auto timeseriesNotAllowedWith = [&cmd](StringData option) -> std::string {
+                    return str::stream() << cmd.getNamespace()
+                                         << ": 'timeseries' is not allowed with '" << option << "'";
+                };
+
+                uassert(ErrorCodes::InvalidOptions,
+                        timeseriesNotAllowedWith("capped"),
+                        !cmd.getCapped());
+                uassert(ErrorCodes::InvalidOptions,
+                        timeseriesNotAllowedWith("autoIndexId"),
+                        !cmd.getAutoIndexId());
+                uassert(ErrorCodes::InvalidOptions,
+                        timeseriesNotAllowedWith("idIndex"),
+                        !cmd.getIdIndex());
+                uassert(
+                    ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("size"), !cmd.getSize());
+                uassert(ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("max"), !cmd.getMax());
+                uassert(ErrorCodes::InvalidOptions,
+                        timeseriesNotAllowedWith("validator"),
+                        !cmd.getValidator());
+                uassert(ErrorCodes::InvalidOptions,
+                        timeseriesNotAllowedWith("validationLevel"),
+                        !cmd.getValidationLevel());
+                uassert(ErrorCodes::InvalidOptions,
+                        timeseriesNotAllowedWith("validationAction"),
+                        !cmd.getValidationAction());
+                uassert(ErrorCodes::InvalidOptions,
+                        timeseriesNotAllowedWith("viewOn"),
+                        !cmd.getViewOn());
+                uassert(ErrorCodes::InvalidOptions,
+                        timeseriesNotAllowedWith("pipeline"),
+                        !cmd.getPipeline());
+
+                if (auto metaField = timeseries->getMetaField()) {
+                    uassert(ErrorCodes::InvalidOptions,
+                            "'metaField' cannot be \"_id\"",
+                            *metaField != "_id");
+                    uassert(ErrorCodes::InvalidOptions,
+                            "'metaField' cannot be the same as 'timeField'",
+                            *metaField != timeseries->getTimeField());
+                }
+            }
+
+            // Validate _id index spec and fill in missing fields.
+            if (cmd.getIdIndex()) {
+                auto idIndexSpec = *cmd.getIdIndex();
+
+                uassert(ErrorCodes::InvalidOptions,
+                        str::stream() << "'idIndex' is not allowed with 'viewOn': " << idIndexSpec,
+                        !cmd.getViewOn());
+
+                uassert(ErrorCodes::InvalidOptions,
+                        str::stream()
+                            << "'idIndex' is not allowed with 'autoIndexId': " << idIndexSpec,
+                        !cmd.getAutoIndexId());
+
+                // Perform index spec validation.
+                idIndexSpec = uassertStatusOK(index_key_validate::validateIndexSpec(
+                    opCtx, idIndexSpec, serverGlobalParams.featureCompatibility));
+                uassertStatusOK(index_key_validate::validateIdIndexSpec(idIndexSpec));
+
+                // Validate or fill in _id index collation.
+                std::unique_ptr<CollatorInterface> defaultCollator;
+                if (cmd.getCollation()) {
+                    auto collatorStatus = CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                              ->makeFromBSON(cmd.getCollation()->toBSON());
+                    uassertStatusOK(collatorStatus.getStatus());
+                    defaultCollator = std::move(collatorStatus.getValue());
+                }
+
+                idIndexSpec = uassertStatusOK(index_key_validate::validateIndexSpecCollation(
+                    opCtx, idIndexSpec, defaultCollator.get()));
+
+                std::unique_ptr<CollatorInterface> idIndexCollator;
+                if (auto collationElem = idIndexSpec["collation"]) {
+                    auto collatorStatus = CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                              ->makeFromBSON(collationElem.Obj());
+                    // validateIndexSpecCollation() should have checked that the _id index collation
+                    // spec is valid.
+                    invariant(collatorStatus.isOK());
+                    idIndexCollator = std::move(collatorStatus.getValue());
+                }
+                if (!CollatorInterface::collatorsMatch(defaultCollator.get(),
+                                                       idIndexCollator.get())) {
+                    uasserted(ErrorCodes::BadValue,
+                              "'idIndex' must have the same collation as the collection.");
+                }
+
+                cmd.setIdIndex(idIndexSpec);
+            }
+
+            uassertStatusOK(createCollection(opCtx, cmd.getNamespace(), cmd));
+            return reply;
         }
-
-        // Validate _id index spec and fill in missing fields.
-        if (cmd.getIdIndex()) {
-            auto idIndexSpec = *cmd.getIdIndex();
-
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "'idIndex' is not allowed with 'viewOn': " << idIndexSpec,
-                    !cmd.getViewOn());
-
-            uassert(ErrorCodes::InvalidOptions,
-                    str::stream() << "'idIndex' is not allowed with 'autoIndexId': " << idIndexSpec,
-                    !cmd.getAutoIndexId());
-
-            // Perform index spec validation.
-            idIndexSpec = uassertStatusOK(index_key_validate::validateIndexSpec(
-                opCtx, idIndexSpec, serverGlobalParams.featureCompatibility));
-            uassertStatusOK(index_key_validate::validateIdIndexSpec(idIndexSpec));
-
-            // Validate or fill in _id index collation.
-            std::unique_ptr<CollatorInterface> defaultCollator;
-            if (cmd.getCollation()) {
-                auto collatorStatus = CollatorFactoryInterface::get(opCtx->getServiceContext())
-                                          ->makeFromBSON(*cmd.getCollation());
-                uassertStatusOK(collatorStatus.getStatus());
-                defaultCollator = std::move(collatorStatus.getValue());
-            }
-
-            idIndexSpec = uassertStatusOK(index_key_validate::validateIndexSpecCollation(
-                opCtx, idIndexSpec, defaultCollator.get()));
-
-            std::unique_ptr<CollatorInterface> idIndexCollator;
-            if (auto collationElem = idIndexSpec["collation"]) {
-                auto collatorStatus = CollatorFactoryInterface::get(opCtx->getServiceContext())
-                                          ->makeFromBSON(collationElem.Obj());
-                // validateIndexSpecCollation() should have checked that the _id index collation
-                // spec is valid.
-                invariant(collatorStatus.isOK());
-                idIndexCollator = std::move(collatorStatus.getValue());
-            }
-            if (!CollatorInterface::collatorsMatch(defaultCollator.get(), idIndexCollator.get())) {
-                uasserted(ErrorCodes::BadValue,
-                          "'idIndex' must have the same collation as the collection.");
-            }
-
-            cmd.setIdIndex(idIndexSpec);
-        }
-
-        uassertStatusOK(createCollection(opCtx, nsToCreate, cmd));
-        return true;
-    }
+    };
 } cmdCreate;
 
 class CmdDatasize : public ErrmsgCommandDeprecated {
@@ -741,8 +733,14 @@ public:
              const string& dbname,
              const BSONObj& jsobj,
              BSONObjBuilder& result) {
-        const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbname, jsobj));
-        uassertStatusOK(collMod(opCtx, nss, jsobj, &result));
+        auto cmd = CollMod::parse(
+            IDLParserErrorContext(CollMod::kCommandName,
+                                  APIParameters::get(opCtx).getAPIStrict().value_or(false)),
+            jsobj);
+        uassertStatusOK(collMod(opCtx, cmd.getNamespace(), cmd.toBSON(BSONObj()), &result));
+
+        CollModReply::parse(IDLParserErrorContext("CollModReply"), result.asTempObj());
+
         return true;
     }
 
@@ -846,6 +844,31 @@ public:
 
 } cmdDBStats;
 
+// Provides the means to asynchronously run `buildinfo` commands.
+class BuildInfoExecutor final : public AsyncRequestExecutor {
+public:
+    BuildInfoExecutor() : AsyncRequestExecutor("BuildInfoExecutor") {}
+
+    Status handleRequest(std::shared_ptr<RequestExecutionContext> rec) {
+        auto result = rec->getReplyBuilder()->getBodyBuilder();
+        VersionInfoInterface::instance().appendBuildInfo(&result);
+        appendStorageEngineList(rec->getOpCtx()->getServiceContext(), &result);
+        return Status::OK();
+    }
+
+    static BuildInfoExecutor* get(ServiceContext* svc);
+};
+
+const auto getBuildInfoExecutor = ServiceContext::declareDecoration<BuildInfoExecutor>();
+BuildInfoExecutor* BuildInfoExecutor::get(ServiceContext* svc) {
+    return const_cast<BuildInfoExecutor*>(&getBuildInfoExecutor(svc));
+}
+
+const auto buildInfoExecutorRegisterer = ServiceContext::ConstructorActionRegisterer{
+    "BuildInfoExecutor",
+    [](ServiceContext* ctx) { getBuildInfoExecutor(ctx).start(); },
+    [](ServiceContext* ctx) { getBuildInfoExecutor(ctx).stop(); }};
+
 class CmdBuildInfo : public BasicCommand {
 public:
     CmdBuildInfo() : BasicCommand("buildInfo", "buildinfo") {}
@@ -879,6 +902,11 @@ public:
         VersionInfoInterface::instance().appendBuildInfo(&result);
         appendStorageEngineList(opCtx->getServiceContext(), &result);
         return true;
+    }
+
+    Future<void> runAsync(std::shared_ptr<RequestExecutionContext> rec, std::string) override {
+        auto opCtx = rec->getOpCtx();
+        return BuildInfoExecutor::get(opCtx->getServiceContext())->schedule(std::move(rec));
     }
 
 } cmdBuildInfo;

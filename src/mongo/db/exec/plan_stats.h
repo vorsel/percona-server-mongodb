@@ -842,4 +842,73 @@ struct TrialStats : public SpecificStats {
     bool trialSucceeded = false;
 };
 
+struct GroupStats : public SpecificStats {
+    SpecificStats* clone() const final {
+        return new GroupStats(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this);
+    }
+
+    // Tracks an estimate of the total size of all documents output by the group stage in bytes.
+    size_t totalOutputDataSizeBytes = 0;
+
+    // Flag to specify if data was spilled to disk while grouping the data.
+    bool usedDisk = false;
+};
+
+struct DocumentSourceCursorStats : public SpecificStats {
+    SpecificStats* clone() const final {
+        return new DocumentSourceCursorStats(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this) +
+            (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
+    }
+
+    void accumulate(PlanSummaryStats& summary) const final {
+        summary.accumulate(planSummaryStats);
+    }
+
+    PlanSummaryStats planSummaryStats;
+};
+
+struct DocumentSourceLookupStats : public SpecificStats {
+    SpecificStats* clone() const final {
+        return new DocumentSourceLookupStats(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this) +
+            (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
+    }
+
+    void accumulate(PlanSummaryStats& summary) const final {
+        summary.accumulate(planSummaryStats);
+    }
+
+    // Tracks the summary stats in aggregate across all executions of the subpipeline.
+    PlanSummaryStats planSummaryStats;
+};
+
+struct UnionWithStats final : public SpecificStats {
+    SpecificStats* clone() const final {
+        return new UnionWithStats(*this);
+    }
+
+    uint64_t estimateObjectSizeInBytes() const {
+        return sizeof(*this) +
+            (planSummaryStats.estimateObjectSizeInBytes() - sizeof(planSummaryStats));
+    }
+
+    void accumulate(PlanSummaryStats& summary) const final {
+        summary.accumulate(planSummaryStats);
+    }
+
+    // Tracks the summary stats of the subpipeline.
+    PlanSummaryStats planSummaryStats;
+};
+
 }  // namespace mongo

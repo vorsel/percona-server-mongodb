@@ -65,7 +65,7 @@ public:
     static constexpr auto kExpeditedRefreshPeriod = Milliseconds(500);
     static constexpr auto kCheckTimeout = Seconds(5);
 
-    ScanningReplicaSetMonitor(const MongoURI& uri);
+    ScanningReplicaSetMonitor(const MongoURI& uri, std::function<void()> cleanupCallback);
 
     void init() override;
 
@@ -76,14 +76,17 @@ public:
      * so any token passed in will be ignored.
      */
     SemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
+                                             const std::vector<HostAndPort>& excludedHosts,
                                              const CancelationToken&) override;
 
     /**
      * NOTE: Cancelation via CancelationTokens is not implemented for the ScanningReplicaSetMonitor,
      * so any token passed in will be ignored.
      */
-    SemiFuture<std::vector<HostAndPort>> getHostsOrRefresh(const ReadPreferenceSetting& readPref,
-                                                           const CancelationToken&) override;
+    SemiFuture<std::vector<HostAndPort>> getHostsOrRefresh(
+        const ReadPreferenceSetting& readPref,
+        const std::vector<HostAndPort>& excludedHosts,
+        const CancelationToken&) override;
 
     HostAndPort getPrimaryOrUassert() override;
 
@@ -138,7 +141,8 @@ public:
     /**
      * Allows tests to set initial conditions and introspect the current state.
      */
-    explicit ScanningReplicaSetMonitor(const SetStatePtr& initialState);
+    ScanningReplicaSetMonitor(const SetStatePtr& initialState,
+                              std::function<void()> cleanupCallback);
     ~ScanningReplicaSetMonitor() override;
 
     /**
@@ -152,8 +156,10 @@ public:
     static bool areRefreshRetriesDisabledForTest();
 
 private:
-    Future<std::vector<HostAndPort>> _getHostsOrRefresh(const ReadPreferenceSetting& readPref,
-                                                        Milliseconds maxWait);
+    Future<std::vector<HostAndPort>> _getHostsOrRefresh(
+        const ReadPreferenceSetting& readPref,
+        Milliseconds maxWait,
+        const std::vector<HostAndPort>& excludedHosts);
     /**
      * If no scan is in-progress, this function is responsible for setting up a new scan. Otherwise,
      * does nothing.

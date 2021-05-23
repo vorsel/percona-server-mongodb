@@ -80,7 +80,7 @@ public:
                                              StringData ident,
                                              const BSONObj& storageMetadata);
 
-    virtual Status dropGroupedSortedDataInterface(OperationContext* opCtx, StringData ident) {
+    virtual Status dropSortedDataInterface(OperationContext* opCtx, StringData ident) {
         return Status::OK();
     }
 
@@ -188,6 +188,10 @@ public:
     void setOldestTimestamp(Timestamp newOldestTimestamp, bool force) override;
 
     std::map<Timestamp, std::shared_ptr<StringStore>> getHistory_forTest();
+
+    boost::optional<Timestamp> getRecoveryTimestamp() const override {
+        return boost::none;
+    }
 
     static bool instanceExists();
 

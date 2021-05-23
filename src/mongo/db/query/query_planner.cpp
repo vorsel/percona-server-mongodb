@@ -179,6 +179,12 @@ string optionString(size_t options) {
             case QueryPlannerParams::ENUMERATE_OR_CHILDREN_LOCKSTEP:
                 ss << "ENUMERATE_OR_CHILDREN_LOCKSTEP ";
                 break;
+            case QueryPlannerParams::OMIT_REPL_STATE_PERMITS_READS_CHECK:
+                ss << "OMIT_REPL_STATE_PERMITS_READS_CHECK";
+                break;
+            case QueryPlannerParams::RETURN_OWNED_DATA:
+                ss << "RETURN_OWNED_DATA ";
+                break;
             case QueryPlannerParams::DEFAULT:
                 MONGO_UNREACHABLE;
                 break;
@@ -584,6 +590,13 @@ StatusWith<std::unique_ptr<QuerySolution>> QueryPlanner::planFromCache(
 // static
 StatusWith<std::vector<std::unique_ptr<QuerySolution>>> QueryPlanner::plan(
     const CanonicalQuery& query, const QueryPlannerParams& params) {
+    // It's a little silly to ask for a count and for owned data. This could indicate a bug earlier
+    // on.
+    tassert(5397500,
+            "Count and owned data requested",
+            !((params.options & QueryPlannerParams::IS_COUNT) &&
+              (params.options & QueryPlannerParams::RETURN_OWNED_DATA)));
+
     LOGV2_DEBUG(20967,
                 5,
                 "Beginning planning",

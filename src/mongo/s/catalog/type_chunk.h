@@ -202,13 +202,14 @@ public:
     static const BSONField<OID> name;
     static const BSONField<BSONObj> minShardID;
     static const BSONField<std::string> ns;
-    static const BSONField<std::string> collectionUUID;
+    static const BSONField<UUID> collectionUUID;
     static const BSONField<BSONObj> min;
     static const BSONField<BSONObj> max;
     static const BSONField<std::string> shard;
     static const BSONField<bool> jumbo;
     static const BSONField<Date_t> lastmod;
     static const BSONField<OID> epoch;
+    static const BSONField<Timestamp> timestamp;
     static const BSONField<BSONObj> history;
 
     ChunkType();
@@ -241,7 +242,9 @@ public:
      *
      * Also does validation of the contents.
      */
-    static StatusWith<ChunkType> fromShardBSON(const BSONObj& source, const OID& epoch);
+    static StatusWith<ChunkType> fromShardBSON(const BSONObj& source,
+                                               const OID& epoch,
+                                               const boost::optional<Timestamp>& timestamp);
 
     /**
      * Returns the BSON representation of the entry for a shard server's config.chunks.<epoch>

@@ -215,9 +215,8 @@ MONGO_INITIALIZER(SaslExternalLDAPServerMechanism)(InitializerContext*) {
     int result = sasl_server_init(saslServerGlobalCallbacks, saslGlobalParams.serviceName.c_str());
     if (result != SASL_OK) {
         LOGV2_ERROR(29030, "SASL server initialization failed");
-        return getInitializationError(result);
+        uassertStatusOK(getInitializationError(result));
     }
-    return Status::OK();
 }
 
 

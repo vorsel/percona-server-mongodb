@@ -41,6 +41,7 @@
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/exec/multi_plan.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/dependencies.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_cursor.h"
@@ -76,7 +77,7 @@ class DocumentSourceCursorTest : public unittest::Test {
 public:
     DocumentSourceCursorTest()
         : client(_opCtx.get()),
-          _ctx(new ExpressionContextForTest(_opCtx.get(), AggregationRequest(nss, {}))) {
+          _ctx(new ExpressionContextForTest(_opCtx.get(), AggregateCommand(nss, {}))) {
         _ctx->tempDir = storageGlobalParams.dbpath + "/_tmp";
     }
 
@@ -98,8 +99,11 @@ protected:
         }
         auto cq = uassertStatusOK(CanonicalQuery::canonicalize(opCtx(), std::move(qr)));
 
-        auto exec = uassertStatusOK(
-            getExecutor(opCtx(), &_coll, std::move(cq), PlanYieldPolicy::YieldPolicy::NO_YIELD, 0));
+        auto exec = uassertStatusOK(getExecutor(opCtx(),
+                                                &_coll,
+                                                std::move(cq),
+                                                PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                                QueryPlannerParams::RETURN_OWNED_DATA));
 
         exec->saveState();
         _source = DocumentSourceCursor::create(
@@ -318,7 +322,8 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterTimeout)
                                                     std::move(workingSet),
                                                     std::move(collectionScan),
                                                     &readLock.getCollection(),
-                                                    PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT));
+                                                    PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT,
+                                                    QueryPlannerParams::DEFAULT));
 
     // Make a DocumentSourceCursor.
     ctx()->tailableMode = TailableModeEnum::kTailableAndAwaitData;
@@ -359,7 +364,10 @@ TEST_F(DocumentSourceCursorTest, NonAwaitDataCursorShouldErrorAfterTimeout) {
                                                     std::move(workingSet),
                                                     std::move(collectionScan),
                                                     &readLock.getCollection(),
-                                                    PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT));
+                                                    PlanYieldPolicy::YieldPolicy::ALWAYS_TIME_OUT,
+                                                    QueryPlannerParams::DEFAULT
+
+                                                    ));
 
     // Make a DocumentSourceCursor.
     ctx()->tailableMode = TailableModeEnum::kNormal;
@@ -409,7 +417,8 @@ TEST_F(DocumentSourceCursorTest, TailableAwaitDataCursorShouldErrorAfterBeingKil
                                     std::move(workingSet),
                                     std::move(collectionScan),
                                     &readLock.getCollection(),
-                                    PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED));
+                                    PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED,
+                                    QueryPlannerParams::DEFAULT));
 
     // Make a DocumentSourceCursor.
     ctx()->tailableMode = TailableModeEnum::kTailableAndAwaitData;
@@ -449,7 +458,8 @@ TEST_F(DocumentSourceCursorTest, NormalCursorShouldErrorAfterBeingKilled) {
                                     std::move(workingSet),
                                     std::move(collectionScan),
                                     &readLock.getCollection(),
-                                    PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED));
+                                    PlanYieldPolicy::YieldPolicy::ALWAYS_MARK_KILLED,
+                                    QueryPlannerParams::DEFAULT));
 
     // Make a DocumentSourceCursor.
     ctx()->tailableMode = TailableModeEnum::kNormal;

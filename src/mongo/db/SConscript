@@ -160,6 +160,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/stats/timer_stats',
         '$BUILD_DIR/mongo/rpc/client_metadata',
+        '$BUILD_DIR/mongo/transport/service_executor',
         '$BUILD_DIR/mongo/util/diagnostic_info' if get_option('use-diagnostic-latches') == 'on' else [],
         '$BUILD_DIR/mongo/util/fail_point',
         '$BUILD_DIR/mongo/util/net/network',
@@ -425,6 +426,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/repl/repl_settings',
         '$BUILD_DIR/mongo/db/repl/replica_set_messages',
         '$BUILD_DIR/mongo/db/storage/storage_options',
+        '$BUILD_DIR/mongo/idl/feature_flag',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
         'global_settings',
         'server_options_base',
@@ -555,6 +557,7 @@ env.Clone().InjectModule("enterprise").Library(
         "audit.cpp",
     ],
     LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
     ],
 )
 
@@ -610,16 +613,22 @@ env.CppUnitTest(
 env.Library(
     target="commands",
     source=[
+        'coll_mod.idl',
         'commands.cpp',
         'drop.idl',
         'drop_database.idl',
         'list_collections.idl',
+        'list_indexes.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        'api_parameters',
+        'create_indexes_idl',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
+        '$BUILD_DIR/mongo/db/catalog/collection_options_idl',
+        '$BUILD_DIR/mongo/db/commands/create_command',
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/rpc/command_status',
         '$BUILD_DIR/mongo/rpc/rpc',
@@ -1051,12 +1060,11 @@ env.Library(
     source=[
         "introspect.cpp",
     ],
-    LIBDEPS=[
-        "db_raii",
-    ],
     LIBDEPS_PRIVATE=[
-       "concurrency/write_conflict_exception",
-       "stats/resource_consumption_metrics",
+        "$BUILD_DIR/mongo/db/catalog/collection_options_idl",
+        "$BUILD_DIR/mongo/db/concurrency/write_conflict_exception",
+        "$BUILD_DIR/mongo/db/stats/resource_consumption_metrics",
+        "db_raii",
     ],
 )
 
@@ -1410,15 +1418,26 @@ env.Library(
 )
 
 env.Library(
+    target='create_indexes_idl',
+    source=[
+        'create_indexes.idl',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/catalog/commit_quorum_idl',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
+)
+
+env.Library(
     target='sessions_collection',
     source=[
         'sessions_collection.cpp',
-        'create_indexes.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
         '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
+        'create_indexes_idl',
         'logical_session_id',
     ],
 )
@@ -1542,6 +1561,7 @@ env.Library(
         'initialize_api_parameters.cpp',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/transport/transport_layer_common',
         'api_parameters',
         'commands',
     ],
@@ -1666,7 +1686,7 @@ env.Library(
 env.Library(
     target='keys_collection_document',
     source=[
-        'keys_collection_document.cpp',
+        'keys_collection_document.idl',
     ],
     LIBDEPS=[
         'logical_time',
@@ -1699,6 +1719,7 @@ env.Library(
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client',
         'keys_collection_document',
         'logical_time',
+        'namespace_string',
     ],
 )
 
@@ -1772,7 +1793,7 @@ env.Library(
 env.Library(
     target= 'logical_time_metadata_hook',
     source= [
-        'logical_time_metadata_hook.cpp',
+        'vector_clock_metadata_hook.cpp',
     ],
     LIBDEPS= [
         '$BUILD_DIR/mongo/rpc/metadata',
@@ -1924,7 +1945,6 @@ env.Library(
     target='write_ops',
     source=[
         'ops/delete.cpp',
-        'ops/find_and_modify_result.cpp',
         'ops/insert.cpp',
         'ops/update.cpp',
         'ops/write_ops_retryability.cpp',
@@ -2263,6 +2283,26 @@ env.Program(
     ],
 )
 
+env.Library(
+    target='op_msg_fuzzer_fixture',
+    source=[
+        'op_msg_fuzzer_fixture.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/auth/auth',
+        '$BUILD_DIR/mongo/db/auth/authmocks',
+        '$BUILD_DIR/mongo/db/catalog/catalog_impl',
+        '$BUILD_DIR/mongo/db/index/index_access_methods',
+        '$BUILD_DIR/mongo/db/repl/replmocks',
+        '$BUILD_DIR/mongo/db/s/sharding_api_d',
+        '$BUILD_DIR/mongo/db/service_context_d',
+        '$BUILD_DIR/mongo/transport/service_entry_point',
+        '$BUILD_DIR/mongo/transport/transport_layer_mock',
+        '$BUILD_DIR/mongo/unittest/unittest',
+    ],
+)
+
 envWithAsio = env.Clone()
 envWithAsio.InjectThirdParty(libraries=['asio'])
 
@@ -2274,6 +2314,7 @@ envWithAsio.CppUnitTest(
         'collection_index_usage_tracker_test.cpp',
         'commands_test.cpp',
         'curop_test.cpp',
+        'dbdirectclient_test.cpp',
         'dbmessage_test.cpp',
         'db_raii_test.cpp',
         'field_parser_test.cpp',
@@ -2290,6 +2331,7 @@ envWithAsio.CppUnitTest(
         'mirroring_sampler_test.cpp',
         'multi_key_path_tracker_test.cpp',
         'namespace_string_test.cpp',
+        'op_msg_fuzzer_fixture_test.cpp',
         'op_observer_impl_test.cpp',
         'op_observer_registry_test.cpp',
         'operation_context_test.cpp',
@@ -2325,6 +2367,7 @@ envWithAsio.CppUnitTest(
         '$BUILD_DIR/mongo/db/catalog/import_collection_oplog_entry',
         '$BUILD_DIR/mongo/db/catalog/index_build_entry_idl',
         '$BUILD_DIR/mongo/db/mongohasher',
+        '$BUILD_DIR/mongo/db/op_msg_fuzzer_fixture',
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
         '$BUILD_DIR/mongo/db/storage/wiredtiger/storage_wiredtiger',
         '$BUILD_DIR/mongo/executor/async_timer_mock',
@@ -2408,8 +2451,8 @@ envWithAsio.CppUnitTest(
         'logical_time_validator_test.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/s/catalog/dist_lock_manager_mock',
         'auth/authmocks',
+        'keys_collection_client_direct',
         's/config_server_test_fixture',
         'vector_clock',
     ],
@@ -2437,14 +2480,7 @@ env.CppLibfuzzerTest(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
-        '$BUILD_DIR/mongo/db/auth/auth',
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/repl/replmocks',
-        '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/db/service_context_d',
-        '$BUILD_DIR/mongo/transport/service_entry_point',
-        '$BUILD_DIR/mongo/transport/transport_layer_mock',
-        '$BUILD_DIR/mongo/unittest/unittest',
+        'op_msg_fuzzer_fixture',
     ],
 )
 

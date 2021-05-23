@@ -32,12 +32,53 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/error_labels.h"
 #include "mongo/db/logical_session_id.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 namespace {
+
+TEST(IsTransientTransactionErrorTest, WriteConflictIsTransient) {
+    ASSERT_TRUE(isTransientTransactionError(
+        ErrorCodes::WriteConflict, false /* hasWriteConcernError */, false /* isCommitOrAbort */));
+}
+
+TEST(IsTransientTransactionErrorTest, LockTimeoutIsTransient) {
+    ASSERT_TRUE(isTransientTransactionError(
+        ErrorCodes::LockTimeout, false /* hasWriteConcernError */, false /* isCommitOrAbort */));
+}
+
+TEST(IsTransientTransactionErrorTest, PreparedTransactionInProgressIsTransient) {
+    ASSERT_TRUE(isTransientTransactionError(ErrorCodes::PreparedTransactionInProgress,
+                                            false /* hasWriteConcernError */,
+                                            false /* isCommitOrAbort */));
+}
+
+TEST(IsTransientTransactionErrorTest, TenantMigrationCommittedIsTransient) {
+    ASSERT_TRUE(isTransientTransactionError(ErrorCodes::TenantMigrationCommitted,
+                                            false /* hasWriteConcernError */,
+                                            false /* isCommitOrAbort */));
+}
+
+TEST(IsTransientTransactionErrorTest, TenantMigrationAbortedIsTransient) {
+    ASSERT_TRUE(isTransientTransactionError(ErrorCodes::TenantMigrationAborted,
+                                            false /* hasWriteConcernError */,
+                                            false /* isCommitOrAbort */));
+}
+
+TEST(IsTransientTransactionErrorTest, ShardInvalidatedForTargetingIsTransient) {
+    ASSERT_TRUE(isTransientTransactionError(ErrorCodes::ShardInvalidatedForTargeting,
+                                            false /* hasWriteConcernError */,
+                                            false /* isCommitOrAbort */));
+}
+
+TEST(IsTransientTransactionErrorTest, StaleDbVersionIsTransient) {
+    ASSERT_TRUE(isTransientTransactionError(
+        ErrorCodes::StaleDbVersion, false /* hasWriteConcernError */, false /* isCommitOrAbort */));
+}
 
 TEST(IsTransientTransactionErrorTest, NetworkErrorsAreTransientBeforeCommit) {
     ASSERT_TRUE(isTransientTransactionError(ErrorCodes::HostUnreachable,
@@ -251,8 +292,8 @@ TEST_F(ErrorLabelBuilderTest, ResumableChangeStreamErrorAppliesToChangeStreamAgg
     // is the only factor that determines the success or failure of isResumableChangeStreamError().
     auto cmdObj = BSON("aggregate" << nss().coll() << "pipeline"
                                    << BSON_ARRAY(BSON("$changeStream" << BSONObj())) << "cursor"
-                                   << BSONObj());
-    auto aggRequest = uassertStatusOK(AggregationRequest::parseFromBSON(nss(), cmdObj));
+                                   << BSONObj() << "$db" << nss().db());
+    auto aggRequest = uassertStatusOK(aggregation_request_helper::parseFromBSON(nss(), cmdObj));
     ASSERT_TRUE(LiteParsedPipeline(aggRequest).hasChangeStream());
 
     // The label applies to a $changeStream "aggregate" command.
@@ -275,8 +316,8 @@ TEST_F(ErrorLabelBuilderTest, ResumableChangeStreamErrorDoesNotApplyToNonResumab
     // is the only factor that determines the success or failure of isResumableChangeStreamError().
     auto cmdObj = BSON("aggregate" << nss().coll() << "pipeline"
                                    << BSON_ARRAY(BSON("$changeStream" << BSONObj())) << "cursor"
-                                   << BSONObj());
-    auto aggRequest = uassertStatusOK(AggregationRequest::parseFromBSON(nss(), cmdObj));
+                                   << BSONObj() << "$db" << nss().db());
+    auto aggRequest = uassertStatusOK(aggregation_request_helper::parseFromBSON(nss(), cmdObj));
     ASSERT_TRUE(LiteParsedPipeline(aggRequest).hasChangeStream());
 
     // The label does not apply to a ChangeStreamFatalError error on a $changeStream aggregation.
@@ -299,8 +340,8 @@ TEST_F(ErrorLabelBuilderTest, ResumableChangeStreamErrorDoesNotApplyToNonChangeS
     // is the only factor that determines the success or failure of isResumableChangeStreamError().
     auto cmdObj =
         BSON("aggregate" << nss().coll() << "pipeline" << BSON_ARRAY(BSON("$match" << BSONObj()))
-                         << "cursor" << BSONObj());
-    auto aggRequest = uassertStatusOK(AggregationRequest::parseFromBSON(nss(), cmdObj));
+                         << "cursor" << BSONObj() << "$db" << nss().db());
+    auto aggRequest = uassertStatusOK(aggregation_request_helper::parseFromBSON(nss(), cmdObj));
     ASSERT_FALSE(LiteParsedPipeline(aggRequest).hasChangeStream());
 
     // The label does not apply to a non-$changeStream "aggregate" command.

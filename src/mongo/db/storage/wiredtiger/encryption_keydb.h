@@ -83,6 +83,10 @@ public:
     // for example _sess pointer is null
     void reconfigure(const char *);
 
+    // generate secure encryption key
+    // _srng use protected by _lock_key
+    void generate_secure_key(unsigned char* key);
+
 private:
     typedef boost::multiprecision::uint128_t _gcm_iv_type;
 
@@ -93,7 +97,7 @@ private:
     void close_handles();
     int store_gcm_iv_reserved();
     int reserve_gcm_iv_range();
-    void generate_secure_key(char key[]); // uses _srng without locks
+    void generate_secure_key_inlock(char key[]);  // uses _srng without locks
 
     void init_masterkey();
 

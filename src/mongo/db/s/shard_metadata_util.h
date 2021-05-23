@@ -175,7 +175,8 @@ StatusWith<std::vector<ChunkType>> readShardChunks(OperationContext* opCtx,
                                                    const BSONObj& query,
                                                    const BSONObj& sort,
                                                    boost::optional<long long> limit,
-                                                   const OID& epoch);
+                                                   const OID& epoch,
+                                                   const boost::optional<Timestamp>& timestamp);
 
 /**
  * Takes a vector of 'chunks' and updates the shard's chunks collection for 'nss'. Any chunk
@@ -221,6 +222,12 @@ void dropChunks(OperationContext* opCtx, const NamespaceString& nss);
  */
 Status deleteDatabasesEntry(OperationContext* opCtx, StringData dbName);
 
+/**
+ * Downgrades the config.cache.databases entries to prior 4.9 version. More specifically, it removes
+ * the 'version.timestamp' field from all the documents in config.cache.databases.
+ *
+ */
+void downgradeShardConfigDatabasesEntriesToPre49(OperationContext* opCtx);
 
 /**
  * Downgrades the config.cache.collections entries to prior 4.9 version. More specifically, it

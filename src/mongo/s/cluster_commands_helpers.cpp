@@ -164,8 +164,7 @@ std::vector<AsyncRequestsSender::Request> buildUnshardedRequestsForAllShards(
 
 std::vector<AsyncRequestsSender::Request> buildUnversionedRequestsForAllShards(
     OperationContext* opCtx, const BSONObj& cmdObj) {
-    std::vector<ShardId> shardIds;
-    Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload(&shardIds);
+    auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload();
     return buildUnshardedRequestsForAllShards(opCtx, std::move(shardIds), cmdObj);
 }
 
@@ -360,6 +359,17 @@ BSONObj applyReadWriteConcern(OperationContext* opCtx, BasicCommand* cmd, const 
                                  cmdObj);
 }
 
+BSONObj applyReadWriteConcern(OperationContext* opCtx,
+                              BasicCommandWithReplyBuilderInterface* cmd,
+                              const BSONObj& cmdObj) {
+    const auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
+    const auto readConcernSupport = cmd->supportsReadConcern(cmdObj, readConcernArgs.getLevel());
+    return applyReadWriteConcern(opCtx,
+                                 readConcernSupport.readConcernSupport.isOK(),
+                                 cmd->supportsWriteConcern(cmdObj),
+                                 cmdObj);
+}
+
 BSONObj stripWriteConcern(const BSONObj& cmdObj) {
     BSONObjBuilder output;
     for (const auto& elem : cmdObj) {
@@ -393,7 +403,7 @@ std::vector<AsyncRequestsSender::Request> buildVersionedRequestsForTargetedShard
         }
 
         // Attach shardVersion "UNSHARDED", unless targeting the config server.
-        const auto cmdObjWithShardVersion = (primaryShardId != ShardRegistry::kConfigServerShardId)
+        const auto cmdObjWithShardVersion = (primaryShardId != ShardId::kConfigServerId)
             ? appendShardVersion(cmdToSend, ChunkVersion::UNSHARDED())
             : cmdToSend;
 
@@ -813,8 +823,7 @@ StatusWith<Shard::QueryResponse> loadIndexesFromAuthoritativeShard(OperationCont
         } else {
             // For an unsharded collection, the primary shard will have correct indexes. We attach
             // unsharded shard version to detect if the collection has become sharded.
-            const auto cmdObjWithShardVersion =
-                (cm.dbPrimary() != ShardRegistry::kConfigServerShardId)
+            const auto cmdObjWithShardVersion = (cm.dbPrimary() != ShardId::kConfigServerId)
                 ? appendShardVersion(cmdNoVersion, ChunkVersion::UNSHARDED())
                 : cmdNoVersion;
             return {

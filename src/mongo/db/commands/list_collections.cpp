@@ -43,6 +43,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_helper.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
@@ -144,7 +145,7 @@ void _addWorkingSetMember(OperationContext* opCtx,
 BSONObj buildViewBson(const ViewDefinition& view, bool nameOnly) {
     BSONObjBuilder b;
     b.append("name", view.name().coll());
-    b.append("type", "view");
+    b.append("type", view.timeseries() ? "timeseries" : "view");
 
     if (nameOnly) {
         return b.obj();
@@ -158,7 +159,7 @@ BSONObj buildViewBson(const ViewDefinition& view, bool nameOnly) {
     }
     optionsBuilder.doneFast();
 
-    BSONObj info = BSON("readOnly" << true);
+    BSONObj info = BSON("readOnly" << !view.timeseries());
     b.append("info", info);
     return b.obj();
 }
@@ -273,7 +274,10 @@ public:
         unique_ptr<MatchExpression> matcher;
         const auto as = AuthorizationSession::get(opCtx->getClient());
 
-        auto parsed = ListCollections::parse(IDLParserErrorContext("listCollections"), jsobj);
+        auto parsed = ListCollections::parse(
+            IDLParserErrorContext("listCollections",
+                                  APIParameters::get(opCtx).getAPIStrict().value_or(false)),
+            jsobj);
         const bool nameOnly = parsed.getNameOnly();
         const bool authorizedCollections = parsed.getAuthorizedCollections();
 
@@ -296,8 +300,10 @@ public:
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
         std::vector<mongo::ListCollectionsReplyItem> firstBatch;
         {
-            AutoGetDb autoDb(opCtx, dbname, MODE_IS);
-            Database* db = autoDb.getDb();
+            // Acquire only the global lock and set up a consistent in-memory catalog and storage
+            // snapshot.
+            AutoGetDbForReadMaybeLockFree lockFreeReadBlock(opCtx, dbname);
+            auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, dbname);
 
             CurOpFailpointHelpers::waitWhileFailPointEnabled(&hangBeforeListCollections,
                                                              opCtx,
@@ -309,10 +315,11 @@ public:
             auto ws = std::make_unique<WorkingSet>();
             auto root = std::make_unique<QueuedDataStage>(expCtx.get(), ws.get());
 
-            if (db) {
+            // If the ViewCatalog pointer is valid, then the database exists.
+            if (viewCatalog) {
                 if (auto collNames = _getExactNameMatches(matcher.get())) {
                     for (auto&& collName : *collNames) {
-                        auto nss = NamespaceString(db->name(), collName);
+                        auto nss = NamespaceString(dbname, collName);
 
                         // Only validate on a per-collection basis if the user requested
                         // a list of authorized collections
@@ -322,7 +329,13 @@ public:
                             continue;
                         }
 
-                        Lock::CollectionLock clk(opCtx, nss, MODE_IS);
+                        // In case lock-free reads are disabled, we must be able to take a
+                        // collection lock.
+                        boost::optional<Lock::CollectionLock> clk;
+                        if (!opCtx->isLockFreeReadsOp()) {
+                            clk.emplace(opCtx, nss, MODE_IS);
+                        }
+
                         CollectionPtr collection =
                             CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
                         BSONObj collBson =
@@ -333,21 +346,34 @@ public:
                         }
                     }
                 } else {
-                    mongo::catalog::forEachCollectionFromDb(
-                        opCtx, dbname, MODE_IS, [&](const CollectionPtr& collection) {
-                            if (authorizedCollections &&
-                                (!as->isAuthorizedForAnyActionOnResource(
-                                    ResourcePattern::forExactNamespace(collection->ns())))) {
-                                return true;
-                            }
-                            BSONObj collBson = buildCollectionBson(
-                                opCtx, collection, includePendingDrops, nameOnly);
-                            if (!collBson.isEmpty()) {
-                                _addWorkingSetMember(
-                                    opCtx, collBson, matcher.get(), ws.get(), root.get());
-                            }
+                    auto perCollectionWork = [&](const CollectionPtr& collection) {
+                        if (authorizedCollections &&
+                            (!as->isAuthorizedForAnyActionOnResource(
+                                ResourcePattern::forExactNamespace(collection->ns())))) {
                             return true;
-                        });
+                        }
+                        BSONObj collBson =
+                            buildCollectionBson(opCtx, collection, includePendingDrops, nameOnly);
+                        if (!collBson.isEmpty()) {
+                            _addWorkingSetMember(
+                                opCtx, collBson, matcher.get(), ws.get(), root.get());
+                        }
+                        return true;
+                    };
+
+                    // If we are lock-free we can just iterate over our collection catalog without
+                    // needing to yield as we don't take any locks.
+                    if (opCtx->isLockFreeReadsOp()) {
+                        auto collectionCatalog = CollectionCatalog::get(opCtx);
+                        for (auto it = collectionCatalog->begin(opCtx, dbname);
+                             it != collectionCatalog->end(opCtx);
+                             ++it) {
+                            perCollectionWork(*it);
+                        }
+                    } else {
+                        mongo::catalog::forEachCollectionFromDb(
+                            opCtx, dbname, MODE_IS, perCollectionWork);
+                    }
                 }
 
                 // Skipping views is only necessary for internal cloning operations.
@@ -356,7 +382,7 @@ public:
                         *parsed.getFilter() == ListCollectionsFilter::makeTypeCollectionFilter());
 
                 if (!skipViews) {
-                    ViewCatalog::get(db)->iterate(opCtx, [&](const ViewDefinition& view) {
+                    viewCatalog->iterate(opCtx, [&](const ViewDefinition& view) {
                         if (authorizedCollections &&
                             !as->isAuthorizedForAnyActionOnResource(
                                 ResourcePattern::forExactNamespace(view.name()))) {
@@ -372,13 +398,14 @@ public:
                 }
             }
 
-            exec =
-                uassertStatusOK(plan_executor_factory::make(expCtx,
-                                                            std::move(ws),
-                                                            std::move(root),
-                                                            &CollectionPtr::null,
-                                                            PlanYieldPolicy::YieldPolicy::NO_YIELD,
-                                                            cursorNss));
+            exec = uassertStatusOK(
+                plan_executor_factory::make(expCtx,
+                                            std::move(ws),
+                                            std::move(root),
+                                            &CollectionPtr::null,
+                                            PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                            false, /* whether owned BSON must be returned */
+                                            cursorNss));
 
             long long batchSize = std::numeric_limits<long long>::max();
             if (parsed.getCursor() && parsed.getCursor()->getBatchSize()) {
@@ -432,6 +459,9 @@ public:
              jsobj,
              uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
                                  ->checkAuthorizedToListCollections(dbname, jsobj))});
+
+        pinnedCursor->incNBatches();
+        pinnedCursor->incNReturnedSoFar(firstBatch.size());
 
         appendListCollectionsCursorReply(
             pinnedCursor.getCursor()->cursorid(), cursorNss, std::move(firstBatch), result);

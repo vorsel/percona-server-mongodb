@@ -61,8 +61,6 @@
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/dist_lock_catalog.h"
-#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -219,13 +217,30 @@ std::unique_ptr<ShardRegistry> ShardingMongodTestFixture::makeShardRegistry(
     return std::make_unique<ShardRegistry>(std::move(shardFactory), configConnStr);
 }
 
-std::unique_ptr<DistLockCatalog> ShardingMongodTestFixture::makeDistLockCatalog() {
-    return nullptr;
-}
-
-std::unique_ptr<DistLockManager> ShardingMongodTestFixture::makeDistLockManager(
-    std::unique_ptr<DistLockCatalog> distLockCatalog) {
-    return nullptr;
+std::unique_ptr<DistLockManager> ShardingMongodTestFixture::makeDistLockManager() {
+    class DistLockManagerNoop : public DistLockManager {
+    public:
+        DistLockManagerNoop() : DistLockManager(OID::gen()) {}
+        void startUp() override {}
+        void shutDown(OperationContext* opCtx) {}
+        std::string getProcessID() override {
+            return "DistLockManagerNoop";
+        }
+        Status lockDirect(OperationContext* opCtx,
+                          StringData name,
+                          StringData whyMessage,
+                          Milliseconds waitFor) override {
+            return Status::OK();
+        }
+        Status tryLockDirectWithLocalWriteConcern(OperationContext* opCtx,
+                                                  StringData name,
+                                                  StringData whyMessage) override {
+            return Status::OK();
+        }
+        void unlock(Interruptible* intr, StringData name) override {}
+        void unlockAll(OperationContext* opCtx) override {}
+    };
+    return std::make_unique<DistLockManagerNoop>();
 }
 
 std::unique_ptr<ClusterCursorManager> ShardingMongodTestFixture::makeClusterCursorManager() {
@@ -249,17 +264,11 @@ Status ShardingMongodTestFixture::initializeGlobalShardingStateForMongodForTest(
         executorPoolPtr->startup();
     }
 
-    auto distLockCatalogPtr = makeDistLockCatalog();
-    _distLockCatalog = distLockCatalogPtr.get();
-
-    auto distLockManagerPtr = makeDistLockManager(std::move(distLockCatalogPtr));
-    _distLockManager = distLockManagerPtr.get();
-
     auto catalogCache = std::make_unique<CatalogCache>(
         getServiceContext(), CatalogCacheLoader::get(getServiceContext()));
 
     auto const grid = Grid::get(operationContext());
-    grid->init(makeShardingCatalogClient(std::move(distLockManagerPtr)),
+    grid->init(makeShardingCatalogClient(),
                std::move(catalogCache),
                makeShardRegistry(configConnStr),
                makeClusterCursorManager(),
@@ -267,26 +276,28 @@ Status ShardingMongodTestFixture::initializeGlobalShardingStateForMongodForTest(
                std::move(executorPoolPtr),
                _mockNetwork);
 
-    if (grid->catalogClient()) {
-        grid->catalogClient()->startup();
+    DistLockManager::create(getServiceContext(), makeDistLockManager());
+    if (DistLockManager::get(operationContext())) {
+        DistLockManager::get(operationContext())->startUp();
     }
 
     return Status::OK();
 }
 
 void ShardingMongodTestFixture::setUp() {
+    ServiceContextMongoDTest::setUp();
     ShardingTestFixtureCommon::setUp();
 }
 
 void ShardingMongodTestFixture::tearDown() {
     ReplicaSetMonitor::cleanup();
 
-    if (Grid::get(operationContext())->getExecutorPool() && !_executorPoolShutDown) {
-        Grid::get(operationContext())->getExecutorPool()->shutdownAndJoin();
+    if (DistLockManager::get(operationContext())) {
+        DistLockManager::get(operationContext())->shutDown(operationContext());
     }
 
-    if (Grid::get(operationContext())->catalogClient()) {
-        Grid::get(operationContext())->catalogClient()->shutDown(operationContext());
+    if (Grid::get(operationContext())->getExecutorPool() && !_executorPoolShutDown) {
+        Grid::get(operationContext())->getExecutorPool()->shutdownAndJoin();
     }
 
     if (Grid::get(operationContext())->shardRegistry()) {

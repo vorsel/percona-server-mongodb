@@ -45,6 +45,7 @@
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/transport/session.h"
+#include "mongo/util/cancelation.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/decorable.h"
 #include "mongo/util/fail_point.h"
@@ -94,6 +95,8 @@ class OperationContext : public Interruptible, public Decorable<OperationContext
     OperationContext& operator=(const OperationContext&) = delete;
 
 public:
+    static constexpr auto kDefaultOperationContextTimeoutError = ErrorCodes::ExceededTimeLimit;
+
     OperationContext(Client* client, OperationId opId);
     virtual ~OperationContext();
 
@@ -227,6 +230,15 @@ public:
     }
 
     /**
+     * Returns a CancelationToken that will be canceled when the OperationContext is killed via
+     * markKilled (including for internal reasons, like the OperationContext deadline being
+     * reached).
+     */
+    CancelationToken getCancelationToken() {
+        return _cancelSource.token();
+    }
+
+    /**
      * Sets a transport Baton on the operation.  This will trigger the Baton on markKilled.
      */
     void setBaton(const BatonHandle& baton) {
@@ -286,7 +298,7 @@ public:
      * Returns true if the operation is running lock-free.
      */
     bool isLockFreeReadsOp() const {
-        return _isLockFreeReadsOp;
+        return _lockFreeReadOpCount;
     }
 
     /**
@@ -587,10 +599,13 @@ private:
     }
 
     /**
-     * Set whether or not the operation is running lock-free.
+     * Increment a count to indicate that the operation is running lock-free.
      */
-    void setIsLockFreeReadsOp(bool isLockFreeReadsOp) {
-        _isLockFreeReadsOp = isLockFreeReadsOp;
+    void incrementLockFreeReadOpCount() {
+        ++_lockFreeReadOpCount;
+    }
+    void decrementLockFreeReadOpCount() {
+        --_lockFreeReadOpCount;
     }
 
     friend class WriteUnitOfWork;
@@ -620,6 +635,10 @@ private:
     // once from OK to some kill code.
     AtomicWord<ErrorCodes::Error> _killCode{ErrorCodes::OK};
 
+    // Used to cancel all tokens obtained via getCancelationToken() when this OperationContext is
+    // killed.
+    CancelationSource _cancelSource;
+
     BatonHandle _baton;
 
     WriteConcernOptions _writeConcern;
@@ -627,7 +646,7 @@ private:
     // The timepoint at which this operation exceeds its time limit.
     Date_t _deadline = Date_t::max();
 
-    ErrorCodes::Error _timeoutError = ErrorCodes::ExceededTimeLimit;
+    ErrorCodes::Error _timeoutError = kDefaultOperationContextTimeoutError;
     bool _ignoreInterrupts = false;
     bool _hasArtificialDeadline = false;
     bool _markKillOnClientDisconnect = false;
@@ -648,11 +667,15 @@ private:
     Timer _elapsedTime;
 
     bool _writesAreReplicated = true;
-    bool _isLockFreeReadsOp = false;
     bool _shouldIncrementLatencyStats = true;
     bool _shouldParticipateInFlowControl = true;
     bool _inMultiDocumentTransaction = false;
     bool _isStartingMultiDocumentTransaction = false;
+
+    // Counts how many lock-free read operations are running nested.
+    // Necessary to use a counter rather than a boolean because there is existing code that
+    // destructs lock helpers out of order.
+    int _lockFreeReadOpCount = 0;
 
     // If true, this OpCtx will get interrupted during replica set stepUp and stepDown, regardless
     // of what locks it's taken.
@@ -705,20 +728,16 @@ class LockFreeReadsBlock {
     LockFreeReadsBlock& operator=(const LockFreeReadsBlock&) = delete;
 
 public:
-    LockFreeReadsBlock(OperationContext* opCtx)
-        : _opCtx(opCtx), _previousLockFreeReadsSetting(opCtx->isLockFreeReadsOp()) {
-        opCtx->setIsLockFreeReadsOp(true);
+    LockFreeReadsBlock(OperationContext* opCtx) : _opCtx(opCtx) {
+        _opCtx->incrementLockFreeReadOpCount();
     }
 
     ~LockFreeReadsBlock() {
-        _opCtx->setIsLockFreeReadsOp(_previousLockFreeReadsSetting);
+        _opCtx->decrementLockFreeReadOpCount();
     }
 
 private:
     OperationContext* _opCtx;
-
-    // Used to re-set the value on the operation context upon destruction that was originally set.
-    const bool _previousLockFreeReadsSetting;
 };
 
 }  // namespace mongo

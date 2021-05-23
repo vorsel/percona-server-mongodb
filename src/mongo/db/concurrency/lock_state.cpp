@@ -382,7 +382,7 @@ void LockerImpl::lockGlobal(OperationContext* opCtx, LockMode mode, Date_t deadl
             deadline = std::min(deadline,
                                 _maxLockTimeout ? beforeAcquire + *_maxLockTimeout : Date_t::max());
             uassert(ErrorCodes::LockTimeout,
-                    str::stream() << "Unable to acquire ticket with mode '" << _modeForTicket
+                    str::stream() << "Unable to acquire ticket with mode '" << mode
                                   << "' within a max lock request timeout of '"
                                   << Date_t::now() - beforeAcquire << "' milliseconds.",
                     _acquireTicket(opCtx, mode, deadline));
@@ -749,6 +749,11 @@ bool LockerImpl::saveLockStateAndUnlock(Locker::LockSnapshot* stateOut) {
     LockRequestsMap::Iterator rstlRequest =
         _requests.find(resourceIdReplicationStateTransitionLock);
     if (globalRequest->recursiveCount > 1 || (rstlRequest && rstlRequest->recursiveCount > 1)) {
+        return false;
+    }
+
+    // If the RSTL is exclusive, then this operation should not yield.
+    if (rstlRequest && rstlRequest->mode != MODE_IX) {
         return false;
     }
 

@@ -38,6 +38,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/db/views/durable_view_catalog.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -45,6 +46,7 @@ namespace mongo {
 using std::string;
 
 namespace {
+
 /**
  * Validates the nesting depth of 'obj', returning a non-OK status if it exceeds the limit.
  */

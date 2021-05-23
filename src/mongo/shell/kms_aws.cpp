@@ -66,6 +66,8 @@ struct AWSConfig {
     boost::optional<std::string> sessionToken;
 };
 
+constexpr auto kAwsKms = "aws"_sd;
+
 /**
  * Manages SSL information and config for how to talk to AWS KMS.
  */
@@ -73,15 +75,19 @@ class AWSKMSService final : public KMSService {
 public:
     AWSKMSService() = default;
 
-    static std::unique_ptr<KMSService> create(const AwsKMS& config);
+    StringData name() const {
+        return kAwsKms;
+    }
 
-    std::vector<uint8_t> encrypt(ConstDataRange cdr, StringData kmsKeyId) final;
+    static std::unique_ptr<KMSService> create(const AwsKMS& config);
 
     SecureVector<uint8_t> decrypt(ConstDataRange cdr, BSONObj masterKey) final;
 
-    BSONObj encryptDataKey(ConstDataRange cdr, StringData keyId) final;
+    BSONObj encryptDataKeyByString(ConstDataRange cdr, StringData keyId) final;
 
 private:
+    std::vector<uint8_t> encrypt(ConstDataRange cdr, StringData kmsKeyId);
+
     void initRequest(kms_request_t* request, StringData host, StringData region);
 
 private:
@@ -127,25 +133,6 @@ void AWSKMSService::initRequest(kms_request_t* request, StringData host, StringD
     }
 }
 
-std::vector<uint8_t> toVector(const std::string& str) {
-    std::vector<uint8_t> blob;
-
-    std::transform(std::begin(str), std::end(str), std::back_inserter(blob), [](auto c) {
-        return static_cast<uint8_t>(c);
-    });
-
-    return blob;
-}
-
-SecureVector<uint8_t> toSecureVector(const std::string& str) {
-    SecureVector<uint8_t> blob(str.length());
-
-    std::transform(std::begin(str), std::end(str), blob->data(), [](auto c) {
-        return static_cast<uint8_t>(c);
-    });
-
-    return blob;
-}
 
 /**
  * Takes in a CMK of the format arn:partition:service:region:account-id:resource (minimum). We
@@ -209,10 +196,10 @@ std::vector<uint8_t> AWSKMSService::encrypt(ConstDataRange cdr, StringData kmsKe
 
     auto blobStr = base64::decode(awsResponse.getCiphertextBlob().toString());
 
-    return toVector(blobStr);
+    return kmsResponseToVector(blobStr);
 }
 
-BSONObj AWSKMSService::encryptDataKey(ConstDataRange cdr, StringData keyId) {
+BSONObj AWSKMSService::encryptDataKeyByString(ConstDataRange cdr, StringData keyId) {
     auto dataKey = encrypt(cdr, keyId);
 
     AwsMasterKey masterKey;
@@ -270,7 +257,7 @@ SecureVector<uint8_t> AWSKMSService::decrypt(ConstDataRange cdr, BSONObj masterK
 
     auto blobStr = base64::decode(awsResponse.getPlaintext().toString());
 
-    return toSecureVector(blobStr);
+    return kmsResponseToSecureVector(blobStr);
 }
 
 boost::optional<std::string> toString(boost::optional<StringData> str) {
@@ -324,11 +311,10 @@ public:
 
 }  // namespace
 
-MONGO_INITIALIZER(KMSRegister)(::mongo::InitializerContext* context) {
+MONGO_INITIALIZER(KMSRegisterAWS)(::mongo::InitializerContext*) {
     kms_message_init();
     KMSServiceController::registerFactory(KMSProviderEnum::aws,
                                           std::make_unique<AWSKMSServiceFactory>());
-    return Status::OK();
 }
 
 }  // namespace mongo

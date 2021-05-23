@@ -38,21 +38,11 @@ class OplogFetcherMock : public OplogFetcher {
 public:
     explicit OplogFetcherMock(
         executor::TaskExecutor* executor,
-        OpTime lastFetched,
-        HostAndPort source,
-        ReplSetConfig config,
         std::unique_ptr<OplogFetcherRestartDecision> oplogFetcherRestartDecision,
-        int requiredRBID,
-        bool requireFresherSyncSource,
         DataReplicatorExternalState* dataReplicatorExternalState,
         EnqueueDocumentsFn enqueueDocumentsFn,
         OnShutdownCallbackFn onShutdownCallbackFn,
-        const int batchSize,
-        StartingPoint startingPoint = StartingPoint::kSkipFirstDoc,
-        BSONObj filter = BSONObj(),
-        ReadConcernArgs readConcern = ReadConcernArgs(),
-        bool requestResumeToken = false,
-        StringData name = "oplog fetcher"_sd);
+        Config config);
 
     virtual ~OplogFetcherMock();
 
@@ -111,6 +101,11 @@ private:
     // This promise is fulfilled with an exit status when the OplogFetcher finishes running and
     // _onShutdownCallbackFn will be called with the status.
     std::unique_ptr<SharedPromise<void>> _finishPromise = std::make_unique<SharedPromise<void>>();
+
+    // Mutex to ensure we call join() on the _waitForFinishThread only once.  This mutex should
+    // never be held when _mutex is held.
+    mutable Mutex _joinFinishThreadMutex =
+        MONGO_MAKE_LATCH("OplogFetcherMock::_joinFinishThreadMutex");
 
     // Thread to wait for _finishPromise and call _onShutdownCallbackFn with the given status only
     // once before the OplogFetcher finishes.

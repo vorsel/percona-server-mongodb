@@ -43,7 +43,6 @@
 #include "mongo/db/s/sharding_mongod_test_fixture.h"
 #include "mongo/db/s/type_shard_identity.h"
 #include "mongo/db/server_options.h"
-#include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/config_server_catalog_cache_loader.h"
 
@@ -65,12 +64,11 @@ public:
         // NOTE: this assumes that globalInit will always be called on the same thread as the main
         // test thread
         ShardingInitializationMongoD::get(operationContext())
-            ->setGlobalInitMethodForTest([this](OperationContext* opCtx,
-                                                const ShardIdentity& shardIdentity,
-                                                StringData distLockProcessId) {
-                _initCallCount++;
-                return Status::OK();
-            });
+            ->setGlobalInitMethodForTest(
+                [this](OperationContext* opCtx, const ShardIdentity& shardIdentity) {
+                    _initCallCount++;
+                    return Status::OK();
+                });
     }
 
     void tearDown() override {

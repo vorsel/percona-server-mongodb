@@ -1101,11 +1101,6 @@ private:
                                std::function<void()> startCompleted = nullptr);
 
     /**
-     * Stops replicating data by stopping the applier, fetcher and such.
-     */
-    void _stopDataReplication(OperationContext* opCtx);
-
-    /**
      * Finishes the work of processReplSetInitiate() in the event of a successful quorum check.
      */
     void _finishReplSetInitiate(OperationContext* opCtx,
@@ -1660,6 +1655,11 @@ private:
     boost::optional<long long> _pendingTermUpdateDuringStepDown;  // (M)
 
     AtomicWord<bool> _startedSteadyStateReplication{false};
+
+    // If we're waiting to get the RSTL at stepdown and therefore should claim we don't allow
+    // writes.  This is a counter rather than a flag because there are scenarios where multiple
+    // stepdowns are attempted at once.
+    short _waitingForRSTLAtStepDown = 0;
 
     // If we're in terminal shutdown.  If true, we'll refuse to vote in elections.
     bool _inTerminalShutdown = false;  // (M)

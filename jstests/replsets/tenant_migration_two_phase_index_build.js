@@ -14,7 +14,9 @@ load("jstests/libs/uuid_util.js");
 load("jstests/replsets/libs/tenant_migration_test.js");
 load("jstests/replsets/libs/tenant_migration_util.js");
 
-const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
+// TODO SERVER-48862: Remove 'enableRecipientTesting: false'.
+const tenantMigrationTest =
+    new TenantMigrationTest({name: jsTestName(), enableRecipientTesting: false});
 if (!tenantMigrationTest.isFeatureFlagEnabled()) {
     jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
     tenantMigrationTest.stop();
@@ -55,7 +57,8 @@ const migrationOpts = {
 const donorRstArgs = TenantMigrationUtil.createRstArgs(tenantMigrationTest.getDonorRst());
 
 // Start a migration, and pause it after the donor has majority-committed the initial state doc.
-const dataSyncFp = configureFailPoint(donorPrimary, "pauseTenantMigrationAfterDataSync");
+const dataSyncFp =
+    configureFailPoint(donorPrimary, "pauseTenantMigrationBeforeLeavingDataSyncState");
 const migrationThread =
     new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 migrationThread.start();
@@ -77,6 +80,7 @@ assert.soon(() => {
 });
 hangIndexBuildFp.off();
 assert.commandWorked(migrationThread.returnData());
+assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 
 // Verify that the index build failed and cleaned up correctly.
 indexBuildThread.join();

@@ -34,7 +34,6 @@
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/repl/optime_with.h"
-#include "mongo/db/s/config/namespace_serializer.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -47,14 +46,7 @@
 
 namespace mongo {
 
-struct CollectionOptions;
-class OperationContext;
-class RemoteCommandTargeter;
-class ServiceContext;
-class UUID;
-
 struct RemoveShardProgress {
-
     /**
      * Used to indicate to the caller of the removeShard method whether draining of chunks for
      * a particular shard has started, is ongoing, or has been completed.
@@ -89,7 +81,6 @@ struct RemoveShardProgress {
 class ShardingCatalogManager {
     ShardingCatalogManager(const ShardingCatalogManager&) = delete;
     ShardingCatalogManager& operator=(const ShardingCatalogManager&) = delete;
-    friend class ConfigSvrShardCollectionCommand;
 
 public:
     ShardingCatalogManager(ServiceContext* serviceContext,
@@ -319,13 +310,6 @@ public:
                                 const ShardId& primaryShard);
 
     /**
-     * Creates a ScopedLock on the database name in _namespaceSerializer. This is to prevent
-     * timeouts waiting on the dist lock if multiple threads attempt to create or drop the same db.
-     */
-    NamespaceSerializer::ScopedLock serializeCreateOrDropDatabase(OperationContext* opCtx,
-                                                                  StringData dbName);
-
-    /**
      * Creates the database if it does not exist, then marks its entry in config.databases as
      * sharding-enabled.
      *
@@ -394,14 +378,6 @@ public:
                                                       const bool upsert,
                                                       TxnNumber txnNumber);
 
-    /**
-     * Creates a ScopedLock on the collection name in _namespaceSerializer. This is to prevent
-     * timeouts waiting on the dist lock if multiple threads attempt to create or drop the same
-     * collection.
-     */
-    NamespaceSerializer::ScopedLock serializeCreateOrDropCollection(OperationContext* opCtx,
-                                                                    const NamespaceString& nss);
-
     //
     // Shard Operations
     //
@@ -456,20 +432,20 @@ public:
     void removePre49LegacyMetadata(OperationContext* opCtx);
 
     /**
-     * Creates a 'timestamp' for each one of the entries in the config server's config.collections,
-     * where 'timestamp' does not already exist.
+     * Patches-up persistent metadata for 4.9.
      *
-     * It shall be called when upgrading to 4.9.
+     * It shall be called when upgrading to 4.9 or newer versions.
+     * TODO SERVER-53283: Remove once 5.0 has been released.
      */
-    void createCollectionTimestampsFor49(OperationContext* opCtx);
+    void upgradeMetadataFor49(OperationContext* opCtx);
 
     /**
-     * Downgrades the config.collections entries to prior 4.9 version. More specifically, it removes
-     * the 'timestamp' field from all the documents in config.collections.
+     * Patches-up persistent metadata for downgrade from 4.9.
      *
      * It shall be called when downgrading from 4.9 to an earlier version.
+     * TODO SERVER-53283: Remove once 5.0 has been released.
      */
-    void downgradeConfigCollectionEntriesToPre49(OperationContext* opCtx);
+    void downgradeMetadataToPre49(OperationContext* opCtx);
 
     //
     // For Diagnostics
@@ -587,6 +563,86 @@ private:
                                                       const std::string& shardName,
                                                       const std::string& zoneName);
 
+    /**
+     * Creates a 'version.timestamp' for each one of the entries in the config server's
+     * config.databases where it didn't already exist before.
+     *
+     * TODO SERVER-53283: Remove once 5.0 has been released.
+     */
+    void _createDBTimestampsFor49(OperationContext* opCtx);
+
+    /**
+     * Downgrades the config.databases entries to prior 4.9 version. More specifically, it removes
+     * the 'version.timestamp' field from all the documents in config.databases.
+     *
+     * TODO SERVER-53283: Remove once 5.0 has been released.
+     */
+    void _downgradeConfigDatabasesEntriesToPre49(OperationContext* opCtx);
+
+    /**
+     * For each one of the entries in config.collections where there is no 'timestamp',
+     * transactionally:
+     * - Patches-up the entries in config.chunks with a 'ns' matching that of the collection to add
+     * a 'collectionUuid' field matching the uuid of the collection.
+     * - Creates a 'timestamp' in its entry in config.collections.
+     *
+     * TODO SERVER-53283: Remove once 5.0 has been released.
+     */
+    void _upgradeCollectionsAndChunksMetadataFor49(OperationContext* opCtx);
+
+    /**
+     * For each one of the entries in config.collections where there is a 'timestamp',
+     * transactionally:
+     * - Patches-up the entries in config.chunks with a 'ns' matching that of the collection to
+     * unset the 'collectionUuid' field.
+     * - Unsets the 'timestamp' in its entry in config.collections.
+     *
+     * TODO SERVER-53283: Remove once 5.0 has been released.
+     */
+    void _downgradeCollectionsAndChunksMetadataToPre49(OperationContext* opCtx);
+
+    /**
+     * Sets the 'timestamp' field for the entry matching nss in config.collections, in a
+     * transaction.
+     *
+     * TODO SERVER-53283: Remove once 5.0 has been released.
+     */
+    void _addTimestampToConfigCollectionsFor49InTxn(OperationContext* opCtx,
+                                                    const NamespaceString& nss,
+                                                    TxnNumber txnNumber,
+                                                    const Timestamp& newTimestamp);
+
+    /**
+     * Deletes the 'timestamp' from the entry in config.collections matching nss, in a transaction.
+     *
+     * TODO SERVER-53283: Remove once 5.0 has been released.
+     */
+    void _deleteTimestampFromConfigCollectionsInTxn(OperationContext* opCtx,
+                                                    const NamespaceString& nss,
+                                                    TxnNumber txnNumber);
+
+    /**
+     * Sets the 'timestamp' and the 'collectionUuid' fields for the entries matching nss in
+     * config.chunks, in a transaction.
+     *
+     * TODO SERVER-53283: Remove once 5.0 has been released.
+     */
+    void _addTimestampAndUUIDToConfigChunksFor49InTxn(OperationContext* opCtx,
+                                                      const NamespaceString& nss,
+                                                      const mongo::UUID& collectionUuid,
+                                                      TxnNumber txnNumber,
+                                                      const Timestamp& newTimestamp);
+
+    /**
+     * Deletes the 'timestamp' and 'collectionUuid' field for the entries matching nss in
+     * config.chunks, in a transaction.
+     *
+     * TODO SERVER-53283: Remove once 5.0 has been released.
+     */
+    void _deleteTimestampAndUUIDFromConfigChunksInTxn(OperationContext* opCtx,
+                                                      const NamespaceString& nss,
+                                                      TxnNumber txnNumber);
+
     // The owning service context
     ServiceContext* const _serviceContext;
 
@@ -642,12 +698,6 @@ private:
      * requests).
      */
     Lock::ResourceMutex _kShardMembershipLock;
-
-    /**
-     * Optimization for DDL operations, which might be tried concurrently by multiple threads.
-     * Avoids convoying and timeouts on the database/collection distributed lock.
-     */
-    NamespaceSerializer _namespaceSerializer;
 };
 
 }  // namespace mongo

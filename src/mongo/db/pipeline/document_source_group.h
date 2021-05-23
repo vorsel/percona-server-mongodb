@@ -116,7 +116,7 @@ public:
      * specification.
      */
     static boost::intrusive_ptr<DocumentSource> createFromBson(
-        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& pExpCtx);
+        BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx);
 
     StageConstraints constraints(Pipeline::SplitState pipeState) const final {
         StageConstraints constraints(StreamType::kBlocking,
@@ -159,7 +159,13 @@ public:
     /**
      * Returns true if this $group stage used disk during execution and false otherwise.
      */
-    bool usedDisk() final;
+    bool usedDisk() final {
+        return _stats.usedDisk;
+    }
+
+    const SpecificStats* getSpecificStats() const final {
+        return &_stats;
+    }
 
     boost::optional<DistributedPlanLogic> distributedPlanLogic() final;
     bool canRunInParallelBeforeWriteStage(
@@ -183,21 +189,24 @@ protected:
 
 private:
     struct MemoryUsageTracker {
-        /**
-         * Cleans up any pending memory usage. Throws error, if memory usage is above
-         * 'maxMemoryUsageBytes' and cannot spill to disk. The 'saveMemory' function should return
-         * the amount of memory saved by the cleanup.
-         *
-         * Returns true, if the caller should spill to disk, false otherwise.
-         */
-        bool shouldSpillWithAttemptToSaveMemory(std::function<int()> saveMemory);
+        struct AccumStatementMemoryTracker {
+            // Maximum memory consumption thus far observed. Only updated when data is spilled to
+            // disk during execution of the $group.
+            uint64_t maxMemoryBytes;
+            // Tracks the current memory footprint.
+            uint64_t currentMemoryBytes;
+        };
 
         const bool allowDiskUse;
         const size_t maxMemoryUsageBytes;
+
+        // Tracks current memory used. This variable will be reset if data is spilled to disk.
         size_t memoryUsageBytes = 0;
+        // Tracks memory consumption per accumulation statement.
+        std::vector<AccumStatementMemoryTracker> accumStatementMemoryBytes;
     };
 
-    explicit DocumentSourceGroup(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
+    explicit DocumentSourceGroup(const boost::intrusive_ptr<ExpressionContext>& expCtx,
                                  boost::optional<size_t> maxMemoryUsageBytes = boost::none);
 
     ~DocumentSourceGroup();
@@ -253,12 +262,22 @@ private:
      */
     bool pathIncludedInGroupKeys(const std::string& dottedPath) const;
 
+    /**
+     * Cleans up any pending memory usage. Throws error, if memory usage is above
+     * 'maxMemoryUsageBytes' and cannot spill to disk. The 'saveMemory' function should return
+     * the amount of memory saved by the cleanup.
+     *
+     * Returns true, if the caller should spill to disk, false otherwise.
+     */
+    bool shouldSpillWithAttemptToSaveMemory(std::function<int()> saveMemory);
+
     std::vector<AccumulationStatement> _accumulatedFields;
 
-    bool _usedDisk;  // Keeps track of whether this $group spilled to disk.
     bool _doingMerge;
 
     MemoryUsageTracker _memoryTracker;
+
+    GroupStats _stats;
 
     std::string _fileName;
     std::streampos _nextSortedFileWriterOffset = 0;

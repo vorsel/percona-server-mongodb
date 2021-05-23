@@ -52,7 +52,6 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/s/catalog/config_server_version.h"
-#include "mongo/s/catalog/dist_lock_manager.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_config_version.h"
@@ -135,32 +134,9 @@ void sendRetryableWriteBatchRequestToConfig(OperationContext* opCtx,
 
 }  // namespace
 
-ShardingCatalogClientImpl::ShardingCatalogClientImpl(
-    std::unique_ptr<DistLockManager> distLockManager)
-    : _distLockManager(std::move(distLockManager)) {}
+ShardingCatalogClientImpl::ShardingCatalogClientImpl() = default;
 
 ShardingCatalogClientImpl::~ShardingCatalogClientImpl() = default;
-
-void ShardingCatalogClientImpl::startup() {
-    stdx::lock_guard<Latch> lk(_mutex);
-    if (_started) {
-        return;
-    }
-
-    _started = true;
-    _distLockManager->startUp();
-}
-
-void ShardingCatalogClientImpl::shutDown(OperationContext* opCtx) {
-    LOGV2_DEBUG(22673, 1, "ShardingCatalogClientImpl::shutDown() called.");
-    {
-        stdx::lock_guard<Latch> lk(_mutex);
-        _inShutdown = true;
-    }
-
-    invariant(_distLockManager);
-    _distLockManager->shutDown(opCtx);
-}
 
 Status ShardingCatalogClientImpl::updateShardingCatalogEntryForCollection(
     OperationContext* opCtx,
@@ -185,17 +161,13 @@ DatabaseType ShardingCatalogClientImpl::getDatabase(OperationContext* opCtx,
 
     // The admin database is always hosted on the config server.
     if (dbName == NamespaceString::kAdminDb)
-        return DatabaseType(dbName.toString(),
-                            ShardRegistry::kConfigServerShardId,
-                            false,
-                            DatabaseVersion::makeFixed());
+        return DatabaseType(
+            dbName.toString(), ShardId::kConfigServerId, false, DatabaseVersion::makeFixed());
 
     // The config database's primary shard is always config, and it is always sharded.
     if (dbName == NamespaceString::kConfigDb)
-        return DatabaseType(dbName.toString(),
-                            ShardRegistry::kConfigServerShardId,
-                            true,
-                            DatabaseVersion::makeFixed());
+        return DatabaseType(
+            dbName.toString(), ShardId::kConfigServerId, true, DatabaseVersion::makeFixed());
 
     auto result =
         _fetchDatabaseMetadata(opCtx, dbName.toString(), kConfigReadSelector, readConcernLevel);
@@ -711,21 +683,6 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
     return Status::OK();
 }
 
-DistLockManager* ShardingCatalogClientImpl::getDistLockManager() {
-    invariant(_distLockManager);
-    return _distLockManager.get();
-}
-
-void ShardingCatalogClientImpl::writeConfigServerDirect(OperationContext* opCtx,
-                                                        const BatchedCommandRequest& batchRequest,
-                                                        BatchedCommandResponse* batchResponse) {
-    auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-    *batchResponse = configShard->runBatchWriteCommand(opCtx,
-                                                       Shard::kDefaultConfigCommandTimeout,
-                                                       batchRequest,
-                                                       Shard::RetryPolicy::kNotIdempotent);
-}
-
 Status ShardingCatalogClientImpl::insertConfigDocument(OperationContext* opCtx,
                                                        const NamespaceString& nss,
                                                        const BSONObj& doc,
@@ -945,7 +902,7 @@ StatusWith<std::vector<KeysCollectionDocument>> ShardingCatalogClientImpl::getNe
     auto findStatus = config->exhaustiveFindOnConfig(opCtx,
                                                      kConfigReadSelector,
                                                      readConcernLevel,
-                                                     KeysCollectionDocument::ConfigNS,
+                                                     NamespaceString::kKeysCollectionNamespace,
                                                      queryBuilder.obj(),
                                                      BSON("expiresAt" << 1),
                                                      boost::none);
@@ -957,12 +914,13 @@ StatusWith<std::vector<KeysCollectionDocument>> ShardingCatalogClientImpl::getNe
     const auto& keyDocs = findStatus.getValue().docs;
     std::vector<KeysCollectionDocument> keys;
     for (auto&& keyDoc : keyDocs) {
-        auto parseStatus = KeysCollectionDocument::fromBSON(keyDoc);
-        if (!parseStatus.isOK()) {
-            return parseStatus.getStatus();
+        KeysCollectionDocument key;
+        try {
+            key = KeysCollectionDocument::parse(IDLParserErrorContext("keyDoc"), keyDoc);
+        } catch (...) {
+            return exceptionToStatus();
         }
-
-        keys.push_back(std::move(parseStatus.getValue()));
+        keys.push_back(std::move(key));
     }
 
     return keys;

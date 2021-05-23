@@ -35,23 +35,62 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/query/collation/collation_spec.h"
+#include "mongo/db/repl/oplog_applier.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/s/migration_destination_manager.h"
 #include "mongo/db/s/resharding/resharding_collection_cloner.h"
+#include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding_util.h"
+#include "mongo/db/s/shard_key_util.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/executor/network_interface_factory.h"
+#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_shard_version_helpers.h"
+#include "mongo/util/future_util.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(removeRecipientDocFailpoint);
+
+namespace {
+
+std::shared_ptr<executor::ThreadPoolTaskExecutor> makeTaskExecutor(StringData name,
+                                                                   size_t maxThreads) {
+    ThreadPool::Limits threadPoolLimits;
+    threadPoolLimits.maxThreads = maxThreads;
+
+    ThreadPool::Options threadPoolOptions(std::move(threadPoolLimits));
+    threadPoolOptions.threadNamePrefix = name + "-";
+    threadPoolOptions.poolName = name + "ThreadPool";
+
+    auto executor = std::make_shared<executor::ThreadPoolTaskExecutor>(
+        std::make_unique<ThreadPool>(std::move(threadPoolOptions)),
+        executor::makeNetworkInterface(name + "Network"));
+
+    executor->startup();
+    return executor;
+}
+
+/**
+ * Fulfills the promise if it is not already. Otherwise, does nothing.
+ */
+void ensureFulfilledPromise(WithLock lk, SharedPromise<void>& sp) {
+    if (!sp.getFuture().isReady()) {
+        sp.emplaceValue();
+    }
+}
+}  // namespace
 
 namespace resharding {
 
 void createTemporaryReshardingCollectionLocally(OperationContext* opCtx,
                                                 const NamespaceString& originalNss,
+                                                const NamespaceString& reshardingNss,
                                                 const UUID& reshardingUUID,
                                                 const UUID& existingUUID,
                                                 Timestamp fetchTimestamp) {
@@ -59,45 +98,41 @@ void createTemporaryReshardingCollectionLocally(OperationContext* opCtx,
         5002300, 1, "Creating temporary resharding collection", "originalNss"_attr = originalNss);
 
     auto catalogCache = Grid::get(opCtx)->catalogCache();
-    auto reshardingNss = constructTemporaryReshardingNss(originalNss.db(), existingUUID);
 
     // Load the original collection's options from the database's primary shard.
-    auto [collOptions, uuid] =
-        shardVersionRetry(opCtx,
-                          catalogCache,
-                          reshardingNss,
-                          "loading collection options to create temporary resharding collection"_sd,
-                          [&]() -> MigrationDestinationManager::CollectionOptionsAndUUID {
-                              auto originalCm = uassertStatusOK(
-                                  catalogCache->getCollectionRoutingInfo(opCtx, originalNss));
-                              return MigrationDestinationManager::getCollectionOptions(
-                                  opCtx,
-                                  NamespaceStringOrUUID(originalNss.db().toString(), existingUUID),
-                                  originalCm.dbPrimary(),
-                                  originalCm,
-                                  fetchTimestamp);
-                          });
-
-    // Load the original collection's indexes from the shard that owns the global minimum chunk.
-    auto [indexes, idIndex] = shardVersionRetry(
+    auto [collOptions, uuid] = shardVersionRetry(
         opCtx,
         catalogCache,
         reshardingNss,
-        "loading indexes to create temporary resharding collection"_sd,
-        [&]() -> MigrationDestinationManager::IndexesAndIdIndex {
-            auto originalCm =
-                uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, originalNss));
-            uassert(ErrorCodes::NamespaceNotSharded,
-                    str::stream() << "Expected collection " << originalNss << " to be sharded",
-                    originalCm.isSharded());
-            auto indexShardId = originalCm.getMinKeyShardIdWithSimpleCollation();
-            return MigrationDestinationManager::getCollectionIndexes(
+        "loading collection options to create temporary resharding collection"_sd,
+        [&]() -> MigrationDestinationManager::CollectionOptionsAndUUID {
+            auto originalCm = uassertStatusOK(
+                catalogCache->getShardedCollectionRoutingInfoWithRefresh(opCtx, originalNss));
+            return MigrationDestinationManager::getCollectionOptions(
                 opCtx,
                 NamespaceStringOrUUID(originalNss.db().toString(), existingUUID),
-                indexShardId,
+                originalCm.dbPrimary(),
                 originalCm,
                 fetchTimestamp);
         });
+
+    // Load the original collection's indexes from the shard that owns the global minimum chunk.
+    auto [indexes, idIndex] =
+        shardVersionRetry(opCtx,
+                          catalogCache,
+                          reshardingNss,
+                          "loading indexes to create temporary resharding collection"_sd,
+                          [&]() -> MigrationDestinationManager::IndexesAndIdIndex {
+                              auto originalCm =
+                                  catalogCache->getShardedCollectionRoutingInfo(opCtx, originalNss);
+                              auto indexShardId = originalCm.getMinKeyShardIdWithSimpleCollation();
+                              return MigrationDestinationManager::getCollectionIndexes(
+                                  opCtx,
+                                  NamespaceStringOrUUID(originalNss.db().toString(), existingUUID),
+                                  indexShardId,
+                                  originalCm,
+                                  fetchTimestamp);
+                          });
 
     // Set the temporary resharding collection's UUID to the resharding UUID. Note that
     // BSONObj::addFields() replaces any fields that already exist.
@@ -124,26 +159,27 @@ ReshardingRecipientService::RecipientStateMachine::RecipientStateMachine(
 
 ReshardingRecipientService::RecipientStateMachine::~RecipientStateMachine() {
     stdx::lock_guard<Latch> lg(_mutex);
-    invariant(_allDonorsMirroring.getFuture().isReady());
-    invariant(_coordinatorHasCommitted.getFuture().isReady());
+    invariant(_coordinatorHasDecisionPersisted.getFuture().isReady());
     invariant(_completionPromise.getFuture().isReady());
 }
 
 SemiFuture<void> ReshardingRecipientService::RecipientStateMachine::run(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
-    const CancelationToken& token) noexcept {
+    const CancelationToken& cancelToken) noexcept {
     return ExecutorFuture<void>(**executor)
         .then([this] { _transitionToCreatingTemporaryReshardingCollection(); })
         .then([this] { _createTemporaryReshardingCollectionThenTransitionToCloning(); })
-        .then([this, executor] { return _cloneThenTransitionToApplying(executor); })
+        .then([this, executor, cancelToken] {
+            return _cloneThenTransitionToApplying(executor, cancelToken);
+        })
         .then([this] { return _applyThenTransitionToSteadyState(); })
         .then([this, executor] {
             return _awaitAllDonorsMirroringThenTransitionToStrictConsistency(executor);
         })
         .then([this, executor] {
-            return _awaitCoordinatorHasCommittedThenTransitionToRenaming(executor);
+            return __awaitCoordinatorHasDecisionPersistedThenTransitionToRenaming(executor);
         })
-        .then([this] { _renameTemporaryReshardingCollectionThenDeleteLocalState(); })
+        .then([this] { _renameTemporaryReshardingCollection(); })
         .onError([this](Status status) {
             LOGV2(4956500,
                   "Resharding operation recipient state machine failed",
@@ -152,17 +188,24 @@ SemiFuture<void> ReshardingRecipientService::RecipientStateMachine::run(
                   "error"_attr = status);
             // TODO SERVER-50584 Report errors to the coordinator so that the resharding operation
             // can be aborted.
-            this->_transitionStateToError(status);
+            _transitionStateToError(status);
             return status;
         })
-        .onCompletion([this](Status status) {
+        .onCompletion([this, self = shared_from_this()](Status status) {
             stdx::lock_guard<Latch> lg(_mutex);
             if (_completionPromise.getFuture().isReady()) {
-                // interrupt() was called before we got her.e
+                // interrupt() was called before we got here.
                 return;
             }
 
+            removeRecipientDocFailpoint.pauseWhileSet();
+
             if (status.isOK()) {
+                // The shared_ptr stored in the PrimaryOnlyService's map for the
+                // ReshardingRecipientService Instance is removed when the recipient state document
+                // tied to the instance is deleted. It is necessary to use shared_from_this() to
+                // extend the lifetime so the code can safely finish executing.
+                _removeRecipientDocument();
                 _completionPromise.emplaceValue();
             } else {
                 // Set error on all promises
@@ -176,12 +219,20 @@ void ReshardingRecipientService::RecipientStateMachine::interrupt(Status status)
     // Resolve any unresolved promises to avoid hanging.
     stdx::lock_guard<Latch> lg(_mutex);
 
-    if (!_allDonorsMirroring.getFuture().isReady()) {
-        _allDonorsMirroring.setError(status);
+    if (_oplogFetcherExecutor) {
+        _oplogFetcherExecutor->shutdown();
     }
 
-    if (!_coordinatorHasCommitted.getFuture().isReady()) {
-        _coordinatorHasCommitted.setError(status);
+    for (auto&& fetcher : _oplogFetchers) {
+        fetcher->interrupt(status);
+    }
+
+    for (auto&& threadPool : _oplogApplierWorkers) {
+        threadPool->shutdown();
+    }
+
+    if (!_coordinatorHasDecisionPersisted.getFuture().isReady()) {
+        _coordinatorHasDecisionPersisted.setError(status);
     }
 
     if (!_completionPromise.getFuture().isReady()) {
@@ -190,7 +241,22 @@ void ReshardingRecipientService::RecipientStateMachine::interrupt(Status status)
 }
 
 void ReshardingRecipientService::RecipientStateMachine::onReshardingFieldsChanges(
-    boost::optional<TypeCollectionReshardingFields> reshardingFields) {}
+    const TypeCollectionReshardingFields& reshardingFields) {
+    auto coordinatorState = reshardingFields.getState();
+    if (coordinatorState == CoordinatorStateEnum::kError) {
+        // TODO SERVER-52838: Investigate if we want to have a special error code so the recipient
+        // knows when it has recieved the error from the coordinator rather than needing to report
+        // an error to the coordinator.
+        interrupt({ErrorCodes::InternalError,
+                   "ReshardingDonorService observed CoordinatorStateEnum::kError"});
+        return;
+    }
+
+    stdx::lock_guard<Latch> lk(_mutex);
+    if (coordinatorState >= CoordinatorStateEnum::kDecisionPersisted) {
+        ensureFulfilledPromise(lk, _coordinatorHasDecisionPersisted);
+    }
+}
 
 void ReshardingRecipientService::RecipientStateMachine::
     _transitionToCreatingTemporaryReshardingCollection() {
@@ -209,11 +275,33 @@ void ReshardingRecipientService::RecipientStateMachine::
 
     {
         auto opCtx = cc().makeOperationContext();
+        auto tempNss = constructTemporaryReshardingNss(_recipientDoc.getNss().db(),
+                                                       _recipientDoc.getExistingUUID());
+
         resharding::createTemporaryReshardingCollectionLocally(opCtx.get(),
                                                                _recipientDoc.getNss(),
+                                                               tempNss,
                                                                _recipientDoc.get_id(),
                                                                _recipientDoc.getExistingUUID(),
                                                                *_recipientDoc.getFetchTimestamp());
+
+        ShardKeyPattern shardKeyPattern(_recipientDoc.getReshardingKey());
+
+        auto catalogCache = Grid::get(opCtx.get())->catalogCache();
+        shardVersionRetry(opCtx.get(),
+                          catalogCache,
+                          tempNss,
+                          "validating shard key index for reshardCollection"_sd,
+                          [&] {
+                              shardkeyutil::validateShardKeyIndexExistsOrCreateIfPossible(
+                                  opCtx.get(),
+                                  tempNss,
+                                  shardKeyPattern.toBSON(),
+                                  shardKeyPattern,
+                                  CollationSpec::kSimpleSpec,
+                                  false,
+                                  shardkeyutil::ValidationBehaviorsShardCollection(opCtx.get()));
+                          });
     }
 
     _transitionState(RecipientStateEnum::kCloning);
@@ -221,7 +309,8 @@ void ReshardingRecipientService::RecipientStateMachine::
 
 ExecutorFuture<void>
 ReshardingRecipientService::RecipientStateMachine::_cloneThenTransitionToApplying(
-    const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
+    const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+    const CancelationToken& cancelToken) {
     if (_recipientDoc.getState() > RecipientStateEnum::kCloning) {
         return ExecutorFuture(**executor);
     }
@@ -238,8 +327,50 @@ ReshardingRecipientService::RecipientStateMachine::_cloneThenTransitionToApplyin
         *_recipientDoc.getFetchTimestamp(),
         std::move(tempNss));
 
-    return _collectionCloner->run(serviceContext, **executor).then([this] {
-        _transitionState(RecipientStateEnum::kApplying);
+    auto numDonors = _recipientDoc.getDonorShardsMirroring().size();
+    _oplogFetchers.reserve(numDonors);
+    _oplogFetcherFutures.reserve(numDonors);
+
+    {
+        stdx::lock_guard<Latch> lk(_mutex);
+        _oplogFetcherExecutor = makeTaskExecutor("ReshardingOplogFetcher"_sd, numDonors);
+    }
+
+    const auto& minKeyChunkOwningShardId = [&] {
+        auto opCtx = cc().makeOperationContext();
+        auto catalogCache = Grid::get(opCtx.get())->catalogCache();
+        const auto sourceChunkMgr =
+            catalogCache->getShardedCollectionRoutingInfo(opCtx.get(), _recipientDoc.getNss());
+        return sourceChunkMgr.getMinKeyShardIdWithSimpleCollation();
+    }();
+
+    const auto& recipientId = ShardingState::get(serviceContext)->shardId();
+    for (const auto& donor : _recipientDoc.getDonorShardsMirroring()) {
+        stdx::lock_guard<Latch> lk(_mutex);
+        _oplogFetchers.emplace_back(std::make_unique<ReshardingOplogFetcher>(
+            _recipientDoc.get_id(),
+            _recipientDoc.getExistingUUID(),
+            // The recipient fetches oplog entries from the donor starting from the fetchTimestamp,
+            // which corresponds to {clusterTime: fetchTimestamp, ts: fetchTimestamp} as a resume
+            // token value.
+            ReshardingDonorOplogId{*_recipientDoc.getFetchTimestamp(),
+                                   *_recipientDoc.getFetchTimestamp()},
+            donor.getId(),
+            recipientId,
+            donor.getId() == minKeyChunkOwningShardId,
+            getLocalOplogBufferNamespace(_recipientDoc.get_id(), donor.getId())));
+
+        _oplogFetcherFutures.emplace_back(
+            _oplogFetchers.back()
+                ->schedule(_oplogFetcherExecutor, cancelToken)
+                .onError([](Status status) {
+                    LOGV2(5259300, "Error fetching oplog entries", "error"_attr = redact(status));
+                    return status;
+                }));
+    }
+
+    return _collectionCloner->run(**executor, cancelToken).then([this] {
+        _transitionStateAndUpdateCoordinator(RecipientStateEnum::kApplying);
     });
 }
 
@@ -248,8 +379,17 @@ void ReshardingRecipientService::RecipientStateMachine::_applyThenTransitionToSt
         return;
     }
 
+    // The contents of the temporary resharding collection are already consistent because the
+    // ReshardingCollectionCloner uses atClusterTime. Using replication's initial sync nomenclature,
+    // resharding has immediately finished the "apply phase" as soon as the
+    // ReshardingCollectionCloner has finished. This is why it is acceptable to not call
+    // applyUntilCloneFinishedTs() here and to only do so in
+    // _awaitAllDonorsMirroringThenTransitionToStrictConsistency() instead.
+    //
+    // TODO: Consider removing _applyThenTransitionToSteadyState() and changing
+    // _cloneThenTransitionToApplying() to call _transitionStateAndUpdateCoordinator(kSteadyState).
+
     _transitionStateAndUpdateCoordinator(RecipientStateEnum::kSteadyState);
-    interrupt({ErrorCodes::InternalError, "Artificial interruption to enable jsTests"});
 }
 
 ExecutorFuture<void> ReshardingRecipientService::RecipientStateMachine::
@@ -259,46 +399,122 @@ ExecutorFuture<void> ReshardingRecipientService::RecipientStateMachine::
         return ExecutorFuture<void>(**executor, Status::OK());
     }
 
-    return _allDonorsMirroring.getFuture().thenRunOn(**executor).then([this]() {
-        _transitionState(RecipientStateEnum::kStrictConsistency);
+    auto numDonors = _recipientDoc.getDonorShardsMirroring().size();
+    _oplogAppliers.reserve(numDonors);
+    _oplogApplierWorkers.reserve(numDonors);
+
+    auto* serviceContext = Client::getCurrent()->getServiceContext();
+    const auto& sourceChunkMgr = [&] {
+        auto opCtx = cc().makeOperationContext();
+        auto catalogCache = Grid::get(opCtx.get())->catalogCache();
+        return catalogCache->getShardedCollectionRoutingInfo(opCtx.get(), _recipientDoc.getNss());
+    }();
+
+    std::vector<NamespaceString> stashCollections;
+    stashCollections.reserve(numDonors);
+
+    {
+        auto opCtx = cc().makeOperationContext();
+        for (const auto& donor : _recipientDoc.getDonorShardsMirroring()) {
+            stashCollections.emplace_back(ReshardingOplogApplier::ensureStashCollectionExists(
+                opCtx.get(), _recipientDoc.getExistingUUID(), donor.getId()));
+        }
+    }
+
+    size_t i = 0;
+    auto futuresToWaitOn = std::move(_oplogFetcherFutures);
+    for (const auto& donor : _recipientDoc.getDonorShardsMirroring()) {
+        {
+            stdx::lock_guard<Latch> lk(_mutex);
+            _oplogApplierWorkers.emplace_back(
+                repl::makeReplWriterPool(resharding::gReshardingWriterThreadCount,
+                                         "ReshardingOplogApplierWorker",
+                                         true /* isKillableByStepdown */));
+        }
+
+        const auto& oplogBufferNss =
+            getLocalOplogBufferNamespace(_recipientDoc.get_id(), donor.getId());
+        _oplogAppliers.emplace_back(std::make_unique<ReshardingOplogApplier>(
+            serviceContext,
+            ReshardingSourceId{_recipientDoc.get_id(), donor.getId()},
+            oplogBufferNss,
+            _recipientDoc.getNss(),
+            _recipientDoc.getExistingUUID(),
+            stashCollections,
+            i,
+            *_recipientDoc.getFetchTimestamp(),
+            // The recipient applies oplog entries from the donor starting from the fetchTimestamp,
+            // which corresponds to {clusterTime: fetchTimestamp, ts: fetchTimestamp} as a resume
+            // token value.
+            std::make_unique<ReshardingDonorOplogIterator>(
+                oplogBufferNss,
+                ReshardingDonorOplogId{*_recipientDoc.getFetchTimestamp(),
+                                       *_recipientDoc.getFetchTimestamp()},
+                _oplogFetchers[i].get()),
+            sourceChunkMgr,
+            **executor,
+            _oplogApplierWorkers.back().get()));
+
+        // The contents of the temporary resharding collection are already consistent because the
+        // ReshardingCollectionCloner uses atClusterTime. Using replication's initial sync
+        // nomenclature, resharding has immediately finished the "apply phase" as soon as the
+        // ReshardingCollectionCloner has finished. This is why applyUntilCloneFinishedTs() and
+        // applyUntilDone() are both called here in sequence.
+        auto* applier = _oplogAppliers.back().get();
+        futuresToWaitOn.emplace_back(applier->applyUntilCloneFinishedTs().then(
+            [applier] { return applier->applyUntilDone(); }));
+        ++i;
+    }
+
+    return whenAllSucceed(std::move(futuresToWaitOn)).thenRunOn(**executor).then([this] {
+        _transitionStateAndUpdateCoordinator(RecipientStateEnum::kStrictConsistency);
     });
 }
 
 ExecutorFuture<void> ReshardingRecipientService::RecipientStateMachine::
-    _awaitCoordinatorHasCommittedThenTransitionToRenaming(
+    __awaitCoordinatorHasDecisionPersistedThenTransitionToRenaming(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor) {
     if (_recipientDoc.getState() > RecipientStateEnum::kStrictConsistency) {
         return ExecutorFuture<void>(**executor, Status::OK());
     }
 
-    return _coordinatorHasCommitted.getFuture().thenRunOn(**executor).then([this]() {
+    return _coordinatorHasDecisionPersisted.getFuture().thenRunOn(**executor).then([this]() {
         _transitionState(RecipientStateEnum::kRenaming);
     });
 }
 
-void ReshardingRecipientService::RecipientStateMachine::
-    _renameTemporaryReshardingCollectionThenDeleteLocalState() {
+void ReshardingRecipientService::RecipientStateMachine::_renameTemporaryReshardingCollection() {
 
     if (_recipientDoc.getState() > RecipientStateEnum::kRenaming) {
         return;
     }
 
-    auto opCtx = cc().makeOperationContext();
+    {
+        auto opCtx = cc().makeOperationContext();
 
-    auto reshardingNss = constructTemporaryReshardingNss(_recipientDoc.getNss().db(),
-                                                         _recipientDoc.getExistingUUID());
+        auto reshardingNss = constructTemporaryReshardingNss(_recipientDoc.getNss().db(),
+                                                             _recipientDoc.getExistingUUID());
 
-    RenameCollectionOptions options;
-    options.dropTarget = true;
-    uassertStatusOK(renameCollection(opCtx.get(), reshardingNss, _recipientDoc.getNss(), options));
+        RenameCollectionOptions options;
+        options.dropTarget = true;
+        uassertStatusOK(
+            renameCollection(opCtx.get(), reshardingNss, _recipientDoc.getNss(), options));
+    }
 
-    _transitionState(RecipientStateEnum::kDone);
+    _transitionStateAndUpdateCoordinator(RecipientStateEnum::kDone);
 }
 
 void ReshardingRecipientService::RecipientStateMachine::_transitionState(
     RecipientStateEnum endState, boost::optional<Timestamp> fetchTimestamp) {
     ReshardingRecipientDocument replacementDoc(_recipientDoc);
     replacementDoc.setState(endState);
+
+    LOGV2_INFO(5279506,
+               "Transition resharding recipient state",
+               "newState"_attr = RecipientState_serializer(replacementDoc.getState()),
+               "oldState"_attr = RecipientState_serializer(_recipientDoc.getState()),
+               "reshardingUUID"_attr = _recipientDoc.get_id());
+
     if (endState == RecipientStateEnum::kCreatingCollection) {
         _insertRecipientDocument(replacementDoc);
         return;
@@ -360,6 +576,16 @@ void ReshardingRecipientService::RecipientStateMachine::_updateRecipientDocument
                  WriteConcerns::kMajorityWriteConcern);
 
     _recipientDoc = replacementDoc;
+}
+
+void ReshardingRecipientService::RecipientStateMachine::_removeRecipientDocument() {
+    auto opCtx = cc().makeOperationContext();
+    PersistentTaskStore<ReshardingRecipientDocument> store(
+        NamespaceString::kRecipientReshardingOperationsNamespace);
+    store.remove(opCtx.get(),
+                 BSON(ReshardingRecipientDocument::k_idFieldName << _id),
+                 WriteConcerns::kMajorityWriteConcern);
+    _recipientDoc = {};
 }
 
 }  // namespace mongo

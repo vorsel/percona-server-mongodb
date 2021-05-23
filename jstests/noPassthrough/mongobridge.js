@@ -1,7 +1,12 @@
 /**
  * Test that mongobridge's *From commands work
  *
- * @tags: [requires_replication,requires_sharding,live_record_incompatible]
+ * @tags: [
+ *   live_record_incompatible,
+ *   requires_replication,
+ *   requires_sharding,
+ *   sbe_incompatible,
+ * ]
  */
 
 // mongobridge depends on test commands being enabled. Also EVERY repl/sharding
@@ -18,7 +23,7 @@ var st = new ShardingTest({
 });
 var wc = {writeConcern: {w: 2, wtimeout: 4000}};
 
-// delayMessages from should cause a write error on this insert
+// delayMessagesFrom should cause a write error on this insert
 st.rs0.getPrimary().delayMessagesFrom(st.rs0.getSecondary(), 13000);
 assert.commandFailed(st.s0.getCollection('testDB.cll').insert({test: 5}, wc));
 st.rs0.getPrimary().delayMessagesFrom(st.rs0.getSecondary(), 0);
@@ -34,7 +39,8 @@ assert.commandFailed(st.s0.getCollection('testDB.cll').insert({test: 5}, wc));
 // but if we make mongobridge accept the connections, the write should now
 // succeed
 st.rs0.getPrimary().acceptConnectionsFrom(st.rs0.getSecondary());
-assert.commandWorked(st.s0.getCollection('testDB.cll').insert({test: 5}, wc));
+// don't use wtimeout with this command. Slower boxes can be busy catching up
+assert.commandWorked(st.s0.getCollection('testDB.cll').insert({test: 5}, {writeConcern: {w: 2}}));
 
 // None of the above commands prevent writes to the primary, so we still
 // expect to find 4 documents

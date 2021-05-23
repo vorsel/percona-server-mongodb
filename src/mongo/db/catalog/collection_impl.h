@@ -32,6 +32,7 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/commands/create_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 
 namespace mongo {
@@ -39,9 +40,6 @@ class IndexConsistency;
 class CollectionCatalog;
 class CollectionImpl final : public Collection {
 public:
-    enum ValidationAction { WARN, ERROR_V };
-    enum ValidationLevel { OFF, MODERATE, STRICT_V };
-
     explicit CollectionImpl(OperationContext* opCtx,
                             const NamespaceString& nss,
                             RecordId catalogId,
@@ -275,21 +273,20 @@ public:
      */
     void setValidator(OperationContext* opCtx, Validator validator) final;
 
-    Status setValidationLevel(OperationContext* opCtx, StringData newLevel) final;
-    Status setValidationAction(OperationContext* opCtx, StringData newAction) final;
+    Status setValidationLevel(OperationContext* opCtx, ValidationLevelEnum newLevel) final;
+    Status setValidationAction(OperationContext* opCtx, ValidationActionEnum newAction) final;
 
-    StringData getValidationLevel() const final;
-    StringData getValidationAction() const final;
+    boost::optional<ValidationLevelEnum> getValidationLevel() const final;
+    boost::optional<ValidationActionEnum> getValidationAction() const final;
 
     /**
-     * Sets the validator to exactly what's provided. If newLevel or newAction are empty, this
-     * sets them to the defaults. Any error Status returned by this function should be considered
-     * fatal.
+     * Sets the validator to exactly what's provided. Any error Status returned by this function
+     * should be considered fatal.
      */
     Status updateValidator(OperationContext* opCtx,
                            BSONObj newValidator,
-                           StringData newLevel,
-                           StringData newAction) final;
+                           boost::optional<ValidationLevelEnum> newLevel,
+                           boost::optional<ValidationActionEnum> newAction) final;
 
     bool getRecordPreImages() const final;
     void setRecordPreImages(OperationContext* opCtx, bool val) final;
@@ -374,7 +371,7 @@ public:
     void indexBuildSuccess(OperationContext* opCtx, IndexCatalogEntry* index) final;
 
     void establishOplogCollectionForLogging(OperationContext* opCtx) final;
-    void onDeregisterFromCatalog() final;
+    void onDeregisterFromCatalog(OperationContext* opCtx) final;
 
 private:
     /**
@@ -448,13 +445,14 @@ private:
         const std::shared_ptr<CappedInsertNotifier> _cappedNotifier;
 
         const bool _needCappedLock;
-    };
 
+        AtomicWord<bool> _committed{true};
+    };
 
     NamespaceString _ns;
     RecordId _catalogId;
     UUID _uuid;
-    bool _committed = true;
+    bool _cachedCommitted = true;
     std::shared_ptr<SharedState> _shared;
 
     clonable_ptr<IndexCatalog> _indexCatalog;
@@ -462,10 +460,8 @@ private:
     // The validator is using shared state internally. Collections share validator until a new
     // validator is set in setValidator which sets a new instance.
     Validator _validator;
-    // The default values match the defaults of the functions that parse the validation action and
-    // level.
-    ValidationAction _validationAction = ERROR_V;
-    ValidationLevel _validationLevel = STRICT_V;
+    boost::optional<ValidationActionEnum> _validationAction;
+    boost::optional<ValidationLevelEnum> _validationLevel;
 
     bool _recordPreImages = false;
 

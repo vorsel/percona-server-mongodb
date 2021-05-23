@@ -712,34 +712,6 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     LOGV2_DEBUG(4280511, 1, "Set local replica set config");
 }
 
-void ReplicationCoordinatorImpl::_stopDataReplication(OperationContext* opCtx) {
-    std::shared_ptr<InitialSyncer> initialSyncerCopy;
-    {
-        stdx::lock_guard<Latch> lk(_mutex);
-        _initialSyncer.swap(initialSyncerCopy);
-    }
-    if (initialSyncerCopy) {
-        LOGV2_DEBUG(
-            21321,
-            1,
-            "ReplicationCoordinatorImpl::_stopDataReplication calling InitialSyncer::shutdown");
-        const auto status = initialSyncerCopy->shutdown();
-        if (!status.isOK()) {
-            LOGV2_WARNING(21408,
-                          "InitialSyncer shutdown failed: {error}",
-                          "InitialSyncer shutdown failed",
-                          "error"_attr = status);
-        }
-        initialSyncerCopy.reset();
-        // Do not return here, fall through.
-    }
-    LOGV2_DEBUG(21322,
-                1,
-                "ReplicationCoordinatorImpl::_stopDataReplication calling "
-                "ReplCoordExtState::stopDataReplication");
-    _externalState->stopDataReplication(opCtx);
-}
-
 void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
                                                        std::function<void()> startCompleted) {
     if (_startedSteadyStateReplication.swap(true)) {
@@ -2169,6 +2141,10 @@ std::shared_ptr<HelloResponse> ReplicationCoordinatorImpl::_makeHelloResponse(
         response->setIsSecondary(true);
     }
 
+    if (_waitingForRSTLAtStepDown) {
+        response->setIsWritablePrimary(false);
+    }
+
     if (_inShutdown) {
         response->setIsWritablePrimary(false);
         response->setIsSecondary(false);
@@ -2567,6 +2543,19 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
             "not primary so can't step down",
             getMemberState().primary());
 
+    // This makes us tell the 'hello' command we can't accept writes (though in fact we can,
+    // it is not valid to disable writes until we actually acquire the RSTL).
+    {
+        stdx::lock_guard lk(_mutex);
+        _waitingForRSTLAtStepDown++;
+        _fulfillTopologyChangePromise(lk);
+    }
+    auto clearStepDownFlag = makeGuard([&] {
+        stdx::lock_guard lk(_mutex);
+        _waitingForRSTLAtStepDown--;
+        _fulfillTopologyChangePromise(lk);
+    });
+
     CurOpFailpointHelpers::waitWhileFailPointEnabled(
         &stepdownHangBeforeRSTLEnqueue, opCtx, "stepdownHangBeforeRSTLEnqueue");
 
@@ -2595,6 +2584,11 @@ void ReplicationCoordinatorImpl::stepDown(OperationContext* opCtx,
     auto action = _updateMemberStateFromTopologyCoordinator(lk);
     invariant(action == PostMemberStateUpdateAction::kActionNone);
     invariant(!_readWriteAbility->canAcceptNonLocalWrites(lk));
+
+    // We truly cannot accept writes now, and we've updated the topology version to say so, so
+    // no need for this flag any more, nor to increment the topology version again.
+    _waitingForRSTLAtStepDown--;
+    clearStepDownFlag.dismiss();
 
     auto updateMemberState = [&] {
         invariant(lk.owns_lock());
@@ -3826,6 +3820,9 @@ Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* opCt
 
     lk.unlock();
 
+    // Initiate FCV in local storage. This will propagate to other nodes via initial sync.
+    FeatureCompatibilityVersion::setIfCleanStartup(opCtx, _storage);
+
     ReplSetConfig newConfig;
     try {
         newConfig = ReplSetConfig::parseForInitiate(configObj, OID::gen());
@@ -4044,9 +4041,11 @@ ReplicationCoordinatorImpl::PostMemberStateUpdateAction
 ReplicationCoordinatorImpl::_updateMemberStateFromTopologyCoordinator(WithLock lk) {
     // We want to respond to any waiting hellos even if our current and target state are the
     // same as it is possible writes have been disabled during a stepDown but the primary has yet
-    // to transition to SECONDARY state.
+    // to transition to SECONDARY state.  We do not do so when _waitingForRSTLAtStepDown is true
+    // because in that case we have already said we cannot accept writes in the hello response
+    // and explictly incremented the toplogy version.
     ON_BLOCK_EXIT([&] {
-        if (_rsConfig.isInitialized()) {
+        if (_rsConfig.isInitialized() && !_waitingForRSTLAtStepDown) {
             _fulfillTopologyChangePromise(lk);
         }
     });
@@ -4663,13 +4662,7 @@ Status ReplicationCoordinatorImpl::_checkIfCommitQuorumCanBeSatisfied(
 
     // We need to ensure that the 'commitQuorum' can be satisfied by all the members of this
     // replica set.
-    bool commitQuorumCanBeSatisfied = _topCoord->checkIfCommitQuorumCanBeSatisfied(commitQuorum);
-    if (!commitQuorumCanBeSatisfied) {
-        return Status(ErrorCodes::UnsatisfiableCommitQuorum,
-                      str::stream() << "Commit quorum cannot be satisfied with the current replica "
-                                    << "set configuration");
-    }
-    return Status::OK();
+    return _topCoord->checkIfCommitQuorumCanBeSatisfied(commitQuorum);
 }
 
 WriteConcernOptions ReplicationCoordinatorImpl::getGetLastErrorDefault() {

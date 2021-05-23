@@ -223,35 +223,4 @@ bool ProcessInfo::checkNumaEnabled() {
     return groups > 1;
 }
 
-bool ProcessInfo::blockCheckSupported() {
-    return true;
-}
-
-bool ProcessInfo::blockInMemory(const void* start) {
-    char x = 0;
-    if (mincore(
-            static_cast<char*>(const_cast<void*>(alignToStartOfPage(start))), getPageSize(), &x)) {
-        LOGV2(23358,
-              "mincore failed: {errnoWithDescription}",
-              "errnoWithDescription"_attr = errnoWithDescription());
-        return 1;
-    }
-    return x & 0x1;
-}
-
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<char>* out) {
-    out->resize(numPages);
-    if (mincore(static_cast<char*>(const_cast<void*>(alignToStartOfPage(start))),
-                numPages * getPageSize(),
-                &out->front())) {
-        LOGV2(23359,
-              "mincore failed: {errnoWithDescription}",
-              "errnoWithDescription"_attr = errnoWithDescription());
-        return false;
-    }
-    for (size_t i = 0; i < numPages; ++i) {
-        (*out)[i] &= 0x1;
-    }
-    return true;
-}
 }  // namespace mongo

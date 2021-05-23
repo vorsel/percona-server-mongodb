@@ -167,13 +167,7 @@ protected:
      */
     void setUpAndInitializeConfigDb();
 
-    std::unique_ptr<DistLockCatalog> makeDistLockCatalog() override;
-
-    std::unique_ptr<DistLockManager> makeDistLockManager(
-        std::unique_ptr<DistLockCatalog> distLockCatalog) override;
-
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
-        std::unique_ptr<DistLockManager> distLockManager) override;
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override;
 
     std::unique_ptr<ClusterCursorManager> makeClusterCursorManager() override;
 

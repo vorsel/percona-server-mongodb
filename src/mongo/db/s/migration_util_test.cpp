@@ -372,8 +372,7 @@ public:
     // and loading all collections when a database is loaded for the first time by the CatalogCache.
     class StaticCatalogClient final : public ShardingCatalogClientMock {
     public:
-        StaticCatalogClient(std::vector<ShardType> shards)
-            : ShardingCatalogClientMock(nullptr), _shards(std::move(shards)) {}
+        StaticCatalogClient(std::vector<ShardType> shards) : _shards(std::move(shards)) {}
 
         StatusWith<repl::OpTimeWith<std::vector<ShardType>>> getAllShards(
             OperationContext* opCtx, repl::ReadConcernLevel readConcern) override {
@@ -404,8 +403,7 @@ public:
         return autoColl.getCollection()->uuid();
     }
 
-    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient(
-        std::unique_ptr<DistLockManager> distLockManager) override {
+    std::unique_ptr<ShardingCatalogClient> makeShardingCatalogClient() override {
         auto mockCatalogClient = std::make_unique<StaticCatalogClient>(kShardList);
         // Stash a pointer to the mock so its return values can be set.
         _mockCatalogClient = mockCatalogClient.get();
@@ -547,7 +545,7 @@ TEST_F(SubmitRangeDeletionTaskTest, SucceedsIfFilteringMetadataUUIDMatchesTaskUU
     _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(coll);
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
-        makeChangedChunks(ChunkVersion(1, 0, kEpoch)));
+        makeChangedChunks(ChunkVersion(1, 0, kEpoch, boost::none /* timestamp */)));
     _mockCatalogClient->setCollections({coll});
     forceShardFilteringMetadataRefresh(opCtx, kNss);
 
@@ -575,7 +573,7 @@ TEST_F(
     _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(coll);
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
-        makeChangedChunks(ChunkVersion(1, 0, kEpoch)));
+        makeChangedChunks(ChunkVersion(1, 0, kEpoch, boost::none /* timestamp */)));
     _mockCatalogClient->setCollections({coll});
 
     // The task should have been submitted successfully.
@@ -607,7 +605,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     auto matchingColl = makeCollectionType(collectionUUID, kEpoch);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(matchingColl);
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
-        makeChangedChunks(ChunkVersion(10, 0, kEpoch)));
+        makeChangedChunks(ChunkVersion(10, 0, kEpoch, boost::none /* timestamp */)));
     _mockCatalogClient->setCollections({matchingColl});
 
     // The task should have been submitted successfully.
@@ -627,7 +625,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(staleColl);
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
-        makeChangedChunks(ChunkVersion(1, 0, staleEpoch)));
+        makeChangedChunks(ChunkVersion(1, 0, staleEpoch, boost::none /* timestamp */)));
     _mockCatalogClient->setCollections({staleColl});
     forceShardFilteringMetadataRefresh(opCtx, kNss);
 
@@ -644,7 +642,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     auto matchingColl = makeCollectionType(collectionUUID, kEpoch);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(matchingColl);
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
-        makeChangedChunks(ChunkVersion(10, 0, kEpoch)));
+        makeChangedChunks(ChunkVersion(10, 0, kEpoch, boost::none /* timestamp */)));
     _mockCatalogClient->setCollections({matchingColl});
 
     // The task should have been submitted successfully.
@@ -670,7 +668,7 @@ TEST_F(SubmitRangeDeletionTaskTest,
     _mockCatalogCacheLoader->setDatabaseRefreshReturnValue(kDefaultDatabaseType);
     _mockCatalogCacheLoader->setCollectionRefreshReturnValue(otherColl);
     _mockCatalogCacheLoader->setChunkRefreshReturnValue(
-        makeChangedChunks(ChunkVersion(1, 0, otherEpoch)));
+        makeChangedChunks(ChunkVersion(1, 0, otherEpoch, boost::none /* timestamp */)));
     _mockCatalogClient->setCollections({otherColl});
 
     // The task should not have been submitted, and the task's entry should have been removed from

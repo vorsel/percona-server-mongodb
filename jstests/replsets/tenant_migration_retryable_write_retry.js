@@ -12,10 +12,11 @@ load("jstests/replsets/libs/tenant_migration_test.js");
 load("jstests/replsets/libs/tenant_migration_util.js");
 load("jstests/libs/uuid_util.js");
 
+const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
 const donorRst = new ReplSetTest({
     nodes: 1,
     name: "donor",
-    nodeOptions: {
+    nodeOptions: Object.assign(migrationX509Options.donor, {
         setParameter: {
             // Set the delay before a donor state doc is garbage collected to be short to speed up
             // the test.
@@ -24,18 +25,10 @@ const donorRst = new ReplSetTest({
             // Set the TTL monitor to run at a smaller interval to speed up the test.
             ttlMonitorSleepSecs: 1,
         }
-    }
+    })
 });
-const recipientRst = new ReplSetTest({
-    nodes: 1,
-    name: "recipient",
-    nodeOptions: {
-        setParameter: {
-            // TODO SERVER-51734: Remove the failpoint 'returnResponseOkForRecipientSyncDataCmd'.
-            'failpoint.returnResponseOkForRecipientSyncDataCmd': tojson({mode: 'alwaysOn'})
-        }
-    }
-});
+const recipientRst =
+    new ReplSetTest({nodes: 1, name: "recipient", nodeOptions: migrationX509Options.recipient});
 
 donorRst.startSet();
 donorRst.initiate();
@@ -204,7 +197,6 @@ assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
 const donorDoc =
     donorPrimary.getCollection(TenantMigrationTest.kConfigDonorsNS).findOne({tenantId: kTenantId});
 
-assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 tenantMigrationTest.waitForMigrationGarbageCollection(donorRst.nodes, migrationId, kTenantId);
 
 // Test the aggregation pipeline the recipient would use for getting the config.transactions entries

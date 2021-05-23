@@ -91,6 +91,16 @@ std::pair<value::TypeTags, value::Value> genericNumericCompare(value::TypeTags l
         // This is where Mongo differs from SQL.
         auto result = op(0, 0);
         return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
+    } else if (lhsTag == value::TypeTags::MinKey && rhsTag == value::TypeTags::MinKey) {
+        auto result = op(0, 0);
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
+    } else if (lhsTag == value::TypeTags::MaxKey && rhsTag == value::TypeTags::MaxKey) {
+        auto result = op(0, 0);
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
+    } else if (lhsTag == value::TypeTags::bsonUndefined &&
+               rhsTag == value::TypeTags::bsonUndefined) {
+        auto result = op(0, 0);
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
     } else if ((value::isArray(lhsTag) && value::isArray(rhsTag)) ||
                (value::isObject(lhsTag) && value::isObject(rhsTag))) {
         auto [tag, val] = value::compareValue(lhsTag, lhsValue, rhsTag, rhsValue);
@@ -154,6 +164,8 @@ struct Instruction {
         isDate,
         isNaN,
         isRecordId,
+        isMinKey,
+        isMaxKey,
         typeMatch,
 
         function,
@@ -179,6 +191,7 @@ enum class Builtin : uint8_t {
     split,
     regexMatch,
     replaceOne,
+    dateDiff,
     dateParts,
     dateToParts,
     isoDateToParts,
@@ -227,6 +240,7 @@ enum class Builtin : uint8_t {
     isMember,
     indexOfBytes,
     indexOfCP,
+    isTimeUnit,
     isTimezone,
     setUnion,
     setIntersection,
@@ -236,6 +250,9 @@ enum class Builtin : uint8_t {
     regexFind,
     regexFindAll,
     shardFilter,
+    extractSubArray,
+    isArrayEmpty,
+    dateAdd,
 };
 
 using SmallArityType = uint8_t;
@@ -315,6 +332,12 @@ public:
     void appendIsDate();
     void appendIsNaN();
     void appendIsRecordId();
+    void appendIsMinKey() {
+        appendSimpleInstruction(Instruction::isMinKey);
+    }
+    void appendIsMaxKey() {
+        appendSimpleInstruction(Instruction::isMaxKey);
+    }
     void appendTypeMatch(uint32_t typeMask);
     void appendFunction(Builtin f, ArityType arity);
     void appendJump(int jumpOffset);
@@ -535,6 +558,7 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinSplit(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDate(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDateWeekYear(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDateDiff(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDateToParts(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinIsoDateToParts(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDayOfYear(ArityType arity);
@@ -583,6 +607,7 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinIsMember(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinIndexOfBytes(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinIndexOfCP(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinIsTimeUnit(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinIsTimezone(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinSetUnion(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinSetIntersection(ArityType arity);
@@ -591,7 +616,10 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinRegexCompile(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinRegexFind(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinRegexFindAll(ArityType arity);
-    std::tuple<bool, value::TypeTags, value::Value> builtinShardFilter(uint8_t arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinShardFilter(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinExtractSubArray(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinIsArrayEmpty(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinDateAdd(ArityType arity);
 
     std::tuple<bool, value::TypeTags, value::Value> dispatchBuiltin(Builtin f, ArityType arity);
 

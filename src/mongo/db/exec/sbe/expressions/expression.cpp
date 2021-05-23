@@ -348,6 +348,7 @@ struct BuiltinFn {
  * The map of recognized builtin functions.
  */
 static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
+    {"dateDiff", BuiltinFn{[](size_t n) { return n == 5; }, vm::Builtin::dateDiff, false}},
     {"dateParts", BuiltinFn{[](size_t n) { return n == 9; }, vm::Builtin::dateParts, false}},
     {"dateToParts",
      BuiltinFn{[](size_t n) { return n == 3 || n == 4; }, vm::Builtin::dateToParts, false}},
@@ -409,6 +410,7 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
      BuiltinFn{[](size_t n) { return n == 3 || n == 4; }, vm::Builtin::indexOfBytes, false}},
     {"indexOfCP",
      BuiltinFn{[](size_t n) { return n == 3 || n == 4; }, vm::Builtin::indexOfCP, false}},
+    {"isTimeUnit", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::isTimeUnit, false}},
     {"isTimezone", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::isTimezone, false}},
     {"setUnion", BuiltinFn{[](size_t n) { return n > 0; }, vm::Builtin::setUnion, false}},
     {"setIntersection",
@@ -421,6 +423,10 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"regexFind", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::regexFind, false}},
     {"regexFindAll", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::regexFindAll, false}},
     {"shardFilter", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::shardFilter, false}},
+    {"extractSubArray",
+     BuiltinFn{[](size_t n) { return n == 2 || n == 3; }, vm::Builtin::extractSubArray, false}},
+    {"isArrayEmpty", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::isArrayEmpty, false}},
+    {"dateAdd", BuiltinFn{[](size_t n) { return n == 5; }, vm::Builtin::dateAdd, false}},
 };
 
 /**
@@ -462,6 +468,10 @@ static stdx::unordered_map<std::string, InstrFn> kInstrFunctions = {
     {"isNaN", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendIsNaN, false}},
     {"isRecordId",
      InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendIsRecordId, false}},
+    {"isMinKey",
+     InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendIsMinKey, false}},
+    {"isMaxKey",
+     InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendIsMaxKey, false}},
     {"sum", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendSum, true}},
     {"min", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendMin, true}},
     {"max", InstrFn{[](size_t n) { return n == 1; }, &vm::CodeFragment::appendMax, true}},
@@ -651,7 +661,7 @@ std::vector<DebugPrinter::Block> ELocalBind::debugPrint() const {
 }
 
 std::unique_ptr<EExpression> EFail::clone() const {
-    return std::make_unique<EFail>(_code, _message);
+    return std::make_unique<EFail>(_code, getStringView(_messageTag, _messageVal));
 }
 
 std::unique_ptr<vm::CodeFragment> EFail::compile(CompileCtx& ctx) const {
@@ -660,8 +670,7 @@ std::unique_ptr<vm::CodeFragment> EFail::compile(CompileCtx& ctx) const {
     code->appendConstVal(value::TypeTags::NumberInt64,
                          value::bitcastFrom<int64_t>(static_cast<int64_t>(_code)));
 
-    code->appendConstVal(value::TypeTags::StringBig,
-                         value::bitcastFrom<const char*>(_message.c_str()));
+    code->appendConstVal(_messageTag, _messageVal);
 
     code->appendFail();
 
@@ -674,9 +683,9 @@ std::vector<DebugPrinter::Block> EFail::debugPrint() const {
 
     ret.emplace_back("(");
 
-    ret.emplace_back(DebugPrinter::Block(std::to_string(_code)));
-    ret.emplace_back(DebugPrinter::Block(",`"));
-    ret.emplace_back(DebugPrinter::Block(_message));
+    ret.emplace_back(std::to_string(_code));
+    ret.emplace_back(",`");
+    ret.emplace_back(getStringView(_messageTag, _messageVal));
 
     ret.emplace_back("`)");
 

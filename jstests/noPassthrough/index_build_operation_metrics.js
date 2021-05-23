@@ -3,6 +3,7 @@
  * @tags: [
  *   requires_replication,
  *   requires_wiredtiger,
+ *   sbe_incompatible,
  * ]
  */
 (function() {
@@ -12,12 +13,7 @@ load('jstests/noPassthrough/libs/index_build.js');  // For IndexBuildTest
 
 var rst = new ReplSetTest({
     nodes: 2,
-    nodeOptions: {
-        setParameter: {
-            "measureOperationResourceConsumption": true,
-            "aggregateOperationResourceConsumptionMetrics": true
-        }
-    }
+    nodeOptions: {setParameter: {"aggregateOperationResourceConsumptionMetrics": true}}
 });
 rst.startSet();
 rst.initiate();
@@ -31,8 +27,8 @@ const secondaryDB = secondary.getDB(dbName);
 
 const nDocs = 100;
 
-const clearMetrics = (db) => {
-    db.aggregate([{$operationMetrics: {clearMetrics: true}}]);
+const clearMetrics = (conn) => {
+    conn.getDB('admin').aggregate([{$operationMetrics: {clearMetrics: true}}]);
 };
 
 // Get aggregated metrics keyed by database name.
@@ -65,7 +61,7 @@ assert.commandWorked(primaryDB.createCollection(collName));
  * primary node.
  */
 (function loadCollection() {
-    clearMetrics(primaryDB);
+    clearMetrics(primary);
 
     let bulk = primaryDB[collName].initializeUnorderedBulkOp();
     for (let i = 0; i < nDocs; i++) {
@@ -97,7 +93,7 @@ assert.commandWorked(primaryDB.createCollection(collName));
  * Build an index. Expect that metrics are reasonable and only reported on the primary node.
  */
 (function buildIndex() {
-    clearMetrics(primaryDB);
+    clearMetrics(primary);
     assert.commandWorked(primaryDB[collName].createIndex({a: 1}));
 
     assertMetrics(primary, (metrics) => {
@@ -139,7 +135,7 @@ assert.commandWorked(primaryDB[collName].dropIndex({a: 1}));
  * Build an index. Expect that metrics are reasonable and only reported on the primary node.
  */
 (function buildUniqueIndex() {
-    clearMetrics(primaryDB);
+    clearMetrics(primary);
     assert.commandWorked(primaryDB[collName].createIndex({a: 1}, {unique: true}));
 
     assertMetrics(primary, (metrics) => {
@@ -185,7 +181,7 @@ assert.commandWorked(primaryDB[collName].dropIndex({a: 1}));
     // Insert a document at the end that makes the index non-unique.
     assert.commandWorked(primaryDB[collName].insert({a: (nDocs - 1)}));
 
-    clearMetrics(primaryDB);
+    clearMetrics(primary);
     assert.commandFailedWithCode(primaryDB[collName].createIndex({a: 1}, {unique: true}),
                                  ErrorCodes.DuplicateKey);
 
@@ -223,12 +219,88 @@ assert.commandWorked(primaryDB[collName].dropIndex({a: 1}));
 })();
 
 /**
+ * Abort an active index build. Expect that the primary node that aborts the index build collects
+ * and reports read metrics.
+ */
+(function buildIndexInterrupt() {
+    clearMetrics(primary);
+
+    // Hang the index build after kicking off the build on the primary, but before scanning the
+    // collection.
+    const failPoint = configureFailPoint(primary, 'hangAfterStartingIndexBuildUnlocked');
+    const awaitIndex = IndexBuildTest.startIndexBuild(
+        primary, primaryDB[collName].getFullName(), {a: 1}, {}, [ErrorCodes.IndexBuildAborted]);
+
+    // Waits until the collection scan is finished.
+    failPoint.wait();
+
+    // Abort the index build and wait for it to exit.
+    const abortIndexThread =
+        startParallelShell('assert.commandWorked(db.getMongo().getCollection("' +
+                               primaryDB[collName].getFullName() + '").dropIndex({a: 1}))',
+                           primary.port);
+    checkLog.containsJson(primary, 4656010);
+
+    failPoint.off();
+
+    abortIndexThread();
+    awaitIndex();
+
+    // Wait for the abort to replicate.
+    rst.awaitReplication();
+
+    assertMetrics(primary, (metrics) => {
+        printjson(metrics);
+        // Each document is 29 bytes. Assert that we read at least as many document bytes as there
+        // are in the collection since the index build is interrupted after this step. Some
+        // additional data is read from the catalog, but it has randomized fields, so we don't make
+        // any exact assertions.
+        assert.gt(metrics[dbName].primaryMetrics.docBytesRead, 29 * nDocs);
+        assert.gt(metrics[dbName].primaryMetrics.docUnitsRead, 1 * nDocs);
+        assert.eq(metrics[dbName].secondaryMetrics.docBytesRead, 0);
+        assert.eq(metrics[dbName].secondaryMetrics.docUnitsRead, 0);
+
+        // We intentionally do not collect sorting metrics for index builds due to their already
+        // high impact on the server.
+        assert.eq(metrics[dbName].primaryMetrics.keysSorted, 0);
+        assert.eq(metrics[dbName].primaryMetrics.sorterSpills, 0);
+        assert.eq(metrics[dbName].secondaryMetrics.keysSorted, 0);
+        assert.eq(metrics[dbName].secondaryMetrics.sorterSpills, 0);
+
+        // Some bytes are written to the catalog and config.system.indexBuilds collection.
+        assert.gt(metrics[dbName].docBytesWritten, 0);
+        assert.gt(metrics[dbName].docUnitsWritten, 0);
+
+        // The index build will have been interrupted before inserting any keys into the index,
+        // however it will have written documents into the config.system.indexBuilds collection when
+        // created and interrupted by the drop.
+        assert.gt(metrics[dbName].idxEntryBytesWritten, 0);
+        assert.lte(metrics[dbName].idxEntryBytesWritten, 40);
+        assert.gt(metrics[dbName].idxEntryUnitsWritten, 0);
+        assert.lte(metrics[dbName].idxEntryUnitsWritten, 4);
+
+        assert.lt(metrics[dbName].idxEntryUnitsWritten, 1 * nDocs);
+    });
+
+    // No metrics should be collected on the secondary.
+    assertMetrics(secondary, (metrics) => {
+        assert(!metrics[dbName]);
+    });
+
+    // Ensure the index was actually built. Do this after checking metrics because the helper calls
+    // listIndexes which contributes to metrics.
+    IndexBuildTest.assertIndexes(primaryDB[collName], 1, ['_id_']);
+    IndexBuildTest.assertIndexes(secondaryDB[collName], 1, ['_id_']);
+})();
+
+/**
  * Start an index build on one node and commit it on a different node. Expect that the primary node
  * that commits the index build collects and reports read metrics attributed to the primary state.
  * The the stepped-down node should not collect anything.
  */
 (function buildIndexWithStepDown() {
-    clearMetrics(primaryDB);
+    clearMetrics(primary);
+    clearMetrics(secondary);
 
     // Hang the index build after kicking off the build on the secondary, but before scanning the
     // collection.
@@ -314,6 +386,5 @@ assert.commandWorked(primaryDB[collName].dropIndex({a: 1}));
     IndexBuildTest.assertIndexes(primaryDB[collName], 2, ['_id_', 'a_1']);
     IndexBuildTest.assertIndexes(secondaryDB[collName], 2, ['_id_', 'a_1']);
 })();
-
 rst.stopSet();
 }());

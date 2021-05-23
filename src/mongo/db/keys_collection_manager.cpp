@@ -55,7 +55,11 @@ namespace {
 
 Milliseconds kDefaultRefreshWaitTime(30 * 1000);
 Milliseconds kRefreshIntervalIfErrored(200);
-Milliseconds kMaxRefreshWaitTime(10 * 60 * 1000);
+Milliseconds kMaxRefreshWaitTimeIfErrored(10 * 60 * 1000);
+// Never wait more than the number of milliseconds in 20 days to avoid sleeping for a number greater
+// than can fit in a signed 32 bit integer.
+// 20 days = 1000 * 60 * 60 * 24 * 20 = 1,728,000,000 vs signed integer max of 2,147,483,648.
+Milliseconds kMaxRefreshWaitTimeOnSuccess(Days(20));
 
 // Prevents the refresher thread from waiting longer than the given number of milliseconds, even on
 // a successful refresh.
@@ -79,11 +83,7 @@ Milliseconds howMuchSleepNeedFor(const LogicalTime& currentTime,
 
     Milliseconds millisBeforeExpire = Milliseconds(expiredSecs) - Milliseconds(currentSecs);
 
-    if (interval <= millisBeforeExpire) {
-        return interval;
-    }
-
-    return millisBeforeExpire;
+    return std::min({millisBeforeExpire, interval, kMaxRefreshWaitTimeOnSuccess});
 }
 
 }  // namespace keys_collection_manager_util
@@ -97,43 +97,49 @@ KeysCollectionManager::KeysCollectionManager(std::string purpose,
       _keysCache(_purpose, _client.get()) {}
 
 
-StatusWith<KeysCollectionDocument> KeysCollectionManager::getKeyForValidation(
+StatusWith<std::vector<KeysCollectionDocument>> KeysCollectionManager::getKeysForValidation(
     OperationContext* opCtx, long long keyId, const LogicalTime& forThisTime) {
-    auto keyStatus = _getKeyWithKeyIdCheck(keyId, forThisTime);
+    auto swInternalKey = _keysCache.getInternalKeyById(keyId, forThisTime);
 
-    if (keyStatus != ErrorCodes::KeyNotFound) {
-        return keyStatus;
+    if (swInternalKey == ErrorCodes::KeyNotFound) {
+        _refresher.refreshNow(opCtx);
+        swInternalKey = _keysCache.getInternalKeyById(keyId, forThisTime);
     }
 
-    _refresher.refreshNow(opCtx);
+    std::vector<KeysCollectionDocument> keys;
 
-    return _getKeyWithKeyIdCheck(keyId, forThisTime);
+    if (swInternalKey.isOK()) {
+        keys.push_back(std::move(swInternalKey.getValue()));
+    }
+
+    auto swExternalKeys = _keysCache.getExternalKeysById(keyId, forThisTime);
+
+    if (swExternalKeys.isOK()) {
+        for (auto& externalKey : swExternalKeys.getValue()) {
+            KeysCollectionDocument key(externalKey.getKeyId());
+            key.setKeysCollectionDocumentBase(externalKey.getKeysCollectionDocumentBase());
+            keys.push_back(std::move(key));
+        };
+    }
+
+    if (keys.empty()) {
+        return {ErrorCodes::KeyNotFound,
+                str::stream() << "No keys found for " << _purpose << " that is valid for time: "
+                              << forThisTime.toString() << " with id: " << keyId};
+    }
+
+    return std::move(keys);
 }
 
 StatusWith<KeysCollectionDocument> KeysCollectionManager::getKeyForSigning(
     OperationContext* opCtx, const LogicalTime& forThisTime) {
-    return _getKey(forThisTime);
-}
+    auto swKey = _keysCache.getInternalKey(forThisTime);
 
-StatusWith<KeysCollectionDocument> KeysCollectionManager::_getKeyWithKeyIdCheck(
-    long long keyId, const LogicalTime& forThisTime) {
-    auto keyStatus = _keysCache.getKeyById(keyId, forThisTime);
-
-    if (!keyStatus.isOK()) {
-        return keyStatus;
+    if (!swKey.isOK()) {
+        return swKey;
     }
 
-    return keyStatus.getValue();
-}
-
-StatusWith<KeysCollectionDocument> KeysCollectionManager::_getKey(const LogicalTime& forThisTime) {
-    auto keyStatus = _keysCache.getKey(forThisTime);
-
-    if (!keyStatus.isOK()) {
-        return keyStatus;
-    }
-
-    const auto& key = keyStatus.getValue();
+    const auto& key = swKey.getValue();
 
     if (key.getExpiresAt() < forThisTime) {
         return {ErrorCodes::KeyNotFound,
@@ -261,8 +267,8 @@ void KeysCollectionManager::PeriodicRunner::_doPeriodicRefresh(ServiceContext* s
             } else {
                 errorCount += 1;
                 nextWakeup = Milliseconds(kRefreshIntervalIfErrored.count() * errorCount);
-                if (nextWakeup > kMaxRefreshWaitTime) {
-                    nextWakeup = kMaxRefreshWaitTime;
+                if (nextWakeup > kMaxRefreshWaitTimeIfErrored) {
+                    nextWakeup = kMaxRefreshWaitTimeIfErrored;
                 }
                 LOGV2(4939300,
                       "Failed to refresh key cache",

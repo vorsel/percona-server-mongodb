@@ -26,6 +26,7 @@ selector:
   - jstests/core/wildcard_index_collation.js
   - jstests/core/wildcard_index_hint.js
   - jstests/core/wildcard_index_return_key.js
+  - jstests/core/wildcard_index_projection.js
   - jstests/core/update_array_offset_positional.js
   - jstests/core/update_arraymatch6.js
   - jstests/core/update_arraymatch8.js
@@ -120,7 +121,8 @@ selector:
   - jstests/core/doc_validation_options.js
   - jstests/core/dotted_path_in_null.js
   - jstests/core/elemmatch_or_pushdown.js
-  - jstests/core/elemMatchProjection.js
+  - jstests/core/elemmatch_projection.js
+  - jstests/core/positional_projection.js
   - jstests/core/ensure_sorted.js
   - jstests/core/exists.js
   - jstests/core/existsa.js
@@ -390,6 +392,7 @@ selector:
   - jstests/core/sparse_index_supports_ne_null.js
   - jstests/core/stages_and_hash.js
   - jstests/core/stages_collection_scan.js
+  - jstests/core/timeseries/timeseries_idle_buckets.js
   - jstests/core/top.js
   - jstests/core/txns/abort_prepared_transaction.js
   - jstests/core/txns/aggregation_in_transaction.js
@@ -490,8 +493,8 @@ selector:
   - jstests/core/elemmatch_object.js
   - jstests/core/elemmatch_or_pushdown.js
   - jstests/core/elemmatch_value.js
-  - jstests/core/elemMatchProjection.js
-  - jstests/core/elemMatchProjection.js
+  - jstests/core/elemmatch_projection.js
+  - jstests/core/positional_projection.js
   - jstests/core/existsa.js
   - jstests/core/expr.js
   - jstests/core/expr_valid_positions.js
@@ -545,7 +548,8 @@ selector:
   - jstests/core/depth_limit.js
   - jstests/core/doc_validation.js
   - jstests/core/doc_validation_invalid_validators.js
-  - jstests/core/elemMatchProjection.js
+  - jstests/core/elemmatch_projection.js
+  - jstests/core/positional_projection.js
   - jstests/core/explain_sort_type.js
   - jstests/core/expr.js
   - jstests/core/expr_index_use.js
@@ -779,6 +783,16 @@ selector:
   - jstests/core/type_array.js
   - jstests/core/exists9.js
   - jstests/core/exists8.js
+
+  # Timeseries collection expireAfterSeconds option requires the TTL Monitor,
+  # which is disabled in this test configuration.
+  - jstests/core/timeseries/timeseries_expire.js
+
+  # TODO SERVER-54042 Time-series collection queries
+  - jstests/core/timeseries/timeseries_bucket_limit_count.js
+  - jstests/core/timeseries/timeseries_min_max.js
+  - jstests/core/timeseries/timeseries_simple.js
+  - jstests/core/timeseries/timeseries_sparse.js
 
 executor:
   archive:

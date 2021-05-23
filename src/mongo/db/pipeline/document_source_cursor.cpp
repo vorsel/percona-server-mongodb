@@ -69,7 +69,8 @@ bool DocumentSourceCursor::Batch::isEmpty() const {
 void DocumentSourceCursor::Batch::enqueue(Document&& doc) {
     switch (_type) {
         case CursorType::kRegular: {
-            _batchOfDocs.push_back(doc.getOwned());
+            invariant(doc.isOwned());
+            _batchOfDocs.push_back(std::move(doc));
             _memUsageBytes += _batchOfDocs.back().getApproximateSize();
             break;
         }
@@ -195,7 +196,7 @@ void DocumentSourceCursor::_updateOplogTimestamp() {
 
 void DocumentSourceCursor::recordPlanSummaryStats() {
     invariant(_exec);
-    _exec->getPlanExplainer().getSummaryStats(&_planSummaryStats);
+    _exec->getPlanExplainer().getSummaryStats(&_stats.planSummaryStats);
 }
 
 Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity> verbosity) const {
@@ -314,7 +315,7 @@ DocumentSourceCursor::DocumentSourceCursor(
 
     if (collection) {
         CollectionQueryInfo::get(collection)
-            .notifyOfQuery(pExpCtx->opCtx, collection, _planSummaryStats);
+            .notifyOfQuery(pExpCtx->opCtx, collection, _stats.planSummaryStats);
     }
 }
 

@@ -47,9 +47,10 @@ namespace mongo::stage_builder {
 std::unique_ptr<sbe::EExpression> generateNullOrMissing(const sbe::EVariable& var) {
     return sbe::makeE<sbe::EPrimBinary>(
         sbe::EPrimBinary::logicOr,
-        sbe::makeE<sbe::EPrimUnary>(sbe::EPrimUnary::logicNot,
-                                    sbe::makeE<sbe::EFunction>("exists", sbe::makeEs(var.clone()))),
-        sbe::makeE<sbe::EFunction>("isNull", sbe::makeEs(var.clone())));
+        makeNot(makeFunction("exists", var.clone())),
+        sbe::makeE<sbe::ETypeMatch>(var.clone(),
+                                    getBSONTypeMask(BSONType::jstNULL) |
+                                        getBSONTypeMask(BSONType::Undefined)));
 }
 
 std::unique_ptr<sbe::EExpression> generateNullOrMissing(const sbe::FrameId frameId,
@@ -479,10 +480,14 @@ std::pair<sbe::value::SlotVector, std::unique_ptr<sbe::PlanStage>> generateVirtu
 }
 
 std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONArray& ba) {
-    int numBytes = ba.objsize();
-    uint8_t* data = new uint8_t[numBytes];
-    memcpy(data, reinterpret_cast<const uint8_t*>(ba.objdata()), numBytes);
-    return {sbe::value::TypeTags::bsonArray, sbe::value::bitcastFrom<uint8_t*>(data)};
+    return sbe::value::copyValue(sbe::value::TypeTags::bsonArray,
+                                 sbe::value::bitcastFrom<const char*>(ba.objdata()));
 }
 
+uint32_t dateTypeMask() {
+    return (getBSONTypeMask(sbe::value::TypeTags::Date) |
+            getBSONTypeMask(sbe::value::TypeTags::Timestamp) |
+            getBSONTypeMask(sbe::value::TypeTags::ObjectId) |
+            getBSONTypeMask(sbe::value::TypeTags::bsonObjectId));
+}
 }  // namespace mongo::stage_builder

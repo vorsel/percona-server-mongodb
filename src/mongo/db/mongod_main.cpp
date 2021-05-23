@@ -101,7 +101,6 @@
 #include "mongo/db/log_process_details.h"
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/logical_session_cache_factory_mongod.h"
-#include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/mirror_maestro.h"
 #include "mongo/db/mongod_options.h"
@@ -168,6 +167,7 @@
 #include "mongo/db/system_index.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/ttl.h"
+#include "mongo/db/vector_clock_metadata_hook.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/network_connection_hook.h"
 #include "mongo/executor/network_interface_factory.h"
@@ -179,7 +179,6 @@
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/sharding_initialization.h"
 #include "mongo/scripting/dbdirectclient_factory.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/future.h"
@@ -293,7 +292,6 @@ MONGO_INITIALIZER_WITH_PREREQUISITES(WireSpec, ("EndStartupOptionHandling"))(Ini
     spec.isInternalClient = true;
 
     WireSpec::instance().initialize(std::move(spec));
-    return Status::OK();
 }
 
 void initializeCommandHooks(ServiceContext* serviceContext) {
@@ -363,6 +361,7 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
 #endif
 
     logProcessDetails(nullptr);
+    audit::logStartupOptions(Client::getCurrent(), serverGlobalParams.parsedOpts);
 
     serviceContext->setServiceEntryPoint(std::make_unique<ServiceEntryPointMongod>(serviceContext));
 
@@ -658,9 +657,8 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
                 }
             }
         } else if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-            initializeGlobalShardingStateForMongoD(startupOpCtx.get(),
-                                                   ConnectionString::forLocal(),
-                                                   kDistLockProcessIdForConfigServer);
+            initializeGlobalShardingStateForMongoD(
+                startupOpCtx.get(), ShardId::kConfigServerId, ConnectionString::forLocal());
 
             ShardingCatalogManager::create(
                 startupOpCtx->getServiceContext(),
@@ -830,7 +828,6 @@ ExitCode initService() {
 MONGO_INITIALIZER_GENERAL(ForkServer, ("EndStartupOptionHandling"), ("default"))
 (InitializerContext* context) {
     mongo::forkServerOrDie();
-    return Status::OK();
 }
 
 /*
@@ -947,7 +944,7 @@ auto makeReplicaSetNodeExecutor(ServiceContext* serviceContext) {
         Client::initThread(threadName.c_str());
     };
     auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
-    hookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
+    hookList->addHook(std::make_unique<rpc::VectorClockMetadataHook>(serviceContext));
     hookList->addHook(std::make_unique<rpc::ClientMetadataPropagationEgressHook>());
     return std::make_unique<executor::ThreadPoolTaskExecutor>(
         std::make_unique<ThreadPool>(tpOptions),
@@ -963,7 +960,7 @@ auto makeReplicationExecutor(ServiceContext* serviceContext) {
         Client::initThread(threadName.c_str());
     };
     auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
-    hookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(serviceContext));
+    hookList->addHook(std::make_unique<rpc::VectorClockMetadataHook>(serviceContext));
     return std::make_unique<executor::ThreadPoolTaskExecutor>(
         std::make_unique<ThreadPool>(tpOptions),
         executor::makeNetworkInterface("ReplNetwork", nullptr, std::move(hookList)));
@@ -1040,10 +1037,9 @@ void setUpObservers(ServiceContext* serviceContext) {
 }
 
 #ifdef MONGO_CONFIG_SSL
-MONGO_INITIALIZER_GENERAL(setSSLManagerType, MONGO_NO_PREREQUISITES, ("SSLManager"))
+MONGO_INITIALIZER_GENERAL(setSSLManagerType, (), ("SSLManager"))
 (InitializerContext* context) {
     isSSLServer = true;
-    return Status::OK();
 }
 #endif
 
@@ -1195,14 +1191,6 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
                       {LogComponent::kTenantMigration},
                       "Shutting down all TenantMigrationAccessBlockers on global shutdown");
         TenantMigrationAccessBlockerRegistry::get(serviceContext).shutDown();
-
-        LOGV2_OPTIONS(5093808,
-                      {LogComponent::kTenantMigration},
-                      "Shutting down and joining the tenant migration donor executor");
-        auto tenantMigrationDonorExecutor =
-            tenant_migration_donor::getTenantMigrationDonorExecutor();
-        tenantMigrationDonorExecutor->shutdown();
-        tenantMigrationDonorExecutor->join();
 
         // Terminate the index consistency check.
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {

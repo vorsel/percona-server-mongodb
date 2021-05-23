@@ -79,7 +79,8 @@ public:
 
     StreamableReplicaSetMonitor(const MongoURI& uri,
                                 std::shared_ptr<executor::TaskExecutor> executor,
-                                std::shared_ptr<executor::EgressTagCloser> connectionManager);
+                                std::shared_ptr<executor::EgressTagCloser> connectionManager,
+                                std::function<void()> cleanupCallback);
 
     ~StreamableReplicaSetMonitor() override;
 
@@ -89,13 +90,17 @@ public:
 
     static ReplicaSetMonitorPtr make(const MongoURI& uri,
                                      std::shared_ptr<executor::TaskExecutor> executor,
-                                     std::shared_ptr<executor::EgressTagCloser> connectionCloser);
+                                     std::shared_ptr<executor::EgressTagCloser> connectionCloser,
+                                     std::function<void()> cleanupCallback);
 
     SemiFuture<HostAndPort> getHostOrRefresh(const ReadPreferenceSetting& readPref,
+                                             const std::vector<HostAndPort>& excludedHosts,
                                              const CancelationToken& cancelToken) override;
 
     SemiFuture<std::vector<HostAndPort>> getHostsOrRefresh(
-        const ReadPreferenceSetting& readPref, const CancelationToken& cancelToken) override;
+        const ReadPreferenceSetting& readPref,
+        const std::vector<HostAndPort>& excludedHosts,
+        const CancelationToken& cancelToken) override;
 
     HostAndPort getPrimaryOrUassert() override;
 
@@ -206,9 +211,13 @@ private:
     std::vector<HostAndPort> _extractHosts(
         const std::vector<sdam::ServerDescriptionPtr>& serverDescriptions);
 
-    boost::optional<std::vector<HostAndPort>> _getHosts(const TopologyDescriptionPtr& topology,
-                                                        const ReadPreferenceSetting& criteria);
-    boost::optional<std::vector<HostAndPort>> _getHosts(const ReadPreferenceSetting& criteria);
+    boost::optional<std::vector<HostAndPort>> _getHosts(
+        const TopologyDescriptionPtr& topology,
+        const ReadPreferenceSetting& criteria,
+        const std::vector<HostAndPort>& excludedHosts = std::vector<HostAndPort>());
+    boost::optional<std::vector<HostAndPort>> _getHosts(
+        const ReadPreferenceSetting& criteria,
+        const std::vector<HostAndPort>& excludedHosts = std::vector<HostAndPort>());
 
     // Incoming Events
     void onTopologyDescriptionChangedEvent(sdam::TopologyDescriptionPtr previousDescription,

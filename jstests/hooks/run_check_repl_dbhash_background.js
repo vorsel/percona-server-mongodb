@@ -245,7 +245,7 @@ function checkReplDbhashBackgroundThread(hosts) {
                     print("DBHash mismatch found for collection with uuid: " + uuid +
                           ". Primary info: " + tojsononeline(primaryInfo) +
                           ". Secondary info: " + tojsononeline(secondaryInfo));
-                    const diff = rst.getCollectionDiffUsingSessions(
+                    const diff = DataConsistencyChecker.getCollectionDiffUsingSessions(
                         primarySession, secondarySession, dbName, primaryInfo.uuid);
 
                     result.push({
@@ -284,9 +284,9 @@ function checkReplDbhashBackgroundThread(hosts) {
             // Note that unlike auto_retry_transaction.js, we do not treat CursorKilled or
             // CursorNotFound error responses as transient errors because the
             // run_check_repl_dbhash_background.js hook would only establish a cursor via
-            // ReplSetTest#getCollectionDiffUsingSessions() upon detecting a dbHash mismatch. It
-            // is presumed to still useful to know that a bug exists even if we cannot get more
-            // diagnostics for it.
+            // DataConsistencyChecker#getCollectionDiffUsingSessions() upon detecting a dbHash
+            // mismatch. It is still useful to know that a bug exists even if we cannot
+            // get more diagnostics for it.
             if (e.code === ErrorCodes.Interrupted) {
                 hasTransientError = true;
             }
@@ -405,26 +405,26 @@ function checkReplDbhashBackgroundThread(hosts) {
         if (diff.docsWithDifferentContents.length > 0) {
             errorBlob += '\nThe following documents have different contents on the primary and' +
                 ' secondary:';
-            for (let {primary, secondary} of diff.docsWithDifferentContents) {
-                errorBlob += `\n  primary:   ${tojsononeline(primary)}`;
-                errorBlob += `\n  secondary: ${tojsononeline(secondary)}`;
+            for (let {sourceNode, syncingNode} of diff.docsWithDifferentContents) {
+                errorBlob += `\n  primary:   ${tojsononeline(sourceNode)}`;
+                errorBlob += `\n  secondary: ${tojsononeline(syncingNode)}`;
             }
         } else {
             errorBlob += '\nNo documents have different contents on the primary and secondary';
         }
 
-        if (diff.docsMissingOnPrimary.length > 0) {
+        if (diff.docsMissingOnSource.length > 0) {
             errorBlob += "\nThe following documents aren't present on the primary:";
-            for (let doc of diff.docsMissingOnPrimary) {
+            for (let doc of diff.docsMissingOnSource) {
                 errorBlob += `\n  ${tojsononeline(doc)}`;
             }
         } else {
             errorBlob += '\nNo documents are missing from the primary';
         }
 
-        if (diff.docsMissingOnSecondary.length > 0) {
+        if (diff.docsMissingOnSyncing.length > 0) {
             errorBlob += "\nThe following documents aren't present on the secondary:";
-            for (let doc of diff.docsMissingOnSecondary) {
+            for (let doc of diff.docsMissingOnSyncing) {
                 errorBlob += `\n  ${tojsononeline(doc)}`;
             }
         } else {

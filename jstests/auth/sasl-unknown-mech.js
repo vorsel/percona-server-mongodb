@@ -34,14 +34,16 @@ function saslStartSuccess(mechanism) {
 saslStartSuccess('SCRAM-SHA-1');
 saslStartSuccess('SCRAM-SHA-256');
 
-function saslStartFailure(mechanism) {
+function saslStartFailure(mechanism, expectedCode) {
     const response = assert.commandFailed(saslStart(mechanism));
     assert.gt(response.errmsg.length, 0);
-    assert.neq(response.code, 0);
+    assert.eq(response.code, expectedCode);
 }
-saslStartFailure('scram-sha-1');
-saslStartFailure('MONGODB-CR');
-saslStartFailure(undefined);
+saslStartFailure('scram-sha-1', ErrorCodes.MechanismUnavailable);
+saslStartFailure('MONGODB-CR', ErrorCodes.MechanismUnavailable);
+
+const kIDLParserMissingRequiredField = 40414;
+saslStartFailure(undefined, kIDLParserMissingRequiredField);
 
 MongoRunner.stopMongod(mongod);
 })();

@@ -103,7 +103,7 @@ public:
     }
     void setSharded(bool sharded);
 
-    DatabaseVersion getVersion() const {
+    const DatabaseVersion& getVersion() const {
         return _version;
     }
     void setVersion(const DatabaseVersion& version);
@@ -111,7 +111,7 @@ public:
 private:
     std::string _name;
     ShardId _primary;
-    bool _sharded;
+    bool _sharded{false};
     DatabaseVersion _version;
 };
 

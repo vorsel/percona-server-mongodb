@@ -37,6 +37,7 @@
 #include <memory>
 #include <vector>
 
+#include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
@@ -47,6 +48,7 @@
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_exchange.h"
 #include "mongo/db/pipeline/document_source_geo_near.h"
@@ -71,6 +73,7 @@
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/storage/storage_options.h"
 #include "mongo/db/views/view.h"
 #include "mongo/db/views/view_catalog.h"
@@ -97,14 +100,14 @@ namespace {
  */
 bool canOptimizeAwayPipeline(const Pipeline* pipeline,
                              const PlanExecutor* exec,
-                             const AggregationRequest& request,
+                             const AggregateCommand& request,
                              bool hasGeoNearStage,
                              bool hasChangeStreamStage) {
     return pipeline && exec && !hasGeoNearStage && !hasChangeStreamStage &&
         pipeline->getSources().empty() &&
         // For exchange we will create a number of pipelines consisting of a single
         // DocumentSourceExchange stage, so cannot not optimize it away.
-        !request.getExchangeSpec();
+        !request.getExchange();
 }
 
 /**
@@ -117,11 +120,12 @@ bool handleCursorCommand(OperationContext* opCtx,
                          boost::intrusive_ptr<ExpressionContext> expCtx,
                          const NamespaceString& nsForCursor,
                          std::vector<ClientCursor*> cursors,
-                         const AggregationRequest& request,
+                         const AggregateCommand& request,
                          const BSONObj& cmdObj,
                          rpc::ReplyBuilderInterface* result) {
     invariant(!cursors.empty());
-    long long batchSize = request.getBatchSize();
+    long long batchSize =
+        request.getCursor().getBatchSize().value_or(aggregation_request_helper::kDefaultBatchSize);
 
     if (cursors.size() > 1) {
 
@@ -167,6 +171,7 @@ bool handleCursorCommand(OperationContext* opCtx,
     invariant(cursor);
     auto exec = cursor->getExecutor();
     invariant(exec);
+    ResourceConsumption::DocumentUnitCounter docUnitsReturned;
 
     bool stashedResult = false;
     // We are careful to avoid ever calling 'getNext()' on the PlanExecutor when the batchSize is
@@ -221,6 +226,7 @@ bool handleCursorCommand(OperationContext* opCtx,
         // If this executor produces a postBatchResumeToken, add it to the cursor response.
         responseBuilder.setPostBatchResumeToken(exec->getPostBatchResumeToken());
         responseBuilder.append(nextDoc);
+        docUnitsReturned.observeOne(nextDoc.objsize());
     }
 
     if (cursor) {
@@ -248,11 +254,14 @@ bool handleCursorCommand(OperationContext* opCtx,
     const CursorId cursorId = cursor ? cursor->cursorid() : 0LL;
     responseBuilder.done(cursorId, nsForCursor.ns());
 
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    metricsCollector.incrementDocUnitsReturned(docUnitsReturned);
+
     return static_cast<bool>(cursor);
 }
 
 StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNamespaces(
-    OperationContext* opCtx, const AggregationRequest& request) {
+    OperationContext* opCtx, const AggregateCommand& request) {
     const LiteParsedPipeline liteParsedPipeline(request);
     const auto& pipelineInvolvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
 
@@ -262,17 +271,13 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
         return {StringMap<ExpressionContext::ResolvedNamespace>()};
     }
 
-    // We intentionally do not drop and reacquire our system.views collection lock after resolving
-    // the view definition in order to prevent the definition for any view namespaces we've already
-    // resolved from changing. This is necessary to prevent a cycle from being formed among the view
-    // definitions cached in 'resolvedNamespaces' because we won't re-resolve a view namespace we've
-    // already encountered.
-    AutoGetCollection autoColl(opCtx,
-                               NamespaceString(request.getNamespaceString().db(),
-                                               NamespaceString::kSystemDotViewsCollectionName),
-                               MODE_IS);
-    Database* const db = autoColl.getDb();
-    ViewCatalog* viewCatalog = db ? ViewCatalog::get(db) : nullptr;
+    // Acquire a single const view of the database's ViewCatalog (if it exists) and use it for all
+    // view definition resolutions that follow. This prevents the view definitions cached in
+    // 'resolvedNamespaces' from changing relative to those in the acquired ViewCatalog. The
+    // resolution of the view definitions below might lead into an endless cycle if any are allowed
+    // to change.
+    auto viewCatalog =
+        DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, request.getNamespace().db());
 
     std::deque<NamespaceString> involvedNamespacesQueue(pipelineInvolvedNamespaces.begin(),
                                                         pipelineInvolvedNamespaces.end());
@@ -286,29 +291,16 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
             continue;
         }
 
-        if (involvedNs.db() != request.getNamespaceString().db()) {
-            // If the involved namespace is not in the same database as the aggregation, it must be
-            // from a $merge to a collection in a different database. Since we cannot write to
-            // views, simply assume that the namespace is a collection.
-            resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
-        } else if (!db ||
-                   CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, involvedNs)) {
-            // If the aggregation database exists and 'involvedNs' refers to a collection namespace,
-            // then we resolve it as an empty pipeline in order to read directly from the underlying
-            // collection. If the database doesn't exist, then we still resolve it as an empty
-            // pipeline because 'involvedNs' doesn't refer to a view namespace in our consistent
-            // snapshot of the view catalog.
-            resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
-        } else if (viewCatalog->lookup(opCtx, involvedNs.ns())) {
-            // If 'involvedNs' refers to a view namespace, then we resolve its definition.
-            auto resolvedView = viewCatalog->resolveView(opCtx, involvedNs);
+        // If 'ns' refers to a view namespace, then we resolve its definition.
+        auto resolveViewDefinition = [&](const NamespaceString& ns) -> Status {
+            auto resolvedView = viewCatalog->resolveView(opCtx, ns);
             if (!resolvedView.isOK()) {
                 return resolvedView.getStatus().withContext(
                     str::stream() << "Failed to resolve view '" << involvedNs.ns());
             }
 
-            resolvedNamespaces[involvedNs.coll()] = {resolvedView.getValue().getNamespace(),
-                                                     resolvedView.getValue().getPipeline()};
+            resolvedNamespaces[ns.coll()] = {resolvedView.getValue().getNamespace(),
+                                             resolvedView.getValue().getPipeline()};
 
             // We parse the pipeline corresponding to the resolved view in case we must resolve
             // other view namespaces that are also involved.
@@ -320,6 +312,40 @@ StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNames
             involvedNamespacesQueue.insert(involvedNamespacesQueue.end(),
                                            resolvedViewInvolvedNamespaces.begin(),
                                            resolvedViewInvolvedNamespaces.end());
+            return Status::OK();
+        };
+
+        // If the involved namespace is not in the same database as the aggregation, it must be
+        // from an $out or a $merge to a collection in a different database.
+        if (involvedNs.db() != request.getNamespace().db()) {
+            // SERVER-51886: It is not correct to assume that we are reading from a collection
+            // because the collection targeted by $out/$merge on a given database can have the same
+            // name as a view on the source database. As such, we determine whether the collection
+            // name references a view on the aggregation request's database. Note that the inverse
+            // scenario (mistaking a view for a collection) is not an issue because $merge/$out
+            // cannot target a view.
+            auto nssToCheck = NamespaceString(request.getNamespace().db(), involvedNs.coll());
+            if (viewCatalog && viewCatalog->lookup(opCtx, nssToCheck.ns())) {
+                auto status = resolveViewDefinition(nssToCheck);
+                if (!status.isOK()) {
+                    return status;
+                }
+            } else {
+                resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
+            }
+        } else if (!viewCatalog ||
+                   CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, involvedNs)) {
+            // If the aggregation database exists and 'involvedNs' refers to a collection namespace,
+            // then we resolve it as an empty pipeline in order to read directly from the underlying
+            // collection. If the database doesn't exist, then we still resolve it as an empty
+            // pipeline because 'involvedNs' doesn't refer to a view namespace in our consistent
+            // snapshot of the view catalog.
+            resolvedNamespaces[involvedNs.coll()] = {involvedNs, std::vector<BSONObj>{}};
+        } else if (viewCatalog->lookup(opCtx, involvedNs.ns())) {
+            auto status = resolveViewDefinition(involvedNs);
+            if (!status.isOK()) {
+                return status;
+            }
         } else {
             // 'involvedNs' is neither a view nor a collection, so resolve it as an empty pipeline
             // to treat it as reading from a non-existent collection.
@@ -338,7 +364,7 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
                                       StringData dbName,
                                       const CollatorInterface* collator,
                                       const LiteParsedPipeline& liteParsedPipeline) {
-    auto viewCatalog = DatabaseHolder::get(opCtx)->getSharedViewCatalog(opCtx, dbName);
+    auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, dbName);
     if (!viewCatalog) {
         return Status::OK();
     }
@@ -368,18 +394,18 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
 // versioned. This can happen in the case where we are running in a cluster with a 4.4 mongoS, which
 // does not set any shard version on a $mergeCursors pipeline.
 void setIgnoredShardVersionForMergeCursors(OperationContext* opCtx,
-                                           const AggregationRequest& request) {
-    auto isMergeCursors = request.isFromMongos() && request.getPipeline().size() > 0 &&
+                                           const AggregateCommand& request) {
+    auto isMergeCursors = request.getFromMongos() && request.getPipeline().size() > 0 &&
         request.getPipeline().front().firstElementFieldNameStringData() == "$mergeCursors"_sd;
     if (isMergeCursors && !OperationShardingState::isOperationVersioned(opCtx)) {
         OperationShardingState::get(opCtx).initializeClientRoutingVersions(
-            request.getNamespaceString(), ChunkVersion::IGNORED(), boost::none);
+            request.getNamespace(), ChunkVersion::IGNORED(), boost::none);
     }
 }
 
 boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
     OperationContext* opCtx,
-    const AggregationRequest& request,
+    const AggregateCommand& request,
     std::unique_ptr<CollatorInterface> collator,
     boost::optional<UUID> uuid) {
     setIgnoredShardVersionForMergeCursors(opCtx, request);
@@ -439,14 +465,14 @@ void _adjustChangeStreamReadConcern(OperationContext* opCtx) {
 std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createExchangePipelinesIfNeeded(
     OperationContext* opCtx,
     boost::intrusive_ptr<ExpressionContext> expCtx,
-    const AggregationRequest& request,
+    const AggregateCommand& request,
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
     boost::optional<UUID> uuid) {
     std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> pipelines;
 
-    if (request.getExchangeSpec() && !expCtx->explain) {
+    if (request.getExchange() && !expCtx->explain) {
         boost::intrusive_ptr<Exchange> exchange =
-            new Exchange(request.getExchangeSpec().get(), std::move(pipeline));
+            new Exchange(request.getExchange().get(), std::move(pipeline));
 
         for (size_t idx = 0; idx < exchange->getConsumers(); ++idx) {
             // For every new pipeline we have create a new ExpressionContext as the context
@@ -475,7 +501,7 @@ std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createExchangePipelinesI
 
 Status runAggregate(OperationContext* opCtx,
                     const NamespaceString& nss,
-                    const AggregationRequest& request,
+                    const AggregateCommand& request,
                     const BSONObj& cmdObj,
                     const PrivilegeVector& privileges,
                     rpc::ReplyBuilderInterface* result) {
@@ -484,13 +510,22 @@ Status runAggregate(OperationContext* opCtx,
 
 Status runAggregate(OperationContext* opCtx,
                     const NamespaceString& origNss,
-                    const AggregationRequest& request,
+                    const AggregateCommand& request,
                     const LiteParsedPipeline& liteParsedPipeline,
                     const BSONObj& cmdObj,
                     const PrivilegeVector& privileges,
                     rpc::ReplyBuilderInterface* result) {
+    // If 'apiStrict: true', validates that the pipeline does not contain stages which are not in
+    // this API version.
+    auto apiParameters = APIParameters::get(opCtx);
+    if (apiParameters.getAPIStrict().value_or(false)) {
+        auto apiVersion = apiParameters.getAPIVersion();
+        invariant(apiVersion);
+        liteParsedPipeline.validatePipelineStagesIfAPIStrict(*apiVersion);
+    }
+
     // For operations on views, this will be the underlying namespace.
-    NamespaceString nss = request.getNamespaceString();
+    NamespaceString nss = request.getNamespace();
 
     // The collation to use for this aggregation. boost::optional to distinguish between the case
     // where the collation has not yet been resolved, and where it has been resolved to nullptr.
@@ -523,7 +558,7 @@ Status runAggregate(OperationContext* opCtx,
         // If this is a change stream, perform special checks and change the execution namespace.
         if (liteParsedPipeline.hasChangeStream()) {
             uassert(4928900,
-                    str::stream() << AggregationRequest::kCollectionUUIDName
+                    str::stream() << AggregateCommand::kCollectionUUIDFieldName
                                   << " is not supported for a change stream",
                     !request.getCollectionUUID());
 
@@ -533,23 +568,27 @@ Status runAggregate(OperationContext* opCtx,
             // Upgrade and wait for read concern if necessary.
             _adjustChangeStreamReadConcern(opCtx);
 
-            // AutoGetCollectionForReadCommand will raise an error if 'origNss' is a view. We do not
-            // need to check this if we are opening a stream on an entire db or across the cluster.
+            // Raise an error if 'origNss' is a view. We do not need to check this if we are opening
+            // a stream on an entire db or across the cluster.
             if (!origNss.isCollectionlessAggregateNS()) {
-                AutoGetCollectionForReadCommandMaybeLockFree origNssCtx(opCtx, origNss);
+                auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, origNss.db());
+                uassert(ErrorCodes::CommandNotSupportedOnView,
+                        str::stream()
+                            << "Namespace " << origNss.ns() << " is a view, not a collection",
+                        !viewCatalog || !viewCatalog->lookup(opCtx, origNss.ns()));
             }
 
             // If the user specified an explicit collation, adopt it; otherwise, use the simple
             // collation. We do not inherit the collection's default collation or UUID, since
             // the stream may be resuming from a point before the current UUID existed.
-            collatorToUse.emplace(
-                PipelineD::resolveCollator(opCtx, request.getCollation(), nullptr));
+            collatorToUse.emplace(PipelineD::resolveCollator(
+                opCtx, request.getCollation().get_value_or(BSONObj()), nullptr));
 
             // Obtain collection locks on the execution namespace; that is, the oplog.
             ctx.emplace(opCtx, nss, AutoGetCollectionViewMode::kViewsForbidden);
         } else if (nss.isCollectionlessAggregateNS() && pipelineInvolvedNamespaces.empty()) {
             uassert(4928901,
-                    str::stream() << AggregationRequest::kCollectionUUIDName
+                    str::stream() << AggregateCommand::kCollectionUUIDFieldName
                                   << " is not supported for a collectionless aggregation",
                     !request.getCollectionUUID());
 
@@ -559,13 +598,13 @@ Status runAggregate(OperationContext* opCtx,
                                  Top::LockType::NotLocked,
                                  AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                  0);
-            collatorToUse.emplace(
-                PipelineD::resolveCollator(opCtx, request.getCollation(), nullptr));
+            collatorToUse.emplace(PipelineD::resolveCollator(
+                opCtx, request.getCollation().get_value_or(BSONObj()), nullptr));
         } else {
             // This is a regular aggregation. Lock the collection or view.
             ctx.emplace(opCtx, nss, AutoGetCollectionViewMode::kViewsPermitted);
-            collatorToUse.emplace(
-                PipelineD::resolveCollator(opCtx, request.getCollation(), ctx->getCollection()));
+            collatorToUse.emplace(PipelineD::resolveCollator(
+                opCtx, request.getCollation().get_value_or(BSONObj()), ctx->getCollection()));
             if (ctx->getCollection()) {
                 uuid = ctx->getCollection()->uuid();
             }
@@ -582,13 +621,13 @@ Status runAggregate(OperationContext* opCtx,
             invariant(nss != NamespaceString::kRsOplogNamespace);
             invariant(!nss.isCollectionlessAggregateNS());
             uassert(ErrorCodes::OptionNotSupportedOnView,
-                    str::stream() << AggregationRequest::kCollectionUUIDName
+                    str::stream() << AggregateCommand::kCollectionUUIDFieldName
                                   << " is not supported against a view",
                     !request.getCollectionUUID());
 
             // Check that the default collation of 'view' is compatible with the operation's
             // collation. The check is skipped if the request did not specify a collation.
-            if (!request.getCollation().isEmpty()) {
+            if (!request.getCollation().get_value_or(BSONObj()).isEmpty()) {
                 invariant(collatorToUse);  // Should already be resolved at this point.
                 if (!CollatorInterface::collatorsMatch(ctx->getView()->defaultCollator(),
                                                        collatorToUse->get())) {
@@ -599,7 +638,7 @@ Status runAggregate(OperationContext* opCtx,
 
 
             auto resolvedView = uassertStatusOK(DatabaseHolder::get(opCtx)
-                                                    ->getSharedViewCatalog(opCtx, nss.db())
+                                                    ->getViewCatalog(opCtx, nss.db())
                                                     ->resolveView(opCtx, nss));
             uassert(std::move(resolvedView),
                     "On sharded systems, resolved views must be executed by mongos",
@@ -610,7 +649,7 @@ Status runAggregate(OperationContext* opCtx,
 
             // Parse the resolved view into a new aggregation request.
             auto newRequest = resolvedView.asExpandedViewAggregation(request);
-            auto newCmd = newRequest.serializeToCommandObj().toBson();
+            auto newCmd = aggregation_request_helper::serializeToCommandObj(newRequest);
 
             auto status = runAggregate(opCtx, origNss, newRequest, newCmd, privileges, result);
 
@@ -749,6 +788,7 @@ Status runAggregate(OperationContext* opCtx,
 
         auto pin = CursorManager::get(opCtx)->registerCursor(opCtx, std::move(cursorParams));
 
+        pin->incNBatches();
         cursors.emplace_back(pin.getCursor());
         pins.emplace_back(std::move(pin));
     }

@@ -71,6 +71,6 @@ Status storeLDAPOptions(const moe::Environment& params) {
 
 MONGO_INITIALIZER_GENERAL(StoreLDAPOptions, ("CoreOptions_Store"), ("EndStartupOptionStorage"))
 (InitializerContext* const context) {
-    return storeLDAPOptions(moe::startupOptionsParsed);
+    uassertStatusOK(storeLDAPOptions(moe::startupOptionsParsed));
 }
 }  // namespace mongo 

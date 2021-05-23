@@ -1028,6 +1028,7 @@ env.Library(
     ],
     LIBDEPS = [
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/dbdirectclient',
         'base_cloner',
         'cloner_utils',
         'repl_sync_shared_data',
@@ -1268,13 +1269,17 @@ env.Library(
 env.Library(
     target='tenant_migration_state_machine_idl',
     source=[
+        'tenant_migration_pem_payload.idl',
         'tenant_migration_state_machine.idl',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/client/connection_string',
         '$BUILD_DIR/mongo/client/read_preference',
         '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/util/net/ssl_manager',
         'optime',
+        'repl_coordinator_interface',
     ],
 )
 
@@ -1301,6 +1306,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/read_preference',
+        '$BUILD_DIR/mongo/util/future_util',
         'primary_only_service',
         'tenant_migration_recipient_utils',
         'wait_for_majority_service',
@@ -1312,7 +1318,9 @@ env.Library(
         'oplog_buffer_collection',
         'oplog_entry',
         'oplog_fetcher',
+        'oplog_interface_local',
         'repl_server_parameters',
+        'replication_auth',
         'tenant_migration_cloners',
         'tenant_migration_state_machine_idl',
         'tenant_oplog_processing',
@@ -1323,6 +1331,7 @@ env.Library(
     target='tenant_migration_donor',
     source=[
         'tenant_migration_access_blocker.cpp',
+        'tenant_migration_access_blocker_executor.cpp',
         'tenant_migration_access_blocker_registry.cpp',
         'tenant_migration_access_blocker_server_status_section.cpp',
         'tenant_migration_donor_op_observer.cpp',
@@ -1384,7 +1393,6 @@ env.Library(
         '$BUILD_DIR/mongo/db/query_exec',
         '$BUILD_DIR/mongo/db/repl/oplog_buffer_proxy',
         '$BUILD_DIR/mongo/db/repl/replication_metrics',
-        '$BUILD_DIR/mongo/db/s/sharding_catalog_manager',
         '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
         '$BUILD_DIR/mongo/db/service_context',
         '$BUILD_DIR/mongo/db/stats/counters',

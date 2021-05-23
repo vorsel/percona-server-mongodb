@@ -155,7 +155,7 @@ public:
     /**
      * Returns nullptr if the view didn't exist.
      */
-    ViewDefinition* getView() const {
+    const ViewDefinition* getView() const {
         return _view.get();
     }
 
@@ -188,7 +188,7 @@ protected:
     AutoGetDb _autoDb;
     boost::optional<Lock::CollectionLock> _collLock;
     CollectionPtr _coll = nullptr;
-    std::shared_ptr<ViewDefinition> _view;
+    std::shared_ptr<const ViewDefinition> _view;
 
     // If the object was instantiated with a UUID, contains the resolved namespace, otherwise it is
     // the same as the input namespace string
@@ -207,7 +207,9 @@ protected:
  * object goes out of scope. This object ensures the continued existence of a Collection reference,
  * if the collection exists when this object is instantiated.
  *
- * This class is only used by AutoGetCollectionForReadLockFree.
+ * NOTE: this class is not safe to instantiate outside of AutoGetCollectionForReadLockFree. For
+ * example, it does not perform database or collection level shard version checks; nor does it
+ * establish a consistent storage snapshot with which to read.
  */
 class AutoGetCollectionLockFree {
     AutoGetCollectionLockFree(const AutoGetCollectionLockFree&) = delete;
@@ -260,7 +262,7 @@ public:
     /**
      * Returns nullptr if the view didn't exist.
      */
-    ViewDefinition* getView() const {
+    const ViewDefinition* getView() const {
         return _view.get();
     }
 
@@ -290,7 +292,33 @@ private:
     // The CollectionPtr is the access point to the Collection instance for callers.
     CollectionPtr _collectionPtr;
 
-    std::shared_ptr<ViewDefinition> _view;
+    std::shared_ptr<const ViewDefinition> _view;
+};
+
+/**
+ * This is a nested lock helper. If a higher level operation is running a lock-free read, then this
+ * helper will follow suite and instantiate a AutoGetCollectionLockFree. Otherwise, it will
+ * instantiate a regular AutoGetCollection helper.
+ */
+class AutoGetCollectionMaybeLockFree {
+    AutoGetCollectionMaybeLockFree(const AutoGetCollectionMaybeLockFree&) = delete;
+    AutoGetCollectionMaybeLockFree& operator=(const AutoGetCollectionMaybeLockFree&) = delete;
+
+public:
+    /**
+     * Decides whether to instantiate a lock-free or locked helper based on whether a lock-free
+     * operation is set on the opCtx.
+     */
+    AutoGetCollectionMaybeLockFree(
+        OperationContext* opCtx,
+        const NamespaceStringOrUUID& nsOrUUID,
+        LockMode modeColl,
+        AutoGetCollectionViewMode viewMode = AutoGetCollectionViewMode::kViewsForbidden,
+        Date_t deadline = Date_t::max());
+
+private:
+    boost::optional<AutoGetCollection> _autoGet;
+    boost::optional<AutoGetCollectionLockFree> _autoGetLockFree;
 };
 
 /**

@@ -17,7 +17,7 @@ const nonRetryableWriteCommands = [
     {distinct: "c"},
     {find: "c"},
     {getMore: NumberLong(1), collection: "c"},
-    {killCursors: 1},
+    {killCursors: 'system.users', cursors: []},
     // A selection of commands that are not allowed in transactions.
     {count: 1},
     {explain: {find: "c"}},
@@ -27,8 +27,8 @@ const nonRetryableWriteCommands = [
     {ping: 1},
     {listCommands: 1},
     {create: "c"},
-    {drop: 1},
-    {createIndexes: 1},
+    {drop: "c"},
+    {createIndexes: "c", indexes: []},
     {mapReduce: "c"}
 ];
 

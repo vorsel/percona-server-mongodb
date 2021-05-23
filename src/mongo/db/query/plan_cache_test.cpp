@@ -286,7 +286,7 @@ std::pair<CoreIndexInfo, std::unique_ptr<WildcardProjection>> makeWildcardUpdate
  */
 struct GenerateQuerySolution {
     QuerySolution* operator()() const {
-        unique_ptr<QuerySolution> qs(new QuerySolution());
+        unique_ptr<QuerySolution> qs(new QuerySolution(QueryPlannerParams::Options::DEFAULT));
         qs->cacheData.reset(new SolutionCacheData());
         qs->cacheData->solnType = SolutionCacheData::COLLSCAN_SOLN;
         qs->cacheData->tree.reset(new PlanCacheIndexTree());
@@ -310,7 +310,7 @@ std::unique_ptr<plan_ranker::PlanRankingDecision> createDecision(size_t numPlans
         why->scores.push_back(0U);
         why->candidateOrder.push_back(i);
     }
-    why->getStats<PlanStageStats>() = std::move(stats);
+    why->getStats<PlanStageStats>().candidatePlanStats = std::move(stats);
     return why;
 }
 
@@ -349,7 +349,8 @@ void assertShouldNotCacheQuery(const char* queryStr) {
 }
 
 std::unique_ptr<QuerySolution> getQuerySolutionForCaching() {
-    std::unique_ptr<QuerySolution> qs = std::make_unique<QuerySolution>();
+    std::unique_ptr<QuerySolution> qs =
+        std::make_unique<QuerySolution>(QueryPlannerParams::Options::DEFAULT);
     qs->cacheData = std::make_unique<SolutionCacheData>();
     qs->cacheData->tree = std::make_unique<PlanCacheIndexTree>();
     return qs;
@@ -686,7 +687,7 @@ TEST(PlanCacheTest, WorksValueIncreases) {
     ASSERT(entry->debugInfo);
     ASSERT(entry->debugInfo->decision);
     auto&& decision = entry->debugInfo->decision;
-    ASSERT_EQ(decision->getStats<PlanStageStats>()[0]->common.works, 25U);
+    ASSERT_EQ(decision->getStats<PlanStageStats>().candidatePlanStats[0]->common.works, 25U);
     ASSERT_EQ(entry->works, 25U);
 
     ASSERT_EQUALS(planCache.size(), 1U);
@@ -1048,8 +1049,7 @@ protected:
         solns.clear();
 
         const bool isExplain = false;
-        std::unique_ptr<QueryRequest> qr(
-            assertGet(QueryRequest::makeFromFindCommand(nss, cmdObj, isExplain)));
+        std::unique_ptr<QueryRequest> qr(QueryRequest::makeFromFindCommand(cmdObj, isExplain));
 
         const boost::intrusive_ptr<ExpressionContext> expCtx;
         auto statusWithCQ =
@@ -1137,7 +1137,7 @@ protected:
 
         // Create a CachedSolution the long way..
         // QuerySolution -> PlanCacheEntry -> CachedSolution
-        QuerySolution qs;
+        QuerySolution qs{QueryPlannerParams::Options::DEFAULT};
         qs.cacheData = soln.cacheData->clone();
         std::vector<QuerySolution*> solutions;
         solutions.push_back(&qs);
@@ -1758,8 +1758,9 @@ TEST_F(CachePlanSelectionTest, Or2DNonNearNotCached) {
 TEST_F(CachePlanSelectionTest, MatchingCollation) {
     CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
     addIndex(BSON("x" << 1), "x_1", &collator);
-    runQueryAsCommand(fromjson(
-        "{find: 'testns', filter: {x: 'foo'}, collation: {locale: 'mock_reverse_string'}}"));
+    runQueryAsCommand(
+        fromjson("{find: 'testns', filter: {x: 'foo'}, collation: {locale: 'mock_reverse_string'}, "
+                 "'$db': 'test'}"));
 
     assertPlanCacheRecoversSolution(BSON("x"
                                          << "bar"),

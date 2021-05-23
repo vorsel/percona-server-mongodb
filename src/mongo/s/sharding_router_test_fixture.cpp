@@ -41,19 +41,18 @@
 #include "mongo/db/client.h"
 #include "mongo/db/client_metadata_propagation_egress_hook.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/logical_time_metadata_hook.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/collation/collator_factory_mock.h"
 #include "mongo/db/query/query_request.h"
 #include "mongo/db/repl/read_concern_args.h"
+#include "mongo/db/vector_clock_metadata_hook.h"
 #include "mongo/executor/task_executor_pool.h"
 #include "mongo/executor/thread_pool_task_executor_test_fixture.h"
 #include "mongo/rpc/metadata/egress_metadata_hook_list.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/s/balancer_configuration.h"
-#include "mongo/s/catalog/dist_lock_manager_mock.h"
 #include "mongo/s/catalog/sharding_catalog_client_impl.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/catalog/type_shard.h"
@@ -107,7 +106,7 @@ ShardingTestFixture::ShardingTestFixture()
     // Set up executor pool used for most operations.
     auto makeMetadataHookList = [&] {
         auto hookList = std::make_unique<rpc::EgressMetadataHookList>();
-        hookList->addHook(std::make_unique<rpc::LogicalTimeMetadataHook>(service));
+        hookList->addHook(std::make_unique<rpc::VectorClockMetadataHook>(service));
         hookList->addHook(std::make_unique<rpc::CommittedOpTimeMetadataHook>(service));
         hookList->addHook(std::make_unique<rpc::ClientMetadataPropagationEgressHook>());
         hookList->addHook(std::make_unique<rpc::ShardingEgressMetadataHookForMongos>(service));
@@ -131,9 +130,6 @@ ShardingTestFixture::ShardingTestFixture()
 
     auto executorPool = std::make_unique<executor::TaskExecutorPool>();
     executorPool->addExecutors(std::move(executorsForPool), _fixedExecutor);
-
-    auto uniqueDistLockManager = std::make_unique<DistLockManagerMock>(nullptr);
-    _distLockManager = uniqueDistLockManager.get();
 
     NumHostsTargetedMetrics::get(service).startup();
 
@@ -174,17 +170,13 @@ ShardingTestFixture::ShardingTestFixture()
     // until we get rid of it.
     auto uniqueOpCtx = makeOperationContext();
     auto const grid = Grid::get(uniqueOpCtx.get());
-    grid->init(makeShardingCatalogClient(std::move(uniqueDistLockManager)),
+    grid->init(makeShardingCatalogClient(),
                std::move(catalogCache),
                std::move(shardRegistry),
                std::make_unique<ClusterCursorManager>(service->getPreciseClockSource()),
                std::make_unique<BalancerConfiguration>(),
                std::move(executorPool),
                _mockNetwork);
-
-    if (grid->catalogClient()) {
-        grid->catalogClient()->startup();
-    }
 }
 
 ShardingTestFixture::~ShardingTestFixture() {
@@ -193,9 +185,6 @@ ShardingTestFixture::~ShardingTestFixture() {
     if (auto grid = Grid::get(getServiceContext())) {
         if (grid->getExecutorPool()) {
             grid->getExecutorPool()->shutdownAndJoin();
-        }
-        if (grid->catalogClient()) {
-            grid->catalogClient()->shutDown(makeOperationContext().get());
         }
         if (grid->shardRegistry()) {
             grid->shardRegistry()->shutdown();
@@ -266,10 +255,9 @@ void ShardingTestFixture::expectGetShards(const std::vector<ShardType>& shards) 
         const NamespaceString nss(request.dbname, request.cmdObj.firstElement().String());
         ASSERT_EQ(nss, ShardType::ConfigNS);
 
-        auto queryResult = QueryRequest::makeFromFindCommand(nss, request.cmdObj, false);
-        ASSERT_OK(queryResult.getStatus());
-
-        const auto& query = queryResult.getValue();
+        // If there is no '$db', append it.
+        auto cmd = OpMsgRequest::fromDBAndBody(nss.db(), request.cmdObj).body;
+        auto query = QueryRequest::makeFromFindCommand(cmd, false, nss);
         ASSERT_EQ(query->nss(), ShardType::ConfigNS);
 
         ASSERT_BSONOBJ_EQ(query->getFilter(), BSONObj());
@@ -419,10 +407,8 @@ void ShardingTestFixture::checkReadConcern(const BSONObj& cmdObj,
     }
 }
 
-std::unique_ptr<ShardingCatalogClient> ShardingTestFixture::makeShardingCatalogClient(
-    std::unique_ptr<DistLockManager> distLockManager) {
-    invariant(distLockManager);
-    return std::make_unique<ShardingCatalogClientImpl>(std::move(distLockManager));
+std::unique_ptr<ShardingCatalogClient> ShardingTestFixture::makeShardingCatalogClient() {
+    return std::make_unique<ShardingCatalogClientImpl>();
 }
 
 }  // namespace mongo

@@ -33,6 +33,7 @@
 
 #include "mongo/db/catalog/rename_collection.h"
 
+#include "mongo/bson/unordered_fields_bsonobj_comparator.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/document_validation.h"
@@ -51,7 +52,6 @@
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
-#include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
@@ -68,11 +68,6 @@ MONGO_FAIL_POINT_DEFINE(writeConflictInRenameCollCopyToTmp);
 
 boost::optional<NamespaceString> getNamespaceFromUUID(OperationContext* opCtx, const UUID& uuid) {
     return CollectionCatalog::get(opCtx)->lookupNSSByUUID(opCtx, uuid);
-}
-
-bool isCollectionSharded(OperationContext* opCtx, const NamespaceString& nss) {
-    return opCtx->writesAreReplicated() &&
-        CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx).isSharded();
 }
 
 // From a replicated to an unreplicated collection or vice versa.
@@ -96,9 +91,6 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
         return Status(ErrorCodes::NotWritablePrimary,
                       str::stream() << "Not primary while renaming collection " << source << " to "
                                     << target);
-
-    if (!options.skipSourceCollectionShardedCheck && isCollectionSharded(opCtx, source))
-        return {ErrorCodes::IllegalOperation, "source namespace cannot be sharded"};
 
     if (isReplicatedChanged(opCtx, source, target))
         return {ErrorCodes::IllegalOperation,
@@ -129,9 +121,6 @@ Status checkSourceAndTargetNamespaces(OperationContext* opCtx,
             return Status(ErrorCodes::NamespaceExists,
                           str::stream() << "a view already exists with that name: " << target);
     } else {
-        if (isCollectionSharded(opCtx, target))
-            return {ErrorCodes::IllegalOperation, "cannot rename to a sharded collection"};
-
         if (!targetExistsAllowed && !options.dropTarget)
             return Status(ErrorCodes::NamespaceExists, "target namespace exists");
     }
@@ -494,10 +483,6 @@ Status renameBetweenDBs(OperationContext* opCtx,
         return Status(ErrorCodes::NamespaceNotFound, "source namespace does not exist");
     }
 
-    // The source collection is not temporary, so we should check if is sharded or not.
-    if (isCollectionSharded(opCtx, source))
-        return {ErrorCodes::IllegalOperation, "source namespace cannot be sharded"};
-
     if (isReplicatedChanged(opCtx, source, target))
         return {ErrorCodes::IllegalOperation,
                 "Cannot rename collections between a replicated and an unreplicated database"};
@@ -516,9 +501,6 @@ Status renameBetweenDBs(OperationContext* opCtx,
             invariant(source == target);
             return Status::OK();
         }
-
-        if (isCollectionSharded(opCtx, target))
-            return {ErrorCodes::IllegalOperation, "cannot rename to a sharded collection"};
 
         if (!options.dropTarget) {
             return Status(ErrorCodes::NamespaceExists, "target namespace exists");
@@ -707,7 +689,6 @@ Status renameBetweenDBs(OperationContext* opCtx,
     // in-place rename and remove the source collection.
     invariant(tmpName.db() == target.db());
     RenameCollectionOptions tempOptions(options);
-    tempOptions.skipSourceCollectionShardedCheck = true;
     Status status = renameCollectionWithinDB(opCtx, tmpName, target, tempOptions);
     if (!status.isOK())
         return status;
@@ -750,14 +731,17 @@ void doLocalRenameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
 
     auto currentIndexes =
         listIndexesEmptyListIfMissing(opCtx, targetNs, false /* includeBuildUUIDs */);
-    uassert(ErrorCodes::CommandFailed,
-            str::stream() << "indexes of target collection " << targetNs.ns()
-                          << " changed during processing.",
-            originalIndexes.size() == currentIndexes.size() &&
-                std::equal(originalIndexes.begin(),
-                           originalIndexes.end(),
-                           currentIndexes.begin(),
-                           SimpleBSONObjComparator::kInstance.makeEqualTo()));
+
+    UnorderedFieldsBSONObjComparator comparator;
+    uassert(
+        ErrorCodes::CommandFailed,
+        str::stream() << "indexes of target collection " << targetNs.ns()
+                      << " changed during processing.",
+        originalIndexes.size() == currentIndexes.size() &&
+            std::equal(originalIndexes.begin(),
+                       originalIndexes.end(),
+                       currentIndexes.begin(),
+                       [&](auto& lhs, auto& rhs) { return comparator.compare(lhs, rhs) == 0; }));
 
     validateAndRunRenameCollection(opCtx, sourceNs, targetNs, options);
 }

@@ -15,7 +15,9 @@ load("jstests/libs/uuid_util.js");
 load("jstests/libs/parallelTester.js");
 load("jstests/replsets/libs/tenant_migration_test.js");
 
-const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
+// TODO SERVER-53110: Remove 'enableRecipientTesting: false'.
+const tenantMigrationTest =
+    new TenantMigrationTest({name: jsTestName(), enableRecipientTesting: false});
 if (!tenantMigrationTest.isFeatureFlagEnabled()) {
     jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
     return;
@@ -29,9 +31,9 @@ let donorPrimary = tenantMigrationTest.getDonorPrimary();
 // Force the migration to pause after entering a randomly selected state to simulate a failure.
 Random.setRandomSeed();
 const kMigrationFpNames = [
-    "pauseTenantMigrationAfterDataSync",
-    "pauseTenantMigrationAfterBlockingStarts",
-    "abortTenantMigrationAfterBlockingStarts"
+    "pauseTenantMigrationBeforeLeavingDataSyncState",
+    "pauseTenantMigrationBeforeLeavingBlockingState",
+    "abortTenantMigrationBeforeLeavingBlockingState"
 ];
 let fp;
 const index = Random.randInt(kMigrationFpNames.length + 1);
@@ -81,7 +83,7 @@ if (donorDoc) {
             assert.soon(
                 () => bsonWoCompare(tenantMigrationTest
                                         .getTenantMigrationAccessBlocker(initialSyncNode, kTenantId)
-                                        .commitOrAbortOpTime,
+                                        .commitOpTime,
                                     donorDoc.commitOrAbortOpTime) == 0);
             assert.soon(
                 () => bsonWoCompare(tenantMigrationTest
@@ -96,7 +98,7 @@ if (donorDoc) {
             assert.soon(
                 () => bsonWoCompare(tenantMigrationTest
                                         .getTenantMigrationAccessBlocker(initialSyncNode, kTenantId)
-                                        .commitOrAbortOpTime,
+                                        .abortOpTime,
                                     donorDoc.commitOrAbortOpTime) == 0);
             assert.soon(
                 () => bsonWoCompare(tenantMigrationTest
@@ -114,5 +116,6 @@ if (fp) {
 }
 
 assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
+assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 tenantMigrationTest.stop();
 })();

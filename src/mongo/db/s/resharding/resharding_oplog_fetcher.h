@@ -36,14 +36,19 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
+#include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
 #include "mongo/db/service_context.h"
+#include "mongo/platform/mutex.h"
 #include "mongo/s/client/shard.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/util/background.h"
+#include "mongo/util/cancelation.h"
+#include "mongo/util/future.h"
+#include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
 
 namespace mongo {
-class ReshardingOplogFetcher {
+class ReshardingOplogFetcher : public resharding::OnInsertAwaitable {
 public:
     ReshardingOplogFetcher(UUID reshardingUUID,
                            UUID collUUID,
@@ -52,6 +57,12 @@ public:
                            ShardId recipientShard,
                            bool doesDonorOwnMinKeyChunk,
                            NamespaceString toWriteInto);
+
+    ~ReshardingOplogFetcher();
+
+    Future<void> awaitInsert(const ReshardingDonorOplogId& lastSeen) override;
+
+    void interrupt(Status status);
 
     /**
      * Schedules a task that will do the following:
@@ -67,13 +78,19 @@ public:
      * oplog, this is thrown as a fatal resharding exception.  In the last circumstance, the task
      * will be rescheduled in a way that resumes where it had left off from.
      */
-    Future<void> schedule(executor::TaskExecutor* executor);
+    ExecutorFuture<void> schedule(std::shared_ptr<executor::TaskExecutor> executor,
+                                  const CancelationToken& cancelToken);
 
     /**
-     * Given a shard, fetches and copies oplog entries until reaching an error, or coming
-     * across a sentinel finish oplog entry. Throws if there's more oplog entries to be copied.
+     * Given a shard, fetches and copies oplog entries until
+     *  - reaching an error,
+     *  - coming across a sentinel finish oplog entry, or
+     *  - hitting the end of the donor's oplog.
+     *
+     * Returns true if there are more oplog entries to be copied, and returns false if the sentinel
+     * finish oplog entry has been copied.
      */
-    void consume(Client* client, Shard* shard);
+    bool consume(Client* client, Shard* shard);
 
     bool iterate(Client* client);
 
@@ -102,8 +119,9 @@ private:
      * Returns true if there's more work to do and the task should be rescheduled.
      */
     void _ensureCollection(Client* client, const NamespaceString nss);
-    std::vector<BSONObj> _makePipeline(Client* client);
-    void _reschedule(executor::TaskExecutor* executor);
+    AggregateCommand _makeAggregateCommand(Client* client);
+    ExecutorFuture<void> _reschedule(std::shared_ptr<executor::TaskExecutor> executor,
+                                     const CancelationToken& cancelToken);
 
     const UUID _reshardingUUID;
     const UUID _collUUID;
@@ -113,8 +131,12 @@ private:
     const bool _doesDonorOwnMinKeyChunk;
     const NamespaceString _toWriteInto;
 
-    Promise<void> _fetchedFinishPromise;
     int _numOplogEntriesCopied = 0;
+
+    Mutex _mutex = MONGO_MAKE_LATCH("ReshardingOplogFetcher::_mutex");
+    Promise<void> _onInsertPromise;
+    Future<void> _onInsertFuture;
+    boost::optional<Status> _interruptStatus;
 
     // For testing to control behavior.
 

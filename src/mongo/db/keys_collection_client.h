@@ -33,7 +33,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/base/string_data.h"
-#include "mongo/db/keys_collection_document.h"
+#include "mongo/db/keys_collection_document_gen.h"
 
 namespace mongo {
 
@@ -46,10 +46,22 @@ public:
     virtual ~KeysCollectionClient() = default;
 
     /**
-     * Returns keys for the given purpose and with an expiresAt value greater than newerThanThis,
-     * using readConcern level majority if possible.
+     * Returns internal keys (keys for signing and validating cluster times created by nodes in the
+     * clusters that this node is in) that match the given purpose and have an expiresAt value
+     * greater than newerThanThis. Uses readConcern level majority if possible.
      */
-    virtual StatusWith<std::vector<KeysCollectionDocument>> getNewKeys(
+    virtual StatusWith<std::vector<KeysCollectionDocument>> getNewInternalKeys(
+        OperationContext* opCtx,
+        StringData purpose,
+        const LogicalTime& newerThanThis,
+        bool useMajority) = 0;
+
+    /**
+     * Returns external keys (validation-only keys copied from other clusters) that match the given
+     * purpose and have an expiresAt value greater than newerThanThis. Uses readConcern level
+     * majority if possible.
+     */
+    virtual StatusWith<std::vector<ExternalKeysCollectionDocument>> getNewExternalKeys(
         OperationContext* opCtx,
         StringData purpose,
         const LogicalTime& newerThanThis,

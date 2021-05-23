@@ -164,6 +164,16 @@ inline std::unique_ptr<sbe::EExpression> makeFunction(std::string_view name, Arg
     return sbe::makeE<sbe::EFunction>(name, sbe::makeEs(std::forward<Args>(args)...));
 }
 
+template <typename T>
+inline auto makeConstant(sbe::value::TypeTags tag, T&& value) {
+    return sbe::makeE<sbe::EConstant>(tag, sbe::value::bitcastFrom<T>(std::forward<T>(value)));
+}
+
+inline auto makeConstant(std::string_view str) {
+    auto [tag, value] = sbe::value::makeNewString(str);
+    return sbe::makeE<sbe::EConstant>(tag, value);
+}
+
 /**
  * Check if expression returns Nothing and return null if so. Otherwise, return the
  * expression.
@@ -337,4 +347,8 @@ std::pair<sbe::value::SlotVector, std::unique_ptr<sbe::PlanStage>> generateVirtu
  */
 std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONArray& ba);
 
+/**
+ * Returns a BSON type mask of all data types coercible to date.
+ */
+uint32_t dateTypeMask();
 }  // namespace mongo::stage_builder

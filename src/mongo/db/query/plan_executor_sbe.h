@@ -46,6 +46,7 @@ public:
                     std::unique_ptr<CanonicalQuery> cq,
                     sbe::CandidatePlans candidates,
                     const CollectionPtr& collection,
+                    bool returnOwnedBson,
                     NamespaceString nss,
                     bool isOpen,
                     std::unique_ptr<PlanYieldPolicySBE> yieldPolicy);
@@ -110,7 +111,7 @@ public:
     }
 
     bool isDisposed() const override {
-        return !_root;
+        return _isDisposed;
     }
 
     Timestamp getLatestOplogTimestamp() const override;
@@ -133,11 +134,12 @@ private:
     OperationContext* _opCtx;
 
     NamespaceString _nss;
+    const bool _mustReturnOwnedBson;
 
     // CompileCtx owns the instance pointed by _env, so we must keep it around.
     sbe::RuntimeEnvironment* _env{nullptr};
     sbe::CompileCtx _ctx;
-    std::unique_ptr<sbe::PlanStage> _root;
+    const std::unique_ptr<sbe::PlanStage> _root;
     std::unique_ptr<QuerySolution> _solution;
 
     sbe::value::SlotAccessor* _result{nullptr};
@@ -158,6 +160,8 @@ private:
     std::unique_ptr<PlanYieldPolicySBE> _yieldPolicy;
 
     std::unique_ptr<PlanExplainer> _planExplainer;
+
+    bool _isDisposed{false};
 };
 
 /**
@@ -172,5 +176,6 @@ sbe::PlanState fetchNext(sbe::PlanStage* root,
                          sbe::value::SlotAccessor* resultSlot,
                          sbe::value::SlotAccessor* recordIdSlot,
                          BSONObj* out,
-                         RecordId* dlOut);
+                         RecordId* dlOut,
+                         bool returnOwnedBson);
 }  // namespace mongo

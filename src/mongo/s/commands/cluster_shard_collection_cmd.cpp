@@ -37,6 +37,8 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
@@ -44,6 +46,8 @@
 #include "mongo/s/config_server_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
@@ -95,31 +99,48 @@ public:
         auto shardCollRequest =
             ShardCollection::parse(IDLParserErrorContext("ShardCollection"), cmdObj);
 
-        ConfigsvrShardCollectionRequest configShardCollRequest;
-        configShardCollRequest.set_configsvrShardCollection(nss);
-        configShardCollRequest.setKey(shardCollRequest.getKey());
-        configShardCollRequest.setUnique(shardCollRequest.getUnique());
-        configShardCollRequest.setNumInitialChunks(shardCollRequest.getNumInitialChunks());
-        configShardCollRequest.setPresplitHashedZones(shardCollRequest.getPresplitHashedZones());
-        configShardCollRequest.setCollation(shardCollRequest.getCollation());
+        ShardsvrCreateCollection shardsvrCollRequest(nss);
+        shardsvrCollRequest.setShardKey(shardCollRequest.getKey());
+        shardsvrCollRequest.setUnique(shardCollRequest.getUnique());
+        shardsvrCollRequest.setNumInitialChunks(shardCollRequest.getNumInitialChunks());
+        shardsvrCollRequest.setPresplitHashedZones(shardCollRequest.getPresplitHashedZones());
+        shardsvrCollRequest.setCollation(shardCollRequest.getCollation());
+        shardsvrCollRequest.setDbName(nss.db());
 
-        // Invalidate the routing table cache entry for this collection so that we reload the
-        // collection the next time it's accessed, even if we receive a failure, e.g. NetworkError.
-        ON_BLOCK_EXIT([opCtx, nss] {
-            Grid::get(opCtx)->catalogCache()->invalidateCollectionEntry_LINEARIZABLE(nss);
-        });
+        auto catalogCache = Grid::get(opCtx)->catalogCache();
+        const auto dbInfo = uassertStatusOK(catalogCache->getDatabase(opCtx, nss.db()));
 
-        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-        auto cmdResponse = uassertStatusOK(configShard->runCommandWithFixedRetryAttempts(
+        ShardId shardId;
+        if (nss.db() == NamespaceString::kConfigDb) {
+            const auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+            uassert(
+                ErrorCodes::IllegalOperation, "there are no shards to target", !shardIds.empty());
+            shardId = shardIds[0];
+        } else {
+            shardId = dbInfo.primaryId();
+        }
+
+        auto shard = uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
+
+        auto cmdResponse = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
             opCtx,
             ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-            "admin",
+            nss.db().toString(),
             CommandHelpers::appendMajorityWriteConcern(
-                CommandHelpers::appendGenericCommandArgs(cmdObj, configShardCollRequest.toBSON()),
+                CommandHelpers::appendGenericCommandArgs(cmdObj, shardsvrCollRequest.toBSON({})),
                 opCtx->getWriteConcern()),
             Shard::RetryPolicy::kIdempotent));
+        uassertStatusOK(cmdResponse.commandStatus);
 
         CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
+        result.append("collectionsharded", nss.toString());
+
+        auto createCollResp = CreateCollectionResponse::parse(
+            IDLParserErrorContext("createCollection"), cmdResponse.response);
+
+        catalogCache->invalidateShardOrEntireCollectionEntryForShardedCollection(
+            nss, createCollResp.getCollectionVersion(), dbInfo.primaryId());
+
         return true;
     }
 

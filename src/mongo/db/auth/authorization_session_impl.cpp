@@ -38,6 +38,7 @@
 
 #include "mongo/base/shim.h"
 #include "mongo/base/status.h"
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authz_session_external_state.h"
@@ -51,7 +52,7 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/pipeline/aggregation_request.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
@@ -89,10 +90,10 @@ Status checkAuthForCreateOrModifyView(AuthorizationSession* authzSession,
         return Status::OK();
     }
 
-    auto status = AggregationRequest::parseFromBSON(viewNs,
-                                                    BSON("aggregate" << viewOnNs.coll()
-                                                                     << "pipeline" << viewPipeline
-                                                                     << "cursor" << BSONObj()));
+    auto status = aggregation_request_helper::parseFromBSON(
+        viewNs,
+        BSON("aggregate" << viewOnNs.coll() << "pipeline" << viewPipeline << "cursor" << BSONObj()
+                         << "$db" << viewOnNs.db()));
     if (!status.isOK())
         return status.getStatus();
 
@@ -111,7 +112,16 @@ AuthorizationSessionImpl::AuthorizationSessionImpl(
     std::unique_ptr<AuthzSessionExternalState> externalState, InstallMockForTestingOrAuthImpl)
     : _externalState(std::move(externalState)), _impersonationFlag(false) {}
 
-AuthorizationSessionImpl::~AuthorizationSessionImpl() {}
+AuthorizationSessionImpl::~AuthorizationSessionImpl() {
+    // Emit logout audit event. Since the AuthorizationSessionImpl is being destroyed, there will
+    // be no users remaining after this event.
+    if (_authenticatedUsers.count() > 0) {
+        audit::logLogout(Client::getCurrent(),
+                         "Implicit logout due to client connection closure",
+                         _authenticatedUsers.toBSON(),
+                         BSONArray());
+    }
+}
 
 AuthorizationManager& AuthorizationSessionImpl::getAuthorizationManager() {
     return _externalState->getAuthorizationManager();
@@ -177,7 +187,18 @@ User* AuthorizationSessionImpl::getSingleUser() {
 
 void AuthorizationSessionImpl::logoutDatabase(OperationContext* opCtx, StringData dbname) {
     stdx::lock_guard<Client> lk(*opCtx->getClient());
-    _authenticatedUsers.removeByDBName(dbname);
+
+    // Emit logout audit event and then remove all users logged into dbname.
+    UserSet updatedUsers(_authenticatedUsers);
+    updatedUsers.removeByDBName(dbname);
+    if (updatedUsers.count() != _authenticatedUsers.count()) {
+        audit::logLogout(opCtx->getClient(),
+                         str::stream() << "Explicit logout from db '" << dbname << "'",
+                         _authenticatedUsers.toBSON(),
+                         updatedUsers.toBSON());
+    }
+    std::swap(_authenticatedUsers, updatedUsers);
+
     clearImpersonatedUserData();
     _buildAuthenticatedRolesVector();
 }
@@ -248,7 +269,7 @@ PrivilegeVector AuthorizationSessionImpl::getDefaultPrivileges() {
 }
 
 StatusWith<PrivilegeVector> AuthorizationSessionImpl::getPrivilegesForAggregate(
-    const NamespaceString& nss, const AggregationRequest& request, bool isMongos) {
+    const NamespaceString& nss, const AggregateCommand& request, bool isMongos) {
     if (!nss.isValid()) {
         return Status(ErrorCodes::InvalidNamespace,
                       str::stream() << "Invalid input namespace, " << nss.ns());
@@ -285,7 +306,7 @@ StatusWith<PrivilegeVector> AuthorizationSessionImpl::getPrivilegesForAggregate(
     for (auto&& pipelineStage : pipeline) {
         liteParsedDocSource = LiteParsedDocumentSource::parse(nss, pipelineStage);
         PrivilegeVector currentPrivs = liteParsedDocSource->requiredPrivileges(
-            isMongos, request.shouldBypassDocumentValidation());
+            isMongos, request.getBypassDocumentValidation().value_or(false));
         Privilege::addPrivilegesToPrivilegeVector(&privileges, currentPrivs);
     }
     return privileges;
@@ -412,31 +433,32 @@ Status AuthorizationSessionImpl::checkAuthForKillCursors(const NamespaceString& 
                   str::stream() << "not authorized to kill cursor on " << ns.ns());
 }
 
-Status AuthorizationSessionImpl::checkAuthForCreate(const NamespaceString& ns,
-                                                    const BSONObj& cmdObj,
-                                                    bool isMongos) {
-    if (cmdObj["capped"].trueValue() &&
-        !isAuthorizedForActionsOnNamespace(ns, ActionType::convertToCapped)) {
-        return Status(ErrorCodes::Unauthorized, "unauthorized");
+Status AuthorizationSessionImpl::checkAuthForCreate(const CreateCommand& cmd, bool isMongos) {
+    auto ns = cmd.getNamespace();
+    if (cmd.getCapped() && !isAuthorizedForActionsOnNamespace(ns, ActionType::convertToCapped)) {
+        return {ErrorCodes::Unauthorized, "unauthorized"};
     }
 
     const bool hasCreateCollectionAction =
         isAuthorizedForActionsOnNamespace(ns, ActionType::createCollection);
 
     // If attempting to create a view, check for additional required privileges.
-    if (cmdObj["viewOn"]) {
+    if (auto optViewOn = cmd.getViewOn()) {
         // You need the createCollection action on this namespace; the insert action is not
         // sufficient.
         if (!hasCreateCollectionAction) {
-            return Status(ErrorCodes::Unauthorized, "unauthorized");
+            return {ErrorCodes::Unauthorized, "unauthorized"};
         }
 
         // Parse the viewOn namespace and the pipeline. If no pipeline was specified, use the empty
         // pipeline.
-        NamespaceString viewOnNs(ns.db(), cmdObj["viewOn"].checkAndGetStringData());
-        auto pipeline =
-            cmdObj.hasField("pipeline") ? BSONArray(cmdObj["pipeline"].Obj()) : BSONArray();
-        return checkAuthForCreateOrModifyView(this, ns, viewOnNs, pipeline, isMongos);
+        NamespaceString viewOnNs(ns.db(), optViewOn.get());
+        auto pipeline = cmd.getPipeline().get_value_or(std::vector<BSONObj>());
+        BSONArrayBuilder pipelineArray;
+        for (const auto& stage : pipeline) {
+            pipelineArray.append(stage);
+        }
+        return checkAuthForCreateOrModifyView(this, ns, viewOnNs, pipelineArray.arr(), isMongos);
     }
 
     // To create a regular collection, ActionType::createCollection or ActionType::insert are
@@ -445,7 +467,7 @@ Status AuthorizationSessionImpl::checkAuthForCreate(const NamespaceString& ns,
         return Status::OK();
     }
 
-    return Status(ErrorCodes::Unauthorized, "unauthorized");
+    return {ErrorCodes::Unauthorized, "unauthorized"};
 }
 
 Status AuthorizationSessionImpl::checkAuthForCollMod(const NamespaceString& ns,

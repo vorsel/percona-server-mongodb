@@ -173,36 +173,6 @@ bool ProcessInfo::supported() {
     return true;
 }
 
-bool ProcessInfo::blockCheckSupported() {
-    return true;
-}
-
-bool ProcessInfo::blockInMemory(const void* start) {
-    char x = 0;
-    if (mincore(alignToStartOfPage(start), getPageSize(), &x)) {
-        LOGV2(23336,
-              "mincore failed: {errnoWithDescription}",
-              "errnoWithDescription"_attr = errnoWithDescription());
-        return 1;
-    }
-    return x & 0x1;
-}
-
-bool ProcessInfo::pagesInMemory(const void* start, size_t numPages, std::vector<char>* out) {
-    out->resize(numPages);
-    // int mincore(const void *addr, size_t len, char *vec);
-    if (mincore(alignToStartOfPage(start), numPages * getPageSize(), &(out->front()))) {
-        LOGV2(23337,
-              "mincore failed: {errnoWithDescription}",
-              "errnoWithDescription"_attr = errnoWithDescription());
-        return false;
-    }
-    for (size_t i = 0; i < numPages; ++i) {
-        (*out)[i] = 0x1;
-    }
-    return true;
-}
-
 // get the number of CPUs available to the scheduler
 boost::optional<unsigned long> ProcessInfo::getNumCoresForProcess() {
     long nprocs = sysconf(_SC_NPROCESSORS_ONLN);

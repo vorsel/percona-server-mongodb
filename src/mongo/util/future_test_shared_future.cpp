@@ -265,10 +265,10 @@ TEST(SharedFuture, InterruptedGet_AddChild_Get) {
     FUTURE_SUCCESS_TEST([] {},
                         [](/*Future<void>*/ auto&& fut) {
                             const auto exec = InlineRecursiveCountingExecutor::make();
-                            DummyInterruptable dummyInterruptable;
+                            DummyInterruptible dummyInterruptible;
 
                             auto shared = std::move(fut).share();
-                            auto res = shared.waitNoThrow(&dummyInterruptable);
+                            auto res = shared.waitNoThrow(&dummyInterruptible);
                             if (!shared.isReady()) {
                                 ASSERT_EQ(res, ErrorCodes::Interrupted);
                             }
@@ -294,6 +294,15 @@ public:
     }
 };
 
+/** Try a simple single-worker shared get. Exercise JoinThread. */
+TEST(SharedFuture, ConcurrentTest_Simple) {
+    SharedPromise<void> promise;
+    auto shared = promise.getFuture();
+    JoinThread thread{stdx::thread{[&] { shared.get(); }}};
+    stdx::this_thread::yield();  // Slightly increase the chance of racing.
+    promise.emplaceValue();
+}
+
 void sharedFutureTestWorker(size_t i, SharedSemiFuture<void>& shared) {
     auto exec = InlineRecursiveCountingExecutor::make();
     if (i % 5 == 0) {
@@ -301,8 +310,8 @@ void sharedFutureTestWorker(size_t i, SharedSemiFuture<void>& shared) {
         shared.get();
     } else if (i % 7 == 0) {
         // interrupted wait, then blocking wait.
-        DummyInterruptable dummyInterruptable;
-        auto res = shared.waitNoThrow(&dummyInterruptable);
+        DummyInterruptible dummyInterruptible;
+        auto res = shared.waitNoThrow(&dummyInterruptible);
         if (!shared.isReady()) {
             ASSERT_EQ(res, ErrorCodes::Interrupted);
         }
@@ -332,9 +341,9 @@ void sharedFutureConcurrentTest(unittest::ThreadAssertionMonitor& monitor, Polic
         const size_t nThreads = 16;
 
         SharedPromise<void> promise;
-        std::vector<JoinThread> threads;
 
         auto&& tryState = policy.onTryBegin(promise);
+        std::vector<JoinThread> threads;
         for (size_t i = 0; i < nThreads; i++) {
             threads.push_back(JoinThread{monitor.spawn([&, i] {
                 auto&& shared = policy.onThreadBegin(tryState);

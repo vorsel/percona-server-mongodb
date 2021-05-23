@@ -419,6 +419,66 @@ void generateComparison(MatchExpressionVisitorContext* context,
         // SBE EConstant assumes ownership of the value so we have to make a copy here.
         auto [tag, val] = sbe::value::copyValue(tagView, valView);
 
+        // Most commonly the comparison does not do any kind of type conversions (i.e. 12 > "10"
+        // does not evaluate to true as we do not try to convert a string to a number). Internally,
+        // SBE returns Nothing for mismatched types.
+        // However, there is a wrinkle with MQL (and there always is one). We can compare any type
+        // to MinKey or MaxKey type and expect a true/false answer.
+        if (tag == sbe::value::TypeTags::MinKey) {
+            switch (binaryOp) {
+                case sbe::EPrimBinary::eq:
+                case sbe::EPrimBinary::neq:
+                    break;
+                case sbe::EPrimBinary::greater: {
+                    return {makeFillEmptyFalse(makeNot(
+                                makeFunction("isMinKey", sbe::makeE<sbe::EVariable>(inputSlot)))),
+                            std::move(inputStage)};
+                }
+                case sbe::EPrimBinary::greaterEq: {
+                    return {makeFunction("exists", sbe::makeE<sbe::EVariable>(inputSlot)),
+                            std::move(inputStage)};
+                }
+                case sbe::EPrimBinary::less: {
+                    return {sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean,
+                                                       sbe::value::bitcastFrom<bool>(false)),
+                            std::move(inputStage)};
+                }
+                case sbe::EPrimBinary::lessEq: {
+                    return {makeFillEmptyFalse(
+                                makeFunction("isMinKey", sbe::makeE<sbe::EVariable>(inputSlot))),
+                            std::move(inputStage)};
+                }
+                default:
+                    break;
+            }
+        } else if (tag == sbe::value::TypeTags::MaxKey) {
+            switch (binaryOp) {
+                case sbe::EPrimBinary::eq:
+                case sbe::EPrimBinary::neq:
+                    break;
+                case sbe::EPrimBinary::greater: {
+                    return {sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Boolean,
+                                                       sbe::value::bitcastFrom<bool>(false)),
+                            std::move(inputStage)};
+                }
+                case sbe::EPrimBinary::greaterEq: {
+                    return {makeFillEmptyFalse(
+                                makeFunction("isMaxKey", sbe::makeE<sbe::EVariable>(inputSlot))),
+                            std::move(inputStage)};
+                }
+                case sbe::EPrimBinary::less: {
+                    return {makeFillEmptyFalse(makeNot(
+                                makeFunction("isMaxKey", sbe::makeE<sbe::EVariable>(inputSlot)))),
+                            std::move(inputStage)};
+                }
+                case sbe::EPrimBinary::lessEq: {
+                    return {makeFunction("exists", sbe::makeE<sbe::EVariable>(inputSlot)),
+                            std::move(inputStage)};
+                }
+                default:
+                    break;
+            }
+        }
         return {
             makeFillEmptyFalse(sbe::makeE<sbe::EPrimBinary>(binaryOp,
                                                             sbe::makeE<sbe::EVariable>(inputSlot),
@@ -580,9 +640,18 @@ public:
 
     void visit(const AndMatchExpression* expr) final {
         if (expr == _context->topLevelAnd) {
-            // For a top-level $and with at least one child, we evaluate each child within the
-            // current EvalFrame ('frame') so that each child builds directly on top of
-            // frame->stage.
+            // Usually, we implement AND expression using limit-1/union tree. Each branch of a union
+            // stage represents AND's argument. For top-level AND we apply an optimization that
+            // allows us to get rid of limit-1/union tree.
+            // Firstly, we add filter stage on top of tree for each of AND's arguments. This ensures
+            // that respective tree does not return ADVANCED if argument evaluates to false.
+            // Secondly, we place trees of AND's arguments on top of each other. This guarantees
+            // that the whole resulting tree for AND does not return ADVANCED if one of arguments
+            // did not returned ADVANCED (e.g. evaluated to false).
+            // First step is performed in 'MatchExpressionInVisitor' and
+            // 'MatchExpressionPostVisitor'. Second step is achieved by evaluating each child within
+            // one EvalFrame, so that each child builds directly on top of
+            // '_context->evalStack.topFrame().extractStage()'.
             return;
         }
 
@@ -797,24 +866,16 @@ public:
         auto childInputSlot = _context->evalStack.topFrame().data().inputSlot;
         auto [filterSlot, filterStage] = [&]() {
             auto [expr, stage] = _context->evalStack.popFrame();
-
-            if (matchExpr->getChild(0)->matchType() == MatchExpression::AND &&
-                matchExpr->getChild(0)->numChildren() == 0) {
-                auto childOutputSlot = _context->slotIdGenerator->generate();
-                auto isObjectOrArrayExpr = sbe::makeE<sbe::EPrimBinary>(
-                    sbe::EPrimBinary::logicOr,
-                    sbe::makeE<sbe::EFunction>(
-                        "isObject", sbe::makeEs(sbe::makeE<sbe::EVariable>(childInputSlot))),
-                    sbe::makeE<sbe::EFunction>(
-                        "isArray", sbe::makeEs(sbe::makeE<sbe::EVariable>(childInputSlot))));
-                return std::make_pair(childOutputSlot,
-                                      makeProject(EvalStage{},
-                                                  _context->planNodeId,
-                                                  childOutputSlot,
-                                                  std::move(isObjectOrArrayExpr)));
-            }
-            return projectEvalExpr(
+            auto [predicateSlot, predicateStage] = projectEvalExpr(
                 std::move(expr), std::move(stage), _context->planNodeId, _context->slotIdGenerator);
+
+            auto isObjectOrArrayExpr = sbe::makeE<sbe::EPrimBinary>(
+                sbe::EPrimBinary::logicOr,
+                makeFunction("isObject", sbe::makeE<sbe::EVariable>(childInputSlot)),
+                makeFunction("isArray", sbe::makeE<sbe::EVariable>(childInputSlot)));
+            predicateStage = makeFilter<true>(
+                std::move(predicateStage), std::move(isObjectOrArrayExpr), _context->planNodeId);
+            return std::make_pair(predicateSlot, std::move(predicateStage));
         }();
 
         // We're using 'kDoNotTraverseLeaf' traverse mode, so we're guaranteed that 'makePredcate'

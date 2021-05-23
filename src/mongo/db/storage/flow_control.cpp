@@ -302,7 +302,7 @@ int FlowControl::_calculateNewTicketsForLag(const std::vector<repl::MemberData>&
     // will be close to 1. In this case the primary will accept writes at roughly the
     // `gFlowControlDecayConstant` (original default of 0.5).
     auto exponent = static_cast<double>(lagMillis - thresholdLagMillis) /
-        static_cast<double>(thresholdLagMillis);
+        static_cast<double>(std::max(thresholdLagMillis, static_cast<std::uint64_t>(1)));
     invariant(exponent >= 0.0);
 
     const double reduce = pow(gFlowControlDecayConstant.load(), exponent);
@@ -448,7 +448,7 @@ std::int64_t FlowControl::_approximateOpsBetween(Timestamp prevTs, Timestamp cur
             prevApplied = std::get<1>(sample);
         }
 
-        if (currApplied == -1 && currTs.asULL() <= std::get<0>(sample)) {
+        if (currTs.asULL() <= std::get<0>(sample)) {
             currApplied = std::get<1>(sample);
             break;
         }

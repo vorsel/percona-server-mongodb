@@ -29,10 +29,9 @@
 
 #pragma once
 
-#include "mongo/db/catalog/database.h"
 #include "mongo/db/s/sharding_migration_critical_section.h"
 #include "mongo/db/s/sharding_state_lock.h"
-#include "mongo/s/database_version.h"
+#include "mongo/s/catalog/type_database.h"
 
 namespace mongo {
 
@@ -66,14 +65,20 @@ public:
     static DatabaseShardingState* get(OperationContext* opCtx, const StringData dbName);
 
     /**
+     * Obtain a pointer to the DatabaseShardingState that remains safe to access without holding
+     * a database lock. Should be called instead of the regular get() if no database lock is held.
+     * The returned DatabaseShardingState instance should not be modified!
+     */
+    static std::shared_ptr<DatabaseShardingState> getSharedForLockFreeReads(
+        OperationContext* opCtx, const StringData dbName);
+
+    /**
      * Methods to control the databases's critical section. Must be called with the database X lock
      * held.
      */
     void enterCriticalSectionCatchUpPhase(OperationContext* opCtx, DSSLock&);
     void enterCriticalSectionCommitPhase(OperationContext* opCtx, DSSLock&);
-    void exitCriticalSection(OperationContext* opCtx,
-                             boost::optional<DatabaseVersion> newDbVersion,
-                             DSSLock&);
+    void exitCriticalSection(OperationContext* opCtx);
 
     auto getCriticalSectionSignal(ShardingMigrationCriticalSection::Operation op, DSSLock&) const {
         return _critSec.getSignal(op);
@@ -87,13 +92,23 @@ public:
     boost::optional<DatabaseVersion> getDbVersion(OperationContext* opCtx, DSSLock&) const;
 
     /**
-     * Sets this shard server's cached dbVersion to newVersion.
+     * Sets this shard server's cached database info.
      *
      * Invariants that the caller holds the DBLock in X mode.
      */
-    void setDbVersion(OperationContext* opCtx,
-                      boost::optional<DatabaseVersion> newVersion,
-                      DSSLock&);
+    void setDatabaseInfo(OperationContext* opCtx, DatabaseType&& newDatabaseInfo, DSSLock&);
+
+    /**
+     * Resets this shard server's cached database info.
+     */
+    void clearDatabaseInfo(OperationContext* opCtx);
+
+    /**
+     * Returns this shard server's cached database info.
+     * Internally performs the same checks of checkDbVersion(),
+     * so it will throws for the same reasons.
+     */
+    DatabaseType getDatabaseInfo(OperationContext* opCtx, DSSLock&) const;
 
     /**
      * If _critSecSignal is non-null, always throws StaleDbVersion.
@@ -121,7 +136,7 @@ public:
      * with the database lock in X mode. May not be called if there isn't a movePrimary source
      * manager installed already through a previous call to setMovePrimarySourceManager.
      */
-    void clearMovePrimarySourceManager(OperationContext* opCtx, DSSLock&);
+    void clearMovePrimarySourceManager(OperationContext* opCtx);
 
 private:
     friend DSSLock;
@@ -138,9 +153,8 @@ private:
 
     ShardingMigrationCriticalSection _critSec;
 
-    // This shard server's cached dbVersion. If boost::none, indicates this shard server does not
-    // know the dbVersion.
-    boost::optional<DatabaseVersion> _dbVersion = boost::none;
+    // This shard server's cached database info. If boost::none
+    boost::optional<DatabaseType> _optDatabaseInfo;
 
     // If this database is serving as a source shard for a movePrimary, the source manager will be
     // non-null. To write this value, there needs to be X-lock on the database in order to

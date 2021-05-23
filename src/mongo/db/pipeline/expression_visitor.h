@@ -117,6 +117,7 @@ class ExpressionBinarySize;
 class ExpressionStrLenCP;
 class ExpressionSubtract;
 class ExpressionSwitch;
+class ExpressionTestApiVersion;
 class ExpressionToLower;
 class ExpressionToUpper;
 class ExpressionTrim;
@@ -153,6 +154,8 @@ class ExpressionFunction;
 class ExpressionDegreesToRadians;
 class ExpressionRadiansToDegrees;
 class ExpressionDateDiff;
+class ExpressionDateAdd;
+class ExpressionDateSubtract;
 
 class AccumulatorAvg;
 class AccumulatorMax;
@@ -185,6 +188,7 @@ public:
     virtual void visit(ExpressionAllElementsTrue*) = 0;
     virtual void visit(ExpressionAnd*) = 0;
     virtual void visit(ExpressionAnyElementTrue*) = 0;
+    virtual void visit(ExpressionTestApiVersion*) = 0;
     virtual void visit(ExpressionArray*) = 0;
     virtual void visit(ExpressionArrayElemAt*) = 0;
     virtual void visit(ExpressionFirst*) = 0;
@@ -303,6 +307,8 @@ public:
     virtual void visit(ExpressionInternalFindPositional*) = 0;
     virtual void visit(ExpressionInternalFindElemMatch*) = 0;
     virtual void visit(ExpressionToHashedIndexKey*) = 0;
+    virtual void visit(ExpressionDateAdd*) = 0;
+    virtual void visit(ExpressionDateSubtract*) = 0;
 };
 
 }  // namespace mongo
