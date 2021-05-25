@@ -7,7 +7,8 @@
  * migration state to "committed" and "aborted" to be majority committed but it cannot do that on
  * ephemeralForTest.
  *
- * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft]
+ * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
+ * incompatible_with_windows_tls]
  */
 
 (function() {
@@ -109,8 +110,13 @@ let configDonorsColl = donorPrimary.getCollection(TenantMigrationTest.kConfigDon
     assert(mtabs[kTenantId].blockTimestamp);
 
     let donorDoc = configDonorsColl.findOne({tenantId: kTenantId});
-    let blockOplogEntry = donorPrimary.getDB("local").oplog.rs.findOne(
-        {ns: TenantMigrationTest.kConfigDonorsNS, op: "u", "o.tenantId": kTenantId});
+    let blockOplogEntry =
+        donorPrimary.getDB("local")
+            .oplog.rs
+            .find({ns: TenantMigrationTest.kConfigDonorsNS, op: "u", "o.tenantId": kTenantId})
+            .sort({"$natural": -1})
+            .limit(1)
+            .next();
     assert.eq(donorDoc.state, "blocking");
     assert.eq(donorDoc.blockTimestamp, blockOplogEntry.ts);
 

@@ -34,6 +34,7 @@
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/bson/bson_helper.h"
 #include "mongo/db/commands/feature_compatibility_version_documentation.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/change_stream_constants.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/document_source_change_stream_close_cursor.h"
@@ -67,7 +68,8 @@ using std::vector;
 // will not serialize themselves.
 REGISTER_DOCUMENT_SOURCE(changeStream,
                          DocumentSourceChangeStream::LiteParsed::parse,
-                         DocumentSourceChangeStream::createFromBson);
+                         DocumentSourceChangeStream::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
 constexpr StringData DocumentSourceChangeStream::kDocumentKeyField;
 constexpr StringData DocumentSourceChangeStream::kFullDocumentBeforeChangeField;

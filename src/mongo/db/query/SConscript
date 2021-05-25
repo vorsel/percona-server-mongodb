@@ -70,6 +70,7 @@ env.Library(
         "query_knobs",
     ],
     LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/db/record_id_helpers",
         "$BUILD_DIR/mongo/idl/server_parameter",
     ],
 )
@@ -126,6 +127,7 @@ env.Library(
     target="explain_options",
     source=[
         "explain_options.cpp",
+        "explain_verbosity.idl"
     ],
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
@@ -141,6 +143,18 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/namespace_string',
+    ],
+)
+
+env.Library(
+    target='cursor_response_idl',
+    source=[
+        'cursor_response.idl',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/idl/basic_types',
+        '$BUILD_DIR/mongo/idl/idl_parser',
     ],
 )
 
@@ -167,6 +181,7 @@ env.Library(
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/rpc/command_status',
         '$BUILD_DIR/mongo/rpc/rpc',
+        'cursor_response_idl',
         'query_request',
     ]
 )
@@ -176,7 +191,8 @@ env.Library(
     source=[
         "distinct_command.idl",
         "find_command.idl",
-        "query_request.cpp",
+        "query_request_helper.cpp",
+        "max_time_ms_parser.cpp",
         "tailable_mode.cpp",
         "tailable_mode.idl",
     ],
@@ -189,6 +205,7 @@ env.Library(
         "$BUILD_DIR/mongo/db/commands/test_commands_enabled",
         "$BUILD_DIR/mongo/db/pipeline/runtime_constants_idl",
         "$BUILD_DIR/mongo/db/repl/read_concern_args",
+        "cursor_response_idl",
         "hint_parser",
     ],
 )
@@ -288,7 +305,6 @@ env.CppUnitTest(
         "classic_stage_builder_test.cpp",
         "count_command_test.cpp",
         "cursor_response_test.cpp",
-        "explain_options_test.cpp",
         "get_executor_test.cpp",
         "getmore_request_test.cpp",
         "hint_parser_test.cpp",

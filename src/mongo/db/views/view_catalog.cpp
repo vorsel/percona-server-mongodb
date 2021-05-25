@@ -40,6 +40,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/api_parameters.h"
+#include "mongo/db/audit.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/namespace_string.h"
@@ -246,6 +247,16 @@ Status ViewCatalog::_reload(OperationContext* opCtx, ViewCatalogLookupBehavior l
 
 void ViewCatalog::clear(const Database* db) {
     auto catalog = getViewCatalog(db).writer();
+
+    // First, iterate through the views on this database and audit them before they are dropped.
+    for (auto&& view : catalog->_viewMap) {
+        audit::logDropView(&cc(),
+                           (*view.second).name().ns(),
+                           (*view.second).viewOn().ns(),
+                           (*view.second).pipeline(),
+                           ErrorCodes::OK);
+    }
+
     catalog.writable()->_viewMap.clear();
     catalog.writable()->_viewGraph.clear();
     catalog.writable()->_valid = true;
@@ -266,10 +277,12 @@ void ViewCatalog::_requireValidCatalog() const {
             _valid);
 }
 
-void ViewCatalog::iterate(OperationContext* opCtx, ViewIteratorCallback callback) const {
+void ViewCatalog::iterate(ViewIteratorCallback callback) const {
     _requireValidCatalog();
     for (auto&& view : _viewMap) {
-        callback(*view.second);
+        if (!callback(*view.second)) {
+            break;
+        }
     }
 }
 
@@ -338,7 +351,7 @@ Status ViewCatalog::_upsertIntoGraph(OperationContext* opCtx, const ViewDefiniti
     auto doInsert = [this, &opCtx](const ViewDefinition& viewDef, bool needsValidation) -> Status {
         // Validate that the pipeline is eligible to serve as a view definition. If it is, this
         // will also return the set of involved namespaces.
-        auto pipelineStatus = _validatePipeline(opCtx, viewDef);
+        auto pipelineStatus = validatePipeline(opCtx, viewDef);
         if (!pipelineStatus.isOK()) {
             if (needsValidation) {
                 uassertStatusOKWithContext(pipelineStatus.getStatus(),
@@ -390,19 +403,12 @@ Status ViewCatalog::_upsertIntoGraph(OperationContext* opCtx, const ViewDefiniti
     return doInsert(viewDef, true);
 }
 
-StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::_validatePipeline(
-    OperationContext* opCtx, const ViewDefinition& viewDef) const {
+StatusWith<stdx::unordered_set<NamespaceString>> ViewCatalog::validatePipeline(
+    OperationContext* opCtx, const ViewDefinition& viewDef) {
     const LiteParsedPipeline liteParsedPipeline(viewDef.viewOn(), viewDef.pipeline());
     const auto involvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
 
-    // If 'apiStrict: true', validates that the pipeline does not contain stages which are not in
-    // this API version.
-    auto apiParameters = APIParameters::get(opCtx);
-    if (apiParameters.getAPIStrict().value_or(false)) {
-        auto apiVersion = apiParameters.getAPIVersion();
-        invariant(apiVersion);
-        liteParsedPipeline.validatePipelineStagesIfAPIStrict(*apiVersion);
-    }
+    liteParsedPipeline.validate(opCtx);
 
     // Verify that this is a legitimate pipeline specification by making sure it parses
     // correctly. In order to parse a pipeline we need to resolve any namespaces involved to a

@@ -69,10 +69,11 @@ class DocumentSource;
  *
  * An expression registered this way can be used in any featureCompatibilityVersion.
  */
-#define REGISTER_EXPRESSION(key, parser)                                                   \
-    MONGO_INITIALIZER_GENERAL(addToExpressionParserMap_##key, (), ("expressionParserMap")) \
-    (InitializerContext*) {                                                                \
-        Expression::registerExpression("$" #key, (parser), boost::none);                   \
+#define REGISTER_EXPRESSION(key, parser)                                      \
+    MONGO_INITIALIZER_GENERAL(                                                \
+        addToExpressionParserMap_##key, ("default"), ("expressionParserMap")) \
+    (InitializerContext*) {                                                   \
+        Expression::registerExpression("$" #key, (parser), boost::none);      \
     }
 
 /**
@@ -84,23 +85,24 @@ class DocumentSource;
  * compatibility version >= X, you would add this line:
  * REGISTER_EXPRESSION_WITH_MIN_VERSION(foo, ExpressionFoo::parse, X);
  */
-#define REGISTER_EXPRESSION_WITH_MIN_VERSION(key, parser, minVersion)                      \
-    MONGO_INITIALIZER_GENERAL(addToExpressionParserMap_##key, (), ("expressionParserMap")) \
-    (InitializerContext*) {                                                                \
-        Expression::registerExpression("$" #key, (parser), (minVersion));                  \
+#define REGISTER_EXPRESSION_WITH_MIN_VERSION(key, parser, minVersion)         \
+    MONGO_INITIALIZER_GENERAL(                                                \
+        addToExpressionParserMap_##key, ("default"), ("expressionParserMap")) \
+    (InitializerContext*) {                                                   \
+        Expression::registerExpression("$" #key, (parser), (minVersion));     \
     }
 
 /**
  * Registers a Parser only if test commands are enabled. Use this if your expression is only used
  * for testing purposes.
  */
-#define REGISTER_TEST_EXPRESSION(key, parser)                                                  \
-    MONGO_INITIALIZER_GENERAL(                                                                 \
-        addToExpressionParserMap_##key, ("EndStartupOptionHandling"), ("expressionParserMap")) \
-    (InitializerContext*) {                                                                    \
-        if (getTestCommandsEnabled()) {                                                        \
-            Expression::registerExpression("$" #key, (parser), boost::none);                   \
-        }                                                                                      \
+#define REGISTER_TEST_EXPRESSION(key, parser)                                 \
+    MONGO_INITIALIZER_GENERAL(                                                \
+        addToExpressionParserMap_##key, ("default"), ("expressionParserMap")) \
+    (InitializerContext*) {                                                   \
+        if (getTestCommandsEnabled()) {                                       \
+            Expression::registerExpression("$" #key, (parser), boost::none);  \
+        }                                                                     \
     }
 
 class Expression : public RefCountable {
@@ -431,7 +433,9 @@ class ExpressionFromAccumulator
     : public ExpressionVariadic<ExpressionFromAccumulator<AccumulatorState>> {
 public:
     explicit ExpressionFromAccumulator(ExpressionContext* const expCtx)
-        : ExpressionVariadic<ExpressionFromAccumulator<AccumulatorState>>(expCtx) {}
+        : ExpressionVariadic<ExpressionFromAccumulator<AccumulatorState>>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluate(const Document& root, Variables* variables) const final {
         AccumulatorState accum(this->getExpressionContext());
@@ -868,7 +872,9 @@ public:
 class ExpressionArray final : public ExpressionVariadic<ExpressionArray> {
 public:
     explicit ExpressionArray(ExpressionContext* const expCtx)
-        : ExpressionVariadic<ExpressionArray>(expCtx) {}
+        : ExpressionVariadic<ExpressionArray>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
 
     ExpressionArray(ExpressionContext* const expCtx,
                     std::vector<boost::intrusive_ptr<Expression>>&& children)
@@ -941,7 +947,9 @@ public:
 class ExpressionObjectToArray final : public ExpressionFixedArity<ExpressionObjectToArray, 1> {
 public:
     explicit ExpressionObjectToArray(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionObjectToArray, 1>(expCtx) {}
+        : ExpressionFixedArity<ExpressionObjectToArray, 1>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluate(const Document& root, Variables* variables) const final;
     const char* getOpName() const final;
@@ -954,7 +962,9 @@ public:
 class ExpressionArrayToObject final : public ExpressionFixedArity<ExpressionArrayToObject, 1> {
 public:
     explicit ExpressionArrayToObject(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionArrayToObject, 1>(expCtx) {}
+        : ExpressionFixedArity<ExpressionArrayToObject, 1>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
 
     ExpressionArrayToObject(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionFixedArity<ExpressionArrayToObject, 1>(expCtx, std::move(children)) {}
@@ -1370,12 +1380,15 @@ public:
      * resolves to a string Value.
      * timezone - expression defining a timezone to perform the operation in that resolves to a
      * string Value. Can be nullptr.
+     * startOfWeek - expression defining the week start day that resolves to a string Value. Can be
+     * nullptr.
      */
     ExpressionDateDiff(ExpressionContext* const expCtx,
                        boost::intrusive_ptr<Expression> startDate,
                        boost::intrusive_ptr<Expression> endDate,
                        boost::intrusive_ptr<Expression> unit,
-                       boost::intrusive_ptr<Expression> timezone);
+                       boost::intrusive_ptr<Expression> timezone,
+                       boost::intrusive_ptr<Expression> startOfWeek);
     boost::intrusive_ptr<Expression> optimize() final;
     Value serialize(bool explain) const final;
     Value evaluate(const Document& root, Variables* variables) const final;
@@ -1393,6 +1406,13 @@ public:
         return static_cast<bool>(_timeZone);
     }
 
+    /**
+     * Returns true if this expression has parameter 'startOfWeek' specified, otherwise false.
+     */
+    bool isStartOfWeekSpecified() const {
+        return static_cast<bool>(_startOfWeek);
+    }
+
 protected:
     void _doAddDependencies(DepsTracker* deps) const final;
 
@@ -1407,6 +1427,11 @@ private:
      */
     static TimeUnit convertToTimeUnit(const Value& value);
 
+    /**
+     * Converts 'value' to DayOfWeek for $dateDiff expression parameter 'startOfWeek'.
+     */
+    static DayOfWeek parseStartOfWeek(const Value& value);
+
     // Starting time instant expression. Accepted types: Date_t, Timestamp, OID.
     boost::intrusive_ptr<Expression>& _startDate;
 
@@ -1420,6 +1445,10 @@ private:
     // Timezone to use for the difference calculation. Accepted type: std::string. If not specified,
     // UTC is used.
     boost::intrusive_ptr<Expression>& _timeZone;
+
+    // First/start day of the week to use for the date difference calculation when time unit is the
+    // week. Accepted type: std::string. If not specified, "sunday" is used.
+    boost::intrusive_ptr<Expression>& _startOfWeek;
 };
 
 class ExpressionDivide final : public ExpressionFixedArity<ExpressionDivide, 2> {
@@ -1608,7 +1637,9 @@ public:
                             boost::intrusive_ptr<Expression> date,
                             boost::intrusive_ptr<Expression> timeZone = nullptr)
         : DateExpressionAcceptingTimeZone<ExpressionHour>(
-              expCtx, "$hour", std::move(date), std::move(timeZone)) {}
+              expCtx, "$hour", std::move(date), std::move(timeZone)) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluateDate(Date_t date, const TimeZone& timeZone) const final {
         return Value(timeZone.dateParts(date).hour);
@@ -1638,7 +1669,9 @@ public:
 class ExpressionIn final : public ExpressionFixedArity<ExpressionIn, 2> {
 public:
     explicit ExpressionIn(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionIn, 2>(expCtx) {}
+        : ExpressionFixedArity<ExpressionIn, 2>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
 
     ExpressionIn(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionFixedArity<ExpressionIn, 2>(expCtx, std::move(children)) {}
@@ -1656,7 +1689,9 @@ public:
 class ExpressionIndexOfArray : public ExpressionRangedArity<ExpressionIndexOfArray, 2, 4> {
 public:
     explicit ExpressionIndexOfArray(ExpressionContext* const expCtx)
-        : ExpressionRangedArity<ExpressionIndexOfArray, 2, 4>(expCtx) {}
+        : ExpressionRangedArity<ExpressionIndexOfArray, 2, 4>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
 
     ExpressionIndexOfArray(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionRangedArity<ExpressionIndexOfArray, 2, 4>(expCtx, std::move(children)) {}
@@ -1889,7 +1924,9 @@ public:
                                    boost::intrusive_ptr<Expression> date,
                                    boost::intrusive_ptr<Expression> timeZone = nullptr)
         : DateExpressionAcceptingTimeZone<ExpressionMillisecond>(
-              expCtx, "$millisecond", std::move(date), std::move(timeZone)) {}
+              expCtx, "$millisecond", std::move(date), std::move(timeZone)) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluateDate(Date_t date, const TimeZone& timeZone) const final {
         return Value(timeZone.dateParts(date).millisecond);
@@ -1907,7 +1944,9 @@ public:
                               boost::intrusive_ptr<Expression> date,
                               boost::intrusive_ptr<Expression> timeZone = nullptr)
         : DateExpressionAcceptingTimeZone<ExpressionMinute>(
-              expCtx, "$minute", std::move(date), std::move(timeZone)) {}
+              expCtx, "$minute", std::move(date), std::move(timeZone)) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluateDate(Date_t date, const TimeZone& timeZone) const final {
         return Value(timeZone.dateParts(date).minute);
@@ -1965,7 +2004,9 @@ public:
                              boost::intrusive_ptr<Expression> date,
                              boost::intrusive_ptr<Expression> timeZone = nullptr)
         : DateExpressionAcceptingTimeZone<ExpressionMonth>(
-              expCtx, "$month", std::move(date), std::move(timeZone)) {}
+              expCtx, "$month", std::move(date), std::move(timeZone)) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluateDate(Date_t date, const TimeZone& timeZone) const final {
         return Value(timeZone.dateParts(date).month);
@@ -2077,7 +2118,9 @@ public:
 class ExpressionPow final : public ExpressionFixedArity<ExpressionPow, 2> {
 public:
     explicit ExpressionPow(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionPow, 2>(expCtx) {}
+        : ExpressionFixedArity<ExpressionPow, 2>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
     ExpressionPow(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionFixedArity<ExpressionPow, 2>(expCtx, std::move(children)) {}
 
@@ -2098,7 +2141,9 @@ private:
 class ExpressionRange final : public ExpressionRangedArity<ExpressionRange, 2, 3> {
 public:
     explicit ExpressionRange(ExpressionContext* const expCtx)
-        : ExpressionRangedArity<ExpressionRange, 2, 3>(expCtx) {}
+        : ExpressionRangedArity<ExpressionRange, 2, 3>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluate(const Document& root, Variables* variables) const final;
     const char* getOpName() const final;
@@ -2122,7 +2167,9 @@ public:
           _initial(_children[1]),
           _in(_children[2]),
           _thisVar(thisVar),
-          _valueVar(valueVar) {}
+          _valueVar(valueVar) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluate(const Document& root, Variables* variables) const final;
     boost::intrusive_ptr<Expression> optimize() final;
@@ -2200,7 +2247,13 @@ protected:
 
 class ExpressionReplaceAll final : public ExpressionReplaceBase {
 public:
-    using ExpressionReplaceBase::ExpressionReplaceBase;
+    ExpressionReplaceAll(ExpressionContext* const expCtx,
+                         boost::intrusive_ptr<Expression> input,
+                         boost::intrusive_ptr<Expression> find,
+                         boost::intrusive_ptr<Expression> replacement)
+        : ExpressionReplaceBase(expCtx, input, find, replacement) {
+        expCtx->sbeCompatible = false;
+    }
 
     static boost::intrusive_ptr<Expression> parse(ExpressionContext* const expCtx,
                                                   BSONElement expr,
@@ -2225,7 +2278,9 @@ public:
                      boost::intrusive_ptr<Expression> date,
                      boost::intrusive_ptr<Expression> timeZone = nullptr)
         : DateExpressionAcceptingTimeZone<ExpressionSecond>(
-              expCtx, "$second", std::move(date), std::move(timeZone)) {}
+              expCtx, "$second", std::move(date), std::move(timeZone)) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluateDate(Date_t date, const TimeZone& timeZone) const final {
         return Value(timeZone.dateParts(date).second);
@@ -2256,7 +2311,9 @@ public:
 class ExpressionSetEquals final : public ExpressionVariadic<ExpressionSetEquals> {
 public:
     explicit ExpressionSetEquals(ExpressionContext* const expCtx)
-        : ExpressionVariadic<ExpressionSetEquals>(expCtx) {}
+        : ExpressionVariadic<ExpressionSetEquals>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
     ExpressionSetEquals(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionVariadic<ExpressionSetEquals>(expCtx, std::move(children)) {}
 
@@ -2298,7 +2355,9 @@ public:
 class ExpressionSetIsSubset : public ExpressionFixedArity<ExpressionSetIsSubset, 2> {
 public:
     explicit ExpressionSetIsSubset(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionSetIsSubset, 2>(expCtx) {}
+        : ExpressionFixedArity<ExpressionSetIsSubset, 2>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
     ExpressionSetIsSubset(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionFixedArity<ExpressionSetIsSubset, 2>(expCtx, std::move(children)) {}
 
@@ -2342,7 +2401,9 @@ public:
 class ExpressionSize final : public ExpressionFixedArity<ExpressionSize, 1> {
 public:
     explicit ExpressionSize(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionSize, 1>(expCtx) {}
+        : ExpressionFixedArity<ExpressionSize, 1>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluate(const Document& root, Variables* variables) const final;
     const char* getOpName() const final;
@@ -2356,7 +2417,9 @@ public:
 class ExpressionReverseArray final : public ExpressionFixedArity<ExpressionReverseArray, 1> {
 public:
     explicit ExpressionReverseArray(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionReverseArray, 1>(expCtx) {}
+        : ExpressionFixedArity<ExpressionReverseArray, 1>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluate(const Document& root, Variables* variables) const final;
     const char* getOpName() const final;
@@ -2370,7 +2433,9 @@ public:
 class ExpressionSlice final : public ExpressionRangedArity<ExpressionSlice, 2, 3> {
 public:
     explicit ExpressionSlice(ExpressionContext* const expCtx)
-        : ExpressionRangedArity<ExpressionSlice, 2, 3>(expCtx) {}
+        : ExpressionRangedArity<ExpressionSlice, 2, 3>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
     ExpressionSlice(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionRangedArity<ExpressionSlice, 2, 3>(expCtx, std::move(children)) {}
 
@@ -2402,7 +2467,9 @@ public:
 class ExpressionRound final : public ExpressionRangedArity<ExpressionRound, 1, 2> {
 public:
     explicit ExpressionRound(ExpressionContext* const expCtx)
-        : ExpressionRangedArity<ExpressionRound, 1, 2>(expCtx) {}
+        : ExpressionRangedArity<ExpressionRound, 1, 2>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
     ExpressionRound(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionRangedArity<ExpressionRound, 1, 2>(expCtx, std::move(children)) {}
 
@@ -2449,7 +2516,9 @@ public:
 class ExpressionStrcasecmp final : public ExpressionFixedArity<ExpressionStrcasecmp, 2> {
 public:
     explicit ExpressionStrcasecmp(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionStrcasecmp, 2>(expCtx) {}
+        : ExpressionFixedArity<ExpressionStrcasecmp, 2>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
     ExpressionStrcasecmp(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionFixedArity<ExpressionStrcasecmp, 2>(expCtx, std::move(children)) {}
 
@@ -2465,7 +2534,9 @@ public:
 class ExpressionSubstrBytes final : public ExpressionFixedArity<ExpressionSubstrBytes, 3> {
 public:
     explicit ExpressionSubstrBytes(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionSubstrBytes, 3>(expCtx) {}
+        : ExpressionFixedArity<ExpressionSubstrBytes, 3>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
     ExpressionSubstrBytes(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionFixedArity<ExpressionSubstrBytes, 3>(expCtx, std::move(children)) {}
 
@@ -2481,7 +2552,9 @@ public:
 class ExpressionSubstrCP final : public ExpressionFixedArity<ExpressionSubstrCP, 3> {
 public:
     explicit ExpressionSubstrCP(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionSubstrCP, 3>(expCtx) {}
+        : ExpressionFixedArity<ExpressionSubstrCP, 3>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
     ExpressionSubstrCP(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionFixedArity<ExpressionSubstrCP, 3>(expCtx, std::move(children)) {}
 
@@ -2497,7 +2570,9 @@ public:
 class ExpressionStrLenBytes final : public ExpressionFixedArity<ExpressionStrLenBytes, 1> {
 public:
     explicit ExpressionStrLenBytes(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionStrLenBytes, 1>(expCtx) {}
+        : ExpressionFixedArity<ExpressionStrLenBytes, 1>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
 
     ExpressionStrLenBytes(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionFixedArity<ExpressionStrLenBytes, 1>(expCtx, std::move(children)) {}
@@ -2514,7 +2589,9 @@ public:
 class ExpressionBinarySize final : public ExpressionFixedArity<ExpressionBinarySize, 1> {
 public:
     ExpressionBinarySize(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionBinarySize, 1>(expCtx) {}
+        : ExpressionFixedArity<ExpressionBinarySize, 1>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluate(const Document& root, Variables* variables) const final;
     const char* getOpName() const final;
@@ -2528,7 +2605,9 @@ public:
 class ExpressionStrLenCP final : public ExpressionFixedArity<ExpressionStrLenCP, 1> {
 public:
     explicit ExpressionStrLenCP(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionStrLenCP, 1>(expCtx) {}
+        : ExpressionFixedArity<ExpressionStrLenCP, 1>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
     ExpressionStrLenCP(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionFixedArity<ExpressionStrLenCP, 1>(expCtx, std::move(children)) {}
 
@@ -2544,7 +2623,9 @@ public:
 class ExpressionSubtract final : public ExpressionFixedArity<ExpressionSubtract, 2> {
 public:
     explicit ExpressionSubtract(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionSubtract, 2>(expCtx) {}
+        : ExpressionFixedArity<ExpressionSubtract, 2>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
     ExpressionSubtract(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionFixedArity<ExpressionSubtract, 2>(expCtx, std::move(children)) {}
 
@@ -2642,7 +2723,9 @@ public:
           _trimType(trimType),
           _name(name.toString()),
           _input(_children[0]),
-          _characters(_children[1]) {}
+          _characters(_children[1]) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluate(const Document& root, Variables* variables) const final;
     boost::intrusive_ptr<Expression> optimize() final;
@@ -2695,7 +2778,9 @@ private:
 class ExpressionTrunc final : public ExpressionRangedArity<ExpressionTrunc, 1, 2> {
 public:
     explicit ExpressionTrunc(ExpressionContext* const expCtx)
-        : ExpressionRangedArity<ExpressionTrunc, 1, 2>(expCtx) {}
+        : ExpressionRangedArity<ExpressionTrunc, 1, 2>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
     ExpressionTrunc(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionRangedArity<ExpressionTrunc, 1, 2>(expCtx, std::move(children)) {}
 
@@ -2714,7 +2799,9 @@ public:
 class ExpressionType final : public ExpressionFixedArity<ExpressionType, 1> {
 public:
     explicit ExpressionType(ExpressionContext* const expCtx)
-        : ExpressionFixedArity<ExpressionType, 1>(expCtx) {}
+        : ExpressionFixedArity<ExpressionType, 1>(expCtx) {
+        expCtx->sbeCompatible = false;
+    }
 
     ExpressionType(ExpressionContext* const expCtx, ExpressionVector&& children)
         : ExpressionFixedArity<ExpressionType, 1>(expCtx, std::move(children)) {}
@@ -2746,7 +2833,9 @@ public:
                    boost::intrusive_ptr<Expression> date,
                    boost::intrusive_ptr<Expression> timeZone = nullptr)
         : DateExpressionAcceptingTimeZone<ExpressionWeek>(
-              expCtx, "$week", std::move(date), std::move(timeZone)) {}
+              expCtx, "$week", std::move(date), std::move(timeZone)) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluateDate(Date_t date, const TimeZone& timeZone) const final {
         return Value(timeZone.week(date));
@@ -2764,7 +2853,9 @@ public:
                           boost::intrusive_ptr<Expression> date,
                           boost::intrusive_ptr<Expression> timeZone = nullptr)
         : DateExpressionAcceptingTimeZone<ExpressionIsoWeekYear>(
-              expCtx, "$isoWeekYear", std::move(date), std::move(timeZone)) {}
+              expCtx, "$isoWeekYear", std::move(date), std::move(timeZone)) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluateDate(Date_t date, const TimeZone& timeZone) const final {
         return Value(timeZone.isoYear(date));
@@ -2801,7 +2892,9 @@ public:
                       boost::intrusive_ptr<Expression> date,
                       boost::intrusive_ptr<Expression> timeZone = nullptr)
         : DateExpressionAcceptingTimeZone<ExpressionIsoWeek>(
-              expCtx, "$isoWeek", std::move(date), std::move(timeZone)) {}
+              expCtx, "$isoWeek", std::move(date), std::move(timeZone)) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluateDate(Date_t date, const TimeZone& timeZone) const final {
         return Value(timeZone.isoWeek(date));
@@ -2819,7 +2912,9 @@ public:
                    boost::intrusive_ptr<Expression> date,
                    boost::intrusive_ptr<Expression> timeZone = nullptr)
         : DateExpressionAcceptingTimeZone<ExpressionYear>(
-              expCtx, "$year", std::move(date), std::move(timeZone)) {}
+              expCtx, "$year", std::move(date), std::move(timeZone)) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluateDate(Date_t date, const TimeZone& timeZone) const final {
         return Value(timeZone.dateParts(date).year);
@@ -2841,7 +2936,9 @@ public:
         : Expression(expCtx, std::move(children)),
           _useLongestLength(useLongestLength),
           _inputs(std::move(inputs)),
-          _defaults(std::move(defaults)) {}
+          _defaults(std::move(defaults)) {
+        expCtx->sbeCompatible = false;
+    }
 
     Value evaluate(const Document& root, Variables* variables) const final;
     boost::intrusive_ptr<Expression> optimize() final;
@@ -2979,10 +3076,11 @@ public:
     }
 
     /**
-     * Return regex pattern and options in case they are constants. Return pattern boost::none in
-     * case the pattern or options are not constants, or if the pattern is null.
+     * If pattern or options are not constants, returns boost::none. Otherwise, return value
+     * contains regex pattern and options if they are not null.
      */
-    std::pair<boost::optional<std::string>, std::string> getConstantPatternAndOptions() const;
+    boost::optional<std::pair<boost::optional<std::string>, std::string>>
+    getConstantPatternAndOptions() const;
 
     Value serialize(bool explain) const;
 
@@ -3114,7 +3212,9 @@ class ExpressionToHashedIndexKey : public Expression {
 public:
     ExpressionToHashedIndexKey(ExpressionContext* const expCtx,
                                boost::intrusive_ptr<Expression> inputExpression)
-        : Expression(expCtx, {inputExpression}){};
+        : Expression(expCtx, {inputExpression}) {
+        expCtx->sbeCompatible = false;
+    };
 
     static boost::intrusive_ptr<Expression> parse(ExpressionContext* const expCtx,
                                                   BSONElement expr,

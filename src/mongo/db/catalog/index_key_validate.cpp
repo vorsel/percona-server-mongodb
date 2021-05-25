@@ -263,6 +263,7 @@ StatusWith<BSONObj> validateIndexSpec(
     bool hasNamespaceField = false;
     bool hasVersionField = false;
     bool hasCollationField = false;
+    bool apiStrict = opCtx && APIParameters::get(opCtx).getAPIStrict().value_or(false);
 
     auto fieldNamesValidStatus = validateIndexSpecFieldNames(indexSpec);
     if (!fieldNamesValidStatus.isOK()) {
@@ -297,10 +298,17 @@ StatusWith<BSONObj> validateIndexSpec(
             // 'validateKeyPattern()'. It must currently be done here so that haystack indexes
             // continue to replicate correctly before the upgrade to FCV "4.9" is complete.
             const auto keyPattern = indexSpecElem.Obj();
-            if (IndexNames::findPluginName(keyPattern) == IndexNames::GEO_HAYSTACK) {
+            const auto indexName = IndexNames::findPluginName(keyPattern);
+            if (indexName == IndexNames::GEO_HAYSTACK) {
                 return {ErrorCodes::CannotCreateIndex,
                         str::stream()
                             << "GeoHaystack indexes cannot be created in version 4.9 and above"};
+            }
+
+            if (apiStrict && indexName == IndexNames::TEXT) {
+                return {ErrorCodes::APIStrictError,
+                        str::stream()
+                            << indexName << " indexes cannot be created with apiStrict: true"};
             }
 
             // Here we always validate the key pattern according to the most recent rules, in order
@@ -693,6 +701,12 @@ Status validateIndexSpecTTL(const BSONObj& indexSpec) {
     }
 
     return Status::OK();
+}
+
+bool isIndexAllowedInAPIVersion1(const IndexDescriptor& indexDesc) {
+    const auto indexName = IndexNames::findPluginName(indexDesc.keyPattern());
+    return indexName != IndexNames::TEXT && indexName != IndexNames::GEO_HAYSTACK &&
+        !indexDesc.isSparse();
 }
 
 GlobalInitializerRegisterer filterAllowedIndexFieldNamesInitializer(

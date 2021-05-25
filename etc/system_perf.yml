@@ -1,6 +1,11 @@
 command_type: system
 stepback: false
 
+## Parameters for parameterized builds (see https://github.com/evergreen-ci/evergreen/wiki/Parameterized-Builds)
+parameters:
+  - key: patch_compile_flags
+    description: "Additional SCons flags to be applied during scons compile invocations in this patch"
+
 variables:
   ###
   # Leave this section uncommented to enable compile.
@@ -74,7 +79,6 @@ modules:
   repo: git@github.com:10gen/linkbench2.git
   prefix: ../../src
   branch: master
-  ref: 63207190657737b32eb0e81c5b81ad1b8bad0e5a
 - name: mongo-perf
   repo: git@github.com:mongodb/mongo-perf.git
   prefix: ../../src
@@ -164,10 +168,6 @@ functions:
       type: test
       params:
         script: ./src/dsi/run-dsi determine_failure -m TEST
-    - command: json.send
-      params:
-        name: "perf"
-        file: "./build/LegacyPerfJson/perf.json"
     - command: shell.exec
       type: test
       params:
@@ -175,6 +175,10 @@ functions:
           ./src/dsi/run-dsi analysis
           # detect outliers needs to run, so defer the post_run_check exit status to later
           echo $? > post_run_check.status
+    - command: json.send
+      params:
+        name: "perf"
+        file: "./build/LegacyPerfJson/perf.json"
     - command: shell.exec
       params:
         script: |
@@ -343,7 +347,7 @@ functions:
           set -o errexit
           set -o verbose
           source "${workdir}/compile_venv/bin/activate"
-          python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} install-core MONGO_VERSION=${version} DESTDIR=$(pwd)/mongodb
+          python ./buildscripts/scons.py ${compile_flags|} ${scons_cache_args|} install-core MONGO_VERSION=${version} DESTDIR=$(pwd)/mongodb ${patch_compile_flags|}
           mkdir -p mongodb/jstests/hooks
           if [ -d jstests/hooks ]
           then
@@ -1244,6 +1248,23 @@ buildvariants:
     - name: genny_patch_tasks
     - name: genny_auto_tasks
 
+- name: linux-shard-lite-all-feature-flags
+  display_name: Linux Shard Lite (all feature flags)
+  batchtime: 10080  # 7 days
+  modules: *modules
+  expansions:
+    mongodb_setup: shard-lite-all-feature-flags
+    infrastructure_provisioning: shard-lite
+    platform: linux
+    project_dir: *project_dir
+    authentication: enabled
+    storageEngine: wiredTiger
+  run_on:
+    - "rhel70-perf-shard-lite"
+  depends_on: *_compile_amazon2
+  tasks:
+    - name: genny_patch_tasks
+    - name: genny_auto_tasks
 
 - name: linux-3-node-replSet
   display_name: Linux 3-Node ReplSet
@@ -1332,12 +1353,14 @@ buildvariants:
         variant: compile-amazon2
   tasks: *3nodetasks
 
+# Note that the "disabled-feature-flags" part of the name is kept to avoid breaking
+# history even though the display name is "all feature flags"
 - name: linux-3-node-replSet-disabled-feature-flags
-  display_name: Linux 3-Node ReplSet (disabled feature flags)
+  display_name: Linux 3-Node ReplSet (all feature flags)
   batchtime: 10080  # 7 days
   modules: *modules
   expansions:
-    mongodb_setup: replica-disabled-feature-flags
+    mongodb_setup: replica-all-feature-flags
     infrastructure_provisioning: replica
     platform: linux
     project_dir: *project_dir

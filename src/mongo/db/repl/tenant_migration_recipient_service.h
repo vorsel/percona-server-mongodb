@@ -63,7 +63,7 @@ public:
         "TenantMigrationRecipientService"_sd;
     static constexpr StringData kNoopMsg = "Resume token noop"_sd;
 
-    explicit TenantMigrationRecipientService(ServiceContext* serviceContext);
+    explicit TenantMigrationRecipientService(ServiceContext* const serviceContext);
     ~TenantMigrationRecipientService() = default;
 
     StringData getServiceName() const final;
@@ -77,7 +77,8 @@ public:
 
     class Instance final : public PrimaryOnlyService::TypedInstance<Instance> {
     public:
-        explicit Instance(const TenantMigrationRecipientService* recipientService,
+        explicit Instance(ServiceContext* const serviceContext,
+                          const TenantMigrationRecipientService* recipientService,
                           BSONObj stateDoc);
 
         SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
@@ -130,9 +131,9 @@ public:
         /**
          * To be called on the instance returned by PrimaryOnlyService::getOrCreate(). Returns an
          * error if the options this Instance was created with are incompatible with a request for
-         * an instance with the options given in 'options'.
+         * an instance with the options given in 'stateDoc'.
          */
-        Status checkIfOptionsConflict(const TenantMigrationRecipientDocument& StateDoc) const;
+        Status checkIfOptionsConflict(const TenantMigrationRecipientDocument& stateDoc) const;
 
         /*
          * Blocks the thread until the tenant migration reaches consistent state in an interruptible
@@ -144,15 +145,12 @@ public:
         /*
          * Blocks the thread until the tenant oplog applier applied data past the given 'donorTs'
          * in an interruptible mode. Returns the majority applied donor optime which may be greater
-         * or equal to given 'donorTs'. Throws exception on error.
+         * or equal to given 'donorTs'. If the recipient's logical clock has not yet reached the
+         * 'donorTs', advance the recipient's logical clock to 'donorTs' and guarantee durability by
+         * applying a noop write. Throws exception on error.
          */
         OpTime waitUntilTimestampIsMajorityCommitted(OperationContext* opCtx,
                                                      const Timestamp& donorTs) const;
-
-        /*
-         * Suppresses selecting 'host' as the donor sync source, until 'until'.
-         */
-        void excludeDonorHost(const HostAndPort& host, Date_t until);
 
         /*
          *  Set the oplog creator functor, to allow use of a mock oplog fetcher.
@@ -168,6 +166,18 @@ public:
         void stopOplogApplier_forTest() {
             stdx::lock_guard lk(_mutex);
             _tenantOplogApplier->shutdown();
+        }
+
+        /*
+         * Suppresses selecting 'host' as the donor sync source, until 'until'.
+         */
+        void excludeDonorHost_forTest(const HostAndPort& host, Date_t until) {
+            stdx::lock_guard lk(_mutex);
+            _excludeDonorHost(lk, host, until);
+        }
+
+        const auto& getExcludedDonorHosts_forTest() {
+            return _excludedDonorHosts;
         }
 
     private:
@@ -199,23 +209,39 @@ public:
                     case kRunning:
                         return newState == kInterrupted || newState == kDone;
                     case kInterrupted:
-                        return newState == kDone;
+                        return newState == kDone || newState == kRunning;
                     case kDone:
                         return false;
                 }
                 MONGO_UNREACHABLE;
             }
 
-            void setState(StateFlag state, boost::optional<Status> interruptStatus = boost::none) {
+            void setState(StateFlag state,
+                          boost::optional<Status> interruptStatus = boost::none,
+                          bool isExternalInterrupt = false) {
                 invariant(checkIfValidTransition(state),
                           str::stream() << "current state: " << toString(_state)
                                         << ", new state: " << toString(state));
 
+                // The interruptStatus can exist (and should be non-OK) if and only if the state is
+                // kInterrupted.
+                invariant((state == kInterrupted && interruptStatus && !interruptStatus->isOK()) ||
+                              (state != kInterrupted && !interruptStatus),
+                          str::stream() << "new state: " << toString(state)
+                                        << ", interruptStatus: " << interruptStatus);
+
                 _state = state;
-                if (interruptStatus) {
-                    invariant(_state == kInterrupted && !interruptStatus->isOK());
-                    _interruptStatus = interruptStatus.get();
-                }
+                _interruptStatus = (interruptStatus) ? interruptStatus.get() : _interruptStatus;
+                _isExternalInterrupt = isExternalInterrupt;
+            }
+
+            void clearInterruptStatus() {
+                _interruptStatus = Status{ErrorCodes::InternalError, "Uninitialized value"};
+                _isExternalInterrupt = false;
+            }
+
+            bool isExternalInterrupt() const {
+                return (_state == kInterrupted) && _isExternalInterrupt;
             }
 
             bool isNotStarted() const {
@@ -259,8 +285,12 @@ public:
         private:
             // task state.
             StateFlag _state = kNotStarted;
-            // task interrupt status.
-            Status _interruptStatus = Status{ErrorCodes::InternalError, "Uninitialized value"};
+            // task interrupt status. Set to Status::OK() only when the recipient service has not
+            // been interrupted so far, and is used to remember the initial interrupt error.
+            Status _interruptStatus = Status::OK();
+            // Indicates if the task was interrupted externally due to a 'recipientForgetMigration'
+            // or stepdown/shutdown.
+            bool _isExternalInterrupt = false;
         };
 
         /*
@@ -285,23 +315,28 @@ public:
          * Persists the instance state doc and waits for it to be majority replicated.
          * Throws on shutdown / notPrimary errors.
          */
-        SemiFuture<void> _markStateDocumentAsGarbageCollectable();
+        SemiFuture<void> _markStateDocAsGarbageCollectable();
 
         /**
-         * Creates a client, connects it to the donor, and authenticates it if authParams is
-         * non-empty.  Throws a user assertion on failure.
+         * Creates a client, connects it to the donor. If '_transientSSLParams' is not none, uses
+         * the migration certificate to do SSL authentication. Otherwise, uses the default
+         * authentication mode. Throws a user assertion on failure.
          *
          */
-        std::unique_ptr<DBClientConnection> _connectAndAuth(
-            const HostAndPort& serverAddress,
-            StringData applicationName,
-            const TransientSSLParams* transientSSLParams);
+        std::unique_ptr<DBClientConnection> _connectAndAuth(const HostAndPort& serverAddress,
+                                                            StringData applicationName);
 
         /**
          * Creates and connects both the oplog fetcher client and the client used for other
          * operations.
          */
         SemiFuture<ConnectionPair> _createAndConnectClients();
+
+        /**
+         * Fetches all key documents from the donor's admin.system.keys collection, stores them in
+         * admin.system.external_validation_keys, and refreshes the keys cache.
+         */
+        void _fetchAndStoreDonorClusterTimeKeyDocs(const CancelationToken& token);
 
         /**
          * Retrieves the start optimes from the donor and updates the in-memory state accordingly.
@@ -317,6 +352,19 @@ public:
         Status _enqueueDocuments(OplogFetcher::Documents::const_iterator begin,
                                  OplogFetcher::Documents::const_iterator end,
                                  const OplogFetcher::DocumentsInfo& info);
+
+        /**
+         * Runs an aggregation that gets the entire oplog chain for every retryable write entry in
+         * `config.transactions` with `lastWriteOpTime` < `startFetchingOpTime`. Adds these oplog
+         * entries to the oplog buffer.
+         */
+        void _fetchRetryableWritesOplogBeforeStartOpTime();
+
+        /**
+         * Runs an aggregation that gets the donor's transactions entries in 'config.transactions'
+         * with 'lastWriteOpTime' < 'startFetchingOpTime' and 'state: committed'.
+         */
+        void _fetchCommittedTransactionsBeforeStartOpTime();
 
         /**
          * Starts the tenant oplog fetcher.
@@ -378,15 +426,35 @@ public:
         void _cleanupOnDataSyncCompletion(Status status);
 
         /*
+         * Suppresses selecting 'host' as the donor sync source, until 'until'.
+         */
+        void _excludeDonorHost(WithLock, const HostAndPort& host, Date_t until);
+
+        /*
          * Returns a vector of currently excluded donor hosts. Also removes hosts from the list of
          * excluded donor nodes, if the exclude duration has expired.
          */
-        std::vector<HostAndPort> _getExcludedDonorHosts(WithLock lk);
+        std::vector<HostAndPort> _getExcludedDonorHosts(WithLock);
 
         /*
          * Makes the failpoint to stop or hang based on failpoint data "action" field.
          */
         void _stopOrHangOnFailPoint(FailPoint* fp);
+
+        /**
+         * Updates the state doc in the database and waits for that to be propagated to a majority.
+         */
+        SemiFuture<void> _updateStateDocForMajority(WithLock lk) const;
+
+        /*
+         * Returns the majority OpTime on the donor node that 'client' is connected to.
+         */
+
+        OpTime _getDonorMajorityOpTime(std::unique_ptr<mongo::DBClientConnection>& client);
+        /**
+         * Enforces that the donor and recipient share the same featureCompatibilityVersion.
+         */
+        void _compareRecipientAndDonorFCV() const;
 
         mutable Mutex _mutex = MONGO_MAKE_LATCH("TenantMigrationRecipientService::_mutex");
 
@@ -398,6 +466,7 @@ public:
         // (M)  Reads and writes guarded by _mutex.
         // (W)  Synchronization required only for writes.
 
+        ServiceContext* const _serviceContext;
         const TenantMigrationRecipientService* const _recipientService;  // (R) (not owned)
         std::shared_ptr<executor::ScopedTaskExecutor> _scopedExecutor;   // (M)
         TenantMigrationRecipientDocument _stateDoc;                      // (M)
@@ -407,7 +476,12 @@ public:
         const std::string _tenantId;                  // (R)
         const UUID _migrationUuid;                    // (R)
         const std::string _donorConnectionString;     // (R)
+        const MongoURI _donorUri;                     // (R)
         const ReadPreferenceSetting _readPreference;  // (R)
+        // TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
+        // Transient SSL params created based on the state doc if the server parameter
+        // 'tenantMigrationDisableX509Auth' is false.
+        const boost::optional<TransientSSLParams> _transientSSLParams = boost::none;  // (R)
 
         std::shared_ptr<ReplicaSetMonitor> _donorReplicaSetMonitor;  // (M)
 
@@ -436,6 +510,8 @@ public:
         std::unique_ptr<TenantMigrationSharedData> _sharedData;  // (S)
         // Indicates whether the main task future continuation chain state kicked off by run().
         TaskState _taskState;  // (M)
+        // Used to indicate whether the migration is able to be retried on fetcher error.
+        boost::optional<Status> _oplogFetcherStatus;  // (M)
 
         // Promise that is resolved when the state document is initialized and persisted.
         SharedPromise<void> _stateDocPersistedPromise;  // (W)
@@ -455,6 +531,11 @@ public:
     };
 
 private:
+    ExecutorFuture<void> _rebuildService(std::shared_ptr<executor::ScopedTaskExecutor> executor,
+                                         const CancelationToken& token) override;
+
+    ServiceContext* const _serviceContext;
+
     /*
      * Ensures that only one Instance is able to insert the initial state doc provided by the user,
      * into NamespaceString::kTenantMigrationRecipientsNamespace collection at a time.

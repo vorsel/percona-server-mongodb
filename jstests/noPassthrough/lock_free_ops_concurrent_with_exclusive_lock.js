@@ -1,6 +1,6 @@
 /**
- * Tests that find, count, distinct and aggregation commands can run while a MODE_X collection lock
- * is held.
+ * Tests that find, count, distinct, (non-writing) aggregation, (non-writing) mapReduce,
+ * listCollection and listIndexes commands can run while a MODE_X collection lock is held.
  *
  * @tags: [
  *     # Cannot run against older binaries because they do not have lock-free ops.
@@ -55,8 +55,16 @@ jsTestLog("Waiting for collMod to acquire a database lock.");
 collModFailPoint.wait();
 
 jsTestLog("Starting lock-free find command.");
-const findResult = coll.find({});
-assert.eq(3, findResult.toArray().length);
+// Set a batch size of 1, so there are more documents for the subsequent getMore command to fetch.
+const findResult = db.runCommand({find: collName, batchSize: 1});
+assert.commandWorked(findResult);
+assert.eq(1, findResult.cursor.firstBatch.length);
+
+jsTestLog("Starting lock-free getMore command");
+const getMoreResult =
+    db.runCommand({getMore: NumberLong(findResult.cursor.id), collection: collName, batchSize: 1});
+assert.commandWorked(getMoreResult);
+assert.eq(1, getMoreResult.cursor.nextBatch.length);
 
 jsTestLog("Starting lock-free count command.");
 const countResult = coll.find().count();
@@ -74,6 +82,30 @@ const aggregationResult = coll.aggregate([
 const aggregationDocuments = aggregationResult.toArray();
 assert.eq(1, aggregationDocuments.length);
 assert.eq(15, aggregationDocuments[0].totalTopGroupCount);
+
+jsTestLog("Starting lock-free mapReduce command.");
+const mapReduceResult = coll.mapReduce(
+    function() {
+        emit(this.topGroupId, this.subGroupCount);
+    },
+    function(key, values) {
+        return Array.sum(values);
+    },
+    // Return the results to the user rather than taking a collection IX lock to write them to a
+    // collection.
+    {out: {inline: 1}});
+assert.commandWorked(mapReduceResult);
+assert.eq(2, mapReduceResult.results.length);
+
+jsTestLog("Starting lock-free listCollections command.");
+const listCollectionsResult = db.runCommand({listCollections: 1});
+assert.commandWorked(listCollectionsResult);
+assert.eq(1, listCollectionsResult.cursor.firstBatch.length);
+
+jsTestLog("Starting lock-free listIndexes command.");
+const listIndexesResult = db.runCommand({listIndexes: collName});
+assert.commandWorked(listIndexesResult);
+assert.eq(1, listIndexesResult.cursor.firstBatch.length);
 
 jsTestLog("Turning off failpoint.");
 collModFailPoint.off();

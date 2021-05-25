@@ -6,7 +6,7 @@
  * Tenant migrations are not expected to be run on servers with ephemeralForTest.
  *
  * @tags: [requires_fcv_49, requires_majority_read_concern, requires_persistence,
- * incompatible_with_eft]
+ * incompatible_with_eft, incompatible_with_windows_tls]
  */
 
 (function() {
@@ -93,6 +93,7 @@ assert(!currOp.startApplyingDonorOpTime, tojson(res));
 assert(!currOp.dataConsistentStopDonorOpTime, tojson(res));
 assert(!currOp.cloneFinishedRecipientOpTime, tojson(res));
 assert(!currOp.expireAt, tojson(res));
+assert(!currOp.donorSyncSource, tojson(res));
 fpAfterPersistingStateDoc.off();
 
 // Allow the migration to move to the point where the startFetchingDonorOpTime has been obtained.
@@ -111,6 +112,7 @@ assert(!currOp.expireAt, tojson(res));
 // Must exist now.
 assert(currOp.startFetchingDonorOpTime, tojson(res));
 assert(currOp.startApplyingDonorOpTime, tojson(res));
+assert(currOp.donorSyncSource, tojson(res));
 fpAfterRetrievingStartOpTime.off();
 
 // Wait until collection cloning is done, and cloneFinishedRecipientOpTime
@@ -128,6 +130,7 @@ assert(!currOp.expireAt, tojson(res));
 // Must exist now.
 assert(currOp.startFetchingDonorOpTime, tojson(res));
 assert(currOp.startApplyingDonorOpTime, tojson(res));
+assert(currOp.donorSyncSource, tojson(res));
 assert(currOp.dataConsistentStopDonorOpTime, tojson(res));
 assert(currOp.cloneFinishedRecipientOpTime, tojson(res));
 fpAfterCollectionCloner.off();

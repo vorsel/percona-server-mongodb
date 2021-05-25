@@ -83,7 +83,10 @@ public:
                                                         const CollectionOptions& options) = 0;
 
     virtual std::unique_ptr<SortedDataInterface> getSortedDataInterface(
-        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) = 0;
+        OperationContext* opCtx,
+        const CollectionOptions& collOptions,
+        StringData ident,
+        const IndexDescriptor* desc) = 0;
 
     /**
      * The create and drop methods on KVEngine are not transactional. Transactional semantics
@@ -233,6 +236,14 @@ public:
      */
     virtual bool supportsCappedCollections() const {
         return true;
+    }
+
+    /**
+     * Returns true if the storage engine supports collections clustered on _id. That is,
+     * collections will use _id values as their RecordId and do not need a separate _id index.
+     */
+    virtual bool supportsClusteredIdIndex() const {
+        return false;
     }
 
     /**
@@ -387,7 +398,8 @@ public:
         MONGO_UNREACHABLE;
     }
 
-    virtual StatusWith<Timestamp> pinOldestTimestamp(const std::string& requestingServiceName,
+    virtual StatusWith<Timestamp> pinOldestTimestamp(OperationContext* opCtx,
+                                                     const std::string& requestingServiceName,
                                                      Timestamp requestedTimestamp,
                                                      bool roundUpIfTooOld) {
         MONGO_UNREACHABLE;

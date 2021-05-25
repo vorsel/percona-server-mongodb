@@ -29,14 +29,13 @@
 
 #pragma once
 
-#include "mongo/db/auth/user_name.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
 #include "mongo/s/shard_id.h"
 
 namespace mongo {
 
 class DropCollectionCoordinator final
-    : public ShardingDDLCoordinator,
+    : public ShardingDDLCoordinator_NORESILIENT,
       public std::enable_shared_from_this<DropCollectionCoordinator> {
 public:
     DropCollectionCoordinator(OperationContext* opCtx, const NamespaceString& nss);
@@ -45,13 +44,10 @@ private:
     SemiFuture<void> runImpl(std::shared_ptr<executor::TaskExecutor> executor) override;
 
     void _stopMigrations(OperationContext* opCtx);
-    void _removeCollMetadataFromConfig(OperationContext* opCtx);
     void _sendDropCollToParticipants(OperationContext* opCtx);
 
     ServiceContext* _serviceContext;
     std::vector<ShardId> _participants;
-    std::vector<UserName> _users;
-    std::vector<RoleName> _roles;
 };
 
 }  // namespace mongo

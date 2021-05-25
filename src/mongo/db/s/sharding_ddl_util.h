@@ -29,9 +29,23 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/s/catalog/type_collection.h"
+#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
 namespace mongo {
 namespace sharding_ddl_util {
+
+/**
+ * Erase tags metadata from config server for the given namespace.
+ */
+void removeTagsMetadataFromConfig(OperationContext* opCtx, const NamespaceString& nss);
+
+
+/**
+ * Erase collection metadata from config server and invalidate the locally cached once.
+ * In particular remove chunks, tags and the description associated with the given namespace.
+ */
+void removeCollMetadataFromConfig(OperationContext* opCtx, const CollectionType& coll);
 
 /**
  * Rename sharded collection metadata as part of a renameCollection operation.
@@ -52,6 +66,30 @@ void shardedRenameMetadata(OperationContext* opCtx,
 void checkShardedRenamePreconditions(OperationContext* opCtx,
                                      const NamespaceString& toNss,
                                      const bool dropTarget);
+
+/**
+ * Throws an exception if the collection is already sharded with different options.
+ *
+ * If the collection is already sharded with the same options, returns the existing collection's
+ * full spec, else returns boost::none.
+ */
+boost::optional<CreateCollectionResponse> checkIfCollectionAlreadySharded(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const BSONObj& key,
+    const BSONObj& collation,
+    bool unique);
+
+/**
+ * Acquires the critical section for the specified namespace.
+ * It works even if the namespace's current metadata are UNKNOWN.
+ */
+void acquireCriticalSection(OperationContext* opCtx, const NamespaceString& nss);
+
+/**
+ * Releases the critical section for the specified namespace.
+ */
+void releaseCriticalSection(OperationContext* opCtx, const NamespaceString& nss);
 
 }  // namespace sharding_ddl_util
 }  // namespace mongo

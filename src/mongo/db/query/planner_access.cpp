@@ -50,6 +50,7 @@
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/query_planner_common.h"
+#include "mongo/db/record_id_helpers.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/transitional_tools_do_not_use/vector_spooling.h"
 
@@ -217,15 +218,13 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
     csn->tailable = tailable;
     csn->shouldTrackLatestOplogTimestamp =
         params.options & QueryPlannerParams::TRACK_LATEST_OPLOG_TS;
-    csn->assertMinTsHasNotFallenOffOplog =
-        params.options & QueryPlannerParams::ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG;
     csn->shouldWaitForOplogVisibility =
         params.options & QueryPlannerParams::OPLOG_SCAN_WAIT_FOR_VISIBLE;
 
     // If the hint is {$natural: +-1} this changes the direction of the collection scan.
-    const BSONObj& hint = query.getQueryRequest().getHint();
+    const BSONObj& hint = query.getFindCommand().getHint();
     if (!hint.isEmpty()) {
-        BSONElement natural = hint[QueryRequest::kNaturalSortField];
+        BSONElement natural = hint[query_request_helper::kNaturalSortField];
         if (natural) {
             csn->direction = natural.numberInt() >= 0 ? 1 : -1;
         }
@@ -234,22 +233,52 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
     // If the client requested a resume token and we are scanning the oplog, prepare
     // the collection scan to return timestamp-based tokens. Otherwise, we should
     // return generic RecordId-based tokens.
-    if (query.getQueryRequest().getRequestResumeToken()) {
+    if (query.getFindCommand().getRequestResumeToken()) {
         csn->shouldTrackLatestOplogTimestamp = query.nss().isOplog();
         csn->requestResumeToken = !query.nss().isOplog();
     }
 
     // Extract and assign the RecordId from the 'resumeAfter' token, if present.
-    const BSONObj& resumeAfterObj = query.getQueryRequest().getResumeAfter();
+    const BSONObj& resumeAfterObj = query.getFindCommand().getResumeAfter();
     if (!resumeAfterObj.isEmpty()) {
-        csn->resumeAfterRecordId = RecordId(resumeAfterObj["$recordId"].numberLong());
+        BSONElement recordIdElem = resumeAfterObj["$recordId"];
+        switch (recordIdElem.type()) {
+            case jstNULL:
+                csn->resumeAfterRecordId = RecordId();
+                break;
+            case jstOID:
+                csn->resumeAfterRecordId =
+                    RecordId(recordIdElem.OID().view().view(), OID::kOIDSize);
+                break;
+            case NumberLong:
+            default:
+                csn->resumeAfterRecordId = RecordId(recordIdElem.numberLong());
+        }
     }
 
+    const bool assertMinTsHasNotFallenOffOplog =
+        params.options & QueryPlannerParams::ASSERT_MIN_TS_HAS_NOT_FALLEN_OFF_OPLOG;
     if (query.nss().isOplog() && csn->direction == 1) {
         // Optimizes the start and end location parameters for a collection scan for an oplog
         // collection. Not compatible with $_resumeAfter so we do not optimize in that case.
         if (resumeAfterObj.isEmpty()) {
-            std::tie(csn->minTs, csn->maxTs) = extractTsRange(query.root());
+            auto [minTs, maxTs] = extractTsRange(query.root());
+            if (minTs) {
+                StatusWith<RecordId> goal = record_id_helpers::keyForOptime(*minTs);
+                if (goal.isOK()) {
+                    csn->minRecord = goal.getValue();
+                }
+
+                if (assertMinTsHasNotFallenOffOplog) {
+                    csn->assertTsHasNotFallenOffOplog = *minTs;
+                }
+            }
+            if (maxTs) {
+                StatusWith<RecordId> goal = record_id_helpers::keyForOptime(*maxTs);
+                if (goal.isOK()) {
+                    csn->maxRecord = goal.getValue();
+                }
+            }
         }
 
         // If the query is just a lower bound on "ts" on a forward scan, every document in the
@@ -261,6 +290,14 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::makeCollectionScan(
         }
     }
 
+    // The user may have requested 'assertMinTsHasNotFallenOffOplog' for a query that does not
+    // specify a minimum timestamp. This is not a valid request, so we throw InvalidOptions.
+    if (assertMinTsHasNotFallenOffOplog) {
+        uassert(ErrorCodes::InvalidOptions,
+                str::stream() << "assertTsHasNotFallenOffOplog cannot be applied to a query "
+                                 "which does not imply a minimum 'ts' value ",
+                csn->assertTsHasNotFallenOffOplog);
+    }
     return csn;
 }
 
@@ -1110,7 +1147,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedAnd(
             for (size_t i = 0; i < andResult->children.size(); ++i) {
                 andResult->children[i]->computeProperties();
                 if (andResult->children[i]->providedSorts().contains(
-                        query.getQueryRequest().getSort())) {
+                        query.getFindCommand().getSort())) {
                     std::swap(andResult->children[i], andResult->children.back());
                     break;
                 }
@@ -1211,7 +1248,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedOr(
             // If all ixscanNodes can provide the sort, shouldReverseScan is populated with which
             // scans to reverse.
             shouldReverseScan =
-                canProvideSortWithMergeSort(ixscanNodes, query.getQueryRequest().getSort());
+                canProvideSortWithMergeSort(ixscanNodes, query.getFindCommand().getSort());
         }
 
         if (!shouldReverseScan.empty()) {
@@ -1225,7 +1262,7 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAccess::buildIndexedOr(
             }
 
             auto msn = std::make_unique<MergeSortNode>();
-            msn->sort = query.getQueryRequest().getSort();
+            msn->sort = query.getFindCommand().getSort();
             msn->addChildren(std::move(ixscanNodes));
             orResult = std::move(msn);
         } else {

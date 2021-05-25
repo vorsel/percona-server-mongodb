@@ -110,12 +110,13 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
                      recordId,
                      IndexAccessMethod::kNoopOnSuppressedErrorFn);
 
-        if (!index->isMultikey() &&
-            iam->shouldMarkIndexAsMultikey(
-                documentKeySet->size(),
-                {multikeyMetadataKeys->begin(), multikeyMetadataKeys->end()},
-                *documentMultikeyPaths)) {
-            if (_validateState->shouldRunRepair()) {
+        bool shouldBeMultikey = iam->shouldMarkIndexAsMultikey(
+            documentKeySet->size(),
+            {multikeyMetadataKeys->begin(), multikeyMetadataKeys->end()},
+            *documentMultikeyPaths);
+
+        if (!index->isMultikey() && shouldBeMultikey) {
+            if (_validateState->fixErrors()) {
                 writeConflictRetry(opCtx, "setIndexAsMultikey", coll->ns().ns(), [&] {
                     WriteUnitOfWork wuow(opCtx);
                     coll->getIndexCatalog()->setMultikeyPaths(
@@ -146,7 +147,7 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
         if (index->isMultikey()) {
             const MultikeyPaths& indexPaths = index->getMultikeyPaths(opCtx);
             if (!MultikeyPathTracker::covers(indexPaths, *documentMultikeyPaths.get())) {
-                if (_validateState->shouldRunRepair()) {
+                if (_validateState->fixErrors()) {
                     writeConflictRetry(opCtx, "increaseMultikeyPathCoverage", coll->ns().ns(), [&] {
                         WriteUnitOfWork wuow(opCtx);
                         coll->getIndexCatalog()->setMultikeyPaths(
@@ -173,6 +174,16 @@ Status ValidateAdaptor::validateRecord(OperationContext* opCtx,
         }
 
         IndexInfo& indexInfo = _indexConsistency->getIndexInfo(descriptor->indexName());
+        if (shouldBeMultikey) {
+            indexInfo.multikeyDocs = true;
+        }
+
+        // An empty set of multikey paths indicates that this index does not track path-level
+        // multikey information and we should do no tracking.
+        if (shouldBeMultikey && documentMultikeyPaths->size()) {
+            _indexConsistency->addDocumentMultikeyPaths(&indexInfo, *documentMultikeyPaths);
+        }
+
         for (const auto& keyString : *multikeyMetadataKeys) {
             try {
                 _indexConsistency->addMultikeyMetadataPath(keyString, &indexInfo);
@@ -227,9 +238,9 @@ void _validateKeyOrder(OperationContext* opCtx,
         if (results && results->valid) {
             auto bsonKey = KeyString::toBson(currKey, Ordering::make(descriptor->keyPattern()));
             auto firstRecordId =
-                KeyString::decodeRecordIdAtEnd(prevKey.getBuffer(), prevKey.getSize());
+                KeyString::decodeRecordIdLongAtEnd(prevKey.getBuffer(), prevKey.getSize());
             auto secondRecordId =
-                KeyString::decodeRecordIdAtEnd(currKey.getBuffer(), currKey.getSize());
+                KeyString::decodeRecordIdLongAtEnd(currKey.getBuffer(), currKey.getSize());
             results->errors.push_back(str::stream() << "Unique index '" << descriptor->indexName()
                                                     << "' has duplicate key: " << bsonKey
                                                     << ", first record: " << firstRecordId
@@ -288,8 +299,18 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
                 opCtx, index, indexEntry->keyString, prevIndexKeyStringValue, &indexResults);
         }
 
-        const RecordId kWildcardMultikeyMetadataRecordId{
-            RecordId::ReservedId::kWildcardMultikeyMetadataId};
+
+        const RecordId kWildcardMultikeyMetadataRecordId = [&]() {
+            auto keyFormat = _validateState->getCollection()->getRecordStore()->keyFormat();
+            if (keyFormat == KeyFormat::Long) {
+                return RecordId::reservedIdFor<int64_t>(
+                    RecordId::Reservation::kWildcardMultikeyMetadataId);
+            } else {
+                invariant(keyFormat == KeyFormat::String);
+                return RecordId::reservedIdFor<OID>(
+                    RecordId::Reservation::kWildcardMultikeyMetadataId);
+            }
+        }();
         if (descriptor->getIndexType() == IndexType::INDEX_WILDCARD &&
             indexEntry->loc == kWildcardMultikeyMetadataRecordId) {
             _indexConsistency->removeMultikeyMetadataPath(indexEntry->keyString, &indexInfo);
@@ -328,6 +349,72 @@ void ValidateAdaptor::traverseIndex(OperationContext* opCtx,
         results->valid = false;
     }
 
+    // Adjust multikey metadata when allowed. These states are all allowed by the design of
+    // multikey. A collection should still be valid without these adjustments.
+    if (_validateState->adjustMultikey()) {
+
+        // If this collection has documents that make this index multikey, then check whether those
+        // multikey paths match the index's metadata.
+        auto indexPaths = index->getMultikeyPaths(opCtx);
+        auto& documentPaths = indexInfo.docMultikeyPaths;
+        if (indexInfo.multikeyDocs && documentPaths != indexPaths) {
+            LOGV2(5367500,
+                  "Index's multikey paths do not match those of its documents",
+                  "index"_attr = descriptor->indexName(),
+                  "indexPaths"_attr = MultikeyPathTracker::dumpMultikeyPaths(indexPaths),
+                  "documentPaths"_attr = MultikeyPathTracker::dumpMultikeyPaths(documentPaths));
+
+            // Since we have the correct multikey path information for this index, we can tighten up
+            // its metadata to improve query performance. This may apply in two distinct scenarios:
+            // 1. Collection data has changed such that the current multikey paths on the index
+            // are too permissive and certain document paths are no longer multikey.
+            // 2. This index was built before 3.4, and there is no multikey path information for
+            // the index. We can effectively 'upgrade' the index so that it does not need to be
+            // rebuilt to update this information.
+            writeConflictRetry(opCtx, "updateMultikeyPaths", _validateState->nss().ns(), [&]() {
+                WriteUnitOfWork wuow(opCtx);
+                auto writeableIndex = const_cast<IndexCatalogEntry*>(index);
+                const bool isMultikey = true;
+                writeableIndex->forceSetMultikey(
+                    opCtx, _validateState->getCollection(), isMultikey, documentPaths);
+                wuow.commit();
+            });
+
+            if (results) {
+                results->warnings.push_back(str::stream() << "Updated index multikey metadata"
+                                                          << ": " << descriptor->indexName());
+                results->repaired = true;
+            }
+        }
+
+        // If this index does not need to be multikey, then unset the flag.
+        if (index->isMultikey() && !indexInfo.multikeyDocs) {
+            invariant(!indexInfo.docMultikeyPaths.size());
+
+            LOGV2(5367501,
+                  "Index is multikey but there are no multikey documents",
+                  "index"_attr = descriptor->indexName());
+
+            // This makes an improvement in the case that no documents make the index multikey and
+            // the flag can be unset entirely. This may be due to a change in the data or historical
+            // multikey bugs that have persisted incorrect multikey infomation.
+            writeConflictRetry(opCtx, "unsetMultikeyPaths", _validateState->nss().ns(), [&]() {
+                WriteUnitOfWork wuow(opCtx);
+                auto writeableIndex = const_cast<IndexCatalogEntry*>(index);
+                const bool isMultikey = false;
+                writeableIndex->forceSetMultikey(
+                    opCtx, _validateState->getCollection(), isMultikey, {});
+                wuow.commit();
+            });
+
+            if (results) {
+                results->warnings.push_back(str::stream() << "Unset index multikey metadata"
+                                                          << ": " << descriptor->indexName());
+                results->repaired = true;
+            }
+        }
+    }
+
     if (numTraversedKeys) {
         *numTraversedKeys = numKeys;
     }
@@ -341,6 +428,12 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
     long long interruptIntervalNumBytes = 0;
     long long nInvalid = 0;
     long long numCorruptRecordsSizeBytes = 0;
+
+    ON_BLOCK_EXIT([&]() {
+        output->appendNumber("nInvalidDocuments", nInvalid);
+        output->appendNumber("nrecords", _numRecords);
+        _progress->finished();
+    });
 
     results->valid = true;
     RecordId prevRecordId;
@@ -360,6 +453,11 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         _progress.set(CurOp::get(opCtx)->setProgress_inlock(curopMessage, totalRecords));
     }
 
+    if (_validateState->getFirstRecordId().isNull()) {
+        // The record store is empty if the first RecordId isn't initialized.
+        return;
+    }
+
     bool corruptRecordsSizeLimitWarning = false;
     const std::unique_ptr<SeekableRecordThrottleCursor>& traverseRecordStoreCursor =
         _validateState->getTraverseRecordStoreCursor();
@@ -374,6 +472,18 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         dataSizeTotal += dataSize;
         size_t validatedSize = 0;
         Status status = validateRecord(opCtx, record->id, record->data, &validatedSize, results);
+
+        // TODO SERVER-54481 : Disable double validate.
+        auto doubleValidateRecord = traverseRecordStoreCursor->seekExact(opCtx, record->id);
+        if (!doubleValidateRecord || doubleValidateRecord->id != record->id ||
+            doubleValidateRecord->data.size() != record->data.size()) {
+            LOGV2(
+                5355600,
+                "Document corruption details - Document validation failure; double validate failed",
+                "recordId"_attr = record->id);
+            results->errors.push_back("Detected one or more invalid documents. See logs.");
+            results->valid = false;
+        }
 
         // Checks to ensure isInRecordIdOrder() is being used properly.
         if (prevRecordId.isValid()) {
@@ -397,7 +507,7 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
                       "recordBytes"_attr = dataSize);
             }
 
-            if (_validateState->shouldRunRepair()) {
+            if (_validateState->fixErrors()) {
                 writeConflictRetry(
                     opCtx, "corrupt record removal", _validateState->nss().ns(), [&] {
                         WriteUnitOfWork wunit(opCtx);
@@ -461,11 +571,6 @@ void ValidateAdaptor::traverseRecordStore(OperationContext* opCtx,
         _validateState->getCollection()->getRecordStore()->updateStatsAfterRepair(
             opCtx, _numRecords, dataSizeTotal);
     }
-
-    _progress->finished();
-
-    output->appendNumber("nInvalidDocuments", nInvalid);
-    output->appendNumber("nrecords", _numRecords);
 }
 
 void ValidateAdaptor::validateIndexKeyCount(const IndexCatalogEntry* index,

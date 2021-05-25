@@ -110,8 +110,9 @@ TEST(SortedDataInterface, BuilderAddKeyWithReservedRecordId) {
         const std::unique_ptr<SortedDataBuilderInterface> builder(
             sorted->makeBulkBuilder(opCtx.get(), true));
 
-        RecordId reservedLoc(RecordId::ReservedId::kWildcardMultikeyMetadataId);
-        ASSERT(reservedLoc.isReserved());
+        RecordId reservedLoc(
+            RecordId::reservedIdFor<int64_t>(RecordId::Reservation::kWildcardMultikeyMetadataId));
+        invariant(RecordId::isReserved<int64_t>(reservedLoc));
 
         WriteUnitOfWork wuow(opCtx.get());
         ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), key1, reservedLoc)));

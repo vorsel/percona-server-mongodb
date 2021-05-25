@@ -86,16 +86,19 @@ class Document;
  *                          LiteParsedDocumentSourceDefault::parse,
  *                          DocumentSourceFoo::createFromBson);
  */
-#define REGISTER_DOCUMENT_SOURCE(key, liteParser, fullParser) \
-    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key, liteParser, fullParser, boost::none, true)
+#define REGISTER_DOCUMENT_SOURCE(key, liteParser, fullParser, allowedWithApiStrict) \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                                         \
+        key, liteParser, fullParser, allowedWithApiStrict, boost::none, true)
 
 /**
  * Like REGISTER_DOCUMENT_SOURCE, except the parser will only be enabled when FCV >= minVersion.
  * We store minVersion in the parserMap, so that changing FCV at runtime correctly enables/disables
  * the parser.
  */
-#define REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(key, liteParser, fullParser, minVersion) \
-    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key, liteParser, fullParser, minVersion, true)
+#define REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(                 \
+    key, liteParser, fullParser, allowedWithApiStrict, minVersion) \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                        \
+        key, liteParser, fullParser, allowedWithApiStrict, minVersion, true)
 
 /**
  * Like REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION, except you can also specify a condition,
@@ -109,21 +112,27 @@ class Document;
  *
  * This is the most general REGISTER_DOCUMENT_SOURCE* macro, which all others should delegate to.
  */
-#define REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(key, liteParser, fullParser, minVersion, ...) \
-    MONGO_INITIALIZER(addToDocSourceParserMap_##key)(InitializerContext*) {                  \
-        if (!__VA_ARGS__) {                                                                  \
-            return;                                                                          \
-        }                                                                                    \
-        LiteParsedDocumentSource::registerParser("$" #key, liteParser);                      \
-        DocumentSource::registerParser("$" #key, fullParser, minVersion);                    \
+#define REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                                               \
+    key, liteParser, fullParser, allowedWithApiStrict, minVersion, ...)                       \
+    MONGO_INITIALIZER(addToDocSourceParserMap_##key)(InitializerContext*) {                   \
+        if (!__VA_ARGS__) {                                                                   \
+            return;                                                                           \
+        }                                                                                     \
+        LiteParsedDocumentSource::registerParser("$" #key, liteParser, allowedWithApiStrict); \
+        DocumentSource::registerParser("$" #key, fullParser, minVersion);                     \
     }
 
 /**
  * Like REGISTER_DOCUMENT_SOURCE, except the parser is only enabled when test-commands are enabled.
  */
-#define REGISTER_TEST_DOCUMENT_SOURCE(key, liteParser, fullParser) \
-    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                        \
-        key, liteParser, fullParser, boost::none, ::mongo::getTestCommandsEnabled())
+#define REGISTER_TEST_DOCUMENT_SOURCE(key, liteParser, fullParser)        \
+    REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(                               \
+        key,                                                              \
+        liteParser,                                                       \
+        fullParser,                                                       \
+        LiteParsedDocumentSource::AllowedWithApiStrict::kNeverInVersion1, \
+        boost::none,                                                      \
+        ::mongo::getTestCommandsEnabled())
 
 class DocumentSource : public RefCountable {
 public:

@@ -47,6 +47,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/platform/mutex.h"
+#include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/elapsed_tracker.h"
 
 namespace mongo {
@@ -152,7 +153,10 @@ public:
                                      const IndexDescriptor* desc) override;
 
     std::unique_ptr<SortedDataInterface> getSortedDataInterface(
-        OperationContext* opCtx, StringData ident, const IndexDescriptor* desc) override;
+        OperationContext* opCtx,
+        const CollectionOptions& collOptions,
+        StringData ident,
+        const IndexDescriptor* desc) override;
 
     Status importRecordStore(OperationContext* opCtx,
                              StringData ident,
@@ -261,6 +265,10 @@ public:
 
     Timestamp getAllDurableTimestamp() const override;
 
+    bool supportsClusteredIdIndex() const final override {
+        return true;
+    }
+
     bool supportsReadConcernSnapshot() const final override;
 
     bool supportsOplogStones() const final override;
@@ -360,10 +368,18 @@ public:
         return _clockSource;
     }
 
-    StatusWith<Timestamp> pinOldestTimestamp(const std::string& requestingServiceName,
+    StatusWith<Timestamp> pinOldestTimestamp(OperationContext* opCtx,
+                                             const std::string& requestingServiceName,
                                              Timestamp requestedTimestamp,
                                              bool roundUpIfTooOld) override;
 
+private:
+    StatusWith<Timestamp> _pinOldestTimestamp(WithLock,
+                                              const std::string& requestingServiceName,
+                                              Timestamp requestedTimestamp,
+                                              bool roundUpIfTooOld);
+
+public:
     void unpinOldestTimestamp(const std::string& requestingServiceName) override;
 
     std::map<std::string, Timestamp> getPinnedTimestampRequests();

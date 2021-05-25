@@ -2,7 +2,7 @@
  * Tests that tenant migrations resume successfully on stepup and restart.
  *
  * @tags: [requires_fcv_47, requires_majority_read_concern, requires_persistence,
- * incompatible_with_eft]
+ * incompatible_with_eft, incompatible_with_windows_tls]
  */
 
 (function() {
@@ -177,16 +177,7 @@ function testDonorForgetMigrationInterrupt(interruptFunc) {
         ErrorCodes.NoSuchTenantMigration);
 
     assert.commandWorked(forgetMigrationThread.returnData());
-    // After forgetMigrationThread returns, check that the recipient state doc is correctly marked
-    // as garbage collectable.
-    const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
-    const recipientStateDoc =
-        recipientPrimary.getCollection(TenantMigrationTest.kConfigRecipientsNS).findOne({
-            _id: migrationId
-        });
-    assert(recipientStateDoc.expireAt);
-    tenantMigrationTest.waitForMigrationGarbageCollection(
-        donorRst.nodes, migrationId, migrationOpts.tenantId);
+    tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, migrationOpts.tenantId);
 
     tenantMigrationTest.stop();
     donorRst.stopSet();
@@ -258,7 +249,6 @@ function testDonorAbortMigrationInterrupt(interruptFunc, fpName, isShutdown = fa
     const tryAbortThread = new Thread(TenantMigrationUtil.tryAbortMigrationAsync,
                                       {migrationIdString: migrationOpts.migrationIdString},
                                       donorRstArgs,
-                                      TenantMigrationUtil.runTenantMigrationCommand,
                                       true /* retryOnRetryableErrors */);
     tryAbortThread.start();
 

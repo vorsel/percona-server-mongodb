@@ -75,12 +75,17 @@ const NamespaceString NamespaceString::kTenantMigrationDonorsNamespace(Namespace
 const NamespaceString NamespaceString::kTenantMigrationRecipientsNamespace(
     NamespaceString::kConfigDb, "tenantMigrationRecipients");
 
+const NamespaceString NamespaceString::kTenantMigrationOplogView(
+    NamespaceString::kLocalDb, "system.tenantMigration.oplogView");
+
 const NamespaceString NamespaceString::kShardConfigCollectionsNamespace(NamespaceString::kConfigDb,
                                                                         "cache.collections");
 const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceString::kConfigDb,
                                                                       "cache.databases");
-const NamespaceString NamespaceString::kSystemKeysNamespace(NamespaceString::kAdminDb,
-                                                            "system.keys");
+const NamespaceString NamespaceString::kKeysCollectionNamespace(NamespaceString::kAdminDb,
+                                                                "system.keys");
+const NamespaceString NamespaceString::kExternalKeysCollectionNamespace(
+    NamespaceString::kAdminDb, "system.external_validation_keys");
 const NamespaceString NamespaceString::kRsOplogNamespace(NamespaceString::kLocalDb, "oplog.rs");
 const NamespaceString NamespaceString::kSystemReplSetNamespace(NamespaceString::kLocalDb,
                                                                "system.replset");
@@ -108,12 +113,6 @@ const NamespaceString NamespaceString::kReshardingApplierProgressNamespace(
 const NamespaceString NamespaceString::kReshardingTxnClonerProgressNamespace(
     NamespaceString::kConfigDb, "localReshardingOperations.recipient.progress_txn_cloner");
 
-const NamespaceString NamespaceString::kKeysCollectionNamespace(NamespaceString::kAdminDb,
-                                                                "system.keys");
-
-const NamespaceString NamespaceString::kExternalKeysCollectionNamespace(
-    NamespaceString::kAdminDb, "system.external_validation_keys");
-
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
 }
@@ -128,16 +127,12 @@ bool NamespaceString::isLegalClientSystemNS() const {
             return true;
         if (coll() == kServerConfigurationNamespace.coll())
             return true;
-        if (coll() == kSystemKeysNamespace.coll())
+        if (coll() == kKeysCollectionNamespace.coll())
+            return true;
+        if (coll() == kExternalKeysCollectionNamespace.coll())
             return true;
         if (coll() == "system.backup_users")
             return true;
-        if (coll() == kExternalKeysCollectionNamespace.coll()) {
-            // TODO (SERVER-53404): This was added to allow client in an integration test to
-            // manually insert the key document into this system collection. Remove this when the
-            // tenant migration donor does the copying by itself.
-            return true;
-        }
     } else if (db() == kConfigDb) {
         if (coll() == "system.sessions")
             return true;
@@ -296,6 +291,14 @@ bool NamespaceString::isNamespaceAlwaysUnsharded() const {
 
 bool NamespaceString::isConfigDotCacheDotChunks() const {
     return db() == "config" && coll().startsWith("cache.chunks.");
+}
+
+bool NamespaceString::isReshardingLocalOplogBufferCollection() const {
+    return db() == "config" && coll().startsWith(kReshardingLocalOplogBufferPrefix);
+}
+
+bool NamespaceString::isReshardingConflictStashCollection() const {
+    return db() == "config" && coll().startsWith(kReshardingConflictStashPrefix);
 }
 
 bool NamespaceString::isTemporaryReshardingCollection() const {

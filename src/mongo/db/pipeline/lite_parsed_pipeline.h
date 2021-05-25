@@ -170,27 +170,16 @@ public:
     void tickGlobalStageCounters() const;
 
     /**
-     * Returns true if 'stageName' is in API Version 1.
+     * Performs API versioning validations on the aggregate pipeline stages.
      */
-    bool isStageInAPIVersion1(const std::string& stageName) const {
-        // These stages are excluded from API Version1 with 'apiStrict: true'.
-        static const stdx::unordered_set<std::string> stagesExcluded = {"$collStats",
-                                                                        "$currentOp",
-                                                                        "$indexStats",
-                                                                        "$listLocalSessions",
-                                                                        "$listSessions",
-                                                                        "$planCacheStats",
-                                                                        "$search",
-                                                                        "$searchBeta"};
-
-        return (stagesExcluded.find(stageName) == stagesExcluded.end());
-    }
+    void validatePipelineStagesforAPIVersion(const OperationContext* opCtx) const;
 
     /**
-     * Throws 'APIStrictError' if the pipeline contains the stages which are not in API Version
-     * 'version'.
+     * Verifies that the pipeline contains valid stages. Calls
+     * 'validatePipelineStagesforAPIVersion' with 'opCtx', and throws UserException if there is
+     * more than one $_internalUnpackBucket stage in the pipeline.
      */
-    void validatePipelineStagesIfAPIStrict(const std::string& version) const;
+    void validate(const OperationContext* opCtx) const;
 
 private:
     std::vector<std::unique_ptr<LiteParsedDocumentSource>> _stageSpecs;

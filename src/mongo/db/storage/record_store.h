@@ -61,6 +61,16 @@ struct Record {
 };
 
 /**
+ * The data format of a RecordStore's RecordId keys.
+ */
+enum class KeyFormat {
+    /** Signed 64-bit integer */
+    Long,
+    /** Variable-length binary comparable data */
+    String,
+};
+
+/**
  * Retrieves Records from a RecordStore.
  *
  * A cursor is constructed with a direction flag with the following effects:
@@ -174,6 +184,20 @@ public:
     virtual boost::optional<Record> seekExact(const RecordId& id) = 0;
 
     /**
+     * Positions this cursor near 'start' or an adjacent record if 'start' does not exist. If there
+     * is not an exact match, the cursor is positioned on the directionally previous Record. If no
+     * earlier record exists, the cursor is positioned on the directionally following record.
+     * Returns boost::none if the RecordStore is empty.
+     *
+     * For forward cursors, returns the Record with the highest RecordId less than or equal to
+     * 'start'. If no such record exists, positions on the next highest RecordId after 'start'.
+     *
+     * For reverse cursors, returns the Record with the lowest RecordId greater than or equal to
+     * 'start'. If no such record exists, positions on the next lowest RecordId before 'start'.
+     */
+    virtual boost::optional<Record> seekNear(const RecordId& start) = 0;
+
+    /**
      * Prepares for state changes in underlying data without necessarily saving the current
      * state.
      *
@@ -206,7 +230,8 @@ class RecordStore : public Ident {
     RecordStore& operator=(const RecordStore&) = delete;
 
 public:
-    RecordStore(StringData ns, StringData identName) : Ident(identName), _ns(ns.toString()) {}
+    RecordStore(StringData ns, StringData identName)
+        : Ident(identName.toString()), _ns(ns.toString()) {}
 
     virtual ~RecordStore() {}
 
@@ -226,6 +251,15 @@ public:
     bool isTemp() const {
         return ns().size() == 0;
     }
+
+    /**
+     * The key format for this RecordStore's RecordIds.
+     *
+     * Collections with clustered indexes on _id may use the String format, however most
+     * RecordStores use Long. RecordStores with the String format require callers to provide
+     * RecordIds and will not generate them automatically.
+     */
+    virtual KeyFormat keyFormat() const = 0;
 
     /**
      * The dataSize is an approximation of the sum of the sizes (in bytes) of the
@@ -321,7 +355,19 @@ public:
                                       const char* data,
                                       int len,
                                       Timestamp timestamp) {
-        std::vector<Record> inOutRecords{Record{RecordId(), RecordData(data, len)}};
+        // Record stores with the Long key format accept a null RecordId, as the storage engine will
+        // generate one.
+        invariant(keyFormat() == KeyFormat::Long);
+        return insertRecord(opCtx, RecordId(), data, len, timestamp);
+    }
+
+    /**
+     * A thin wrapper around insertRecords() to simplify handling of single document inserts.
+     * If RecordId is null, the storage engine will generate one and return it.
+     */
+    StatusWith<RecordId> insertRecord(
+        OperationContext* opCtx, RecordId rid, const char* data, int len, Timestamp timestamp) {
+        std::vector<Record> inOutRecords{Record{rid, RecordData(data, len)}};
         Status status = insertRecords(opCtx, &inOutRecords, std::vector<Timestamp>{timestamp});
         if (!status.isOK())
             return status;
@@ -457,18 +503,6 @@ public:
     virtual void appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* result,
                                    double scale) const = 0;
-
-    /**
-     * Return the RecordId of an oplog entry as close to startingPosition as possible without
-     * being higher. If there are no entries <= startingPosition, return RecordId().
-     *
-     * If you don't implement the oplogStartHack, just use the default implementation which
-     * returns boost::none.
-     */
-    virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
-                                                     const RecordId& startingPosition) const {
-        return boost::none;
-    }
 
     /**
      * When we write to an oplog, we call this so that that the storage engine can manage the

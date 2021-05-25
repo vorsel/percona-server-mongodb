@@ -218,7 +218,8 @@ void PrimaryOnlyServiceRegistry::onStepDown() {
 void PrimaryOnlyServiceRegistry::reportServiceInfoForServerStatus(BSONObjBuilder* result) noexcept {
     BSONObjBuilder subBuilder(result->subobjStart("primaryOnlyServices"));
     for (auto& service : _servicesByName) {
-        subBuilder.appendNumber(service.first, service.second->getNumberOfInstances());
+        subBuilder.appendNumber(service.first,
+                                static_cast<long long>(service.second->getNumberOfInstances()));
     }
 }
 
@@ -453,6 +454,11 @@ void PrimaryOnlyService::shutdown() {
             {ErrorCodes::InterruptedAtShutdown, "PrimaryOnlyService interrupted due to shutdown"});
     }
 
+    for (auto opCtx : _opCtxs) {
+        stdx::lock_guard<Client> clientLock(*opCtx->getClient());
+        _serviceContext->killOperation(clientLock, opCtx, ErrorCodes::InterruptedAtShutdown);
+    }
+
     if (savedScopedExecutor) {
         // Make sure to shut down the scoped executor before the parent executor to avoid
         // SERVER-50612.
@@ -540,14 +546,38 @@ boost::optional<std::shared_ptr<PrimaryOnlyService::Instance>> PrimaryOnlyServic
     return it->second;
 }
 
-void PrimaryOnlyService::releaseInstance(const InstanceID& id) {
-    stdx::lock_guard lk(_mutex);
-    _instances.erase(id);
+void PrimaryOnlyService::releaseInstance(const InstanceID& id, Status status) {
+    std::shared_ptr<Instance> savedInstance;
+    {
+        stdx::lock_guard lk(_mutex);
+        auto iterator = _instances.find(id);
+        if (iterator == _instances.end()) {
+            return;
+        }
+        savedInstance = iterator->second;
+        _instances.erase(iterator);
+    }
+    if (!status.isOK() && savedInstance) {
+        savedInstance->interrupt(std::move(status));
+    }
 }
 
-void PrimaryOnlyService::releaseAllInstances() {
-    stdx::lock_guard lk(_mutex);
-    _instances.clear();
+void PrimaryOnlyService::releaseAllInstances(Status status) {
+    InstanceMap savedInstances;
+    {
+        stdx::lock_guard lk(_mutex);
+        if (status.isOK()) {
+            _instances.clear();
+            return;
+        }
+        savedInstances = std::move(_instances);
+        _instances.clear();
+    }
+    for (const auto& instancePair : savedInstances) {
+        if (instancePair.second) {
+            instancePair.second->interrupt(status);
+        }
+    }
 }
 
 void PrimaryOnlyService::_setHasExecutor(WithLock) {
@@ -574,7 +604,7 @@ void PrimaryOnlyService::_rebuildInstances(long long term) noexcept {
                     2,
                     "Querying {ns} to look for state documents while rebuilding PrimaryOnlyService "
                     "{service}",
-                    "Querying to look for state documents while rebuiding PrimaryOnlyService",
+                    "Querying to look for state documents while rebuilding PrimaryOnlyService",
                     "ns"_attr = ns,
                     "service"_attr = serviceName);
 

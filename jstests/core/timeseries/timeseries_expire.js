@@ -20,20 +20,23 @@ if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
     return;
 }
 
-const testDB = db.getSiblingDB(jsTestName());
-assert.commandWorked(testDB.dropDatabase());
+// TODO SERVER-53990: to re-enable this.
+if (true) {
+    jsTestLog("SERVER-53990 to re-enable this test");
+    return;
+}
 
-const coll = testDB.getCollection('t');
-const bucketsColl = testDB.getCollection('system.buckets.' + coll.getName());
+const coll = db.timeseries_expire;
+const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
 
 coll.drop();
 
 const timeFieldName = 'time';
 const expireAfterSeconds = NumberLong(5);
-assert.commandWorked(testDB.createCollection(
+assert.commandWorked(db.createCollection(
     coll.getName(),
     {timeseries: {timeField: timeFieldName, expireAfterSeconds: expireAfterSeconds}}));
-assert.contains(bucketsColl.getName(), testDB.getCollectionNames());
+assert.contains(bucketsColl.getName(), db.getCollectionNames());
 
 // Inserts a measurement with a time in the past to ensure the measurement will be removed
 // immediately.
@@ -46,7 +49,7 @@ const doc = {
     [timeFieldName]: t,
     x: 0
 };
-assert.commandWorked(coll.insert(doc), 'failed to insert doc: ' + tojson(doc));
+assert.commandWorked(coll.insert(doc, {ordered: false}), 'failed to insert doc: ' + tojson(doc));
 jsTestLog('Insertion took ' + ((new Date()).getTime() - start.getTime()) + ' ms.');
 
 // Wait for the document to be removed.

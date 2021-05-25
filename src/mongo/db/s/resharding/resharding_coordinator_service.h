@@ -120,6 +120,11 @@ public:
     void interrupt(Status status) override;
 
     /**
+     * Replace in-memory representation of the CoordinatorDoc
+     */
+    void installCoordinatorDoc(const ReshardingCoordinatorDocument& doc);
+
+    /**
      * Returns a Future that will be resolved when all work associated with this Instance has
      * completed running.
      */
@@ -127,14 +132,9 @@ public:
         return _completionPromise.getFuture();
     }
 
-    /**
-     * TODO(SERVER-50976) Report ReshardingCoordinators in currentOp().
-     */
     boost::optional<BSONObj> reportForCurrentOp(
-        MongoProcessInterface::CurrentOpConnectionsMode connMode,
-        MongoProcessInterface::CurrentOpSessionsMode sessionMode) noexcept override {
-        return boost::none;
-    }
+        MongoProcessInterface::CurrentOpConnectionsMode,
+        MongoProcessInterface::CurrentOpSessionsMode) noexcept override;
 
     std::shared_ptr<ReshardingCoordinatorObserver> getObserver();
 
@@ -223,7 +223,8 @@ private:
     void _updateCoordinatorDocStateAndCatalogEntries(
         CoordinatorStateEnum nextState,
         ReshardingCoordinatorDocument coordinatorDoc,
-        boost::optional<Timestamp> fetchTimestamp = boost::none);
+        boost::optional<Timestamp> fetchTimestamp = boost::none,
+        boost::optional<Status> abortReason = boost::none);
 
     /**
      * Sends 'flushRoutingTableCacheUpdatesWithWriteConcern' to all recipient shards.
@@ -245,7 +246,7 @@ private:
      * participant shards.
      */
     void _tellAllParticipantsToRefresh(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+        const BSONObj& refreshCmd, const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
     // The unique key for a given resharding operation. InstanceID is an alias for BSONObj. The
     // value of this is the UUID that will be used as the collection UUID for the new sharded

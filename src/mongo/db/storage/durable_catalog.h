@@ -190,6 +190,14 @@ public:
      */
     virtual void updateCappedSize(OperationContext* opCtx, RecordId catalogId, long long size) = 0;
 
+    /**
+     * Updates the expireAfterSeconds option on the clustered index. If no expireAfterSeconds value
+     * is passed in then TTL deletions will be stopped on the clustered index.
+     */
+    virtual void updateClusteredIndexTTLSetting(OperationContext* opCtx,
+                                                RecordId catalogId,
+                                                boost::optional<int64_t> expireAfterSeconds) = 0;
+
     /*
      * Updates the expireAfterSeconds field of the given index to the value in newExpireSecs.
      * The specified index must already contain an expireAfterSeconds field, and the value in
@@ -209,12 +217,13 @@ public:
                                      StringData idxName,
                                      bool hidden) = 0;
 
-    /** Compares the UUID argument to the UUID obtained from the metadata. Returns true if they are
+    /**
+     * Compares the UUID argument to the UUID obtained from the metadata. Returns true if they are
      * equal, false otherwise.
      */
     virtual bool isEqualToMetadataUUID(OperationContext* opCtx,
                                        RecordId catalogId,
-                                       OptionalCollectionUUID uuid) = 0;
+                                       const UUID& uuid) = 0;
 
     /**
      * Updates the 'temp' setting for this collection.
@@ -281,8 +290,8 @@ public:
      * Returns true if the index identified by 'indexName' is multikey, and returns false otherwise.
      *
      * If the 'multikeyPaths' pointer is non-null, then it must point to an empty vector. If this
-     * index supports tracking path-level multikey information, then this function sets
-     * 'multikeyPaths' as the path components that cause this index to be multikey.
+     * index type supports tracking path-level multikey information in the catalog, then this
+     * function sets 'multikeyPaths' as the path components that cause this index to be multikey.
      *
      * In particular, if this function returns false and the index supports tracking path-level
      * multikey information, then 'multikeyPaths' is initialized as a vector with size equal to the
@@ -306,6 +315,22 @@ public:
                                     RecordId catalogId,
                                     StringData indexName,
                                     const MultikeyPaths& multikeyPaths) = 0;
+
+    /**
+     * Sets the index to be multikey with the provided paths. This performs minimal validation of
+     * the inputs and is intended to be used internally to "correct" multikey metadata that drifts
+     * from the underlying collection data.
+     *
+     * When isMultikey is false, ignores multikeyPaths and resets the metadata appropriately based
+     * on the index descriptor. Otherwise, overwrites the existing multikeyPaths with the ones
+     * provided. This only writes multikey paths if the index type supports path-level tracking, and
+     * only sets the multikey boolean flag otherwise.
+     */
+    virtual void forceSetIndexIsMultikey(OperationContext* opCtx,
+                                         RecordId catalogId,
+                                         const IndexDescriptor* desc,
+                                         bool isMultikey,
+                                         const MultikeyPaths& multikeyPaths) = 0;
 
     virtual CollectionOptions getCollectionOptions(OperationContext* opCtx,
                                                    RecordId catalogId) const = 0;

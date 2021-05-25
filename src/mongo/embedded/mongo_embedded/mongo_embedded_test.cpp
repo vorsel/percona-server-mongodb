@@ -598,13 +598,13 @@ TEST_F(MongodbCAPITest, RunListCommands) {
                                           "refreshSessions",
                                           "renameCollection",
                                           "repairDatabase",
-                                          "resetError",
                                           "serverStatus",
                                           "setParameter",
                                           "sleep",
                                           "startSession",
                                           "update",
                                           "validate",
+                                          "validateDBMetadata",
                                           "waitForFailPoint",
                                           "whatsmysni"};
 

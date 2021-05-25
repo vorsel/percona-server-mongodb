@@ -45,6 +45,7 @@
 #include "mongo/bson/ordering.h"
 #include "mongo/db/exec/shard_filterer.h"
 #include "mongo/db/query/bson_typemask.h"
+#include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/represent_as.h"
@@ -113,6 +114,8 @@ enum class TypeTags : uint8_t {
     // The bson prefix signifies the fact that this type can only come from BSON (either from disk
     // or from user over the wire). It is never created or manipulated by SBE.
     bsonUndefined,
+    bsonRegex,
+    bsonJavascript,
 
     // KeyString::Value
     ksValue,
@@ -128,6 +131,9 @@ enum class TypeTags : uint8_t {
 
     // Pointer to a ShardFilterer for shard filtering.
     shardFilterer,
+
+    // Pointer to a collator interface object.
+    collator,
 };
 
 inline constexpr bool isNumber(TypeTags tag) noexcept {
@@ -164,6 +170,14 @@ inline constexpr bool isPcreRegex(TypeTags tag) noexcept {
     return tag == TypeTags::pcreRegex;
 }
 
+inline constexpr bool isCollatableType(TypeTags tag) noexcept {
+    return isString(tag) || isArray(tag) || isObject(tag);
+}
+
+inline constexpr bool isBsonRegex(TypeTags tag) noexcept {
+    return tag == TypeTags::bsonRegex;
+}
+
 BSONType tagToType(TypeTags tag) noexcept;
 
 /**
@@ -192,7 +206,9 @@ enum class SortDirection : uint8_t { Descending, Ascending };
  */
 void releaseValue(TypeTags tag, Value val) noexcept;
 std::pair<TypeTags, Value> copyValue(TypeTags tag, Value val);
-std::size_t hashValue(TypeTags tag, Value val) noexcept;
+std::size_t hashValue(TypeTags tag,
+                      Value val,
+                      const CollatorInterface* collator = nullptr) noexcept;
 
 /**
  * Overloads for writing values and tags to stream.
@@ -205,10 +221,12 @@ str::stream& operator<<(str::stream& str, const std::pair<TypeTags, Value>& valu
 /**
  * Three ways value comparison (aka spaceship operator).
  */
-std::pair<TypeTags, Value> compareValue(TypeTags lhsTag,
-                                        Value lhsValue,
-                                        TypeTags rhsTag,
-                                        Value rhsValue);
+std::pair<TypeTags, Value> compareValue(
+    TypeTags lhsTag,
+    Value lhsValue,
+    TypeTags rhsTag,
+    Value rhsValue,
+    const StringData::ComparatorInterface* comparator = nullptr);
 
 bool isNaN(TypeTags tag, Value val);
 
@@ -233,13 +251,13 @@ public:
     ValueGuard(TypeTags tag, Value val) : _tag(tag), _value(val) {}
     ValueGuard() = delete;
     ValueGuard(const ValueGuard&) = delete;
-    ValueGuard(ValueGuard&&) = delete;
+    ValueGuard(ValueGuard&& other) = delete;
     ~ValueGuard() {
         releaseValue(_tag, _value);
     }
 
     ValueGuard& operator=(const ValueGuard&) = delete;
-    ValueGuard& operator=(ValueGuard&&) = delete;
+    ValueGuard& operator=(ValueGuard&& other) = delete;
 
     void reset() {
         _tag = TypeTags::Nothing;
@@ -330,18 +348,31 @@ T bitcastTo(const Value in) noexcept {
  * Defines hash value for <TypeTags, Value> pair. To be used in associative containers.
  */
 struct ValueHash {
+    explicit ValueHash(const CollatorInterface* collator = nullptr) : _collator(collator) {}
+
     size_t operator()(const std::pair<TypeTags, Value>& p) const {
-        return hashValue(p.first, p.second);
+        return hashValue(p.first, p.second, _collator);
     }
+
+    const CollatorInterface* getCollator() const {
+        return _collator;
+    }
+
+private:
+    const CollatorInterface* _collator;
 };
 
 /**
  * Defines equivalence of two <TypeTags, Value> pairs. To be used in associative containers.
  */
 struct ValueEq {
+    explicit ValueEq(const CollatorInterface* collator = nullptr) : _collator(collator) {}
+
     bool operator()(const std::pair<TypeTags, Value>& lhs,
                     const std::pair<TypeTags, Value>& rhs) const {
-        auto [tag, val] = compareValue(lhs.first, lhs.second, rhs.first, rhs.second);
+        auto comparator = _collator;
+
+        auto [tag, val] = compareValue(lhs.first, lhs.second, rhs.first, rhs.second, comparator);
 
         if (tag != TypeTags::NumberInt32 || bitcastTo<int32_t>(val) != 0) {
             return false;
@@ -349,6 +380,13 @@ struct ValueEq {
             return true;
         }
     }
+
+    const CollatorInterface* getCollator() const {
+        return _collator;
+    }
+
+private:
+    const CollatorInterface* _collator;
 };
 
 template <typename T>
@@ -502,8 +540,11 @@ class ArraySet {
 public:
     using iterator = ValueSetType::iterator;
 
-    ArraySet() = default;
-    ArraySet(const ArraySet& other) {
+    explicit ArraySet(const CollatorInterface* collator = nullptr)
+        : _values(0, ValueHash(collator), ValueEq(collator)) {}
+
+    ArraySet(const ArraySet& other)
+        : _values(0, other._values.hash_function(), other._values.key_eq()) {
         reserve(other._values.size());
         for (const auto& p : other._values) {
             const auto copy = copyValue(p.first, p.second);
@@ -512,7 +553,9 @@ public:
             guard.reset();
         }
     }
+
     ArraySet(ArraySet&&) = default;
+
     ~ArraySet() {
         for (const auto& p : _values) {
             releaseValue(p.first, p.second);
@@ -534,6 +577,10 @@ public:
         _values.reserve(s);
     }
 
+    const CollatorInterface* getCollator() {
+        return _values.key_eq().getCollator();
+    }
+
 private:
     ValueSetType _values;
 };
@@ -546,10 +593,8 @@ private:
  */
 class PcreRegex {
 public:
-    PcreRegex() = default;
-
     PcreRegex(std::string_view pattern, std::string_view options)
-        : _pattern(pattern), _options(options), _pcrePtr(nullptr) {
+        : _pattern(pattern), _options(options) {
         _compile();
     }
 
@@ -559,25 +604,16 @@ public:
 
     PcreRegex& operator=(const PcreRegex& other) {
         if (this != &other) {
-            if (_pcrePtr != nullptr) {
-                (*pcre_free)(_pcrePtr);
-            }
+            (*pcre_free)(_pcrePtr);
             _pattern = other._pattern;
             _options = other._options;
-            _isValid = false;
             _compile();
         }
         return *this;
     }
 
     ~PcreRegex() {
-        if (_pcrePtr != nullptr) {
-            (*pcre_free)(_pcrePtr);
-        }
-    }
-
-    bool isValid() const {
-        return _isValid;
+        (*pcre_free)(_pcrePtr);
     }
 
     const std::string& pattern() const {
@@ -610,7 +646,6 @@ private:
     std::string _options;
 
     pcre* _pcrePtr;
-    bool _isValid = false;
 };
 
 constexpr size_t kSmallStringMaxLength = 7;
@@ -784,8 +819,8 @@ inline std::pair<TypeTags, Value> makeNewArray() {
     return {TypeTags::Array, reinterpret_cast<Value>(a)};
 }
 
-inline std::pair<TypeTags, Value> makeNewArraySet() {
-    auto a = new ArraySet;
+inline std::pair<TypeTags, Value> makeNewArraySet(const CollatorInterface* collator = nullptr) {
+    auto a = new ArraySet(collator);
     return {TypeTags::ArraySet, reinterpret_cast<Value>(a)};
 }
 
@@ -867,6 +902,57 @@ inline ShardFilterer* getShardFiltererView(Value val) noexcept {
     return reinterpret_cast<ShardFilterer*>(val);
 }
 
+inline CollatorInterface* getCollatorView(Value val) noexcept {
+    return reinterpret_cast<CollatorInterface*>(val);
+}
+
+/**
+ * Pattern and flags of Regex are stored in BSON as two C strings written one after another.
+ *
+ *   <pattern> <NULL> <flags> <NULL>
+ */
+struct BsonRegex {
+    BsonRegex(const char* rawValue) {
+        pattern = rawValue;
+        // We add 1 to account NULL byte after pattern.
+        flags = pattern.data() + pattern.size() + 1;
+    }
+
+    BsonRegex(std::string_view pattern, std::string_view flags) : pattern(pattern), flags(flags) {
+        // Ensure that flags follow right after pattern in memory. Otherwise 'dataView()' may return
+        // invalid 'std::string_view' object.
+        invariant(pattern.data() + pattern.size() + 1 == flags.data());
+    }
+
+    size_t byteSize() const {
+        // We add 2 to account NULL bytes after each string.
+        return pattern.size() + flags.size() + 2;
+    }
+
+    const char* data() const {
+        return pattern.data();
+    }
+
+    std::string_view dataView() const {
+        return {data(), byteSize()};
+    }
+
+    std::string_view pattern;
+    std::string_view flags;
+};
+
+inline BsonRegex getBsonRegexView(Value val) noexcept {
+    return BsonRegex(getRawPointerView(val));
+}
+
+std::pair<TypeTags, Value> makeCopyBsonRegex(const BsonRegex& regex);
+
+inline std::string_view getBsonJavascriptView(Value val) noexcept {
+    return getStringView(TypeTags::StringBig, val);
+}
+
+std::pair<TypeTags, Value> makeCopyBsonJavascript(std::string_view code);
+
 std::pair<TypeTags, Value> makeCopyKeyString(const KeyString::Value& inKey);
 
 std::pair<TypeTags, Value> makeCopyJsFunction(const JsFunction&);
@@ -925,6 +1011,10 @@ inline std::pair<TypeTags, Value> copyValue(TypeTags tag, Value val) {
             return makeCopyJsFunction(*getJsFunctionView(val));
         case TypeTags::shardFilterer:
             return makeCopyShardFilterer(*getShardFiltererView(val));
+        case TypeTags::bsonRegex:
+            return makeCopyBsonRegex(getBsonRegexView(val));
+        case TypeTags::bsonJavascript:
+            return makeCopyBsonJavascript(getBsonJavascriptView(val));
         default:
             break;
     }
@@ -1134,7 +1224,9 @@ private:
  * Copies the content of the input array into an ArraySet. If the input has duplicate elements, they
  * will be removed.
  */
-std::pair<TypeTags, Value> arrayToSet(TypeTags tag, Value val);
+std::pair<TypeTags, Value> arrayToSet(TypeTags tag,
+                                      Value val,
+                                      CollatorInterface* collator = nullptr);
 
 }  // namespace value
 }  // namespace sbe

@@ -158,6 +158,26 @@ protected:
                                           false,
                                           false,
                                           planNodeId),
+            sbe::makeS<sbe::MakeObjStage>(sbe::makeS<sbe::CoScanStage>(planNodeId),
+                                          sbe::value::SlotId{1},
+                                          boost::none,
+                                          boost::none,
+                                          std::vector<std::string>{},
+                                          std::vector<std::string>{"projected", "fields"},
+                                          sbe::makeSV(3, 4),
+                                          false,
+                                          false,
+                                          planNodeId),
+            sbe::makeS<sbe::MakeBsonObjStage>(sbe::makeS<sbe::CoScanStage>(planNodeId),
+                                              sbe::value::SlotId{1},
+                                              boost::none,
+                                              boost::none,
+                                              std::vector<std::string>{},
+                                              std::vector<std::string>{"projected", "fields"},
+                                              sbe::makeSV(3, 4),
+                                              false,
+                                              false,
+                                              planNodeId),
             sbe::makeS<sbe::MakeBsonObjStage>(sbe::makeS<sbe::CoScanStage>(planNodeId),
                                               sbe::value::SlotId{1},
                                               sbe::value::SlotId{2},
@@ -231,9 +251,9 @@ TEST_F(SBEParserTest, TestIdenticalDebugOutputAfterParse) {
     sbe::Parser parser;
 
     for (const auto& stage : stages) {
-        const auto stageText = printer.print(stage.get());
+        const auto stageText = printer.print(*stage);
         const auto parsedStage = parser.parse(nullptr, "testDb", stageText);
-        const auto stageTextAfterParse = printer.print(parsedStage.get());
+        const auto stageTextAfterParse = printer.print(*parsedStage);
         ASSERT_EQ(stageText, stageTextAfterParse);
     }
 }
@@ -243,7 +263,7 @@ TEST_F(SBEParserTest, TestPlanNodeIdIsParsed) {
     sbe::Parser parser;
 
     for (const auto& stage : stages) {
-        const auto stageText = printer.print(stage.get());
+        const auto stageText = printer.print(*stage);
         const auto parsedStage = parser.parse(nullptr, "testDb", stageText);
         ASSERT_EQ(parsedStage->getCommonStats()->nodeId, planNodeId);
     }

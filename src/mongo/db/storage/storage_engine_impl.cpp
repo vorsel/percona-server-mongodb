@@ -33,6 +33,7 @@
 
 #include <algorithm>
 
+#include "mongo/db/audit.h"
 #include "mongo/db/catalog/catalog_control.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_catalog_helper.h"
@@ -43,6 +44,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/durable_catalog_feature_tracker.h"
+#include "mongo/db/storage/durable_history_pin.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/kv/temporary_kv_record_store.h"
 #include "mongo/db/storage/storage_repair_observer.h"
@@ -604,21 +606,15 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
                     "namespace"_attr = coll);
             }
 
-            const bool foundIdent = engineIdents.find(indexIdent) != engineIdents.end();
-            // An index drop will immediately remove the ident, but the `indexMetaData` catalog
-            // entry still exists implying the drop hasn't necessarily been replicated to a
-            // majority of nodes. The code will rebuild the index, despite potentially
-            // encountering another `dropIndex` command.
-            if (indexMetaData.ready && !foundIdent) {
-                LOGV2(22252,
-                      "Expected index data is missing, rebuilding. Collection: {namespace} Index: "
-                      "{index}",
-                      "Expected index data is missing, rebuilding",
-                      "index"_attr = indexName,
-                      "namespace"_attr = coll);
-                reconcileResult.indexesToRebuild.push_back({entry.catalogId, coll, indexName});
-                continue;
-            }
+            // Two-phase index drop ensures that the underlying data table for an index in the
+            // catalog is not dropped until the index removal from the catalog has been majority
+            // committed and become part of the latest checkpoint. Therefore, there should never be
+            // a case where the index catalog entry remains but the index table (identified by
+            // ident) has been removed.
+            invariant(engineIdents.find(indexIdent) != engineIdents.end(),
+                      str::stream() << "Failed to find an index data table matching " << indexIdent
+                                    << " for durable index catalog entry " << indexMetaData.spec
+                                    << " in collection " << coll);
 
             // Any index build with a UUID is an unfinished two-phase build and must be restarted.
             // There are no special cases to handle on primaries or secondaries. An index build may
@@ -653,10 +649,9 @@ StatusWith<StorageEngine::ReconcileResult> StorageEngineImpl::reconcileCatalogAn
             }
 
             // If the index was kicked off as a background secondary index build, replication
-            // recovery will not run into the oplog entry to recreate the index. If the index
-            // table is not found, or the index build did not successfully complete, this code
-            // will return the index to be rebuilt.
-            if (indexMetaData.isBackgroundSecondaryBuild && (!foundIdent || !indexMetaData.ready)) {
+            // recovery will not run into the oplog entry to recreate the index. If the index build
+            // did not successfully complete, this code will return the index to be rebuilt.
+            if (indexMetaData.isBackgroundSecondaryBuild && !indexMetaData.ready) {
                 LOGV2(22255,
                       "Expected background index build did not complete, rebuilding in foreground "
                       "- see SERVER-43097",
@@ -826,6 +821,9 @@ Status StorageEngineImpl::_dropCollectionsNoTimestamp(OperationContext* opCtx,
             coll->getIndexCatalog()->getIndexIterator(opCtx, true /* includeUnfinishedIndexes */);
         while (ii->more()) {
             const IndexCatalogEntry* ice = ii->next();
+
+            audit::logDropIndex(&cc(), ice->descriptor()->indexName(), nss.ns());
+
             catalog::removeIndex(opCtx,
                                  ice->descriptor()->indexName(),
                                  coll->getCatalogId(),
@@ -833,6 +831,8 @@ Status StorageEngineImpl::_dropCollectionsNoTimestamp(OperationContext* opCtx,
                                  coll->ns(),
                                  ice->getSharedIdent());
         }
+
+        audit::logDropCollection(&cc(), nss.ns());
 
         Status result = catalog::dropCollection(
             opCtx, coll->ns(), coll->getCatalogId(), coll->getSharedIdent());
@@ -1025,6 +1025,7 @@ StatusWith<Timestamp> StorageEngineImpl::recoverToStableTimestamp(OperationConte
     }
 
     catalog::openCatalog(opCtx, state, swTimestamp.getValue());
+    DurableHistoryRegistry::get(opCtx)->reconcilePins(opCtx);
 
     LOGV2(22259,
           "recoverToStableTimestamp successful",
@@ -1038,6 +1039,10 @@ boost::optional<Timestamp> StorageEngineImpl::getRecoveryTimestamp() const {
 
 boost::optional<Timestamp> StorageEngineImpl::getLastStableRecoveryTimestamp() const {
     return _engine->getLastStableRecoveryTimestamp();
+}
+
+bool StorageEngineImpl::supportsClusteredIdIndex() const {
+    return _engine->supportsClusteredIdIndex();
 }
 
 bool StorageEngineImpl::supportsReadConcernSnapshot() const {
@@ -1276,8 +1281,12 @@ int64_t StorageEngineImpl::sizeOnDiskForDb(OperationContext* opCtx, StringData d
 }
 
 StatusWith<Timestamp> StorageEngineImpl::pinOldestTimestamp(
-    const std::string& requestingServiceName, Timestamp requestedTimestamp, bool roundUpIfTooOld) {
-    return _engine->pinOldestTimestamp(requestingServiceName, requestedTimestamp, roundUpIfTooOld);
+    OperationContext* opCtx,
+    const std::string& requestingServiceName,
+    Timestamp requestedTimestamp,
+    bool roundUpIfTooOld) {
+    return _engine->pinOldestTimestamp(
+        opCtx, requestingServiceName, requestedTimestamp, roundUpIfTooOld);
 }
 
 void StorageEngineImpl::unpinOldestTimestamp(const std::string& requestingServiceName) {

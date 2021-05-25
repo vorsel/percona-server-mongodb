@@ -288,10 +288,18 @@ public:
                            boost::optional<ValidationLevelEnum> newLevel,
                            boost::optional<ValidationActionEnum> newAction) final;
 
+    /**
+     * Returns non-OK status if the collection validator does not comply with stable API
+     * requirements.
+     */
+    Status checkValidatorAPIVersionCompatability(OperationContext* opCtx) const final;
+
     bool getRecordPreImages() const final;
     void setRecordPreImages(OperationContext* opCtx, bool val) final;
 
     bool isTemporary(OperationContext* opCtx) const final;
+
+    bool isClustered() const final;
 
     //
     // Stats
@@ -462,6 +470,9 @@ private:
     Validator _validator;
     boost::optional<ValidationActionEnum> _validationAction;
     boost::optional<ValidationLevelEnum> _validationLevel;
+
+    // Whether or not this collection is clustered on _id values.
+    bool _clustered = false;
 
     bool _recordPreImages = false;
 

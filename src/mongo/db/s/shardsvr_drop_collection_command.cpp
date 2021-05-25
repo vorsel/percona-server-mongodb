@@ -32,10 +32,11 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/s/drop_collection_coordinator.h"
+#include "mongo/db/s/drop_collection_legacy.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
@@ -45,21 +46,15 @@
 namespace mongo {
 namespace {
 
-void dropCollectionLegacy(OperationContext* opCtx, const NamespaceString& nss) {
-    auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-    const auto cmdResponse = configShard->runCommandWithFixedRetryAttempts(
-        opCtx,
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        "admin",
-        CommandHelpers::appendMajorityWriteConcern(
-            BSON("_configsvrDropCollection" << nss.toString()), opCtx->getWriteConcern()),
-        Shard::RetryPolicy::kIdempotent);
-
-    uassertStatusOK(Shard::CommandResponse::getEffectiveStatus(cmdResponse));
-}
-
 class ShardsvrDropCollectionCommand final : public TypedCommand<ShardsvrDropCollectionCommand> {
 public:
+    using Request = ShardsvrDropCollection;
+
+    std::string help() const override {
+        return "Internal command, which is exported by the primary sharding server. Do not call "
+               "directly. Drops a collection.";
+    }
+
     bool acceptsAnyApiVersionParameters() const override {
         return true;
     }
@@ -67,13 +62,6 @@ public:
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
         return Command::AllowedOnSecondary::kNever;
     }
-
-    std::string help() const override {
-        return "Internal command, which is exported by the primary sharding server. Do not call "
-               "directly. Drops a collection.";
-    }
-
-    using Request = ShardsvrDropCollection;
 
     class Invocation final : public InvocationBase {
     public:
@@ -88,10 +76,20 @@ public:
                                   << opCtx->getWriteConcern().wMode,
                     opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
-            if (!feature_flags::gShardingFullDDLSupport.isEnabled(
-                    serverGlobalParams.featureCompatibility) ||
-                feature_flags::gDisableIncompleteShardingDDLSupport.isEnabled(
-                    serverGlobalParams.featureCompatibility)) {
+            DistLockManager::ScopedDistLock dbDistLock(
+                uassertStatusOK(DistLockManager::get(opCtx)->lock(
+                    opCtx,
+                    DistLockManager::kShardingRoutingInfoFormatStabilityLockName,
+                    "dropCollection",
+                    DistLockManager::kDefaultLockTimeout)));
+            bool useNewPath = [&] {
+                return feature_flags::gShardingFullDDLSupport.isEnabled(
+                           serverGlobalParams.featureCompatibility) &&
+                    !feature_flags::gDisableIncompleteShardingDDLSupport.isEnabled(
+                        serverGlobalParams.featureCompatibility);
+            }();
+
+            if (!useNewPath) {
                 LOGV2_DEBUG(5280951,
                             1,
                             "Running legacy drop collection procedure",

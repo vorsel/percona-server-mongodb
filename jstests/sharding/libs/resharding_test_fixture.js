@@ -62,6 +62,10 @@ var ReshardingTest = class {
         /** @private */
         this._pauseCoordinatorInSteadyStateFailpoint = undefined;
         /** @private */
+        this._pauseCoordinatorBeforeDecisionPersistedFailpoint = undefined;
+        /** @private */
+        this._pauseCoordinatorBeforeCompletionFailpoint = undefined;
+        /** @private */
         this._reshardingThread = undefined;
         /** @private */
         this._isReshardingActive = false;
@@ -73,11 +77,6 @@ var ReshardingTest = class {
             config: 1,
             shards: this._numShards,
             rs: {nodes: 2},
-            rsOptions: {
-                setParameter: {
-                    "failpoint.WTPreserveSnapshotHistoryIndefinitely": tojson({mode: "alwaysOn"}),
-                }
-            },
             manualAddShard: true,
         });
 
@@ -182,8 +181,13 @@ var ReshardingTest = class {
 
         this._newShardKey = Object.assign({}, newShardKeyPattern);
 
-        this._pauseCoordinatorInSteadyStateFailpoint = configureFailPoint(
-            this._st.configRS.getPrimary(), "reshardingPauseCoordinatorInSteadyState");
+        const configPrimary = this._st.configRS.getPrimary();
+        this._pauseCoordinatorInSteadyStateFailpoint =
+            configureFailPoint(configPrimary, "reshardingPauseCoordinatorInSteadyState");
+        this._pauseCoordinatorBeforeDecisionPersistedFailpoint =
+            configureFailPoint(configPrimary, "reshardingPauseCoordinatorBeforeDecisionPersisted");
+        this._pauseCoordinatorBeforeCompletionFailpoint =
+            configureFailPoint(configPrimary, "reshardingPauseCoordinatorBeforeCompletion");
 
         const commandDoneSignal = new CountDownLatch(1);
 
@@ -236,7 +240,11 @@ var ReshardingTest = class {
      */
     withReshardingInBackground({newShardKeyPattern, newChunks},
                                duringReshardingFn = (tempNs) => {},
-                               expectedErrorCode = ErrorCodes.OK) {
+                               {
+                                   expectedErrorCode = ErrorCodes.OK,
+                                   postCheckConsistencyFn = (tempNs) => {},
+                                   postAbortDecisionPersistedFn = () => {}
+                               } = {}) {
         const commandDoneSignal = this._startReshardingInBackgroundAndAllowCommandFailure(
             {newShardKeyPattern, newChunks}, expectedErrorCode);
 
@@ -247,7 +255,9 @@ var ReshardingTest = class {
         }, "failed to find reshardCollection in $currentOp output");
 
         this._callFunctionSafely(() => duringReshardingFn(this._tempNs));
-        this._checkConsistencyAndPostState(expectedErrorCode);
+        this._checkConsistencyAndPostState(expectedErrorCode,
+                                           () => postCheckConsistencyFn(this._tempNs),
+                                           () => postAbortDecisionPersistedFn());
     }
 
     /** @private */
@@ -276,14 +286,19 @@ var ReshardingTest = class {
         try {
             fn();
         } catch (duringReshardingError) {
-            try {
-                this._pauseCoordinatorInSteadyStateFailpoint.off();
-            } catch (disableFailpointError) {
-                print(`Ignoring error from disabling the resharding coordinator failpoint: ${
-                    tojson(disableFailpointError)}`);
+            for (const fp of [this._pauseCoordinatorInSteadyStateFailpoint,
+                              this._pauseCoordinatorBeforeDecisionPersistedFailpoint,
+                              this._pauseCoordinatorBeforeCompletionFailpoint]) {
+                try {
+                    fp.off();
+                } catch (disableFailpointError) {
+                    print(`Ignoring error from disabling the resharding coordinator failpoint: ${
+                        tojson(disableFailpointError)}`);
 
-                print("The config server primary and the mongo shell along with it are expected" +
-                      " to hang due to the resharding coordinator being left uninterrupted");
+                    print(
+                        "The config server primary and the mongo shell along with it are expected" +
+                        " to hang due to the resharding coordinator being left uninterrupted");
+                }
             }
 
             try {
@@ -294,6 +309,8 @@ var ReshardingTest = class {
                 } catch (joinError) {
                     print(`Ignoring error from the resharding thread: ${tojson(joinError)}`);
                 }
+
+                this._isReshardingActive = false;
             } catch (killOpError) {
                 print(`Ignoring error from sending killOp to the reshardCollection command: ${
                     tojson(killOpError)}`);
@@ -313,7 +330,9 @@ var ReshardingTest = class {
     }
 
     /** @private */
-    _checkConsistencyAndPostState(expectedErrorCode) {
+    _checkConsistencyAndPostState(expectedErrorCode,
+                                  postCheckConsistencyFn = () => {},
+                                  postAbortDecisionPersistedFn = () => {}) {
         if (expectedErrorCode === ErrorCodes.OK) {
             this._callFunctionSafely(() => {
                 // We use the reshardingPauseCoordinatorInSteadyState failpoint so that any
@@ -323,20 +342,23 @@ var ReshardingTest = class {
                 // wait for all of the recipient shards to have applied through all of the oplog
                 // entries from all of the donor shards.
                 this._pauseCoordinatorInSteadyStateFailpoint.wait();
-                const pauseCoordinatorBeforeDecisionPersistedFailpoint =
-                    configureFailPoint(this._pauseCoordinatorInSteadyStateFailpoint.conn,
-                                       "reshardingPauseCoordinatorBeforeDecisionPersisted");
-
                 this._pauseCoordinatorInSteadyStateFailpoint.off();
-                pauseCoordinatorBeforeDecisionPersistedFailpoint.wait();
+                this._pauseCoordinatorBeforeDecisionPersistedFailpoint.wait();
 
+                assert.commandWorked(this._st.s.adminCommand({flushRouterConfig: this._ns}));
                 this._checkConsistency();
+                this._checkDocumentOwnership();
+                postCheckConsistencyFn();
 
-                pauseCoordinatorBeforeDecisionPersistedFailpoint.off();
+                this._pauseCoordinatorBeforeDecisionPersistedFailpoint.off();
+                this._pauseCoordinatorBeforeCompletionFailpoint.off();
             });
         } else {
             this._callFunctionSafely(() => {
                 this._pauseCoordinatorInSteadyStateFailpoint.off();
+                this._pauseCoordinatorBeforeDecisionPersistedFailpoint.off();
+                postAbortDecisionPersistedFn();
+                this._pauseCoordinatorBeforeCompletionFailpoint.off();
             });
         }
 
@@ -364,11 +386,48 @@ var ReshardingTest = class {
             };
         })(DataConsistencyChecker.getDiff(nsCursor, tempNsCursor));
 
-        assert.eq(diff, {
-            docsWithDifferentContents: [],
-            docsExtraAfterResharding: [],
-            docsMissingAfterResharding: [],
-        });
+        assert.eq(diff,
+                  {
+                      docsWithDifferentContents: [],
+                      docsExtraAfterResharding: [],
+                      docsMissingAfterResharding: [],
+                  },
+                  "existing sharded collection and temporary resharding collection had different" +
+                      " contents");
+    }
+
+    /** @private */
+    _checkDocumentOwnership() {
+        // The "available" read concern level won't perform any ownership filtering. Any documents
+        // which were copied by a recipient shard that are actually owned by a different recipient
+        // shard would appear as extra documents.
+        const tempColl = this._st.s.getCollection(this._tempNs);
+        const localReadCursor = tempColl.find().sort({_id: 1});
+        // tempColl.find().readConcern("available") would be an error when the mongo shell is
+        // started with --readMode=legacy. We call runCommand() directly to avoid needing to tag
+        // every test which uses ReshardingTest with "requires_find_command".
+        const availableReadCursor =
+            new DBCommandCursor(tempColl.getDB(), assert.commandWorked(tempColl.runCommand("find", {
+                sort: {_id: 1},
+                readConcern: {level: "available"},
+            })));
+
+        const diff = ((diff) => {
+            return {
+                docsWithDifferentContents: diff.docsWithDifferentContents.map(
+                    ({first, second}) => ({local: first, available: second})),
+                docsFoundUnownedWithReadAvailable: diff.docsMissingOnFirst,
+                docsNotFoundWithReadAvailable: diff.docsMissingOnSecond,
+            };
+        })(DataConsistencyChecker.getDiff(localReadCursor, availableReadCursor));
+
+        assert.eq(diff,
+                  {
+                      docsWithDifferentContents: [],
+                      docsFoundUnownedWithReadAvailable: [],
+                      docsNotFoundWithReadAvailable: [],
+                  },
+                  "temporary resharding collection had unowned documents");
     }
 
     /** @private */
@@ -447,6 +506,42 @@ var ReshardingTest = class {
                 null,
                 collInfo,
                 `collection exists on ${recipient.shardName} despite resharding having failed`);
+        }
+
+        assert.eq(
+            [],
+            recipient.getCollection(`config.localReshardingOperations.recipient.progress_applier`)
+                .find()
+                .toArray(),
+            `config.localReshardingOperations.recipient.progress_applier wasn't cleaned up on ${
+                recipient.shardName}`);
+
+        assert.eq(
+            [],
+            recipient
+                .getCollection(`config.localReshardingOperations.recipient.progress_txn_cloner`)
+                .find()
+                .toArray(),
+            `config.localReshardingOperations.recipient.progress_txn_cloner wasn't cleaned up on ${
+                recipient.shardName}`);
+
+        const sourceCollectionUUIDString = extractUUIDFromObject(this._sourceCollectionUUID);
+        for (const donor of this._donorShards()) {
+            assert.eq(null,
+                      recipient
+                          .getCollection(`config.localReshardingOplogBuffer.${
+                              sourceCollectionUUIDString}.${donor.shardName}`)
+                          .exists(),
+                      `expected config.localReshardingOplogBuffer.${sourceCollectionUUIDString}.${
+                          donor.shardName} not to exist on ${recipient.shardName}, but it did.`);
+
+            assert.eq(null,
+                      recipient
+                          .getCollection(`config.localReshardingConflictStash.${
+                              sourceCollectionUUIDString}.${donor.shardName}`)
+                          .exists(),
+                      `expected config.localReshardingConflictStash.${sourceCollectionUUIDString}.${
+                          donor.shardName} not to exist on ${recipient.shardName}, but it did.`);
         }
 
         const localRecipientOpsNs = "config.localReshardingOperations.recipient";

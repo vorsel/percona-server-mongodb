@@ -59,6 +59,10 @@ const int kProgressMeterCheckInterval = 128;
 // listIndexes and recorded the results and the operationTime.
 MONGO_FAIL_POINT_DEFINE(tenantCollectionClonerHangAfterGettingOperationTime);
 
+// Failpoint which causes the tenant collection cloner to hang after createCollection. This
+// failpoint doesn't check for cloner exit so we can rely on its timesEntered in tests.
+MONGO_FAIL_POINT_DEFINE(tenantCollectionClonerHangAfterCreateCollection);
+
 // Failpoint which causes tenant migration to hang after handling the next batch of results from the
 // DBClientConnection, optionally limited to a specific collection.
 MONGO_FAIL_POINT_DEFINE(tenantMigrationHangCollectionClonerAfterHandlingBatchResponse);
@@ -128,6 +132,7 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::TenantCollectionClonerSta
     try {
         return ClonerStage<TenantCollectionCloner>::run();
     } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+        // We can exit this cloner cleanly and move on to the next one.
         LOGV2(5289701,
               "TenantCollectionCloner stopped because collection was dropped on the donor.",
               "namespace"_attr = getCloner()->getSourceNss(),
@@ -331,6 +336,7 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::createCollectionStage() {
         uassertStatusOKWithContext(status, "Tenant collection cloner: create indexes");
     }
 
+    tenantCollectionClonerHangAfterCreateCollection.pauseWhileSet();
     return kContinueNormally;
 }
 
@@ -344,13 +350,21 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::queryStage() {
     auto replyMetadataReader =
         [this](OperationContext* opCtx, const BSONObj& metadataObj, StringData source) -> Status {
         auto readResult = rpc::ReplSetMetadata::readFromMetadata(metadataObj);
-        if (!readResult.isOK()) {
-            return readResult.getStatus().withContext(
-                "tenant collection cloner failed to read repl set metadata");
+        if (readResult.isOK()) {
+            stdx::lock_guard<TenantMigrationSharedData> lk(*getSharedData());
+            getSharedData()->setLastVisibleOpTime(lk, readResult.getValue().getLastOpVisible());
+            return Status::OK();
         }
-        stdx::lock_guard<TenantMigrationSharedData> lk(*getSharedData());
-        getSharedData()->setLastVisibleOpTime(lk, readResult.getValue().getLastOpVisible());
-        return Status::OK();
+        if (readResult.getStatus() == ErrorCodes::NoSuchKey) {
+            // Some responses may not carry this information (e.g. reconnecting to verify a drop).
+            LOGV2_DEBUG(5328200,
+                        1,
+                        "No repl metadata found in response",
+                        "data"_attr = redact(metadataObj));
+            return Status::OK();
+        }
+        return readResult.getStatus().withContext(
+            "tenant collection cloner failed to read repl set metadata");
     };
     ScopedMetadataWriterAndReader mwr(getClient(), requestMetadataWriter, replyMetadataReader);
 
@@ -366,6 +380,8 @@ void TenantCollectionCloner::runQuery() {
         : QUERY("$expr" << BSON("$gt" << BSON_ARRAY("$_id" << _lastDocId["_id"])));
     query.hint(BSON("_id" << 1));
 
+    // Any errors that are thrown here (including NamespaceNotFound) will be handled on the stage
+    // level.
     getClient()->query([this](DBClientCursorBatchIterator& iter) { handleNextBatch(iter); },
                        _sourceDbAndUuid,
                        query,
@@ -374,7 +390,6 @@ void TenantCollectionCloner::runQuery() {
                            (collectionClonerUsesExhaust ? QueryOption_Exhaust : 0),
                        _collectionClonerBatchSize,
                        ReadConcernArgs(ReadConcernLevel::kMajorityReadConcern).toBSONInner());
-    _dbWorkTaskRunner.join();
 }
 
 void TenantCollectionCloner::handleNextBatch(DBClientCursorBatchIterator& iter) {
@@ -490,10 +505,10 @@ BSONObj TenantCollectionCloner::Stats::toBSON() const {
 }
 
 void TenantCollectionCloner::Stats::append(BSONObjBuilder* builder) const {
-    builder->appendNumber(kDocumentsToCopyFieldName, documentToCopy);
-    builder->appendNumber(kDocumentsCopiedFieldName, documentsCopied);
-    builder->appendNumber("indexes", indexes);
-    builder->appendNumber("insertedBatches", insertedBatches);
+    builder->appendNumber(kDocumentsToCopyFieldName, static_cast<long long>(documentToCopy));
+    builder->appendNumber(kDocumentsCopiedFieldName, static_cast<long long>(documentsCopied));
+    builder->appendNumber("indexes", static_cast<long long>(indexes));
+    builder->appendNumber("insertedBatches", static_cast<long long>(insertedBatches));
     if (start != Date_t()) {
         builder->appendDate("start", start);
         if (end != Date_t()) {
@@ -503,7 +518,7 @@ void TenantCollectionCloner::Stats::append(BSONObjBuilder* builder) const {
             builder->appendNumber("elapsedMillis", elapsedMillis);
         }
     }
-    builder->appendNumber("receivedBatches", receivedBatches);
+    builder->appendNumber("receivedBatches", static_cast<long long>(receivedBatches));
 }
 
 Timestamp TenantCollectionCloner::getOperationTime_forTest() {

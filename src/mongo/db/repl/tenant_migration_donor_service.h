@@ -30,10 +30,12 @@
 #pragma once
 
 #include "mongo/base/string_data.h"
+#include "mongo/client/fetcher.h"
 #include "mongo/client/remote_command_targeter_rs.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
-#include "mongo/db/repl/tenant_migration_donor_util.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
+#include "mongo/executor/thread_pool_task_executor.h"
 #include "mongo/util/cancelation.h"
 #include "mongo/util/string_map.h"
 
@@ -43,10 +45,8 @@ class TenantMigrationDonorService final : public repl::PrimaryOnlyService {
 public:
     static constexpr StringData kServiceName = "TenantMigrationDonorService"_sd;
 
-    explicit TenantMigrationDonorService(ServiceContext* serviceContext)
-        : PrimaryOnlyService(serviceContext) {
-        _serviceContext = serviceContext;
-    }
+    explicit TenantMigrationDonorService(ServiceContext* const serviceContext)
+        : PrimaryOnlyService(serviceContext), _serviceContext(serviceContext) {}
     ~TenantMigrationDonorService() = default;
 
     StringData getServiceName() const override {
@@ -76,7 +76,7 @@ public:
             boost::optional<Status> abortReason;
         };
 
-        explicit Instance(ServiceContext* serviceContext, const BSONObj& initialState);
+        explicit Instance(ServiceContext* const serviceContext, const BSONObj& initialState);
 
         ~Instance();
 
@@ -95,9 +95,9 @@ public:
         /**
          * To be called on the instance returned by PrimaryOnlyService::getOrCreate. Returns an
          * error if the options this Instance was created with are incompatible with a request for
-         * an instance with the options given in 'options'.
+         * an instance with the options given in 'stateDoc'.
          */
-        Status checkIfOptionsConflict(BSONObj options);
+        Status checkIfOptionsConflict(const TenantMigrationDonorDocument& stateDoc);
 
         /**
          * Returns the latest durable migration state.
@@ -149,11 +149,28 @@ public:
         const NamespaceString _stateDocumentsNS = NamespaceString::kTenantMigrationDonorsNamespace;
 
         /**
+         * Makes a task executor for executing commands against the recipient. If the server
+         * parameter 'tenantMigrationDisableX509Auth' is false, configures the executor to use the
+         * migration certificate to establish an SSL connection to the recipient.
+         */
+        std::shared_ptr<executor::ThreadPoolTaskExecutor> _makeRecipientCmdExecutor();
+
+        /**
+         * Fetches all key documents from the recipient's admin.system.keys collection, stores
+         * them in admin.system.external_validation_keys, and refreshes the keys cache.
+         */
+        ExecutorFuture<void> _fetchAndStoreRecipientClusterTimeKeyDocs(
+            std::shared_ptr<executor::ScopedTaskExecutor> executor,
+            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
+            const CancelationToken& serviceToken,
+            const CancelationToken& instanceToken);
+
+        /**
          * Inserts the state document to _stateDocumentsNS and returns the opTime for the insert
          * oplog entry.
          */
-        ExecutorFuture<repl::OpTime> _insertStateDocument(
-            std::shared_ptr<executor::ScopedTaskExecutor> executor);
+        ExecutorFuture<repl::OpTime> _insertStateDoc(
+            std::shared_ptr<executor::ScopedTaskExecutor> executor, const CancelationToken& token);
 
         /**
          * Updates the state document to have the given state. Then, persists the updated document
@@ -161,16 +178,17 @@ public:
          * commitOrAbortTimestamp depending on the state. Returns the opTime for the update oplog
          * entry.
          */
-        ExecutorFuture<repl::OpTime> _updateStateDocument(
+        ExecutorFuture<repl::OpTime> _updateStateDoc(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
-            const TenantMigrationDonorStateEnum nextState);
+            const TenantMigrationDonorStateEnum nextState,
+            const CancelationToken& token);
 
         /**
          * Sets the "expireAt" time for the state document to be garbage collected, and returns the
          * the opTime for the write.
          */
-        ExecutorFuture<repl::OpTime> _markStateDocumentAsGarbageCollectable(
-            std::shared_ptr<executor::ScopedTaskExecutor> executor);
+        ExecutorFuture<repl::OpTime> _markStateDocAsGarbageCollectable(
+            std::shared_ptr<executor::ScopedTaskExecutor> executor, const CancelationToken& token);
 
         /**
          * Waits for given opTime to be majority committed.
@@ -184,37 +202,45 @@ public:
         ExecutorFuture<void> _sendCommandToRecipient(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
             std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
-            const BSONObj& cmdObj);
+            const BSONObj& cmdObj,
+            const CancelationToken& token);
 
         /**
          * Sends the recipientSyncData command to the recipient replica set.
          */
         ExecutorFuture<void> _sendRecipientSyncDataCommand(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
-            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS);
+            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
+            const CancelationToken& token);
 
         /**
          * Sends the recipientForgetMigration command to the recipient replica set.
          */
         ExecutorFuture<void> _sendRecipientForgetMigrationCommand(
             std::shared_ptr<executor::ScopedTaskExecutor> executor,
-            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS);
+            std::shared_ptr<RemoteCommandTargeter> recipientTargeterRS,
+            const CancelationToken& token);
+
+        ThreadPool::Limits _getRecipientCmdThreadPoolLimits() const {
+            ThreadPool::Limits recipientCmdThreadPoolLimits;
+            recipientCmdThreadPoolLimits.maxThreads = 1;
+            return recipientCmdThreadPoolLimits;
+        }
 
         ServiceContext* _serviceContext;
 
         TenantMigrationDonorDocument _stateDoc;
         const std::string _instanceName;
         const MongoURI _recipientUri;
+        // TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
+        const transport::ConnectSSLMode _sslMode;
 
-        // Task executor used for executing commands against the recipient using SSL connection
-        // created using the migration-specific certificate.
+        // Task executor used for executing commands against the recipient.
         std::shared_ptr<executor::TaskExecutor> _recipientCmdExecutor;
 
-        ThreadPool::Limits getRecipientCmdThreadPoolLimits() const {
-            ThreadPool::Limits recipientCmdThreadPoolLimits;
-            recipientCmdThreadPoolLimits.maxThreads = 1;
-            return recipientCmdThreadPoolLimits;
-        }
+        // Weak pointer to the Fetcher used for fetching admin.system.keys documents from the
+        // recipient. It is only not null when the instance is actively fetching the documents.
+        std::weak_ptr<Fetcher> _recipientKeysFetcher;
 
         boost::optional<Status> _abortReason;
 
@@ -240,13 +266,13 @@ public:
 
         // This CancelationSource is instantiated from CancelationToken that is passed into run().
         // It allows for manual cancelation of work from the instance.
-        CancelationSource _instanceCancelationSource;
+        CancelationSource _abortMigrationSource;
     };
 
 private:
     ExecutorFuture<void> _rebuildService(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                          const CancelationToken& token) override;
 
-    ServiceContext* _serviceContext;
+    ServiceContext* const _serviceContext;
 };
 }  // namespace mongo

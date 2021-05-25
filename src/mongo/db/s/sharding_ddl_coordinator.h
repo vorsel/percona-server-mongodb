@@ -31,18 +31,20 @@
 
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/s/forwardable_operation_metadata.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/util/future.h"
 
 namespace mongo {
 
-class ShardingDDLCoordinator {
+class ShardingDDLCoordinator_NORESILIENT {
 public:
-    ShardingDDLCoordinator(const NamespaceString& nss);
+    ShardingDDLCoordinator_NORESILIENT(OperationContext* opCtx, const NamespaceString& nss);
     SemiFuture<void> run(OperationContext* opCtx);
 
 protected:
     NamespaceString _nss;
+    ForwardableOperationMetadata _forwardableOpMetadata;
 
 private:
     virtual SemiFuture<void> runImpl(std::shared_ptr<executor::TaskExecutor>) = 0;

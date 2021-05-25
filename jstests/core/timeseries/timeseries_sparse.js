@@ -21,8 +21,7 @@ if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
     return;
 }
 
-const testDB = db.getSiblingDB(jsTestName());
-assert.commandWorked(testDB.dropDatabase());
+const collNamePrefix = 'timeseries_sparse_';
 
 const timeFieldName = 'time';
 let collCount = 0;
@@ -33,8 +32,8 @@ let collCount = 0;
  * time-series collection.
  */
 const runTest = function(docsInsert, docsUpdate) {
-    const coll = testDB.getCollection('t_' + collCount++);
-    const bucketsColl = testDB.getCollection('system.buckets.' + coll.getName());
+    const coll = db.getCollection(collNamePrefix + collCount++);
+    const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
     coll.drop();
 
     jsTestLog('Running test: collection: ' + coll.getFullName() + '; bucket collection: ' +
@@ -42,12 +41,12 @@ const runTest = function(docsInsert, docsUpdate) {
               '; measurements to append: ' + tojson(docsUpdate));
 
     assert.commandWorked(
-        testDB.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
-    assert.contains(bucketsColl.getName(), testDB.getCollectionNames());
+        db.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
+    assert.contains(bucketsColl.getName(), db.getCollectionNames());
 
-    assert.commandWorked(coll.insert(docsInsert),
+    assert.commandWorked(coll.insert(docsInsert, {ordered: false}),
                          'failed to create bucket with initial docs: ' + tojson(docsInsert));
-    assert.commandWorked(coll.insert(docsUpdate),
+    assert.commandWorked(coll.insert(docsUpdate, {ordered: false}),
                          'failed to append docs to bucket : ' + tojson(docsUpdate));
 
     // Check view.

@@ -664,6 +664,7 @@ __wt_conn_btree_apply(WT_SESSION_IMPL *session, const char *uri,
             conn->ckpt_apply = conn->ckpt_skip = 0;
             conn->ckpt_apply_time = conn->ckpt_skip_time = 0;
             time_start = __wt_clock(session);
+            F_SET(conn, WT_CONN_CKPT_GATHER);
         }
         for (dhandle = NULL;;) {
             WT_WITH_HANDLE_LIST_READ_LOCK(
@@ -679,6 +680,7 @@ __wt_conn_btree_apply(WT_SESSION_IMPL *session, const char *uri,
         }
 done:
         if (WT_SESSION_IS_CHECKPOINT(session)) {
+            F_CLR(conn, WT_CONN_CKPT_GATHER);
             time_stop = __wt_clock(session);
             time_diff = WT_CLOCKDIFF_US(time_stop, time_start);
             WT_STAT_CONN_SET(session, txn_checkpoint_handle_applied, conn->ckpt_apply);
@@ -692,6 +694,7 @@ done:
     }
 
 err:
+    F_CLR(conn, WT_CONN_CKPT_GATHER);
     WT_DHANDLE_RELEASE(dhandle);
     return (ret);
 }
@@ -914,37 +917,6 @@ restart:
     WT_TAILQ_SAFE_REMOVE_END
 
     return (ret);
-}
-
-/*
- * __wt_dhandle_update_write_gens --
- *     Update the open dhandles write generation, run write generation and base write generation
- *     number.
- */
-void
-__wt_dhandle_update_write_gens(WT_SESSION_IMPL *session)
-{
-    WT_BTREE *btree;
-    WT_CONNECTION_IMPL *conn;
-    WT_DATA_HANDLE *dhandle;
-
-    conn = S2C(session);
-
-    for (dhandle = NULL;;) {
-        WT_WITH_HANDLE_LIST_WRITE_LOCK(session, WT_DHANDLE_NEXT(session, dhandle, &conn->dhqh, q));
-        if (dhandle == NULL)
-            break;
-        btree = (WT_BTREE *)dhandle->handle;
-
-        WT_ASSERT(session, btree != NULL);
-
-        /*
-         * Initialize the btree write generation numbers after rollback to stable so that the
-         * transaction ids of the pages will be reset when loaded from disk to memory.
-         */
-        btree->write_gen = btree->base_write_gen = btree->run_write_gen =
-          WT_MAX(btree->write_gen, conn->base_write_gen);
-    }
 }
 
 /*

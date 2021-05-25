@@ -37,6 +37,7 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/util/fail_point.h"
@@ -46,6 +47,8 @@ namespace mongo {
 using CollectionAndChangedChunks = CatalogCacheLoader::CollectionAndChangedChunks;
 
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeReadingChunks);
 
 /**
  * Structure repsenting the generated query and sort order for a chunk diffing operation.
@@ -66,9 +69,15 @@ struct QueryAndSort {
  * ensures that changes to chunk version (which will always be higher) will always come *after* our
  * current position in the chunk cursor.
  */
-QueryAndSort createConfigDiffQuery(const NamespaceString& nss, ChunkVersion collectionVersion) {
+QueryAndSort createConfigDiffQueryNs(const NamespaceString& nss, ChunkVersion collectionVersion) {
     return {BSON(ChunkType::ns() << nss.ns() << ChunkType::lastmod() << GTE
                                  << Timestamp(collectionVersion.toLong())),
+            BSON(ChunkType::lastmod() << 1)};
+}
+
+QueryAndSort createConfigDiffQueryUuid(const UUID& uuid, ChunkVersion collectionVersion) {
+    return {BSON(ChunkType::collectionUUID()
+                 << uuid << ChunkType::lastmod() << GTE << Timestamp(collectionVersion.toLong())),
             BSON(ChunkType::lastmod() << 1)};
 }
 
@@ -92,7 +101,32 @@ CollectionAndChangedChunks getChangedChunks(OperationContext* opCtx,
         : ChunkVersion(0, 0, coll.getEpoch(), coll.getTimestamp());
 
     // Diff tracker should *always* find at least one chunk if collection exists
-    const auto diffQuery = createConfigDiffQuery(nss, startingCollectionVersion);
+    const auto diffQuery = [&]() {
+        if (coll.getTimestamp()) {
+            return createConfigDiffQueryUuid(coll.getUuid(), startingCollectionVersion);
+        } else {
+            return createConfigDiffQueryNs(nss, startingCollectionVersion);
+        }
+    }();
+
+    if (MONGO_unlikely(hangBeforeReadingChunks.shouldFail())) {
+        LOGV2(5310504, "Hit hangBeforeReadingChunks failpoint");
+        hangBeforeReadingChunks.pauseWhileSet(opCtx);
+    }
+
+    // TODO SERVER-53283: Remove once 5.0 has branched out.
+    // Use a hint to make sure the query will use an index. This ensures that the query on
+    // config.chunks will only execute if config.chunks is guaranteed to still have the same
+    // metadata format as we inferred from the config.collections entry we read.
+    // This is because when the config.chunks are patched up as part of the FCV upgrade (or
+    // downgrade), first the ns_1_lastmod_1 index (or uuid_1_lastmod_1) is dropped, then the 'ns'
+    // (or 'uuid') fields are unset from config.chunks. If the query is forced to use the expected
+    // index, we can guarantee that the config.chunks we will read will have the expected format. If
+    // it doesn't, it means that it's being patched-up. Then the query will fail and the refresh
+    // will be retried, this time expecting the new metadata format.
+    const auto hint = coll.getTimestamp()
+        ? BSON(ChunkType::collectionUUID() << 1 << ChunkType::lastmod() << 1)
+        : BSON(ChunkType::ns() << 1 << ChunkType::lastmod() << 1);
 
     // Query the chunks which have changed
     repl::OpTime opTime;
@@ -102,7 +136,8 @@ CollectionAndChangedChunks getChangedChunks(OperationContext* opCtx,
                                                      diffQuery.sort,
                                                      boost::none,
                                                      &opTime,
-                                                     repl::ReadConcernLevel::kMajorityReadConcern));
+                                                     repl::ReadConcernLevel::kMajorityReadConcern,
+                                                     hint));
 
     uassert(ErrorCodes::ConflictingOperationInProgress,
             "No chunks were found for the collection",

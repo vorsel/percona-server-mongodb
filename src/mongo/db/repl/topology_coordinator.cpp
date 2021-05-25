@@ -483,13 +483,14 @@ bool TopologyCoordinator::_isEligibleSyncSource(int candidateIndex,
             return false;
         }
         // Candidate must not have a configured delay larger than ours.
-        if (_selfConfig().getSlaveDelay() < memberConfig.getSlaveDelay()) {
+        if (_selfConfig().getSecondaryDelay() < memberConfig.getSecondaryDelay()) {
             LOGV2_DEBUG(3873111,
                         2,
-                        "Cannot select sync source with larger slaveDelay than ours",
+                        "Cannot select sync source with larger secondaryDelaySecs than ours",
                         "syncSourceCandidate"_attr = syncSourceCandidate,
-                        "syncSourceCandidateSlaveDelay"_attr = memberConfig.getSlaveDelay(),
-                        "slaveDelay"_attr = _selfConfig().getSlaveDelay());
+                        "syncSourceCandidateSecondaryDelaySecs"_attr =
+                            memberConfig.getSecondaryDelay(),
+                        "secondaryDelaySecs"_attr = _selfConfig().getSecondaryDelay());
             return false;
         }
     }
@@ -1871,8 +1872,8 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
                 bb.appendDate("electionDate",
                               Date_t::fromDurationSinceEpoch(Seconds(_electionTime.getSecs())));
             }
-            bb.appendIntOrLL("configVersion", _rsConfig.getConfigVersion());
-            bb.appendIntOrLL("configTerm", _rsConfig.getConfigTerm());
+            bb.appendNumber("configVersion", static_cast<long long>(_rsConfig.getConfigVersion()));
+            bb.appendNumber("configTerm", static_cast<long long>(_rsConfig.getConfigTerm()));
             bb.append("self", true);
             bb.append("lastHeartbeatMessage", "");
             membersOut.push_back(bb.obj());
@@ -1934,8 +1935,8 @@ void TopologyCoordinator::prepareStatusResponse(const ReplSetStatusArgs& rsStatu
                     "electionDate",
                     Date_t::fromDurationSinceEpoch(Seconds(it->getElectionTime().getSecs())));
             }
-            bb.appendIntOrLL("configVersion", it->getConfigVersion());
-            bb.appendIntOrLL("configTerm", it->getConfigTerm());
+            bb.appendNumber("configVersion", it->getConfigVersion());
+            bb.appendNumber("configTerm", it->getConfigTerm());
             membersOut.push_back(bb.obj());
         }
     }
@@ -2096,7 +2097,7 @@ void TopologyCoordinator::fillHelloForReplSet(std::shared_ptr<HelloResponse> res
     invariant(!_rsConfig.members().empty());
 
     for (const auto& member : _rsConfig.members()) {
-        if (member.isHidden() || member.getSlaveDelay() > Seconds{0}) {
+        if (member.isHidden() || member.getSecondaryDelay() > Seconds{0}) {
             continue;
         }
         auto hostView = member.getHostAndPort(horizonString);
@@ -2130,8 +2131,8 @@ void TopologyCoordinator::fillHelloForReplSet(std::shared_ptr<HelloResponse> res
     } else if (selfConfig.getPriority() == 0) {
         response->setIsPassive(true);
     }
-    if (selfConfig.getSlaveDelay() > Seconds(0)) {
-        response->setSecondaryDelaySecs(selfConfig.getSlaveDelay());
+    if (selfConfig.getSecondaryDelay() > Seconds(0)) {
+        response->setSecondaryDelaySecs(selfConfig.getSecondaryDelay());
     }
     if (selfConfig.isHidden()) {
         response->setIsHidden(true);
@@ -3098,8 +3099,8 @@ bool TopologyCoordinator::shouldChangeSyncSourceDueToPingTime(const HostAndPort&
         return false;
     }
 
-    // If we are configured with slaveDelay, do not re-evaluate our sync source.
-    if (_selfIndex == -1 || _selfConfig().getSlaveDelay() > Seconds(0)) {
+    // If we are configured with secondaryDelaySecs, do not re-evaluate our sync source.
+    if (_selfIndex == -1 || _selfConfig().getSecondaryDelay() > Seconds(0)) {
         return false;
     }
 

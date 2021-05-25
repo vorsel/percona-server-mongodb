@@ -14,8 +14,9 @@ class TenantMigrationFixture(interface.Fixture):  # pylint: disable=too-many-ins
     """Fixture which provides JSTests with a set of replica sets to run tenant migration against."""
 
     def __init__(  # pylint: disable=too-many-arguments,too-many-locals
-            self, logger, job_num, mongod_options=None, dbpath_prefix=None, preserve_dbpath=False,
-            num_replica_sets=1, num_nodes_per_replica_set=2, start_initial_sync_node=False,
+            self, logger, job_num, common_mongod_options=None, per_mongod_options=None,
+            dbpath_prefix=None, preserve_dbpath=False, num_replica_sets=1,
+            num_nodes_per_replica_set=2, start_initial_sync_node=False,
             write_concern_majority_journal_default=None, auth_options=None,
             replset_config_options=None, voting_secondaries=True, all_nodes_electable=False,
             use_replica_set_connection_string=None, linear_chain=False, mixed_bin_versions=None,
@@ -24,7 +25,8 @@ class TenantMigrationFixture(interface.Fixture):  # pylint: disable=too-many-ins
 
         interface.Fixture.__init__(self, logger, job_num, dbpath_prefix=dbpath_prefix)
 
-        self.mongod_options = utils.default_if_none(mongod_options, {})
+        self.common_mongod_options = utils.default_if_none(common_mongod_options, {})
+        self.per_mongod_options = utils.default_if_none(per_mongod_options, {})
         self.preserve_dbpath = preserve_dbpath
         self.start_initial_sync_node = start_initial_sync_node
         self.write_concern_majority_journal_default = write_concern_majority_journal_default
@@ -68,7 +70,8 @@ class TenantMigrationFixture(interface.Fixture):  # pylint: disable=too-many-ins
         if not self.replica_sets:
             for i in range(self.num_replica_sets):
                 rs_name = f"rs{i}"
-                mongod_options = self.mongod_options.copy()
+                mongod_options = self.common_mongod_options.copy()
+                mongod_options.update(self.per_mongod_options[i])
                 mongod_options["dbpath"] = os.path.join(self._dbpath_prefix, rs_name)
                 mongod_options["replSet"] = rs_name
 
@@ -117,7 +120,7 @@ class TenantMigrationFixture(interface.Fixture):  # pylint: disable=too-many-ins
         """Return true if all replica sets are still operating."""
         return all(replica_set.is_running() for replica_set in self.replica_sets)
 
-    def get_num_replica_sets(self):
+    def get_num_replsets(self):
         """Return the number of replica sets."""
         return self.num_replica_sets
 
@@ -126,6 +129,12 @@ class TenantMigrationFixture(interface.Fixture):  # pylint: disable=too-many-ins
         if not self.replica_sets:
             raise ValueError("Must call setup() before calling get_replset")
         return self.replica_sets[index]
+
+    def get_replsets(self):
+        """Return the ReplicaSetFixtures for all the replica sets."""
+        if not self.replica_sets:
+            raise ValueError("Must call setup() before calling get_replsets")
+        return self.replica_sets
 
     def get_internal_connection_string(self):
         """Return the internal connection string to the replica set that currently starts out owning the data."""

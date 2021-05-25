@@ -69,10 +69,6 @@ MONGO_FAIL_POINT_DEFINE(hangIndexBuildDuringBulkLoadPhase);
 
 namespace {
 
-// Reserved RecordId against which multikey metadata keys are indexed.
-static const RecordId kMultikeyMetadataKeyId =
-    RecordId{RecordId::ReservedId::kWildcardMultikeyMetadataId};
-
 /**
  * Returns true if at least one prefix of any of the indexed fields causes the index to be
  * multikey, and returns false otherwise. This function returns false if the 'multikeyPaths'
@@ -494,10 +490,6 @@ public:
                   const RecordId& loc,
                   const InsertDeleteOptions& options) final;
 
-    void addToSorter(const KeyString::Value& keyString) final {
-        _sorter->add(keyString, mongo::NullValue());
-    }
-
     const MultikeyPaths& getMultikeyPaths() const final;
 
     bool isMultikey() const final;
@@ -856,11 +848,6 @@ bool AbstractIndexAccessMethod::shouldMarkIndexAsMultikey(
     return numberOfKeys > 1 || isMultikeyFromPaths(multikeyPaths);
 }
 
-std::unique_ptr<SortedDataBuilderInterface> AbstractIndexAccessMethod::makeBulkBuilder(
-    OperationContext* opCtx, bool dupsAllowed) {
-    return _newInterface->makeBulkBuilder(opCtx, dupsAllowed);
-}
-
 SortedDataInterface* AbstractIndexAccessMethod::getSortedDataInterface() const {
     return _newInterface.get();
 }
@@ -885,7 +872,7 @@ std::string nextFileName() {
 Status AbstractIndexAccessMethod::_handleDuplicateKey(OperationContext* opCtx,
                                                       const KeyString::Value& dataKey,
                                                       const RecordIdHandlerFn& onDuplicateRecord) {
-    RecordId recordId = KeyString::decodeRecordIdAtEnd(dataKey.getBuffer(), dataKey.getSize());
+    RecordId recordId = KeyString::decodeRecordIdLongAtEnd(dataKey.getBuffer(), dataKey.getSize());
     if (onDuplicateRecord) {
         return onDuplicateRecord(recordId);
     }

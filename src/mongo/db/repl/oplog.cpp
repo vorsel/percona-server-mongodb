@@ -80,8 +80,9 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/tenant_migration_decoration.h"
-#include "mongo/db/repl/tenant_migration_donor_util.h"
+#include "mongo/db/repl/tenant_migration_util.h"
 #include "mongo/db/repl/timestamp_block.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/s/resharding_util.h"
@@ -295,7 +296,7 @@ void _logOpsInner(OperationContext* opCtx,
         });
 
         if (!isAbortIndexBuild) {
-            tenant_migration_donor::onWriteToDatabase(opCtx, nss.db());
+            tenant_migration_access_blocker::checkIfCanWriteOrThrow(opCtx, nss.db());
         } else if (records->size() > 1) {
             str::stream ss;
             ss << "abortIndexBuild cannot be logged with other oplog entries ";
@@ -406,7 +407,7 @@ OpTime logOp(OperationContext* opCtx, MutableOplogEntry* oplogEntry) {
 
     auto bsonOplogEntry = oplogEntry->toBSON();
     // The storage engine will assign the RecordId based on the "ts" field of the oplog entry, see
-    // oploghack::extractKey.
+    // record_id_helpers::extractKey.
     std::vector<Record> records{
         {RecordId(), RecordData(bsonOplogEntry.objdata(), bsonOplogEntry.objsize())}};
     std::vector<Timestamp> timestamps{slot.getTimestamp()};
@@ -476,7 +477,7 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
         timestamps[i] = insertStatementOplogSlot.getTimestamp();
         bsonOplogEntries[i] = oplogEntry.toBSON();
         // The storage engine will assign the RecordId based on the "ts" field of the oplog entry,
-        // see oploghack::extractKey.
+        // see record_id_helpers::extractKey.
         records[i] = Record{
             RecordId(), RecordData(bsonOplogEntries[i].objdata(), bsonOplogEntries[i].objsize())};
     }
@@ -660,6 +661,7 @@ void createOplog(OperationContext* opCtx,
     });
 
     createSlimOplogView(opCtx, ctx.db());
+    tenant_migration_util::createRetryableWritesView(opCtx, ctx.db());
 
     /* sync here so we don't get any surprising lag later when we try to sync */
     service->getStorageEngine()->flushAllFiles(opCtx, /*callerHoldsReadLock*/ false);
@@ -678,32 +680,14 @@ std::vector<OplogSlot> getNextOpTimes(OperationContext* opCtx, std::size_t count
 // -------------------------------------
 
 namespace {
-NamespaceString extractNs(const NamespaceString& ns, const BSONObj& cmdObj) {
+NamespaceString extractNs(StringData db, const BSONObj& cmdObj) {
     BSONElement first = cmdObj.firstElement();
     uassert(40073,
             str::stream() << "collection name has invalid type " << typeName(first.type()),
             first.canonicalType() == canonicalizeBSONType(mongo::String));
-    std::string coll = first.valuestr();
+    StringData coll = first.valueStringData();
     uassert(28635, "no collection name specified", !coll.empty());
-    return NamespaceString(ns.db().toString(), coll);
-}
-
-std::pair<OptionalCollectionUUID, NamespaceString> extractCollModUUIDAndNss(
-    OperationContext* opCtx,
-    const boost::optional<UUID>& ui,
-    const NamespaceString& ns,
-    const BSONObj& cmd) {
-    if (!ui) {
-        return std::pair<OptionalCollectionUUID, NamespaceString>(boost::none, extractNs(ns, cmd));
-    }
-    CollectionUUID uuid = ui.get();
-    auto catalog = CollectionCatalog::get(opCtx);
-    const auto nsByUUID = catalog->lookupNSSByUUID(opCtx, uuid);
-    uassert(ErrorCodes::NamespaceNotFound,
-            str::stream() << "Failed to apply operation due to missing collection (" << uuid
-                          << "): " << redact(cmd.toString()),
-            nsByUUID);
-    return std::pair<OptionalCollectionUUID, NamespaceString>(uuid, *nsByUUID);
+    return NamespaceString(db, coll);
 }
 
 NamespaceString extractNsFromUUID(OperationContext* opCtx, const UUID& uuid) {
@@ -717,7 +701,7 @@ NamespaceString extractNsFromUUIDorNs(OperationContext* opCtx,
                                       const NamespaceString& ns,
                                       const boost::optional<UUID>& ui,
                                       const BSONObj& cmd) {
-    return ui ? extractNsFromUUID(opCtx, ui.get()) : extractNs(ns, cmd);
+    return ui ? extractNsFromUUID(opCtx, ui.get()) : extractNs(ns.db(), cmd);
 }
 
 using OpApplyFn = std::function<Status(
@@ -745,7 +729,7 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
      {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
           const auto& ui = entry.getUuid();
           const auto& cmd = entry.getObject();
-          const NamespaceString nss(extractNs(entry.getNss(), cmd));
+          const NamespaceString nss(extractNs(entry.getNss().db(), cmd));
 
           // Mode SECONDARY steady state replication should not allow create collection to rename an
           // existing collection out of the way. This leaves a collection orphaned and is a bug.
@@ -867,11 +851,26 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
       {ErrorCodes::NamespaceNotFound}}},
     {"collMod",
      {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
-          NamespaceString nss;
-          BSONObjBuilder resultWeDontCareAbout;
           const auto& cmd = entry.getObject();
-          std::tie(std::ignore, nss) =
-              extractCollModUUIDAndNss(opCtx, entry.getUuid(), entry.getNss(), cmd);
+          const auto nss([&] {
+              // Oplog entries from secondary oplog application will allways have the Uuid set and
+              // it is only invocations of applyOps directly that may omit it
+              if (!entry.getUuid()) {
+                  invariant(mode == OplogApplication::Mode::kApplyOpsCmd);
+                  return extractNs(entry.getNss().db(), cmd);
+              }
+
+              const auto& uuid = *entry.getUuid();
+              auto catalog = CollectionCatalog::get(opCtx);
+              const auto nsByUUID = catalog->lookupNSSByUUID(opCtx, uuid);
+              uassert(ErrorCodes::NamespaceNotFound,
+                      str::stream() << "Failed to apply operation due to missing collection ("
+                                    << uuid << "): " << redact(cmd.toString()),
+                      nsByUUID);
+              return *nsByUUID;
+          }());
+
+          BSONObjBuilder resultWeDontCareAbout;
           return collMod(opCtx, nss, cmd, &resultWeDontCareAbout);
       },
       {ErrorCodes::IndexNotFound, ErrorCodes::NamespaceNotFound}}},
@@ -908,34 +907,30 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
     // deleteIndex(es) is deprecated but still works as of April 10, 2015
     {"deleteIndex",
      {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
-          BSONObjBuilder resultWeDontCareAbout;
           const auto& cmd = entry.getObject();
           return dropIndexesForApplyOps(
-              opCtx, extractNsFromUUID(opCtx, entry.getUuid().get()), cmd, &resultWeDontCareAbout);
+              opCtx, extractNsFromUUID(opCtx, entry.getUuid().get()), cmd);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"deleteIndexes",
      {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
-          BSONObjBuilder resultWeDontCareAbout;
           const auto& cmd = entry.getObject();
           return dropIndexesForApplyOps(
-              opCtx, extractNsFromUUID(opCtx, entry.getUuid().get()), cmd, &resultWeDontCareAbout);
+              opCtx, extractNsFromUUID(opCtx, entry.getUuid().get()), cmd);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"dropIndex",
      {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
-          BSONObjBuilder resultWeDontCareAbout;
           const auto& cmd = entry.getObject();
           return dropIndexesForApplyOps(
-              opCtx, extractNsFromUUID(opCtx, entry.getUuid().get()), cmd, &resultWeDontCareAbout);
+              opCtx, extractNsFromUUID(opCtx, entry.getUuid().get()), cmd);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"dropIndexes",
      {[](OperationContext* opCtx, const OplogEntry& entry, OplogApplication::Mode mode) -> Status {
-          BSONObjBuilder resultWeDontCareAbout;
           const auto& cmd = entry.getObject();
           return dropIndexesForApplyOps(
-              opCtx, extractNsFromUUID(opCtx, entry.getUuid().get()), cmd, &resultWeDontCareAbout);
+              opCtx, extractNsFromUUID(opCtx, entry.getUuid().get()), cmd);
       },
       {ErrorCodes::NamespaceNotFound, ErrorCodes::IndexNotFound}}},
     {"renameCollection",
@@ -1589,7 +1584,7 @@ Status applyCommand_inlock(OperationContext* opCtx,
     if ((mode == OplogApplication::Mode::kInitialSync) &&
         (std::find(whitelistedOps.begin(), whitelistedOps.end(), o.firstElementFieldName()) ==
          whitelistedOps.end()) &&
-        extractNs(nss, o) == NamespaceString::kServerConfigurationNamespace) {
+        extractNs(nss.db(), o) == NamespaceString::kServerConfigurationNamespace) {
         return Status(ErrorCodes::OplogOperationUnsupported,
                       str::stream() << "Applying command to feature compatibility version "
                                        "collection not supported in initial sync: "

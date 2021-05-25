@@ -45,7 +45,7 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/cursor_response.h"
-#include "mongo/db/query/query_request.h"
+#include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_settings.h"
@@ -322,7 +322,16 @@ void ConfigServerTestFixture::setupCollection(const NamespaceString& nss,
         setupDatabase(nss.db().toString(), ShardId(shard.getName()), true /* sharded */);
     }
 
-    CollectionType coll(nss, chunks[0].getVersion().epoch(), Date_t::now(), UUID::gen());
+    const auto collUUID = [&]() {
+        const auto& chunk = chunks.front();
+        if (chunk.getVersion().getTimestamp()) {
+            return chunk.getCollectionUUID();
+        } else {
+            return UUID::gen();
+        }
+    }();
+    CollectionType coll(nss, chunks[0].getVersion().epoch(), Date_t::now(), collUUID);
+    coll.setTimestamp(chunks.front().getVersion().getTimestamp());
     coll.setKeyPattern(shardKey);
     ASSERT_OK(
         insertToConfigCollection(operationContext(), CollectionType::ConfigNS, coll.toBSON()));

@@ -21,7 +21,7 @@
 // Below is the list of known equivalent error code groups. As new groups of equivalent error codes
 // are discovered, they should be added to this list.
 const equivalentErrorCodesList = [
-    [9, 5166503, 5166605],
+    [9, 5166503, 5166605, 5338802],
     [28651, 5073201],
     [16006, 4997703, 4998202],
     [28689, 5126701],
@@ -32,6 +32,9 @@ const equivalentErrorCodesList = [
     [16608, 4848401],
     [16609, 5073101],
     [16610, 4848403],
+    [16611, 5154000],
+    [16612, 4974202],
+    [16554, 4974203],
     [16555, 5073102],
     [28664, 5153400],
     [28680, 4903701],
@@ -67,9 +70,21 @@ const equivalentErrorCodesList = [
     [5166403, 5166603],
     [5166404, 5166604],
     [5166405, 5166606],
+    [51246, 5291401],
+    [51247, 5291402],
     [51744, 5154400],
     [51745, 5154400],
     [51746, 5154400],
+    [51104, 5073401],
+    [51105, 5126601, 5073405],
+    [51106, 5126603, 5126607],
+    [51107, 5126605, 5073406],
+    [51109, 5126602, 5073407],
+    [51110, 5126604, 5073408],
+    [51111, 5073402],
+    [51151, 5126606],
+    [51156, 5073403],
+    [5338800, 5338801],
 ];
 
 // This map is generated based on the contents of 'equivalentErrorCodesList'. This map should _not_
@@ -104,6 +119,10 @@ const equivalentErrorCodesMap = function() {
 }();
 
 const lookupEquivalentErrorCodes = function(errorCodes) {
+    if (errorCodes === assert._kAnyErrorCode) {
+        return errorCodes;
+    }
+
     if (!Array.isArray(errorCodes)) {
         errorCodes = [errorCodes];
     }

@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2019 MongoDB, Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -179,7 +179,7 @@ public:
         }
         auto intVal = stdx::get_if<std::int64_t>(&_w);
         invariant(intVal);
-        builder->appendIntOrLL("w", *intVal);
+        builder->appendNumber("w", static_cast<long long>(*intVal));
     }
 
     WriteConcernW() : _w{1}, _usedDefault{true} {};

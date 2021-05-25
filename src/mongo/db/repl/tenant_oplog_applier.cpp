@@ -56,6 +56,7 @@ namespace mongo {
 namespace repl {
 
 MONGO_FAIL_POINT_DEFINE(hangInTenantOplogApplication);
+MONGO_FAIL_POINT_DEFINE(fpBeforeTenantOplogApplyingBatch);
 
 TenantOplogApplier::TenantOplogApplier(const UUID& migrationUuid,
                                        const std::string& tenantId,
@@ -144,6 +145,12 @@ void TenantOplogApplier::_doShutdown_inlock() noexcept {
         // We actually hold the required lock, but the lock object itself is not passed through.
         _finishShutdown(WithLock::withoutLock(),
                         {ErrorCodes::CallbackCanceled, "Tenant oplog applier shut down"});
+    }
+}
+
+void TenantOplogApplier::_preJoin() noexcept {
+    if (_oplogBatcher) {
+        _oplogBatcher->join();
     }
 }
 
@@ -271,6 +278,7 @@ void TenantOplogApplier::_applyOplogBatch(TenantOplogBatch* batch) {
         uassertStatusOK(status);
     }
 
+    fpBeforeTenantOplogApplyingBatch.pauseWhileSet();
 
     LOGV2_DEBUG(4886011,
                 1,
@@ -579,15 +587,18 @@ Status TenantOplogApplier::_applyOplogEntryOrGroupedInserts(
     invariant(oplogApplicationMode == OplogApplication::Mode::kInitialSync);
 
     auto op = entryOrGroupedInserts.getOp();
-    if (op.isIndexCommandType()) {
-        // TODO(SERVER-48862): Handle index builds during oplog application.
+    if (op.isIndexCommandType() && op.getCommandType() != OplogEntry::CommandType::kCreateIndexes &&
+        op.getCommandType() != OplogEntry::CommandType::kDropIndexes) {
         LOGV2_ERROR(488610,
-                    "Index operations are not currently supported in tenant migration",
+                    "Index creation, except createIndex on empty collections, is not supported in "
+                    "tenant migration",
                     "tenant"_attr = _tenantId,
                     "migrationUuid"_attr = _migrationUuid,
                     "op"_attr = redact(op.toBSONForLogging()));
 
-        return Status::OK();
+        uasserted(5434700,
+                  "Index creation, except createIndex on empty collections, is not supported in "
+                  "tenant migration");
     }
     // We don't count tenant application in the ops applied stats.
     auto incrementOpsAppliedStats = [] {};

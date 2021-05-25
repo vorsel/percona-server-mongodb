@@ -31,6 +31,8 @@
 
 #if !PERCONA_AUDIT_ENABLED
 
+mongo::audit::ImpersonatedClientAttrs::ImpersonatedClientAttrs(Client* client) {}
+
 void mongo::audit::logAuthentication(Client* client,
                                      StringData mechanism,
                                      const UserName& user,
@@ -169,9 +171,17 @@ void mongo::audit::logDropIndex(Client* client, StringData indexname, StringData
 
 void mongo::audit::logDropCollection(Client* client, StringData nsname) {}
 
+void mongo::audit::logDropView(Client* client,
+                               StringData nsname,
+                               StringData viewOn,
+                               const std::vector<BSONObj>& pipeline,
+                               ErrorCodes::Error code) {}
+
 void mongo::audit::logDropDatabase(Client* client, StringData dbname) {}
 
-void mongo::audit::logRenameCollection(Client* client, StringData source, StringData target) {}
+void mongo::audit::logRenameCollection(Client* client,
+                                       const NamespaceString& source,
+                                       const NamespaceString& target) {}
 
 void mongo::audit::logEnableSharding(Client* client, StringData dbname) {}
 
@@ -190,5 +200,17 @@ void mongo::audit::logShardCollection(Client* client,
 void mongo::audit::logRefineCollectionShardKey(Client* client,
                                                StringData ns,
                                                const BSONObj& keyPattern) {}
+
+void mongo::audit::logInsertOperation(Client* client,
+                                      const NamespaceString& nss,
+                                      const BSONObj& doc) {}
+
+void mongo::audit::logUpdateOperation(Client* client,
+                                      const NamespaceString& nss,
+                                      const BSONObj& doc) {}
+
+void mongo::audit::logRemoveOperation(Client* client,
+                                      const NamespaceString& nss,
+                                      const BSONObj& doc) {}
 
 #endif

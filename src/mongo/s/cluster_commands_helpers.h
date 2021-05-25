@@ -148,12 +148,12 @@ BSONObj applyReadWriteConcern(OperationContext* opCtx,
 
 /**
  * Convenience versions of applyReadWriteConcern() for calling from within
- * CommandInvocation or BasicCommand.
+ * CommandInvocation, BasicCommand or BasicCommandWithRequestParser.
  */
 BSONObj applyReadWriteConcern(OperationContext* opCtx,
                               CommandInvocation* invocation,
                               const BSONObj& cmdObj);
-BSONObj applyReadWriteConcern(OperationContext* opCtx, BasicCommand* cmd, const BSONObj& cmdObj);
+
 BSONObj applyReadWriteConcern(OperationContext* opCtx,
                               BasicCommandWithReplyBuilderInterface* cmd,
                               const BSONObj& cmdObj);
@@ -327,12 +327,6 @@ bool appendEmptyResultSet(OperationContext* opCtx,
                           BSONObjBuilder& result,
                           Status status,
                           const std::string& ns);
-
-/**
- * If the specified database exists already, loads it in the cache (if not already there).
- * Otherwise, if it does not exist, this call will implicitly create it as non-sharded.
- */
-void createShardDatabase(OperationContext* opCtx, StringData dbName);
 
 /**
  * Returns the shards that would be targeted for the given query according to the given routing

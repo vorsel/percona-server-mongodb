@@ -41,9 +41,10 @@ namespace mongo {
  * Extracts the multikey path from a metadata key stored within a wildcard index.
  */
 static FieldRef extractMultikeyPathFromIndexKey(const IndexKeyEntry& entry) {
-    invariant(entry.loc.isReserved());
-    invariant(entry.loc.repr() ==
-              static_cast<int64_t>(RecordId::ReservedId::kWildcardMultikeyMetadataId));
+    invariant(RecordId::isReserved<int64_t>(entry.loc));
+    invariant(entry.loc.asLong() ==
+              RecordId::reservedIdFor<int64_t>(RecordId::Reservation::kWildcardMultikeyMetadataId)
+                  .asLong());
 
     // Validate that the first piece of the key is the integer 1.
     BSONObjIterator iter(entry.key);

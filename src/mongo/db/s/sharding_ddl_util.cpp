@@ -34,7 +34,8 @@
 #include "mongo/db/s/sharding_ddl_util.h"
 
 #include "mongo/db/catalog/collection_catalog.h"
-#include "mongo/db/s/config/sharding_catalog_manager.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_collection.h"
@@ -47,20 +48,122 @@ namespace mongo {
 
 namespace sharding_ddl_util {
 
-void shardedRenameMetadata(OperationContext* opCtx,
-                           const NamespaceString& fromNss,
-                           const NamespaceString& toNss) {
-    // TODO SERVER-53871: enclose the following operations into a transaction
-    auto catalogClient = Grid::get(opCtx)->catalogClient();
-    auto collType = catalogClient->getCollection(opCtx, fromNss);
+namespace {
 
-    // Delete the FROM collection entry
+void cloneTags(OperationContext* opCtx,
+               const NamespaceString& fromNss,
+               const NamespaceString& toNss) {
+    auto catalogClient = Grid::get(opCtx)->catalogClient();
+    auto tags = uassertStatusOK(catalogClient->getTagsForCollection(opCtx, fromNss));
+
+    if (tags.empty()) {
+        return;
+    }
+
+    // Wait for majority just for last tag
+    auto lastTag = tags.back();
+    tags.pop_back();
+    for (auto& tag : tags) {
+        tag.setNS(toNss);
+        uassertStatusOK(catalogClient->insertConfigDocument(
+            opCtx, TagsType::ConfigNS, tag.toBSON(), ShardingCatalogClient::kLocalWriteConcern));
+    }
+    lastTag.setNS(toNss);
+    uassertStatusOK(catalogClient->insertConfigDocument(
+        opCtx, TagsType::ConfigNS, lastTag.toBSON(), ShardingCatalogClient::kMajorityWriteConcern));
+}
+
+void deleteChunks(OperationContext* opCtx, const NamespaceStringOrUUID& nssOrUUID) {
+    const auto catalogClient = Grid::get(opCtx)->catalogClient();
+
+    // Remove config.chunks entries
+    const auto chunksQuery = [&]() {
+        auto optUUID = nssOrUUID.uuid();
+        if (optUUID) {
+            return BSON(ChunkType::collectionUUID << *optUUID);
+        }
+
+        auto optNss = nssOrUUID.nss();
+        invariant(optNss);
+        return BSON(ChunkType::ns(optNss->ns()));
+    }();
+
+    uassertStatusOK(catalogClient->removeConfigDocuments(
+        opCtx, ChunkType::ConfigNS, chunksQuery, ShardingCatalogClient::kMajorityWriteConcern));
+}
+
+void deleteCollection(OperationContext* opCtx, const NamespaceString& nss) {
+    const auto catalogClient = Grid::get(opCtx)->catalogClient();
+
+    // Remove config.collection entry
     uassertStatusOK(
         catalogClient->removeConfigDocuments(opCtx,
                                              CollectionType::ConfigNS,
-                                             BSON(CollectionType::kNssFieldName << fromNss.ns()),
+                                             BSON(CollectionType::kNssFieldName << nss.ns()),
                                              ShardingCatalogClient::kMajorityWriteConcern));
+}
 
+}  // namespace
+
+void removeTagsMetadataFromConfig(OperationContext* opCtx, const NamespaceString& nss) {
+    const auto catalogClient = Grid::get(opCtx)->catalogClient();
+
+    // Remove config.tags entries
+    uassertStatusOK(
+        catalogClient->removeConfigDocuments(opCtx,
+                                             TagsType::ConfigNS,
+                                             BSON(TagsType::ns(nss.ns())),
+                                             ShardingCatalogClient::kMajorityWriteConcern));
+}
+
+void removeCollMetadataFromConfig(OperationContext* opCtx, const CollectionType& coll) {
+    IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
+    const auto& nss = coll.getNss();
+
+    ON_BLOCK_EXIT(
+        [&] { Grid::get(opCtx)->catalogCache()->invalidateCollectionEntry_LINEARIZABLE(nss); });
+
+    const NamespaceStringOrUUID nssOrUUID = coll.getTimestamp()
+        ? NamespaceStringOrUUID(nss.db().toString(), coll.getUuid())
+        : NamespaceStringOrUUID(nss);
+
+    deleteChunks(opCtx, nssOrUUID);
+
+    removeTagsMetadataFromConfig(opCtx, nss);
+
+    deleteCollection(opCtx, nss);
+}
+
+bool removeCollMetadataFromConfig(OperationContext* opCtx, const NamespaceString& nss) {
+    IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
+    const auto catalogClient = Grid::get(opCtx)->catalogClient();
+
+    ON_BLOCK_EXIT(
+        [&] { Grid::get(opCtx)->catalogCache()->invalidateCollectionEntry_LINEARIZABLE(nss); });
+
+    try {
+        auto coll = catalogClient->getCollection(opCtx, nss);
+        removeCollMetadataFromConfig(opCtx, coll);
+        return true;
+    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+        // The collection is not sharded or doesn't exist, just tags need to be removed
+        removeTagsMetadataFromConfig(opCtx, nss);
+        return false;
+    }
+}
+
+void shardedRenameMetadata(OperationContext* opCtx,
+                           const NamespaceString& fromNss,
+                           const NamespaceString& toNss) {
+    auto catalogClient = Grid::get(opCtx)->catalogClient();
+
+    // Delete eventual TO chunk/collection entries referring a dropped collection
+    removeCollMetadataFromConfig(opCtx, toNss);
+
+    // Clone FROM tags to TO
+    cloneTags(opCtx, fromNss, toNss);
+
+    auto collType = catalogClient->getCollection(opCtx, fromNss);
     collType.setNss(toNss);
     // Insert the TO collection entry
     uassertStatusOK(
@@ -69,30 +172,9 @@ void shardedRenameMetadata(OperationContext* opCtx,
                                             collType.toBSON(),
                                             ShardingCatalogClient::kMajorityWriteConcern));
 
-    // Super-inefficient due to limitation of the catalogClient (no multi-document update), but just
-    // temporary: TODO on SERVER-53105 completion, throw out the following scope
-    {
-        // Update all config.chunks entries for the given collection
-        repl::OpTime opTime;
-        auto chunks = uassertStatusOK(Grid::get(opCtx)->catalogClient()->getChunks(
-            opCtx,
-            BSON(ChunkType::ns(fromNss.ns())),
-            BSON(ChunkType::lastmod() << 1),
-            boost::none,
-            &opTime,
-            repl::ReadConcernLevel::kMajorityReadConcern));
-
-
-        for (auto& chunk : chunks) {
-            uassertStatusOK(
-                catalogClient->updateConfigDocument(opCtx,
-                                                    ChunkType::ConfigNS,
-                                                    BSON(ChunkType::name(chunk.getName())),
-                                                    BSON("$set" << BSON(ChunkType::ns(toNss.ns()))),
-                                                    false, /* upsert */
-                                                    ShardingCatalogClient::kMajorityWriteConcern));
-        }
-    }
+    // Delete FROM tag/collection entries
+    removeTagsMetadataFromConfig(opCtx, fromNss);
+    deleteCollection(opCtx, fromNss);
 }
 
 void checkShardedRenamePreconditions(OperationContext* opCtx,
@@ -130,6 +212,50 @@ void checkShardedRenamePreconditions(OperationContext* opCtx,
             str::stream() << "Can't rename to target collection " << toNss.ns()
                           << " because it must not have associated tags",
             tags.empty());
+}
+
+boost::optional<CreateCollectionResponse> checkIfCollectionAlreadySharded(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const BSONObj& key,
+    const BSONObj& collation,
+    bool unique) {
+    auto cm = uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(opCtx, nss));
+
+    if (!cm.isSharded()) {
+        return boost::none;
+    }
+
+    auto defaultCollator =
+        cm.getDefaultCollator() ? cm.getDefaultCollator()->getSpec().toBSON() : BSONObj();
+
+    // If the collection is already sharded, fail if the deduced options in this request do not
+    // match the options the collection was originally sharded with.
+    uassert(ErrorCodes::AlreadyInitialized,
+            str::stream() << "sharding already enabled for collection " << nss,
+            SimpleBSONObjComparator::kInstance.evaluate(cm.getShardKeyPattern().toBSON() == key) &&
+                SimpleBSONObjComparator::kInstance.evaluate(defaultCollator == collation) &&
+                cm.isUnique() == unique);
+
+    CreateCollectionResponse response(cm.getVersion());
+    response.setCollectionUUID(cm.getUUID());
+    return response;
+}
+
+void acquireCriticalSection(OperationContext* opCtx, const NamespaceString& nss) {
+    AutoGetCollection cCollLock(opCtx, nss, MODE_X);
+    auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr);
+    csr->enterCriticalSectionCatchUpPhase(csrLock);
+    csr->enterCriticalSectionCommitPhase(csrLock);
+}
+
+void releaseCriticalSection(OperationContext* opCtx, const NamespaceString& nss) {
+    AutoGetCollection collLock(opCtx, nss, MODE_X);
+    auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
+    csr->exitCriticalSection(opCtx);
+    csr->clearFilteringMetadata(opCtx);
 }
 
 }  // namespace sharding_ddl_util

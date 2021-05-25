@@ -224,7 +224,15 @@ public:
         std::abort();
     }
 
+    Status checkValidatorAPIVersionCompatability(OperationContext* opCtx) const final {
+        std::abort();
+    }
+
     bool isTemporary(OperationContext* opCtx) const {
+        std::abort();
+    }
+
+    bool isClustered() const {
         std::abort();
     }
 

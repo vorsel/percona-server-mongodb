@@ -53,7 +53,7 @@ void statsToBSON(const QuerySolutionNode* node,
     }
 
     bob->append("stage", stageTypeToString(node->getType()));
-    bob->appendNumber("planNodeId", static_cast<size_t>(node->nodeId()));
+    bob->appendNumber("planNodeId", static_cast<long long>(node->nodeId()));
 
     // Display the BSON representation of the filter, if there is one.
     if (node->filter) {
@@ -65,11 +65,17 @@ void statsToBSON(const QuerySolutionNode* node,
         case STAGE_COLLSCAN: {
             auto csn = static_cast<const CollectionScanNode*>(node);
             bob->append("direction", csn->direction > 0 ? "forward" : "backward");
-            if (csn->minTs) {
-                bob->append("minTs", *csn->minTs);
+            if (csn->minRecord) {
+                csn->minRecord->withFormat(
+                    [&](RecordId::Null n) { bob->appendNull("minRecord"); },
+                    [&](int64_t rid) { bob->append("minRecord", rid); },
+                    [&](const char* str, int size) { bob->append("minRecord", OID::from(str)); });
             }
-            if (csn->maxTs) {
-                bob->append("maxTs", *csn->maxTs);
+            if (csn->maxRecord) {
+                csn->maxRecord->withFormat(
+                    [&](RecordId::Null n) { bob->appendNull("maxRecord"); },
+                    [&](int64_t rid) { bob->append("maxRecord", rid); },
+                    [&](const char* str, int size) { bob->append("maxRecord", OID::from(str)); });
             }
             break;
         }
@@ -136,10 +142,10 @@ void statsToBSON(const QuerySolutionNode* node,
         case STAGE_SORT_DEFAULT: {
             auto sn = static_cast<const SortNode*>(node);
             bob->append("sortPattern", sn->pattern);
-            bob->appendIntOrLL("memLimit", sn->maxMemoryUsageBytes);
+            bob->appendNumber("memLimit", static_cast<long long>(sn->maxMemoryUsageBytes));
 
             if (sn->limit > 0) {
-                bob->appendIntOrLL("limitAmount", sn->limit);
+                bob->appendNumber("limitAmount", static_cast<long long>(sn->limit));
             }
 
             bob->append("type", node->getType() == STAGE_SORT_SIMPLE ? "simple" : "default");
@@ -205,19 +211,19 @@ void statsToBSON(const sbe::PlanStageStats* stats,
 
     auto stageType = stats->common.stageType;
     bob->append("stage", stageType);
-    bob->appendNumber("planNodeId", static_cast<size_t>(stats->common.nodeId));
+    bob->appendNumber("planNodeId", static_cast<long long>(stats->common.nodeId));
 
     // Some top-level exec stats get pulled out of the root stage.
-    bob->appendNumber("nReturned", stats->common.advances);
+    bob->appendNumber("nReturned", static_cast<long long>(stats->common.advances));
     // Include executionTimeMillis if it was recorded.
     if (stats->common.executionTimeMillis) {
         bob->appendNumber("executionTimeMillisEstimate", *stats->common.executionTimeMillis);
     }
-    bob->appendNumber("advances", stats->common.advances);
-    bob->appendNumber("opens", stats->common.opens);
-    bob->appendNumber("closes", stats->common.closes);
-    bob->appendNumber("saveState", stats->common.yields);
-    bob->appendNumber("restoreState", stats->common.unyields);
+    bob->appendNumber("advances", static_cast<long long>(stats->common.advances));
+    bob->appendNumber("opens", static_cast<long long>(stats->common.opens));
+    bob->appendNumber("closes", static_cast<long long>(stats->common.closes));
+    bob->appendNumber("saveState", static_cast<long long>(stats->common.yields));
+    bob->appendNumber("restoreState", static_cast<long long>(stats->common.unyields));
     bob->appendNumber("isEOF", stats->common.isEOF);
 
     // Include any extra debug info if present.
@@ -298,21 +304,35 @@ PlanSummaryStats collectExecutionStatsSummary(const sbe::PlanStageStats* stats) 
     return summary;
 }
 
-PlanExplainer::PlanStatsDetails buildPlanStatsDetails(const QuerySolutionNode* node,
-                                                      const sbe::PlanStageStats* stats,
-                                                      ExplainOptions::Verbosity verbosity) {
+PlanExplainer::PlanStatsDetails buildPlanStatsDetails(
+    const QuerySolutionNode* node,
+    const sbe::PlanStageStats* stats,
+    const boost::optional<BSONObj>& execPlanDebugInfo,
+    ExplainOptions::Verbosity verbosity) {
     BSONObjBuilder bob;
 
     if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
         auto summary = collectExecutionStatsSummary(stats);
         statsToBSON(stats, &bob, &bob);
+        // At the 'kQueryPlanner' verbosity level we use the QSN-derived format for the given plan,
+        // and thus the winning plan and rejected plans at this verbosity should display the
+        // stringified SBE plan, which is added below. However, at the 'kExecStats' the execution
+        // stats use the PlanStage-derived format for the SBE tree, so there is no need to repeat
+        // the stringified SBE plan and we only included what's been generated from the
+        // PlanStageStats.
         return {bob.obj(), std::move(summary)};
     }
 
     statsToBSON(node, &bob, &bob);
-    return {bob.obj(), boost::none};
+    invariant(execPlanDebugInfo);
+    return {BSON("queryPlan" << bob.obj() << "slotBasedPlan" << *execPlanDebugInfo), boost::none};
 }
 }  // namespace
+
+const PlanExplainer::ExplainVersion& PlanExplainerSBE::getVersion() const {
+    static const ExplainVersion kExplainVersion = "2";
+    return kExplainVersion;
+}
 
 std::string PlanExplainerSBE::getPlanSummary() const {
     if (!_solution) {
@@ -320,6 +340,7 @@ std::string PlanExplainerSBE::getPlanSummary() const {
     }
 
     StringBuilder sb;
+    bool seenLeaf = false;
     std::queue<const QuerySolutionNode*> queue;
     queue.push(_solution->root());
 
@@ -327,55 +348,59 @@ std::string PlanExplainerSBE::getPlanSummary() const {
         auto node = queue.front();
         queue.pop();
 
-        sb << stageTypeToString(node->getType());
+        if (node->children.empty()) {
+            if (seenLeaf) {
+                sb << ", ";
+            } else {
+                seenLeaf = true;
+            }
 
-        switch (node->getType()) {
-            case STAGE_COUNT_SCAN: {
-                auto csn = static_cast<const CountScanNode*>(node);
-                const KeyPattern keyPattern{csn->index.keyPattern};
-                sb << " " << keyPattern;
-                break;
+            sb << stageTypeToString(node->getType());
+
+            switch (node->getType()) {
+                case STAGE_COUNT_SCAN: {
+                    auto csn = static_cast<const CountScanNode*>(node);
+                    const KeyPattern keyPattern{csn->index.keyPattern};
+                    sb << " " << keyPattern;
+                    break;
+                }
+                case STAGE_DISTINCT_SCAN: {
+                    auto dn = static_cast<const DistinctNode*>(node);
+                    const KeyPattern keyPattern{dn->index.keyPattern};
+                    sb << " " << keyPattern;
+                    break;
+                }
+                case STAGE_GEO_NEAR_2D: {
+                    auto geo2d = static_cast<const GeoNear2DNode*>(node);
+                    const KeyPattern keyPattern{geo2d->index.keyPattern};
+                    sb << " " << keyPattern;
+                    break;
+                }
+                case STAGE_GEO_NEAR_2DSPHERE: {
+                    auto geo2dsphere = static_cast<const GeoNear2DSphereNode*>(node);
+                    const KeyPattern keyPattern{geo2dsphere->index.keyPattern};
+                    sb << " " << keyPattern;
+                    break;
+                }
+                case STAGE_IXSCAN: {
+                    auto ixn = static_cast<const IndexScanNode*>(node);
+                    const KeyPattern keyPattern{ixn->index.keyPattern};
+                    sb << " " << keyPattern;
+                    break;
+                }
+                case STAGE_TEXT: {
+                    auto tn = static_cast<const TextNode*>(node);
+                    const KeyPattern keyPattern{tn->indexPrefix};
+                    sb << " " << keyPattern;
+                    break;
+                }
+                default:
+                    break;
             }
-            case STAGE_DISTINCT_SCAN: {
-                auto dn = static_cast<const DistinctNode*>(node);
-                const KeyPattern keyPattern{dn->index.keyPattern};
-                sb << " " << keyPattern;
-                break;
-            }
-            case STAGE_GEO_NEAR_2D: {
-                auto geo2d = static_cast<const GeoNear2DNode*>(node);
-                const KeyPattern keyPattern{geo2d->index.keyPattern};
-                sb << " " << keyPattern;
-                break;
-            }
-            case STAGE_GEO_NEAR_2DSPHERE: {
-                auto geo2dsphere = static_cast<const GeoNear2DSphereNode*>(node);
-                const KeyPattern keyPattern{geo2dsphere->index.keyPattern};
-                sb << " " << keyPattern;
-                break;
-            }
-            case STAGE_IXSCAN: {
-                auto ixn = static_cast<const IndexScanNode*>(node);
-                const KeyPattern keyPattern{ixn->index.keyPattern};
-                sb << " " << keyPattern;
-                break;
-            }
-            case STAGE_TEXT: {
-                auto tn = static_cast<const TextNode*>(node);
-                const KeyPattern keyPattern{tn->indexPrefix};
-                sb << " " << keyPattern;
-                break;
-            }
-            default:
-                break;
         }
 
         for (auto&& child : node->children) {
             queue.push(child);
-        }
-
-        if (!queue.empty()) {
-            sb << ", ";
         }
     }
 
@@ -462,7 +487,7 @@ PlanExplainer::PlanStatsDetails PlanExplainerSBE::getWinningPlanStats(
     invariant(_root);
     invariant(_solution);
     auto stats = _root->getStats(true /* includeDebugInfo  */);
-    return buildPlanStatsDetails(_solution->root(), stats.get(), verbosity);
+    return buildPlanStatsDetails(_solution->root(), stats.get(), _execPlanDebugInfo, verbosity);
 }
 
 std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerSBE::getRejectedPlansStats(
@@ -478,7 +503,9 @@ std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerSBE::getRejectedPlansS
         invariant(candidate.solution);
 
         auto stats = candidate.root->getStats(true /* includeDebugInfo  */);
-        res.push_back(buildPlanStatsDetails(candidate.solution->root(), stats.get(), verbosity));
+        auto execPlanDebugInfo = buildExecPlanDebugInfo(candidate.root.get(), &candidate.data);
+        res.push_back(buildPlanStatsDetails(
+            candidate.solution->root(), stats.get(), execPlanDebugInfo, verbosity));
     }
     return res;
 }
@@ -491,7 +518,7 @@ std::vector<PlanExplainer::PlanStatsDetails> PlanExplainerSBE::getCachedPlanStat
     auto&& stats = decision.getStats<mongo::sbe::PlanStageStats>();
     if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
         for (auto&& planStats : stats.candidatePlanStats) {
-            res.push_back(buildPlanStatsDetails(nullptr, planStats.get(), verbosity));
+            res.push_back(buildPlanStatsDetails(nullptr, planStats.get(), boost::none, verbosity));
         }
     } else {
         // At the "queryPlanner" verbosity we only need to provide details about the winning plan

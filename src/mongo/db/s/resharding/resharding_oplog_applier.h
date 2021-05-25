@@ -31,7 +31,6 @@
 
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry.h"
-#include "mongo/db/repl/oplog_entry_or_grouped_inserts.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
 #include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
 #include "mongo/db/s/resharding/resharding_oplog_application.h"
@@ -43,6 +42,7 @@
 
 namespace mongo {
 
+class ReshardingMetrics;
 class ServiceContext;
 class ThreadPool;
 
@@ -53,7 +53,23 @@ class ThreadPool;
  */
 class ReshardingOplogApplier {
 public:
-    ReshardingOplogApplier(ServiceContext* service,
+    class Env {
+    public:
+        Env(ServiceContext* service, ReshardingMetrics* metrics)
+            : _service(service), _metrics(metrics) {}
+        ServiceContext* service() const {
+            return _service;
+        }
+        ReshardingMetrics* metrics() const {
+            return _metrics;
+        }
+
+    private:
+        ServiceContext* _service;
+        ReshardingMetrics* _metrics;
+    };
+
+    ReshardingOplogApplier(std::unique_ptr<Env> env,
                            ReshardingSourceId sourceId,
                            NamespaceString oplogNs,
                            NamespaceString nsBeingResharded,
@@ -87,7 +103,8 @@ public:
 
     static NamespaceString ensureStashCollectionExists(OperationContext* opCtx,
                                                        const UUID& existingUUID,
-                                                       const ShardId& donorShardId);
+                                                       const ShardId& donorShardId,
+                                                       const CollectionOptions& options);
 
 private:
     using OplogBatch = std::vector<repl::OplogEntry>;
@@ -114,8 +131,7 @@ private:
     /**
      * Apply the oplog entries.
      */
-    Status _applyOplogEntryOrGroupedInserts(
-        OperationContext* opCtx, const repl::OplogEntryOrGroupedInserts& entryOrGroupedInserts);
+    Status _applyOplogEntry(OperationContext* opCtx, const repl::OplogEntry& op);
 
     /**
      * Record results from a writer vector for the current batch being applied.
@@ -130,6 +146,11 @@ private:
      */
     Status _onError(Status status);
 
+    /** The ServiceContext to use internally. */
+    ServiceContext* _service() const {
+        return _env->service();
+    }
+
     /**
      * Records the progress made by this applier to storage. Returns the timestamp of the progress
      * recorded.
@@ -137,6 +158,8 @@ private:
     Timestamp _clearAppliedOpsAndStoreProgress(OperationContext* opCtx);
 
     static constexpr auto kClientName = "ReshardingOplogApplier"_sd;
+
+    std::unique_ptr<Env> _env;
 
     // Identifier for the oplog source.
     const ReshardingSourceId _sourceId;
@@ -171,9 +194,6 @@ private:
     // R - Read relaxed. Can read freely without holding mutex because there are no case where
     //     more than one thread will modify it concurrently while being read.
     // S - Special case. Manages it's own concurrency. Can access without holding mutex.
-
-    // (S)
-    ServiceContext* _service;
 
     // (S)
     std::shared_ptr<executor::TaskExecutor> _executor;

@@ -907,9 +907,6 @@ StatusWith<DurableCatalog::ImportResult> DurableCatalogImpl::importCollection(
     uassert(ErrorCodes::BadValue,
             "Attempted to import catalog entry without an ident",
             metadata.hasField("ident"));
-    uassert(ErrorCodes::BadValue,
-            "Attempted to import collection without idxIdent",
-            metadata.hasField("idxIdent"));
 
     const auto& catalogEntry = [&] {
         if (uuidOption == ImportCollectionUUIDOption::kGenerateNew) {
@@ -931,8 +928,10 @@ StatusWith<DurableCatalog::ImportResult> DurableCatalogImpl::importCollection(
     {
         const std::string collectionIdent = catalogEntry["ident"].String();
 
-        for (const auto& indexIdent : catalogEntry["idxIdent"].Obj()) {
-            indexIdents.insert(indexIdent.String());
+        if (!catalogEntry["idxIdent"].eoo()) {
+            for (const auto& indexIdent : catalogEntry["idxIdent"].Obj()) {
+                indexIdents.insert(indexIdent.String());
+            }
         }
 
         auto identsToImportConflict = [&](WithLock) -> bool {
@@ -1027,6 +1026,15 @@ void DurableCatalogImpl::updateCappedSize(OperationContext* opCtx,
     putMetaData(opCtx, catalogId, md);
 }
 
+void DurableCatalogImpl::updateClusteredIndexTTLSetting(
+    OperationContext* opCtx, RecordId catalogId, boost::optional<int64_t> expireAfterSeconds) {
+    BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
+    uassert(5401000, "The collection doesn't have a clustered index", md.options.clusteredIndex);
+
+    md.options.clusteredIndex->setExpireAfterSeconds(expireAfterSeconds);
+    putMetaData(opCtx, catalogId, md);
+}
+
 void DurableCatalogImpl::updateTTLSetting(OperationContext* opCtx,
                                           RecordId catalogId,
                                           StringData idxName,
@@ -1055,9 +1063,12 @@ void DurableCatalogImpl::updateHiddenSetting(OperationContext* opCtx,
 
 bool DurableCatalogImpl::isEqualToMetadataUUID(OperationContext* opCtx,
                                                RecordId catalogId,
-                                               OptionalCollectionUUID uuid) {
+                                               const UUID& uuid) {
     BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
-    return md.options.uuid && md.options.uuid == uuid;
+    invariant(md.options.uuid,
+              str::stream() << "UUID missing for catalog entry " << catalogId << " : "
+                            << md.toBSON());
+    return *md.options.uuid == uuid;
 }
 
 void DurableCatalogImpl::setIsTemp(OperationContext* opCtx, RecordId catalogId, bool isTemp) {
@@ -1257,6 +1268,31 @@ bool DurableCatalogImpl::setIndexIsMultikey(OperationContext* opCtx,
     putMetaData(opCtx, catalogId, md);
     return true;
 }
+
+void DurableCatalogImpl::forceSetIndexIsMultikey(OperationContext* opCtx,
+                                                 RecordId catalogId,
+                                                 const IndexDescriptor* desc,
+                                                 bool isMultikey,
+                                                 const MultikeyPaths& multikeyPaths) {
+    BSONCollectionCatalogEntry::MetaData md = getMetaData(opCtx, catalogId);
+
+    int offset = md.findIndexOffset(desc->indexName());
+    invariant(offset >= 0,
+              str::stream() << "cannot set index " << desc->indexName() << " multikey state @ "
+                            << catalogId << " : " << md.toBSON());
+
+    md.indexes[offset].multikey = isMultikey;
+    if (indexTypeSupportsPathLevelMultikeyTracking(desc->getAccessMethodName())) {
+        if (isMultikey) {
+            md.indexes[offset].multikeyPaths = multikeyPaths;
+        } else {
+            md.indexes[offset].multikeyPaths =
+                MultikeyPaths{static_cast<size_t>(desc->keyPattern().nFields())};
+        }
+    }
+    putMetaData(opCtx, catalogId, md);
+}
+
 
 CollectionOptions DurableCatalogImpl::getCollectionOptions(OperationContext* opCtx,
                                                            RecordId catalogId) const {

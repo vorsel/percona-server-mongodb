@@ -34,9 +34,9 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/tenant_migration_committed_info.h"
 #include "mongo/db/repl/tenant_migration_donor_service.h"
-#include "mongo/db/repl/tenant_migration_donor_util.h"
 
 namespace mongo {
 namespace {
@@ -62,37 +62,56 @@ public:
                     repl::feature_flags::gTenantMigrations.isEnabled(
                         serverGlobalParams.featureCompatibility));
 
-            const RequestType& requestBody = request();
+            // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+            uassert(
+                5356100,
+                "donorStartMigration not available while upgrading or downgrading the donor FCV",
+                !serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading());
 
-            const auto donorStateDoc =
-                TenantMigrationDonorDocument(requestBody.getMigrationId(),
-                                             requestBody.getRecipientConnectionString().toString(),
-                                             requestBody.getReadPreference(),
-                                             requestBody.getTenantId().toString(),
-                                             requestBody.getDonorCertificateForRecipient(),
-                                             requestBody.getRecipientCertificateForDonor())
-                    .toBSON();
+            const auto& cmd = request();
+
+            TenantMigrationDonorDocument stateDoc(cmd.getMigrationId(),
+                                                  cmd.getRecipientConnectionString().toString(),
+                                                  cmd.getReadPreference(),
+                                                  cmd.getTenantId().toString());
+
+            if (!repl::tenantMigrationDisableX509Auth) {
+                uassert(ErrorCodes::InvalidOptions,
+                        str::stream() << "'" << Request::kDonorCertificateForRecipientFieldName
+                                      << "' is a required field",
+                        cmd.getDonorCertificateForRecipient());
+                uassert(ErrorCodes::InvalidOptions,
+                        str::stream() << "'" << Request::kRecipientCertificateForDonorFieldName
+                                      << "' is a required field",
+                        cmd.getRecipientCertificateForDonor());
+                stateDoc.setDonorCertificateForRecipient(cmd.getDonorCertificateForRecipient());
+                stateDoc.setRecipientCertificateForDonor(cmd.getRecipientCertificateForDonor());
+            }
+
+            const auto stateDocBson = stateDoc.toBSON();
 
             auto donorService =
                 repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
                     ->lookupServiceByName(TenantMigrationDonorService::kServiceName);
             auto donor = TenantMigrationDonorService::Instance::getOrCreate(
-                opCtx, donorService, donorStateDoc);
+                opCtx, donorService, stateDocBson);
 
             // If the conflict is discovered here, it implies that there is an existing instance
             // with the same migrationId but different options (e.g. tenantId or
             // recipientConnectionString or readPreference).
-            uassertStatusOK(donor->checkIfOptionsConflict(donorStateDoc));
+            uassertStatusOK(donor->checkIfOptionsConflict(stateDoc));
 
             auto durableState = [&] {
                 try {
                     return donor->getDurableState(opCtx);
-                } catch (ExceptionFor<ErrorCodes::ConflictingOperationInProgress>&) {
+                } catch (ExceptionFor<ErrorCodes::ConflictingOperationInProgress>& ex) {
                     // The conflict is discovered while inserting the donor instance's state doc.
                     // This implies that there is no other instance with the same migrationId, but
                     // there is another instance with the same tenantId. Therefore, the instance
                     // above was created by this command, so remove it.
-                    donorService->releaseInstance(donorStateDoc["_id"].wrap());
+                    // The status from this exception will be passed to the instance interrupt()
+                    // method.
+                    donorService->releaseInstance(stateDocBson["_id"].wrap(), ex.toStatus());
                     throw;
                 }
             }();
@@ -153,22 +172,21 @@ public:
                     repl::feature_flags::gTenantMigrations.isEnabled(
                         serverGlobalParams.featureCompatibility));
 
-            const RequestType& requestBody = request();
+            const auto& cmd = request();
 
             auto donorService =
                 repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
                     ->lookupServiceByName(TenantMigrationDonorService::kServiceName);
             auto donor = TenantMigrationDonorService::Instance::lookup(
-                opCtx, donorService, BSON("_id" << requestBody.getMigrationId()));
+                opCtx, donorService, BSON("_id" << cmd.getMigrationId()));
             uassert(ErrorCodes::NoSuchTenantMigration,
                     str::stream() << "Could not find tenant migration with id "
-                                  << requestBody.getMigrationId(),
+                                  << cmd.getMigrationId(),
                     donor);
 
             auto durableState = donor.get()->getDurableState(opCtx);
             uassert(ErrorCodes::TenantMigrationInProgress,
-                    str::stream() << "Could not forget migration with id "
-                                  << requestBody.getMigrationId()
+                    str::stream() << "Could not forget migration with id " << cmd.getMigrationId()
                                   << " since no decision has been made yet",
                     durableState.state == TenantMigrationDonorStateEnum::kCommitted ||
                         durableState.state == TenantMigrationDonorStateEnum::kAborted);
@@ -222,19 +240,20 @@ public:
                     repl::feature_flags::gTenantMigrations.isEnabled(
                         serverGlobalParams.featureCompatibility));
 
-            const RequestType& requestBody = request();
+            const RequestType& cmd = request();
 
             auto donorService =
                 repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
                     ->lookupServiceByName(TenantMigrationDonorService::kServiceName);
             auto donorPtr = TenantMigrationDonorService::Instance::lookup(
-                opCtx, donorService, BSON("_id" << requestBody.getMigrationId()));
+                opCtx, donorService, BSON("_id" << cmd.getMigrationId()));
 
             // If there is NoSuchTenantMigration, perform a noop write and wait for it to be
             // majority committed to verify that any durable data read up to this point is majority
             // committed.
             if (!donorPtr) {
-                tenant_migration_donor::performNoopWrite(opCtx, "NoSuchTenantMigration error");
+                tenant_migration_access_blocker::performNoopWrite(opCtx,
+                                                                  "NoSuchTenantMigration error");
 
                 auto& replClient = repl::ReplClientInfo::forClient(opCtx->getClient());
                 WriteConcernResult writeConcernResult;
@@ -246,7 +265,7 @@ public:
 
                 uasserted(ErrorCodes::NoSuchTenantMigration,
                           str::stream() << "Could not find tenant migration with id "
-                                        << requestBody.getMigrationId());
+                                        << cmd.getMigrationId());
             }
 
             const auto& donor = donorPtr.get().get();

@@ -37,12 +37,10 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/api_parameters.h"
 #include "mongo/db/exec/document_value/document_comparator.h"
 #include "mongo/db/exec/document_value/value_comparator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/db/pipeline/aggregate_command_gen.h"
 #include "mongo/db/pipeline/javascript_execution.h"
 #include "mongo/db/pipeline/legacy_runtime_constants_gen.h"
 #include "mongo/db/pipeline/process_interface/mongo_process_interface.h"
@@ -57,6 +55,8 @@
 #include "mongo/util/uuid.h"
 
 namespace mongo {
+
+class AggregateCommand;
 
 class ExpressionContext : public RefCountable {
 public:
@@ -364,10 +364,15 @@ public:
     // construction.
     const bool mayDbProfile = true;
 
-    // API Parameters pulled from OperationContext upon object creation.
-    // This may become stale if OperationContext changes after object creation.
-    // Expressions should reach APIParameters with this variable instead of using the decorator.
-    APIParameters apiParameters;
+    // True if all expressions which use this expression context can be translated into equivalent
+    // SBE expressions.
+    bool sbeCompatible = true;
+
+    // These fields can be used in a context when API version validations were not enforced during
+    // parse time (Example creating a view or validator), but needs to be enforce while querying
+    // later.
+    bool exprUnstableForApiV1 = false;
+    bool exprDeprectedForApiV1 = false;
 
 protected:
     static const int kInterruptCheckPeriod = 128;

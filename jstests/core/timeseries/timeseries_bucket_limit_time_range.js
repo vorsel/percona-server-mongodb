@@ -20,8 +20,7 @@ if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
     return;
 }
 
-const testDB = db.getSiblingDB(jsTestName());
-assert.commandWorked(testDB.dropDatabase());
+const collNamePrefix = 'timeseries_bucket_limit_time_range_';
 
 const timeFieldName = 'time';
 
@@ -30,19 +29,20 @@ const docTimes = [ISODate("2020-11-13T01:00:00Z"), ISODate("2020-11-13T03:00:00Z
 const numDocs = 2;
 
 const runTest = function(numDocsPerInsert) {
-    const coll = testDB.getCollection('t_' + numDocsPerInsert);
-    const bucketsColl = testDB.getCollection('system.buckets.' + coll.getName());
+    const coll = db.getCollection(collNamePrefix + numDocsPerInsert);
+    const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
     coll.drop();
 
     assert.commandWorked(
-        testDB.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
-    assert.contains(bucketsColl.getName(), testDB.getCollectionNames());
+        db.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
+    assert.contains(bucketsColl.getName(), db.getCollectionNames());
 
     let docs = [];
     for (let i = 0; i < numDocs; i++) {
         docs.push({_id: i, [timeFieldName]: docTimes[i], x: i});
         if ((i + 1) % numDocsPerInsert === 0) {
-            assert.commandWorked(coll.insert(docs), 'failed to insert docs: ' + tojson(docs));
+            assert.commandWorked(coll.insert(docs, {ordered: false}),
+                                 'failed to insert docs: ' + tojson(docs));
             docs = [];
         }
     }

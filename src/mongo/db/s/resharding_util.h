@@ -33,11 +33,14 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/resharding/coordinator_document_gen.h"
 #include "mongo/db/s/resharding/donor_oplog_id_gen.h"
+#include "mongo/db/s/sharding_state_lock.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_tags.h"
 #include "mongo/s/chunk_manager.h"
@@ -70,6 +73,7 @@ void emplaceFetchTimestampIfExists(ClassWithFetchTimestamp& c,
     fetchTimestampStruct.setFetchTimestamp(std::move(fetchTimestamp));
     c.setFetchTimestampStruct(std::move(fetchTimestampStruct));
 }
+
 /**
  * Emplaces the 'minFetchTimestamp' onto the ClassWithFetchTimestamp if the timestamp has been
  * emplaced inside the boost::optional.
@@ -116,11 +120,55 @@ void emplaceStrictConsistencyTimestampIfExists(
 }
 
 /**
+ * Emplaces the 'abortReason' onto the ClassWithAbortReason if the reason has been emplaced inside
+ * the boost::optional.
+ */
+template <class ClassWithAbortReason>
+void emplaceAbortReasonIfExists(ClassWithAbortReason& c, boost::optional<Status> abortReason) {
+    if (!abortReason) {
+        return;
+    }
+
+    invariant(!abortReason->isOK());
+
+    if (auto alreadyExistingAbortReason = c.getAbortReason()) {
+        // If there already is an abortReason, don't overwrite it.
+        return;
+    }
+
+    BSONObjBuilder bob;
+    abortReason.get().serializeErrorToBSON(&bob);
+    AbortReason abortReasonStruct;
+    abortReasonStruct.setAbortReason(bob.obj());
+    c.setAbortReasonStruct(std::move(abortReasonStruct));
+}
+
+/**
+ * Extract the abortReason BSONObj into a status.
+ */
+template <class ClassWithAbortReason>
+Status getStatusFromAbortReason(ClassWithAbortReason& c) {
+    invariant(c.getAbortReason());
+    auto abortReasonObj = c.getAbortReason().get();
+    BSONElement codeElement = abortReasonObj["code"];
+    BSONElement errmsgElement = abortReasonObj["errmsg"];
+    int code = codeElement.numberInt();
+    std::string errmsg;
+    if (errmsgElement.type() == String) {
+        errmsg = errmsgElement.String();
+    } else if (!errmsgElement.eoo()) {
+        errmsg = errmsgElement.toString();
+    }
+    return Status(ErrorCodes::Error(code), errmsg, abortReasonObj);
+}
+
+/**
  * Helper method to construct a DonorShardEntry with the fields specified.
  */
 DonorShardEntry makeDonorShard(ShardId shardId,
                                DonorStateEnum donorState,
-                               boost::optional<Timestamp> minFetchTimestamp = boost::none);
+                               boost::optional<Timestamp> minFetchTimestamp = boost::none,
+                               boost::optional<Status> abortReason = boost::none);
 
 /**
  * Helper method to construct a RecipientShardEntry with the fields specified.
@@ -128,7 +176,8 @@ DonorShardEntry makeDonorShard(ShardId shardId,
 RecipientShardEntry makeRecipientShard(
     ShardId shardId,
     RecipientStateEnum recipientState,
-    boost::optional<Timestamp> strictConsistencyTimestamp = boost::none);
+    boost::optional<Timestamp> strictConsistencyTimestamp = boost::none,
+    boost::optional<Status> abortReason = boost::none);
 
 /**
  * Gets the UUID for 'nss' from the 'cm'
@@ -146,13 +195,26 @@ UUID getCollectionUUIDFromChunkManger(const NamespaceString& nss, const ChunkMan
 NamespaceString constructTemporaryReshardingNss(StringData db, const UUID& sourceUuid);
 
 /**
+ * Gets the recipient shards for a resharding operation.
+ */
+std::set<ShardId> getRecipientShards(OperationContext* opCtx,
+                                     const NamespaceString& reshardNss,
+                                     const UUID& reshardingUUID);
+
+/**
  * Sends _flushRoutingTableCacheUpdatesWithWriteConcern to a list of shards. Throws if one of the
  * shards fails to refresh.
  */
 void tellShardsToRefresh(OperationContext* opCtx,
                          const std::vector<ShardId>& shardIds,
                          const NamespaceString& nss,
-                         std::shared_ptr<executor::TaskExecutor> executor);
+                         const std::shared_ptr<executor::TaskExecutor>& executor);
+
+void sendCommandToShards(OperationContext* opCtx,
+                         const BSONObj& command,
+                         const std::vector<ShardId>& shardIds,
+                         const NamespaceString& nss,
+                         const std::shared_ptr<executor::TaskExecutor>& executor);
 
 /**
  * Asserts that there is not a hole or overlap in the chunks.
@@ -205,8 +267,7 @@ std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForReshard
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
     const ReshardingDonorOplogId& startAfter,
     UUID collUUID,
-    const ShardId& recipientShard,
-    bool doesDonorOwnMinKeyChunk);
+    const ShardId& recipientShard);
 
 /**
  * Returns the shard Id of the recipient shard that would own the document under the new shard
@@ -231,6 +292,8 @@ boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
 bool isFinalOplog(const repl::OplogEntry& oplog);
 bool isFinalOplog(const repl::OplogEntry& oplog, UUID reshardingUUID);
 
-NamespaceString getLocalOplogBufferNamespace(UUID reshardingUUID, ShardId donorShardId);
+NamespaceString getLocalOplogBufferNamespace(UUID existingUUID, ShardId donorShardId);
+
+NamespaceString getLocalConflictStashNamespace(UUID existingUUID, ShardId donorShardId);
 
 }  // namespace mongo

@@ -59,11 +59,15 @@ value::SlotAccessor* TextMatchStage::getAccessor(CompileCtx& ctx, value::SlotId 
 }
 
 void TextMatchStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.opens++;
     _children[0]->open(reOpen);
 }
 
 PlanState TextMatchStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     auto state = _children[0]->getNext();
 
     if (state == PlanState::ADVANCED) {
@@ -87,6 +91,8 @@ PlanState TextMatchStage::getNext() {
 }
 
 void TextMatchStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.closes++;
     _children[0]->close();
 }
@@ -110,8 +116,8 @@ std::unique_ptr<PlanStageStats> TextMatchStage::getStats(bool includeDebugInfo) 
 
     if (includeDebugInfo) {
         BSONObjBuilder bob;
-        bob.appendIntOrLL("inputSlot", _inputSlot);
-        bob.appendIntOrLL("outputSlot", _outputSlot);
+        bob.appendNumber("inputSlot", static_cast<long long>(_inputSlot));
+        bob.appendNumber("outputSlot", static_cast<long long>(_outputSlot));
         ret->debugInfo = bob.obj();
     }
 

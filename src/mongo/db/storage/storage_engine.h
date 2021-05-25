@@ -422,6 +422,12 @@ public:
     virtual void setJournalListener(JournalListener* jl) = 0;
 
     /**
+     * Returns true if the storage engine supports collections clustered on _id. That is,
+     * collections will use _id values as their RecordId and do not need a separate _id index.
+     */
+    virtual bool supportsClusteredIdIndex() const = 0;
+
+    /**
      * Returns whether the storage engine supports "recover to stable timestamp". Returns true
      * if the storage engine supports "recover to stable timestamp" but does not currently have
      * a stable timestamp. In that case StorageEngine::recoverToStableTimestamp() will return
@@ -676,8 +682,12 @@ public:
      * | requested >= oldest | false/true      | <OK, requested timestamp> |
      * | requested < oldest  | false           | <SnapshotTooOld>          |
      * | requested < oldest  | true            | <OK, oldest timestamp>    |
+     *
+     * If the input OperationContext is in a WriteUnitOfWork, an `onRollback` handler will be
+     * registered to return the pin for the `requestingServiceName` to the previous value.
      */
-    virtual StatusWith<Timestamp> pinOldestTimestamp(const std::string& requestingServiceName,
+    virtual StatusWith<Timestamp> pinOldestTimestamp(OperationContext* opCtx,
+                                                     const std::string& requestingServiceName,
                                                      Timestamp requestedTimestamp,
                                                      bool roundUpIfTooOld) = 0;
 

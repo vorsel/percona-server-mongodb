@@ -329,6 +329,10 @@ void CollectionImpl::init(OperationContext* opCtx) {
                               "validatorStatus"_attr = _validator.getStatus());
     }
 
+    if (collectionOptions.clusteredIndex) {
+        _clustered = true;
+    }
+
     getIndexCatalog()->init(opCtx).transitional_ignore();
     _initialized = true;
 }
@@ -359,6 +363,11 @@ bool CollectionImpl::requiresIdIndex() const {
         return false;
     }
 
+    if (isClustered()) {
+        // Collections clustered by _id do not have a separate _id index.
+        return false;
+    }
+
     if (_ns.isSystem()) {
         StringData shortName = _ns.coll().substr(_ns.coll().find('.') + 1);
         if (shortName == "indexes" || shortName == "namespaces" || shortName == "profile") {
@@ -385,6 +394,25 @@ bool CollectionImpl::findDoc(OperationContext* opCtx,
     return true;
 }
 
+Status CollectionImpl::checkValidatorAPIVersionCompatability(OperationContext* opCtx) const {
+    if (!_validator.expCtxForFilter) {
+        return Status::OK();
+    }
+    const auto& apiParams = APIParameters::get(opCtx);
+    const auto apiVersion = apiParams.getAPIVersion().value_or("");
+    if (apiParams.getAPIStrict().value_or(false) && apiVersion == "1" &&
+        _validator.expCtxForFilter->exprUnstableForApiV1) {
+        return {ErrorCodes::APIStrictError,
+                "The validator uses unstable expression(s) for API Version 1."};
+    }
+    if (apiParams.getAPIDeprecationErrors().value_or(false) && apiVersion == "1" &&
+        _validator.expCtxForFilter->exprDeprectedForApiV1) {
+        return {ErrorCodes::APIDeprecationError,
+                "The validator uses deprecated expression(s) for API Version 1."};
+    }
+    return Status::OK();
+}
+
 Status CollectionImpl::checkValidation(OperationContext* opCtx, const BSONObj& document) const {
     if (!_validator.isOK()) {
         return _validator.getStatus();
@@ -405,6 +433,11 @@ Status CollectionImpl::checkValidation(OperationContext* opCtx, const BSONObj& d
         // and the recipient should not perform validation on documents inserted into the temporary
         // resharding collection.
         return Status::OK();
+    }
+
+    auto status = checkValidatorAPIVersionCompatability(opCtx);
+    if (!status.isOK()) {
+        return status;
     }
 
     // TODO SERVER-50524: remove these FCV checks when 5.0 becomes last-lts in order to make sure
@@ -617,10 +650,22 @@ Status CollectionImpl::insertDocumentForBulkLoader(
 
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_IX));
 
+    RecordId recordId;
+    if (isClustered()) {
+        // Collections clustered by _id require ObjectId values.
+        BSONElement oidElem;
+        bool foundId = doc.getObjectID(oidElem);
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "Document " << redact(doc) << " is missing the '_id' field",
+                foundId);
+        invariant(_shared->_recordStore->keyFormat() == KeyFormat::String);
+        recordId = RecordId(oidElem.OID().view().view(), OID::kOIDSize);
+    }
+
     // Using timestamp 0 for these inserts, which are non-oplog so we don't have an appropriate
     // timestamp to use.
-    StatusWith<RecordId> loc =
-        _shared->_recordStore->insertRecord(opCtx, doc.objdata(), doc.objsize(), Timestamp());
+    StatusWith<RecordId> loc = _shared->_recordStore->insertRecord(
+        opCtx, recordId, doc.objdata(), doc.objsize(), Timestamp());
 
     if (!loc.isOK())
         return loc.getStatus();
@@ -686,13 +731,27 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
     for (auto it = begin; it != end; it++) {
         const auto& doc = it->doc;
 
+        RecordId recordId;
+        if (isClustered()) {
+            // Collections clustered by _id require ObjectId values.
+            BSONElement oidElem;
+            bool foundId = doc.getObjectID(oidElem);
+            uassert(ErrorCodes::BadValue,
+                    str::stream() << "Document " << redact(doc) << " is missing the '_id' field",
+                    foundId);
+
+            invariant(_shared->_recordStore->keyFormat() == KeyFormat::String);
+            recordId = RecordId(oidElem.OID().view().view(), OID::kOIDSize);
+        }
+
         if (MONGO_unlikely(corruptDocumentOnInsert.shouldFail())) {
             // Insert a truncated record that is half the expected size of the source document.
-            records.emplace_back(Record{RecordId(), RecordData(doc.objdata(), doc.objsize() / 2)});
+            records.emplace_back(Record{recordId, RecordData(doc.objdata(), doc.objsize() / 2)});
             timestamps.emplace_back(it->oplogSlot.getTimestamp());
             continue;
         }
-        records.emplace_back(Record{RecordId(), RecordData(doc.objdata(), doc.objsize())});
+
+        records.emplace_back(Record{recordId, RecordData(doc.objdata(), doc.objsize())});
         timestamps.emplace_back(it->oplogSlot.getTimestamp());
     }
     Status status = _shared->_recordStore->insertRecords(opCtx, &records, timestamps);
@@ -704,8 +763,10 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
     int recordIndex = 0;
     for (auto it = begin; it != end; it++) {
         RecordId loc = records[recordIndex++].id;
-        invariant(RecordId::min() < loc);
-        invariant(loc < RecordId::max());
+        if (_shared->_recordStore->keyFormat() == KeyFormat::Long) {
+            invariant(RecordId::minLong() < loc);
+            invariant(loc < RecordId::maxLong());
+        }
 
         BsonRecord bsonRecord = {loc, Timestamp(it->oplogSlot.getTimestamp()), &(it->doc)};
         bsonRecords.push_back(bsonRecord);
@@ -937,6 +998,10 @@ StatusWith<RecordData> CollectionImpl::updateDocumentWithDamages(
 
 bool CollectionImpl::isTemporary(OperationContext* opCtx) const {
     return DurableCatalog::get(opCtx)->getCollectionOptions(opCtx, getCatalogId()).temp;
+}
+
+bool CollectionImpl::isClustered() const {
+    return _clustered;
 }
 
 bool CollectionImpl::getRecordPreImages() const {

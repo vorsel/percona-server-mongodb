@@ -36,7 +36,6 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/catalog/type_tags.h"
-#include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/util/string_map.h"
@@ -45,9 +44,9 @@ namespace mongo {
 
 struct SplitPolicyParams {
     NamespaceString nss;
-    // TODO SERVER-53105 update this comment explaining that just (nss || uuid) field will be
-    // persisted If boost::none, the resulting config.chunks document(s) are not going to include
-    // the collection UUID field
+    // If collectionUUID is set, then only the uuid field will be persisted on the config.chunks
+    // document(s), but not the nss. If collectionUUID is not set, then only nss will be persisted
+    // on config.chunks, but not the uuid.
     boost::optional<CollectionUUID> collectionUUID;
     ShardId primaryShardId;
 };
@@ -61,7 +60,9 @@ public:
     static std::unique_ptr<InitialSplitPolicy> calculateOptimizationStrategy(
         OperationContext* opCtx,
         const ShardKeyPattern& shardKeyPattern,
-        const ShardsvrShardCollectionRequest& request,
+        const std::int64_t numInitialChunks,
+        const bool presplitHashedZones,
+        const boost::optional<std::vector<BSONObj>>& initialSplitPoints,
         const std::vector<TagsType>& tags,
         size_t numShards,
         bool collectionIsEmpty);

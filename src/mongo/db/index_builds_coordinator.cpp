@@ -49,6 +49,7 @@
 #include "mongo/db/index_build_entry_helpers.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/cloner_utils.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/timestamp_block.h"
@@ -765,6 +766,34 @@ void IndexBuildsCoordinator::abortDatabaseIndexBuilds(OperationContext* opCtx,
     }
 }
 
+void IndexBuildsCoordinator::abortTenantIndexBuilds(OperationContext* opCtx,
+                                                    StringData tenantId,
+                                                    const std::string& reason) {
+    LOGV2(4886203,
+          "About to abort all index builders running for collections belonging to the given tenant",
+          "tenantId"_attr = tenantId,
+          "reason"_attr = reason);
+
+    auto builds = [&]() -> std::vector<std::shared_ptr<ReplIndexBuildState>> {
+        auto indexBuildFilter = [=](const auto& replState) {
+            return repl::ClonerUtils::isDatabaseForTenant(replState.dbName, tenantId);
+        };
+        return activeIndexBuilds.filterIndexBuilds(indexBuildFilter);
+    }();
+    for (auto replState : builds) {
+        if (!abortIndexBuildByBuildUUID(
+                opCtx, replState->buildUUID, IndexBuildAction::kTenantMigrationAbort, reason)) {
+            // The index build may already be in the midst of tearing down.
+            LOGV2(4886204,
+                  "Index build: failed to abort index build for tenant migration",
+                  "tenantId"_attr = tenantId,
+                  "buildUUID"_attr = replState->buildUUID,
+                  "db"_attr = replState->dbName,
+                  "collectionUUID"_attr = replState->collectionUUID);
+        }
+    }
+}
+
 void IndexBuildsCoordinator::abortAllIndexBuildsForInitialSync(OperationContext* opCtx,
                                                                const std::string& reason) {
     LOGV2(4833200, "About to abort all index builders running", "reason"_attr = reason);
@@ -1079,7 +1108,8 @@ bool IndexBuildsCoordinator::abortIndexBuildByBuildUUID(OperationContext* opCtx,
                 signalAction = IndexBuildAction::kInitialSyncAbort;
             }
 
-            if (IndexBuildAction::kPrimaryAbort == signalAction &&
+            if ((IndexBuildAction::kPrimaryAbort == signalAction ||
+                 IndexBuildAction::kTenantMigrationAbort == signalAction) &&
                 !replCoord->canAcceptWritesFor(opCtx, dbAndUUID)) {
                 uassertStatusOK({ErrorCodes::NotWritablePrimary,
                                  str::stream()
@@ -1168,6 +1198,7 @@ void IndexBuildsCoordinator::_completeAbort(OperationContext* opCtx,
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     switch (signalAction) {
         // Replicates an abortIndexBuild oplog entry and deletes the index from the durable catalog.
+        case IndexBuildAction::kTenantMigrationAbort:
         case IndexBuildAction::kPrimaryAbort: {
             // Single-phase builds are aborted on step-down, so it's possible to no longer be
             // primary after we process an abort. We must continue with the abort, but since
@@ -1669,23 +1700,26 @@ IndexBuildsCoordinator::_filterSpecsAndRegisterBuild(OperationContext* opCtx,
     AutoGetCollection autoColl(opCtx, nssOrUuid, MODE_X);
     CollectionWriter collection(autoColl);
 
+    const auto& ns = collection.get()->ns();
+    auto css = CollectionShardingState::get(opCtx, ns);
+
     // Disallow index builds on drop-pending namespaces (system.drop.*) if we are primary.
     auto replCoord = repl::ReplicationCoordinator::get(opCtx);
     if (replCoord->getSettings().usingReplSets() &&
         replCoord->canAcceptWritesFor(opCtx, nssOrUuid)) {
         uassert(ErrorCodes::NamespaceNotFound,
-                str::stream() << "drop-pending collection: " << collection.get()->ns(),
-                !collection.get()->ns().isDropPendingNamespace());
+                str::stream() << "drop-pending collection: " << ns,
+                !ns.isDropPendingNamespace());
     }
 
     // This check is for optimization purposes only as since this lock is released after this,
     // and is acquired again when we build the index in _setUpIndexBuild.
-    CollectionShardingState::get(opCtx, collection.get()->ns())->checkShardVersionOrThrow(opCtx);
+    css->checkShardVersionOrThrow(opCtx);
+    css->getCollectionDescription(opCtx).throwIfReshardingInProgress(ns);
 
     std::vector<BSONObj> filteredSpecs;
     try {
-        filteredSpecs =
-            prepareSpecListForCreate(opCtx, collection.get(), collection.get()->ns(), specs);
+        filteredSpecs = prepareSpecListForCreate(opCtx, collection.get(), ns, specs);
     } catch (const DBException& ex) {
         return ex.toStatus();
     }
@@ -1711,15 +1745,12 @@ IndexBuildsCoordinator::_filterSpecsAndRegisterBuild(OperationContext* opCtx,
             // commitIndexBuild oplog entries, this optimization will fail to accurately timestamp
             // the catalog update when it uses the timestamp from the startIndexBuild, rather than
             // the commitIndexBuild, oplog entry.
-            writeConflictRetry(opCtx,
-                               "IndexBuildsCoordinator::_filterSpecsAndRegisterBuild",
-                               collection.get()->ns().ns(),
-                               [&] {
-                                   WriteUnitOfWork wuow(opCtx);
-                                   createIndexesOnEmptyCollection(
-                                       opCtx, collection, filteredSpecs, false);
-                                   wuow.commit();
-                               });
+            writeConflictRetry(
+                opCtx, "IndexBuildsCoordinator::_filterSpecsAndRegisterBuild", ns.ns(), [&] {
+                    WriteUnitOfWork wuow(opCtx);
+                    createIndexesOnEmptyCollection(opCtx, collection, filteredSpecs, false);
+                    wuow.commit();
+                });
         } catch (DBException& ex) {
             ex.addContext(str::stream() << "index build on empty collection failed: " << buildUUID);
             return ex.toStatus();
@@ -2053,9 +2084,8 @@ void IndexBuildsCoordinator::_runIndexBuildInner(
     // This Status stays unchanged unless we catch an exception in the following try-catch block.
     auto status = Status::OK();
     try {
-        while (MONGO_unlikely(hangAfterInitializingIndexBuild.shouldFail())) {
-            hangAfterInitializingIndexBuild.pauseWhileSet(opCtx);
-        }
+
+        hangAfterInitializingIndexBuild.pauseWhileSet(opCtx);
 
         if (resumeInfo) {
             _resumeIndexBuildFromPhase(opCtx, replState, indexBuildOptions, resumeInfo.get());
@@ -2090,6 +2120,8 @@ void IndexBuildsCoordinator::_runIndexBuildInner(
     // commit-time, there is no work to do. This is the most routine case, since index
     // constraint checking happens at commit-time for index builds.
     if (replState->isAborted()) {
+        if (ErrorCodes::isTenantMigrationError(replState->getAbortStatus()))
+            uassertStatusOK(replState->getAbortStatus());
         uassertStatusOK(status);
     }
 
@@ -2146,12 +2178,17 @@ void IndexBuildsCoordinator::_resumeIndexBuildFromPhase(
 
     if (resumeInfo.getPhase() == IndexBuildPhaseEnum::kInitialized ||
         resumeInfo.getPhase() == IndexBuildPhaseEnum::kCollectionScan) {
-        _scanCollectionAndInsertSortedKeysIntoIndex(
-            opCtx,
-            replState,
-            resumeInfo.getCollectionScanPosition()
-                ? boost::make_optional<RecordId>(RecordId(*resumeInfo.getCollectionScanPosition()))
-                : boost::none);
+        boost::optional<RecordId> resumeAfterRecordId;
+        if (resumeInfo.getCollectionScanPosition()) {
+            auto scanPosition = *resumeInfo.getCollectionScanPosition();
+            if (auto recordIdOIDPtr = stdx::get_if<OID>(&scanPosition)) {
+                resumeAfterRecordId.emplace(recordIdOIDPtr->view().view(), OID::kOIDSize);
+            } else if (auto recordIdLongPtr = stdx::get_if<int64_t>(&scanPosition)) {
+                resumeAfterRecordId.emplace(RecordId(*recordIdLongPtr));
+            }
+        }
+
+        _scanCollectionAndInsertSortedKeysIntoIndex(opCtx, replState, resumeAfterRecordId);
     } else if (resumeInfo.getPhase() == IndexBuildPhaseEnum::kBulkLoad) {
         _insertSortedKeysIntoIndexForResume(opCtx, replState);
     }

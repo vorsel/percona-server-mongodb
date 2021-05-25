@@ -34,13 +34,13 @@
 #include <string>
 #include <wiredtiger.h>
 
-#include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/storage/capped_callback.h"
 #include "mongo/db/storage/record_store.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_cursor.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_recovery_unit.h"
 #include "mongo/db/storage/wiredtiger/wiredtiger_size_storer.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_util.h"
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/condition_variable.h"
@@ -104,6 +104,7 @@ public:
         std::string ident;
         std::string engineName;
         bool isCapped;
+        KeyFormat keyFormat;
         bool isEphemeral;
         int64_t cappedMaxSize;
         int64_t cappedMaxDocs;
@@ -123,6 +124,8 @@ public:
 
     // name of the RecordStore implementation
     virtual const char* name() const;
+
+    virtual KeyFormat keyFormat() const;
 
     virtual long long dataSize(OperationContext* opCtx) const;
 
@@ -193,9 +196,6 @@ public:
                                    double scale) const;
 
     virtual void cappedTruncateAfter(OperationContext* opCtx, RecordId end, bool inclusive);
-
-    virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
-                                                     const RecordId& startingPosition) const;
 
     virtual Status oplogDiskLocRegister(OperationContext* opCtx,
                                         const Timestamp& opTime,
@@ -276,18 +276,18 @@ public:
         return _oplogStones.get();
     };
 
+    typedef stdx::variant<int64_t, WiredTigerItem> CursorKey;
+
 protected:
     virtual RecordId getKey(WT_CURSOR* cursor) const = 0;
 
-    virtual void setKey(WT_CURSOR* cursor, RecordId id) const = 0;
+    virtual void setKey(WT_CURSOR* cursor, const CursorKey& key) const = 0;
 
 private:
     class RandomCursor;
 
     class NumRecordsChange;
     class DataSizeChange;
-
-    static WiredTigerRecoveryUnit* _getRecoveryUnit(OperationContext* opCtx);
 
     Status _insertRecords(OperationContext* opCtx,
                           Record* records,
@@ -352,6 +352,8 @@ private:
     const std::string _engineName;
     // The capped settings should not be updated once operations have started
     const bool _isCapped;
+    // The format of this RecordStore's RecordId keys.
+    const KeyFormat _keyFormat;
     // True if the storage engine is an in-memory storage engine
     const bool _isEphemeral;
     // True if WiredTiger is logging updates to this table
@@ -408,7 +410,7 @@ public:
 protected:
     virtual RecordId getKey(WT_CURSOR* cursor) const;
 
-    virtual void setKey(WT_CURSOR* cursor, RecordId id) const;
+    virtual void setKey(WT_CURSOR* cursor, const CursorKey& key) const;
 };
 
 class WiredTigerRecordStoreCursorBase : public SeekableRecordCursor {
@@ -420,6 +422,8 @@ public:
     boost::optional<Record> next();
 
     boost::optional<Record> seekExact(const RecordId& id);
+
+    boost::optional<Record> seekNear(const RecordId& start);
 
     void save();
 
@@ -434,7 +438,7 @@ public:
 protected:
     virtual RecordId getKey(WT_CURSOR* cursor) const = 0;
 
-    virtual void setKey(WT_CURSOR* cursor, RecordId id) const = 0;
+    virtual void setKey(WT_CURSOR* cursor, const WiredTigerRecordStore::CursorKey& key) const = 0;
 
     /**
      * Called when restoring a cursor that has not been advanced.
@@ -470,7 +474,8 @@ public:
 protected:
     virtual RecordId getKey(WT_CURSOR* cursor) const override;
 
-    virtual void setKey(WT_CURSOR* cursor, RecordId id) const override;
+    virtual void setKey(WT_CURSOR* cursor,
+                        const WiredTigerRecordStore::CursorKey& key) const override;
 
     virtual void initCursorToBeginning(){};
 };

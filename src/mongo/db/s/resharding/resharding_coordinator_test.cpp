@@ -167,6 +167,7 @@ protected:
         ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
         ChunkType chunk1(nss, chunkRanges[0], version, ShardId("shard0000"));
         chunk1.setName(ids[0]);
+        version.incMinor();
         ChunkType chunk2(nss, chunkRanges[1], version, ShardId("shard0001"));
         chunk2.setName(ids[1]);
 
@@ -248,10 +249,20 @@ protected:
                       0);
         ASSERT(coordinatorDoc.getState() == expectedCoordinatorDoc.getState());
         if (expectedCoordinatorDoc.getFetchTimestamp()) {
+            ASSERT(coordinatorDoc.getFetchTimestamp());
             ASSERT_EQUALS(coordinatorDoc.getFetchTimestamp().get(),
                           expectedCoordinatorDoc.getFetchTimestamp().get());
         } else {
             ASSERT(!coordinatorDoc.getFetchTimestamp());
+        }
+
+        // Confirm the (non)existence of the CoordinatorDocument abortReason.
+        if (expectedCoordinatorDoc.getAbortReason()) {
+            ASSERT(coordinatorDoc.getAbortReason());
+            ASSERT_BSONOBJ_EQ(coordinatorDoc.getAbortReason().get(),
+                              expectedCoordinatorDoc.getAbortReason().get());
+        } else {
+            ASSERT(!coordinatorDoc.getAbortReason());
         }
 
         if (!expectedCoordinatorDoc.getPresetReshardedChunks()) {
@@ -341,6 +352,12 @@ protected:
                 expectedReshardingFields->getDonorFields()->getReshardingKey().toBSON()),
             0);
 
+        if (auto expectedAbortReason = expectedCoordinatorDoc.getAbortReason()) {
+            ASSERT(onDiskReshardingFields.getAbortReason());
+            ASSERT_BSONOBJ_EQ(expectedAbortReason.get(),
+                              onDiskReshardingFields.getAbortReason().get());
+        }
+
         // Check the reshardingFields.recipientFields.
         if (expectedCoordinatorState != CoordinatorStateEnum::kError) {
             // Don't bother checking the recipientFields if the coordinator state is already kError.
@@ -389,6 +406,11 @@ protected:
                           expectedReshardingFields.getRecipientFields()->getFetchTimestamp().get());
         } else {
             ASSERT(!onDiskReshardingFields.getRecipientFields()->getFetchTimestamp());
+        }
+
+        if (onDiskReshardingFields.getState() == CoordinatorStateEnum::kError) {
+            // Confirm 'reshardingFields.abortReason' exists on the temporary collection.
+            ASSERT(onDiskReshardingFields.getAbortReason());
         }
 
         // 'donorFields' should not exist for the temporary collection.
@@ -449,13 +471,19 @@ protected:
 
         // Check the resharding fields and allowMigrations in the config.collections entry for the
         // original collection
-        TypeCollectionReshardingFields originalReshardingFields(expectedCoordinatorDoc.get_id());
-        originalReshardingFields.setState(expectedCoordinatorDoc.getState());
+        TypeCollectionReshardingFields expectedReshardingFields(expectedCoordinatorDoc.get_id());
+        expectedReshardingFields.setState(expectedCoordinatorDoc.getState());
         TypeCollectionDonorFields donorField(expectedCoordinatorDoc.getReshardingKey());
-        originalReshardingFields.setDonorFields(donorField);
+        expectedReshardingFields.setDonorFields(donorField);
+        if (auto abortReason = expectedCoordinatorDoc.getAbortReason()) {
+            AbortReason abortReasonStruct;
+            abortReasonStruct.setAbortReason(abortReason);
+            expectedReshardingFields.setAbortReasonStruct(std::move(abortReasonStruct));
+        }
+
         auto expectedOriginalCollType = makeOriginalCollectionCatalogEntry(
             expectedCoordinatorDoc,
-            originalReshardingFields,
+            expectedReshardingFields,
             std::move(collectionEpoch),
             opCtx->getServiceContext()->getPreciseClockSource()->now());
         assertOriginalCollectionCatalogEntryMatchesExpected(
@@ -503,6 +531,13 @@ protected:
 
             client.createCollection(ChunkType::ConfigNS.ns());
             client.createCollection(TagsType::ConfigNS.ns());
+
+            auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+            ASSERT_OK(configShard->createIndexOnConfig(
+                opCtx,
+                ChunkType::ConfigNS,
+                BSON(ChunkType::ns() << 1 << ChunkType::lastmod() << 1),
+                true));
         }
 
         resharding::insertCoordDocAndChangeOrigCollEntry(opCtx, expectedCoordinatorDoc);
@@ -740,9 +775,15 @@ TEST_F(ReshardingCoordinatorPersistenceTest, StateTransitionToErrorSucceeds) {
     auto coordinatorDoc =
         insertStateAndCatalogEntries(CoordinatorStateEnum::kPreparingToDonate, _originalEpoch);
 
+    insertChunkAndZoneEntries(
+        makeChunks(_originalNss, OID::gen(), _oldShardKey, std::vector{OID::gen(), OID::gen()}),
+        makeZones(_originalNss, _oldShardKey));
+
     // Persist the updates on disk
     auto expectedCoordinatorDoc = coordinatorDoc;
     expectedCoordinatorDoc.setState(CoordinatorStateEnum::kError);
+    auto abortReason = Status{ErrorCodes::InternalError, "reason to abort"};
+    emplaceAbortReasonIfExists(expectedCoordinatorDoc, abortReason);
 
     writeStateTransitionUpdateExpectSuccess(operationContext(), expectedCoordinatorDoc);
 }
@@ -761,7 +802,7 @@ TEST_F(ReshardingCoordinatorPersistenceTest, StateTransitionWhenCoordinatorDocDo
     ASSERT_THROWS_CODE(resharding::writeStateTransitionAndCatalogUpdatesThenBumpShardVersions(
                            operationContext(), coordinatorDoc),
                        AssertionException,
-                       50577);
+                       5057701);
 }
 
 TEST_F(ReshardingCoordinatorPersistenceTest,

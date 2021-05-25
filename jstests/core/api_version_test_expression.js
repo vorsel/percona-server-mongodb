@@ -7,7 +7,6 @@
  *   assumes_against_mongod_not_mongos,
  *   assumes_unsharded_collection,
  *   requires_fcv_47,
- *   sbe_incompatible,
  *   uses_api_parameters,
  * ]
  */
@@ -136,16 +135,27 @@ assert.commandFailedWithCode(
         {aggregate: "view", pipeline: pipeline, cursor: {}, apiVersion: "1", apiStrict: true}),
     ErrorCodes.APIStrictError);
 
-// Create a view with {unstable: true}.
+// Create a view with 'unstable' parameter should fail with 'apiStrict'.
 db.unstableView.drop();
-assert.commandWorked(db.runCommand({
+assert.commandFailedWithCode(db.runCommand({
     create: "unstableView",
     viewOn: collName,
     pipeline: pipeline,
     apiStrict: true,
     apiVersion: "1"
+}),
+                             ErrorCodes.APIStrictError);
+
+// Create a view with 'unstable' should be allowed without 'apiStrict'.
+assert.commandWorked(db.runCommand({
+    create: "unstableView",
+    viewOn: collName,
+    pipeline: pipeline,
+    apiVersion: "1",
+    apiStrict: false
 }));
 assert.commandWorked(db.runCommand({aggregate: "unstableView", pipeline: [], cursor: {}}));
+
 // This commmand will fail even with the empty pipeline because of the view.
 assert.commandFailedWithCode(
     db.runCommand(
@@ -156,19 +166,24 @@ assert.commandFailedWithCode(
 let validator = {$expr: {$_testApiVersion: {unstable: true}}};
 let validatedCollName = collName + "_validated";
 
-// Create the collection with the unstable validator, setting apiStrict: true does not have an
-// effect.
+// Creating a collection with the unstable validator is not allowed with apiStrict:true.
 db[validatedCollName].drop();
-assert.commandWorked(db.runCommand(
-    {create: validatedCollName, validator: validator, apiVersion: "1", apiStrict: true}));
+assert.commandFailedWithCode(
+    db.runCommand(
+        {create: validatedCollName, validator: validator, apiVersion: "1", apiStrict: true}),
+    ErrorCodes.APIStrictError);
 
-// Run an insert command without any API version and verify that it is successful.
+// Run create and insert commands without apiStrict:true and verify that it is successful.
+assert.commandWorked(db.runCommand(
+    {create: validatedCollName, validator: validator, apiVersion: "1", apiStrict: false}));
 assert.commandWorked(
     db[validatedCollName].runCommand({insert: validatedCollName, documents: [{num: 1}]}));
 
-// TODO SERVER-53218: Specifying apiStrict: true results in an error.
-assert.commandWorked(db[validatedCollName].runCommand(
-    {insert: validatedCollName, documents: [{num: 1}], apiVersion: "1", apiStrict: true}));
+// Specifying apiStrict: true results in an error.
+assert.commandFailedWithCode(
+    db[validatedCollName].runCommand(
+        {insert: validatedCollName, documents: [{num: 1}], apiVersion: "1", apiStrict: true}),
+    ErrorCodes.APIStrictError);
 
 // Recreate the validator containing a deprecated test expression.
 db[validatedCollName].drop();
@@ -176,41 +191,45 @@ validator = {
     $expr: {$_testApiVersion: {deprecated: true}}
 };
 
-// Create the collection with the unstable validator, setting apiDeprecationErrors : true does not
-// have an effect.
-assert.commandWorked(db.runCommand({
+// Creating a collection with the deprecated validator is not allowed with
+// apiDeprecationErrors:true.
+assert.commandFailedWithCode(db.runCommand({
     create: validatedCollName,
     validator: validator,
     apiVersion: "1",
     apiDeprecationErrors: true,
-}));
+}),
+                             ErrorCodes.APIDeprecationError);
 
-// Run an insert command without any API version and verify that it is successful.
+// Run create and insert commands without apiDeprecationErrors:true and verify that it is
+// successful.
+assert.commandWorked(db.runCommand({
+    create: validatedCollName,
+    validator: validator,
+    apiVersion: "1",
+    apiDeprecationErrors: false,
+}));
 assert.commandWorked(
     db[validatedCollName].runCommand({insert: validatedCollName, documents: [{num: 1}]}));
 
-// TODO SERVER-53218: Specifying apiDeprecationErrors: true results in an error.
-assert.commandWorked(db[validatedCollName].runCommand({
+// Specifying apiDeprecationErrors: true results in an error.
+assert.commandFailedWithCode(db[validatedCollName].runCommand({
     insert: validatedCollName,
     documents: [{num: 1}],
     apiVersion: "1",
     apiDeprecationErrors: true
-}));
+}),
+                             ErrorCodes.APIDeprecationError);
 
 // Test that API version parameters are inherited into the inner command of the explain command.
 function checkExplainInnerCommandGetsAPIVersionParameters(explainedCmd, errCode) {
-    let explainRes = db.runCommand(
-        {explain: explainedCmd, apiVersion: "1", apiDeprecationErrors: true, apiStrict: true});
-
-    assert(explainRes.hasOwnProperty('executionStats'), explainRes);
-    const execStats = explainRes['executionStats'];
-
-    // 'execStats' will return APIStrictError if the inner command gets the APIVersionParameters.
-    assert.eq(execStats['executionSuccess'], false, execStats);
-    assert.eq(execStats['errorCode'], errCode, execStats);
+    assert.commandFailedWithCode(
+        db.runCommand(
+            {explain: explainedCmd, apiVersion: "1", apiDeprecationErrors: true, apiStrict: true}),
+        errCode);
 
     // If 'apiStrict: false' the inner aggregate command will execute successfully.
-    explainRes = db.runCommand({explain: explainedCmd, apiVersion: "1", apiStrict: false});
+    const explainRes = db.runCommand({explain: explainedCmd, apiVersion: "1", apiStrict: false});
     assert(explainRes.hasOwnProperty('executionStats'), explainRes);
     assert.eq(explainRes['executionStats']['executionSuccess'], true, explainRes);
 }
@@ -235,4 +254,7 @@ findCmd = {
     projection: {v: {$_testApiVersion: {deprecated: true}}}
 };
 checkExplainInnerCommandGetsAPIVersionParameters(findCmd, ErrorCodes.APIDeprecationError);
+
+db[validatedCollName].drop();
+db.unstableView.drop();
 })();

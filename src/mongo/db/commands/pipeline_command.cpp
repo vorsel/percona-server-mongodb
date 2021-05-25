@@ -29,6 +29,7 @@
 
 #include "mongo/platform/basic.h"
 
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/run_aggregate.h"
@@ -72,13 +73,17 @@ public:
         OperationContext* opCtx,
         const OpMsgRequest& opMsgRequest,
         boost::optional<ExplainOptions::Verbosity> explainVerbosity) override {
-        const auto aggregationRequest = uassertStatusOK(aggregation_request_helper::parseFromBSON(
-            opMsgRequest.getDatabase().toString(), opMsgRequest.body, explainVerbosity));
+        const auto aggregationRequest = aggregation_request_helper::parseFromBSON(
+            opMsgRequest.getDatabase().toString(),
+            opMsgRequest.body,
+            explainVerbosity,
+            APIParameters::get(opCtx).getAPIStrict().value_or(false));
 
-        auto privileges =
-            uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
-                                ->getPrivilegesForAggregate(
-                                    aggregationRequest.getNamespace(), aggregationRequest, false));
+        auto privileges = uassertStatusOK(
+            auth::getPrivilegesForAggregate(AuthorizationSession::get(opCtx->getClient()),
+                                            aggregationRequest.getNamespace(),
+                                            aggregationRequest,
+                                            false));
 
         return std::make_unique<Invocation>(
             this, opMsgRequest, std::move(aggregationRequest), std::move(privileges));
@@ -141,6 +146,12 @@ public:
                                          _request.body,
                                          _privileges,
                                          reply));
+
+            // The aggregate command's response is unstable when 'explain' or 'exchange' fields are
+            // set.
+            if (!_aggregationRequest.getExplain() && !_aggregationRequest.getExchange()) {
+                query_request_helper::validateCursorResponse(reply->getBodyBuilder().asTempObj());
+            }
         }
 
         NamespaceString ns() const override {

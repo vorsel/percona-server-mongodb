@@ -50,11 +50,12 @@
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/active_migrations_registry.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/migration_util.h"
-#include "mongo/db/s/shard_metadata_util.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/views/view_catalog.h"
@@ -121,6 +122,20 @@ void checkInitialSyncFinished(OperationContext* opCtx) {
         replCoord->awaitReplication(opCtx, fakeOpTime, writeConcern).status,
         "Failed to wait for the current replica set config to propagate to all nodes");
     LOGV2(4637905, "The current replica set config has been propagated to all nodes.");
+}
+
+void waitForCurrentConfigCommitment(OperationContext* opCtx) {
+    auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+
+    // Skip the waiting if the current config is from a force reconfig.
+    auto oplogWait = replCoord->getConfig().getConfigTerm() != repl::OpTime::kUninitializedTerm;
+    auto status = replCoord->awaitConfigCommitment(opCtx, oplogWait);
+    status.addContext("New feature compatibility version is rejected");
+    if (status == ErrorCodes::MaxTimeMSExpired) {
+        // Convert the error code to be more specific.
+        uasserted(ErrorCodes::CurrentConfigNotCommittedYet, status.reason());
+    }
+    uassertStatusOK(status);
 }
 
 /**
@@ -239,11 +254,46 @@ public:
         FeatureCompatibilityVersion::validateSetFeatureCompatibilityVersionRequest(
             actualVersion, requestedVersion, isFromConfigServer);
 
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        const bool isReplSet =
+            replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
         if (actualVersion < requestedVersion) {
             checkInitialSyncFinished(opCtx);
 
+            // Start transition to 'requestedVersion' by updating the local FCV document to a
+            // 'kUpgrading' state.
             FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
-                opCtx, actualVersion, requestedVersion, isFromConfigServer);
+                opCtx,
+                actualVersion,
+                requestedVersion,
+                isFromConfigServer,
+                true /* setTargetVersion */);
+
+            // If the 'useSecondaryDelaySecs' feature flag is enabled in the upgraded FCV, issue a
+            // reconfig to change the 'slaveDelay' field to 'secondaryDelaySecs'.
+            if (isReplSet && repl::feature_flags::gUseSecondaryDelaySecs.isEnabledAndIgnoreFCV() &&
+                requestedVersion == ServerGlobalParams::FeatureCompatibility::kLatest) {
+                // Wait for the current config to be committed before starting a new reconfig.
+                waitForCurrentConfigCommitment(opCtx);
+
+                auto getNewConfig = [&](const repl::ReplSetConfig& oldConfig, long long term) {
+                    auto newConfig = oldConfig.getMutable();
+                    newConfig.setConfigVersion(newConfig.getConfigVersion() + 1);
+                    for (auto mem = oldConfig.membersBegin(); mem != oldConfig.membersEnd();
+                         mem++) {
+                        newConfig.useSecondaryDelaySecsFieldName(mem->getId());
+                    }
+                    return repl::ReplSetConfig(std::move(newConfig));
+                };
+                auto status = replCoord->doReplSetReconfig(opCtx, getNewConfig, false /* force */);
+                uassertStatusOKWithContext(status, "Failed to upgrade the replica set config");
+
+                uassertStatusOKWithContext(
+                    replCoord->awaitConfigCommitment(opCtx, true /* waitForOplogCommitment */),
+                    "The upgraded replica set config failed to propagate to a majority");
+                LOGV2(5042302, "The upgraded replica set config has been propagated to a majority");
+            }
+
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
                 // global IX or X locks. This ensures that either
@@ -270,14 +320,7 @@ public:
                     ShardingCatalogManager::get(opCtx)->removePre49LegacyMetadata(opCtx);
                 }
 
-                // Upgrade shards before config finishes its upgrade.
-                uassertStatusOK(
-                    ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
-                        opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
-
-                // Amend metadata created before FCV 4.9. This must be done after all shards have
-                // been upgraded to 4.9 in order to guarantee that when the metadata is amended, no
-                // new databases or collections with the old version of the metadata will be added.
+                // Upgrade metadata created before FCV 4.9.
                 // TODO SERVER-53283: Remove once 5.0 has been released.
                 if (requestedVersion >= FeatureCompatibilityParams::Version::kVersion49) {
                     try {
@@ -289,15 +332,22 @@ public:
                         throw;
                     }
                 }
+
+                // Upgrade shards after config finishes its upgrade.
+                uassertStatusOK(
+                    ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
+                        opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
             }
 
             hangWhileUpgrading.pauseWhileSet(opCtx);
-            // Completed transition to requestedVersion.
+            // Complete transition by updating the local FCV document to the fully upgraded
+            // requestedVersion.
             FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
                 opCtx,
                 serverGlobalParams.featureCompatibility.getVersion(),
                 requestedVersion,
-                isFromConfigServer);
+                isFromConfigServer,
+                false /* setTargetVersion */);
         } else {
             // Time-series collections are only supported in 5.0. If the user tries to downgrade the
             // cluster to an earlier version, they must first remove all time-series collections.
@@ -306,7 +356,7 @@ public:
                 if (!viewCatalog) {
                     continue;
                 }
-                viewCatalog->iterate(opCtx, [](const ViewDefinition& view) {
+                viewCatalog->iterate([](const ViewDefinition& view) {
                     uassert(ErrorCodes::CannotDowngrade,
                             str::stream()
                                 << "Cannot downgrade the cluster when there are time-series "
@@ -314,13 +364,48 @@ public:
                                    "downgrading. First detected time-series collection: "
                                 << view.name(),
                             !view.timeseries());
+                    return true;
                 });
             }
 
             checkInitialSyncFinished(opCtx);
 
+            // Start transition to 'requestedVersion' by updating the local FCV document to a
+            // 'kDowngrading' state.
             FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
-                opCtx, actualVersion, requestedVersion, isFromConfigServer);
+                opCtx,
+                actualVersion,
+                requestedVersion,
+                isFromConfigServer,
+                true /* setTargetVersion */);
+
+            // If the 'useSecondaryDelaySecs' feature flag is disabled in the downgraded FCV, issue
+            // a reconfig to change the 'secondaryDelaySecs' field to 'slaveDelay'.
+            if (isReplSet && repl::feature_flags::gUseSecondaryDelaySecs.isEnabledAndIgnoreFCV() &&
+                requestedVersion < repl::feature_flags::gUseSecondaryDelaySecs.getVersion()) {
+                // Wait for the current config to be committed before starting a new reconfig.
+                waitForCurrentConfigCommitment(opCtx);
+
+                auto getNewConfig = [&](const repl::ReplSetConfig& oldConfig, long long term) {
+                    auto newConfig = oldConfig.getMutable();
+                    newConfig.setConfigVersion(newConfig.getConfigVersion() + 1);
+                    for (auto mem = oldConfig.membersBegin(); mem != oldConfig.membersEnd();
+                         mem++) {
+                        newConfig.useSlaveDelayFieldName(mem->getId());
+                    }
+
+                    return repl::ReplSetConfig(std::move(newConfig));
+                };
+
+                auto status = replCoord->doReplSetReconfig(opCtx, getNewConfig, false /* force */);
+                uassertStatusOKWithContext(status, "Failed to downgrade the replica set config");
+
+                uassertStatusOKWithContext(
+                    replCoord->awaitConfigCommitment(opCtx, true /* waitForOplogCommitment */),
+                    "The downgraded replica set config failed to propagate to a majority");
+                LOGV2(5042304,
+                      "The downgraded replica set config has been propagated to a majority");
+            }
 
             {
                 // Take the global lock in S mode to create a barrier for operations taking the
@@ -336,24 +421,8 @@ public:
             if (failDowngrading.shouldFail())
                 return false;
 
-            if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
-                if (requestedVersion < FeatureCompatibilityParams::Version::kVersion49) {
-                    // SERVER-52632: Remove once 5.0 becomes the LastLTS
-                    shardmetadatautil::downgradeShardConfigDatabasesEntriesToPre49(opCtx);
-                    shardmetadatautil::downgradeShardConfigCollectionEntriesToPre49(opCtx);
-                }
-            }
-
             if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
-                // Downgrade shards before config finishes its downgrade.
-                uassertStatusOK(
-                    ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
-                        opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
-
-                // Amend metadata created in FCV 4.9. This must be done after all shards have
-                // been downgraded to prior 4.9 in order to guarantee that when the metadata is
-                // amended, no new databases or collections with the new version of the metadata
-                // will be added.
+                // Downgrade metadata created in FCV 4.9.
                 // TODO SERVER-53283: Remove once 5.0 has been released.
                 if (requestedVersion < FeatureCompatibilityParams::Version::kVersion49) {
                     try {
@@ -365,15 +434,22 @@ public:
                         throw;
                     }
                 }
+
+                // Downgrade shards after config finishes its downgrade.
+                uassertStatusOK(
+                    ShardingCatalogManager::get(opCtx)->setFeatureCompatibilityVersionOnShards(
+                        opCtx, CommandHelpers::appendMajorityWriteConcern(request.toBSON({}))));
             }
 
             hangWhileDowngrading.pauseWhileSet(opCtx);
-            // Completed transition to requestedVersion.
+            // Complete transition by updating the local FCV document to the fully downgraded
+            // requestedVersion.
             FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
                 opCtx,
                 serverGlobalParams.featureCompatibility.getVersion(),
                 requestedVersion,
-                isFromConfigServer);
+                isFromConfigServer,
+                false /* setTargetVersion */);
 
             if (request.getDowngradeOnDiskChanges()) {
                 invariant(requestedVersion == FeatureCompatibilityParams::kLastContinuous);
@@ -418,21 +494,11 @@ private:
                     continue;
                 }
 
-                // Construct a dropIndexes command to drop the indexes in 'haystackIndexes'.
-                BSONObjBuilder dropIndexesCmd;
-                dropIndexesCmd.append("dropIndexes", collName.nss()->coll());
-                BSONArrayBuilder indexNames;
+                std::vector<std::string> indexNames;
                 for (auto&& haystackIndex : haystackIndexes) {
-                    indexNames.append(haystackIndex->indexName());
+                    indexNames.emplace_back(haystackIndex->indexName());
                 }
-                dropIndexesCmd.append("index", indexNames.arr());
-
-                BSONObjBuilder response;  // This response is ignored.
-                uassertStatusOK(
-                    dropIndexes(opCtx,
-                                *collName.nss(),
-                                CommandHelpers::appendMajorityWriteConcern(dropIndexesCmd.obj()),
-                                &response));
+                dropIndexes(opCtx, *collName.nss(), indexNames);
             }
         }
     }

@@ -62,8 +62,8 @@
 #include "mongo/db/exec/text.h"
 #include "mongo/db/index/fts_access_method.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/record_id_helpers.h"
 #include "mongo/db/s/collection_sharding_state.h"
-#include "mongo/db/storage/oplog_hack.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo::stage_builder {
@@ -78,12 +78,12 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
             CollectionScanParams params;
             params.tailable = csn->tailable;
             params.shouldTrackLatestOplogTimestamp = csn->shouldTrackLatestOplogTimestamp;
-            params.assertMinTsHasNotFallenOffOplog = csn->assertMinTsHasNotFallenOffOplog;
+            params.assertTsHasNotFallenOffOplog = csn->assertTsHasNotFallenOffOplog;
             params.direction = (csn->direction == 1) ? CollectionScanParams::FORWARD
                                                      : CollectionScanParams::BACKWARD;
             params.shouldWaitForOplogVisibility = csn->shouldWaitForOplogVisibility;
-            params.minTs = csn->minTs;
-            params.maxTs = csn->maxTs;
+            params.minRecord = csn->minRecord;
+            params.maxRecord = csn->maxRecord;
             params.requestResumeToken = csn->requestResumeToken;
             params.resumeAfterRecordId = csn->resumeAfterRecordId;
             params.stopApplyingFilterAfterFirstMatch = csn->stopApplyingFilterAfterFirstMatch;
@@ -161,7 +161,7 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
             auto pn = static_cast<const ProjectionNodeDefault*>(root);
             auto childStage = build(pn->children[0]);
             return std::make_unique<ProjectionStageDefault>(_cq.getExpCtx(),
-                                                            _cq.getQueryRequest().getProj(),
+                                                            _cq.getFindCommand().getProjection(),
                                                             _cq.getProj(),
                                                             _ws,
                                                             std::move(childStage));
@@ -170,7 +170,7 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
             auto pn = static_cast<const ProjectionNodeCovered*>(root);
             auto childStage = build(pn->children[0]);
             return std::make_unique<ProjectionStageCovered>(_cq.getExpCtxRaw(),
-                                                            _cq.getQueryRequest().getProj(),
+                                                            _cq.getFindCommand().getProjection(),
                                                             _cq.getProj(),
                                                             _ws,
                                                             std::move(childStage),
@@ -180,7 +180,7 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
             auto pn = static_cast<const ProjectionNodeSimple*>(root);
             auto childStage = build(pn->children[0]);
             return std::make_unique<ProjectionStageSimple>(_cq.getExpCtxRaw(),
-                                                           _cq.getQueryRequest().getProj(),
+                                                           _cq.getFindCommand().getProjection(),
                                                            _cq.getProj(),
                                                            _ws,
                                                            std::move(childStage));
@@ -357,7 +357,11 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
         }
         case STAGE_VIRTUAL_SCAN: {
             const auto* vsn = static_cast<const VirtualScanNode*>(root);
-            invariant(vsn->hasRecordId);
+
+            // The classic stage builder currently only supports VirtualScanNodes which represent
+            // collection scans that do not produce record ids.
+            invariant(!vsn->hasRecordId);
+            invariant(vsn->scanType == VirtualScanNode::ScanType::kCollScan);
 
             auto qds = std::make_unique<QueuedDataStage>(expCtx, _ws);
             for (auto&& arr : vsn->docs) {

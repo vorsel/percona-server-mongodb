@@ -45,6 +45,14 @@
 namespace mongo {
 namespace {
 
+std::vector<ShardId> getAllShardIdsSorted(OperationContext* opCtx) {
+    // Many tests assume that chunks will be placed on shards
+    // according to their IDs in ascending lexical order.
+    auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload();
+    std::sort(shardIds.begin(), shardIds.end());
+    return shardIds;
+}
+
 /*
  * Creates a chunk based on the given arguments, appends it to 'chunks', and
  * increments the given chunk version
@@ -58,7 +66,7 @@ void appendChunk(const NamespaceString& nss,
                  const ShardId& shardId,
                  std::vector<ChunkType>* chunks) {
     if (collectionUUID) {
-        chunks->emplace_back(nss, *collectionUUID, ChunkRange(min, max), *version, shardId);
+        chunks->emplace_back(*collectionUUID, ChunkRange(min, max), *version, shardId);
     } else {
         chunks->emplace_back(nss, ChunkRange(min, max), *version, shardId);
     }
@@ -231,41 +239,41 @@ InitialSplitPolicy::ShardCollectionConfig InitialSplitPolicy::generateShardColle
 std::unique_ptr<InitialSplitPolicy> InitialSplitPolicy::calculateOptimizationStrategy(
     OperationContext* opCtx,
     const ShardKeyPattern& shardKeyPattern,
-    const ShardsvrShardCollectionRequest& request,
+    const std::int64_t numInitialChunks,
+    const bool presplitHashedZones,
+    const boost::optional<std::vector<BSONObj>>& initialSplitPoints,
     const std::vector<TagsType>& tags,
     size_t numShards,
     bool collectionIsEmpty) {
     uassert(ErrorCodes::InvalidOptions,
             str::stream() << "numInitialChunks is only supported when the collection is empty "
                              "and has a hashed field in the shard key pattern",
-            !request.getNumInitialChunks() ||
-                (shardKeyPattern.isHashedPattern() && collectionIsEmpty));
+            !numInitialChunks || (shardKeyPattern.isHashedPattern() && collectionIsEmpty));
     uassert(ErrorCodes::InvalidOptions,
             str::stream()
                 << "When the prefix of the hashed shard key is a range field, "
                    "'numInitialChunks' can only be used when the 'presplitHashedZones' is true",
-            !request.getNumInitialChunks() || shardKeyPattern.hasHashedPrefix() ||
-                request.getPresplitHashedZones());
+            !numInitialChunks || shardKeyPattern.hasHashedPrefix() || presplitHashedZones);
     uassert(ErrorCodes::InvalidOptions,
             str::stream() << "Cannot have both initial split points and tags set",
-            !request.getInitialSplitPoints() || tags.empty());
+            !initialSplitPoints || tags.empty());
 
     // If 'presplitHashedZones' flag is set, we always use 'PresplitHashedZonesSplitPolicy', to make
     // sure we throw the correct assertion if further validation fails.
-    if (request.getPresplitHashedZones()) {
+    if (presplitHashedZones) {
         return std::make_unique<PresplitHashedZonesSplitPolicy>(
-            opCtx, shardKeyPattern, tags, request.getNumInitialChunks(), collectionIsEmpty);
+            opCtx, shardKeyPattern, tags, numInitialChunks, collectionIsEmpty);
     }
 
     // The next preference is to use split points based strategy. This is only possible if
     // 'initialSplitPoints' is set, or if the collection is empty with shard key having a hashed
     // prefix.
-    if (request.getInitialSplitPoints()) {
-        return std::make_unique<SplitPointsBasedSplitPolicy>(*request.getInitialSplitPoints());
+    if (initialSplitPoints) {
+        return std::make_unique<SplitPointsBasedSplitPolicy>(*initialSplitPoints);
     }
     if (tags.empty() && shardKeyPattern.hasHashedPrefix() && collectionIsEmpty) {
         return std::make_unique<SplitPointsBasedSplitPolicy>(
-            shardKeyPattern, numShards, request.getNumInitialChunks());
+            shardKeyPattern, numShards, numInitialChunks);
     }
 
     if (!tags.empty()) {
@@ -340,7 +348,7 @@ InitialSplitPolicy::ShardCollectionConfig SplitPointsBasedSplitPolicy::createFir
     OperationContext* opCtx, const ShardKeyPattern& shardKeyPattern, SplitPolicyParams params) {
 
     // On which shards are the generated chunks allowed to be placed.
-    const auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload();
+    const auto shardIds = getAllShardIdsSorted(opCtx);
 
     const auto currentTime = VectorClock::get(opCtx)->getTime();
     return generateShardCollectionInitialChunks(params,
@@ -372,7 +380,7 @@ InitialSplitPolicy::ShardCollectionConfig AbstractTagsBasedSplitPolicy::createFi
     OperationContext* opCtx, const ShardKeyPattern& shardKeyPattern, SplitPolicyParams params) {
     invariant(!_tags.empty());
 
-    const auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIdsNoReload();
+    const auto shardIds = getAllShardIdsSorted(opCtx);
     const auto currentTime = VectorClock::get(opCtx)->getTime();
     const auto validAfter = currentTime.clusterTime().asTimestamp();
     const auto& keyPattern = shardKeyPattern.getKeyPattern();

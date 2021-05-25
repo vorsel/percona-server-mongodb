@@ -707,8 +707,9 @@ TEST(SortedDataInterface, InsertReservedRecordId) {
     const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
     ASSERT(sorted->isEmpty(opCtx.get()));
     WriteUnitOfWork uow(opCtx.get());
-    RecordId reservedLoc(RecordId::ReservedId::kWildcardMultikeyMetadataId);
-    ASSERT(reservedLoc.isReserved());
+    RecordId reservedLoc(
+        RecordId::reservedIdFor<int64_t>(RecordId::Reservation::kWildcardMultikeyMetadataId));
+    invariant(RecordId::isReserved<int64_t>(reservedLoc));
     ASSERT_OK(sorted->insert(opCtx.get(),
                              makeKeyString(sorted.get(), key1, reservedLoc),
                              /*dupsAllowed*/ true));

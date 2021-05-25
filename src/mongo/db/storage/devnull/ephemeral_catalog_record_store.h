@@ -58,6 +58,10 @@ public:
 
     virtual const char* name() const;
 
+    virtual KeyFormat keyFormat() const {
+        return KeyFormat::Long;
+    }
+
     virtual RecordData dataFor(OperationContext* opCtx, const RecordId& loc) const;
 
     virtual bool findRecord(OperationContext* opCtx, const RecordId& loc, RecordData* rd) const;
@@ -103,9 +107,6 @@ public:
     virtual long long numRecords(OperationContext* opCtx) const {
         return _data->records.size();
     }
-
-    virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
-                                                     const RecordId& startingPosition) const;
 
     void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const override {}
 

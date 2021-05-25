@@ -32,11 +32,13 @@
 #include "mongo/db/s/drop_collection_coordinator.h"
 
 #include "mongo/db/api_parameters.h"
-#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/concurrency/lock_manager_defs.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/dist_lock_manager.h"
+#include "mongo/db/s/drop_collection_coordinator.h"
+#include "mongo/db/s/sharding_ddl_util.h"
+#include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -49,17 +51,9 @@
 
 namespace mongo {
 
-static constexpr int kMaxNumStaleShardVersionRetries = 10;
-
 DropCollectionCoordinator::DropCollectionCoordinator(OperationContext* opCtx,
                                                      const NamespaceString& nss)
-    : ShardingDDLCoordinator(nss), _serviceContext(opCtx->getServiceContext()) {
-    auto authSession = AuthorizationSession::get(opCtx->getClient());
-    _users =
-        userNameIteratorToContainer<std::vector<UserName>>(authSession->getImpersonatedUserNames());
-    _roles =
-        roleNameIteratorToContainer<std::vector<RoleName>>(authSession->getImpersonatedRoleNames());
-}
+    : ShardingDDLCoordinator_NORESILIENT(opCtx, nss), _serviceContext(opCtx->getServiceContext()) {}
 
 void DropCollectionCoordinator::_sendDropCollToParticipants(OperationContext* opCtx) {
     auto* const shardRegistry = Grid::get(opCtx)->shardRegistry();
@@ -83,34 +77,6 @@ void DropCollectionCoordinator::_sendDropCollToParticipants(OperationContext* op
     }
 }
 
-void DropCollectionCoordinator::_removeCollMetadataFromConfig(OperationContext* opCtx) {
-    IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
-
-    ON_BLOCK_EXIT([this, opCtx] {
-        Grid::get(opCtx)->catalogCache()->invalidateCollectionEntry_LINEARIZABLE(_nss);
-    });
-
-    // Remove chunk data
-    uassertStatusOK(
-        catalogClient->removeConfigDocuments(opCtx,
-                                             ChunkType::ConfigNS,
-                                             BSON(ChunkType::ns(_nss.ns())),
-                                             ShardingCatalogClient::kMajorityWriteConcern));
-    // Remove tag data
-    uassertStatusOK(
-        catalogClient->removeConfigDocuments(opCtx,
-                                             TagsType::ConfigNS,
-                                             BSON(TagsType::ns(_nss.ns())),
-                                             ShardingCatalogClient::kMajorityWriteConcern));
-    // Remove coll metadata
-    uassertStatusOK(
-        catalogClient->removeConfigDocuments(opCtx,
-                                             CollectionType::ConfigNS,
-                                             BSON(CollectionType::kNssFieldName << _nss.ns()),
-                                             ShardingCatalogClient::kMajorityWriteConcern));
-}
-
 void DropCollectionCoordinator::_stopMigrations(OperationContext* opCtx) {
     // TODO SERVER-53861 this will not stop current ongoing migrations
     uassertStatusOK(Grid::get(opCtx)->catalogClient()->updateConfigDocument(
@@ -129,9 +95,7 @@ SemiFuture<void> DropCollectionCoordinator::runImpl(
             ThreadClient tc{"DropCollectionCoordinator", _serviceContext};
             auto opCtxHolder = tc->makeOperationContext();
             auto* opCtx = opCtxHolder.get();
-
-            auto authSession = AuthorizationSession::get(opCtx->getClient());
-            authSession->setImpersonatedUserData(_users, _roles);
+            _forwardableOpMetadata.setOn(opCtx);
 
             auto distLockManager = DistLockManager::get(_serviceContext);
             const auto dbDistLock = uassertStatusOK(distLockManager->lock(
@@ -141,15 +105,16 @@ SemiFuture<void> DropCollectionCoordinator::runImpl(
 
             _stopMigrations(opCtx);
 
-            const auto routingInfo = uassertStatusOK(
-                Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfoWithRefresh(opCtx, _nss));
+            const auto catalogClient = Grid::get(opCtx)->catalogClient();
 
-            _removeCollMetadataFromConfig(opCtx);
-
-            if (routingInfo.isSharded()) {
+            try {
+                auto coll = catalogClient->getCollection(opCtx, _nss);
+                sharding_ddl_util::removeCollMetadataFromConfig(opCtx, coll);
                 _participants = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
-            } else {
-                _participants = {routingInfo.dbPrimary()};
+            } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+                // The collection is not sharded or doesn't exist, just remove tags
+                sharding_ddl_util::removeTagsMetadataFromConfig(opCtx, _nss);
+                _participants = {ShardingState::get(opCtx)->shardId()};
             }
 
             _sendDropCollToParticipants(opCtx);

@@ -136,6 +136,10 @@ public:
 
     void updateCappedSize(OperationContext* opCtx, RecordId catalogId, long long size);
 
+    void updateClusteredIndexTTLSetting(OperationContext* opCtx,
+                                        RecordId catalogId,
+                                        boost::optional<int64_t> expireAfterSeconds);
+
     void updateTTLSetting(OperationContext* opCtx,
                           RecordId catalogId,
                           StringData idxName,
@@ -146,9 +150,7 @@ public:
                              StringData idxName,
                              bool hidden);
 
-    bool isEqualToMetadataUUID(OperationContext* opCtx,
-                               RecordId catalogId,
-                               OptionalCollectionUUID uuid);
+    bool isEqualToMetadataUUID(OperationContext* opCtx, RecordId catalogId, const UUID& uuid);
 
     void setIsTemp(OperationContext* opCtx, RecordId catalogId, bool isTemp);
 
@@ -188,6 +190,12 @@ public:
                             RecordId catalogId,
                             StringData indexName,
                             const MultikeyPaths& multikeyPaths);
+
+    void forceSetIndexIsMultikey(OperationContext* opCtx,
+                                 RecordId catalogId,
+                                 const IndexDescriptor* desc,
+                                 bool isMultikey,
+                                 const MultikeyPaths& multikeyPaths);
 
     CollectionOptions getCollectionOptions(OperationContext* opCtx, RecordId catalogId) const;
 

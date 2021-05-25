@@ -31,11 +31,15 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/namespace_string.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/s/resharding/common_types_gen.h"
 #include "mongo/util/clock_source.h"
 #include "mongo/util/duration.h"
+#include "mongo/util/uuid.h"
+
+#pragma once
 
 namespace mongo {
 
@@ -79,15 +83,36 @@ public:
     enum class OperationStatus { kUnknown = -1, kSucceeded = 0, kFailed = 1, kCanceled = 2 };
     void onCompletion(OperationStatus) noexcept;
 
-    void serialize(BSONObjBuilder*) const;
+    struct ReporterOptions {
+        enum class Role { kAll, kDonor, kRecipient, kCoordinator };
+        ReporterOptions(Role role, UUID id, NamespaceString nss, BSONObj shardKey, bool unique)
+            : role(role),
+              id(std::move(id)),
+              nss(std::move(nss)),
+              shardKey(std::move(shardKey)),
+              unique(unique) {}
+
+        const Role role;
+        const UUID id;
+        const NamespaceString nss;
+        const BSONObj shardKey;
+        const bool unique;
+    };
+    BSONObj reportForCurrentOp(const ReporterOptions& options) const noexcept;
+
+    void serialize(BSONObjBuilder*, ReporterOptions::Role role = ReporterOptions::Role::kAll) const;
+
+    // Reports the elapsed time for the active resharding operation, or `boost::none`.
+    boost::optional<Milliseconds> getOperationElapsedTime() const;
 
 private:
     ServiceContext* const _svcCtx;
 
     mutable Mutex _mutex = MONGO_MAKE_LATCH("ReshardingMetrics::_mutex");
 
-    // The following maintain the number of operations that succeeded, failed with an unrecoverable
-    // error, and canceled by the user, respectively.
+    // The following maintain the number of resharding operations that have started, succeeded,
+    // failed with an unrecoverable error, and canceled by the user, respectively.
+    int64_t _started = 0;
     int64_t _succeeded = 0;
     int64_t _failed = 0;
     int64_t _canceled = 0;
@@ -119,7 +144,8 @@ private:
               applyingOplogEntries(clockSource),
               inCriticalSection(clockSource) {}
 
-        void append(BSONObjBuilder*) const;
+        using Role = ReporterOptions::Role;
+        void append(BSONObjBuilder*, Role) const;
 
         bool isCompleted() const noexcept {
             return completionStatus.has_value();

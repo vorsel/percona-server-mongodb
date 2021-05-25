@@ -39,6 +39,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/util/bufreader.h"
+#include "mongo/util/hex.h"
 
 namespace mongo {
 
@@ -47,59 +48,83 @@ namespace mongo {
  */
 class RecordId {
 public:
-    // This set of constants define the boundaries of the 'normal' and 'reserved' id ranges.
-    static constexpr int64_t kNullRepr = 0;
+    // This set of constants define the boundaries of the 'normal' id ranges for the int64_t format.
     static constexpr int64_t kMinRepr = LLONG_MIN;
     static constexpr int64_t kMaxRepr = LLONG_MAX;
-    static constexpr int64_t kMinReservedRepr = kMaxRepr - (1024 * 1024);
+
+    // Fixed size of a RecordId that holds a char array
+    enum { kSmallStrSize = 12 };
 
     /**
-     * Enumerates all ids in the reserved range that have been allocated for a specific purpose.
+     * A RecordId that compares less than all int64_t RecordIds that represent documents in a
+     * collection.
      */
-    enum class ReservedId : int64_t { kWildcardMultikeyMetadataId = kMinReservedRepr };
-
-    /**
-     * Constructs a Null RecordId.
-     */
-    RecordId() : _repr(kNullRepr) {}
-
-    explicit RecordId(int64_t repr) : _repr(repr) {}
-
-    explicit RecordId(ReservedId repr) : RecordId(static_cast<int64_t>(repr)) {}
-
-    /**
-     * Construct a RecordId from two halves.
-     * TODO consider removing.
-     */
-    RecordId(int high, int low) : _repr((uint64_t(high) << 32) | uint32_t(low)) {}
-
-    /**
-     * A RecordId that compares less than all ids that represent documents in a collection.
-     */
-    static RecordId min() {
+    static RecordId minLong() {
         return RecordId(kMinRepr);
     }
 
     /**
-     * A RecordId that compares greater than all ids that represent documents in a collection.
+     * A RecordId that compares greater than all int64_t RecordIds that represent documents in a
+     * collection.
      */
-    static RecordId max() {
+    static RecordId maxLong() {
         return RecordId(kMaxRepr);
     }
 
+    RecordId() : _format(Format::kNull) {}
+
     /**
-     * Returns the first record in the reserved id range at the top of the RecordId space.
+     * RecordId supports holding either an int64_t or a 12 byte char array.
      */
-    static RecordId minReserved() {
-        return RecordId(kMinReservedRepr);
+    explicit RecordId(int64_t repr) : _storage(repr), _format(Format::kLong) {}
+    explicit RecordId(const char* str, int32_t size)
+        : _storage(str, size), _format(Format::kSmallStr) {}
+
+    /**
+     * Construct a RecordId from two halves.
+     */
+    RecordId(int high, int low) : RecordId((uint64_t(high) << 32) | uint32_t(low)) {}
+
+    /** Tag for dispatching on null values */
+    class Null {};
+
+    /**
+     * Helpers to dispatch based on the underlying type.
+     */
+    template <typename OnNull, typename OnLong, typename OnStr>
+    auto withFormat(OnNull&& onNull, OnLong&& onLong, OnStr&& onStr) const {
+        switch (_format) {
+            case Format::kNull:
+                return onNull(Null());
+            case Format::kLong:
+                return onLong(_storage._long);
+            case Format::kSmallStr:
+                return onStr(_storage._str, kSmallStrSize);
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }
+
+    int64_t asLong() const {
+        // In the the int64_t format, null can also be represented by '0'.
+        if (_format == Format::kNull) {
+            return 0;
+        }
+        invariant(_format == Format::kLong);
+        return _storage._long;
+    }
+
+    const char* strData() const {
+        invariant(_format == Format::kSmallStr);
+        return _storage._str;
     }
 
     bool isNull() const {
-        return _repr == 0;
-    }
-
-    int64_t repr() const {
-        return _repr;
+        // In the the int64_t format, null can also represented by '0'.
+        if (_format == Format::kLong) {
+            return _storage._long == 0;
+        }
+        return _format == Format::kNull;
     }
 
     /**
@@ -108,26 +133,43 @@ public:
      * used internally. All RecordIds outside of the valid range are sentinel values.
      */
     bool isValid() const {
-        return isNormal() || isReserved();
+        return withFormat([](Null n) { return false; },
+                          [&](int64_t rid) { return rid > 0; },
+                          [&](const char* str, int size) { return true; });
     }
 
-    /**
-     * Normal RecordIds are those which fall within the range used to represent normal user data,
-     * excluding the reserved range at the top of the RecordId space.
-     */
-    bool isNormal() const {
-        return _repr > 0 && _repr < kMinReservedRepr;
+    int compare(const RecordId& rhs) const {
+        // Null always compares less than every other RecordId format.
+        if (_format == Format::kNull && rhs._format == Format::kNull) {
+            return 0;
+        } else if (_format == Format::kNull) {
+            return -1;
+        } else if (rhs._format == Format::kNull) {
+            return 1;
+        }
+        invariant(_format == rhs._format);
+        return withFormat(
+            [](Null n) { return 0; },
+            [&](const int64_t rid) {
+                return rid == rhs._storage._long ? 0 : rid < rhs._storage._long ? -1 : 1;
+            },
+            [&](const char* str, int size) { return memcmp(str, rhs._storage._str, size); });
     }
 
-    /**
-     * Returns true if this RecordId falls within the reserved range at the top of the record space.
-     */
-    bool isReserved() const {
-        return _repr >= kMinReservedRepr && _repr < kMaxRepr;
+    size_t hash() const {
+        size_t hash = 0;
+        withFormat(
+            [](Null n) {},
+            [&](int64_t rid) { boost::hash_combine(hash, rid); },
+            [&](const char* str, int size) { boost::hash_combine(hash, std::string(str, size)); });
+        return hash;
     }
 
-    int compare(RecordId rhs) const {
-        return _repr == rhs._repr ? 0 : _repr < rhs._repr ? -1 : 1;
+    std::string toString() const {
+        return withFormat(
+            [](Null n) { return std::string("null"); },
+            [](int64_t rid) { return std::to_string(rid); },
+            [](const char* str, int size) { return hexblob::encodeLower(str, size); });
     }
 
     /**
@@ -135,70 +177,136 @@ public:
      * may differ across platforms. Hash values should not be persisted.
      */
     struct Hasher {
-        size_t operator()(RecordId rid) const {
-            size_t hash = 0;
-            // TODO consider better hashes
-            boost::hash_combine(hash, rid.repr());
-            return hash;
+        size_t operator()(const RecordId& rid) const {
+            return rid.hash();
         }
     };
 
-    /// members for Sorter
-    struct SorterDeserializeSettings {};  // unused
-    void serializeForSorter(BufBuilder& buf) const {
-        buf.appendNum(static_cast<long long>(_repr));
-    }
-    static RecordId deserializeForSorter(BufReader& buf, const SorterDeserializeSettings&) {
-        return RecordId(buf.read<LittleEndian<int64_t>>());
-    }
-    int memUsageForSorter() const {
-        return sizeof(RecordId);
-    }
-    RecordId getOwned() const {
-        return *this;
-    }
-
     void serialize(fmt::memory_buffer& buffer) const {
-        fmt::format_to(buffer, "RecordId({})", _repr);
+        withFormat([&](Null n) { fmt::format_to(buffer, "RecordId(null)"); },
+                   [&](int64_t rid) { fmt::format_to(buffer, "RecordId({})", rid); },
+                   [&](const char* str, int size) {
+                       fmt::format_to(buffer, "RecordId({})", hexblob::encodeLower(str, size));
+                   });
     }
 
     void serialize(BSONObjBuilder* builder) const {
-        builder->append("RecordId"_sd, _repr);
+        withFormat([&](Null n) { builder->append("RecordId", "null"); },
+                   [&](int64_t rid) { builder->append("RecordId"_sd, rid); },
+                   [&](const char* str, int size) {
+                       builder->appendBinData("RecordId"_sd, size, BinDataGeneral, str);
+                   });
+    }
+
+    /**
+     * Enumerates all reserved ids that have been allocated for a specific purpose.
+     * The underlying value of the reserved Record ID is data-type specific and must be
+     * retrieved by the reservedIdFor() helper.
+     */
+    enum class Reservation { kWildcardMultikeyMetadataId };
+
+    // These reserved ranges leave 2^20 possible reserved values.
+    static constexpr int64_t kMinReservedLong = RecordId::kMaxRepr - (1024 * 1024);
+    static constexpr unsigned char kMinReservedOID[OID::kOIDSize] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0, 0x00, 0x00};
+
+    /**
+     * Returns the reserved RecordId value for a given Reservation.
+     */
+    template <typename T>
+    static RecordId reservedIdFor(Reservation res) {
+        // There is only one reservation at the moment.
+        invariant(res == Reservation::kWildcardMultikeyMetadataId);
+        if constexpr (std::is_same_v<T, int64_t>) {
+            return RecordId(kMinReservedLong);
+        } else {
+            static_assert(std::is_same_v<T, OID>, "Unsupported RecordId type");
+            OID minReserved(kMinReservedOID);
+            return RecordId(minReserved.view().view(), OID::kOIDSize);
+        }
+    }
+
+    /**
+     * Returns true if this RecordId falls within the reserved range for a given RecordId type.
+     */
+    template <typename T>
+    static bool isReserved(RecordId id) {
+        if (id.isNull()) {
+            return false;
+        }
+        if constexpr (std::is_same_v<T, int64_t>) {
+            return id.asLong() >= kMinReservedLong && id.asLong() < RecordId::kMaxRepr;
+        } else {
+            static_assert(std::is_same_v<T, OID>, "Unsupported RecordId type");
+            return memcmp(id.strData(), kMinReservedOID, OID::kOIDSize) >= 0;
+        }
     }
 
 private:
-    int64_t _repr;
+    /**
+     * Specifies the storage format of this RecordId.
+     */
+    enum class Format : uint32_t {
+        /** Contains no value */
+        kNull,
+        /** int64_t */
+        kLong,
+        /** char[12] */
+        kSmallStr
+    };
+
+// Pack our union so that it only uses 12 bytes. The union will default to a 8 byte alignment,
+// making it 16 bytes total with 4 bytes of padding. Instead, we force the union to use a 4 byte
+// alignment, so it packs into 12 bytes. This leaves 4 bytes for our Format, allowing the RecordId
+// to use 16 bytes total.
+#pragma pack(push, 4)
+    union Storage {
+        int64_t _long;
+        char _str[kSmallStrSize];
+
+        Storage() {}
+        Storage(int64_t s) : _long(s) {}
+        Storage(const char* str, int32_t size) {
+            invariant(size == kSmallStrSize);
+            memcpy(_str, str, size);
+        }
+    };
+#pragma pack(pop)
+
+    Storage _storage;
+    Format _format;
 };
 
+
 inline bool operator==(RecordId lhs, RecordId rhs) {
-    return lhs.repr() == rhs.repr();
+    return lhs.compare(rhs) == 0;
 }
 inline bool operator!=(RecordId lhs, RecordId rhs) {
-    return lhs.repr() != rhs.repr();
+    return lhs.compare(rhs);
 }
 inline bool operator<(RecordId lhs, RecordId rhs) {
-    return lhs.repr() < rhs.repr();
+    return lhs.compare(rhs) < 0;
 }
 inline bool operator<=(RecordId lhs, RecordId rhs) {
-    return lhs.repr() <= rhs.repr();
+    return lhs.compare(rhs) <= 0;
 }
 inline bool operator>(RecordId lhs, RecordId rhs) {
-    return lhs.repr() > rhs.repr();
+    return lhs.compare(rhs) > 0;
 }
 inline bool operator>=(RecordId lhs, RecordId rhs) {
-    return lhs.repr() >= rhs.repr();
+    return lhs.compare(rhs) >= 0;
 }
 
 inline StringBuilder& operator<<(StringBuilder& stream, const RecordId& id) {
-    return stream << "RecordId(" << id.repr() << ')';
+    return stream << "RecordId(" << id.toString() << ')';
 }
 
 inline std::ostream& operator<<(std::ostream& stream, const RecordId& id) {
-    return stream << "RecordId(" << id.repr() << ')';
+    return stream << "RecordId(" << id.toString() << ')';
 }
 
 inline std::ostream& operator<<(std::ostream& stream, const boost::optional<RecordId>& id) {
-    return stream << "RecordId(" << (id ? id.get().repr() : 0) << ')';
+    return stream << "RecordId(" << (id ? id->toString() : 0) << ')';
 }
 
 }  // namespace mongo

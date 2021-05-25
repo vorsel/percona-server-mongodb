@@ -100,7 +100,6 @@ env.Library(
     source=[
         'end_sessions_command.cpp',
         'fail_point_cmd.cpp',
-        'find_and_modify_common.cpp',
         'generic.cpp',
         'hashcmd.cpp',
         'kill_all_sessions_by_pattern_command.cpp',
@@ -200,11 +199,11 @@ env.Library(
         'authentication_commands.idl',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/audit',
-        '$BUILD_DIR/mongo/db/auth/sasl_options',
-        '$BUILD_DIR/mongo/db/auth/user_document_parser',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
+        '$BUILD_DIR/mongo/db/auth/auth',
+        '$BUILD_DIR/mongo/db/auth/auth_options',
+        '$BUILD_DIR/mongo/db/auth/authentication_session',
         '$BUILD_DIR/mongo/db/commands',
-        '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/rpc/client_metadata',
         '$BUILD_DIR/mongo/util/net/ssl_manager',
         'test_commands_enabled',
@@ -282,6 +281,17 @@ env.Library(
     ],
 )
 
+env.Library(
+    target='validate_db_metadata_command',
+    source=[
+        'validate_db_metadata.idl',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
+)
+
 # Commands that are present in both mongod and embedded
 env.Library(
     target="standalone",
@@ -314,6 +324,7 @@ env.Library(
         "run_aggregate.cpp",
         "sleep_command.cpp",
         "validate.cpp",
+        "validate_db_metadata_cmd.cpp",
         "whats_my_sni_command.cpp",
         "write_commands/write_commands.cpp",
     ],
@@ -339,7 +350,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/query/command_request_response',
         '$BUILD_DIR/mongo/db/query_exec',
         '$BUILD_DIR/mongo/db/repl/replica_set_messages',
-        '$BUILD_DIR/mongo/db/repl/tenant_migration_donor',
+        '$BUILD_DIR/mongo/db/repl/tenant_migration_access_blocker',
         '$BUILD_DIR/mongo/db/rw_concern_d',
         '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/db/stats/server_read_concern_write_concern_metrics',
@@ -361,11 +372,11 @@ env.Library(
         'list_databases_command',
         'rename_collection_idl',
         'test_commands_enabled',
+        'validate_db_metadata_command',
         'write_commands_common',
     ],
 )
 
-# Commands required by the shell to connect
 env.Library(
     target="shell_protocol",
     source=[
@@ -376,6 +387,8 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/catalog_helpers',
         '$BUILD_DIR/mongo/db/catalog/collection',
         '$BUILD_DIR/mongo/db/commands',
+        '$BUILD_DIR/mongo/db/db_raii',
+        '$BUILD_DIR/mongo/db/ops/write_ops_exec',
         'test_commands_enabled',
     ],
 )
@@ -465,6 +478,7 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
         '$BUILD_DIR/mongo/db/auth/auth',
+        '$BUILD_DIR/mongo/db/auth/auth_options',
         '$BUILD_DIR/mongo/db/auth/authprivilege',
         '$BUILD_DIR/mongo/db/auth/builtin_roles',
         '$BUILD_DIR/mongo/db/auth/sasl_options',

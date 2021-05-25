@@ -2,7 +2,7 @@
  * Tests that tenant migrations are interrupted successfully on stepdown and shutdown.
  *
  * @tags: [requires_fcv_47, requires_majority_read_concern, requires_persistence,
- * incompatible_with_eft]
+ * incompatible_with_eft, incompatible_with_windows_tls]
  */
 
 (function() {
@@ -139,8 +139,7 @@ function testDonorAbortMigrationInterrupt(interruptFunc, verifyCmdResponseFunc, 
 
     const tryAbortThread = new Thread(TenantMigrationUtil.tryAbortMigrationAsync,
                                       {migrationIdString: migrationOpts.migrationIdString},
-                                      donorRstArgs,
-                                      TenantMigrationUtil.runTenantMigrationCommand);
+                                      donorRstArgs);
     tryAbortThread.start();
 
     // Wait for donorAbortMigration command to start.

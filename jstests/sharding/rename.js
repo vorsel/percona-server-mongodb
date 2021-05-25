@@ -34,27 +34,35 @@ s.ensurePrimaryShard('samePrimary', s.shard0.shardName);
 assert.commandWorked(s.s0.adminCommand({enablesharding: "otherPrimary"}));
 s.ensurePrimaryShard('otherPrimary', s.shard1.shardName);
 
-// Ensure renaming to or from a sharded collection fails.
-jsTest.log('Testing renaming sharded collections');
-assert.commandWorked(
-    s.s0.adminCommand({shardCollection: 'test.shardedColl', key: {_id: 'hashed'}}));
+const DDLFeatureFlagParam = assert.commandWorked(
+    s.configRS.getPrimary().adminCommand({getParameter: 1, featureFlagShardingFullDDLSupport: 1}));
+const isDDLFeatureFlagEnabled = DDLFeatureFlagParam.featureFlagShardingFullDDLSupport.value;
+if (!isDDLFeatureFlagEnabled) {
+    // Ensure renaming to or from a sharded collection fails.
+    jsTest.log('Testing renaming sharded collections');
+    assert.commandWorked(
+        s.s0.adminCommand({shardCollection: 'test.shardedColl', key: {_id: 'hashed'}}));
 
-// Renaming from a sharded collection
-assert.commandFailed(db.shardedColl.renameCollection('somethingElse'));
+    // Renaming from a sharded collection
+    assert.commandFailed(db.shardedColl.renameCollection('somethingElse'));
 
-// Renaming to a sharded collection
-assert.commandFailed(db.bar.renameCollection('shardedColl'));
+    // Renaming to a sharded collection
+    assert.commandFailed(db.bar.renameCollection('shardedColl'));
+
+    // Renaming to a sharded collection with dropTarget=true
+    const dropTarget = true;
+    assert.commandFailed(db.bar.renameCollection('shardedColl', dropTarget));
+}
 
 // Renaming unsharded collection to a different db with different primary shard.
 db.unSharded.insert({x: 1});
 assert.commandFailedWithCode(
-    db.adminCommand({renameCollection: 'test.unSharded', to: 'otherPrimary.foo'}), 13137);
+    db.adminCommand({renameCollection: 'test.unSharded', to: 'otherPrimary.foo'}),
+    [13137, 5448802],
+    "Source and destination collections must be on same shard");
 
 // Renaming unsharded collection to a different db with same primary shard.
 assert.commandWorked(db.adminCommand({renameCollection: 'test.unSharded', to: 'samePrimary.foo'}));
-
-const dropTarget = true;
-assert.commandFailed(db.bar.renameCollection('shardedColl', dropTarget));
 
 jsTest.log("Testing write concern (1)");
 
@@ -85,9 +93,6 @@ awaitRSClientHosts(s.s, replTest.getPrimary(), {ok: true, ismaster: true}, replT
 
 assert.commandWorked(db.foo.insert({_id: 4}));
 assert.commandWorked(db.foo.renameCollection('bar', true));
-
-ans = db.runCommand({getLastError: 1, w: 3, wtimeout: 5000});
-assert.eq(ans.err, "timeout", 'gle: ' + tojson(ans));
 
 s.stop();
 })();

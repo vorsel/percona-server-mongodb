@@ -293,37 +293,27 @@ public:
         const std::vector<ShardId>& shardIds,
         unique_function<void(OperationContext*, TxnNumber)> changeMetadataFunc);
 
+    /**
+     * Performs a split on the chunk with min value "minKey". If the split fails, it is marked as
+     * jumbo.
+     */
+    void splitOrMarkJumbo(OperationContext* opCtx,
+                          const NamespaceString& nss,
+                          const BSONObj& minKey);
+
     //
     // Database Operations
     //
 
     /**
-     * Checks if a database with the same name already exists, and if not, selects a primary shard
-     * for the database and creates a new entry for it in config.databases.
-     *
-     * Returns the database entry.
-     *
-     * Throws DatabaseDifferCase if the database already exists with a different case.
+     * Checks if a database with the same name, optPrimaryShard and enableSharding state already
+     * exists, and if not, creates a new one that matches these prerequisites. If a database already
+     * exists and matches all the prerequisites returns success, otherwise throws NamespaceNotFound.
      */
     DatabaseType createDatabase(OperationContext* opCtx,
                                 StringData dbName,
-                                const ShardId& primaryShard);
-
-    /**
-     * Creates the database if it does not exist, then marks its entry in config.databases as
-     * sharding-enabled.
-     *
-     * Throws DatabaseDifferCase if the database already exists with a different case.
-     */
-    void enableSharding(OperationContext* opCtx, StringData dbName, const ShardId& primaryShard);
-
-    /**
-     * Retrieves all databases for a shard.
-     *
-     * Returns a !OK status if an error occurs.
-     */
-    StatusWith<std::vector<std::string>> getDatabasesForShard(OperationContext* opCtx,
-                                                              const ShardId& shardId);
+                                const boost::optional<ShardId>& optPrimaryShard,
+                                bool enableSharding);
 
     /**
      * Updates metadata in config.databases collection to show the given primary database on its
@@ -334,27 +324,6 @@ public:
     //
     // Collection Operations
     //
-
-    /**
-     * Drops the specified collection from the collection metadata store.
-     *
-     * Throws a DBException for any failures. These are some of the known failures:
-     *  - NamespaceNotFound - Collection does not exist
-     */
-    void dropCollection(OperationContext* opCtx, const NamespaceString& nss);
-
-    /**
-     * Ensures that a namespace that has received a dropCollection, but no longer has an entry in
-     * config.collections, has cleared all relevant metadata entries for the corresponding
-     * collection. As part of this, sends dropCollection and setShardVersion to all shards -- in
-     * case shards didn't receive these commands as part of the original dropCollection.
-     *
-     * This function does not guarantee that all shards will eventually receive setShardVersion,
-     * unless the client infinitely retries until hearing back success. This function does, however,
-     * increase the likelihood of shards having received setShardVersion.
-     */
-
-    void ensureDropCollectionCompleted(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
      * Refines the shard key of an existing collection with namespace 'nss'. Here, 'shardKey'
@@ -551,7 +520,7 @@ private:
      * Retrieve the full chunk description from the config.
      */
     StatusWith<ChunkType> _findChunkOnConfig(OperationContext* opCtx,
-                                             const NamespaceString& nss,
+                                             const NamespaceStringOrUUID& nsOrUUID,
                                              const BSONObj& key);
 
     /**
@@ -601,48 +570,6 @@ private:
      */
     void _downgradeCollectionsAndChunksMetadataToPre49(OperationContext* opCtx);
 
-    /**
-     * Sets the 'timestamp' field for the entry matching nss in config.collections, in a
-     * transaction.
-     *
-     * TODO SERVER-53283: Remove once 5.0 has been released.
-     */
-    void _addTimestampToConfigCollectionsFor49InTxn(OperationContext* opCtx,
-                                                    const NamespaceString& nss,
-                                                    TxnNumber txnNumber,
-                                                    const Timestamp& newTimestamp);
-
-    /**
-     * Deletes the 'timestamp' from the entry in config.collections matching nss, in a transaction.
-     *
-     * TODO SERVER-53283: Remove once 5.0 has been released.
-     */
-    void _deleteTimestampFromConfigCollectionsInTxn(OperationContext* opCtx,
-                                                    const NamespaceString& nss,
-                                                    TxnNumber txnNumber);
-
-    /**
-     * Sets the 'timestamp' and the 'collectionUuid' fields for the entries matching nss in
-     * config.chunks, in a transaction.
-     *
-     * TODO SERVER-53283: Remove once 5.0 has been released.
-     */
-    void _addTimestampAndUUIDToConfigChunksFor49InTxn(OperationContext* opCtx,
-                                                      const NamespaceString& nss,
-                                                      const mongo::UUID& collectionUuid,
-                                                      TxnNumber txnNumber,
-                                                      const Timestamp& newTimestamp);
-
-    /**
-     * Deletes the 'timestamp' and 'collectionUuid' field for the entries matching nss in
-     * config.chunks, in a transaction.
-     *
-     * TODO SERVER-53283: Remove once 5.0 has been released.
-     */
-    void _deleteTimestampAndUUIDFromConfigChunksInTxn(OperationContext* opCtx,
-                                                      const NamespaceString& nss,
-                                                      TxnNumber txnNumber);
-
     // The owning service context
     ServiceContext* const _serviceContext;
 
@@ -662,9 +589,6 @@ private:
 
     Mutex _mutex = MONGO_MAKE_LATCH("ShardingCatalogManager::_mutex");
 
-    // True if shutDown() has been called. False, otherwise.
-    bool _inShutdown{false};  // (M)
-
     // True if startup() has been called.
     bool _started{false};  // (M)
 
@@ -676,13 +600,10 @@ private:
     // _kZoneOpLock
 
     /**
-     * Lock for shard zoning operations. This should be acquired when doing any operations that
-     * can affect the config.tags collection or the tags field of the config.shards collection.
-     * No other locks should be held when locking this. If an operation needs to take database
-     * locks (for example to write to a local collection) those locks should be taken after
-     * taking this.
+     * Lock that guards changes to the set of shards in the cluster (ie addShard and removeShard
+     * requests).
      */
-    Lock::ResourceMutex _kZoneOpLock;
+    Lock::ResourceMutex _kShardMembershipLock;
 
     /**
      * Lock for chunk split/merge/move operations. This should be acquired when doing split/merge/
@@ -694,10 +615,13 @@ private:
     Lock::ResourceMutex _kChunkOpLock;
 
     /**
-     * Lock that guards changes to the set of shards in the cluster (ie addShard and removeShard
-     * requests).
+     * Lock for shard zoning operations. This should be acquired when doing any operations that
+     * can affect the config.tags collection or the tags field of the config.shards collection.
+     * No other locks should be held when locking this. If an operation needs to take database
+     * locks (for example to write to a local collection) those locks should be taken after
+     * taking this.
      */
-    Lock::ResourceMutex _kShardMembershipLock;
+    Lock::ResourceMutex _kZoneOpLock;
 };
 
 }  // namespace mongo

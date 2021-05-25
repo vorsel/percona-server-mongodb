@@ -68,7 +68,6 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/flush_routing_table_cache_updates_gen.h"
-#include "mongo/s/request_types/set_shard_version_request.h"
 #include "mongo/s/shard_key_pattern.h"
 #include "mongo/s/shard_util.h"
 #include "mongo/s/sharded_collections_ddl_parameters_gen.h"
@@ -91,7 +90,6 @@ MONGO_FAIL_POINT_DEFINE(hangRefineCollectionShardKeyBeforeCommit);
 
 namespace {
 const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
-static constexpr int kMaxNumStaleShardVersionRetries = 10;
 const WriteConcernOptions kNoWaitWriteConcern(1, WriteConcernOptions::SyncMode::UNSET, Seconds(0));
 const char kWriteConcernField[] = "writeConcern";
 
@@ -139,20 +137,29 @@ boost::optional<UUID> checkCollectionOptions(OperationContext* opCtx,
     return uassertStatusOK(UUID::parse(collectionInfo["uuid"]));
 }
 
-void triggerFireAndForgetShardRefreshes(OperationContext* opCtx, const NamespaceString& nss) {
+void triggerFireAndForgetShardRefreshes(OperationContext* opCtx, const CollectionType& coll) {
     const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
     const auto allShards = uassertStatusOK(Grid::get(opCtx)->catalogClient()->getAllShards(
                                                opCtx, repl::ReadConcernLevel::kLocalReadConcern))
                                .value;
 
     for (const auto& shardEntry : allShards) {
+        const auto query = [&]() {
+            if (coll.getTimestamp()) {
+                return BSON(ChunkType::collectionUUID << coll.getUuid()
+                                                      << ChunkType::shard(shardEntry.getName()));
+            } else {
+                return BSON(ChunkType::ns(coll.getNss().ns())
+                            << ChunkType::shard(shardEntry.getName()));
+            }
+        }();
+
         const auto chunk = uassertStatusOK(shardRegistry->getConfigShard()->exhaustiveFindOnConfig(
                                                opCtx,
                                                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                                                repl::ReadConcernLevel::kLocalReadConcern,
                                                ChunkType::ConfigNS,
-                                               BSON(ChunkType::ns(nss.ns())
-                                                    << ChunkType::shard(shardEntry.getName())),
+                                               query,
                                                BSONObj(),
                                                1LL))
                                .docs;
@@ -169,200 +176,12 @@ void triggerFireAndForgetShardRefreshes(OperationContext* opCtx, const Namespace
                 opCtx,
                 ReadPreferenceSetting{ReadPreference::PrimaryOnly},
                 NamespaceString::kAdminDb.toString(),
-                BSON(_flushRoutingTableCacheUpdates::kCommandName << nss.ns()));
+                BSON(_flushRoutingTableCacheUpdates::kCommandName << coll.getNss().ns()));
         }
     }
 }
 
 }  // namespace
-
-void sendDropCollectionToAllShards(OperationContext* opCtx, const NamespaceString& nss) {
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
-
-    const auto shardsStatus =
-        catalogClient->getAllShards(opCtx, repl::ReadConcernLevel::kLocalReadConcern);
-    uassertStatusOK(shardsStatus.getStatus());
-
-    vector<ShardType> allShards = std::move(shardsStatus.getValue().value);
-
-    const auto dropCommandBSON = [opCtx, &nss] {
-        BSONObjBuilder builder;
-        builder.append("drop", nss.coll());
-
-        if (!opCtx->getWriteConcern().usedDefault) {
-            builder.append(WriteConcernOptions::kWriteConcernField,
-                           opCtx->getWriteConcern().toBSON());
-        }
-
-        ChunkVersion::IGNORED().appendToCommand(&builder);
-        return builder.obj();
-    }();
-
-    auto* const shardRegistry = Grid::get(opCtx)->shardRegistry();
-
-    for (const auto& shardEntry : allShards) {
-        bool keepTrying;
-        size_t numStaleShardVersionAttempts = 0;
-        do {
-            const auto& shard =
-                uassertStatusOK(shardRegistry->getShard(opCtx, shardEntry.getName()));
-
-            auto swDropResult = shard->runCommandWithFixedRetryAttempts(
-                opCtx,
-                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                nss.db().toString(),
-                dropCommandBSON,
-                Shard::RetryPolicy::kIdempotent);
-
-            const std::string dropCollectionErrMsg = str::stream()
-                << "Error dropping collection on shard " << shardEntry.getName();
-
-            auto dropResult = uassertStatusOKWithContext(swDropResult, dropCollectionErrMsg);
-            uassertStatusOKWithContext(dropResult.writeConcernStatus, dropCollectionErrMsg);
-
-            auto dropCommandStatus = std::move(dropResult.commandStatus);
-
-            if (dropCommandStatus.code() == ErrorCodes::NamespaceNotFound) {
-                // The dropCollection command on the shard is not idempotent, and can return
-                // NamespaceNotFound. We can ignore NamespaceNotFound since we have already asserted
-                // that there is no writeConcern error.
-                keepTrying = false;
-            } else if (ErrorCodes::isStaleShardVersionError(dropCommandStatus.code())) {
-                numStaleShardVersionAttempts++;
-                if (numStaleShardVersionAttempts == kMaxNumStaleShardVersionRetries) {
-                    uassertStatusOKWithContext(dropCommandStatus,
-                                               str::stream() << dropCollectionErrMsg
-                                                             << " due to exceeded retry attempts");
-                }
-                // No need to refresh cache, the command was sent with ChunkVersion::IGNORED and the
-                // shard is allowed to throw, which means that the drop will serialize behind a
-                // refresh.
-                keepTrying = true;
-            } else {
-                uassertStatusOKWithContext(dropCommandStatus, dropCollectionErrMsg);
-                keepTrying = false;
-            }
-        } while (keepTrying);
-    }
-}
-
-void sendSSVToAllShards(OperationContext* opCtx, const NamespaceString& nss) {
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
-
-    const auto shardsStatus =
-        catalogClient->getAllShards(opCtx, repl::ReadConcernLevel::kLocalReadConcern);
-    uassertStatusOK(shardsStatus.getStatus());
-
-    vector<ShardType> allShards = std::move(shardsStatus.getValue().value);
-
-    auto* const shardRegistry = Grid::get(opCtx)->shardRegistry();
-
-    IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
-    for (const auto& shardEntry : allShards) {
-        const auto& shard = uassertStatusOK(shardRegistry->getShard(opCtx, shardEntry.getName()));
-
-        SetShardVersionRequest ssv(
-            nss, ChunkVersion::UNSHARDED(), true /* isAuthoritative */, true /* forceRefresh */);
-
-        auto ssvResult = shard->runCommandWithFixedRetryAttempts(
-            opCtx,
-            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-            "admin",
-            ssv.toBSON(),
-            Shard::RetryPolicy::kIdempotent);
-
-        uassertStatusOK(ssvResult.getStatus());
-        uassertStatusOK(ssvResult.getValue().commandStatus);
-    }
-}
-
-void removeChunksAndTagsForDroppedCollection(OperationContext* opCtx, const NamespaceString& nss) {
-    IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
-
-    // Remove chunk data
-    uassertStatusOK(
-        catalogClient->removeConfigDocuments(opCtx,
-                                             ChunkType::ConfigNS,
-                                             BSON(ChunkType::ns(nss.ns())),
-                                             ShardingCatalogClient::kMajorityWriteConcern));
-
-    // Remove tag data
-    uassertStatusOK(
-        catalogClient->removeConfigDocuments(opCtx,
-                                             TagsType::ConfigNS,
-                                             BSON(TagsType::ns(nss.ns())),
-                                             ShardingCatalogClient::kMajorityWriteConcern));
-}
-
-void ShardingCatalogManager::dropCollection(OperationContext* opCtx, const NamespaceString& nss) {
-    uassertStatusOK(ShardingLogging::get(opCtx)->logChangeChecked(
-        opCtx,
-        "dropCollection.start",
-        nss.ns(),
-        BSONObj(),
-        ShardingCatalogClient::kMajorityWriteConcern));
-
-    LOGV2_DEBUG(21924,
-                1,
-                "dropCollection {namespace} started",
-                "dropCollection started",
-                "namespace"_attr = nss.ns());
-
-    sendDropCollectionToAllShards(opCtx, nss);
-
-    LOGV2_DEBUG(21925,
-                1,
-                "dropCollection {namespace} shard data deleted",
-                "dropCollection shard data deleted",
-                "namespace"_attr = nss.ns());
-
-    removeChunksAndTagsForDroppedCollection(opCtx, nss);
-
-    LOGV2_DEBUG(21926,
-                1,
-                "dropCollection {namespace} chunk and tag data deleted",
-                "dropCollection chunk and tag data deleted",
-                "namespace"_attr = nss.ns());
-
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
-    uassertStatusOK(
-        catalogClient->removeConfigDocuments(opCtx,
-                                             CollectionType::ConfigNS,
-                                             BSON(CollectionType::kNssFieldName << nss.ns()),
-                                             ShardingCatalogClient::kMajorityWriteConcern));
-    LOGV2_DEBUG(21927,
-                1,
-                "dropCollection {namespace} collection entry deleted",
-                "dropCollection collection entry deleted",
-                "namespace"_attr = nss.ns());
-
-    sendSSVToAllShards(opCtx, nss);
-
-    LOGV2_DEBUG(21928,
-                1,
-                "dropCollection {namespace} completed",
-                "dropCollection completed",
-                "namespace"_attr = nss.ns());
-
-    ShardingLogging::get(opCtx)->logChange(
-        opCtx, "dropCollection", nss.ns(), BSONObj(), ShardingCatalogClient::kMajorityWriteConcern);
-}
-
-void ShardingCatalogManager::ensureDropCollectionCompleted(OperationContext* opCtx,
-                                                           const NamespaceString& nss) {
-
-    LOGV2_DEBUG(21929,
-                1,
-                "Ensuring config entries for {namespace} from previous dropCollection are cleared",
-                "Ensuring config entries from previous dropCollection are cleared",
-                "namespace"_attr = nss.ns());
-    sendDropCollectionToAllShards(opCtx, nss);
-
-    IgnoreAPIParametersBlock ignoreApiParametersBlock(opCtx);
-    removeChunksAndTagsForDroppedCollection(opCtx, nss);
-    sendSSVToAllShards(opCtx, nss);
-}
 
 // Returns the pipeline updates to be used for updating a refined collection's chunk and tag
 // documents.
@@ -516,8 +335,7 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
     collType.setKeyPattern(newShardKeyPattern.getKeyPattern());
 
     boost::optional<Timestamp> newTimestamp;
-    if (feature_flags::gShardingFullDDLSupportTimestampedVersion.isEnabled(
-            serverGlobalParams.featureCompatibility)) {
+    if (collType.getTimestamp()) {
         auto now = VectorClock::get(opCtx)->getTime();
         newTimestamp = now.clusterTime().asTimestamp();
         collType.setTimestamp(newTimestamp);
@@ -549,11 +367,18 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
         // to the newly-generated objectid, (ii) their bounds for each new field in the refined
         // key to MinKey (except for the global max chunk where the max bounds are set to
         // MaxKey), and unsetting (iii) their jumbo field.
+        const auto chunksQuery = [&]() {
+            if (collType.getTimestamp()) {
+                return BSON(ChunkType::collectionUUID << collType.getUuid());
+            } else {
+                return BSON(ChunkType::ns(collType.getNss().ns()));
+            }
+        }();
         writeToConfigDocumentInTxn(
             opCtx,
             ChunkType::ConfigNS,
             BatchedCommandRequest::buildPipelineUpdateOp(ChunkType::ConfigNS,
-                                                         BSON("ns" << nss.ns()),
+                                                         chunksQuery,
                                                          chunkUpdates,
                                                          false,  // upsert
                                                          true    // useMultiUpdate
@@ -609,7 +434,7 @@ void ShardingCatalogManager::refineCollectionShardKey(OperationContext* opCtx,
     // Trigger refreshes on each shard containing chunks in the namespace 'nss'. Since this isn't
     // necessary for correctness, all refreshes are best-effort.
     try {
-        triggerFireAndForgetShardRefreshes(opCtx, nss);
+        triggerFireAndForgetShardRefreshes(opCtx, collType);
     } catch (const DBException& ex) {
         LOGV2(
             51798,

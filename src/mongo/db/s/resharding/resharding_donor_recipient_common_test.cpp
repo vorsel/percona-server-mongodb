@@ -49,7 +49,7 @@ using namespace fmt::literals;
 
 TEST_F(ReshardingDonorRecipientCommonInternalsTest, ConstructDonorDocumentFromReshardingFields) {
     OperationContext* opCtx = operationContext();
-    auto metadata = makeShardedMetadataForOriginalCollection(opCtx);
+    auto metadata = makeShardedMetadataForOriginalCollection(opCtx, kThisShard);
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
@@ -63,13 +63,13 @@ TEST_F(ReshardingDonorRecipientCommonInternalsTest, ConstructDonorDocumentFromRe
 TEST_F(ReshardingDonorRecipientCommonInternalsTest,
        ConstructRecipientDocumentFromReshardingFields) {
     OperationContext* opCtx = operationContext();
-    auto metadata = makeShardedMetadataForTemporaryReshardingCollection(opCtx);
+    auto metadata = makeShardedMetadataForTemporaryReshardingCollection(opCtx, kThisShard);
 
     auto reshardingFields =
-        createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kCloning);
+        createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
 
     appendRecipientFieldsToReshardingFields(
-        reshardingFields, kShardIds, kExistingUUID, kOriginalNss, kFetchTimestamp);
+        reshardingFields, kShardIds, kExistingUUID, kOriginalNss);
 
     auto recipientDoc = resharding::constructRecipientDocumentFromReshardingFields(
         opCtx, metadata, reshardingFields);
@@ -79,7 +79,7 @@ TEST_F(ReshardingDonorRecipientCommonInternalsTest,
 
 TEST_F(ReshardingDonorRecipientCommonTest, CreateDonorServiceInstance) {
     OperationContext* opCtx = operationContext();
-    auto metadata = makeShardedMetadataForOriginalCollection(opCtx);
+    auto metadata = makeShardedMetadataForOriginalCollection(opCtx, kThisShard);
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
@@ -100,12 +100,12 @@ TEST_F(ReshardingDonorRecipientCommonTest, CreateDonorServiceInstance) {
 
 TEST_F(ReshardingDonorRecipientCommonTest, CreateRecipientServiceInstance) {
     OperationContext* opCtx = operationContext();
-    auto metadata = makeShardedMetadataForTemporaryReshardingCollection(opCtx);
+    auto metadata = makeShardedMetadataForTemporaryReshardingCollection(opCtx, kThisShard);
 
     auto reshardingFields =
-        createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kCloning);
+        createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
     appendRecipientFieldsToReshardingFields(
-        reshardingFields, kShardIds, kExistingUUID, kOriginalNss, kFetchTimestamp);
+        reshardingFields, kShardIds, kExistingUUID, kOriginalNss);
 
     resharding::processReshardingFieldsForCollection(
         opCtx, kTemporaryReshardingNss, metadata, reshardingFields);
@@ -124,7 +124,7 @@ TEST_F(ReshardingDonorRecipientCommonTest, CreateRecipientServiceInstance) {
 TEST_F(ReshardingDonorRecipientCommonTest,
        CreateDonorServiceInstanceWithIncorrectCoordinatorState) {
     OperationContext* opCtx = operationContext();
-    auto metadata = makeShardedMetadataForOriginalCollection(opCtx);
+    auto metadata = makeShardedMetadataForOriginalCollection(opCtx, kThisShard);
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
@@ -140,7 +140,7 @@ TEST_F(ReshardingDonorRecipientCommonTest,
 TEST_F(ReshardingDonorRecipientCommonTest,
        CreateRecipientServiceInstanceWithIncorrectCoordinatorState) {
     OperationContext* opCtx = operationContext();
-    auto metadata = makeShardedMetadataForTemporaryReshardingCollection(opCtx);
+    auto metadata = makeShardedMetadataForTemporaryReshardingCollection(opCtx, kThisShard);
 
     auto reshardingFields =
         createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kDecisionPersisted);
@@ -161,12 +161,52 @@ TEST_F(ReshardingDonorRecipientCommonTest,
     ASSERT(recipientStateMachine == boost::none);
 }
 
-TEST_F(ReshardingDonorRecipientCommonTest, ProcessReshardingFieldsWithoutDonorOrRecipientFields) {
+TEST_F(ReshardingDonorRecipientCommonTest, ProcessDonorFieldsWhenShardDoesntOwnAnyChunks) {
     OperationContext* opCtx = operationContext();
-    auto metadata = makeShardedMetadataForTemporaryReshardingCollection(opCtx);
+    auto metadata = makeShardedMetadataForOriginalCollection(opCtx, kOtherShard);
 
     auto reshardingFields =
-        createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kCloning);
+        createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
+    appendDonorFieldsToReshardingFields(reshardingFields, kReshardingKeyPattern);
+
+    resharding::processReshardingFieldsForCollection(
+        opCtx, kOriginalNss, metadata, reshardingFields);
+
+    auto donorStateMachine =
+        resharding::tryGetReshardingStateMachine<ReshardingDonorService,
+                                                 ReshardingDonorService::DonorStateMachine,
+                                                 ReshardingDonorDocument>(opCtx, kReshardingUUID);
+
+    ASSERT(donorStateMachine == boost::none);
+}
+
+TEST_F(ReshardingDonorRecipientCommonTest, ProcessRecipientFieldsWhenShardDoesntOwnAnyChunks) {
+    OperationContext* opCtx = operationContext();
+    auto metadata = makeShardedMetadataForTemporaryReshardingCollection(opCtx, kOtherShard);
+
+    auto reshardingFields =
+        createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
+    appendRecipientFieldsToReshardingFields(
+        reshardingFields, kShardIds, kExistingUUID, kOriginalNss);
+
+    resharding::processReshardingFieldsForCollection(
+        opCtx, kTemporaryReshardingNss, metadata, reshardingFields);
+
+    auto recipientStateMachine =
+        resharding::tryGetReshardingStateMachine<ReshardingRecipientService,
+                                                 ReshardingRecipientService::RecipientStateMachine,
+                                                 ReshardingRecipientDocument>(opCtx,
+                                                                              kReshardingUUID);
+
+    ASSERT(recipientStateMachine == boost::none);
+}
+
+TEST_F(ReshardingDonorRecipientCommonTest, ProcessReshardingFieldsWithoutDonorOrRecipientFields) {
+    OperationContext* opCtx = operationContext();
+    auto metadata = makeShardedMetadataForTemporaryReshardingCollection(opCtx, kThisShard);
+
+    auto reshardingFields =
+        createCommonReshardingFields(kReshardingUUID, CoordinatorStateEnum::kPreparingToDonate);
 
     ASSERT_THROWS_CODE(resharding::processReshardingFieldsForCollection(
                            opCtx, kTemporaryReshardingNss, metadata, reshardingFields),

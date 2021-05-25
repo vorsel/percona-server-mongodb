@@ -208,7 +208,7 @@ WorkingSetMember roundtripWsmThroughSerialization(WorkingSetMember wsm) {
 }
 }  // namespace
 
-TEST_F(WorkingSetFixture, RecordIdAndObjStateCanRoundtripThroughSerialization) {
+TEST_F(WorkingSetFixture, RecordIdLongAndObjStateCanRoundtripThroughSerialization) {
     Document doc{{"foo", Value{"bar"_sd}}};
     member->doc.setValue(doc);
     member->doc.setSnapshotId(SnapshotId{42u});
@@ -218,7 +218,22 @@ TEST_F(WorkingSetFixture, RecordIdAndObjStateCanRoundtripThroughSerialization) {
     ASSERT_EQ(WorkingSetMember::RID_AND_OBJ, roundtripped.getState());
     ASSERT_DOCUMENT_EQ(roundtripped.doc.value(), doc);
     ASSERT_EQ(roundtripped.doc.snapshotId().toNumber(), 42u);
-    ASSERT_EQ(roundtripped.recordId.repr(), 43);
+    ASSERT_EQ(roundtripped.recordId.asLong(), 43);
+    ASSERT_FALSE(roundtripped.metadata());
+}
+
+TEST_F(WorkingSetFixture, RecordIdStrAndObjStateCanRoundtripThroughSerialization) {
+    Document doc{{"foo", Value{"bar"_sd}}};
+    member->doc.setValue(doc);
+    member->doc.setSnapshotId(SnapshotId{42u});
+    const OID oid = OID::gen();
+    member->recordId = RecordId{oid.view().view(), RecordId::kSmallStrSize};
+    ws->transitionToRecordIdAndObj(id);
+    auto roundtripped = roundtripWsmThroughSerialization(*member);
+    ASSERT_EQ(WorkingSetMember::RID_AND_OBJ, roundtripped.getState());
+    ASSERT_DOCUMENT_EQ(roundtripped.doc.value(), doc);
+    ASSERT_EQ(roundtripped.doc.snapshotId().toNumber(), 42u);
+    ASSERT_EQ(OID::from(roundtripped.recordId.strData()), oid);
     ASSERT_FALSE(roundtripped.metadata());
 }
 
@@ -244,7 +259,7 @@ TEST_F(WorkingSetFixture, RecordIdAndIdxStateCanRoundtripThroughSerialization) {
 
     auto roundtripped = roundtripWsmThroughSerialization(*member);
     ASSERT_EQ(WorkingSetMember::RID_AND_IDX, roundtripped.getState());
-    ASSERT_EQ(roundtripped.recordId.repr(), 43);
+    ASSERT_EQ(roundtripped.recordId.asLong(), 43);
     ASSERT_EQ(roundtripped.keyData.size(), 2u);
 
     ASSERT_BSONOBJ_EQ(roundtripped.keyData[0].indexKeyPattern, BSON("a" << 1 << "b" << 1));
@@ -265,10 +280,10 @@ TEST_F(WorkingSetFixture, WsmWithMetadataCanRoundtripThroughSerialization) {
     member->doc.setValue(doc);
     member->metadata().setTextScore(42.0);
     member->metadata().setSearchScore(43.0);
-    ws->transitionToRecordIdAndObj(id);
+    ws->transitionToOwnedObj(id);
     auto roundtripped = roundtripWsmThroughSerialization(*member);
 
-    ASSERT_EQ(WorkingSetMember::RID_AND_OBJ, roundtripped.getState());
+    ASSERT_EQ(WorkingSetMember::OWNED_OBJ, roundtripped.getState());
     ASSERT_DOCUMENT_EQ(roundtripped.doc.value(), doc);
     ASSERT_FALSE(roundtripped.doc.value().metadata());
     ASSERT_TRUE(roundtripped.doc.snapshotId().isNull());
@@ -298,7 +313,7 @@ TEST_F(WorkingSetFixture, WsmCanBeExtractedAndReinserted) {
     ASSERT_EQ(extractedWsm.getState(), WorkingSetMember::RID_AND_OBJ);
     ASSERT_DOCUMENT_EQ(extractedWsm.doc.value(), doc);
     ASSERT_EQ(extractedWsm.doc.snapshotId().toNumber(), 42u);
-    ASSERT_EQ(extractedWsm.recordId.repr(), 43);
+    ASSERT_EQ(extractedWsm.recordId.asLong(), 43);
     ASSERT_FALSE(extractedWsm.metadata());
 
     auto emplacedId = ws->emplace(std::move(extractedWsm));
@@ -309,7 +324,7 @@ TEST_F(WorkingSetFixture, WsmCanBeExtractedAndReinserted) {
     ASSERT_EQ(emplacedWsm->getState(), WorkingSetMember::RID_AND_OBJ);
     ASSERT_DOCUMENT_EQ(emplacedWsm->doc.value(), doc);
     ASSERT_EQ(emplacedWsm->doc.snapshotId().toNumber(), 42u);
-    ASSERT_EQ(emplacedWsm->recordId.repr(), 43);
+    ASSERT_EQ(emplacedWsm->recordId.asLong(), 43);
     ASSERT_FALSE(emplacedWsm->metadata());
 }
 

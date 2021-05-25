@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include "mongo/platform/basic.h"
 
@@ -46,6 +46,7 @@
 #include "mongo/db/repl/oplog_applier_utils.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
 #include "mongo/db/s/resharding/resharding_donor_oplog_iterator.h"
+#include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding_util.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/transaction_participant.h"
@@ -216,6 +217,9 @@ Status insertOplogAndUpdateConfigForRetryable(OperationContext* opCtx,
             sessionTxnRecord.setSessionId(*oplog.getSessionId());
             sessionTxnRecord.setTxnNum(txnNumber);
             sessionTxnRecord.setLastWriteOpTime(oplogOpTime);
+
+            // Use the same wallTime as oplog since SessionUpdateTracker looks at the oplog entry
+            // wallTime when replicating.
             sessionTxnRecord.setLastWriteDate(noOpOplog.getWallClockTime());
             txnParticipant.onRetryableWriteCloningCompleted(opCtx, {stmtId}, sessionTxnRecord);
 
@@ -241,7 +245,7 @@ ServiceContext::UniqueOperationContext makeInterruptibleOperationContext() {
 }  // anonymous namespace
 
 ReshardingOplogApplier::ReshardingOplogApplier(
-    ServiceContext* service,
+    std::unique_ptr<Env> env,
     ReshardingSourceId sourceId,
     NamespaceString oplogNs,
     NamespaceString nsBeingResharded,
@@ -253,7 +257,8 @@ ReshardingOplogApplier::ReshardingOplogApplier(
     const ChunkManager& sourceChunkMgr,
     std::shared_ptr<executor::TaskExecutor> executor,
     ThreadPool* writerPool)
-    : _sourceId(std::move(sourceId)),
+    : _env(std::move(env)),
+      _sourceId(std::move(sourceId)),
       _oplogNs(std::move(oplogNs)),
       _nsBeingResharded(std::move(nsBeingResharded)),
       _uuidBeingResharded(std::move(collUUIDBeingResharded)),
@@ -263,7 +268,6 @@ ReshardingOplogApplier::ReshardingOplogApplier(
       _batchPreparer{CollatorInterface::cloneCollator(sourceChunkMgr.getDefaultCollator())},
       _applicationRules(ReshardingOplogApplicationRules(
           _outputNs, std::move(allStashNss), myStashIdx, _sourceId.getShardId(), sourceChunkMgr)),
-      _service(service),
       _executor(std::move(executor)),
       _writerPool(writerPool),
       _oplogIter(std::move(oplogIterator)) {}
@@ -293,28 +297,31 @@ ExecutorFuture<void> ReshardingOplogApplier::applyUntilDone() {
 ExecutorFuture<void> ReshardingOplogApplier::_scheduleNextBatch() {
     return ExecutorFuture(_executor)
         .then([this] {
-            auto batchClient = makeKillableClient(_service, kClientName);
+            auto batchClient = makeKillableClient(_service(), kClientName);
             AlternativeClientRegion acr(batchClient);
 
             return _oplogIter->getNextBatch(_executor);
         })
         .then([this](OplogBatch batch) {
+            LOGV2_DEBUG(5391002, 3, "Starting batch", "batchSize"_attr = batch.size());
             _currentBatchToApply = std::move(batch);
 
-            auto applyBatchClient = makeKillableClient(_service, kClientName);
+            auto applyBatchClient = makeKillableClient(_service(), kClientName);
             AlternativeClientRegion acr(applyBatchClient);
             auto applyBatchOpCtx = makeInterruptibleOperationContext();
 
             return _applyBatch(applyBatchOpCtx.get(), false /* isForSessionApplication */);
         })
         .then([this] {
-            auto applyBatchClient = makeKillableClient(_service, kClientName);
+            auto applyBatchClient = makeKillableClient(_service(), kClientName);
             AlternativeClientRegion acr(applyBatchClient);
             auto applyBatchOpCtx = makeInterruptibleOperationContext();
 
             return _applyBatch(applyBatchOpCtx.get(), true /* isForSessionApplication */);
         })
         .then([this] {
+            _env->metrics()->onOplogEntriesApplied(_currentBatchToApply.size());
+
             if (_currentBatchToApply.empty()) {
                 // It is possible that there are no more oplog entries from the last point we
                 // resumed from.
@@ -328,7 +335,7 @@ ExecutorFuture<void> ReshardingOplogApplier::_scheduleNextBatch() {
 
             auto lastApplied = _currentBatchToApply.back();
 
-            auto scheduleBatchClient = makeKillableClient(_service, kClientName);
+            auto scheduleBatchClient = makeKillableClient(_service(), kClientName);
             AlternativeClientRegion acr(scheduleBatchClient);
             auto opCtx = makeInterruptibleOperationContext();
 
@@ -391,34 +398,32 @@ Status ReshardingOplogApplier::_applyOplogBatchPerWorker(
     std::vector<const repl::OplogEntry*>* ops) {
     auto opCtx = makeInterruptibleOperationContext();
 
-    return repl::OplogApplierUtils::applyOplogBatchCommon(
-        opCtx.get(),
-        ops,
-        repl::OplogApplication::Mode::kInitialSync,
-        false /* allowNamespaceNotFoundErrorsOnCrudOps */,
-        [this](OperationContext* opCtx,
-               const repl::OplogEntryOrGroupedInserts& opOrInserts,
-               repl::OplogApplication::Mode mode) {
-            invariant(mode == repl::OplogApplication::Mode::kInitialSync);
-            return _applyOplogEntryOrGroupedInserts(opCtx, opOrInserts);
-        });
+    for (const auto& op : *ops) {
+        try {
+            auto status = _applyOplogEntry(opCtx.get(), *op);
+
+            if (!status.isOK()) {
+                return status;
+            }
+        } catch (const DBException& ex) {
+            return ex.toStatus();
+        }
+    }
+
+    return Status::OK();
 }
 
-Status ReshardingOplogApplier::_applyOplogEntryOrGroupedInserts(
-    OperationContext* opCtx, const repl::OplogEntryOrGroupedInserts& entryOrGroupedInserts) {
+Status ReshardingOplogApplier::_applyOplogEntry(OperationContext* opCtx,
+                                                const repl::OplogEntry& op) {
     // Unlike normal secondary replication, we want the write to generate it's own oplog entry.
     invariant(opCtx->writesAreReplicated());
 
-    auto op = entryOrGroupedInserts.getOp();
-
     if (op.isForReshardingSessionApplication()) {
-        return insertOplogAndUpdateConfigForRetryable(opCtx, entryOrGroupedInserts.getOp());
+        return insertOplogAndUpdateConfigForRetryable(opCtx, op);
     }
 
-    invariant(DocumentValidationSettings::get(opCtx).isSchemaValidationDisabled());
-
     invariant(op.isCrudOpType());
-    return _applicationRules.applyOperation(opCtx, entryOrGroupedInserts);
+    return _applicationRules.applyOperation(opCtx, op);
 }
 
 Status ReshardingOplogApplier::_onError(Status status) {
@@ -498,14 +503,14 @@ Timestamp ReshardingOplogApplier::_clearAppliedOpsAndStoreProgress(OperationCont
     return lastAppliedTs;
 }
 
-NamespaceString ReshardingOplogApplier::ensureStashCollectionExists(OperationContext* opCtx,
-                                                                    const UUID& existingUUID,
-                                                                    const ShardId& donorShardId) {
-    auto nss = NamespaceString{NamespaceString::kConfigDb,
-                               "localReshardingConflictStash.{}.{}"_format(
-                                   existingUUID.toString(), donorShardId.toString())};
+NamespaceString ReshardingOplogApplier::ensureStashCollectionExists(
+    OperationContext* opCtx,
+    const UUID& existingUUID,
+    const ShardId& donorShardId,
+    const CollectionOptions& options) {
+    auto nss = getLocalConflictStashNamespace(existingUUID, donorShardId);
 
-    resharding::data_copy::ensureCollectionExists(opCtx, nss);
+    resharding::data_copy::ensureCollectionExists(opCtx, nss, options);
     return nss;
 }
 

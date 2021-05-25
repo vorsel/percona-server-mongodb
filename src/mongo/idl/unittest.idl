@@ -609,6 +609,16 @@ structs:
                     - int
                     - one_string
 
+    one_variant_safeInt_array:
+        description: UnitTest for a single variant which accepts a string or array of safeInt
+        strict: false
+        fields:
+            value:
+                type:
+                    variant:
+                    - string
+                    - array<safeInt>
+
     one_variant_struct_array:
         description: UnitTest for a single variant which accepts an int or array of structs
         strict: false
@@ -1006,7 +1016,7 @@ commands:
     
     CommandWithAnyTypeOwnedMember:
         description: "A mock command to test IDLAnyTypeOwned"
-        command_name: CommandWithValueTypeMember
+        command_name: CommandWithAnyTypeOwnedMember
         namespace: ignored
         api_version: ""
         reply_type: OkReply
@@ -1027,6 +1037,16 @@ commands:
         description: A versioned API command
         command_name: APIVersion1CommandRuntimeName2
         cpp_name: APIVersion1CommandCPPName2
+        namespace: ignored
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+
+    # Test whether the C++ code for a command with alias name is currently generated.
+    APIVersion1CommandWithAlias:
+        description: A versioned API command with alias
+        command_name: NewCommandName
+        command_alias: OldCommandName
         namespace: ignored
         strict: true
         api_version: "1"

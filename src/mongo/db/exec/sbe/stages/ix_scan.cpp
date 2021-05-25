@@ -170,6 +170,8 @@ void IndexScanStage::doAttachToTrialRunTracker(TrialRunTracker* tracker) {
 }
 
 void IndexScanStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.opens++;
 
     invariant(_opCtx);
@@ -238,6 +240,8 @@ void IndexScanStage::open(bool reOpen) {
             // TODO SERVER-49385: When the 'prepare()' phase takes the collection lock, it will be
             // possible to intialize '_ordering' there instead of here.
             _ordering = entry->ordering();
+
+            ++_specificStats.seeks;
         } else {
             _cursor.reset();
         }
@@ -247,6 +251,8 @@ void IndexScanStage::open(bool reOpen) {
 }
 
 PlanState IndexScanStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     if (!_cursor) {
         return trackPlanState(PlanState::IS_EOF);
     }
@@ -285,7 +291,7 @@ PlanState IndexScanStage::getNext() {
 
     if (_recordIdAccessor) {
         _recordIdAccessor->reset(value::TypeTags::RecordId,
-                                 value::bitcastFrom<int64_t>(_nextRecord->loc.repr()));
+                                 value::bitcastFrom<int64_t>(_nextRecord->loc.asLong()));
     }
 
     if (_accessors.size()) {
@@ -306,6 +312,8 @@ PlanState IndexScanStage::getNext() {
 }
 
 void IndexScanStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.closes++;
 
     _cursor.reset();
@@ -319,19 +327,19 @@ std::unique_ptr<PlanStageStats> IndexScanStage::getStats(bool includeDebugInfo) 
 
     if (includeDebugInfo) {
         BSONObjBuilder bob;
-        bob.appendNumber("numReads", _specificStats.numReads);
-        bob.appendNumber("seeks", _specificStats.seeks);
+        bob.appendNumber("numReads", static_cast<long long>(_specificStats.numReads));
+        bob.appendNumber("seeks", static_cast<long long>(_specificStats.seeks));
         if (_recordSlot) {
-            bob.appendIntOrLL("recordSlot", *_recordSlot);
+            bob.appendNumber("recordSlot", static_cast<long long>(*_recordSlot));
         }
         if (_recordIdSlot) {
-            bob.appendIntOrLL("recordIdSlot", *_recordIdSlot);
+            bob.appendNumber("recordIdSlot", static_cast<long long>(*_recordIdSlot));
         }
         if (_seekKeySlotLow) {
-            bob.appendIntOrLL("seekKeySlotLow", *_seekKeySlotLow);
+            bob.appendNumber("seekKeySlotLow", static_cast<long long>(*_seekKeySlotLow));
         }
         if (_seekKeySlotHigh) {
-            bob.appendIntOrLL("seekKeySlotHigh", *_seekKeySlotHigh);
+            bob.appendNumber("seekKeySlotHigh", static_cast<long long>(*_seekKeySlotHigh));
         }
         bob.append("outputSlots", _vars);
         bob.append("indexKeysToInclude", _indexKeysToInclude.to_string());

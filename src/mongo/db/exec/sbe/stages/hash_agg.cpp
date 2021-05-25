@@ -102,6 +102,8 @@ value::SlotAccessor* HashAggStage::getAccessor(CompileCtx& ctx, value::SlotId sl
 }
 
 void HashAggStage::open(bool reOpen) {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.opens++;
     _children[0]->open(reOpen);
 
@@ -140,6 +142,8 @@ void HashAggStage::open(bool reOpen) {
 }
 
 PlanState HashAggStage::getNext() {
+    auto optTimer(getOptTimer(_opCtx));
+
     if (_htIt == _ht.end()) {
         _htIt = _ht.begin();
     } else {
@@ -178,6 +182,8 @@ const SpecificStats* HashAggStage::getSpecificStats() const {
 }
 
 void HashAggStage::close() {
+    auto optTimer(getOptTimer(_opCtx));
+
     _commonStats.closes++;
     _ht.clear();
 }
@@ -197,16 +203,16 @@ std::vector<DebugPrinter::Block> HashAggStage::debugPrint() const {
 
     ret.emplace_back(DebugPrinter::Block("[`"));
     bool first = true;
-    for (auto& p : _aggs) {
+    value::orderedSlotMapTraverse(_aggs, [&](auto slot, auto&& expr) {
         if (!first) {
             ret.emplace_back(DebugPrinter::Block("`,"));
         }
 
-        DebugPrinter::addIdentifier(ret, p.first);
+        DebugPrinter::addIdentifier(ret, slot);
         ret.emplace_back("=");
-        DebugPrinter::addBlocks(ret, p.second->debugPrint());
+        DebugPrinter::addBlocks(ret, expr->debugPrint());
         first = false;
-    }
+    });
     ret.emplace_back("`]");
 
     DebugPrinter::addNewLine(ret);

@@ -36,11 +36,15 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
+#include "mongo/db/s/create_collection_coordinator.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/s/shard_collection_legacy.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
+#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 
 namespace mongo {
 namespace {
@@ -158,17 +162,34 @@ CreateCollectionResponse createCollectionLegacy(OperationContext* opCtx,
     return shardCollectionLegacy(opCtx, nss, shardsvrShardCollectionRequest.toBSON(), false);
 }
 
+CreateCollectionResponse createCollection(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          const ShardsvrCreateCollection& request) {
+    uassert(
+        ErrorCodes::NotImplemented, "create collection not implemented yet", request.getShardKey());
+
+    DistLockManager::ScopedDistLock dbDistLock(uassertStatusOK(DistLockManager::get(opCtx)->lock(
+        opCtx, nss.db(), "shardCollection", DistLockManager::kDefaultLockTimeout)));
+    DistLockManager::ScopedDistLock collDistLock(uassertStatusOK(DistLockManager::get(opCtx)->lock(
+        opCtx, nss.ns(), "shardCollection", DistLockManager::kDefaultLockTimeout)));
+
+    auto createCollectionCoordinator =
+        std::make_shared<CreateCollectionCoordinator>(opCtx, request);
+    createCollectionCoordinator->run(opCtx).get(opCtx);
+    return createCollectionCoordinator->getResultOnSuccess();
+}
+
 class ShardsvrCreateCollectionCommand final : public TypedCommand<ShardsvrCreateCollectionCommand> {
 public:
     using Request = ShardsvrCreateCollection;
     using Response = CreateCollectionResponse;
 
-    bool adminOnly() const override {
-        return false;
-    }
-
     std::string help() const override {
         return "Internal command. Do not call directly. Creates a collection.";
+    }
+
+    bool adminOnly() const override {
+        return false;
     }
 
     AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
@@ -194,7 +215,30 @@ public:
                     "Create Collection path has not been implemented",
                     request().getShardKey());
 
-            return createCollectionLegacy(opCtx, ns(), request());
+            DistLockManager::ScopedDistLock dbDistLock(
+                uassertStatusOK(DistLockManager::get(opCtx)->lock(
+                    opCtx,
+                    DistLockManager::kShardingRoutingInfoFormatStabilityLockName,
+                    "createCollection",
+                    DistLockManager::kDefaultLockTimeout)));
+            bool useNewPath = [&] {
+                return feature_flags::gShardingFullDDLSupport.isEnabled(
+                           serverGlobalParams.featureCompatibility) &&
+                    !feature_flags::gDisableIncompleteShardingDDLSupport.isEnabled(
+                        serverGlobalParams.featureCompatibility);
+            }();
+
+            if (!useNewPath) {
+                LOGV2_DEBUG(5277911,
+                            1,
+                            "Running legacy create collection procedure",
+                            "namespace"_attr = ns());
+                return createCollectionLegacy(opCtx, ns(), request());
+            }
+
+            LOGV2_DEBUG(
+                5277910, 1, "Running new create collection procedure", "namespace"_attr = ns());
+            return createCollection(opCtx, ns(), request());
         }
 
     private:

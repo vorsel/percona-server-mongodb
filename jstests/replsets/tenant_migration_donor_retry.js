@@ -2,7 +2,8 @@
  * Tests that the donor retries its steps until success, or it gets an error that should lead to
  * an abort decision.
  *
- * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft]
+ * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
+ * incompatible_with_windows_tls]
  */
 
 (function() {
@@ -18,23 +19,25 @@ const kGarbageCollectionDelayMS = 5 * 1000;
 const kTenantIdPrefix = "testTenantId";
 let testNum = 0;
 
+const garbageCollectionOpts = {
+    // Set the delay before a donor state doc is garbage collected to be short to speed
+    // up the test.
+    tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
+    ttlMonitorSleepSecs: 1
+};
+
 const donorRst = new ReplSetTest({
     name: "donorRst",
     nodes: 1,
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor, {
-        setParameter: {
-            // Set the delay before a donor state doc is garbage collected to be short to speed
-            // up the test.
-            tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
-            ttlMonitorSleepSecs: 1,
-        }
-    })
+    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor,
+                               {setParameter: garbageCollectionOpts})
 });
 
 donorRst.startSet();
 donorRst.initiate();
 
-const tenantMigrationTest = new TenantMigrationTest({name: jsTestName(), donorRst: donorRst});
+const tenantMigrationTest = new TenantMigrationTest(
+    {name: jsTestName(), donorRst: donorRst, sharedOptions: {setParameter: garbageCollectionOpts}});
 const donorPrimary = tenantMigrationTest.getDonorPrimary();
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
@@ -121,8 +124,7 @@ function testDonorRetryRecipientForgetMigrationCmdOnError(errorCode) {
     fp.off();
 
     // Check that forgetMigration properly deletes the stateDoc and mtab from the donor primary.
-    tenantMigrationTest.waitForMigrationGarbageCollection(
-        tenantMigrationTest.getDonorRst().nodes, migrationId, tenantId);
+    tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, tenantId);
 }
 
 (() => {

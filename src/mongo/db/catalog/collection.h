@@ -491,6 +491,8 @@ public:
                                    boost::optional<ValidationLevelEnum> newLevel,
                                    boost::optional<ValidationActionEnum> newAction) = 0;
 
+    virtual Status checkValidatorAPIVersionCompatability(OperationContext* opCtx) const = 0;
+
     virtual bool getRecordPreImages() const = 0;
     virtual void setRecordPreImages(OperationContext* opCtx, bool val) = 0;
 
@@ -501,6 +503,12 @@ public:
      * cache of collection information.
      */
     virtual bool isTemporary(OperationContext* opCtx) const = 0;
+
+    /**
+     * Returns true if this collection is clustered on _id values. That is, its RecordIds are _id
+     * values and has no separate _id index.
+     */
+    virtual bool isClustered() const = 0;
 
     //
     // Stats
@@ -673,7 +681,10 @@ private:
     // These members needs to be mutable so the yield/restore interface can be const. We don't want
     // yield/restore to require a non-const instance when it otherwise could be const.
     mutable const Collection* _collection;
-    mutable OptionalCollectionUUID _yieldedUUID;
+
+    // If the collection is currently in the 'yielded' state (i.e. yield() has been called), this
+    // field will contain what was the UUID of the collection at the time of yield.
+    mutable boost::optional<UUID> _yieldedUUID;
 
     OperationContext* _opCtx;
     RestoreFn _restoreFn;

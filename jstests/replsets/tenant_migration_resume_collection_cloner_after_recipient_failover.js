@@ -1,7 +1,7 @@
 /**
  * Tests that in tenant migration, the recipient set can resume collection cloning from the last
  * document cloned after a failover.
- * @tags: [requires_majority_read_concern, requires_fcv_49]
+ * @tags: [requires_majority_read_concern, requires_fcv_49, incompatible_with_windows_tls]
  */
 
 (function() {
@@ -43,8 +43,9 @@ const docs = [{_id: 0}, {_id: "string"}, {_id: UUID()}, {_id: new Date()}];
 tenantMigrationTest.insertDonorDB(dbName, collName, docs);
 
 const migrationId = UUID();
+const migrationIdString = extractUUIDFromObject(migrationId);
 const migrationOpts = {
-    migrationIdString: extractUUIDFromObject(migrationId),
+    migrationIdString: migrationIdString,
     recipientConnString: tenantMigrationTest.getRecipientConnString(),
     tenantId: tenantId,
 };
@@ -63,7 +64,17 @@ const migrationThread =
     new Thread(TenantMigrationUtil.runMigrationAsync, migrationOpts, donorRstArgs);
 migrationThread.start();
 hangDuringCollectionClone.wait();
-assert.eq(2, recipientColl.find().itcount());
+assert.soon(() => recipientColl.find().itcount() === 2);
+
+// Insert some documents that will be fetched by the recipient. This is to test that on failover,
+// the fetcher will resume fetching from where it left off. The system is expected to crash if
+// the recipient fetches a duplicate oplog entry upon resuming the migration.
+tenantMigrationTest.insertDonorDB(dbName, "aNewColl", [{_id: "docToBeFetched"}]);
+assert.soon(() => {
+    const configDb = recipientPrimary.getDB("config");
+    const oplogBuffer = configDb.getCollection("repl.migration.oplog_" + migrationIdString);
+    return oplogBuffer.find({"entry.o._id": "docToBeFetched"}).count() === 1;
+});
 
 // Step up a new node in the recipient set and trigger a failover. The new primary should resume
 // cloning starting from the third document.

@@ -41,6 +41,7 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_management_commands_parser.h"
@@ -54,6 +55,7 @@
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/coll_mod_gen.h"
+#include "mongo/db/coll_mod_reply_validation.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/create_gen.h"
 #include "mongo/db/commands/profile_common.h"
@@ -315,8 +317,8 @@ public:
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const final {
-            uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
-                                ->checkAuthForCreate(request(), false));
+            uassertStatusOK(auth::checkAuthForCreate(
+                AuthorizationSession::get(opCtx->getClient()), request(), false));
         }
 
         NamespaceString ns() const final {
@@ -405,6 +407,18 @@ public:
                         timeseriesNotAllowedWith("pipeline"),
                         !cmd.getPipeline());
 
+                auto hasDot = [](StringData field) -> bool {
+                    return field.find('.') != std::string::npos;
+                };
+                auto mustBeTopLevel = [&cmd](StringData field) -> std::string {
+                    return str::stream()
+                        << cmd.getNamespace() << ": '" << field << "' must be a top-level field "
+                        << "and not contain a '.'";
+                };
+                uassert(ErrorCodes::InvalidOptions,
+                        mustBeTopLevel("timeField"),
+                        !hasDot(timeseries->getTimeField()));
+
                 if (auto metaField = timeseries->getMetaField()) {
                     uassert(ErrorCodes::InvalidOptions,
                             "'metaField' cannot be \"_id\"",
@@ -412,6 +426,9 @@ public:
                     uassert(ErrorCodes::InvalidOptions,
                             "'metaField' cannot be the same as 'timeField'",
                             *metaField != timeseries->getTimeField());
+                    uassert(ErrorCodes::InvalidOptions,
+                            mustBeTopLevel("metaField"),
+                            !hasDot(*metaField));
                 }
             }
 
@@ -696,9 +713,12 @@ public:
 
 } cmdCollectionStats;
 
-class CollectionModCommand : public BasicCommand {
+class CollectionModCommand : public BasicCommandWithRequestParser<CollectionModCommand> {
 public:
-    CollectionModCommand() : BasicCommand("collMod") {}
+    using Request = CollMod;
+    using Reply = CollModReply;
+
+    CollectionModCommand() : BasicCommandWithRequestParser() {}
 
     virtual const std::set<std::string>& apiVersions() const {
         return kApiVersions1;
@@ -726,22 +746,22 @@ public:
                                        const std::string& dbname,
                                        const BSONObj& cmdObj) const {
         const NamespaceString nss(parseNs(dbname, cmdObj));
-        return AuthorizationSession::get(client)->checkAuthForCollMod(nss, cmdObj, false);
+        return auth::checkAuthForCollMod(AuthorizationSession::get(client), nss, cmdObj, false);
     }
 
-    bool run(OperationContext* opCtx,
-             const string& dbname,
-             const BSONObj& jsobj,
-             BSONObjBuilder& result) {
-        auto cmd = CollMod::parse(
-            IDLParserErrorContext(CollMod::kCommandName,
-                                  APIParameters::get(opCtx).getAPIStrict().value_or(false)),
-            jsobj);
+    bool runWithRequestParser(OperationContext* opCtx,
+                              const std::string& db,
+                              const BSONObj& cmdObj,
+                              const RequestParser& requestParser,
+                              BSONObjBuilder& result) final {
+        auto cmd = requestParser.request();
         uassertStatusOK(collMod(opCtx, cmd.getNamespace(), cmd.toBSON(BSONObj()), &result));
-
-        CollModReply::parse(IDLParserErrorContext("CollModReply"), result.asTempObj());
-
         return true;
+    }
+
+    void validateResult(const BSONObj& resultObj) final {
+        auto reply = Reply::parse(IDLParserErrorContext("CollModReply"), resultObj);
+        coll_mod_reply_validation::validateReply(reply);
     }
 
 } collectionModCommand;

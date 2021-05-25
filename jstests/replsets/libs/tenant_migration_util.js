@@ -65,6 +65,14 @@ var TenantMigrationUtil = (function() {
     }
 
     /**
+     * Takes in the response to the donorStartMigration command and returns true if the state is
+     * "committed" or "aborted".
+     */
+    function isMigrationCompleted(res) {
+        return res.state === "committed" || res.state === "aborted";
+    }
+
+    /**
      * Runs the donorStartMigration command with the given migration options
      * until the migration commits or aborts, or until the command fails. Returns the last command
      * response.
@@ -78,6 +86,7 @@ var TenantMigrationUtil = (function() {
      */
     function runMigrationAsync(migrationOpts, donorRstArgs, retryOnRetryableErrors = false) {
         load("jstests/replsets/libs/tenant_migration_util.js");
+        const donorRst = new ReplSetTest({rstArgs: donorRstArgs});
 
         const migrationCertificates = TenantMigrationUtil.makeMigrationCertificatesForTest();
         const cmdObj = {
@@ -92,35 +101,8 @@ var TenantMigrationUtil = (function() {
                 migrationCertificates.recipientCertificateForDonor
         };
 
-        const donorRst = new ReplSetTest({rstArgs: donorRstArgs});
-        let donorPrimary = donorRst.getPrimary();
-
-        let res;
-        assert.soon(() => {
-            try {
-                res = donorPrimary.adminCommand(cmdObj);
-
-                if (!res.ok) {
-                    // If retry is enabled and the command failed with a NotPrimary error, continue
-                    // looping.
-                    if (retryOnRetryableErrors && ErrorCodes.isNotPrimaryError(res.code)) {
-                        donorPrimary = donorRst.getPrimary();
-                        return false;
-                    }
-                    return true;
-                }
-
-                return (res.state === "committed" || res.state === "aborted");
-            } catch (e) {
-                // If the thrown error is network related and we are allowing retryable errors,
-                // continue issuing commands.
-                if (retryOnRetryableErrors && isNetworkError(e)) {
-                    return false;
-                }
-                throw e;
-            }
-        });
-        return res;
+        return TenantMigrationUtil.runTenantMigrationCommand(
+            cmdObj, donorRst, retryOnRetryableErrors, TenantMigrationUtil.isMigrationCompleted);
     }
 
     /**
@@ -134,34 +116,11 @@ var TenantMigrationUtil = (function() {
      * TenantMigrationTest fixture.
      */
     function forgetMigrationAsync(migrationIdString, donorRstArgs, retryOnRetryableErrors = false) {
+        load("jstests/replsets/libs/tenant_migration_util.js");
         const donorRst = new ReplSetTest({rstArgs: donorRstArgs});
-        let donorPrimary = donorRst.getPrimary();
-
-        let res;
-
-        assert.soon(() => {
-            try {
-                res = donorPrimary.adminCommand(
-                    {donorForgetMigration: 1, migrationId: UUID(migrationIdString)});
-
-                if (!res.ok) {
-                    // If retry is enabled and the command failed with a NotPrimary error, continue
-                    // looping.
-                    if (retryOnRetryableErrors && ErrorCodes.isNotPrimaryError(res.code)) {
-                        donorPrimary = donorRst.getPrimary();
-                        return false;
-                    }
-                }
-
-                return true;
-            } catch (e) {
-                if (retryOnRetryableErrors && isNetworkError(e)) {
-                    return false;
-                }
-                throw e;
-            }
-        });
-        return res;
+        const cmdObj = {donorForgetMigration: 1, migrationId: UUID(migrationIdString)};
+        return TenantMigrationUtil.runTenantMigrationCommand(
+            cmdObj, donorRst, retryOnRetryableErrors);
     }
 
     /**
@@ -175,37 +134,42 @@ var TenantMigrationUtil = (function() {
      * all other use cases, please consider the tryAbortMigration() function in the
      * TenantMigrationTest fixture.
      */
-    function tryAbortMigrationAsync(
-        migrationOpts, donorRstArgs, runTenantMigrationFunc, retryOnRetryableErrors = false) {
+    function tryAbortMigrationAsync(migrationOpts, donorRstArgs, retryOnRetryableErrors = false) {
+        load("jstests/replsets/libs/tenant_migration_util.js");
         const donorRst = new ReplSetTest({rstArgs: donorRstArgs});
-        let donorPrimary = donorRst.getPrimary();
-
         const cmdObj = {
             donorAbortMigration: 1,
             migrationId: UUID(migrationOpts.migrationIdString),
         };
-
-        return runTenantMigrationFunc(cmdObj, donorPrimary, donorRst, retryOnRetryableErrors);
+        return TenantMigrationUtil.runTenantMigrationCommand(
+            cmdObj, donorRst, retryOnRetryableErrors);
     }
 
     /**
-     * Helper to run a given tenant migration command and retry the command if it is retryable.
+     * Runs the given tenant migration command against the primary of the given replica set until
+     * the command succeeds or fails with a non-retryable error (if 'retryOnRetryableErrors' is
+     * true) or until 'shouldStopFunc' returns true (if it is given). Returns the last response.
      */
-    function runTenantMigrationCommand(cmdObj, donorPrimary, donorRst, retryOnRetryableErrors) {
+    function runTenantMigrationCommand(cmdObj, rst, retryOnRetryableErrors, shouldStopFunc) {
+        let primary = rst.getPrimary();
         let res;
         assert.soon(() => {
             try {
-                res = donorPrimary.adminCommand(cmdObj);
+                res = primary.adminCommand(cmdObj);
 
                 if (!res.ok) {
                     // If retry is enabled and the command failed with a NotPrimary error, continue
                     // looping.
                     if (retryOnRetryableErrors && ErrorCodes.isNotPrimaryError(res.code)) {
-                        donorPrimary = donorRst.getPrimary();
+                        primary = rst.getPrimary();
                         return false;
                     }
+                    return true;
                 }
 
+                if (shouldStopFunc) {
+                    return shouldStopFunc(res);
+                }
                 return true;
             } catch (e) {
                 if (retryOnRetryableErrors && isNetworkError(e)) {
@@ -217,16 +181,53 @@ var TenantMigrationUtil = (function() {
         return res;
     }
 
-    function createRstArgs(donorRst) {
-        const donorRstArgs = {
-            name: donorRst.name,
-            nodeHosts: donorRst.nodes.map(node => `127.0.0.1:${node.port}`),
-            nodeOptions: donorRst.nodeOptions,
-            keyFile: donorRst.keyFile,
-            host: donorRst.host,
+    function createRstArgs(rst) {
+        const rstArgs = {
+            name: rst.name,
+            nodeHosts: rst.nodes.map(node => `127.0.0.1:${node.port}`),
+            nodeOptions: rst.nodeOptions,
+            keyFile: rst.keyFile,
+            host: rst.host,
             waitForKeys: false,
         };
-        return donorRstArgs;
+        return rstArgs;
+    }
+
+    /**
+     * Returns the TenantMigrationAccessBlocker serverStatus output for the migration for the given
+     * tenant if there one.
+     */
+    function getTenantMigrationAccessBlocker(node, tenantId) {
+        const mtabs =
+            assert.commandWorked(node.adminCommand({serverStatus: 1})).tenantMigrationAccessBlocker;
+        if (!mtabs) {
+            return null;
+        }
+        return mtabs[tenantId];
+    }
+
+    /**
+     * Returns the number of reads on the given donor node that were blocked due to tenant migration
+     * for the given tenant.
+     */
+    function getNumBlockedReads(donorNode, tenantId) {
+        const mtab = getTenantMigrationAccessBlocker(donorNode, tenantId);
+        if (!mtab) {
+            return 0;
+        }
+        return mtab.numBlockedReads;
+    }
+
+    /**
+     * Returns the number of writes on the given donor node that were blocked due to tenant
+     * migration for the given tenant.
+     */
+    function getNumBlockedWrites(donorNode, tenantId) {
+        const mtab = getTenantMigrationAccessBlocker(donorNode, tenantId);
+        if (!mtab) {
+            return 0;
+        }
+        return mtab.numBlockedWrites;
     }
 
     return {
@@ -240,5 +241,9 @@ var TenantMigrationUtil = (function() {
         makeX509Options,
         makeMigrationCertificatesForTest,
         makeX509OptionsForTest,
+        isMigrationCompleted,
+        getTenantMigrationAccessBlocker,
+        getNumBlockedReads,
+        getNumBlockedWrites
     };
 })();

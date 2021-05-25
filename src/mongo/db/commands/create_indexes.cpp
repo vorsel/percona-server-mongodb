@@ -258,8 +258,7 @@ void checkDatabaseShardingState(OperationContext* opCtx, const NamespaceString& 
             auto mpsm = dss->getMovePrimarySourceManager(dssLock);
 
             if (mpsm) {
-                LOGV2(
-                    4909200, "assertMovePrimaryInProgress", "movePrimaryNss"_attr = ns.toString());
+                LOGV2(4909200, "assertMovePrimaryInProgress", "namespace"_attr = ns.toString());
 
                 uasserted(ErrorCodes::MovePrimaryInProgress,
                           "movePrimary is in progress for namespace " + ns.toString());
@@ -267,7 +266,7 @@ void checkDatabaseShardingState(OperationContext* opCtx, const NamespaceString& 
         }
     } catch (const DBException& ex) {
         if (ex.toStatus() != ErrorCodes::MovePrimaryInProgress) {
-            LOGV2(4909201, "Error when getting colleciton description", "what"_attr = ex.what());
+            LOGV2(4909201, "Error when getting collection description", "what"_attr = ex.what());
             return;
         }
         throw;
@@ -398,7 +397,7 @@ CreateIndexesReply runCreateIndexesWithCoordinator(OperationContext* opCtx,
     // 1) We are in a replication mode that allows for index creation.
     // 2) Check sharding state.
     // 3) Check if we can create the index without handing control to the IndexBuildsCoordinator.
-    OptionalCollectionUUID collectionUUID;
+    boost::optional<UUID> collectionUUID;
     CreateIndexesReply reply;
     {
         Lock::DBLock dbLock(opCtx, ns.db(), MODE_IS);

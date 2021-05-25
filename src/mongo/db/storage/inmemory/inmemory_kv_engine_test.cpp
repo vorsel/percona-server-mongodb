@@ -48,7 +48,7 @@ namespace {
 
 class InMemoryKVHarnessHelper : public KVHarnessHelper {
 public:
-    InMemoryKVHarnessHelper() : _dbpath("inmem-kv-harness") {
+    InMemoryKVHarnessHelper(ServiceContext* svcCtx) : _dbpath("inmem-kv-harness") {
         const bool readOnly = false;
         if (!hasGlobalServiceContext())
             setGlobalServiceContext(ServiceContext::make());
@@ -60,9 +60,9 @@ public:
             "checkpoint=(wait=0,log_size=0)",
             100, 0, false, true, false, readOnly));
         repl::ReplicationCoordinator::set(
-            getGlobalServiceContext(),
-            std::unique_ptr<repl::ReplicationCoordinator>(new repl::ReplicationCoordinatorMock(
-                getGlobalServiceContext(), repl::ReplSettings())));
+            svcCtx,
+            std::unique_ptr<repl::ReplicationCoordinator>(
+                new repl::ReplicationCoordinatorMock(svcCtx, repl::ReplSettings())));
     }
 
     virtual ~InMemoryKVHarnessHelper() {
@@ -85,8 +85,8 @@ private:
     std::unique_ptr<WiredTigerKVEngine> _engine;
 };
 
-std::unique_ptr<KVHarnessHelper> makeHelper() {
-    return std::make_unique<InMemoryKVHarnessHelper>();
+std::unique_ptr<KVHarnessHelper> makeHelper(ServiceContext* svcCtx) {
+    return std::make_unique<InMemoryKVHarnessHelper>(svcCtx);
 }
 
 MONGO_INITIALIZER(RegisterKVHarnessFactory)(InitializerContext*) {

@@ -70,6 +70,7 @@ enums:
         type: string
         values:
             kUnused: "unused"
+            kAwaitingFetchTimestamp: "awaiting-fetch-timestamp"
             kCreatingCollection: "creating-collection"
             kCloning: "cloning"
             kApplying: "applying"
@@ -127,6 +128,26 @@ structs:
                 description: "Timestamp after which all writes to a particular recipient shard for
                               the original resharding collection will be executed as distributed
                               transactions."
+                optional: true
+    
+    AbortReason:
+        description: "Not meant to be used directly. Only use internal fields."
+        fields:
+            abortReason:
+                type: object_owned
+                description: "The error that caused the node to abort the resharding operation. In
+                             this case, the node may be a donor shard, recipient shard, or the
+                             coordinator itself." 
+                optional: true 
+
+    ReshardingCloneSize:
+        description: "Not meant to be used directly. Only use internal fields."
+        fields:
+            bytesToClone:
+                type: long
+                optional: true
+            documentsToClone:
+                type: long
                 optional: true
 
     ReshardingSourceId:

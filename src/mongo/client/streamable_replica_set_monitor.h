@@ -86,6 +86,8 @@ public:
 
     void init() override;
 
+    void initForTesting(sdam::TopologyManagerPtr topologyManager);
+
     void drop() override;
 
     static ReplicaSetMonitorPtr make(const MongoURI& uri,
@@ -180,6 +182,8 @@ private:
 
         ReadPreferenceSetting criteria;
 
+        std::vector<HostAndPort> excludedHosts;
+
         // Used to compute latency.
         Date_t start;
 
@@ -201,6 +205,7 @@ private:
     SemiFuture<std::vector<HostAndPort>> _enqueueOutstandingQuery(
         WithLock,
         const ReadPreferenceSetting& criteria,
+        const std::vector<HostAndPort>& excludedHosts,
         const CancelationToken& cancelToken,
         const Date_t& deadline);
 

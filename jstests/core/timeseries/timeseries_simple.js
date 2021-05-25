@@ -20,18 +20,14 @@ if (!TimeseriesTest.timeseriesCollectionsEnabled(db.getMongo())) {
     return;
 }
 
-const testDB = db.getSiblingDB(jsTestName());
-assert.commandWorked(testDB.dropDatabase());
-
-const coll = testDB.getCollection('t');
-const bucketsColl = testDB.getCollection('system.buckets.' + coll.getName());
+const coll = db.timeseries_simple;
+const bucketsColl = db.getCollection('system.buckets.' + coll.getName());
 
 coll.drop();
 
 const timeFieldName = 'time';
-assert.commandWorked(
-    testDB.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
-assert.contains(bucketsColl.getName(), testDB.getCollectionNames());
+assert.commandWorked(db.createCollection(coll.getName(), {timeseries: {timeField: timeFieldName}}));
+assert.contains(bucketsColl.getName(), db.getCollectionNames());
 
 Random.setRandomSeed();
 const numHosts = 10;
@@ -76,7 +72,7 @@ for (let i = 0; i < numDocs; i++) {
 
     jsTestLog('Inserting doc into time-series collection: ' + i + ': ' + tojson(doc));
     let start = new Date();
-    assert.commandWorked(coll.insert(doc));
+    assert.commandWorked(coll.insert(doc, {ordered: false}));
     jsTestLog('Insertion took ' + ((new Date()).getTime() - start.getTime()) +
               ' ms. Retrieving doc from view: ' + i);
     start = new Date();

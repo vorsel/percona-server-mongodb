@@ -97,6 +97,7 @@ public:
         params.ident = ident;
         params.engineName = kWiredTigerEngineName;
         params.isCapped = false;
+        params.keyFormat = KeyFormat::Long;
         params.isEphemeral = false;
         params.cappedMaxSize = -1;
         params.cappedMaxDocs = -1;
@@ -224,6 +225,7 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, NoOverlapReadSource) {
             rs->insertRecord(opCtx2, str.c_str(), str.size() + 1, Timestamp());
         ASSERT_OK(opCtx2->recoveryUnit()->setTimestamp(ts2));
         ASSERT_OK(res);
+        rid2 = res.getValue();
 
         // While holding open a transaction with opCtx2, perform an insert at ts3 with opCtx1. This
         // creates a "hole".
@@ -253,7 +255,6 @@ TEST_F(WiredTigerRecoveryUnitTestFixture, NoOverlapReadSource) {
         ASSERT_FALSE(rs->findRecord(opCtx1, rid3, &unused));
 
         wuow.commit();
-        rid2 = res.getValue();
     }
 
     // Now that the hole has been closed, kNoOverlap should see all 3 records.

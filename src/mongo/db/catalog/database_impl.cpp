@@ -122,7 +122,7 @@ void assertMovePrimaryInProgress(OperationContext* opCtx, NamespaceString const&
     auto mpsm = dss->getMovePrimarySourceManager(dssLock);
 
     if (mpsm) {
-        LOGV2(4909100, "assertMovePrimaryInProgress", "movePrimaryNss"_attr = nss.toString());
+        LOGV2(4909100, "assertMovePrimaryInProgress", "namespace"_attr = nss.toString());
 
         uasserted(ErrorCodes::MovePrimaryInProgress,
                   "movePrimary is in progress for namespace " + nss.toString());
@@ -282,7 +282,11 @@ void DatabaseImpl::getStats(OperationContext* opCtx, BSONObjBuilder* output, dou
             return true;
         });
 
-    ViewCatalog::get(this)->iterate(opCtx, [&](const ViewDefinition& view) { nViews += 1; });
+
+    ViewCatalog::get(this)->iterate([&](const ViewDefinition& view) {
+        nViews += 1;
+        return true;
+    });
 
     output->appendNumber("collections", nCollections);
     output->appendNumber("views", nViews);
@@ -348,7 +352,8 @@ Status DatabaseImpl::dropCollection(OperationContext* opCtx,
                               "turn off profiling before dropping system.profile collection");
         } else if (!(nss.isSystemDotViews() || nss.isHealthlog() ||
                      nss == NamespaceString::kLogicalSessionsNamespace ||
-                     nss == NamespaceString::kSystemKeysNamespace ||
+                     nss == NamespaceString::kKeysCollectionNamespace ||
+                     nss == NamespaceString::kExternalKeysCollectionNamespace ||
                      nss.isTemporaryReshardingCollection())) {
             return Status(ErrorCodes::IllegalOperation,
                           str::stream() << "can't drop system collection " << nss);
@@ -524,7 +529,7 @@ Status DatabaseImpl::renameCollection(OperationContext* opCtx,
                                       NamespaceString fromNss,
                                       NamespaceString toNss,
                                       bool stayTemp) const {
-    audit::logRenameCollection(&cc(), fromNss.ns(), toNss.ns());
+    audit::logRenameCollection(&cc(), fromNss, toNss);
 
     invariant(opCtx->lockState()->isCollectionLockedForMode(fromNss, MODE_X));
     invariant(opCtx->lockState()->isCollectionLockedForMode(toNss, MODE_X));

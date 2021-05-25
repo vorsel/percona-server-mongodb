@@ -384,23 +384,24 @@ void ChunkManager::getShardIdsForQuery(boost::intrusive_ptr<ExpressionContext> e
                                        const BSONObj& query,
                                        const BSONObj& collation,
                                        std::set<ShardId>* shardIds) const {
-    auto qr = std::make_unique<QueryRequest>(_rt->optRt->nss());
-    qr->setFilter(query);
+    auto findCommand = std::make_unique<FindCommand>(_rt->optRt->nss());
+    findCommand->setFilter(query.getOwned());
 
     if (auto uuid = getUUID())
         expCtx->uuid = uuid;
 
     if (!collation.isEmpty()) {
-        qr->setCollation(collation);
+        findCommand->setCollation(collation.getOwned());
     } else if (_rt->optRt->getDefaultCollator()) {
         auto defaultCollator = _rt->optRt->getDefaultCollator();
-        qr->setCollation(defaultCollator->getSpec().toBSON());
+        findCommand->setCollation(defaultCollator->getSpec().toBSON());
         expCtx->setCollator(defaultCollator->clone());
     }
 
     auto cq = uassertStatusOK(
         CanonicalQuery::canonicalize(expCtx->opCtx,
-                                     std::move(qr),
+                                     std::move(findCommand),
+                                     false, /* isExplain */
                                      expCtx,
                                      ExtensionsCallbackNoop(),
                                      MatchExpressionParser::kAllowAllSpecialFeatures));
@@ -772,6 +773,36 @@ RoutingTableHistory RoutingTableHistory::makeUpdated(
                                std::move(chunkMap));
 }
 
+RoutingTableHistory RoutingTableHistory::makeUpdatedReplacingTimestamp(
+    const boost::optional<Timestamp>& timestamp) const {
+    invariant(getVersion().getTimestamp().is_initialized() != timestamp.is_initialized());
+
+    ChunkMap newMap(getVersion().epoch(), timestamp, _chunkMap.size());
+    _chunkMap.forEach([&](const std::shared_ptr<ChunkInfo>& chunkInfo) {
+        const ChunkVersion oldVersion = chunkInfo->getLastmod();
+        newMap.appendChunk(std::make_shared<ChunkInfo>(chunkInfo->getRange(),
+                                                       chunkInfo->getMaxKeyString(),
+                                                       chunkInfo->getShardId(),
+                                                       ChunkVersion(oldVersion.majorVersion(),
+                                                                    oldVersion.minorVersion(),
+                                                                    oldVersion.epoch(),
+                                                                    timestamp),
+                                                       chunkInfo->getHistory(),
+                                                       chunkInfo->isJumbo(),
+                                                       chunkInfo->getWritesTracker()));
+        return true;
+    });
+
+    return RoutingTableHistory(_nss,
+                               _uuid,
+                               getShardKeyPattern().getKeyPattern(),
+                               CollatorInterface::cloneCollator(getDefaultCollator()),
+                               _unique,
+                               _reshardingFields,
+                               _allowMigrations,
+                               std::move(newMap));
+}
+
 AtomicWord<uint64_t> ComparableChunkVersion::_epochDisambiguatingSequenceNumSource{1ULL};
 AtomicWord<uint64_t> ComparableChunkVersion::_forcedRefreshSequenceNumSource{1ULL};
 
@@ -785,6 +816,13 @@ ComparableChunkVersion ComparableChunkVersion::makeComparableChunkVersion(
 ComparableChunkVersion ComparableChunkVersion::makeComparableChunkVersionForForcedRefresh() {
     return ComparableChunkVersion(_forcedRefreshSequenceNumSource.addAndFetch(2) - 1,
                                   boost::none,
+                                  _epochDisambiguatingSequenceNumSource.fetchAndAdd(1));
+}
+
+ComparableChunkVersion ComparableChunkVersion::makeComparableChunkVersionForForcedRefresh(
+    const ChunkVersion& version) {
+    return ComparableChunkVersion(_forcedRefreshSequenceNumSource.addAndFetch(1),
+                                  version,
                                   _epochDisambiguatingSequenceNumSource.fetchAndAdd(1));
 }
 

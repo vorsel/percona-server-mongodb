@@ -5,6 +5,27 @@
 load("jstests/libs/fixture_helpers.js");  // For FixtureHelpers.
 
 /**
+ * Returns a sub-element of the 'queryPlanner' explain output which represents a winning plan.
+ */
+function getWinningPlan(queryPlanner) {
+    // The 'queryPlan' format is used when the SBE engine is turned on. If this field is present,
+    // it will hold a serialized winning plan, otherwise it will be stored in the 'winningPlan'
+    // field itself.
+    return queryPlanner.winningPlan.hasOwnProperty("queryPlan") ? queryPlanner.winningPlan.queryPlan
+                                                                : queryPlanner.winningPlan;
+}
+
+/**
+ * Returns an element of explain output which represents a rejected candidate plan.
+ */
+function getRejectedPlan(rejectedPlan) {
+    // The 'queryPlan' format is used when the SBE engine is turned on. If this field is present,
+    // it will hold a serialized winning plan, otherwise it will be stored in the 'rejectedPlan'
+    // element itself.
+    return rejectedPlan.hasOwnProperty("queryPlan") ? rejectedPlan.queryPlan : rejectedPlan;
+}
+
+/**
  * Given the root stage of explain's JSON representation of a query plan ('root'), returns all
  * subdocuments whose stage is 'stage'. Returns an empty array if the plan does not have the
  * requested stage.
@@ -27,7 +48,12 @@ function getPlanStages(root, stage) {
     }
 
     if ("queryPlanner" in root) {
-        results = results.concat(getPlanStages(root.queryPlanner.winningPlan, stage));
+        results = results.concat(getPlanStages(getWinningPlan(root.queryPlanner), stage));
+    }
+
+    // This field is used in SBE explain output.
+    if ("queryPlan" in root) {
+        results = results.concat(getPlanStages(root.queryPlan, stage));
     }
 
     if ("thenStage" in root) {
@@ -48,11 +74,12 @@ function getPlanStages(root, stage) {
 
     if ("shards" in root) {
         if (Array.isArray(root.shards)) {
-            results = root.shards.reduce(
-                (res, shard) => res.concat(getPlanStages(
-                    shard.hasOwnProperty("winningPlan") ? shard.winningPlan : shard.executionStages,
-                    stage)),
-                results);
+            results =
+                root.shards.reduce((res, shard) => res.concat(getPlanStages(
+                                       shard.hasOwnProperty("winningPlan") ? getWinningPlan(shard)
+                                                                           : shard.executionStages,
+                                       stage)),
+                                   results);
         } else {
             const shards = Object.keys(root.shards);
             results = shards.reduce(
@@ -162,10 +189,13 @@ function getExecutionStages(root) {
  * subdocuments whose stage is 'stage'. This can either be an agg stage name like "$cursor" or
  * "$sort", or a query stage name like "IXSCAN" or "SORT".
  *
+ * If 'useQueryPlannerSection' is set to 'true', the 'queryPlanner' section of the explain output
+ * will be used to lookup the given 'stage', even if 'executionStats' section is available.
+ *
  * Returns an empty array if the plan does not have the requested stage. Asserts that agg explain
  * structure matches expected format.
  */
-function getAggPlanStages(root, stage) {
+function getAggPlanStages(root, stage, useQueryPlannerSection = false) {
     let results = [];
 
     function getDocumentSources(docSourceArray) {
@@ -187,13 +217,13 @@ function getAggPlanStages(root, stage) {
 
         // If execution stats are available, then use the execution stats tree. Otherwise use the
         // plan info from the "queryPlanner" section.
-        if (queryLayerOutput.hasOwnProperty("executionStats")) {
+        if (queryLayerOutput.hasOwnProperty("executionStats") && !useQueryPlannerSection) {
             assert(queryLayerOutput.executionStats.hasOwnProperty("executionStages"));
             results = results.concat(
                 getPlanStages(queryLayerOutput.executionStats.executionStages, stage));
         } else {
             results =
-                results.concat(getPlanStages(queryLayerOutput.queryPlanner.winningPlan, stage));
+                results.concat(getPlanStages(getWinningPlan(queryLayerOutput.queryPlanner), stage));
         }
 
         return results;
@@ -407,12 +437,12 @@ function assertExplainCount({explainResults, expectedCount}) {
  */
 function assertCoveredQueryAndCount({collection, query, project, count}) {
     let explain = collection.find(query, project).explain();
-    assert(isIndexOnly(db, explain.queryPlanner.winningPlan),
+    assert(isIndexOnly(db, getWinningPlan(explain.queryPlanner)),
            "Winning plan was not covered: " + tojson(explain.queryPlanner.winningPlan));
 
     // Same query as a count command should also be covered.
     explain = collection.explain("executionStats").find(query).count();
-    assert(isIndexOnly(db, explain.queryPlanner.winningPlan),
+    assert(isIndexOnly(db, getWinningPlan(explain.queryPlanner)),
            "Winning plan for count was not covered: " + tojson(explain.queryPlanner.winningPlan));
     assertExplainCount({explainResults: explain, expectedCount: count});
 }
@@ -424,7 +454,7 @@ function assertCoveredQueryAndCount({collection, query, project, count}) {
  */
 function assertStagesForExplainOfCommand({coll, cmdObj, expectedStages, stagesNotExpected}) {
     const plan = assert.commandWorked(coll.runCommand({explain: cmdObj}));
-    const winningPlan = plan.queryPlanner.winningPlan;
+    const winningPlan = getWinningPlan(plan.queryPlanner);
     for (let expectedStage of expectedStages) {
         assert(planHasStage(coll.getDB(), winningPlan, expectedStage),
                "Could not find stage " + expectedStage + ". Plan: " + tojson(plan));

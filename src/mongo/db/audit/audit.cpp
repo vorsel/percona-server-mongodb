@@ -69,6 +69,7 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/logv2/log.h"
 #include "mongo/logv2/log_util.h"
 #include "mongo/platform/mutex.h"
+#include "mongo/rpc/metadata/impersonated_user_metadata.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/exit_code.h"
 #include "mongo/util/net/sock.h"
@@ -646,6 +647,14 @@ namespace audit {
 
     }
 
+    ImpersonatedClientAttrs::ImpersonatedClientAttrs(Client* client) {
+        auto optAttrs = rpc::getImpersonatedUserMetadata(client->getOperationContext());
+        if (optAttrs) {
+            userNames = optAttrs->getUsers();
+            roleNames = optAttrs->getRoles();
+        }
+    }
+
     void logAuthentication(Client* client,
                            StringData mechanism,
                            const UserName& user,
@@ -897,6 +906,22 @@ namespace audit {
         _auditEvent(client, "dropCollection", params);
     }
 
+    void logDropView(Client* client,
+                     StringData nsname,
+                     StringData viewOn,
+                     const std::vector<BSONObj>& pipeline,
+                     ErrorCodes::Error code) {
+        if (!_auditLog) {
+            return;
+        }
+
+        BSONObjBuilder params;
+        params.append("ns", nsname);
+        params.append("viewOn", viewOn);
+        params.append("pipeline", pipeline);
+        _auditEvent(client, "dropView", params.done(), code);
+    }
+
     void logDropDatabase(Client* client,
                          StringData nsname) {
         if (!_auditLog) {
@@ -908,13 +933,13 @@ namespace audit {
     }
 
     void logRenameCollection(Client* client,
-                             StringData source,
-                             StringData target) {
+                             const NamespaceString& source,
+                             const NamespaceString& target) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("old" << source << "new" << target);
+        const BSONObj params = BSON("old" << nssToString(source) << "new" << nssToString(target));
         _auditEvent(client, "renameCollection", params);
     }
 
@@ -1179,6 +1204,33 @@ namespace audit {
         const BSONObj params = BSON("ns" << ns <<
                                     "key" << keyPattern);
         _auditEvent(client, "refineCollectionShardKey", params);
+    }
+
+    void logInsertOperation(Client* client, const NamespaceString& nss, const BSONObj& doc) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("ns" << nssToString(nss) << "doc" << doc);
+        _auditEvent(client, "insertOperation", params);
+    }
+
+    void logUpdateOperation(Client* client, const NamespaceString& nss, const BSONObj& doc) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("ns" << nssToString(nss) << "doc" << doc);
+        _auditEvent(client, "updateOperation", params);
+    }
+
+    void logRemoveOperation(Client* client, const NamespaceString& nss, const BSONObj& doc) {
+        if (!_auditLog) {
+            return;
+        }
+
+        const BSONObj params = BSON("ns" << nssToString(nss) << "doc" << doc);
+        _auditEvent(client, "removeOperation", params);
     }
 
     void writeImpersonatedUsersToMetadata(OperationContext* txn,

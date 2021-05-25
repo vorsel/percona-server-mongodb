@@ -17,31 +17,44 @@ load("jstests/replsets/libs/tenant_migration_util.js");
  * @param {string} [name] the name of the replica sets
  * @param {Object} [donorRst] the ReplSetTest instance to adopt for the donor
  * @param {Object} [recipientRst] the ReplSetTest instance to adopt for the recipient
+ * @param {Object} [sharedOptions] an object that can contain 'nodes' <number>, the number of nodes
+ *     each RST will contain, and 'setParameter' <object>, an object with various server parameters.
  */
-function TenantMigrationTest(
-    {name = "TenantMigrationTest", enableRecipientTesting = true, donorRst, recipientRst}) {
+function TenantMigrationTest({
+    name = "TenantMigrationTest",
+    enableRecipientTesting = true,
+    donorRst,
+    recipientRst,
+    sharedOptions = {}
+}) {
     const donorPassedIn = (donorRst !== undefined);
     const recipientPassedIn = (recipientRst !== undefined);
 
     const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
     const migrationCertificates = TenantMigrationUtil.makeMigrationCertificatesForTest();
 
+    const nodes = sharedOptions.nodes || 2;
+    let setParameterOpts = sharedOptions.setParameter || {};
+
     donorRst = donorPassedIn ? donorRst : performSetUp(true /* isDonor */);
     recipientRst = recipientPassedIn ? recipientRst : performSetUp(false /* isDonor */);
 
-    donorRst.getPrimary();
-    donorRst.awaitReplication();
+    donorRst.asCluster(donorRst.nodes, () => {
+        donorRst.getPrimary();
+        donorRst.awaitReplication();
+        createFindInternalClusterTimeKeysRoleIfNotExist(donorRst);
+    });
 
-    recipientRst.getPrimary();
-    recipientRst.awaitReplication();
-
-    createAdvanceClusterTimeRoleIfNotExist(donorRst);
+    recipientRst.asCluster(recipientRst.nodes, () => {
+        recipientRst.getPrimary();
+        recipientRst.awaitReplication();
+        createFindInternalClusterTimeKeysRoleIfNotExist(recipientRst);
+    });
 
     /**
-     * Creates a ReplSetTest instance. The repl set will have 2 nodes.
+     * Creates a ReplSetTest instance. The repl set will have 2 nodes if not otherwise specified.
      */
     function performSetUp(isDonor) {
-        let setParameterOpts = {};
         if (TestData.logComponentVerbosity) {
             setParameterOpts["logComponentVerbosity"] =
                 tojsononeline(TestData.logComponentVerbosity);
@@ -56,43 +69,105 @@ function TenantMigrationTest(
         nodeOptions["setParameter"] = setParameterOpts;
 
         const rstName = `${name}_${(isDonor ? "donor" : "recipient")}`;
-        const rst = new ReplSetTest({name: rstName, nodes: 2, nodeOptions});
+        const rst = new ReplSetTest({name: rstName, nodes, nodeOptions});
         rst.startSet();
         rst.initiateWithHighElectionTimeout();
 
         return rst;
     }
 
-    function createAdvanceClusterTimeRoleIfNotExist(rst) {
-        const adminDB = rst.getPrimary().getDB("admin");
-        const roles =
-            adminDB.getRoles({rolesInfo: 1, showPrivileges: false, showBuiltinRoles: false});
+    /**
+     * Returns true if the given database role already exists.
+     */
+    function roleExists(db, roleName) {
+        const roles = db.getRoles({rolesInfo: 1, showPrivileges: false, showBuiltinRoles: false});
+        const fullRoleName = `${db.getName()}.${roleName}`;
+        for (let role of roles) {
+            if (role._id == fullRoleName) {
+                return true;
+            }
+        }
+        return false;
+    }
 
-        if (roles.filter(role => role._id == "admin.advanceClusterTimeRole").length > 0) {
+    /**
+     * Creates a role for running find command against admin.system.keys if it doesn't exist.
+     */
+    function createFindInternalClusterTimeKeysRoleIfNotExist(rst) {
+        const adminDB = rst.getPrimary().getDB("admin");
+
+        if (roleExists(adminDB, "findInternalClusterTimeKeysRole")) {
             return;
         }
 
         assert.commandWorked(adminDB.runCommand({
-            createRole: "advanceClusterTimeRole",
-            privileges: [{resource: {cluster: true}, actions: ["advanceClusterTime"]}],
+            createRole: "findInternalClusterTimeKeysRole",
+            privileges: [{resource: {db: "admin", collection: "system.keys"}, actions: ["find"]}],
             roles: []
         }));
+    }
+
+    /**
+     * Creates a role for running find command against admin.system.external_validation_keys if it
+     * doesn't exist.
+     */
+    function createFindExternalClusterTimeKeysRoleIfNotExist(rst) {
+        const adminDB = rst.getPrimary().getDB("admin");
+
+        if (roleExists(adminDB, "findExternalClusterTimeKeysRole")) {
+            return;
+        }
+
+        assert.commandWorked(adminDB.runCommand({
+            createRole: "findExternalClusterTimeKeysRole",
+            privileges: [{
+                resource: {db: "admin", collection: "system.external_validation_keys"},
+                actions: ["find"]
+            }],
+            roles: []
+        }));
+    }
+
+    /**
+     * Gives the current admin database user the privilege to run find commands against
+     * admin.system.external_validation_keys if it does not have that privilege. Used by
+     * 'assertNoDuplicatedExternalKeyDocs' below.
+     */
+    function grantFindExternalClusterTimeKeysPrivilegeIfNeeded(rst) {
+        const adminDB = rst.getPrimary().getDB("admin");
+        const users = assert.commandWorked(adminDB.runCommand({connectionStatus: 1}))
+                          .authInfo.authenticatedUsers;
+
+        if (users.length === 0 || users[0].user === "__system" || users[0].db != "admin") {
+            return;
+        }
+
+        const userRoles = adminDB.getUser(users[0].user).roles;
+
+        if (userRoles.includes("findExternalClusterTimeKeysRole")) {
+            return;
+        }
+
+        createFindExternalClusterTimeKeysRoleIfNotExist(rst);
+        userRoles.push("findExternalClusterTimeKeysRole");
+        assert.commandWorked(adminDB.runCommand({updateUser: users[0].user, roles: userRoles}));
     }
 
     /**
      * Returns whether tenant migration commands are supported.
      */
     this.isFeatureFlagEnabled = function() {
-        const donorPrimary = this.getDonorPrimary();
-        const recipientPrimary = this.getRecipientPrimary();
-
-        function supportsTenantMigrations(conn) {
-            return assert
-                .commandWorked(conn.adminCommand({getParameter: 1, featureFlagTenantMigrations: 1}))
-                .featureFlagTenantMigrations.value;
+        function supportsTenantMigrations(rst) {
+            const conn = rst.getPrimary();
+            return rst.asCluster(conn, () => {
+                return assert
+                    .commandWorked(
+                        conn.adminCommand({getParameter: 1, featureFlagTenantMigrations: 1}))
+                    .featureFlagTenantMigrations.value;
+            });
         }
-        const retVal =
-            (supportsTenantMigrations(donorPrimary) && supportsTenantMigrations(recipientPrimary));
+        const retVal = (supportsTenantMigrations(this.getDonorRst()) &&
+                        supportsTenantMigrations(this.getRecipientRst()));
         if (!retVal) {
             jsTestLog("At least one of the donor or recipient replica sets do not support tenant " +
                       "migration commands. Terminating any replica sets started by the " +
@@ -188,40 +263,12 @@ function TenantMigrationTest(
             recipientCertificateForDonor
         };
 
-        let donorPrimary = this.getDonorPrimary();
-        let stateRes;
-
-        assert.soon(() => {
-            try {
-                stateRes = donorPrimary.adminCommand(cmdObj);
-
-                if (!stateRes.ok) {
-                    // If retry is enabled and the command failed with a NotPrimary error, continue
-                    // looping.
-                    if (retryOnRetryableErrors && ErrorCodes.isNotPrimaryError(stateRes.code)) {
-                        donorPrimary = donorRst.getPrimary();
-                        return false;
-                    }
-                    return true;
-                }
-
-                // The command has been successfully executed. If we don't need to wait for the
-                // migration to complete, exit the loop.
-                if (!waitForMigrationToComplete) {
-                    return true;
-                }
-
-                return (stateRes.state === TenantMigrationTest.State.kCommitted ||
-                        stateRes.state === TenantMigrationTest.State.kAborted);
-            } catch (e) {
-                // If the thrown error is network related and we are allowing retryable errors,
-                // continue issuing commands.
-                if (retryOnRetryableErrors && isNetworkError(e)) {
-                    return false;
-                }
-                throw e;
-            }
-        });
+        const stateRes = TenantMigrationUtil.runTenantMigrationCommand(
+            cmdObj,
+            this.getDonorRst(),
+            retryOnRetryableErrors,
+            stateRes => (!waitForMigrationToComplete ||
+                         TenantMigrationUtil.isMigrationCompleted(stateRes)));
 
         // If the migration has been successfully committed, check the db hashes for the tenantId
         // between the donor and recipient.
@@ -239,36 +286,15 @@ function TenantMigrationTest(
      * NotPrimary or network error.
      */
     this.forgetMigration = function(migrationIdString, retryOnRetryableErrors = false) {
-        let donorPrimary = this.getDonorPrimary();
-
-        let res;
-
-        assert.soon(() => {
-            try {
-                res = donorPrimary.adminCommand(
-                    {donorForgetMigration: 1, migrationId: UUID(migrationIdString)});
-
-                if (!res.ok) {
-                    // If retry is enabled and the command failed with a NotPrimary error, continue
-                    // looping.
-                    if (retryOnRetryableErrors && ErrorCodes.isNotPrimaryError(res.code)) {
-                        donorPrimary = donorRst.getPrimary();
-                        return false;
-                    }
-                }
-
-                return true;
-            } catch (e) {
-                if (retryOnRetryableErrors && isNetworkError(e)) {
-                    return false;
-                }
-                throw e;
-            }
-        });
+        const cmdObj = {donorForgetMigration: 1, migrationId: UUID(migrationIdString)};
+        const res = TenantMigrationUtil.runTenantMigrationCommand(
+            cmdObj, this.getDonorRst(), retryOnRetryableErrors);
 
         // If the command succeeded, we expect that the migration is marked garbage collectable on
-        // the donor and the recipient. Check the state docs for expireAt.
+        // the donor and the recipient. Check the state docs for expireAt, and check that the oplog
+        // buffer collection has been dropped.
         if (res.ok) {
+            const donorPrimary = this.getDonorPrimary();
             const recipientPrimary = this.getRecipientPrimary();
 
             const donorStateDoc =
@@ -286,6 +312,10 @@ function TenantMigrationTest(
             if (recipientStateDoc) {
                 assert(recipientStateDoc.expireAt);
             }
+
+            const configDBCollections = recipientPrimary.getDB('config').getCollectionNames();
+            assert(!configDBCollections.includes('repl.migration.oplog_' + migrationIdString),
+                   configDBCollections);
         }
 
         return res;
@@ -296,25 +326,26 @@ function TenantMigrationTest(
      * response.
      */
     this.tryAbortMigration = function(migrationOpts, retryOnRetryableErrors = false) {
-        let donorPrimary = this.getDonorPrimary();
-
         const cmdObj = {
             donorAbortMigration: 1,
             migrationId: UUID(migrationOpts.migrationIdString),
         };
-
         return TenantMigrationUtil.runTenantMigrationCommand(
-            cmdObj, donorPrimary, this.getDonorRst, retryOnRetryableErrors);
+            cmdObj, this.getDonorRst(), retryOnRetryableErrors);
     };
 
     /**
      * Asserts that durable and in-memory state for the migration 'migrationId' and 'tenantId' is
      * eventually deleted from the given nodes.
      */
-    this.waitForMigrationGarbageCollection = function(nodes, migrationId, tenantId) {
-        nodes.forEach(node => {
-            const configDonorsColl = node.getCollection("config.tenantMigrationDonors");
-            assert.soon(() => 0 === configDonorsColl.count({_id: migrationId}));
+    this.waitForMigrationGarbageCollection = function(
+        migrationId, tenantId, donorNodes, recipientNodes) {
+        donorNodes = donorNodes || donorRst.nodes;
+        recipientNodes = recipientNodes || recipientRst.nodes;
+
+        donorNodes.forEach(node => {
+            const configDonorsColl = node.getCollection(TenantMigrationTest.kConfigDonorsNS);
+            assert.soon(() => 0 === configDonorsColl.count({_id: migrationId}), tojson(node));
 
             let mtabs;
             assert.soon(() => {
@@ -322,6 +353,12 @@ function TenantMigrationTest(
                             .tenantMigrationAccessBlocker;
                 return !mtabs || !mtabs[tenantId];
             }, tojson(mtabs));
+        });
+
+        recipientNodes.forEach(node => {
+            const configRecipientsColl =
+                node.getCollection(TenantMigrationTest.kConfigRecipientsNS);
+            assert.soon(() => 0 === configRecipientsColl.count({_id: migrationId}));
         });
     };
 
@@ -382,8 +419,7 @@ function TenantMigrationTest(
         const db = this.getDonorPrimary().getDB(dbName);
         const coll = db.getCollection(collName);
 
-        assert.commandWorked(coll.insertMany(data));
-        this.getDonorRst().awaitReplication();
+        assert.commandWorked(coll.insertMany(data, {writeConcern: {w: 'majority'}}));
     };
 
     /**

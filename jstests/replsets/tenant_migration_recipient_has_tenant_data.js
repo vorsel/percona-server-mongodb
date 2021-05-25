@@ -2,7 +2,8 @@
  * Tests that tenant migration fails with NamespaceExists if the recipient already has tenant's
  * data.
  *
- * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft]
+ * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
+ * incompatible_with_windows_tls]
  */
 
 (function() {
@@ -12,25 +13,27 @@ load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
 load("jstests/replsets/libs/tenant_migration_test.js");
 
+const kGarbageCollectionParams = {
+    // Set the delay before a donor state doc is garbage collected to be short to speed up
+    // the test.
+    tenantMigrationGarbageCollectionDelayMS: 3 * 1000,
+
+    // Set the TTL monitor to run at a smaller interval to speed up the test.
+    ttlMonitorSleepSecs: 1,
+};
+
 const donorRst = new ReplSetTest({
     nodes: 1,
     name: "donor",
-    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor, {
-        setParameter: {
-            // Set the delay before a donor state doc is garbage collected to be short to speed up
-            // the test.
-            tenantMigrationGarbageCollectionDelayMS: 3 * 1000,
-
-            // Set the TTL monitor to run at a smaller interval to speed up the test.
-            ttlMonitorSleepSecs: 1,
-        }
-    })
+    nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor,
+                               {setParameter: kGarbageCollectionParams})
 });
 
 donorRst.startSet();
 donorRst.initiate();
 
-const tenantMigrationTest = new TenantMigrationTest({name: jsTestName(), donorRst});
+const tenantMigrationTest = new TenantMigrationTest(
+    {name: jsTestName(), donorRst, sharedOptions: {setParameter: kGarbageCollectionParams}});
 if (!tenantMigrationTest.isFeatureFlagEnabled()) {
     jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
     donorRst.stopSet();
@@ -54,8 +57,7 @@ jsTest.log("Start a tenant migration and verify that it commits successfully");
     const stateRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
     assert.eq(stateRes.state, TenantMigrationTest.State.kCommitted);
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
-    tenantMigrationTest.waitForMigrationGarbageCollection(
-        tenantMigrationTest.getDonorRst().nodes, migrationId, kTenantId);
+    tenantMigrationTest.waitForMigrationGarbageCollection(migrationId, kTenantId);
 })();
 
 jsTest.log(

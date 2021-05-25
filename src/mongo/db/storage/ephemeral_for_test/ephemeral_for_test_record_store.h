@@ -58,6 +58,9 @@ public:
     ~RecordStore() = default;
 
     virtual const char* name() const;
+    virtual KeyFormat keyFormat() const {
+        return KeyFormat::Long;
+    }
     virtual long long dataSize(OperationContext* opCtx) const;
     virtual long long numRecords(OperationContext* opCtx) const;
     virtual bool isCapped() const;
@@ -102,9 +105,6 @@ public:
     virtual void appendCustomStats(OperationContext* opCtx,
                                    BSONObjBuilder* result,
                                    double scale) const;
-
-    virtual boost::optional<RecordId> oplogStartHack(OperationContext* opCtx,
-                                                     const RecordId& startingPosition) const;
 
     void waitForAllEarlierOplogWritesToBeVisible(OperationContext* opCtx) const override;
 
@@ -188,6 +188,7 @@ private:
                VisibilityManager* visibilityManager);
         boost::optional<Record> next() final;
         boost::optional<Record> seekExact(const RecordId& id) final override;
+        boost::optional<Record> seekNear(const RecordId& id) final override;
         void save() final;
         void saveUnpositioned() final override;
         bool restore() final;
@@ -213,6 +214,7 @@ private:
                       VisibilityManager* visibilityManager);
         boost::optional<Record> next() final;
         boost::optional<Record> seekExact(const RecordId& id) final override;
+        boost::optional<Record> seekNear(const RecordId& id) final override;
         void save() final;
         void saveUnpositioned() final override;
         bool restore() final;

@@ -38,6 +38,7 @@
 #include "mongo/bson/simple_bsonobj_comparator.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/db/bson/dotted_path_support.h"
+#include "mongo/logv2/log.h"
 #include "mongo/s/catalog/type_chunk.h"
 #include "mongo/util/str.h"
 
@@ -91,6 +92,15 @@ boost::optional<ShardKeyPattern> CollectionMetadata::getReshardingKeyIfShouldFor
         return boost::none;
 
     return ShardKeyPattern(donorFields->getReshardingKey());
+}
+
+void CollectionMetadata::throwIfReshardingInProgress(NamespaceString const& nss) const {
+    if (isSharded() && getReshardingFields()) {
+        LOGV2(5277122, "reshardCollection in progress", "namespace"_attr = nss.toString());
+
+        uasserted(ErrorCodes::ReshardCollectionInProgress,
+                  "reshardCollection is in progress for namespace " + nss.toString());
+    }
 }
 
 bool CollectionMetadata::disallowWritesForResharding(const UUID& currentCollectionUUID) const {
@@ -233,6 +243,13 @@ Status CollectionMetadata::checkChunkIsValid(const ChunkType& chunk) const {
     }
 
     return Status::OK();
+}
+
+bool CollectionMetadata::currentShardHasAnyChunks() const {
+    invariant(isSharded());
+    std::set<ShardId> shards;
+    _cm->getAllShardIds(&shards);
+    return shards.find(_thisShardId) != shards.end();
 }
 
 boost::optional<ChunkRange> CollectionMetadata::getNextOrphanRange(

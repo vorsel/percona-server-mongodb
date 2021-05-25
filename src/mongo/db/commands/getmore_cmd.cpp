@@ -34,6 +34,7 @@
 #include <memory>
 #include <string>
 
+#include "mongo/db/auth/authorization_checks.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/client.h"
@@ -283,8 +284,8 @@ public:
         }
 
         void doCheckAuthorization(OperationContext* opCtx) const override {
-            uassertStatusOK(AuthorizationSession::get(opCtx->getClient())
-                                ->checkAuthForGetMore(_request.nss,
+            uassertStatusOK(auth::checkAuthForGetMore(AuthorizationSession::get(opCtx->getClient()),
+                                                      _request.nss,
                                                       _request.cursorid,
                                                       _request.term.is_initialized()));
         }
@@ -487,7 +488,12 @@ public:
             // repeatedly release and re-acquire the collection readLock at regular intervals until
             // the failpoint is released. This is done in order to avoid deadlocks caused by the
             // pinned-cursor failpoints in this file (see SERVER-21997).
-            std::function<void()> dropAndReacquireReadLock = [&readLock, opCtx, this]() {
+            std::function<void()> dropAndReacquireReadLockIfLocked = [&readLock, opCtx, this]() {
+                if (!readLock) {
+                    // This function is a no-op if 'readLock' is not held in the first place.
+                    return;
+                }
+
                 // Make sure an interrupted operation does not prevent us from reacquiring the lock.
                 UninterruptibleLockGuard noInterrupt(opCtx->lockState());
                 readLock.reset();
@@ -498,8 +504,7 @@ public:
                     &waitAfterPinningCursorBeforeGetMoreBatch,
                     opCtx,
                     "waitAfterPinningCursorBeforeGetMoreBatch",
-                    dropAndReacquireReadLock,
-                    false,
+                    dropAndReacquireReadLockIfLocked,
                     _request.nss);
             }
 
@@ -516,7 +521,7 @@ public:
 
             PlanExecutor* exec = cursorPin->getExecutor();
             const auto* cq = exec->getCanonicalQuery();
-            if (cq && cq->getQueryRequest().isReadOnce()) {
+            if (cq && cq->getFindCommand().getReadOnce()) {
                 // The readOnce option causes any storage-layer cursors created during plan
                 // execution to assume read data will not be needed again and need not be cached.
                 opCtx->recoveryUnit()->setReadOnce(true);
@@ -591,9 +596,9 @@ public:
             // of this operation's CurOp to signal that we've hit this point and then spin until the
             // failpoint is released.
             std::function<void()> saveAndRestoreStateWithReadLockReacquisition =
-                [exec, dropAndReacquireReadLock, &readLock]() {
+                [exec, dropAndReacquireReadLockIfLocked, &readLock]() {
                     exec->saveState();
-                    dropAndReacquireReadLock();
+                    dropAndReacquireReadLockIfLocked();
                     exec->restoreState(&readLock->getCollection());
                 };
 
@@ -605,7 +610,6 @@ public:
                     data["shouldNotdropLock"].booleanSafe()
                         ? []() {} /*empty function*/
                         : saveAndRestoreStateWithReadLockReacquisition,
-                    false,
                     _request.nss);
             });
 

@@ -380,7 +380,7 @@ server_parameters:
         cpp_vartype: AtomicWord<int>
         cpp_varname: tenantMigrationGarbageCollectionDelayMS
         default:
-            expr: 48 * 60 * 60 * 1000
+            expr: 15 * 60 * 1000
 
     tenantMigrationExternalKeysRemovalDelaySecs:
         description: >-
@@ -419,7 +419,10 @@ server_parameters:
         set_at: startup
         cpp_vartype: int
         cpp_varname: maxTenantMigrationRecipientThreadPoolSize
-        default: 8
+        # Each migration needs at least 2 dedicated threads for oplog fetching and data cloning plus
+        # 1 thread for other async jobs. To support 50 concurrent migrations on the recipient, we
+        # set the thread pool size to 128.
+        default: 128
         validator:
             gte: 1
 
@@ -444,9 +447,36 @@ server_parameters:
         validator:
             gte: 1
 
+    # TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
+    tenantMigrationDisableX509Auth:
+        description: >-
+            Disable x509 authentication for all ingoing and outgoing tenant migrations.
+        set_at: [ startup ]
+        cpp_vartype: bool
+        cpp_varname: tenantMigrationDisableX509Auth
+        default: false
+
+    tenantMigrationExcludeDonorHostTimeoutMS:
+        description: >-
+            Period of time, in milliseconds, that a donor host should be excluded for.
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: tenantMigrationExcludeDonorHostTimeoutMS
+        default: 60000
+        validator:
+            gte: 1
+
 feature_flags:
     featureFlagTenantMigrations:
         description: >-
             When enabled, tenant migration commands are supported.
         cpp_varname: feature_flags::gTenantMigrations
         default: false
+
+    # TODO (SERVER-54730): Remove featureFlagUseSecondaryDelaySecs.
+    featureFlagUseSecondaryDelaySecs:
+        description: >-
+            If enabled, use field secondaryDelaySecs instead of slaveDelay in MemberConfig.
+        cpp_varname: feature_flags::gUseSecondaryDelaySecs
+        default: true
+        version: 4.9

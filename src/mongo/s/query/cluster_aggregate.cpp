@@ -188,6 +188,20 @@ void updateHostsTargetedMetrics(OperationContext* opCtx,
     }
 }
 
+/**
+ * Performs validations related to API versioning and time-series stages.
+ * Throws UserAssertion if any of the validations fails
+ *     - validation of API versioning on each stage on the pipeline
+ *     - validation of API versioning on 'AggregateCommand' request
+ *     - validation of time-series related stages
+ */
+void performValidationChecks(const OperationContext* opCtx,
+                             const AggregateCommand& request,
+                             const LiteParsedPipeline& liteParsedPipeline) {
+    liteParsedPipeline.validate(opCtx);
+    aggregation_request_helper::validateRequestForAPIVersion(opCtx, request);
+}
+
 }  // namespace
 
 Status ClusterAggregate::runAggregate(OperationContext* opCtx,
@@ -204,14 +218,9 @@ Status ClusterAggregate::runAggregate(OperationContext* opCtx,
                                       const LiteParsedPipeline& liteParsedPipeline,
                                       const PrivilegeVector& privileges,
                                       BSONObjBuilder* result) {
-    // If 'apiStrict: true', validates that the pipeline does not contain stages which are not in
-    // this API version.
-    auto apiParameters = APIParameters::get(opCtx);
-    if (apiParameters.getAPIStrict().value_or(false)) {
-        auto apiVersion = apiParameters.getAPIVersion().value_or("");
-        if (!apiVersion.empty())
-            liteParsedPipeline.validatePipelineStagesIfAPIStrict(apiVersion);
-    }
+    // Perform some validations on the LiteParsedPipeline and request before continuing with the
+    // aggregation command.
+    performValidationChecks(opCtx, request, liteParsedPipeline);
 
     uassert(51028, "Cannot specify exchange option to a mongos", !request.getExchange());
     uassert(51143,

@@ -38,9 +38,11 @@
 #include "mongo/client/replica_set_monitor_protocol_test_util.h"
 #include "mongo/config.h"
 #include "mongo/db/client.h"
+#include "mongo/db/commands/feature_compatibility_version_document_gen.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/op_observer_impl.h"
 #include "mongo/db/op_observer_registry.h"
+#include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_buffer_collection.h"
 #include "mongo/db/repl/oplog_fetcher_mock.h"
@@ -74,6 +76,7 @@ namespace repl {
 
 namespace {
 constexpr std::int32_t stopFailPointErrorCode = 4880402;
+const Timestamp kDefaultStartMigrationTimestamp(1, 1);
 
 OplogEntry makeOplogEntry(OpTime opTime,
                           OpTypeEnum opType,
@@ -170,6 +173,11 @@ public:
         ReplicaSetMonitorProtocolTestUtil::setRSMProtocol(ReplicaSetMonitorProtocol::kScanning);
         ConnectionString::setConnectionHook(mongo::MockConnRegistry::get()->getConnStrHook());
 
+        // Set up clocks.
+        serviceContext->setFastClockSource(std::make_unique<SharedClockSourceAdapter>(_clkSource));
+        serviceContext->setPreciseClockSource(
+            std::make_unique<SharedClockSourceAdapter>(_clkSource));
+
         WaitForMajorityService::get(getServiceContext()).setUp(getServiceContext());
 
         // Automatically mark the state doc garbage collectable after data sync completion.
@@ -186,6 +194,12 @@ public:
 
             // Need real (non-mock) storage for the oplog buffer.
             StorageInterface::set(serviceContext, std::make_unique<StorageInterfaceImpl>());
+
+            // The DropPendingCollectionReaper is required to drop the oplog buffer collection.
+            repl::DropPendingCollectionReaper::set(
+                serviceContext,
+                std::make_unique<repl::DropPendingCollectionReaper>(
+                    StorageInterface::get(serviceContext)));
 
             // Set up OpObserver so that repl::logOp() will store the oplog entry's optime in
             // ReplClientInfo.
@@ -211,10 +225,12 @@ public:
         auto authFp = globalFailPointRegistry().find("skipTenantMigrationRecipientAuth");
         authFp->setMode(FailPoint::alwaysOn);
 
-        // Set up clocks.
-        serviceContext->setFastClockSource(std::make_unique<SharedClockSourceAdapter>(_clkSource));
-        serviceContext->setPreciseClockSource(
-            std::make_unique<SharedClockSourceAdapter>(_clkSource));
+        // Set the sslMode to allowSSL to avoid validation error.
+        sslGlobalParams.sslMode.store(SSLParams::SSLMode_allowSSL);
+        // Skipped unless tested explicitly, as we will not receive an FCV document from the donor
+        // in these unittests without (unsightly) intervention.
+        auto compFp = globalFailPointRegistry().find("skipComparingRecipientAndDonorFCV");
+        compFp->setMode(FailPoint::alwaysOn);
 
         // Timestamps of "0 seconds" are not allowed, so we must advance our clock mock to the first
         // real second.
@@ -224,6 +240,9 @@ public:
     void tearDown() override {
         auto authFp = globalFailPointRegistry().find("skipTenantMigrationRecipientAuth");
         authFp->setMode(FailPoint::off);
+
+        // Unset the sslMode.
+        sslGlobalParams.sslMode.store(SSLParams::SSLMode_disabled);
 
         WaitForMajorityService::get(getServiceContext()).shutDown();
 
@@ -293,32 +312,45 @@ protected:
         ASSERT_OK(persistedStateDocWithStatus.getStatus());
         ASSERT_BSONOBJ_EQ(memoryStateDoc.toBSON(), persistedStateDocWithStatus.getValue().toBSON());
     }
-    void insertToAllNodes(MockReplicaSet* replSet, const std::string& nss, BSONObj obj) {
-        for (const auto& host : replSet->getHosts()) {
+    void insertToNodes(MockReplicaSet* replSet,
+                       const std::string& nss,
+                       BSONObj obj,
+                       const std::vector<HostAndPort>& hosts) {
+        for (const auto& host : hosts) {
             replSet->getNode(host.toString())->insert(nss, obj);
         }
     }
 
-    void clearCollectionAllNodes(MockReplicaSet* replSet, const std::string& nss) {
-        for (const auto& host : replSet->getHosts()) {
+    void insertToAllNodes(MockReplicaSet* replSet, const std::string& nss, BSONObj obj) {
+        insertToNodes(replSet, nss, obj, replSet->getHosts());
+    }
+
+    void clearCollection(MockReplicaSet* replSet,
+                         const std::string& nss,
+                         const std::vector<HostAndPort>& hosts) {
+        for (const auto& host : hosts) {
             replSet->getNode(host.toString())->remove(nss, Query());
         }
     }
 
-    void insertTopOfOplog(MockReplicaSet* replSet, const OpTime& topOfOplogOpTime) {
+    void insertTopOfOplog(MockReplicaSet* replSet,
+                          const OpTime& topOfOplogOpTime,
+                          const std::vector<HostAndPort> hosts = {}) {
+        const auto targetHosts = hosts.empty() ? replSet->getHosts() : hosts;
         // The MockRemoteDBService does not actually implement the database, so to make our
         // find work correctly we must make sure there's only one document to find.
-        clearCollectionAllNodes(replSet, NamespaceString::kRsOplogNamespace.ns());
-        insertToAllNodes(replSet,
-                         NamespaceString::kRsOplogNamespace.ns(),
-                         makeOplogEntry(topOfOplogOpTime,
-                                        OpTypeEnum::kNoop,
-                                        {} /* namespace */,
-                                        boost::none /* uuid */,
-                                        BSONObj() /* o */,
-                                        boost::none /* o2 */)
-                             .getEntry()
-                             .toBSON());
+        clearCollection(replSet, NamespaceString::kRsOplogNamespace.ns(), targetHosts);
+        insertToNodes(replSet,
+                      NamespaceString::kRsOplogNamespace.ns(),
+                      makeOplogEntry(topOfOplogOpTime,
+                                     OpTypeEnum::kNoop,
+                                     {} /* namespace */,
+                                     boost::none /* uuid */,
+                                     BSONObj() /* o */,
+                                     boost::none /* o2 */)
+                          .getEntry()
+                          .toBSON(),
+                      targetHosts);
     }
 
     // Accessors to class private members
@@ -382,6 +414,18 @@ protected:
         initialStateDoc.setStartFetchingDonorOpTime(startFetchingDonorOptime);
     }
 
+    /**
+     * Sets the FCV on the donor so that it can respond to FCV requests appropriately.
+     * (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+     */
+    void setDonorFCV(const TenantMigrationRecipientService::Instance* instance,
+                     ServerGlobalParams::FeatureCompatibility::Version version =
+                         ServerGlobalParams::FeatureCompatibility::kLatest) {
+        auto fcvDoc = FeatureCompatibilityVersionDocument(version);
+        auto client = getClient(instance);
+        client->insert(NamespaceString::kServerConfigurationNamespace.ns(), fcvDoc.toBSON());
+    }
+
 private:
     std::shared_ptr<ClockSourceMock> _clkSource = std::make_shared<ClockSourceMock>();
 
@@ -397,17 +441,18 @@ TEST_F(TenantMigrationRecipientServiceTest, BasicTenantMigrationRecipientService
 
     const UUID migrationUUID = UUID::gen();
 
-    TenantMigrationRecipientDocument TenantMigrationRecipientInstance(
+    TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         "donor-rs/localhost:12345",
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly, TagSet::primaryOnly()),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly, TagSet::primaryOnly()));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
     auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
-        opCtx.get(), _service, TenantMigrationRecipientInstance.toBSON());
+        opCtx.get(), _service, initialStateDocument.toBSON());
     ASSERT(instance.get());
     ASSERT_EQ(migrationUUID, instance->getMigrationUUID());
 
@@ -416,23 +461,23 @@ TEST_F(TenantMigrationRecipientServiceTest, BasicTenantMigrationRecipientService
     ASSERT_OK(instance->getCompletionFuture().getNoThrow());
 }
 
-
-TEST_F(TenantMigrationRecipientServiceTest, InstanceReportsErrorOnFailureWhilePersisitingStateDoc) {
+TEST_F(TenantMigrationRecipientServiceTest, InstanceReportsErrorOnFailureWhilePersistingStateDoc) {
     stopFailPointEnableBlock fp("failWhilePersistingTenantMigrationRecipientInstanceStateDoc");
 
     const UUID migrationUUID = UUID::gen();
 
-    TenantMigrationRecipientDocument TenantMigrationRecipientInstance(
+    TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         "donor-rs/localhost:12345",
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly, TagSet::primaryOnly()),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly, TagSet::primaryOnly()));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
     auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
-        opCtx.get(), _service, TenantMigrationRecipientInstance.toBSON());
+        opCtx.get(), _service, initialStateDocument.toBSON());
     ASSERT(instance.get());
     ASSERT_EQ(migrationUUID, instance->getMigrationUUID());
 
@@ -454,17 +499,20 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientConnection_P
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
 
-    TenantMigrationRecipientDocument TenantMigrationRecipientInstance(
+    insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
+
+    TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
     auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
-        opCtx.get(), _service, TenantMigrationRecipientInstance.toBSON());
+        opCtx.get(), _service, initialStateDocument.toBSON());
     ASSERT(instance.get());
 
     taskFp->waitForTimesEntered(initialTimesEntered + 1);
@@ -502,17 +550,20 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientConnection_S
 
     MockReplicaSet replSet("donorSet", 2, true /* hasPrimary */, true /* dollarPrefixHosts */);
 
-    TenantMigrationRecipientDocument TenantMigrationRecipientInstance(
+    insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
+
+    TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::SecondaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::SecondaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
     auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
-        opCtx.get(), _service, TenantMigrationRecipientInstance.toBSON());
+        opCtx.get(), _service, initialStateDocument.toBSON());
     ASSERT(instance.get());
 
     taskFp->waitForTimesEntered(initialTimesEntered + 1);
@@ -540,93 +591,46 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientConnection_S
     ASSERT_OK(instance->getCompletionFuture().getNoThrow());
 }
 
-TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientConnection_PrimaryFails) {
-    stopFailPointEnableBlock fp("fpAfterConnectingTenantMigrationRecipientInstance");
-
-    FailPointEnableBlock timeoutFp("setTenantMigrationRecipientInstanceHostTimeout",
-                                   BSON("findHostTimeoutMillis" << 100));
-
-    auto taskFp = globalFailPointRegistry().find("hangBeforeTaskCompletion");
-    auto initialTimesEntered = taskFp->setMode(FailPoint::alwaysOn);
-
-    const UUID migrationUUID = UUID::gen();
-
-    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
-    // Primary is unavailable.
-    replSet.kill(replSet.getHosts()[0].toString());
-
-    TenantMigrationRecipientDocument initialStateDocument(
-        migrationUUID,
-        replSet.getConnectionString(),
-        "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
-
-    // Create and start the instance.
-    auto opCtx = makeOperationContext();
-    auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
-        opCtx.get(), _service, initialStateDocument.toBSON());
-    ASSERT(instance.get());
-
-    AtomicWord<bool> runReplMonitor{true};
-    // Keep scanning the replica set while waiting to reach the failpoint. This would normally
-    // be automatic but that doesn't work with mock replica sets.
-    stdx::thread replMonitorThread([&] {
-        Client::initThread("replMonitorThread");
-        while (runReplMonitor.load()) {
-            auto monitor = ReplicaSetMonitor::get(replSet.getSetName());
-            // Monitor may not have been created yet.
-            if (monitor) {
-                monitor->runScanForMockReplicaSet();
-            }
-            mongo::sleepmillis(100);
-        }
-    });
-
-    taskFp->waitForTimesEntered(initialTimesEntered + 1);
-    runReplMonitor.store(false);
-    replMonitorThread.join();
-
-    auto* client = getClient(instance.get());
-    auto* oplogFetcherClient = getOplogFetcherClient(instance.get());
-    // Neither client should be populated.
-    ASSERT_FALSE(client);
-    ASSERT_FALSE(oplogFetcherClient);
-
-    taskFp->setMode(FailPoint::off);
-
-    // Wait for task completion failure.
-    ASSERT_EQUALS(ErrorCodes::FailedToSatisfyReadPreference,
-                  instance->getDataSyncCompletionFuture().getNoThrow().code());
-    ASSERT_OK(instance->getCompletionFuture().getNoThrow());
-}
-
 TEST_F(TenantMigrationRecipientServiceTest,
        TenantMigrationRecipientConnect_ExcludedPrimaryHostPrimaryOnly) {
+    FailPointEnableBlock skipRetriesFp("skipRetriesWhenConnectingToDonorHost");
+
     auto taskFp = globalFailPointRegistry().find("hangBeforeTaskCompletion");
-    auto initialTimesEntered = taskFp->setMode(FailPoint::alwaysOn);
+    auto taskFpInitialTimesEntered = taskFp->setMode(FailPoint::alwaysOn);
 
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 2);
 
+    insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
+
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
+    // Hang the migration before attempting to connect to clients.
+    auto hangFp =
+        globalFailPointRegistry().find("fpAfterPersistingTenantMigrationRecipientInstanceStateDoc");
+    auto hangFpInitialTimesEntered = hangFp->setMode(FailPoint::alwaysOn,
+                                                     0,
+                                                     BSON("action"
+                                                          << "hang"));
     // Create and start the instance.
     auto opCtx = makeOperationContext();
     auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
         opCtx.get(), _service, initialStateDocument.toBSON());
     ASSERT(instance.get());
 
+    hangFp->waitForTimesEntered(hangFpInitialTimesEntered + 1);
+
     // Mark the primary as excluded.
     auto hosts = replSet.getHosts();
     auto now = opCtx->getServiceContext()->getFastClockSource()->now();
-    instance->excludeDonorHost(hosts.at(0), now + Milliseconds(500));
+    instance->excludeDonorHost_forTest(hosts.at(0), now + Milliseconds(500));
 
     AtomicWord<bool> runReplMonitor{true};
     // Keep scanning the replica set while waiting to reach the failpoint. This would normally
@@ -643,7 +647,8 @@ TEST_F(TenantMigrationRecipientServiceTest,
         }
     });
 
-    taskFp->waitForTimesEntered(initialTimesEntered + 1);
+    hangFp->setMode(FailPoint::off);
+    taskFp->waitForTimesEntered(taskFpInitialTimesEntered + 1);
     runReplMonitor.store(false);
     replMonitorThread.join();
 
@@ -666,18 +671,29 @@ TEST_F(TenantMigrationRecipientServiceTest,
     stopFailPointEnableBlock fp("fpAfterConnectingTenantMigrationRecipientInstance");
 
     auto taskFp = globalFailPointRegistry().find("hangBeforeTaskCompletion");
-    auto initialTimesEntered = taskFp->setMode(FailPoint::alwaysOn);
+    auto taskFpInitialTimesEntered = taskFp->setMode(FailPoint::alwaysOn);
 
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 2);
 
+    insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
+
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Hang the migration before attempting to connect to clients.
+    auto hangFp =
+        globalFailPointRegistry().find("fpAfterPersistingTenantMigrationRecipientInstanceStateDoc");
+    auto hangFpInitialTimesEntered = hangFp->setMode(FailPoint::alwaysOn,
+                                                     0,
+                                                     BSON("action"
+                                                          << "hang"));
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -685,16 +701,19 @@ TEST_F(TenantMigrationRecipientServiceTest,
         opCtx.get(), _service, initialStateDocument.toBSON());
     ASSERT(instance.get());
 
+    hangFp->waitForTimesEntered(hangFpInitialTimesEntered + 1);
+
     // Mark the primary as excluded.
     auto hosts = replSet.getHosts();
     auto now = opCtx->getServiceContext()->getFastClockSource()->now();
     auto excludeTime = Milliseconds(500);
-    instance->excludeDonorHost(hosts.at(0), now + excludeTime);
+    instance->excludeDonorHost_forTest(hosts.at(0), now + excludeTime);
 
     // Advance the clock past excludeTime.
     advanceTime(excludeTime + Milliseconds(500));
 
-    taskFp->waitForTimesEntered(initialTimesEntered + 1);
+    hangFp->setMode(FailPoint::off);
+    taskFp->waitForTimesEntered(taskFpInitialTimesEntered + 1);
 
     auto* client = getClient(instance.get());
     auto* oplogFetcherClient = getOplogFetcherClient(instance.get());
@@ -721,19 +740,32 @@ TEST_F(TenantMigrationRecipientServiceTest,
 
 TEST_F(TenantMigrationRecipientServiceTest,
        TenantMigrationRecipientConnect_ExcludedAllHostsNearest) {
+    FailPointEnableBlock skipRetriesFp("skipRetriesWhenConnectingToDonorHost");
+
     auto taskFp = globalFailPointRegistry().find("hangBeforeTaskCompletion");
-    auto initialTimesEntered = taskFp->setMode(FailPoint::alwaysOn);
+    auto taskFpInitialTimesEntered = taskFp->setMode(FailPoint::alwaysOn);
 
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 2);
 
+    insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
+
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::Nearest),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::Nearest));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Hang the migration before attempting to connect to clients.
+    auto hangFp =
+        globalFailPointRegistry().find("fpAfterPersistingTenantMigrationRecipientInstanceStateDoc");
+    auto hangFpInitialTimesEntered = hangFp->setMode(FailPoint::alwaysOn,
+                                                     0,
+                                                     BSON("action"
+                                                          << "hang"));
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -741,11 +773,13 @@ TEST_F(TenantMigrationRecipientServiceTest,
         opCtx.get(), _service, initialStateDocument.toBSON());
     ASSERT(instance.get());
 
+    hangFp->waitForTimesEntered(hangFpInitialTimesEntered + 1);
+
     // Mark all hosts as excluded.
     auto hosts = replSet.getHosts();
     for (const auto& host : hosts) {
         const auto now = opCtx->getServiceContext()->getFastClockSource()->now();
-        instance->excludeDonorHost(host, now + Milliseconds(500));
+        instance->excludeDonorHost_forTest(host, now + Milliseconds(500));
     }
 
     AtomicWord<bool> runReplMonitor{true};
@@ -763,7 +797,8 @@ TEST_F(TenantMigrationRecipientServiceTest,
         }
     });
 
-    taskFp->waitForTimesEntered(initialTimesEntered + 1);
+    hangFp->setMode(FailPoint::off);
+    taskFp->waitForTimesEntered(taskFpInitialTimesEntered + 1);
     runReplMonitor.store(false);
     replMonitorThread.join();
 
@@ -786,18 +821,29 @@ TEST_F(TenantMigrationRecipientServiceTest,
     stopFailPointEnableBlock fp("fpAfterConnectingTenantMigrationRecipientInstance");
 
     auto taskFp = globalFailPointRegistry().find("hangBeforeTaskCompletion");
-    auto initialTimesEntered = taskFp->setMode(FailPoint::alwaysOn);
+    auto taskFpInitialTimesEntered = taskFp->setMode(FailPoint::alwaysOn);
 
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 2);
 
+    insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
+
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryPreferred),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryPreferred));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Hang the migration before attempting to connect to clients.
+    auto hangFp =
+        globalFailPointRegistry().find("fpAfterPersistingTenantMigrationRecipientInstanceStateDoc");
+    auto hangFpInitialTimesEntered = hangFp->setMode(FailPoint::alwaysOn,
+                                                     0,
+                                                     BSON("action"
+                                                          << "hang"));
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -805,13 +851,16 @@ TEST_F(TenantMigrationRecipientServiceTest,
         opCtx.get(), _service, initialStateDocument.toBSON());
     ASSERT(instance.get());
 
+    hangFp->waitForTimesEntered(hangFpInitialTimesEntered + 1);
+
     // Mark the primary as excluded.
     auto hosts = replSet.getHosts();
     auto now = opCtx->getServiceContext()->getFastClockSource()->now();
     auto excludeTime = Milliseconds(500);
-    instance->excludeDonorHost(hosts.at(0), now + excludeTime);
+    instance->excludeDonorHost_forTest(hosts.at(0), now + excludeTime);
 
-    taskFp->waitForTimesEntered(initialTimesEntered + 1);
+    hangFp->setMode(FailPoint::off);
+    taskFp->waitForTimesEntered(taskFpInitialTimesEntered + 1);
 
     auto* client = getClient(instance.get());
     auto* oplogFetcherClient = getOplogFetcherClient(instance.get());
@@ -841,18 +890,29 @@ TEST_F(TenantMigrationRecipientServiceTest,
     stopFailPointEnableBlock fp("fpAfterConnectingTenantMigrationRecipientInstance");
 
     auto taskFp = globalFailPointRegistry().find("hangBeforeTaskCompletion");
-    auto initialTimesEntered = taskFp->setMode(FailPoint::alwaysOn);
+    auto taskFpInitialTimesEntered = taskFp->setMode(FailPoint::alwaysOn);
 
     const UUID migrationUUID = UUID::gen();
 
     MockReplicaSet replSet("donorSet", 2);
 
+    insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
+
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryPreferred),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryPreferred));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Hang the migration before attempting to connect to clients.
+    auto hangFp =
+        globalFailPointRegistry().find("fpAfterPersistingTenantMigrationRecipientInstanceStateDoc");
+    auto hangFpInitialTimesEntered = hangFp->setMode(FailPoint::alwaysOn,
+                                                     0,
+                                                     BSON("action"
+                                                          << "hang"));
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -860,16 +920,19 @@ TEST_F(TenantMigrationRecipientServiceTest,
         opCtx.get(), _service, initialStateDocument.toBSON());
     ASSERT(instance.get());
 
+    hangFp->waitForTimesEntered(hangFpInitialTimesEntered + 1);
+
     // Mark the primary as excluded.
     auto hosts = replSet.getHosts();
     auto now = opCtx->getServiceContext()->getFastClockSource()->now();
     auto excludeTime = Milliseconds(500);
-    instance->excludeDonorHost(hosts.at(0), now + excludeTime);
+    instance->excludeDonorHost_forTest(hosts.at(0), now + excludeTime);
 
     // Advance the clock past excludeTime.
     advanceTime(excludeTime + Milliseconds(500));
 
-    taskFp->waitForTimesEntered(initialTimesEntered + 1);
+    hangFp->setMode(FailPoint::off);
+    taskFp->waitForTimesEntered(taskFpInitialTimesEntered + 1);
 
     auto* client = getClient(instance.get());
     auto* oplogFetcherClient = getOplogFetcherClient(instance.get());
@@ -894,6 +957,126 @@ TEST_F(TenantMigrationRecipientServiceTest,
     ASSERT_OK(instance->getCompletionFuture().getNoThrow());
 }
 
+TEST_F(TenantMigrationRecipientServiceTest,
+       TenantMigrationRecipientConnection_RemoteMajorityOpTimeBehindStartApplying) {
+    stopFailPointEnableBlock fp("fpAfterConnectingTenantMigrationRecipientInstance");
+
+    const UUID migrationUUID = UUID::gen();
+    const OpTime remoteMajorityOpTime(Timestamp(5, 1), 1);
+    const OpTime startApplyingOpTime(Timestamp(6, 1), 1);
+
+    auto taskFp = globalFailPointRegistry().find("hangBeforeTaskCompletion");
+    auto timesEntered = taskFp->setMode(FailPoint::alwaysOn, 0);
+
+    // Insert the remote majority optime into the oplogs of the first two hosts.
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    const auto hosts = replSet.getHosts();
+    const std::vector<HostAndPort> advancedOpTimeHosts = {hosts.begin(), hosts.begin() + 2};
+
+    insertTopOfOplog(&replSet, remoteMajorityOpTime, advancedOpTimeHosts);
+    insertTopOfOplog(&replSet, startApplyingOpTime, {hosts.at(2)});
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryPreferred));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+    initialStateDocument.setStartApplyingDonorOpTime(startApplyingOpTime);
+
+    // Create and start the instance.
+    auto opCtx = makeOperationContext();
+    auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
+        opCtx.get(), _service, initialStateDocument.toBSON());
+    ASSERT(instance.get());
+    ASSERT_EQ(migrationUUID, instance->getMigrationUUID());
+
+    taskFp->waitForTimesEntered(timesEntered + 1);
+
+    auto* client = getClient(instance.get());
+    auto* oplogFetcherClient = getOplogFetcherClient(instance.get());
+    // Both clients should be populated.
+    ASSERT(client);
+    ASSERT(oplogFetcherClient);
+
+    // Clients should be distinct.
+    ASSERT(client != oplogFetcherClient);
+
+    // Clients should be connected to donor node at index 2.
+    auto donorHost = hosts[2].toString();
+    ASSERT_EQ(donorHost, client->getServerAddress());
+    ASSERT(client->isStillConnected());
+    ASSERT_EQ(donorHost, oplogFetcherClient->getServerAddress());
+    ASSERT(oplogFetcherClient->isStillConnected());
+
+    taskFp->setMode(FailPoint::off, 0);
+}
+
+TEST_F(TenantMigrationRecipientServiceTest,
+       TenantMigrationRecipientConnection_RemoteMajorityOpTimeBehindStartMigrationDonorTimestamp) {
+    stopFailPointEnableBlock fp("fpAfterConnectingTenantMigrationRecipientInstance");
+
+    const UUID migrationUUID = UUID::gen();
+    const OpTime remoteMajorityOpTime(Timestamp(5, 1), 1);
+    const Timestamp startMigrationDonorTimestamp(6, 1);
+
+    auto taskFp = globalFailPointRegistry().find("hangBeforeTaskCompletion");
+    auto timesEntered = taskFp->setMode(FailPoint::alwaysOn, 0);
+
+    // Insert the remote majority optime into the oplogs of the first two hosts.
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    const auto hosts = replSet.getHosts();
+    const std::vector<HostAndPort> advancedOpTimeHosts = {hosts[0], hosts[1]};
+
+    insertTopOfOplog(&replSet, remoteMajorityOpTime, advancedOpTimeHosts);
+    insertTopOfOplog(&replSet, OpTime(startMigrationDonorTimestamp, 1), {hosts.at(2)});
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        startMigrationDonorTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryPreferred));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Create and start the instance.
+    auto opCtx = makeOperationContext();
+    auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
+        opCtx.get(), _service, initialStateDocument.toBSON());
+    ASSERT(instance.get());
+    ASSERT_EQ(migrationUUID, instance->getMigrationUUID());
+
+    taskFp->waitForTimesEntered(timesEntered + 1);
+
+    auto* client = getClient(instance.get());
+    auto* oplogFetcherClient = getOplogFetcherClient(instance.get());
+    // Both clients should be populated.
+    ASSERT(client);
+    ASSERT(oplogFetcherClient);
+
+    // Clients should be distinct.
+    ASSERT(client != oplogFetcherClient);
+
+    // Clients should be connected to donor node at index 2.
+    auto donorHost = hosts[2].toString();
+    ASSERT_EQ(donorHost, client->getServerAddress());
+    ASSERT(client->isStillConnected());
+    ASSERT_EQ(donorHost, oplogFetcherClient->getServerAddress());
+    ASSERT(oplogFetcherClient->isStillConnected());
+
+    // Since we were using primaryPreferred read preference, we should have tried hosts[0]
+    // and had it rejected.
+    const auto& excludedHosts = instance->getExcludedDonorHosts_forTest();
+    ASSERT_TRUE(std::find_if(excludedHosts.begin(),
+                             excludedHosts.end(),
+                             [hosts](const std::pair<HostAndPort, Date_t>& a) {
+                                 return a.first == hosts[0];
+                             }) != excludedHosts.end());
+
+    taskFp->setMode(FailPoint::off, 0);
+}
+
 TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientConnection_PrimaryFailsOver) {
     stopFailPointEnableBlock fp("fpAfterConnectingTenantMigrationRecipientInstance");
 
@@ -904,6 +1087,8 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientConnection_P
 
     MockReplicaSet replSet("donorSet", 2, true /* hasPrimary */, true /* dollarPrefixHosts */);
 
+    insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
+
     // Primary is unavailable.
     replSet.kill(replSet.getHosts()[0].toString());
 
@@ -911,8 +1096,9 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientConnection_P
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryPreferred),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryPreferred));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -954,8 +1140,9 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientConnection_B
         migrationUUID,
         "broken,connect,string,no,set,name",
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -975,8 +1162,9 @@ TEST_F(TenantMigrationRecipientServiceTest,
         migrationUUID,
         "localhost:12345",
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -999,8 +1187,9 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientGetStartOpTi
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -1036,8 +1225,9 @@ TEST_F(TenantMigrationRecipientServiceTest,
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -1078,8 +1268,9 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientGetStartOpTi
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -1122,8 +1313,9 @@ TEST_F(TenantMigrationRecipientServiceTest,
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -1156,8 +1348,9 @@ TEST_F(TenantMigrationRecipientServiceTest,
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.  Fail to populate the remote oplog mock.
     auto opCtx = makeOperationContext();
@@ -1189,8 +1382,9 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientStartOplogFe
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     auto opCtx = makeOperationContext();
     std::shared_ptr<TenantMigrationRecipientService::Instance> instance;
@@ -1242,8 +1436,9 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientStartsCloner
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     auto opCtx = makeOperationContext();
     std::shared_ptr<TenantMigrationRecipientService::Instance> instance;
@@ -1295,8 +1490,9 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogFetcherFailsDuringOplogApplicat
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Skip the cloners in this test, so we provide an empty list of databases.
     MockRemoteDBServer* const _donorServer =
@@ -1349,8 +1545,9 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogFetcherResumesFromTopOfOplogBuf
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // We skip cloning here as a way to simulate that the recipient service has detected an existing
     // migration on startup and will resume oplog fetching from the appropriate optime.
@@ -1439,21 +1636,21 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogFetcherResumesFromTopOfOplogBuf
 
 TEST_F(TenantMigrationRecipientServiceTest, OplogFetcherNoDocInBufferToResumeFrom) {
     const UUID migrationUUID = UUID::gen();
-    const OpTime initialOpTime(Timestamp(1, 1), 1);
     const OpTime startFetchingOpTime(Timestamp(2, 1), 1);
     const OpTime clonerFinishedOpTime(Timestamp(3, 1), 1);
     const OpTime resumeFetchingOpTime(Timestamp(4, 1), 1);
     const OpTime dataConsistentOpTime(Timestamp(5, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
-    insertTopOfOplog(&replSet, initialOpTime);
+    insertTopOfOplog(&replSet, startFetchingOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // We skip cloning here as a way to simulate that the recipient service has detected an existing
     // migration on startup and will attempt to resume oplog fetching from the appropriate optime.
@@ -1545,20 +1742,20 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogFetcherNoDocInBufferToResumeFro
 
 TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromLastNoOpOplogEntry) {
     const UUID migrationUUID = UUID::gen();
-    const OpTime initialOpTime(Timestamp(1, 1), 1);
     const OpTime clonerFinishedOpTime(Timestamp(2, 1), 1);
     const OpTime resumeOpTime(Timestamp(3, 1), 1);
     const OpTime dataConsistentOpTime(Timestamp(4, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
-    insertTopOfOplog(&replSet, initialOpTime);
+    insertTopOfOplog(&replSet, clonerFinishedOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // We skip cloning here as a way to simulate that the recipient service has detected an existing
     // migration on startup and will attempt to resume oplog fetching from the appropriate optime.
@@ -1566,7 +1763,7 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromLastNoOpOplog
                                     clonerFinishedOpTime /* cloneFinishedRecipientOpTime */,
                                     dataConsistentOpTime /* dataConsistentStopDonorOpTime */,
                                     clonerFinishedOpTime /* startApplyingDonorOpTime */,
-                                    initialOpTime /* startFetchingDonorOpTime */);
+                                    clonerFinishedOpTime /* startFetchingDonorOpTime */);
 
     auto opCtx = makeOperationContext();
     std::shared_ptr<TenantMigrationRecipientService::Instance> instance;
@@ -1665,27 +1862,29 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromLastNoOpOplog
 
 TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromStartDonorApplyingOpTime) {
     const UUID migrationUUID = UUID::gen();
-    const OpTime initialOpTime(Timestamp(1, 1), 1);
     const OpTime startApplyingOpTime(Timestamp(2, 1), 1);
     const OpTime dataConsistentOpTime(Timestamp(4, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
-    insertTopOfOplog(&replSet, initialOpTime);
+    insertTopOfOplog(&replSet, startApplyingOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // We skip cloning here as a way to simulate that the recipient service has detected an existing
     // migration on startup and will attempt to resume oplog fetching from the appropriate optime.
     updateStateDocToCloningFinished(initialStateDocument,
-                                    OpTime(Timestamp(10, 1), 1) /* cloneFinishedRecipientOpTime */,
+                                    OpTime(Timestamp(10, 1), 1) /* cloneFinishedRecipientOpTime
+                                                                 */
+                                    ,
                                     dataConsistentOpTime /* dataConsistentStopDonorOpTime */,
                                     startApplyingOpTime /* startApplyingDonorOpTime */,
-                                    initialOpTime /* startFetchingDonorOpTime */);
+                                    startApplyingOpTime /* startFetchingDonorOpTime */);
 
     auto opCtx = makeOperationContext();
     std::shared_ptr<TenantMigrationRecipientService::Instance> instance;
@@ -1708,8 +1907,9 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromStartDonorApp
     // field. These oplog entries do not satisfy the conditions for the oplog applier to resume from
     // so we default to resuming from 'startDonorApplyingOpTime'.
     const auto insertNss = NamespaceString("tenantA_foo.bar");
+    const auto beforeStartApplyingOpTime = OpTime(Timestamp(1, 1), 1);
     const auto entryBeforeStartApplyingOpTime = makeOplogEntry(
-                                                    initialOpTime,
+                                                    beforeStartApplyingOpTime,
                                                     OpTypeEnum::kInsert,
                                                     insertNss,
                                                     UUID::gen(),
@@ -1819,19 +2019,19 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromStartDonorApp
 TEST_F(TenantMigrationRecipientServiceTest,
        OplogFetcherResumesFromStartFetchingOpTimeWithDocInBuffer) {
     const UUID migrationUUID = UUID::gen();
-    const OpTime initialOpTime(Timestamp(1, 1), 1);
     const OpTime startFetchingOpTime(Timestamp(2, 1), 1);
     const OpTime dataConsistentOpTime(Timestamp(4, 1), 1);
 
     MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
-    insertTopOfOplog(&replSet, initialOpTime);
+    insertTopOfOplog(&replSet, startFetchingOpTime);
 
     TenantMigrationRecipientDocument initialStateDocument(
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // We skip cloning here as a way to simulate that the recipient service has detected an existing
     // migration on startup and will resume oplog fetching from the appropriate optime.
@@ -1934,8 +2134,9 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierFails) {
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Skip the cloners in this test, so we provide an empty list of databases.
     MockRemoteDBServer* const _donorServer =
@@ -1998,8 +2199,9 @@ TEST_F(TenantMigrationRecipientServiceTest, StoppingApplierAllowsCompletion) {
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Skip the cloners in this test, so we provide an empty list of databases.
     MockRemoteDBServer* const _donorServer =
@@ -2051,8 +2253,9 @@ TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientAddResumeTok
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Skip the cloners in this test, so we provide an empty list of databases.
     MockRemoteDBServer* const _donorServer =
@@ -2151,8 +2354,9 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_BeforeRun) 
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     auto fp = globalFailPointRegistry().find("pauseBeforeRunTenantMigrationRecipientInstance");
     fp->setMode(FailPoint::alwaysOn);
@@ -2186,8 +2390,9 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_FailToIniti
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     auto opCtx = makeOperationContext();
     auto instance = repl::TenantMigrationRecipientService::Instance::getOrCreate(
@@ -2218,8 +2423,9 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_WaitUntilSt
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     auto fp = globalFailPointRegistry().find("pauseAfterRunTenantMigrationRecipientInstance");
     auto initialTimesEntered = fp->setMode(FailPoint::alwaysOn);
@@ -2298,8 +2504,9 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_AfterStartO
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -2359,8 +2566,9 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_AfterConsis
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Skip the cloners in this test, so we provide an empty list of databases.
     MockRemoteDBServer* const _donorServer =
@@ -2445,8 +2653,9 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_AfterFail) 
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Skip the cloners in this test, so we provide an empty list of databases.
     MockRemoteDBServer* const _donorServer =
@@ -2524,8 +2733,9 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_FailToMarkG
         migrationUUID,
         replSet.getConnectionString(),
         "tenantA",
-        ReadPreferenceSetting(ReadPreference::PrimaryOnly),
-        kRecipientPEMPayload);
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
 
     // Create and start the instance.
     auto opCtx = makeOperationContext();
@@ -2562,6 +2772,507 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_FailToMarkG
         checkStateDocPersisted(opCtx.get(), instance.get());
     }
 }
+
+TEST_F(TenantMigrationRecipientServiceTest, TenantMigrationRecipientServiceRecordsFCVAtStart) {
+    stopFailPointEnableBlock fp("fpAfterRecordingRecipientPrimaryStartingFCV");
+
+    const UUID migrationUUID = UUID::gen();
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+
+    insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Create and start the instance.
+    auto opCtx = makeOperationContext();
+    auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
+        opCtx.get(), _service, initialStateDocument.toBSON());
+    ASSERT(instance.get());
+
+    // Wait for task completion.
+    ASSERT_EQ(stopFailPointErrorCode, instance->getDataSyncCompletionFuture().getNoThrow().code());
+    ASSERT_OK(instance->getCompletionFuture().getNoThrow());
+
+    auto doc = getStateDoc(instance.get());
+    auto docFCV = doc.getRecipientPrimaryStartingFCV();
+    auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
+    LOGV2(5356202, "FCV in doc vs current", "docFCV"_attr = docFCV, "currentFCV"_attr = currentFCV);
+    ASSERT(currentFCV == docFCV);
+    checkStateDocPersisted(opCtx.get(), instance.get());
+}
+
+TEST_F(TenantMigrationRecipientServiceTest,
+       TenantMigrationRecipientServiceAlreadyRecordedFCV_Match) {
+    stopFailPointEnableBlock fp("fpAfterRecordingRecipientPrimaryStartingFCV");
+
+    const UUID migrationUUID = UUID::gen();
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+
+    insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Add an FCV value as if it was from a previous attempt.
+    auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
+    initialStateDocument.setRecipientPrimaryStartingFCV(currentFCV);
+
+    // Create and start the instance.
+    auto opCtx = makeOperationContext();
+    auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
+        opCtx.get(), _service, initialStateDocument.toBSON());
+    ASSERT(instance.get());
+
+    // Wait for task completion.
+    // The FCV should match so we should exit with the failpoint code rather than an error.
+    ASSERT_EQ(stopFailPointErrorCode, instance->getDataSyncCompletionFuture().getNoThrow().code());
+    ASSERT_OK(instance->getCompletionFuture().getNoThrow());
+
+    auto doc = getStateDoc(instance.get());
+    auto docFCV = doc.getRecipientPrimaryStartingFCV();
+    LOGV2(5356203, "FCV in doc vs current", "docFCV"_attr = docFCV, "currentFCV"_attr = currentFCV);
+    ASSERT(currentFCV == docFCV);
+    checkStateDocPersisted(opCtx.get(), instance.get());
+}
+
+TEST_F(TenantMigrationRecipientServiceTest,
+       TenantMigrationRecipientServiceAlreadyRecordedFCV_Mismatch) {
+    stopFailPointEnableBlock fp("fpAfterRecordingRecipientPrimaryStartingFCV");
+
+    const UUID migrationUUID = UUID::gen();
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+
+    insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Add an FCV value as if it was from a previous attempt, making sure we set a different
+    // version from the one we currently have.
+    // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+    initialStateDocument.setRecipientPrimaryStartingFCV(
+        ServerGlobalParams::FeatureCompatibility::kLastLTS);
+
+    // Create and start the instance.
+    auto opCtx = makeOperationContext();
+    auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
+        opCtx.get(), _service, initialStateDocument.toBSON());
+    ASSERT(instance.get());
+
+    // Wait for task completion failure.
+    // The FCV should differ so we expect to exit with an error.
+    std::int32_t expectedCode = 5356201;
+    ASSERT_EQ(expectedCode, instance->getDataSyncCompletionFuture().getNoThrow().code());
+    ASSERT_OK(instance->getCompletionFuture().getNoThrow());
+}
+
+TEST_F(TenantMigrationRecipientServiceTest,
+       TenantMigrationRecipientServiceDonorAndRecipientFCVMismatch) {
+    stopFailPointEnableBlock fp("fpAfterComparingRecipientAndDonorFCV");
+
+    // Tests skip this check by default but we are specifically testing it here.
+    auto compFp = globalFailPointRegistry().find("skipComparingRecipientAndDonorFCV");
+    compFp->setMode(FailPoint::off);
+
+    // Set to allow the donor to respond to FCV requests.
+    auto connFp =
+        globalFailPointRegistry().find("fpAfterConnectingTenantMigrationRecipientInstance");
+    auto initialTimesEntered = connFp->setMode(FailPoint::alwaysOn,
+                                               0,
+                                               BSON("action"
+                                                    << "hang"));
+
+    const UUID migrationUUID = UUID::gen();
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+
+    insertTopOfOplog(&replSet, OpTime(kDefaultStartMigrationTimestamp, 1));
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Create and start the instance.
+    auto opCtx = makeOperationContext();
+    auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
+        opCtx.get(), _service, initialStateDocument.toBSON());
+    ASSERT(instance.get());
+
+    // Set the donor FCV to be different from 'latest'.
+    // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+    connFp->waitForTimesEntered(initialTimesEntered + 1);
+    setDonorFCV(instance.get(), ServerGlobalParams::FeatureCompatibility::kLastContinuous);
+    connFp->setMode(FailPoint::off);
+
+    // Wait for task completion failure.
+    // The FCVs should differ so we expect to exit with an error.
+    std::int32_t expectedCode = 5382301;
+    ASSERT_EQ(expectedCode, instance->getDataSyncCompletionFuture().getNoThrow().code());
+    ASSERT_OK(instance->getCompletionFuture().getNoThrow());
+}
+
+TEST_F(TenantMigrationRecipientServiceTest, WaitUntilTimestampIsMajorityCommitted) {
+    const UUID migrationUUID = UUID::gen();
+    const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
+
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    insertTopOfOplog(&replSet, topOfOplogOpTime);
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Skip the cloners in this test, so we provide an empty list of databases.
+    MockRemoteDBServer* const _donorServer =
+        mongo::MockConnRegistry::get()->getMockRemoteDBServer(replSet.getPrimary());
+    _donorServer->setCommandReply("listDatabases", makeListDatabasesResponse({}));
+    _donorServer->setCommandReply("find", makeFindResponse());
+
+    auto opCtx = makeOperationContext();
+    std::shared_ptr<TenantMigrationRecipientService::Instance> instance;
+    {
+        FailPointEnableBlock fp("pauseBeforeRunTenantMigrationRecipientInstance");
+        // Create and start the instance.
+        instance = TenantMigrationRecipientService::Instance::getOrCreate(
+            opCtx.get(), _service, initialStateDocument.toBSON());
+        ASSERT(instance.get());
+        instance->setCreateOplogFetcherFn_forTest(std::make_unique<CreateOplogFetcherMockFn>());
+    }
+
+    instance->waitUntilMigrationReachesConsistentState(opCtx.get());
+    checkStateDocPersisted(opCtx.get(), instance.get());
+
+    // Simulate recipient receiving a donor timestamp.
+    auto newTimestamp =
+        ReplicationCoordinator::get(getServiceContext())->getMyLastAppliedOpTime().getTimestamp() +
+        1;
+    const OpTime newOpTime(
+        newTimestamp,
+        ReplicationCoordinator::get(getServiceContext())->getMyLastAppliedOpTime().getTerm());
+
+    instance->waitUntilTimestampIsMajorityCommitted(opCtx.get(), newTimestamp);
+
+    auto lastAppliedOpTime =
+        ReplicationCoordinator::get(getServiceContext())->getMyLastAppliedOpTime();
+    ASSERT_GTE(lastAppliedOpTime, newOpTime);
+
+    DBDirectClient client(opCtx.get());
+    auto oplogBSON =
+        client.findOne(NamespaceString::kRsOplogNamespace.ns(), lastAppliedOpTime.asQuery());
+
+    ASSERT_FALSE(oplogBSON.isEmpty());
+    ASSERT_EQ(oplogBSON["o"]["msg"].String(), "Noop write for recipientSyncData");
+}
+
+TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesRetriableFetcherError) {
+    stopFailPointEnableBlock stopFp("fpAfterCollectionClonerDone");
+    auto fp =
+        globalFailPointRegistry().find("fpAfterStartingOplogFetcherMigrationRecipientInstance");
+    auto initialTimesEntered = fp->setMode(FailPoint::alwaysOn,
+                                           0,
+                                           BSON("action"
+                                                << "hang"));
+
+    const UUID migrationUUID = UUID::gen();
+    const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
+
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    insertTopOfOplog(&replSet, topOfOplogOpTime);
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Create and start the instance.
+    auto opCtx = makeOperationContext();
+    std::shared_ptr<TenantMigrationRecipientService::Instance> instance;
+    {
+        FailPointEnableBlock fp("pauseBeforeRunTenantMigrationRecipientInstance");
+        // Create and start the instance.
+        instance = TenantMigrationRecipientService::Instance::getOrCreate(
+            opCtx.get(), _service, initialStateDocument.toBSON());
+        ASSERT(instance.get());
+        instance->setCreateOplogFetcherFn_forTest(std::make_unique<CreateOplogFetcherMockFn>());
+    }
+
+    fp->waitForTimesEntered(initialTimesEntered + 1);
+    auto oplogFetcher = checked_cast<OplogFetcherMock*>(getDonorOplogFetcher(instance.get()));
+    ASSERT_TRUE(oplogFetcher != nullptr);
+    ASSERT_TRUE(oplogFetcher->isActive());
+
+    auto doc = getStateDoc(instance.get());
+    ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 0);
+    // Kill the oplog fetcher with a retriable error and wait for the migration to retry.
+    const auto retriableErrorCode = ErrorCodes::SocketException;
+    ASSERT_TRUE(ErrorCodes::isRetriableError(retriableErrorCode));
+    oplogFetcher->shutdownWith({retriableErrorCode, "Injected retriable error"});
+
+    // Skip the cloners in this test, so we provide an empty list of databases.
+    MockRemoteDBServer* const _donorServer =
+        mongo::MockConnRegistry::get()->getMockRemoteDBServer(replSet.getPrimary());
+    _donorServer->setCommandReply("listDatabases", makeListDatabasesResponse({}));
+    _donorServer->setCommandReply("find", makeFindResponse());
+
+    fp->setMode(FailPoint::off);
+    // Wait for task completion.
+    ASSERT_EQ(stopFailPointErrorCode, instance->getDataSyncCompletionFuture().getNoThrow().code());
+    ASSERT_OK(instance->getCompletionFuture().getNoThrow());
+
+    doc = getStateDoc(instance.get());
+    ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 1);
+}
+
+TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesNonRetriableFetcherError) {
+    auto fp =
+        globalFailPointRegistry().find("fpAfterStartingOplogFetcherMigrationRecipientInstance");
+    auto initialTimesEntered = fp->setMode(FailPoint::alwaysOn,
+                                           0,
+                                           BSON("action"
+                                                << "hang"));
+
+    const UUID migrationUUID = UUID::gen();
+    const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
+
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    insertTopOfOplog(&replSet, topOfOplogOpTime);
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Create and start the instance.
+    auto opCtx = makeOperationContext();
+    std::shared_ptr<TenantMigrationRecipientService::Instance> instance;
+    {
+        FailPointEnableBlock fp("pauseBeforeRunTenantMigrationRecipientInstance");
+        // Create and start the instance.
+        instance = TenantMigrationRecipientService::Instance::getOrCreate(
+            opCtx.get(), _service, initialStateDocument.toBSON());
+        ASSERT(instance.get());
+        instance->setCreateOplogFetcherFn_forTest(std::make_unique<CreateOplogFetcherMockFn>());
+    }
+
+    fp->waitForTimesEntered(initialTimesEntered + 1);
+    auto oplogFetcher = checked_cast<OplogFetcherMock*>(getDonorOplogFetcher(instance.get()));
+    ASSERT_TRUE(oplogFetcher != nullptr);
+    ASSERT_TRUE(oplogFetcher->isActive());
+
+    auto doc = getStateDoc(instance.get());
+    ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 0);
+    // Kill the oplog fetcher with a non-retriable error.
+    const auto nonRetriableErrorCode = ErrorCodes::Error(5271901);
+    ASSERT_FALSE(ErrorCodes::isRetriableError(nonRetriableErrorCode));
+    oplogFetcher->shutdownWith({nonRetriableErrorCode, "Injected non-retriable error"});
+
+    fp->setMode(FailPoint::off);
+    // Wait for task completion failure.
+    auto status = instance->getDataSyncCompletionFuture().getNoThrow();
+    ASSERT_EQ(nonRetriableErrorCode, status.code());
+    ASSERT_OK(instance->getCompletionFuture().getNoThrow());
+
+    doc = getStateDoc(instance.get());
+    ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 0);
+}
+
+TEST_F(TenantMigrationRecipientServiceTest, RecipientWillNotRetryOnExternalInterrupt) {
+    auto fp =
+        globalFailPointRegistry().find("fpAfterStartingOplogFetcherMigrationRecipientInstance");
+    auto initialTimesEntered = fp->setMode(FailPoint::alwaysOn,
+                                           0,
+                                           BSON("action"
+                                                << "hang"));
+
+    const UUID migrationUUID = UUID::gen();
+    const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
+
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    insertTopOfOplog(&replSet, topOfOplogOpTime);
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Create and start the instance.
+    auto opCtx = makeOperationContext();
+    std::shared_ptr<TenantMigrationRecipientService::Instance> instance;
+    {
+        FailPointEnableBlock fp("pauseBeforeRunTenantMigrationRecipientInstance");
+        // Create and start the instance.
+        instance = TenantMigrationRecipientService::Instance::getOrCreate(
+            opCtx.get(), _service, initialStateDocument.toBSON());
+        ASSERT(instance.get());
+        instance->setCreateOplogFetcherFn_forTest(std::make_unique<CreateOplogFetcherMockFn>());
+    }
+
+    fp->waitForTimesEntered(initialTimesEntered + 1);
+    auto oplogFetcher = checked_cast<OplogFetcherMock*>(getDonorOplogFetcher(instance.get()));
+    ASSERT_TRUE(oplogFetcher != nullptr);
+    ASSERT_TRUE(oplogFetcher->isActive());
+
+    auto doc = getStateDoc(instance.get());
+    ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 0);
+    ASSERT_TRUE(ErrorCodes::isRetriableError(ErrorCodes::SocketException));
+    // Interrupt the task with 'skipWaitingForForgetMigration' = true.
+    instance->interrupt(
+        {ErrorCodes::SocketException, "Test retriable error with external interrupt"});
+
+    fp->setMode(FailPoint::off);
+    // Wait for task completion failure.
+    ASSERT_EQ(instance->getCompletionFuture().getNoThrow(), ErrorCodes::SocketException);
+
+    doc = getStateDoc(instance.get());
+    ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 0);
+}
+
+TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesRetriableClonerError) {
+    stopFailPointEnableBlock stopFp("fpAfterCollectionClonerDone");
+    auto fp =
+        globalFailPointRegistry().find("fpAfterStartingOplogFetcherMigrationRecipientInstance");
+    auto initialTimesEntered = fp->setMode(FailPoint::alwaysOn,
+                                           0,
+                                           BSON("action"
+                                                << "hang"));
+
+    const UUID migrationUUID = UUID::gen();
+    const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
+
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    insertTopOfOplog(&replSet, topOfOplogOpTime);
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Create and start the instance.
+    auto opCtx = makeOperationContext();
+    auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
+        opCtx.get(), _service, initialStateDocument.toBSON());
+    ASSERT(instance.get());
+
+    fp->waitForTimesEntered(initialTimesEntered + 1);
+    auto doc = getStateDoc(instance.get());
+    ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 0);
+
+    // Have the cloner fail on a retriable error (from the point of view of the recipient service).
+    MockRemoteDBServer* const _donorServer =
+        mongo::MockConnRegistry::get()->getMockRemoteDBServer(replSet.getPrimary());
+    const auto retriableErrorCode = ErrorCodes::HostUnreachable;
+    ASSERT_TRUE(ErrorCodes::isRetriableError(retriableErrorCode));
+    _donorServer->setCommandReply("listDatabases",
+                                  Status(retriableErrorCode, "Injecting retriable error."));
+
+    auto retryFp =
+        globalFailPointRegistry().find("fpAfterRetrievingStartOpTimesMigrationRecipientInstance");
+    initialTimesEntered = retryFp->setMode(FailPoint::alwaysOn,
+                                           0,
+                                           BSON("action"
+                                                << "hang"));
+    fp->setMode(FailPoint::off);
+
+    retryFp->waitForTimesEntered(initialTimesEntered + 1);
+    // Let cloner run successfully on retry.
+    _donorServer->setCommandReply("listDatabases", makeListDatabasesResponse({}));
+    _donorServer->setCommandReply("find", makeFindResponse());
+    retryFp->setMode(FailPoint::off);
+
+    // Wait for task completion.
+    ASSERT_EQ(stopFailPointErrorCode, instance->getDataSyncCompletionFuture().getNoThrow().code());
+    ASSERT_OK(instance->getCompletionFuture().getNoThrow());
+
+    doc = getStateDoc(instance.get());
+    ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 1);
+}
+
+TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesNonRetriableClonerError) {
+    stopFailPointEnableBlock stopFp("fpAfterCollectionClonerDone");
+    auto fp =
+        globalFailPointRegistry().find("fpAfterStartingOplogFetcherMigrationRecipientInstance");
+    auto initialTimesEntered = fp->setMode(FailPoint::alwaysOn,
+                                           0,
+                                           BSON("action"
+                                                << "hang"));
+
+    const UUID migrationUUID = UUID::gen();
+    const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
+
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    insertTopOfOplog(&replSet, topOfOplogOpTime);
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+
+    // Create and start the instance.
+    auto opCtx = makeOperationContext();
+    auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
+        opCtx.get(), _service, initialStateDocument.toBSON());
+    ASSERT(instance.get());
+
+    fp->waitForTimesEntered(initialTimesEntered + 1);
+    auto doc = getStateDoc(instance.get());
+    ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 0);
+
+    // Have the cloner fail on a non-retriable error.
+    MockRemoteDBServer* const _donorServer =
+        mongo::MockConnRegistry::get()->getMockRemoteDBServer(replSet.getPrimary());
+    const auto nonRetriableErrorCode = ErrorCodes::Error(5271902);
+    ASSERT_FALSE(ErrorCodes::isRetriableError(nonRetriableErrorCode));
+    _donorServer->setCommandReply("listDatabases",
+                                  Status(nonRetriableErrorCode, "Injecting non-retriable error."));
+
+    fp->setMode(FailPoint::off);
+
+    // Wait for task completion.
+    ASSERT_EQ(nonRetriableErrorCode, instance->getDataSyncCompletionFuture().getNoThrow().code());
+    ASSERT_OK(instance->getCompletionFuture().getNoThrow());
+
+    doc = getStateDoc(instance.get());
+    ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 0);
+}
+
 #endif
 }  // namespace repl
 }  // namespace mongo

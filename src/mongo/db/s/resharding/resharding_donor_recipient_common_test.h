@@ -31,7 +31,6 @@
 
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/db_raii.h"
-#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/operation_sharding_state.h"
@@ -60,31 +59,34 @@ public:
     const OID kReshardingEpoch = OID::gen();
     const UUID kReshardingUUID = UUID::gen();
 
-    const ShardId kShardOne = ShardId("shardOne");
-    const ShardId kShardTwo = ShardId("shardTwo");
+    const ShardId kThisShard = ShardId("shardOne");
+    const ShardId kOtherShard = ShardId("shardTwo");
 
-    const std::vector<ShardId> kShardIds = {kShardOne, kShardTwo};
+    const std::vector<ShardId> kShardIds = {kThisShard, kOtherShard};
 
     const Timestamp kFetchTimestamp = Timestamp(1, 0);
 
 protected:
-    CollectionMetadata makeShardedMetadataForOriginalCollection(OperationContext* opCtx) {
+    CollectionMetadata makeShardedMetadataForOriginalCollection(
+        OperationContext* opCtx, const ShardId& shardThatChunkExistsOn) {
         return makeShardedMetadata(opCtx,
                                    kOriginalNss,
                                    kOriginalShardKey,
                                    kOriginalShardKeyPattern,
                                    kExistingUUID,
-                                   kOriginalEpoch);
+                                   kOriginalEpoch,
+                                   shardThatChunkExistsOn);
     }
 
     CollectionMetadata makeShardedMetadataForTemporaryReshardingCollection(
-        OperationContext* opCtx) {
+        OperationContext* opCtx, const ShardId& shardThatChunkExistsOn) {
         return makeShardedMetadata(opCtx,
                                    kTemporaryReshardingNss,
                                    kReshardingKey,
                                    kReshardingKeyPattern,
                                    kReshardingUUID,
-                                   kReshardingEpoch);
+                                   kReshardingEpoch,
+                                   shardThatChunkExistsOn);
     }
 
     CollectionMetadata makeShardedMetadata(OperationContext* opCtx,
@@ -92,12 +94,13 @@ protected:
                                            const std::string& shardKey,
                                            const BSONObj& shardKeyPattern,
                                            const UUID& uuid,
-                                           const OID& epoch) {
+                                           const OID& epoch,
+                                           const ShardId& shardThatChunkExistsOn) {
         auto range = ChunkRange(BSON(shardKey << MINKEY), BSON(shardKey << MAXKEY));
-        auto chunk =
-            ChunkType(nss, std::move(range), ChunkVersion(1, 0, epoch, boost::none), kShardTwo);
+        auto chunk = ChunkType(
+            nss, std::move(range), ChunkVersion(1, 0, epoch, boost::none), shardThatChunkExistsOn);
         ChunkManager cm(
-            kShardOne,
+            kThisShard,
             DatabaseVersion(uuid),
             makeStandaloneRoutingTableHistory(RoutingTableHistory::makeNew(nss,
                                                                            uuid,
@@ -112,7 +115,7 @@ protected:
             boost::none);
 
         if (!OperationShardingState::isOperationVersioned(opCtx)) {
-            const auto version = cm.getVersion(kShardOne);
+            const auto version = cm.getVersion(kThisShard);
             BSONObjBuilder builder;
             version.appendToCommand(&builder);
 
@@ -120,7 +123,7 @@ protected:
             oss.initializeClientRoutingVersionsFromCommand(nss, builder.obj());
         }
 
-        return CollectionMetadata(std::move(cm), kShardOne);
+        return CollectionMetadata(std::move(cm), kThisShard);
     }
 
     ReshardingFields createCommonReshardingFields(const UUID& reshardingUUID,
@@ -184,9 +187,8 @@ protected:
             metadata.getShardKeyPattern().toBSON(),
             recipientDoc);
 
-        ASSERT(recipientDoc.getState() == RecipientStateEnum::kCreatingCollection);
-        ASSERT(recipientDoc.getFetchTimestamp() ==
-               reshardingFields.getRecipientFields()->getFetchTimestamp());
+        ASSERT(recipientDoc.getState() == RecipientStateEnum::kAwaitingFetchTimestamp);
+        ASSERT(!recipientDoc.getFetchTimestamp());
 
         auto donorShardIds = reshardingFields.getRecipientFields()->getDonorShardIds();
         auto donorShardIdsSet = std::set<ShardId>(donorShardIds.begin(), donorShardIds.end());

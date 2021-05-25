@@ -39,21 +39,22 @@ namespace {
 constexpr auto kAnotherOperationInProgress = "Another operation is in progress";
 constexpr auto kNoOperationInProgress = "No operation is in progress";
 
-constexpr auto kSuccessfulOps = "successfulOperations";
-constexpr auto kFailedOps = "failedOperations";
-constexpr auto kCanceledOps = "canceledOperations";
-constexpr auto kOpTimeElapsed = "totalOperationTimeElapsedMillis";
-constexpr auto kOpTimeRemaining = "remainingOperationTimeEstimatedMillis";
+constexpr auto kTotalOps = "countReshardingOperations";
+constexpr auto kSuccessfulOps = "countReshardingSuccessful";
+constexpr auto kFailedOps = "countReshardingFailures";
+constexpr auto kCanceledOps = "countReshardingCanceled";
+constexpr auto kOpTimeElapsed = "totalOperationTimeElapsed";
+constexpr auto kOpTimeRemaining = "remainingOperationTimeEstimated";
 constexpr auto kDocumentsToCopy = "approxDocumentsToCopy";
 constexpr auto kDocumentsCopied = "documentsCopied";
 constexpr auto kBytesToCopy = "approxBytesToCopy";
 constexpr auto kBytesCopied = "bytesCopied";
-constexpr auto kCopyTimeElapsed = "totalCopyTimeElapsedMillis";
+constexpr auto kCopyTimeElapsed = "totalCopyTimeElapsed";
 constexpr auto kOplogsFetched = "oplogEntriesFetched";
 constexpr auto kOplogsApplied = "oplogEntriesApplied";
-constexpr auto kApplyTimeElapsed = "totalApplyTimeElapsedMillis";
+constexpr auto kApplyTimeElapsed = "totalApplyTimeElapsed";
 constexpr auto kWritesDuringCritialSection = "countWritesDuringCriticalSection";
-constexpr auto kCriticalSectionTimeElapsed = "totalCriticalSectionTimeElapsedMillis";
+constexpr auto kCriticalSectionTimeElapsed = "totalCriticalSectionTimeElapsed";
 constexpr auto kCoordinatorState = "coordinatorState";
 constexpr auto kDonorState = "donorState";
 constexpr auto kRecipientState = "recipientState";
@@ -66,6 +67,20 @@ const auto getMetrics = ServiceContext::declareDecoration<MetricsPtr>();
 const auto reshardingMetricsRegisterer = ServiceContext::ConstructorActionRegisterer{
     "ReshardingMetrics",
     [](ServiceContext* ctx) { getMetrics(ctx) = std::make_unique<ReshardingMetrics>(ctx); }};
+
+/**
+ * Given a constant rate of time per unit of work:
+ *    totalTime / totalWork == elapsedTime / elapsedWork
+ * Solve for remaining time.
+ *    remainingTime := totalTime - elapsedTime
+ *                  == (totalWork * (elapsedTime / elapsedWork)) - elapsedTime
+ *                  == elapsedTime * (totalWork / elapsedWork - 1)
+ */
+Milliseconds remainingTime(Milliseconds elapsedTime, double elapsedWork, double totalWork) {
+    elapsedWork = std::min(elapsedWork, totalWork);
+    double remainingMsec = 1.0 * elapsedTime.count() * (totalWork / elapsedWork - 1);
+    return Milliseconds(Milliseconds::rep(remainingMsec));
+}
 }  // namespace
 
 ReshardingMetrics* ReshardingMetrics::get(ServiceContext* ctx) noexcept {
@@ -79,6 +94,7 @@ void ReshardingMetrics::onStart() noexcept {
     // Create a new operation and record the time it started.
     _currentOp.emplace(_svcCtx->getFastClockSource());
     _currentOp->runningOperation.start();
+    _started++;
 }
 
 void ReshardingMetrics::onCompletion(ReshardingMetrics::OperationStatus status) noexcept {
@@ -218,67 +234,155 @@ Milliseconds ReshardingMetrics::OperationMetrics::TimeInterval::duration() const
     return duration_cast<Milliseconds>(_end.value() - _start.value());
 }
 
-void ReshardingMetrics::OperationMetrics::append(BSONObjBuilder* bob) const {
-    auto getElapsedTime = [](const TimeInterval& interval) -> int64_t {
-        return durationCount<Milliseconds>(interval.duration());
-    };
-
-    auto estimateRemainingOperationTime = [&]() -> int64_t {
-        if (bytesCopied == 0 && oplogEntriesApplied == 0)
-            return -1;
-        else if (oplogEntriesApplied == 0) {
-            invariant(bytesCopied > 0);
-            // Until the time to apply batches of oplog entries is measured, we assume that applying
-            // all of them will take as long as copying did.
-            const auto elapsedCopyTime = getElapsedTime(copyingDocuments);
-            const auto approxTimeToCopy =
-                elapsedCopyTime * std::max((int64_t)0, bytesToCopy / bytesCopied - 1);
-            return elapsedCopyTime + 2 * approxTimeToCopy;
-        } else {
-            invariant(oplogEntriesApplied > 0);
-            const auto approxTimeToApply = getElapsedTime(applyingOplogEntries) *
-                std::max((int64_t)0, oplogEntriesFetched / oplogEntriesApplied - 1);
-            return approxTimeToApply;
-        }
-    };
-
-    bob->append(kOpTimeElapsed, getElapsedTime(runningOperation));
-    bob->append(kOpTimeRemaining, estimateRemainingOperationTime());
-
-    bob->append(kDocumentsToCopy, documentsToCopy);
-    bob->append(kDocumentsCopied, documentsCopied);
-    bob->append(kBytesToCopy, bytesToCopy);
-    bob->append(kBytesCopied, bytesCopied);
-    bob->append(kCopyTimeElapsed, getElapsedTime(copyingDocuments));
-
-    bob->append(kOplogsFetched, oplogEntriesFetched);
-    bob->append(kOplogsApplied, oplogEntriesApplied);
-    bob->append(kApplyTimeElapsed, getElapsedTime(applyingOplogEntries));
-
-    bob->append(kWritesDuringCritialSection, writesDuringCriticalSection);
-    bob->append(kCriticalSectionTimeElapsed, getElapsedTime(inCriticalSection));
-
-    bob->append(kDonorState, donorState);
-    bob->append(kRecipientState, recipientState);
-    bob->append(kCoordinatorState, coordinatorState);
-
-    bob->append(kCompletionStatus, completionStatus.value_or(OperationStatus::kUnknown));
+std::string OperationStatus_serializer(const ReshardingMetrics::OperationStatus& status) noexcept {
+    switch (status) {
+        case ReshardingMetrics::OperationStatus::kUnknown:
+            return "actively running";
+        case ReshardingMetrics::OperationStatus::kSucceeded:
+            return "success";
+        case ReshardingMetrics::OperationStatus::kFailed:
+            return "failure";
+        case ReshardingMetrics::OperationStatus::kCanceled:
+            return "canceled";
+    }
+    MONGO_UNREACHABLE;
 }
 
-void ReshardingMetrics::serialize(BSONObjBuilder* bob) const {
+void ReshardingMetrics::OperationMetrics::append(BSONObjBuilder* bob, Role role) const {
+    auto getElapsedTime = [role](const TimeInterval& interval) -> int64_t {
+        if (role == Role::kAll)
+            return durationCount<Milliseconds>(interval.duration());
+        else
+            return durationCount<Seconds>(interval.duration());
+    };
+
+    auto remainingMsec = [&]() -> boost::optional<Milliseconds> {
+        if (oplogEntriesApplied > 0 && oplogEntriesFetched > 0) {
+            // All fetched oplogEntries must be applied. Some of them already have been.
+            return remainingTime(
+                applyingOplogEntries.duration(), oplogEntriesApplied, oplogEntriesFetched);
+        }
+        if (bytesCopied > 0 && bytesToCopy > 0) {
+            // Until the time to apply batches of oplog entries is measured, we assume that applying
+            // all of them will take as long as copying did.
+            return remainingTime(copyingDocuments.duration(), bytesCopied, 2 * bytesToCopy);
+        }
+        return {};
+    }();
+
+
+    const std::string kIntervalSuffix = role == Role::kAll ? "Millis" : "";
+    bob->append(kOpTimeElapsed + kIntervalSuffix, getElapsedTime(runningOperation));
+
+    bob->append(kOpTimeRemaining + kIntervalSuffix,
+                !remainingMsec ? int64_t{-1} /** -1 is a specified integer null value */
+                               : role == Role::kAll ? durationCount<Milliseconds>(*remainingMsec)
+                                                    : durationCount<Seconds>(*remainingMsec));
+
+    if (role == Role::kAll || role == Role::kRecipient) {
+        bob->append(kDocumentsToCopy, documentsToCopy);
+        bob->append(kDocumentsCopied, documentsCopied);
+        bob->append(kBytesToCopy, bytesToCopy);
+        bob->append(kBytesCopied, bytesCopied);
+        bob->append(kCopyTimeElapsed + kIntervalSuffix, getElapsedTime(copyingDocuments));
+
+        bob->append(kOplogsFetched, oplogEntriesFetched);
+        bob->append(kOplogsApplied, oplogEntriesApplied);
+        bob->append(kApplyTimeElapsed + kIntervalSuffix, getElapsedTime(applyingOplogEntries));
+    }
+
+    if (role == Role::kAll || role == Role::kDonor) {
+        bob->append(kWritesDuringCritialSection, writesDuringCriticalSection);
+        bob->append(kCriticalSectionTimeElapsed + kIntervalSuffix,
+                    getElapsedTime(inCriticalSection));
+    }
+
+    const auto operationStatus = completionStatus.value_or(OperationStatus::kUnknown);
+    switch (role) {
+        case Role::kDonor:
+            bob->append(kDonorState, DonorState_serializer(donorState));
+            bob->append(kCompletionStatus, OperationStatus_serializer(operationStatus));
+            break;
+        case Role::kRecipient:
+            bob->append(kRecipientState, RecipientState_serializer(recipientState));
+            bob->append(kCompletionStatus, OperationStatus_serializer(operationStatus));
+            break;
+        case Role::kCoordinator:
+            bob->append(kCoordinatorState, CoordinatorState_serializer(coordinatorState));
+            bob->append(kCompletionStatus, OperationStatus_serializer(operationStatus));
+            break;
+        case Role::kAll:
+            bob->append(kDonorState, donorState);
+            bob->append(kRecipientState, recipientState);
+            bob->append(kCoordinatorState, coordinatorState);
+            bob->append(kCompletionStatus, operationStatus);
+            break;
+        default:
+            MONGO_UNREACHABLE;
+    }
+}
+
+void ReshardingMetrics::serialize(BSONObjBuilder* bob, ReporterOptions::Role role) const {
     stdx::lock_guard<Latch> lk(_mutex);
 
-    bob->append(kSuccessfulOps, _succeeded);
-    bob->append(kFailedOps, _failed);
-    bob->append(kCanceledOps, _canceled);
+    if (role == ReporterOptions::Role::kAll) {
+        bob->append(kTotalOps, _started);
+        bob->append(kSuccessfulOps, _succeeded);
+        bob->append(kFailedOps, _failed);
+        bob->append(kCanceledOps, _canceled);
+    }
 
     if (_currentOp) {
-        _currentOp->append(bob);
+        _currentOp->append(bob, role);
     } else {
         // There are no resharding operations in progress, so report the default metrics.
         OperationMetrics opMetrics(_svcCtx->getFastClockSource());
-        opMetrics.append(bob);
+        opMetrics.append(bob, role);
     }
+}
+
+BSONObj ReshardingMetrics::reportForCurrentOp(const ReporterOptions& options) const noexcept {
+    const auto role = [&options] {
+        switch (options.role) {
+            case ReporterOptions::Role::kDonor:
+                return "Donor";
+            case ReporterOptions::Role::kRecipient:
+                return "Recipient";
+            case ReporterOptions::Role::kCoordinator:
+                return "Coordinator";
+            default:
+                MONGO_UNREACHABLE;
+        }
+    }();
+
+    const auto originatingCommand =
+        [&options] {
+            BSONObjBuilder bob;
+            bob.append("reshardCollection", options.nss.toString());
+            bob.append("key", options.shardKey);
+            bob.append("unique", options.unique);
+            bob.append("collation",
+                       BSON("locale"
+                            << "simple"));
+            return bob.obj();
+        }();
+
+    BSONObjBuilder bob;
+    bob.append("type", "op");
+    bob.append("desc", fmt::format("Resharding{}Service {}", role, options.id.toString()));
+    bob.append("op", "command");
+    bob.append("ns", options.nss.toString());
+    bob.append("originatingCommand", originatingCommand);
+
+    serialize(&bob, options.role);
+
+    return bob.obj();
+}
+
+boost::optional<Milliseconds> ReshardingMetrics::getOperationElapsedTime() const {
+    if (!_currentOp)
+        return boost::none;
+    return _currentOp->runningOperation.duration();
 }
 
 }  // namespace mongo

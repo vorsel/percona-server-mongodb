@@ -1,4 +1,5 @@
 # -*- mode: python; -*-
+
 import atexit
 import copy
 import datetime
@@ -288,6 +289,13 @@ add_option('opt',
     help='Enable compile-time optimization',
     nargs='?',
     type='choice',
+)
+
+add_option('debug-compress',
+    action="append",
+    choices=["off", "as", "ld"],
+    default=["auto"],
+    help="Compress debug sections",
 )
 
 add_option('sanitize',
@@ -2400,7 +2408,7 @@ if env.TargetOSIs('posix'):
             env.Append( CCFLAGS=["-Werror"] )
 
     env.Append( CXXFLAGS=["-Woverloaded-virtual"] )
-    if env.ToolchainIs('clang'):
+    if env.ToolchainIs('clang') and not has_option('disable-warnings-as-errors'):
         env.Append( CXXFLAGS=['-Werror=unused-result'] )
 
     # On OS X, clang doesn't want the pthread flag at link time, or it
@@ -3508,6 +3516,79 @@ def doConfigure(myenv):
         # If possible with the current linker, mark relocations as read-only.
         AddToLINKFLAGSIfSupported(myenv, "-Wl,-z,relro")
 
+        # As far as we know these flags only apply on posix-y systems,
+        # and not on Darwin.
+        if env.TargetOSIs("posix") and not env.TargetOSIs("darwin"):
+
+            # Disable debug compression in both the assembler and linker
+            # by default. If the user requested compression, only allow
+            # the zlib-gabi form.
+            debug_compress = get_option("debug-compress")
+
+            # If a value was provided on the command line for --debug-compress, it should
+            # inhibit the application of auto, so strip it out.
+            if "auto" in debug_compress and len(debug_compress) > 1:
+                debug_compress = debug_compress[1:]
+
+            # Disallow saying --debug-compress=off --debug-compress=ld and similar
+            if "off" in debug_compress and len(debug_compress) > 1:
+                env.FatalError("Cannot combine 'off' for --debug-compress with other values")
+
+            # Transform the 'auto' argument into a real value.
+            if "auto" in debug_compress:
+                debug_compress = []
+
+                # We only automatically enable ld compression for
+                # dynamic builds because it seems to use enormous
+                # amounts of memory in static builds.
+                if link_model.startswith("dynamic"):
+                    debug_compress.append("ld")
+
+            compress_type="zlib-gabi"
+            compress_flag="compress-debug-sections"
+
+            AddToCCFLAGSIfSupported(
+                myenv,
+                f"-Wa,--{compress_flag}={compress_type}" if "as" in debug_compress else f"-Wa,--no{compress_flag}")
+
+            # We shouldn't enable debug compression in the linker
+            # (meaning our final binaries contain compressed debug
+            # info) unless our local elf environment appears to at
+            # least be aware of SHF_COMPRESSED. This seems like a
+            # necessary precondition, but is it sufficient?
+            #
+            # https://gnu.wildebeest.org/blog/mjw/2016/01/13/elf-libelf-compressed-sections-and-elfutils/
+
+            def CheckElfHForSHF_COMPRESSED(context):
+
+                test_body = """
+                #include <elf.h>
+                #if !defined(SHF_COMPRESSED)
+                #error
+                #endif
+                """
+
+                context.Message('Checking elf.h for SHF_COMPRESSED... ')
+                ret = context.TryCompile(textwrap.dedent(test_body), ".c")
+                context.Result(ret)
+                return ret
+
+            conf = Configure(myenv, help=False, custom_tests = {
+                'CheckElfHForSHF_COMPRESSED' : CheckElfHForSHF_COMPRESSED,
+            })
+
+            have_shf_compressed = conf.CheckElfHForSHF_COMPRESSED()
+            conf.Finish()
+
+            if have_shf_compressed and 'ld' in debug_compress:
+                AddToLINKFLAGSIfSupported(
+                    myenv,
+                    f"-Wl,--{compress_flag}={compress_type}")
+            else:
+                AddToLINKFLAGSIfSupported(
+                    myenv,
+                    f"-Wl,--{compress_flag}=none")
+
     # Avoid deduping symbols on OS X debug builds, as it takes a long time.
     if not optBuild and myenv.ToolchainIs('clang') and env.TargetOSIs('darwin'):
         AddToLINKFLAGSIfSupported(myenv, "-Wl,-no_deduplicate")
@@ -4206,6 +4287,9 @@ def doConfigure(myenv):
             myenv.ConfError("Running on ppc64le, but can't find a correct vec_vbpermq output index.  Compiler or platform not supported")
 
     myenv = conf.Finish()
+
+    if env['TARGET_ARCH'] == "aarch64":
+        AddToCCFLAGSIfSupported(myenv, "-moutline-atomics")
 
     conf = Configure(myenv)
     usdt_enabled = get_option('enable-usdt-probes')
