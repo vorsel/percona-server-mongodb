@@ -29,10 +29,20 @@
 
 #include "mongo/db/repl/tenant_migration_util.h"
 
+#include "mongo/bson/json.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/logical_time_validator.h"
+#include "mongo/db/ops/update.h"
+#include "mongo/db/ops/update_request.h"
+#include "mongo/db/pipeline/document_source_add_fields.h"
+#include "mongo/db/pipeline/document_source_graph_lookup.h"
+#include "mongo/db/pipeline/document_source_lookup.h"
+#include "mongo/db/pipeline/document_source_match.h"
+#include "mongo/db/pipeline/document_source_project.h"
+#include "mongo/db/pipeline/document_source_replace_root.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
@@ -42,17 +52,15 @@ namespace mongo {
 
 namespace tenant_migration_util {
 
-ExternalKeysCollectionDocument makeExternalClusterTimeKeyDoc(ServiceContext* serviceContext,
-                                                             UUID migrationId,
-                                                             BSONObj keyDoc) {
+MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationBeforeMarkingExternalKeysGarbageCollectable);
+
+const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
+
+ExternalKeysCollectionDocument makeExternalClusterTimeKeyDoc(UUID migrationId, BSONObj keyDoc) {
     auto originalKeyDoc = KeysCollectionDocument::parse(IDLParserErrorContext("keyDoc"), keyDoc);
 
     ExternalKeysCollectionDocument externalKeyDoc(
-        OID::gen(),
-        originalKeyDoc.getKeyId(),
-        migrationId,
-        serviceContext->getFastClockSource()->now() +
-            Seconds{repl::tenantMigrationExternalKeysRemovalDelaySecs.load()});
+        OID::gen(), originalKeyDoc.getKeyId(), migrationId);
     externalKeyDoc.setKeysCollectionDocumentBase(originalKeyDoc.getKeysCollectionDocumentBase());
 
     return externalKeyDoc;
@@ -83,7 +91,7 @@ void storeExternalClusterTimeKeyDocs(std::shared_ptr<executor::ScopedTaskExecuto
     }
 }
 
-void createRetryableWritesView(OperationContext* opCtx, Database* db) {
+void createOplogViewForTenantMigrations(OperationContext* opCtx, Database* db) {
     writeConflictRetry(
         opCtx, "createDonorOplogView", NamespaceString::kTenantMigrationOplogView.ns(), [&] {
             {
@@ -98,24 +106,286 @@ void createRetryableWritesView(OperationContext* opCtx, Database* db) {
                 wuow.commit();
             }
 
-            // First match entries with a `stmtId` so that we're filtering for retryable writes
-            // oplog entries. Pass the result into the next stage of the pipeline and only project
-            // the fields that a tenant migration recipient needs to refetch retryable writes oplog
-            // entries: `ts`, `prevOpTime`, `preImageOpTime`, and `postImageOpTime`.
+            // Project the fields that a tenant migration recipient needs to refetch retryable
+            // writes oplog entries: `ts`, `prevOpTime`, `preImageOpTime`, and `postImageOpTime`.
+            // Also projects the first 'ns' field of 'applyOps' for transactions.
+            //
+            // We use two stages in this pipeline because 'o.applyOps' is an array but '$project'
+            // does not recognize numeric paths as array indices. As a result, we use one '$project'
+            // stage to get the first element in 'o.applyOps', then a second stage to store the 'ns'
+            // field of the element into 'applyOpsNs'.
+            BSONArrayBuilder pipeline;
+            pipeline.append(BSON("$project" << BSON("_id"
+                                                    << "$ts"
+                                                    << "ns" << 1 << "ts" << 1 << "prevOpTime" << 1
+                                                    << "preImageOpTime" << 1 << "postImageOpTime"
+                                                    << 1 << "applyOpsNs"
+                                                    << BSON("$first"
+                                                            << "$o.applyOps"))));
+            pipeline.append(BSON("$project" << BSON("_id"
+                                                    << "$ts"
+                                                    << "ns" << 1 << "ts" << 1 << "prevOpTime" << 1
+                                                    << "preImageOpTime" << 1 << "postImageOpTime"
+                                                    << 1 << "applyOpsNs"
+                                                    << "$applyOpsNs.ns")));
+
             CollectionOptions options;
             options.viewOn = NamespaceString::kRsOplogNamespace.coll().toString();
-            options.pipeline = BSON_ARRAY(
-                BSON("$match" << BSON("stmtId" << BSON("$exists" << true)))
-                << BSON("$project" << BSON("_id"
-                                           << "$ts"
-                                           << "ns" << 1 << "ts" << 1 << "prevOpTime" << 1
-                                           << "preImageOpTime" << 1 << "postImageOpTime" << 1)));
+            options.pipeline = pipeline.arr();
 
             WriteUnitOfWork wuow(opCtx);
             uassertStatusOK(
                 db->createView(opCtx, NamespaceString::kTenantMigrationOplogView, options));
             wuow.commit();
         });
+}
+
+std::unique_ptr<Pipeline, PipelineDeleter> createCommittedTransactionsPipelineForTenantMigrations(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const Timestamp& startFetchingTimestamp,
+    const std::string& tenantId) {
+    Pipeline::SourceContainer stages;
+    using Doc = Document;
+
+    // 1. Match config.transactions entries that have a 'lastWriteOpTime.ts' before
+    //    'startFetchingTimestamp' and 'state: committed', which indicates that it is a committed
+    //    transaction. Retryable writes should not have the 'state' field.
+    stages.emplace_back(DocumentSourceMatch::createFromBson(
+        Doc{{"$match",
+             Doc{{"state", Value{"committed"_sd}},
+                 {"lastWriteOpTime.ts", Doc{{"$lt", startFetchingTimestamp}}}}}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+    // 2. Get all oplog entries that have a timestamp equal to 'lastWriteOpTime.ts'. Store these
+    //    oplog entries in the 'oplogEntry' field.
+    stages.emplace_back(DocumentSourceLookUp::createFromBson(fromjson("{\
+        $lookup: {\
+            from: {db: 'local', coll: 'system.tenantMigration.oplogView'},\
+            localField: 'lastWriteOpTime.ts',\
+            foreignField: 'ts',\
+            as: 'oplogEntry'\
+        }}")
+                                                                 .firstElement(),
+                                                             expCtx));
+
+    // 3. Filter out the entries that do not belong to the tenant.
+    stages.emplace_back(DocumentSourceMatch::createFromBson(fromjson("{\
+        $match: {\
+            'oplogEntry.applyOpsNs': {$regex: '^" + tenantId + "_'}\
+        }}")
+                                                                .firstElement(),
+                                                            expCtx));
+
+    // 4. Unset the 'oplogEntry' field and return the committed transaction entries.
+    stages.emplace_back(DocumentSourceProject::createUnset(FieldPath("oplogEntry"), expCtx));
+
+    return Pipeline::create(std::move(stages), expCtx);
+}
+
+std::unique_ptr<Pipeline, PipelineDeleter>
+createRetryableWritesOplogFetchingPipelineForTenantMigrations(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx,
+    const Timestamp& startFetchingTimestamp,
+    const std::string& tenantId) {
+
+    using Doc = Document;
+    const Value DNE = Value{Doc{{"$exists", false}}};
+
+    Pipeline::SourceContainer stages;
+
+    // 1. Match config.transactions entries that do not have a `state` field, which indicates that
+    //    the last write on the session was a retryable write and not a transaction.
+    stages.emplace_back(DocumentSourceMatch::create(Doc{{"state", DNE}}.toBson(), expCtx));
+
+    // 2. Fetch latest oplog entry for each config.transactions entry from the oplog view. `lastOps`
+    //    is expected to contain exactly one element, unless `ns` does not contain the correct
+    //    `tenantId`. In that case, it will be empty.
+    stages.emplace_back(DocumentSourceLookUp::createFromBson(fromjson("{\
+                    $lookup: {\
+                        from: {db: 'local', coll: 'system.tenantMigration.oplogView'},\
+                        let: { tenant_ts: '$lastWriteOpTime.ts'},\
+                        pipeline: [{\
+                            $match: {\
+                                $expr: {\
+                                    $and: [\
+                                        {$regexMatch: {\
+                                            input: '$ns',\
+                                            regex: /^" + tenantId + "_/\
+                                        }},\
+                                        {$eq: ['$ts', '$$tenant_ts']}\
+                                    ]\
+                                }\
+                            }\
+                        }],\
+                        as: 'lastOps'\
+                    }}")
+                                                                 .firstElement(),
+                                                             expCtx));
+
+    // 3. Filter out entries with an empty `lastOps` array since they do not correspond to the
+    //    correct tenant.
+    stages.emplace_back(DocumentSourceMatch::create(fromjson("{'lastOps': {$ne: []}}"), expCtx));
+
+    // 4. Replace the single-element 'lastOps' array field with a single 'lastOp' field.
+    stages.emplace_back(
+        DocumentSourceAddFields::create(fromjson("{lastOp: {$first: '$lastOps'}}"), expCtx));
+
+    // 5. Remove `lastOps` in favor of `lastOp`.
+    stages.emplace_back(DocumentSourceProject::createUnset(FieldPath("lastOps"), expCtx));
+
+    // 6. Fetch preImage oplog entry for `findAndModify` from the oplog view. `preImageOps` is not
+    //    expected to contain exactly one element if the `preImageOpTime` field is not null.
+    stages.emplace_back(DocumentSourceLookUp::createFromBson(
+        Doc{{"$lookup",
+             Doc{{"from", Doc{{"db", "local"_sd}, {"coll", "system.tenantMigration.oplogView"_sd}}},
+                 {"localField", "lastOp.preImageOpTime.ts"_sd},
+                 {"foreignField", "ts"_sd},
+                 {"as", "preImageOps"_sd}}}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+
+    // 7. Fetch postImage oplog entry for `findAndModify` from the oplog view. `postImageOps` is not
+    //    expected to contain exactly one element if the `postImageOpTime` field is not null.
+    stages.emplace_back(DocumentSourceLookUp::createFromBson(
+        Doc{{"$lookup",
+             Doc{{"from", Doc{{"db", "local"_sd}, {"coll", "system.tenantMigration.oplogView"_sd}}},
+                 {"localField", "lastOp.postImageOpTime.ts"_sd},
+                 {"foreignField", "ts"_sd},
+                 {"as", "postImageOps"_sd}}}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+
+    // 8. Fetch oplog entries in each chain from the oplog view.
+    stages.emplace_back(DocumentSourceGraphLookUp::createFromBson(
+        Doc{{"$graphLookup",
+             Doc{{"from", Doc{{"db", "local"_sd}, {"coll", "system.tenantMigration.oplogView"_sd}}},
+                 {"startWith", "$lastOp.ts"_sd},
+                 {"connectFromField", "prevOpTime.ts"_sd},
+                 {"connectToField", "ts"_sd},
+                 {"as", "history"_sd},
+                 {"depthField", "depthForTenantMigration"_sd}}}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+    // 9. Filter out all oplog entries from the `history` arrary that occur after
+    //    `startFetchingTimestamp`. Since the oplog fetching and application stages will already
+    //    capture entries after `startFetchingTimestamp`, we only need the earlier part of the oplog
+    //    chain.
+    stages.emplace_back(DocumentSourceAddFields::create(fromjson("{\
+                    history: {$filter: {\
+                        input: '$history',\
+                        cond: {$lt: ['$$this.ts', " + startFetchingTimestamp.toString() +
+                                                                 "]}}}}"),
+                                                        expCtx));
+
+    // 10. Sort the oplog entries in each oplog chain. The $reduce expression sorts the `history`
+    //    array in ascending `depthForTenantMigration` order. The $reverseArray expression will
+    //    give an array in ascending timestamp order.
+    stages.emplace_back(DocumentSourceAddFields::create(fromjson("{\
+                    history: {$reverseArray: {$reduce: {\
+                        input: '$history',\
+                        initialValue: {$range: [0, {$size: '$history'}]},\
+                        in: {$concatArrays: [\
+                            {$slice: ['$$value', '$$this.depthForTenantMigration']},\
+                            ['$$this'],\
+                            {$slice: [\
+                                '$$value',\
+                                {$subtract: [\
+                                    {$add: ['$$this.depthForTenantMigration', 1]},\
+                                    {$size: '$history'}]}]}]}}}}}"),
+                                                        expCtx));
+
+    // 11. Combine the oplog entries.
+    stages.emplace_back(DocumentSourceAddFields::create(fromjson("{\
+                        'history': {$concatArrays: [\
+                            '$preImageOps', '$postImageOps', '$history']}}"),
+                                                        expCtx));
+
+    // 12. Fetch the complete oplog entries. `completeOplogEntry` is expected to contain exactly one
+    //     element.
+    stages.emplace_back(DocumentSourceLookUp::createFromBson(
+        Doc{{"$lookup",
+             Doc{{"from", Doc{{"db", "local"_sd}, {"coll", "oplog.rs"_sd}}},
+                 {"localField", "history.ts"_sd},
+                 {"foreignField", "ts"_sd},
+                 {"as", "completeOplogEntry"_sd}}}}
+            .toBson()
+            .firstElement(),
+        expCtx));
+
+    // 13. Unwind oplog entries in each chain to the top-level array.
+    stages.emplace_back(
+        DocumentSourceUnwind::create(expCtx, "completeOplogEntry", false, boost::none));
+
+    // 14. Replace root.
+    stages.emplace_back(DocumentSourceReplaceRoot::createFromBson(
+        fromjson("{$replaceRoot: {newRoot: '$completeOplogEntry'}}").firstElement(), expCtx));
+
+    return Pipeline::create(std::move(stages), expCtx);
+}
+
+bool shouldStopUpdatingExternalKeys(Status status, const CancelationToken& token) {
+    return status.isOK() || token.isCanceled();
+}
+
+ExecutorFuture<void> markExternalKeysAsGarbageCollectable(
+    ServiceContext* serviceContext,
+    std::shared_ptr<executor::ScopedTaskExecutor> executor,
+    std::shared_ptr<executor::TaskExecutor> parentExecutor,
+    UUID migrationId,
+    const CancelationToken& token) {
+    auto ttlExpiresAt = serviceContext->getFastClockSource()->now() +
+        Milliseconds{repl::tenantMigrationGarbageCollectionDelayMS.load()} +
+        Seconds{repl::tenantMigrationExternalKeysRemovalBufferSecs.load()};
+    return AsyncTry([executor, migrationId, ttlExpiresAt] {
+               return ExecutorFuture(**executor).then([migrationId, ttlExpiresAt] {
+                   auto opCtxHolder = cc().makeOperationContext();
+                   auto opCtx = opCtxHolder.get();
+
+                   pauseTenantMigrationBeforeMarkingExternalKeysGarbageCollectable.pauseWhileSet(
+                       opCtx);
+
+                   const auto& nss = NamespaceString::kExternalKeysCollectionNamespace;
+                   AutoGetCollection coll(opCtx, nss, MODE_IX);
+
+                   writeConflictRetry(
+                       opCtx, "TenantMigrationMarkExternalKeysAsGarbageCollectable", nss.ns(), [&] {
+                           auto request = UpdateRequest();
+                           request.setNamespaceString(nss);
+                           request.setQuery(
+                               BSON(ExternalKeysCollectionDocument::kMigrationIdFieldName
+                                    << migrationId));
+                           request.setUpdateModification(
+                               write_ops::UpdateModification::parseFromClassicUpdate(BSON(
+                                   "$set"
+                                   << BSON(ExternalKeysCollectionDocument::kTTLExpiresAtFieldName
+                                           << ttlExpiresAt))));
+                           request.setMulti(true);
+
+                           // Note marking keys garbage collectable is not atomic with marking the
+                           // state document garbage collectable, so after a failover this update
+                           // may fail to match any keys if they were previously marked garbage
+                           // collectable and deleted by the TTL monitor. Because of this we can't
+                           // assert on the update result's numMatched or numDocsModified.
+                           update(opCtx, coll.getDb(), request);
+                       });
+               });
+           })
+        .until([token](Status status) { return shouldStopUpdatingExternalKeys(status, token); })
+        .withBackoffBetweenIterations(kExponentialBackoff)
+        // Due to the issue in SERVER-54735, using AsyncTry with a scoped executor can lead to a
+        // BrokenPromise error if the executor is shut down. To work around this, schedule the
+        // AsyncTry itself on an executor that won't shut down.
+        //
+        // TODO SERVER-54735: Stop using the parent executor here.
+        .on(parentExecutor, CancelationToken::uncancelable());
 }
 
 }  // namespace tenant_migration_util

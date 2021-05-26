@@ -113,7 +113,8 @@ MutableOplogEntry makeNoOpOplogEntry(OpTime opTime,
     oplogEntry.setOpType(repl::OpTypeEnum::kNoop);
     oplogEntry.setOpTime(opTime);
     oplogEntry.setNss(nss);
-    oplogEntry.setObject(o);
+    oplogEntry.setObject({});
+    oplogEntry.setObject2(o);
     oplogEntry.setWallClockTime(Date_t::now());
     if (migrationUUID) {
         oplogEntry.setFromTenantMigration(migrationUUID.get());
@@ -231,6 +232,18 @@ public:
         // in these unittests without (unsightly) intervention.
         auto compFp = globalFailPointRegistry().find("skipComparingRecipientAndDonorFCV");
         compFp->setMode(FailPoint::alwaysOn);
+
+        // Skip fetching retryable writes, as we will test this logic entirely in integration
+        // tests.
+        auto fetchRetryableWritesFp =
+            globalFailPointRegistry().find("skipFetchingRetryableWritesEntriesBeforeStartOpTime");
+        fetchRetryableWritesFp->setMode(FailPoint::alwaysOn);
+
+        // Skip fetching committed transactions, as we will test this logic entirely in integration
+        // tests.
+        auto fetchCommittedTransactionsFp =
+            globalFailPointRegistry().find("skipFetchingCommittedTransactions");
+        fetchCommittedTransactionsFp->setMode(FailPoint::alwaysOn);
 
         // Timestamps of "0 seconds" are not allowed, so we must advance our clock mock to the first
         // real second.
@@ -1901,11 +1914,11 @@ TEST_F(TenantMigrationRecipientServiceTest, OplogApplierResumesFromStartDonorApp
     // Create and insert the following into the oplog:
     // - (1) An oplog entry with opTime earlier than 'cloneFinishedRecipientOpTime'.
     // - (2) An oplog entry with opTime greater than 'cloneFinishedRecipientOpTime'.
-    // - (3) A no-op oplog entry with an inner donor oplog entry as the 'o' field. The donor opTime
-    //   is less than the 'startApplyingDonorOpTime'.
-    // - (4) A no-op oplog entry with an inner oplog entry as the 'o' field but no 'fromMigrate'
-    // field. These oplog entries do not satisfy the conditions for the oplog applier to resume from
-    // so we default to resuming from 'startDonorApplyingOpTime'.
+    // - (3) A no-op oplog entry with an inner donor oplog entry as the 'o2' field. The donor opTime
+    //       is less than the 'startApplyingDonorOpTime'.
+    // - (4) A no-op oplog entry with an inner oplog entry as the 'o2' field but no
+    //       'fromTenantMigrate' field. These oplog entries do not satisfy the conditions for the
+    //       oplog applier to resume from so we default to resuming from 'startDonorApplyingOpTime'.
     const auto insertNss = NamespaceString("tenantA_foo.bar");
     const auto beforeStartApplyingOpTime = OpTime(Timestamp(1, 1), 1);
     const auto entryBeforeStartApplyingOpTime = makeOplogEntry(
@@ -2482,6 +2495,8 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientForgetMigration_WaitUntilSt
     ASSERT_TRUE(doc.getStartFetchingDonorOpTime() == boost::none);
     ASSERT_TRUE(doc.getDataConsistentStopDonorOpTime() == boost::none);
     ASSERT_TRUE(doc.getCloneFinishedRecipientOpTime() == boost::none);
+    ASSERT_EQ(doc.getNumRestartsDueToRecipientFailure(), 0);
+    ASSERT_EQ(doc.getNumRestartsDueToRecipientFailure(), 0);
     checkStateDocPersisted(opCtx.get(), instance.get());
 }
 
@@ -2930,7 +2945,7 @@ TEST_F(TenantMigrationRecipientServiceTest,
     ASSERT_OK(instance->getCompletionFuture().getNoThrow());
 }
 
-TEST_F(TenantMigrationRecipientServiceTest, WaitUntilTimestampIsMajorityCommitted) {
+TEST_F(TenantMigrationRecipientServiceTest, WaitUntilMigrationReachesReturnAfterReachingTimestamp) {
     const UUID migrationUUID = UUID::gen();
     const OpTime topOfOplogOpTime(Timestamp(5, 1), 1);
 
@@ -2966,25 +2981,19 @@ TEST_F(TenantMigrationRecipientServiceTest, WaitUntilTimestampIsMajorityCommitte
     checkStateDocPersisted(opCtx.get(), instance.get());
 
     // Simulate recipient receiving a donor timestamp.
-    auto newTimestamp =
+    auto returnAfterReachingTimestamp =
         ReplicationCoordinator::get(getServiceContext())->getMyLastAppliedOpTime().getTimestamp() +
         1;
     const OpTime newOpTime(
-        newTimestamp,
+        returnAfterReachingTimestamp,
         ReplicationCoordinator::get(getServiceContext())->getMyLastAppliedOpTime().getTerm());
 
-    instance->waitUntilTimestampIsMajorityCommitted(opCtx.get(), newTimestamp);
+    instance->waitUntilMigrationReachesReturnAfterReachingTimestamp(opCtx.get(),
+                                                                    returnAfterReachingTimestamp);
 
     auto lastAppliedOpTime =
         ReplicationCoordinator::get(getServiceContext())->getMyLastAppliedOpTime();
     ASSERT_GTE(lastAppliedOpTime, newOpTime);
-
-    DBDirectClient client(opCtx.get());
-    auto oplogBSON =
-        client.findOne(NamespaceString::kRsOplogNamespace.ns(), lastAppliedOpTime.asQuery());
-
-    ASSERT_FALSE(oplogBSON.isEmpty());
-    ASSERT_EQ(oplogBSON["o"]["msg"].String(), "Noop write for recipientSyncData");
 }
 
 TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesRetriableFetcherError) {
@@ -3047,6 +3056,8 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesRetriableFetcherErr
 
     doc = getStateDoc(instance.get());
     ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 1);
+    ASSERT_EQ(doc.getNumRestartsDueToRecipientFailure(), 0);
+    checkStateDocPersisted(opCtx.get(), instance.get());
 }
 
 TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesNonRetriableFetcherError) {
@@ -3103,6 +3114,8 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesNonRetriableFetcher
 
     doc = getStateDoc(instance.get());
     ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 0);
+    ASSERT_EQ(doc.getNumRestartsDueToRecipientFailure(), 0);
+    checkStateDocPersisted(opCtx.get(), instance.get());
 }
 
 TEST_F(TenantMigrationRecipientServiceTest, RecipientWillNotRetryOnExternalInterrupt) {
@@ -3157,6 +3170,8 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientWillNotRetryOnExternalInter
 
     doc = getStateDoc(instance.get());
     ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 0);
+    ASSERT_EQ(doc.getNumRestartsDueToRecipientFailure(), 0);
+    checkStateDocPersisted(opCtx.get(), instance.get());
 }
 
 TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesRetriableClonerError) {
@@ -3220,6 +3235,8 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesRetriableClonerErro
 
     doc = getStateDoc(instance.get());
     ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 1);
+    ASSERT_EQ(doc.getNumRestartsDueToRecipientFailure(), 0);
+    checkStateDocPersisted(opCtx.get(), instance.get());
 }
 
 TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesNonRetriableClonerError) {
@@ -3254,6 +3271,7 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesNonRetriableClonerE
     fp->waitForTimesEntered(initialTimesEntered + 1);
     auto doc = getStateDoc(instance.get());
     ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 0);
+    ASSERT_EQ(doc.getNumRestartsDueToRecipientFailure(), 0);
 
     // Have the cloner fail on a non-retriable error.
     MockRemoteDBServer* const _donorServer =
@@ -3271,6 +3289,100 @@ TEST_F(TenantMigrationRecipientServiceTest, RecipientReceivesNonRetriableClonerE
 
     doc = getStateDoc(instance.get());
     ASSERT_EQ(doc.getNumRestartsDueToDonorConnectionFailure(), 0);
+    ASSERT_EQ(doc.getNumRestartsDueToRecipientFailure(), 0);
+    checkStateDocPersisted(opCtx.get(), instance.get());
+}
+
+TEST_F(TenantMigrationRecipientServiceTest, IncrementNumRestartsDueToRecipientFailureCounter) {
+    stopFailPointEnableBlock fp("fpAfterPersistingTenantMigrationRecipientInstanceStateDoc");
+    const UUID migrationUUID = UUID::gen();
+    const OpTime topOfOplogOpTime(Timestamp(1, 1), 1);
+
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    insertTopOfOplog(&replSet, topOfOplogOpTime);
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+    // Starting a migration where the state is not 'kUninitialized' indicates that we are restarting
+    // from failover.
+    initialStateDocument.setState(TenantMigrationRecipientStateEnum::kStarted);
+    ASSERT_EQ(0, initialStateDocument.getNumRestartsDueToRecipientFailure());
+
+    auto opCtx = makeOperationContext();
+    CollectionOptions collectionOptions;
+    collectionOptions.uuid = UUID::gen();
+    auto storage = StorageInterface::get(opCtx->getServiceContext());
+    ASSERT_OK(storage->createCollection(
+        opCtx.get(), NamespaceString::kTenantMigrationRecipientsNamespace, collectionOptions));
+    ASSERT_OK(storage->insertDocument(opCtx.get(),
+                                      NamespaceString::kTenantMigrationRecipientsNamespace,
+                                      {initialStateDocument.toBSON()},
+                                      0));
+
+    // Create and start the instance.
+    auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
+        opCtx.get(), _service, initialStateDocument.toBSON());
+    ASSERT(instance.get());
+
+    ASSERT_EQ(stopFailPointErrorCode, instance->getDataSyncCompletionFuture().getNoThrow().code());
+    ASSERT_OK(instance->getCompletionFuture().getNoThrow());
+
+    const auto stateDoc = getStateDoc(instance.get());
+    ASSERT_EQ(stateDoc.getNumRestartsDueToDonorConnectionFailure(), 0);
+    ASSERT_EQ(stateDoc.getNumRestartsDueToRecipientFailure(), 1);
+    checkStateDocPersisted(opCtx.get(), instance.get());
+}
+
+TEST_F(TenantMigrationRecipientServiceTest,
+       RecipientFailureCounterNotIncrementedWhenMigrationForgotten) {
+    const UUID migrationUUID = UUID::gen();
+    const OpTime topOfOplogOpTime(Timestamp(1, 1), 1);
+
+    MockReplicaSet replSet("donorSet", 3, true /* hasPrimary */, true /* dollarPrefixHosts */);
+    insertTopOfOplog(&replSet, topOfOplogOpTime);
+
+    TenantMigrationRecipientDocument initialStateDocument(
+        migrationUUID,
+        replSet.getConnectionString(),
+        "tenantA",
+        kDefaultStartMigrationTimestamp,
+        ReadPreferenceSetting(ReadPreference::PrimaryOnly));
+    initialStateDocument.setRecipientCertificateForDonor(kRecipientPEMPayload);
+    // Starting a migration where the state is not 'kUninitialized' indicates that we are restarting
+    // from failover.
+    initialStateDocument.setState(TenantMigrationRecipientStateEnum::kStarted);
+    // Set the 'expireAt' field to indicate the migration is garbage collectable.
+    auto opCtx = makeOperationContext();
+    initialStateDocument.setExpireAt(opCtx->getServiceContext()->getFastClockSource()->now());
+    ASSERT_EQ(0, initialStateDocument.getNumRestartsDueToRecipientFailure());
+
+    CollectionOptions collectionOptions;
+    collectionOptions.uuid = UUID::gen();
+    auto storage = StorageInterface::get(opCtx->getServiceContext());
+    ASSERT_OK(storage->createCollection(
+        opCtx.get(), NamespaceString::kTenantMigrationRecipientsNamespace, collectionOptions));
+    ASSERT_OK(storage->insertDocument(opCtx.get(),
+                                      NamespaceString::kTenantMigrationRecipientsNamespace,
+                                      {initialStateDocument.toBSON()},
+                                      0));
+
+    // Create and start the instance.
+    auto instance = TenantMigrationRecipientService::Instance::getOrCreate(
+        opCtx.get(), _service, initialStateDocument.toBSON());
+    ASSERT(instance.get());
+
+    ASSERT_EQ(ErrorCodes::TenantMigrationForgotten,
+              instance->getDataSyncCompletionFuture().getNoThrow().code());
+
+    const auto stateDoc = getStateDoc(instance.get());
+    ASSERT_EQ(stateDoc.getNumRestartsDueToDonorConnectionFailure(), 0);
+    ASSERT_EQ(stateDoc.getNumRestartsDueToRecipientFailure(), 0);
+    checkStateDocPersisted(opCtx.get(), instance.get());
 }
 
 #endif

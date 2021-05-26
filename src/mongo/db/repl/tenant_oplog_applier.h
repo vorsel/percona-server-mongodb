@@ -108,10 +108,13 @@ private:
     Status _applyOplogBatchPerWorker(std::vector<const OplogEntry*>* ops);
     void _checkNsAndUuidsBelongToTenant(OperationContext* opCtx, const TenantOplogBatch& batch);
     OpTimePair _writeNoOpEntries(OperationContext* opCtx, const TenantOplogBatch& batch);
+
+    using TenantNoOpEntry = std::pair<const OplogEntry*, std::vector<OplogSlot>::iterator>;
     void _writeNoOpsForRange(OpObserver* opObserver,
-                             std::vector<TenantOplogEntry>::const_iterator begin,
-                             std::vector<TenantOplogEntry>::const_iterator end,
-                             std::vector<OplogSlot>::iterator firstSlot);
+                             std::vector<TenantNoOpEntry>::const_iterator begin,
+                             std::vector<TenantNoOpEntry>::const_iterator end);
+    void _writeSessionNoOpsForRange(std::vector<TenantNoOpEntry>::const_iterator begin,
+                                    std::vector<TenantNoOpEntry>::const_iterator end);
 
     Status _applyOplogEntryOrGroupedInserts(OperationContext* opCtx,
                                             const OplogEntryOrGroupedInserts& entryOrGroupedInserts,
@@ -119,11 +122,6 @@ private:
     std::vector<std::vector<const OplogEntry*>> _fillWriterVectors(OperationContext* opCtx,
                                                                    TenantOplogBatch* batch);
 
-    OpTime _getRecipientOpTime(const OpTime& donorOpTime);
-    // This is a convenience call for getRecipientOpTime which handles boost::none and nulls.
-    boost::optional<OpTime> _maybeGetRecipientOpTime(const boost::optional<OpTime>);
-    // _setRecipientOpTime must be called in optime order.
-    void _setRecipientOpTime(const OpTime& donorOpTime, const OpTime& recipientOpTime);
     /**
      * Sets the _finalStatus to the new status if and only if the old status is "OK".
      */

@@ -62,6 +62,12 @@ public:
                     repl::feature_flags::gTenantMigrations.isEnabled(
                         serverGlobalParams.featureCompatibility));
 
+            // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
+            uassert(
+                5356101,
+                "recipientSyncData not available while upgrading or downgrading the recipient FCV",
+                !serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading());
+
             const auto& cmd = request();
 
             TenantMigrationRecipientDocument stateDoc(cmd.getMigrationId(),
@@ -108,9 +114,9 @@ public:
                         recipientInstance->waitUntilMigrationReachesConsistentState(opCtx));
                 }
 
-                return Response(recipientInstance->waitUntilTimestampIsMajorityCommitted(
-                    opCtx, *returnAfterReachingDonorTs));
-
+                return Response(
+                    recipientInstance->waitUntilMigrationReachesReturnAfterReachingTimestamp(
+                        opCtx, *returnAfterReachingDonorTs));
             } catch (ExceptionFor<ErrorCodes::ConflictingOperationInProgress>& ex) {
                 // A conflict may arise when inserting the recipientInstance's  state document.
                 // Since the conflict occurred at the insert stage, that means this instance's

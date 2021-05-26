@@ -89,6 +89,7 @@
 #include "mongo/db/query/stage_builder_util.h"
 #include "mongo/db/query/util/make_data_structure.h"
 #include "mongo/db/query/wildcard_multikey_paths.h"
+#include "mongo/db/query/yield_policy_callbacks_impl.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
@@ -1043,16 +1044,14 @@ std::unique_ptr<sbe::RuntimePlanner> makeRuntimePlannerIfNeeded(
 std::unique_ptr<PlanYieldPolicySBE> makeSbeYieldPolicy(
     OperationContext* opCtx,
     PlanYieldPolicy::YieldPolicy requestedYieldPolicy,
+    const Yieldable* yieldable,
     NamespaceString nss) {
-    auto whileYieldingFn = [nss = std::move(nss)](OperationContext* yieldingOpCtx) {
-        CurOp::get(yieldingOpCtx)->yielded();
-        PlanYieldPolicy::handleDuringYieldFailpoints(yieldingOpCtx, nss);
-    };
     return std::make_unique<PlanYieldPolicySBE>(requestedYieldPolicy,
                                                 opCtx->getServiceContext()->getFastClockSource(),
                                                 internalQueryExecYieldIterations.load(),
                                                 Milliseconds{internalQueryExecYieldPeriodMS.load()},
-                                                std::move(whileYieldingFn));
+                                                yieldable,
+                                                std::make_unique<YieldPolicyCallbacksImpl>(nss));
 }
 
 StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getSlotBasedExecutor(
@@ -1063,7 +1062,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getSlotBasedExe
     size_t plannerOptions) {
     invariant(cq);
     auto nss = cq->nss();
-    auto yieldPolicy = makeSbeYieldPolicy(opCtx, requestedYieldPolicy, nss);
+    auto yieldPolicy = makeSbeYieldPolicy(opCtx, requestedYieldPolicy, collection, nss);
     SlotBasedPrepareExecutionHelper helper{
         opCtx, *collection, cq.get(), yieldPolicy.get(), plannerOptions};
     auto executionResult = helper.prepare();
@@ -1106,22 +1105,23 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getSlotBasedExe
 }
 
 // Checks if the given query can be executed with the SBE engine.
-inline bool isQuerySbeCompatible(const CanonicalQuery* const cq, size_t plannerOptions) {
+inline bool isQuerySbeCompatible(OperationContext* opCtx,
+                                 const CanonicalQuery* const cq,
+                                 size_t plannerOptions) {
     invariant(cq);
     auto expCtx = cq->getExpCtxRaw();
     auto sortPattern = cq->getSortPattern();
     const bool allExpressionsSupported = expCtx && expCtx->sbeCompatible;
     const bool isNotCount = !(plannerOptions & QueryPlannerParams::IS_COUNT);
-    // Specifying 'ntoreturn' in an OP_QUERY style find may result in a QuerySolution with
-    // ENSURE_SORTED node, which is currently not supported by SBE.
-    const bool doesNotNeedEnsureSorted = !cq->getFindCommand().getNtoreturn();
     const bool doesNotContainMetadataRequirements = cq->metadataDeps().none();
     const bool doesNotSortOnDottedPath =
         !sortPattern || std::all_of(sortPattern->begin(), sortPattern->end(), [](auto&& part) {
             return part.fieldPath && part.fieldPath->getPathLength() == 1;
         });
-    return allExpressionsSupported && isNotCount && doesNotNeedEnsureSorted &&
-        doesNotContainMetadataRequirements && doesNotSortOnDottedPath;
+    // OP_QUERY style find commands are not currently supported by SBE.
+    const bool isNotLegacy = !CurOp::get(opCtx)->isLegacyQuery();
+    return allExpressionsSupported && isNotCount && doesNotContainMetadataRequirements &&
+        doesNotSortOnDottedPath && isNotLegacy;
 }
 }  // namespace
 
@@ -1132,7 +1132,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutor(
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions) {
     return feature_flags::gSBE.isEnabledAndIgnoreFCV() &&
-            isQuerySbeCompatible(canonicalQuery.get(), plannerOptions)
+            isQuerySbeCompatible(opCtx, canonicalQuery.get(), plannerOptions)
         ? getSlotBasedExecutor(
               opCtx, collection, std::move(canonicalQuery), yieldPolicy, plannerOptions)
         : getClassicExecutor(
@@ -2211,16 +2211,17 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutorWith
 
     const boost::intrusive_ptr<ExpressionContext> expCtx;
     const ExtensionsCallbackReal extensionsCallback(opCtx, &collection->ns());
-    auto cqWithoutProjection =
+
+    auto cqWithoutProjection = uassertStatusOKWithContext(
         CanonicalQuery::canonicalize(opCtx,
                                      std::move(findCommand),
                                      cq->getExplain(),
                                      expCtx,
                                      extensionsCallback,
-                                     MatchExpressionParser::kAllowAllSpecialFeatures);
+                                     MatchExpressionParser::kAllowAllSpecialFeatures),
+        "Unable to canonicalize query");
 
-    return getExecutor(
-        opCtx, coll, std::move(cqWithoutProjection.getValue()), yieldPolicy, plannerOptions);
+    return getExecutor(opCtx, coll, std::move(cqWithoutProjection), yieldPolicy, plannerOptions);
 }
 }  // namespace
 

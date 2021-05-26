@@ -39,6 +39,7 @@
 #include "mongo/bson/simple_bsonelement_comparator.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/create_gen.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -221,17 +222,32 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
                 }
             }
 
-            // Hiding a hidden index or unhiding a visible index should be treated as a no-op.
-            if (!cmr.indexHidden.eoo() && cmr.idx->hidden() == cmr.indexHidden.booleanSafe()) {
-                // If the collMod includes "expireAfterSeconds", remove the no-op "hidden" parameter
-                // and write the remaining "index" object to the oplog entry builder.
-                if (!cmr.indexExpireAfterSeconds.eoo()) {
-                    oplogEntryBuilder->append(fieldName, indexObj.removeField("hidden"));
+            if (cmr.indexHidden) {
+                // Hiding a hidden index or unhiding a visible index should be treated as a no-op.
+                if (cmr.idx->hidden() == cmr.indexHidden.booleanSafe()) {
+                    // If the collMod includes "expireAfterSeconds", remove the no-op "hidden"
+                    // parameter and write the remaining "index" object to the oplog entry builder.
+                    if (!cmr.indexExpireAfterSeconds.eoo()) {
+                        oplogEntryBuilder->append(fieldName, indexObj.removeField("hidden"));
+                    }
+                    // Un-set "indexHidden" in CollModRequest, and skip the automatic write to the
+                    // oplogEntryBuilder that occurs at the end of the parsing loop.
+                    cmr.indexHidden = {};
+                    continue;
                 }
-                // Un-set "indexHidden" in CollModRequest, and skip the automatic write to the
-                // oplogEntryBuilder that occurs at the end of the parsing loop.
-                cmr.indexHidden = {};
-                continue;
+
+                // Disallow index hiding/unhiding on system collections.
+                // Bucket collections, which hold data for user-created time-series collections, do
+                // not have this restriction.
+                if (nss.isSystem() && !nss.isTimeseriesBucketsCollection()) {
+                    return Status(ErrorCodes::BadValue, "Can't hide index on system collection");
+                }
+
+                // Disallow index hiding/unhiding on _id indexes - these are created by default and
+                // are critical to most collection operations.
+                if (cmr.idx->isIdIndex()) {
+                    return Status(ErrorCodes::BadValue, "can't hide _id index");
+                }
             }
         } else if (fieldName == "validator" && !isView) {
             // If the feature compatibility version is not kLatest, and we are validating features
@@ -310,12 +326,7 @@ StatusWith<CollModRequest> parseCollModRequest(OperationContext* opCtx,
             } else {
                 invariant(elem.type() == mongo::NumberLong);
                 const int64_t elemNum = elem.safeNumberLong();
-                if (elemNum < 0) {
-                    return Status(ErrorCodes::InvalidOptions,
-                                  str::stream() << "Expected a number >= 0 for the "
-                                                << "'clusteredIndex::expireAfterSeconds' "
-                                                << "option. Got: " << elemNum);
-                }
+                uassertStatusOK(index_key_validate::validateExpireAfterSeconds(elemNum));
             }
 
             cmr.clusteredIndexExpireAfterSeconds = e.Obj()["expireAfterSeconds"];
@@ -440,13 +451,6 @@ Status _collModInternal(OperationContext* opCtx,
     // WriteConflictExceptions thrown in the writeConflictRetry loop below can cause cmrNew.idx to
     // become invalid, so save a copy to use in the loop until we can refresh it.
     auto idx = cmrNew.idx;
-
-    if (indexHidden) {
-        if (coll->ns().isSystem())
-            return Status(ErrorCodes::BadValue, "Can't hide index on system collection");
-        if (idx->isIdIndex())
-            return Status(ErrorCodes::BadValue, "can't hide _id index");
-    }
 
     return writeConflictRetry(opCtx, "collMod", nss.ns(), [&] {
         WriteUnitOfWork wunit(opCtx);

@@ -32,6 +32,7 @@
 #include "mongo/db/index/skipped_record_tracker.h"
 
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/index/index_access_method.h"
 #include "mongo/logv2/log.h"
@@ -67,21 +68,31 @@ void SkippedRecordTracker::finalizeTemporaryTable(OperationContext* opCtx,
 }
 
 void SkippedRecordTracker::record(OperationContext* opCtx, const RecordId& recordId) {
-    auto toInsert = BSON(kRecordIdField << recordId.asLong());
+    BSONObj toInsert;
+    recordId.withFormat([](RecordId::Null n) { invariant(false); },
+                        [&](int64_t rid) { toInsert = BSON(kRecordIdField << rid); },
+                        [&](const char* str, int size) {
+                            toInsert = BSON(kRecordIdField << std::string(str, size));
+                        });
 
     // Lazily initialize table when we record the first document.
     if (!_skippedRecordsTable) {
         _skippedRecordsTable =
             opCtx->getServiceContext()->getStorageEngine()->makeTemporaryRecordStore(opCtx);
     }
-    // A WriteUnitOfWork may not already be active if the originating operation was part of an
-    // insert into the external sorter.
-    WriteUnitOfWork wuow(opCtx);
-    uassertStatusOK(
-        _skippedRecordsTable->rs()
-            ->insertRecord(opCtx, toInsert.objdata(), toInsert.objsize(), Timestamp::min())
-            .getStatus());
-    wuow.commit();
+
+    writeConflictRetry(
+        opCtx,
+        "recordSkippedRecordTracker",
+        NamespaceString::kIndexBuildEntryNamespace.ns(),
+        [&]() {
+            WriteUnitOfWork wuow(opCtx);
+            uassertStatusOK(
+                _skippedRecordsTable->rs()
+                    ->insertRecord(opCtx, toInsert.objdata(), toInsert.objsize(), Timestamp::min())
+                    .getStatus());
+            wuow.commit();
+        });
 }
 
 bool SkippedRecordTracker::areAllRecordsApplied(OperationContext* opCtx) const {
@@ -132,7 +143,15 @@ Status SkippedRecordTracker::retrySkippedRecords(OperationContext* opCtx,
         const BSONObj doc = record->data.toBson();
 
         // This is the RecordId of the skipped record from the collection.
-        const RecordId skippedRecordId(doc[kRecordIdField].Long());
+        RecordId skippedRecordId;
+        const KeyFormat keyFormat = collection->getRecordStore()->keyFormat();
+        if (keyFormat == KeyFormat::Long) {
+            skippedRecordId = RecordId(doc[kRecordIdField].Long());
+        } else {
+            invariant(keyFormat == KeyFormat::String);
+            const std::string recordIdStr = doc[kRecordIdField].String();
+            skippedRecordId = RecordId(recordIdStr.c_str(), recordIdStr.size());
+        }
 
         WriteUnitOfWork wuow(opCtx);
 

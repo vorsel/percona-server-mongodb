@@ -1,6 +1,7 @@
 /**
  * Tests that chunk migrations, collMod, createIndexes, and dropIndexes are prohibited on a
- * collection that is undergoing a resharding operation.
+ * collection that is undergoing a resharding operation. Also tests that concurrent resharding
+ * operations are prohibited.
  *
  * @tags: [
  *   requires_fcv_49,
@@ -51,13 +52,23 @@ reshardingTest.withReshardingInBackground(
 
         assert.commandFailedWithCode(
             mongos.adminCommand({moveChunk: ns, find: {oldKey: -10}, to: donorShardNames[1]}),
-            ErrorCodes.ConflictingOperationInProgress);
+            ErrorCodes.LockBusy);
         assert.commandFailedWithCode(db.runCommand({collMod: 'coll'}),
                                      ErrorCodes.ReshardCollectionInProgress);
         assert.commandFailedWithCode(sourceCollection.createIndexes([{newKey: 1}]),
                                      ErrorCodes.ReshardCollectionInProgress);
         assert.commandFailedWithCode(db.runCommand({dropIndexes: 'coll', index: '*'}),
                                      ErrorCodes.ReshardCollectionInProgress);
+
+        let newNs = "reshardingDb2.coll2";
+        assert.commandWorked(mongos.adminCommand({enableSharding: "reshardingDb2"}));
+        assert.commandWorked(mongos.adminCommand({shardCollection: newNs, key: {oldKey: 1}}));
+
+        assert.commandFailedWithCode(
+            mongos.adminCommand({reshardCollection: newNs, key: {newKey: 1}}),
+            ErrorCodes.ReshardCollectionInProgress);
+
+        mongos.getCollection(newNs).drop();
     });
 
 reshardingTest.teardown();

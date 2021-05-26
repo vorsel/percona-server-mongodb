@@ -1649,7 +1649,7 @@ class TestBinder(testcase.IDLTestcase):
                 serializer: foo
                 deserializer: foo
                 default: foo
-        
+
         structs:
             reply:
                 description: foo
@@ -2362,6 +2362,110 @@ class TestBinder(testcase.IDLTestcase):
                     default: false
                     version: 123
             """), idl.errors.ERROR_ID_FEATURE_FLAG_DEFAULT_FALSE_HAS_VERSION)
+
+    def test_access_check(self):
+        # type: () -> None
+        """Test access check."""
+
+        test_preamble = textwrap.dedent("""
+        types:
+            string:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: string
+                serializer: foo
+                deserializer: foo
+
+        enums:
+            AccessCheck:
+                description: "test"
+                type: string
+                values:
+                    kIsAuthenticated :  "is_authenticated"
+                    kIsCoAuthorized :  "is_coauthorized"
+
+        structs:
+            reply:
+                description: foo
+                fields:
+                    foo: string
+        """)
+
+        # Test none
+        self.assert_bind(test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: ""
+                namespace: ignored
+                access_check:
+                    none: true
+                fields:
+                    foo: string
+                reply_type: reply
+            """))
+
+        # Test simple with access check
+        self.assert_bind(test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: ""
+                namespace: ignored
+                access_check:
+                    simple:
+                        check: is_authenticated
+                fields:
+                    foo: string
+                reply_type: reply
+            """))
+
+    def test_access_check_negative(self):
+        # type: () -> None
+        """Negative access check tests."""
+
+        test_preamble = textwrap.dedent("""
+        types:
+            string:
+                description: foo
+                cpp_type: foo
+                bson_serialization_type: string
+                serializer: foo
+                deserializer: foo
+
+        enums:
+            AccessCheck:
+                description: "test"
+                type: string
+                values:
+                    kIsAuthenticated :  "is_authenticated"
+                    kIsCoAuthorized :  "is_coauthorized"
+
+        structs:
+            reply:
+                description: foo
+                fields:
+                    foo: string
+        """)
+
+        # Test simple with bad access check
+        self.assert_bind_fail(
+            test_preamble + textwrap.dedent("""
+        commands:
+            test1:
+                description: foo
+                command_name: foo
+                api_version: ""
+                namespace: ignored
+                access_check:
+                    simple:
+                        check: unknown
+                fields:
+                    foo: string
+                reply_type: reply
+            """), idl.errors.ERROR_ID_UNKOWN_ENUM_VALUE)
 
 
 if __name__ == '__main__':

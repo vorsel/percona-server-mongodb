@@ -46,17 +46,19 @@ namespace mongo::window_function {
 
 StringMap<Expression::Parser> Expression::parserMap;
 
-intrusive_ptr<Expression> Expression::parse(BSONElement elem,
+intrusive_ptr<Expression> Expression::parse(BSONObj obj,
                                             const optional<SortPattern>& sortBy,
                                             ExpressionContext* expCtx) {
-    auto parser = parserMap.find(elem.fieldNameStringData());
-    uassert(ErrorCodes::FailedToParse,
-            str::stream() << "No such window function: " << elem.fieldName(),
-            parser != parserMap.end());
-    uassert(ErrorCodes::FailedToParse,
-            str::stream() << "Window function " << elem.fieldName() << " requires an object.",
-            elem.type() == BSONType::Object);
-    return parser->second(elem, sortBy, expCtx);
+    boost::optional<Expression::Parser> parser;
+    for (const auto& field : obj) {
+        // Found one valid window function. If there are multiple window functions they will be
+        // caught as invalid arguments to the Expression parser later.
+        auto parser = parserMap.find(field.fieldNameStringData());
+        if (parser != parserMap.end()) {
+            return parser->second(obj, sortBy, expCtx);
+        }
+    }
+    uasserted(ErrorCodes::FailedToParse, "Unrecognized window function");
 }
 
 void Expression::registerParser(std::string functionName, Parser parser) {
@@ -66,7 +68,8 @@ void Expression::registerParser(std::string functionName, Parser parser) {
 
 MONGO_INITIALIZER(windowFunctionExpressionMap)(InitializerContext*) {
     // Nothing to do. This initializer exists to tie together all the individual initializers
-    // defined by REGISTER_WINDOW_FUNCTION.
+    // defined by REGISTER_NON_REMOVABLE_WINDOW_FUNCTION and REGISTER_REMOVABLE_WINDOW_FUNCTION
+    // macros.
 }
 
 }  // namespace mongo::window_function

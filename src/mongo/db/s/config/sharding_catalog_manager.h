@@ -301,6 +301,14 @@ public:
                           const NamespaceString& nss,
                           const BSONObj& minKey);
 
+    /**
+     * In a transaction, sets the 'allowMigrations' to the requested state and bumps the collection
+     * version.
+     */
+    void setAllowMigrationsAndBumpOneChunk(OperationContext* opCtx,
+                                           const NamespaceString& nss,
+                                           bool allowMigrations);
+
     //
     // Database Operations
     //
@@ -319,6 +327,7 @@ public:
      * Updates metadata in config.databases collection to show the given primary database on its
      * new shard.
      */
+    // TODO SERVER-54879 throw out this method once 5.0 becomes last-LTS
     Status commitMovePrimary(OperationContext* opCtx, const StringData nss, const ShardId& toShard);
 
     //
@@ -388,17 +397,6 @@ public:
      * Runs the setFeatureCompatibilityVersion command on all shards.
      */
     Status setFeatureCompatibilityVersionOnShards(OperationContext* opCtx, const BSONObj& cmdObj);
-
-    /**
-     * Removes all entries from the config server's config.collections where 'dropped' is true.
-     *
-     * Before v5.0, when a collection was dropped, its entry in config.collections remained, tagged
-     * as 'dropped: true'. As those are no longer needed, this method cleans up the leftover
-     * metadata.
-     *
-     * It shall be called when upgrading to 4.9 or newer versions.
-     */
-    void removePre49LegacyMetadata(OperationContext* opCtx);
 
     /**
      * Patches-up persistent metadata for 4.9.
@@ -531,6 +529,19 @@ private:
                                                       const ReadPreferenceSetting& readPref,
                                                       const std::string& shardName,
                                                       const std::string& zoneName);
+
+    /**
+     * Removes all entries from the config server's config.collections where 'dropped' is true.
+     *
+     * Before v5.0, when a collection was dropped, its entry in config.collections remained, tagged
+     * as 'dropped: true'. As those are no longer needed, this method cleans up the leftover
+     * metadata.
+     *
+     * It shall be called when upgrading to 4.9 or newer versions.
+     *
+     * TODO SERVER-53283: Remove once 5.0 has been released.
+     */
+    void _removePre49LegacyMetadata(OperationContext* opCtx);
 
     /**
      * Creates a 'version.timestamp' for each one of the entries in the config server's

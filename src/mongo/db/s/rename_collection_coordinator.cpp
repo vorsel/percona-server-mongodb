@@ -37,8 +37,10 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/dist_lock_manager.h"
+#include "mongo/db/s/range_deletion_util.h"
 #include "mongo/db/s/shard_metadata_util.h"
 #include "mongo/db/s/sharding_ddl_util.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/client/shard_registry.h"
@@ -206,10 +208,17 @@ SemiFuture<void> RenameCollectionCoordinator::runImpl(
             if (!sourceIsSharded) {
                 const auto sourceCollPtr =
                     CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, _nss);
-                uassert(ErrorCodes::CommandFailed,
+                uassert(ErrorCodes::NamespaceNotFound,
                         str::stream() << "Collection " << _nss << " doesn't exist.",
                         sourceCollPtr);
             }
+
+            ShardingLogging::get(opCtx)->logChange(
+                opCtx,
+                "renameCollection.start",
+                _nss.ns(),
+                BSON("source" << _nss.toString() << "destination" << _toNss.toString()),
+                ShardingCatalogClient::kMajorityWriteConcern);
 
             sharding_ddl_util::checkShardedRenamePreconditions(opCtx, _toNss, _dropTarget);
 
@@ -225,7 +234,14 @@ SemiFuture<void> RenameCollectionCoordinator::runImpl(
                 });
 
                 if (sourceIsSharded) {
+                    auto rangeDeletionTasks = getPersistentRangeDeletionTasks(opCtx, _nss);
                     _renameShardedCollection(opCtx);
+                    deleteRangeDeletionTasks(opCtx, _toNss);
+                    for (auto& task : rangeDeletionTasks) {
+                        task.setId(UUID::gen());
+                        task.setNss(_toNss);
+                    }
+                    storeRangeDeletionTasks(opCtx, rangeDeletionTasks);
                 } else {
                     _renameUnshardedCollection(opCtx);
                 }
@@ -236,6 +252,13 @@ SemiFuture<void> RenameCollectionCoordinator::runImpl(
                 uassertStatusOK(catalog->getCollectionRoutingInfoWithRefresh(opCtx, _toNss));
             const auto version = cm.isSharded() ? cm.getVersion() : ChunkVersion::UNSHARDED();
             _response.emplaceValue(RenameCollectionResponse(version));
+
+            ShardingLogging::get(opCtx)->logChange(
+                opCtx,
+                "renameCollection.end",
+                _nss.ns(),
+                BSON("source" << _nss.toString() << "destination" << _toNss.toString()),
+                ShardingCatalogClient::kMajorityWriteConcern);
         })
         .onError([this, anchor = shared_from_this()](const Status& status) {
             LOGV2_ERROR(5438700,

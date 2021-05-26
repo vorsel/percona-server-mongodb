@@ -48,6 +48,7 @@ const equivalentErrorCodesList = [
     [28766, 4903706],
     [31034, 4848972],
     [31095, 4848972],
+    [34435, 5154901],
     [40066, 4934200],
     [40085, 5155402],
     [40086, 5155400],
@@ -150,5 +151,19 @@ assert.commandFailedWithCode = function(res, expectedCode, msg) {
 const assertWriteErrorWithCodeOriginal = assert.writeErrorWithCode;
 assert.writeErrorWithCode = function(res, expectedCode, msg) {
     return assertWriteErrorWithCodeOriginal(res, lookupEquivalentErrorCodes(expectedCode), msg);
+};
+
+// NOTE: Consider using 'assert.commandFailedWithCode' and 'assert.writeErrorWithCode' instead.
+// This function should be only used when error code does not come from command. For instance, when
+// validating explain output, which includes error code in the execution stats.
+assert.errorCodeEq = function(actualErrorCode, expectedErrorCodes, msg) {
+    if (expectedErrorCodes === assert._kAnyErrorCode) {
+        return;
+    }
+
+    const equivalentErrorCodes = lookupEquivalentErrorCodes(expectedErrorCodes);
+    assert(equivalentErrorCodes.includes(actualErrorCode),
+           actualErrorCode + " not found in the list of expected error codes: " +
+               tojson(equivalentErrorCodes) + ": " + msg);
 };
 }());

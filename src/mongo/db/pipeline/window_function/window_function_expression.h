@@ -33,135 +33,215 @@
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_set_window_fields_gen.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
+#include "mongo/db/pipeline/window_function/window_function.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/sort_pattern.h"
 
-#define REGISTER_WINDOW_FUNCTION(name, parser)                                       \
+#define REGISTER_NON_REMOVABLE_WINDOW_FUNCTION(name, parser)                         \
     MONGO_INITIALIZER_GENERAL(                                                       \
         addToWindowFunctionMap_##name, ("default"), ("windowFunctionExpressionMap")) \
     (InitializerContext*) {                                                          \
         ::mongo::window_function::Expression::registerParser("$" #name, parser);     \
     }
 
+#define REGISTER_REMOVABLE_WINDOW_FUNCTION(name, accumClass, wfClass)                              \
+    MONGO_INITIALIZER_GENERAL(                                                                     \
+        addToWindowFunctionMap_##name, ("default"), ("windowFunctionExpressionMap"))               \
+    (InitializerContext*) {                                                                        \
+        ::mongo::window_function::Expression::registerParser(                                      \
+            "$" #name, ::mongo::window_function::ExpressionRemovable<accumClass, wfClass>::parse); \
+    }
 namespace mongo::window_function {
-
 /**
  * A window-function expression describes how to compute a single output value in a
  * $setWindowFields stage. For example, in
  *
  *     {$setWindowFields: {
  *         output: {
- *             totalCost: {$sum: {input: "$price"}},
+ *             totalCost: {$sum: "$price"},
  *             numItems: {$count: {}},
  *         }
  *     }}
  *
- * the two window-function expressions are {$sum: {input: "$price"}} and {$count: {}}.
+ * the two window-function expressions are {$sum: "$price"} and {$count: {}}.
  *
  * Because this class is part of a syntax tree, it does not hold any execution state:
  * instead it lets you create new instances of a window-function state.
  */
 class Expression : public RefCountable {
 public:
+    static constexpr StringData kWindowArg = "window"_sd;
     /**
-     * Parses a single window-function expression. The BSONElement's key is the function name,
-     * and the value is the spec: for example, the whole BSONElement might be '$sum: {input: "$x"}'.
+     * Parses a single window-function expression. One of the BSONObj's keys is the function
+     * name, and the other (optional) key is 'window': for example, the whole BSONObj might be
+     * {$sum: "$x"} or {$sum: "$x", window: {documents: [2,3]}}.
      *
      * 'sortBy' is from the sortBy argument of $setWindowFields. Some window functions require
      * a sort spec, or require a one-field sort spec; they use this argument to enforce those
      * requirements.
      *
-     * If the window function accepts bounds, parse() parses them, just like other arguments
-     * such as 'input' or 'default'. For window functions like $rank, which don't accept bounds,
-     * parse() is responsible for throwing a parse error, just like other unexpected arguments.
+     * If the window function accepts bounds, parse() parses them, from the window field. For window
+     * functions like $rank, which don't accept bounds, parse() is responsible for throwing a parse
+     * error, just like other unexpected arguments.
      */
-    static boost::intrusive_ptr<Expression> parse(BSONElement elem,
+    static boost::intrusive_ptr<Expression> parse(BSONObj obj,
                                                   const boost::optional<SortPattern>& sortBy,
                                                   ExpressionContext* expCtx);
 
     /**
-     * A Parser has the same signature as parse(). The BSONElement is the whole expression, such
-     * as '$sum: {input: "$x"}', because some parsers need to switch on the function name.
+     * A Parser has the same signature as parse(). The BSONObj is the whole expression, as
+     * described above, because some parsers need to switch on the function name.
      */
     using Parser = std::function<decltype(parse)>;
     static void registerParser(std::string functionName, Parser parser);
 
-    virtual Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const = 0;
+    Expression(ExpressionContext* expCtx,
+               std::string accumulatorName,
+               boost::intrusive_ptr<::mongo::Expression> input,
+               WindowBounds bounds)
+        : _expCtx(expCtx),
+          _accumulatorName(accumulatorName),
+          _input(std::move(input)),
+          _bounds(std::move(bounds)) {}
 
-    virtual std::string getOpName() const = 0;
+    std::string getOpName() const {
+        return _accumulatorName;
+    }
 
-    virtual WindowBounds bounds() const = 0;
+    WindowBounds bounds() const {
+        return _bounds;
+    }
 
-    virtual boost::intrusive_ptr<::mongo::Expression> input() const = 0;
+    boost::intrusive_ptr<::mongo::Expression> input() const {
+        return _input;
+    }
 
     virtual boost::intrusive_ptr<AccumulatorState> buildAccumulatorOnly() const = 0;
 
-private:
+    virtual std::unique_ptr<WindowFunctionState> buildRemovable() const = 0;
+
+    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+        MutableDocument args;
+
+        args[_accumulatorName] = _input->serialize(static_cast<bool>(explain));
+        MutableDocument windowField;
+        _bounds.serialize(windowField);
+        args[kWindowArg] = windowField.freezeToValue();
+        return args.freezeToValue();
+    }
+
+
+protected:
+    ExpressionContext* _expCtx;
+    std::string _accumulatorName;
+    boost::intrusive_ptr<::mongo::Expression> _input;
+    WindowBounds _bounds;
     static StringMap<Parser> parserMap;
 };
 
 template <typename NonRemovableType>
 class ExpressionFromAccumulator : public Expression {
 public:
-    static boost::intrusive_ptr<Expression> parse(BSONElement elem,
+    static boost::intrusive_ptr<Expression> parse(BSONObj obj,
                                                   const boost::optional<SortPattern>& sortBy,
                                                   ExpressionContext* expCtx) {
-        // 'elem' is something like '$sum: {input: E, ...}'
-        std::string accumulatorName = elem.fieldName();
-        boost::intrusive_ptr<::mongo::Expression> input = ::mongo::Expression::parseOperand(
-            expCtx, elem.embeddedObject()["input"], expCtx->variablesParseState);
-        auto bounds = WindowBounds::parse(elem.Obj(), sortBy, expCtx);
-        // Reject extra arguments.
-        static const StringSet allowedFields = {"input", "documents", "range", "unit"};
-        for (auto&& arg : elem.embeddedObject()) {
-            uassert(ErrorCodes::FailedToParse,
-                    str::stream() << "Window function " << accumulatorName
-                                  << " found an unknown argument: " << arg.fieldNameStringData(),
-                    allowedFields.find(arg.fieldNameStringData()) != allowedFields.end());
+        // 'obj' is something like '{$func: <args>, window: {...}}'
+        boost::optional<StringData> accumulatorName;
+        WindowBounds bounds = WindowBounds::defaultBounds();
+        boost::intrusive_ptr<::mongo::Expression> input;
+        for (const auto& arg : obj) {
+            auto argName = arg.fieldNameStringData();
+            if (argName == kWindowArg) {
+                uassert(ErrorCodes::FailedToParse,
+                        "'window' field must be an object",
+                        arg.type() == BSONType::Object);
+                bounds = WindowBounds::parse(arg.embeddedObject(), sortBy, expCtx);
+            } else if (parserMap.find(argName) != parserMap.end()) {
+                uassert(ErrorCodes::FailedToParse,
+                        "Cannot specify two functions in window function spec",
+                        !accumulatorName);
+                accumulatorName = argName;
+                input = ::mongo::Expression::parseOperand(expCtx, arg, expCtx->variablesParseState);
+            } else {
+                uasserted(ErrorCodes::FailedToParse,
+                          str::stream()
+                              << "Window function found an unknown argument: " << argName);
+            }
         }
+
+        uassert(ErrorCodes::FailedToParse,
+                "Must specify a window function in output field",
+                accumulatorName);
         return make_intrusive<ExpressionFromAccumulator<NonRemovableType>>(
-            expCtx, std::move(accumulatorName), std::move(input), std::move(bounds));
+            expCtx, accumulatorName->toString(), std::move(input), std::move(bounds));
     }
-    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final {
-        MutableDocument args;
 
-        args["input"] = _input->serialize(static_cast<bool>(explain));
-        _bounds.serialize(args);
-
-        return Value{Document{
-            {_accumulatorName, args.freezeToValue()},
-        }};
+    boost::intrusive_ptr<AccumulatorState> buildAccumulatorOnly() const final {
+        return NonRemovableType::create(_expCtx);
+    }
+    std::unique_ptr<WindowFunctionState> buildRemovable() const final {
+        uasserted(5461500,
+                  str::stream() << "Window function " << _accumulatorName
+                                << " is not supported with a removable window");
     }
 
     ExpressionFromAccumulator(ExpressionContext* expCtx,
                               std::string accumulatorName,
                               boost::intrusive_ptr<::mongo::Expression> input,
                               WindowBounds bounds)
-        : _expCtx(expCtx),
-          _accumulatorName(std::move(accumulatorName)),
-          _input(std::move(input)),
-          _bounds(std::move(bounds)) {}
+        : Expression(expCtx, std::move(accumulatorName), std::move(input), std::move(bounds)) {}
+};
 
-    std::string getOpName() const final {
-        return _accumulatorName;
+template <typename NonRemovableType, typename RemovableType>
+class ExpressionRemovable : public Expression {
+public:
+    static boost::intrusive_ptr<Expression> parse(BSONObj obj,
+                                                  const boost::optional<SortPattern>& sortBy,
+                                                  ExpressionContext* expCtx) {
+        // 'obj' is something like '{$func: <args>, window: {...}}'
+        boost::optional<StringData> accumulatorName;
+        WindowBounds bounds = WindowBounds::defaultBounds();
+        boost::intrusive_ptr<::mongo::Expression> input;
+        for (const auto& arg : obj) {
+            auto argName = arg.fieldNameStringData();
+            if (argName == kWindowArg) {
+                uassert(ErrorCodes::FailedToParse,
+                        "'window' field must be an object",
+                        obj[kWindowArg].type() == BSONType::Object);
+                bounds = WindowBounds::parse(arg.embeddedObject(), sortBy, expCtx);
+            } else if (parserMap.find(argName) != parserMap.end()) {
+                uassert(ErrorCodes::FailedToParse,
+                        "Cannot specify two functions in window function spec",
+                        !accumulatorName);
+                accumulatorName = argName;
+                input = ::mongo::Expression::parseOperand(expCtx, arg, expCtx->variablesParseState);
+            } else {
+                uasserted(ErrorCodes::FailedToParse,
+                          str::stream()
+                              << "Window function found an unknown argument: " << argName);
+            }
+        }
+
+        uassert(ErrorCodes::FailedToParse,
+                "Must specify a window function in output field",
+                accumulatorName);
+        return make_intrusive<ExpressionRemovable<NonRemovableType, RemovableType>>(
+            expCtx, accumulatorName->toString(), std::move(input), std::move(bounds));
     }
 
-    boost::intrusive_ptr<::mongo::Expression> input() const final {
-        return _input;
-    }
+    ExpressionRemovable(ExpressionContext* expCtx,
+                        std::string accumulatorName,
+                        boost::intrusive_ptr<::mongo::Expression> input,
+                        WindowBounds bounds)
+        : Expression(expCtx, std::move(accumulatorName), std::move(input), std::move(bounds)) {}
 
-    WindowBounds bounds() const final {
-        return _bounds;
-    }
-
-    boost::intrusive_ptr<AccumulatorState> buildAccumulatorOnly() const {
+    boost::intrusive_ptr<AccumulatorState> buildAccumulatorOnly() const final {
         return NonRemovableType::create(_expCtx);
     }
 
-private:
-    ExpressionContext* _expCtx;
-    std::string _accumulatorName;
-    boost::intrusive_ptr<::mongo::Expression> _input;
-    WindowBounds _bounds;
+    std::unique_ptr<WindowFunctionState> buildRemovable() const final {
+        return RemovableType::create(_expCtx);
+    }
 };
 
 }  // namespace mongo::window_function

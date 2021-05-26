@@ -60,6 +60,7 @@
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/storage/two_phase_index_build_knobs_gen.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
@@ -135,7 +136,8 @@ std::vector<BSONObj> parseAndValidateIndexSpecs(OperationContext* opCtx,
 
             uassert(ErrorCodes::BadValue,
                     "Can't hide index on system collection",
-                    !ns.isSystem() || indexSpec[IndexDescriptor::kHiddenFieldName].eoo());
+                    !(ns.isSystem() && !ns.isTimeseriesBucketsCollection()) ||
+                        indexSpec[IndexDescriptor::kHiddenFieldName].eoo());
         }
 
         indexSpecs.push_back(std::move(indexSpec));
@@ -613,6 +615,53 @@ CreateIndexesReply runCreateIndexesWithCoordinator(OperationContext* opCtx,
 }
 
 /**
+ * Returns a CreateIndexesCommand for creating indexes on the bucket collection.
+ * Returns null if 'origCmd' is not for a time-series collection.
+ */
+std::unique_ptr<CreateIndexesCommand> makeTimeseriesCreateIndexesCommand(
+    OperationContext* opCtx, const CreateIndexesCommand& origCmd) {
+    const auto& origNs = origCmd.getNamespace();
+
+    auto timeseriesOptions = timeseries::getTimeseriesOptions(opCtx, origNs);
+
+    // Return early with null if we are not working with a time-series collection.
+    if (!timeseriesOptions) {
+        return {};
+    }
+
+    const auto& origIndexes = origCmd.getIndexes();
+    std::vector<mongo::BSONObj> indexes;
+    for (const auto& origIndex : origIndexes) {
+        BSONObjBuilder builder;
+        for (const auto& elem : origIndex) {
+            if (elem.fieldNameStringData() == NewIndexSpec::kKeyFieldName) {
+                auto bucketsIndexSpecWithStatus =
+                    timeseries::convertTimeseriesIndexSpecToBucketsIndexSpec(*timeseriesOptions,
+                                                                             elem.Obj());
+                uassert(ErrorCodes::CannotCreateIndex,
+                        str::stream() << bucketsIndexSpecWithStatus.getStatus().toString()
+                                      << " Command request: " << redact(origCmd.toBSON({})),
+                        bucketsIndexSpecWithStatus.isOK());
+
+                builder.append(NewIndexSpec::kKeyFieldName,
+                               std::move(bucketsIndexSpecWithStatus.getValue()));
+                continue;
+            }
+            builder.append(elem);
+        }
+        indexes.push_back(builder.obj());
+    }
+
+    auto ns = origNs.makeTimeseriesBucketsNamespace();
+    auto cmd = std::make_unique<CreateIndexesCommand>(ns, std::move(indexes));
+    cmd->setV(origCmd.getV());
+    cmd->setIgnoreUnknownIndexOptions(origCmd.getIgnoreUnknownIndexOptions());
+    cmd->setCommitQuorum(origCmd.getCommitQuorum());
+
+    return cmd;
+}
+
+/**
  * { createIndexes : "bar",
  *   indexes : [ { ns : "test.bar", key : { x : 1 }, name: "x_1" } ],
  *   commitQuorum: "majority" }
@@ -633,20 +682,31 @@ public:
 
         void doCheckAuthorization(OperationContext* opCtx) const {
             Privilege p(CommandHelpers::resourcePatternForNamespace(ns().toString()),
-                        {ActionType::createIndex});
+                        ActionType::createIndex);
             uassert(ErrorCodes::Unauthorized,
                     "Unauthorized",
                     AuthorizationSession::get(opCtx->getClient())->isAuthorizedForPrivilege(p));
         }
 
         CreateIndexesReply typedRun(OperationContext* opCtx) {
+            const auto& origCmd = request();
+            const auto* cmd = &origCmd;
+
+            // 'timeseriesCmd' is null if the request namespace does not refer to a time-series
+            // collection. Otherwise, transforms the user time-series index request to one on the
+            // underlying bucket.
+            auto timeseriesCmd = makeTimeseriesCreateIndexesCommand(opCtx, origCmd);
+            if (timeseriesCmd) {
+                cmd = timeseriesCmd.get();
+            }
+
             // If we encounter an IndexBuildAlreadyInProgress error for any of the requested index
             // specs, then we will wait for the build(s) to finish before trying again unless we are
             // in a multi-document transaction.
             bool shouldLogMessageOnAlreadyBuildingError = true;
             while (true) {
                 try {
-                    return runCreateIndexesWithCoordinator(opCtx, request());
+                    return runCreateIndexesWithCoordinator(opCtx, *cmd);
                 } catch (const DBException& ex) {
                     hangAfterIndexBuildAbort.pauseWhileSet();
                     // We can only wait for an existing index build to finish if we are able to
@@ -668,7 +728,7 @@ public:
                             "but found that at least one of the indexes is already being built."
                             "This request will wait for the pre-existing index build to finish "
                             "before proceeding",
-                            "indexesFieldName"_attr = request().getIndexes(),
+                            "indexesFieldName"_attr = cmd->getIndexes(),
                             "error"_attr = ex);
                         shouldLogMessageOnAlreadyBuildingError = false;
                     }

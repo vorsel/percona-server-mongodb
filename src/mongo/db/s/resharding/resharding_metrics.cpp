@@ -129,11 +129,11 @@ void ReshardingMetrics::setDonorState(DonorStateEnum state) noexcept {
     const auto oldState = std::exchange(_currentOp->donorState, state);
     invariant(oldState != state);
 
-    if (state == DonorStateEnum::kPreparingToMirror) {
+    if (state == DonorStateEnum::kPreparingToBlockWrites) {
         _currentOp->inCriticalSection.start();
     }
 
-    if (oldState == DonorStateEnum::kMirroring) {
+    if (oldState == DonorStateEnum::kBlockingWrites) {
         _currentOp->inCriticalSection.end();
     }
 }
@@ -167,7 +167,6 @@ void ReshardingMetrics::setCoordinatorState(CoordinatorStateEnum state) noexcept
 void ReshardingMetrics::setDocumentsToCopy(int64_t documents, int64_t bytes) noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
     invariant(_currentOp.has_value() && !_currentOp->isCompleted(), kNoOperationInProgress);
-    invariant(_currentOp->recipientState == RecipientStateEnum::kCloning);
 
     _currentOp->documentsToCopy = documents;
     _currentOp->bytesToCopy = bytes;
@@ -202,8 +201,8 @@ void ReshardingMetrics::onOplogEntriesApplied(int64_t entries) noexcept {
 void ReshardingMetrics::onWriteDuringCriticalSection(int64_t writes) noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
     invariant(_currentOp.has_value() && !_currentOp->isCompleted(), kNoOperationInProgress);
-    invariant(_currentOp->donorState == DonorStateEnum::kPreparingToMirror ||
-              _currentOp->donorState == DonorStateEnum::kMirroring);
+    invariant(_currentOp->donorState == DonorStateEnum::kPreparingToBlockWrites ||
+              _currentOp->donorState == DonorStateEnum::kBlockingWrites);
     _currentOp->writesDuringCriticalSection += writes;
 }
 

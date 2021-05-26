@@ -107,9 +107,36 @@ boost::optional<repl::OplogEntry> createMatchingTransactionTableUpdate(
 }
 
 /**
+ * A tenant migrations transaction entry will:
+ *
+ * 1) Have the 'fromTenantMigration' field set
+ * 2) Be a no-op entry
+ * 3) Have sessionId and txnNumber
+ */
+bool isTransactionEntryFromTenantMigrations(OplogEntry& entry) {
+    if (!entry.getFromTenantMigration()) {
+        return false;
+    }
+
+    if (entry.getOpType() != repl::OpTypeEnum::kNoop) {
+        return false;
+    }
+
+    if (!entry.getSessionId() || !entry.getTxnNumber()) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
  * Returns true if the oplog entry represents an operation in a transaction and false otherwise.
  */
 bool isTransactionEntry(OplogEntry entry) {
+    if (isTransactionEntryFromTenantMigrations(entry)) {
+        return true;
+    }
+
     auto sessionInfo = entry.getOperationSessionInfo();
     if (!sessionInfo.getTxnNumber()) {
         return false;
@@ -273,6 +300,13 @@ boost::optional<OplogEntry> SessionUpdateTracker::_createTransactionTableUpdateF
         newTxnRecord.setTxnNum(*sessionInfo.getTxnNumber());
         newTxnRecord.setLastWriteOpTime(entry.getOpTime());
         newTxnRecord.setLastWriteDate(entry.getWallClockTime());
+
+        if (entry.getFromTenantMigration() && entry.getOpType() == OpTypeEnum::kNoop) {
+            // For tenant migration, we don't need to set the lastWriteOpTime.
+            newTxnRecord.setLastWriteOpTime(OpTime());
+            newTxnRecord.setState(DurableTxnStateEnum::kCommitted);
+            return newTxnRecord.toBSON();
+        }
 
         if (entry.isPartialTransaction()) {
             invariant(entry.getPrevWriteOpTimeInTransaction()->isNull());

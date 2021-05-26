@@ -39,11 +39,13 @@
 #include "mongo/db/auth/user.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/rpc/op_msg.h"
+#include "mongo/util/functional.h"
 
 namespace mongo {
 
 class AuthorizationSession;
 class BSONObj;
+class BSONObjBuilder;
 class Client;
 class NamespaceString;
 class OperationContext;
@@ -86,12 +88,59 @@ public:
 };
 
 /**
+ * AuthenticateEvent is a opaque view into a finished authentication handshake.
+ *
+ * This object is only valid within its initial stack context.
+ */
+class AuthenticateEvent {
+public:
+    using Appender = unique_function<void(BSONObjBuilder*)>;
+
+    AuthenticateEvent(StringData mechanism,
+                      StringData db,
+                      StringData user,
+                      Appender appender,
+                      ErrorCodes::Error result)
+        : _mechanism(mechanism),
+          _db(db),
+          _user(user),
+          _appender(std::move(appender)),
+          _result(result) {}
+
+    StringData getMechanism() const {
+        return _mechanism;
+    }
+
+    StringData getDatabase() const {
+        return _db;
+    }
+
+    StringData getUser() const {
+        return _user;
+    }
+
+    ErrorCodes::Error getResult() const {
+        return _result;
+    }
+
+    void appendExtraInfo(BSONObjBuilder* bob) const {
+        _appender(bob);
+    }
+
+private:
+    StringData _mechanism;
+    StringData _db;
+    StringData _user;
+
+    Appender _appender;
+
+    ErrorCodes::Error _result;
+};
+
+/**
  * Logs the result of an authentication attempt.
  */
-void logAuthentication(Client* client,
-                       StringData mechanism,
-                       const UserName& user,
-                       ErrorCodes::Error result);
+void logAuthentication(Client* client, const AuthenticateEvent& event);
 
 //
 // Authorization (authz) logging functions.
@@ -291,18 +340,18 @@ void logLogout(Client* client,
 void logCreateIndex(Client* client,
                     const BSONObj* indexSpec,
                     StringData indexname,
-                    StringData nsname);
+                    const NamespaceString& nsname);
 
 /**
  * Logs the result of a createCollection command.
  */
-void logCreateCollection(Client* client, StringData nsname);
+void logCreateCollection(Client* client, const NamespaceString& nsname);
 
 /**
  * Logs the result of a createView command.
  */
 void logCreateView(Client* client,
-                   StringData nsname,
+                   const NamespaceString& nsname,
                    StringData viewOn,
                    BSONArray pipeline,
                    ErrorCodes::Error code);
@@ -310,7 +359,7 @@ void logCreateView(Client* client,
 /**
  * Logs the result of an importCollection command.
  */
-void logImportCollection(Client* client, StringData nsname);
+void logImportCollection(Client* client, const NamespaceString& nsname);
 
 /**
  * Logs the result of a createDatabase command.
@@ -321,18 +370,18 @@ void logCreateDatabase(Client* client, StringData dbname);
 /**
  * Logs the result of a dropIndex command.
  */
-void logDropIndex(Client* client, StringData indexname, StringData nsname);
+void logDropIndex(Client* client, StringData indexname, const NamespaceString& nsname);
 
 /**
  * Logs the result of a dropCollection command on a collection.
  */
-void logDropCollection(Client* client, StringData nsname);
+void logDropCollection(Client* client, const NamespaceString& nsname);
 
 /**
  * Logs the result of a dropCollection command on a view.
  */
 void logDropView(Client* client,
-                 StringData nsname,
+                 const NamespaceString& nsname,
                  StringData viewOn,
                  const std::vector<BSONObj>& pipeline,
                  ErrorCodes::Error code);

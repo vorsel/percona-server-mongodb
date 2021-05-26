@@ -132,7 +132,7 @@ variables:
 
 # Templates used by powercycle
 - &powercycle_remote_credentials
-  private_key_file: $(${posix_workdir})/powercycle.pem
+  private_key_file: $(${posix_workdir})/src/powercycle.pem
   private_key_remote: ${__project_aws_ssh_key_value}
   aws_key_remote: ${powercycle_aws_key}
   aws_secret_remote: ${powercycle_aws_secret}
@@ -393,7 +393,7 @@ variables:
   - ubuntu1804-debug-suggested
   - enterprise-ubuntu1604-64
   - enterprise-ubuntu1604-arm64
-  - enterprise-ubuntu-dynamic-1804-clang-tidy-suggested
+  - enterprise-ubuntu-dynamic-1804-clang-tidy-required
   - ubuntu1804
   - ubuntu1804-arm64
   - ubuntu2004-arm64
@@ -1027,7 +1027,7 @@ functions:
   "update task timeout": &update_task_timeout
     command: timeout.update
     params:
-      timeout_secs: ${timeout_secs}
+      exec_timeout_secs: ${timeout_secs}
 
   "update bypass expansions": &update_bypass_expansions
     command: expansions.update
@@ -1103,12 +1103,6 @@ functions:
           fi
       - key: posix_workdir
         value: eval 'if [ "Windows_NT" = "$OS" ]; then echo $(cygpath -u "${workdir}"); else echo ${workdir}; fi'
-      # For ssh disable the options GSSAPIAuthentication, CheckHostIP, StrictHostKeyChecking
-      # & UserKnownHostsFile, since these are local connections from one AWS instance to another.
-      - key: ssh_connection_options
-        value: -o GSSAPIAuthentication=no -o CheckHostIP=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30 -o ConnectionAttempts=20
-      - key: ssh_retries
-        value: "10"
       - key: set_sudo
         value: |
           set -o > /tmp/settings.log
@@ -1681,6 +1675,10 @@ functions:
         display_name: Generated Task Config - Execution ${execution}
         optional: true
 
+    - command: timeout.update
+      params:
+        exec_timeout_secs: 10800  # 3 hours
+
     - command: generate.tasks
       params:
         optional: true
@@ -1726,6 +1724,10 @@ functions:
         content_type: ${content_type|application/gzip}
         display_name: Generated Task Config - Execution ${execution}
         optional: true
+
+    - command: timeout.update
+      params:
+        exec_timeout_secs: 10800  # 3 hours
 
     - command: generate.tasks
       params:
@@ -1844,7 +1846,7 @@ functions:
         # for tasks that don't support the one we set here. A better plan would be
         # to support install-action for Ninja builds directly.
         # TODO: https://jira.mongodb.org/browse/SERVER-48203
-        extra_args="--install-action=${task_install_action|hardlink}"
+        extra_args="--install-action=hardlink"
 
         # By default, limit link jobs to one quarter of our overall -j
         # concurrency unless locally overridden. We do this because in
@@ -1897,8 +1899,8 @@ functions:
 
         ${compile_env|} $python ./buildscripts/scons.py                                     \
             ${compile_flags|} ${task_compile_flags|} ${task_compile_flags_extra|}           \
-            ${scons_cache_args|} $extra_args                                                \
-            ${targets} MONGO_VERSION=${version} ${patch_compile_flags|} || exit_status=$?
+            ${scons_cache_args|} $extra_args MONGO_VERSION=${version}                       \
+            ${patch_compile_flags|} ${targets} || exit_status=$?
 
         chmod -R ugo+w ./src
         ls -la src/mongo/stdx/sigaltstack_location_test.cpp || true
@@ -2158,6 +2160,10 @@ functions:
         display_name: Generated Task Config - Execution ${execution}
         optional: true
 
+    - command: timeout.update
+      params:
+        exec_timeout_secs: 10800  # 3 hours
+
     - command: generate.tasks
       params:
         optional: true
@@ -2203,6 +2209,10 @@ functions:
         content_type: ${content_type|application/gzip}
         display_name: Generated Task Config - Execution ${execution}
         optional: true
+
+    - command: timeout.update
+      params:
+        exec_timeout_secs: 10800  # 3 hours
 
     - command: generate.tasks
       params:
@@ -2250,6 +2260,10 @@ functions:
         permissions: public-read
         content_type: ${content_type|application/gzip}
         display_name: Generated Task Config - Execution ${execution}
+
+    - command: timeout.update
+      params:
+        exec_timeout_secs: 10800  # 3 hours
 
     - command: generate.tasks
       params:
@@ -2380,7 +2394,7 @@ functions:
           set +o errexit
           eval $python -u buildscripts/resmoke.py powercycle run \
             "--sshUserHost=$(printf "%s@%s" "$user" "${private_ip_address}") \
-            --sshConnection=\"-i ${private_key_file} ${ssh_connection_options}\" \
+            --sshConnection=\"-i ${private_key_file}\" \
             --taskName=${task_name}"
 
     - command: expansions.update
@@ -3373,31 +3387,33 @@ tasks:
   commands:
     - func: "scons compile"
       vars:
-        task_install_action:
-            default
         task_compile_flags: >-
           --ninja
         targets:
-          build.ninja
+          generate-ninja
     - command: shell.exec
       params:
         working_dir: src
         shell: bash
         script: |
+          set -o errexit
+          set -o verbose
+
           ${activate_virtualenv}
+          python -m pip install ninja
           if [ "Windows_NT" = "$OS" ]; then
             vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"
-            cd "$vcvars" && cmd /K "vcvarsall.bat amd64 && cd ${workdir}\src"
+            echo "call \"$vcvars/vcvarsall.bat\" amd64" > msvc.bat
+            echo "ninja install-core" >> msvc.bat
+            cmd /C msvc.bat
+          else
+            ninja install-core
           fi
-          python -m pip install ninja
-          ninja install-core
 
 - name: compile_ninja_next
   commands:
     - func: "scons compile"
       vars:
-        task_install_action:
-            default
         task_compile_flags: >-
           --build-tools=next
           --ninja
@@ -3408,21 +3424,24 @@ tasks:
         working_dir: src
         shell: bash
         script: |
+          set -o errexit
+          set -o verbose
+
           ${activate_virtualenv}
+          python -m pip install ninja
           if [ "Windows_NT" = "$OS" ]; then
             vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"
-            cd "$vcvars" && cmd /K "vcvarsall.bat amd64 && cd ${workdir}\src"
+            echo "call \"$vcvars/vcvarsall.bat\" amd64" > msvc.bat
+            echo "ninja install-core" >> msvc.bat
+            cmd /C msvc.bat
+          else
+            ninja install-core
           fi
-          python -m pip install ninja
-          ninja install-core
-
 
 - name: compile_build_tools_next
   commands:
     - func: "scons compile"
       vars:
-        task_install_action:
-            default
         task_compile_flags: >-
           --build-tools=next
         targets:
@@ -4691,6 +4710,32 @@ tasks:
       suite: jstestfuzz_interrupt_replication
       resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: jstestfuzz_interrupt_replication
+
+# jstestfuzz write conflict #
+- <<: *jstestfuzz_template
+  name: jstestfuzz_replication_write_conflicts_gen
+  tags: ["jstestfuzz", "write_conflict"]
+  commands:
+  - func: "generate fuzzer tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      jstestfuzz_vars: --jsTestsDir ../jstests
+      suite: jstestfuzz_replication_write_conflicts
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      name: jstestfuzz_replication_write_conflicts
+
+# jstestfuzz concurrent conflict #
+- <<: *jstestfuzz_template
+  name: jstestfuzz_concurrent_replication_write_conflicts_gen
+  tags: ["jstestfuzz", "write_conflict"]
+  commands:
+  - func: "generate fuzzer tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      jstestfuzz_vars: --jsTestsDir ../jstests
+      suite: jstestfuzz_replication_write_conflicts
+      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2}}' --numClientsPerFixture=10"
+      name: jstestfuzz_concurrent_replication_write_conflicts
 
 # jstestfuzz interrupt with flow control engaged #
 - <<: *jstestfuzz_template
@@ -6399,7 +6444,7 @@ tasks:
   # TODO: SERVER-35964 revert the addition of UBSAN concurrency_replication suites.
 - <<: *task_template
   name: concurrency_replication_ubsan
-  tags: ["concurrency", "ubsan"]
+  tags: ["concurrency", "ubsan", "repl"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6409,7 +6454,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_replication_causal_consistency_ubsan
-  tags: ["concurrency", "ubsan"]
+  tags: ["concurrency", "ubsan", "repl"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6419,7 +6464,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_replication_multi_stmt_txn_ubsan
-  tags: ["concurrency", "ubsan"]
+  tags: ["concurrency", "ubsan", "repl"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -6457,7 +6502,7 @@ tasks:
       resmoke_jobs_max: 1
 
 - name: concurrency_sharded_replication_multiversion_gen
-  tags: ["multiversion_passthrough"]
+  tags: ["multiversion_passthrough", "sharded"]
   commands:
   - func: "generate implicit multiversion tasks"
     vars:
@@ -6640,6 +6685,16 @@ tasks:
       resmoke_jobs_max: 1
       fallback_num_sub_suites: 3
 
+# TODO (SERVER-54850): Remove once SERVER-54850 is completed.
+- <<: *task_template
+  name: concurrency_sharded_ddl_operations
+  commands:
+  - func: "do setup"
+  - func: "run tests"
+    vars:
+      resmoke_args: "--suites=concurrency_sharded_ddl_operations --storageEngine=wiredTiger"
+      resmoke_jobs_max: 1
+
 - <<: *task_template
   name: concurrency_simultaneous
   tags: ["concurrency", "common"]
@@ -6652,7 +6707,7 @@ tasks:
 
 - <<: *task_template
   name: concurrency_simultaneous_replication
-  tags: ["concurrency", "common", "large"]
+  tags: ["concurrency", "common", "large", "repl"]
   commands:
   - func: "do setup"
   - func: "run tests"
@@ -7257,6 +7312,19 @@ tasks:
   - func: "run powercycle test"
     timeout_secs: 1800 # 30 minute timeout for no output
 
+- name: powercycle_kill_mongod_smoke
+  exec_timeout_secs: 7200 # 2 hour timeout for the task overall
+  depends_on:
+  - name: archive_dist_test_debug
+  commands:
+  - func: "do setup"
+  - func: "set up remote credentials"
+    vars:
+      <<: *powercycle_remote_credentials
+  - func: "set up EC2 instance"
+  - func: "run powercycle test"
+    timeout_secs: 1800 # 30 minute timeout for no output
+
 - name: powercycle
   tags: ["powercycle"]
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
@@ -7314,6 +7382,7 @@ tasks:
     timeout_secs: 1800 # 30 minute timeout for no output
 
 - name: powercycle_replication_smalloplog
+  tags: ["powercycle"]
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on:
   - name: archive_dist_test_debug
@@ -7341,6 +7410,7 @@ tasks:
     timeout_secs: 1800 # 30 minute timeout for no output
 
 - name: powercycle_write_concern_majority
+  tags: ["powercycle"]
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on:
   - name: archive_dist_test_debug
@@ -8822,12 +8892,6 @@ buildvariants:
   - name: .powercycle
     distros:
     - ubuntu1604-powercycle
-  - name: powercycle_replication_smalloplog
-    distros:
-    - ubuntu1604-powercycle
-  - name: powercycle_write_concern_majority
-    distros:
-    - ubuntu1604-powercycle
   - name: replica_sets
   - name: watchdog_wiredtiger
   - name: .replica_sets .common
@@ -8854,7 +8918,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: aarch64-enterprise-ubuntu1604
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu1604 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     resmoke_jobs_max: 8 # Avoid starting too many mongod's on ARM test servers
     has_packages: true
     packager_script: packager_enterprise.py
@@ -8896,7 +8960,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: aarch64-enterprise-ubuntu1804
-    compile_flags: --ssl --ocsp-stapling=off MONGO_DISTMOD=ubuntu1804 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl --ocsp-stapling=off MONGO_DISTMOD=ubuntu1804 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     test_flags: --excludeWithAnyTags=requires_ocsp_stapling
     resmoke_jobs_max: 4 # Avoid starting too many mongod's on ARM test servers
     has_packages: true
@@ -8945,7 +9009,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: aarch64-ubuntu1804
-    compile_flags: --ssl --ocsp-stapling=off MONGO_DISTMOD=ubuntu1804 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl --ocsp-stapling=off MONGO_DISTMOD=ubuntu1804 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     test_flags: --excludeWithAnyTags=requires_ocsp_stapling
     resmoke_jobs_max: 8 # Avoid starting too many mongod's on ARM test servers
     has_packages: true
@@ -9087,7 +9151,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: aarch64-enterprise-ubuntu2004
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu2004 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu2004 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     resmoke_jobs_max: 4 # Avoid starting too many mongod's on ARM test servers
     has_packages: true
     packager_script: packager_enterprise.py
@@ -9135,7 +9199,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: aarch64-ubuntu2004
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu2004 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=ubuntu2004 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     resmoke_jobs_max: 8 # Avoid starting too many mongod's on ARM test servers
     has_packages: true
     packager_script: packager.py
@@ -9386,7 +9450,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: aarch64-enterprise-amazon2
-    compile_flags: --ssl MONGO_DISTMOD=amazon2 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=amazon2 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     has_packages: true
     packager_script: packager_enterprise.py
     packager_arch: aarch64
@@ -9436,7 +9500,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: aarch64-amazon2
-    compile_flags: --ssl MONGO_DISTMOD=amazon2 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=amazon2 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     has_packages: true
     packager_script: packager.py
     packager_arch: aarch64
@@ -9609,7 +9673,7 @@ buildvariants:
   - name: burn_in_tests_gen
   - name: buildscripts_test
   - name: noPassthrough_gen
-  - name: powercycle_smoke
+  - name: powercycle_kill_mongod_smoke
   - name: server_discovery_and_monitoring_json_test_TG
   - name: server_selection_json_test_TG
   - name: compile_run_and_archive_dbtest_TG
@@ -9649,10 +9713,12 @@ buildvariants:
             featureFlagShardingFullDDLSupportTimestampedVersion: true,
             featureFlagWindowFunctions: true,
             featureFlagUseSecondaryDelaySecs: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
         --mongosSetParameters="{
             featureFlagTimeseriesCollection: true,
             featureFlagWindowFunctions: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
         --excludeWithAnyTags=incompatible_with_windows_tls
 
@@ -9720,9 +9786,6 @@ buildvariants:
     - name: sharding_ese_gen
     - name: snmp
     - name: unittest_shell_hang_analyzer_gen
-    - name: push
-      distros:
-        - rhel70-small
 
 - <<: *enterprise-windows-suggested-template
   name: enterprise-windows-all-feature-flags-suggested
@@ -9755,10 +9818,12 @@ buildvariants:
             featureFlagShardingFullDDLSupportTimestampedVersion: true,
             featureFlagWindowFunctions: true,
             featureFlagUseSecondaryDelaySecs: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
         --mongosSetParameters="{
             featureFlagTimeseriesCollection: true,
             featureFlagWindowFunctions: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
         --excludeWithAnyTags=incompatible_with_windows_tls
 
@@ -9874,7 +9939,71 @@ buildvariants:
   - name: .jstestfuzz !.initsync !.flow_control !.stepdowns
   - name: multiversion_gen
   - name: multiversion_auth_gen
-  - name: .powercycle
+  - name: powercycle_kill_mongod
+  - name: .query_fuzzer
+  - name: .read_write_concern
+  - name: replica_sets
+  - name: replica_sets_jscore_passthrough
+  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
+  - name: .sharding .txns
+  - name: .sharding .common !.op_query !.csrs
+  - name: .ssl
+  - name: .stitch
+  - name: .updatefuzzer
+  - name: push
+    distros:
+    - rhel70-small
+
+- name: enterprise-windows
+  display_name: "Enterprise Windows"
+  modules:
+    - enterprise
+  run_on:
+    - windows-64-vs2019-small
+  expansions:
+    exe: ".exe"
+    additional_package_targets: archive-mongocryptd archive-mongocryptd-debug msi archive-mh archive-mh-debug
+    content_type: application/zip
+    compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=win10
+    num_scons_link_jobs_available: 0.5
+    python: '/cygdrive/c/python/python37/python.exe'
+    ext: zip
+    scons_cache_scope: shared
+    multiversion_platform: windows
+    multiversion_edition: enterprise
+    jstestfuzz_num_generated_files: 35
+    target_resmoke_time: 20
+    max_sub_suites: 3
+    large_distro_name: windows-64-vs2019-large
+    push_path: windows
+    push_bucket: downloads.10gen.com
+    push_name: windows
+    push_arch: x86_64-enterprise
+    test_flags: *windows_common_test_excludes
+  tasks:
+  - name: compile_test_and_package_serial_TG
+    distros:
+    - windows-64-vs2019-large
+  - name: .aggfuzzer
+  - name: .aggregation !.auth !.encrypt !.unwind
+  - name: auth_gen
+  - name: .auth .gle
+  - name: causally_consistent_jscore_txns_passthrough
+  - name: .misc_js
+    # Some concurrency workloads require a lot of memory, so we use machines
+    # with more RAM for these suites.
+  - name: .concurrency !.ubsan !.no_txns !.kill_terminate !.common !.debug_only
+    distros:
+      - windows-64-vs2019-large
+  - name: .concurrency .common
+  - name: disk_wiredtiger
+  - name: free_monitoring
+  - name: .jscore .common !.auth
+  - name: jsonSchema
+  - name: .jstestfuzz !.initsync !.flow_control !.stepdowns
+  - name: multiversion_gen
+  - name: multiversion_auth_gen
+  - name: powercycle_kill_mongod
   - name: .query_fuzzer
   - name: .read_write_concern
   - name: replica_sets
@@ -10250,6 +10379,7 @@ buildvariants:
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
   - name: multiversion_gen
   - name: powercycle_smoke
+  - name: powercycle_kill_mongod_smoke
   - name: .query_fuzzer
   - name: .random_multiversion_ds
   - name: .read_write_concern .large
@@ -10326,10 +10456,12 @@ buildvariants:
             featureFlagShardingFullDDLSupportTimestampedVersion: true,
             featureFlagWindowFunctions: true,
             featureFlagUseSecondaryDelaySecs: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
         --mongosSetParameters="{
             featureFlagTimeseriesCollection: true,
             featureFlagWindowFunctions: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
   tasks:
   - name: compile_test_and_package_parallel_core_stream_TG
@@ -10353,6 +10485,7 @@ buildvariants:
   - name: .causally_consistent !.sharding
   - name: .change_streams
   - name: .misc_js
+  - name: concurrency_sharded_ddl_operations
   - name: .concurrency !.large !.ubsan !.no_txns !.debug_only
   - name: .concurrency .large !.ubsan !.no_txns !.debug_only
     distros:
@@ -10455,6 +10588,7 @@ buildvariants:
     distros:
     - rhel62-medium
   - name: .aggregation !.no_async !.secondary_reads !.read_write_concern !.sharded !.unwind !aggregation_disabled_optimization
+  - name: .concurrency !.large !.ubsan !.no_txns !.debug_only !.sharded !.repl
   - name: .jscore !.sharding !.decimal !.compat !cst_jscore_passthrough
   - name: noPassthrough_gen
     distros:
@@ -11055,7 +11189,7 @@ buildvariants:
     push_bucket: downloads.10gen.com
     push_name: linux
     push_arch: aarch64-enterprise-rhel82
-    compile_flags: --ssl MONGO_DISTMOD=rhel82 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=rhel82 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     has_packages: true
     packager_script: packager_enterprise.py
     packager_arch: aarch64
@@ -11381,7 +11515,7 @@ buildvariants:
     push_bucket: downloads.mongodb.org
     push_name: linux
     push_arch: aarch64-rhel82
-    compile_flags: --ssl MONGO_DISTMOD=rhel82 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=armv8-a+crc -mtune=generic" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=rhel82 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     has_packages: true
     packager_script: packager.py
     packager_arch: aarch64
@@ -11445,7 +11579,7 @@ buildvariants:
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
     # We need to compensate for SMT8 setting the cpu count very high and lower the amount of parallelism down
-    compile_flags: --ssl MONGO_DISTMOD=rhel81 -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) CCFLAGS="-mcpu=power8 -mtune=power8 -mcmodel=medium" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=rhel81 -j$(echo "$(grep -c processor /proc/cpuinfo)/2" | bc) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     resmoke_jobs_factor: 0.25
     has_packages: true
     packager_script: packager_enterprise.py
@@ -11496,7 +11630,7 @@ buildvariants:
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
     release_buid: true
-    compile_flags: --ssl MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=rhel72 -j3 --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     resmoke_jobs_max: 2
     has_packages: true
     packager_script: packager_enterprise.py
@@ -11526,7 +11660,7 @@ buildvariants:
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
     release_buid: true
-    compile_flags: --ssl MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=rhel72 -j3 --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     resmoke_jobs_max: 2
     has_packages: true
     packager_script: packager_enterprise.py
@@ -11577,7 +11711,7 @@ buildvariants:
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
     release_buid: true
-    compile_flags: --ssl MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=rhel72 -j3 --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     resmoke_jobs_max: 2
     has_packages: true
     packager_script: packager_enterprise.py
@@ -11600,10 +11734,12 @@ buildvariants:
             featureFlagShardingFullDDLSupportTimestampedVersion: true,
             featureFlagWindowFunctions: true,
             featureFlagUseSecondaryDelaySecs: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
         --mongosSetParameters="{
             featureFlagTimeseriesCollection: true,
             featureFlagWindowFunctions: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
   tasks:
   - name: compile_test_and_package_serial_TG
@@ -11618,7 +11754,7 @@ buildvariants:
   run_on:
   - rhel72-zseries-test
   expansions:
-    compile_flags: --ssl MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --ssl MONGO_DISTMOD=rhel72 -j3 --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     has_packages: true
     packager_script: packager.py
     packager_arch: s390x
@@ -11693,8 +11829,8 @@ buildvariants:
     distros:
     - ubuntu1604-small
 
-- name: enterprise-ubuntu-dynamic-1804-clang-tidy-suggested
-  display_name: "* Enterprise Clang Tidy"
+- name: enterprise-ubuntu-dynamic-1804-clang-tidy-required
+  display_name: "! Enterprise Clang Tidy"
   batchtime: 240 # 4 hours
   modules:
   - enterprise
@@ -12229,7 +12365,7 @@ buildvariants:
   stepback: false
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
-    compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel72 -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    compile_flags: --dbg=on --opt=on --ssl MONGO_DISTMOD=rhel72 -j3 --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     resmoke_jobs_max: 2
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling
   tasks:
@@ -12340,7 +12476,6 @@ buildvariants:
   run_on:
   - ubuntu1804-build
   stepback: false
-  batchtime: 240 # 4 hours
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
     lang_environment: LANG=C
@@ -12367,10 +12502,12 @@ buildvariants:
             featureFlagShardingFullDDLSupportTimestampedVersion: true,
             featureFlagWindowFunctions: true,
             featureFlagUseSecondaryDelaySecs: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
         --mongosSetParameters="{
             featureFlagTimeseriesCollection: true,
             featureFlagWindowFunctions: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
   tasks:
   - name: compile_test_and_package_serial_TG
@@ -12510,7 +12647,6 @@ buildvariants:
 - <<: *ubuntu1804-debug-ubsan-template
   name: ubuntu1804-debug-ubsan-all-feature-flags
   display_name: "~ Shared Library UBSAN Enterprise Ubuntu 18.04 DEBUG (all feature flags)"
-  batchtime: 240 # 4 hours
   modules:
   - enterprise
   run_on:
@@ -12537,10 +12673,12 @@ buildvariants:
             featureFlagShardingFullDDLSupportTimestampedVersion: true,
             featureFlagWindowFunctions: true,
             featureFlagUseSecondaryDelaySecs: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
         --mongosSetParameters="{
             featureFlagTimeseriesCollection: true,
             featureFlagWindowFunctions: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
     multiversion_platform: ubuntu1804
     multiversion_edition: enterprise
@@ -12651,10 +12789,12 @@ buildvariants:
             featureFlagShardingFullDDLSupportTimestampedVersion: true,
             featureFlagWindowFunctions: true,
             featureFlagUseSecondaryDelaySecs: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
         --mongosSetParameters="{
             featureFlagTimeseriesCollection: true,
             featureFlagWindowFunctions: true,
+            featureFlagChangeStreamsOptimization: true,
         }"
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
     hang_analyzer_dump_core: false
@@ -12746,7 +12886,6 @@ buildvariants:
 
 - name: enterprise-ubuntu-no-latch-1804-64-bit
   display_name: "~ Enterprise Ubuntu 18.04 DEBUG (Unoptimized)"
-  batchtime: 1440 # 1 day
   modules:
   - enterprise
   expansions:

@@ -103,7 +103,9 @@ env.Library(
         'auth_impl_internal',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/catalog/collection_catalog',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/db_raii',
     ]
 )
 
@@ -150,6 +152,7 @@ env.Library(
 env.Library(
     target='auth_impl_internal',
     source=[
+        'access_checks.idl',
         'authorization_contract.idl',
         'authorization_manager_impl.cpp',
         'authorization_session_impl.cpp',
@@ -174,6 +177,7 @@ env.Library(
         '$BUILD_DIR/mongo/util/net/ssl_types',
         'address_restriction',
         'auth',
+        'auth_umc',
         'authorization_manager_global',
         'authprivilege',
         'builtin_roles',
@@ -221,10 +225,25 @@ env.Library(
         'action_set.cpp',
         'action_type.cpp',
         'action_type.idl',
-        'impersonation_session.cpp',
+        'authorization_contract.cpp',
         'privilege.cpp',
         'privilege_parser.cpp',
         'resource_pattern.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/common',
+    ],
+)
+
+env.Library(
+    target='auth_umc',
+    source=[
+        'impersonation_session.cpp',
         'user_management_commands_parser.cpp',
     ],
     LIBDEPS=[
@@ -233,6 +252,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/common',
         'address_restriction',
         'auth',
+        'authprivilege',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/rpc/metadata_impersonated_user',
@@ -454,6 +474,7 @@ env.CppUnitTest(
     source=[
         'action_set_test.cpp',
         'address_restriction_test.cpp',
+        'authorization_contract_test.cpp',
         'auth_op_observer_test.cpp',
         'authorization_manager_test.cpp',
         'authorization_session_for_test.cpp',

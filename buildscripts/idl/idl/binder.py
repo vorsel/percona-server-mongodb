@@ -31,7 +31,7 @@
 import collections
 import re
 import typing
-from typing import Type, TypeVar, cast, List, Set, Union
+from typing import Type, TypeVar, cast, List, Set, Union, Optional
 
 from . import ast
 from . import bson
@@ -549,6 +549,68 @@ def _bind_command_reply_type(ctxt, parsed_spec, command):
     return ast_field
 
 
+def resolve_enum_value(ctxt, syntax_enum, name):
+    # type: (errors.ParserContext, syntax.Enum, str) -> syntax.EnumValue
+    """Resolve a single enum value in an enum."""
+
+    for value in syntax_enum.values:
+        if value.value == name:
+            return value
+
+    ctxt.add_unknown_enum_value(syntax_enum, "AccessCheck", name)
+
+    return None
+
+
+def _bind_single_check(ctxt, parsed_spec, access_check):
+    # type: (errors.ParserContext, syntax.IDLSpec, syntax.AccessCheck) -> ast.AccessCheck
+    """Bind a single access_check."""
+
+    ast_access_check = ast.AccessCheck(access_check.file_name, access_check.line,
+                                       access_check.column)
+
+    # Look up the enum for "AccessCheck" in the symbol table
+    access_check_enum = parsed_spec.symbols.resolve_type_from_name(
+        ctxt, access_check, "access_check.simple", "AccessCheck")
+
+    if access_check_enum is None:
+        # Resolution failed, we've recorded an error.
+        return None
+
+    if not isinstance(access_check_enum, syntax.Enum):
+        ctxt.add_unknown_type_error(access_check, "AccessCheck", "enum")
+        return None
+
+    enum_value = resolve_enum_value(ctxt, cast(syntax.Enum, access_check_enum), access_check.check)
+    if not enum_value:
+        return None
+
+    ast_access_check.check = enum_value.name
+
+    return ast_access_check
+
+
+def _bind_access_check(ctxt, parsed_spec, command):
+    # type: (errors.ParserContext, syntax.IDLSpec, syntax.Command) -> Optional[List[ast.AccessCheck]]
+    """Bind the access_check field in a command."""
+    if not command.access_check:
+        return None
+
+    access_check = command.access_check
+
+    if access_check.none:
+        return []
+
+    if access_check.simple:
+        ast_access_check = _bind_single_check(ctxt, parsed_spec, access_check.simple)
+        if not ast_access_check:
+            return None
+
+        return [ast_access_check]
+
+    return None
+
+
 def _bind_command(ctxt, parsed_spec, command):
     # type: (errors.ParserContext, syntax.IDLSpec, syntax.Command) -> ast.Command
     """
@@ -568,6 +630,8 @@ def _bind_command(ctxt, parsed_spec, command):
     _inject_hidden_command_fields(command)
 
     _bind_struct_common(ctxt, parsed_spec, command, ast_command)
+
+    ast_command.access_checks = _bind_access_check(ctxt, parsed_spec, command)
 
     ast_command.namespace = command.namespace
 
@@ -1055,7 +1119,7 @@ def _validate_enum_int(ctxt, idl_enum):
     min_value = min(int_values_set)
     max_value = max(int_values_set)
 
-    valid_int = {x for x in range(min_value, max_value + 1)}
+    valid_int = set(range(min_value, max_value + 1))
 
     if valid_int != int_values_set:
         ctxt.add_enum_non_continuous_range_error(idl_enum, idl_enum.name)

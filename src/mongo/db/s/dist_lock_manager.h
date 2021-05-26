@@ -57,15 +57,11 @@ namespace mongo {
 class DistLockManager {
 public:
     // Default timeout which will be used if one is not passed to the lock method.
-    static const Seconds kDefaultLockTimeout;
+    static const Minutes kDefaultLockTimeout;
 
     // Timeout value, which specifies that if the lock is not available immediately, no attempt
     // should be made to wait for it to become free.
     static const Milliseconds kSingleLockAttemptTimeout;
-
-    // DistLock to ensure DDL operations see an stable sharding routing info format.
-    static constexpr StringData kShardingRoutingInfoFormatStabilityLockName =
-        "ShardingRoutingInfoFormatStability"_sd;
 
     /**
      * RAII type for the local lock.
@@ -102,6 +98,7 @@ public:
         ScopedDistLock(ScopedDistLock&& other);
 
         ScopedDistLock moveToAnotherThread();
+        void assignNewOpCtx(OperationContext* opCtx);
 
     private:
         OperationContext* _opCtx;

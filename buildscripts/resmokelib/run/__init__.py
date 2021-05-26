@@ -269,6 +269,7 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
                                suite.test_kind, suite.get_display_name(), config.RANDOM_SEED)
         random.shuffle(suite.tests)
 
+    # pylint: disable=inconsistent-return-statements
     def _get_suites(self):
         """Return the list of suites for this resmoke invocation."""
         try:
@@ -894,6 +895,13 @@ class RunPlugin(PluginInterface):
             "--staggerJobs", action="store", dest="stagger_jobs", choices=("on", "off"),
             metavar="ON|OFF", help=("Enables or disables the stagger of launching resmoke jobs."
                                     " Defaults to %%default."))
+
+        internal_options.add_argument(
+            "--exportMongodConfig", dest="export_mongod_config", choices=("off", "regular",
+                                                                          "detailed"),
+            help=("Exports a yaml containing the history of each mongod config option to"
+                  " {nodeName}_config.yml."
+                  " Defaults to 'off'. A 'detailed' export will include locations of accesses."))
 
         evergreen_options = parser.add_argument_group(
             title=_EVERGREEN_ARGUMENT_TITLE, description=(

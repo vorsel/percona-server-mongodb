@@ -78,6 +78,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
+#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/internal_plans.h"
@@ -93,6 +94,8 @@
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/views/view_catalog.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/executor/async_request_executor.h"
 #include "mongo/logv2/log.h"
@@ -111,6 +114,48 @@ using std::stringstream;
 using std::unique_ptr;
 
 namespace {
+
+/**
+ * Returns a CollMod on the underlying buckets collection of the time-series collection.
+ * Returns null if 'origCmd' is not for a time-series collection.
+ */
+std::unique_ptr<CollMod> makeTimeseriesCollModCommand(OperationContext* opCtx,
+                                                      const CollMod& origCmd) {
+    const auto& origNs = origCmd.getNamespace();
+
+    auto timeseriesOptions = timeseries::getTimeseriesOptions(opCtx, origNs);
+
+    // Return early with null if we are not working with a time-series collection.
+    if (!timeseriesOptions) {
+        return {};
+    }
+
+    auto index = origCmd.getIndex();
+    if (index && index->getKeyPattern()) {
+        auto bucketsIndexSpecWithStatus = timeseries::convertTimeseriesIndexSpecToBucketsIndexSpec(
+            *timeseriesOptions, *index->getKeyPattern());
+
+        uassert(ErrorCodes::IndexNotFound,
+                str::stream() << bucketsIndexSpecWithStatus.getStatus().toString()
+                              << " Command request: " << redact(origCmd.toBSON({})),
+                bucketsIndexSpecWithStatus.isOK());
+
+        index->setKeyPattern(std::move(bucketsIndexSpecWithStatus.getValue()));
+    }
+
+    auto ns = origNs.makeTimeseriesBucketsNamespace();
+    auto cmd = std::make_unique<CollMod>(ns);
+    cmd->setIndex(index);
+    cmd->setValidator(origCmd.getValidator());
+    cmd->setValidationLevel(origCmd.getValidationLevel());
+    cmd->setValidationAction(origCmd.getValidationAction());
+    cmd->setViewOn(origCmd.getViewOn());
+    cmd->setPipeline(origCmd.getPipeline());
+    cmd->setRecordPreImages(origCmd.getRecordPreImages());
+    cmd->setClusteredIndex(origCmd.getClusteredIndex());
+
+    return cmd;
+}
 
 class CmdDropDatabase : public DropDatabaseCmdVersion1Gen<CmdDropDatabase> {
 public:
@@ -754,8 +799,28 @@ public:
                               const BSONObj& cmdObj,
                               const RequestParser& requestParser,
                               BSONObjBuilder& result) final {
-        auto cmd = requestParser.request();
-        uassertStatusOK(collMod(opCtx, cmd.getNamespace(), cmd.toBSON(BSONObj()), &result));
+        const auto* cmd = &requestParser.request();
+
+        // If the target namespace refers to a time-series collection, we will redirect the
+        // collection modification request to the underlying bucket collection.
+        // Aliasing collMod on a time-series collection in this manner has a few advantages:
+        // - It supports modifying the expireAfterSeconds setting (which is also a collection
+        //   creation option).
+        // - It avoids any accidental changes to critical view-specific properties of the
+        //   time-series collection, which are important for maintaining the view-bucket
+        //   relationship.
+        // - It disallows hiding/unhiding indexes on the time-series collection due to a
+        //   restriction on system collections. TODO(SERVER-54646): Update this comment.
+        //
+        // 'timeseriesCmd' is null if the request namespace does not refer to a time-series
+        // collection. Otherwise, transforms the user time-series index request to one on the
+        // underlying bucket.
+        auto timeseriesCmd = makeTimeseriesCollModCommand(opCtx, requestParser.request());
+        if (timeseriesCmd) {
+            cmd = timeseriesCmd.get();
+        }
+
+        uassertStatusOK(collMod(opCtx, cmd->getNamespace(), cmd->toBSON(BSONObj()), &result));
         return true;
     }
 

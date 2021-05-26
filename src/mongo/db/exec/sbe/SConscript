@@ -80,6 +80,7 @@ sbeEnv.Library(
 env.Library(
     target='query_sbe_storage',
     source=[
+        'stages/collection_helpers.cpp',
         'stages/ix_scan.cpp',
         'stages/scan.cpp',
         ],
@@ -134,6 +135,7 @@ env.CppUnitTest(
         'expressions/sbe_mod_expression_test.cpp',
         'expressions/sbe_regex_test.cpp',
         'expressions/sbe_replace_one_expression_test.cpp',
+        'expressions/sbe_reverse_array_builtin_test.cpp',
         'expressions/sbe_set_expressions_test.cpp',
         'expressions/sbe_shard_filter_builtin_test.cpp',
         'expressions/sbe_to_upper_to_lower_test.cpp',
@@ -142,6 +144,7 @@ env.CppUnitTest(
         'parser/sbe_parser_test.cpp',
         'sbe_filter_test.cpp',
         'sbe_hash_agg_test.cpp',
+        'sbe_hash_join_test.cpp',
         'sbe_key_string_test.cpp',
         'sbe_limit_skip_test.cpp',
         'sbe_math_builtins_test.cpp',

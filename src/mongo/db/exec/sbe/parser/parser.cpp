@@ -138,8 +138,9 @@ static constexpr auto kSyntax = R"(
                                    MKOBJ_FLAG # Return old object
                                    OPERATOR # child
 
-                GROUP <- 'group' IDENT_LIST PROJECT_LIST OPERATOR
-                HJOIN <- 'hj' LEFT RIGHT
+                GROUP <- 'group' IDENT_LIST PROJECT_LIST OPERATOR ( EXPR )? # optional collator
+                HJOIN <- 'hj' ( EXPR )? # optional collator
+                              LEFT RIGHT
                 LEFT <- 'left' IDENT_LIST IDENT_LIST OPERATOR
                 RIGHT <- 'right' IDENT_LIST IDENT_LIST OPERATOR
 
@@ -978,21 +979,38 @@ void Parser::walkMkObj(AstQuery& ast) {
 void Parser::walkGroup(AstQuery& ast) {
     walkChildren(ast);
 
+    boost::optional<value::SlotId> collatorSlot;
+    if (ast.nodes.size() == 3) {
+        collatorSlot = lookupSlot(std::move(ast.nodes[2]->identifier));
+    }
+
     ast.stage = makeS<HashAggStage>(std::move(ast.nodes[2]->stage),
                                     lookupSlots(std::move(ast.nodes[0]->identifiers)),
                                     lookupSlots(std::move(ast.nodes[1]->projects)),
+                                    collatorSlot,
                                     getCurrentPlanNodeId());
 }
 
 void Parser::walkHashJoin(AstQuery& ast) {
     walkChildren(ast);
+
+    boost::optional<value::SlotId> collatorSlot;
+    auto outerNode = ast.nodes[0];
+    auto innerNode = ast.nodes[1];
+    if (ast.nodes.size() == 3) {
+        outerNode = ast.nodes[1];
+        innerNode = ast.nodes[2];
+        collatorSlot = lookupSlot(ast.nodes[0]->identifier);
+    }
+
     ast.stage =
-        makeS<HashJoinStage>(std::move(ast.nodes[0]->nodes[2]->stage),          // outer
-                             std::move(ast.nodes[1]->nodes[2]->stage),          // inner
-                             lookupSlots(ast.nodes[0]->nodes[0]->identifiers),  // outer conditions
-                             lookupSlots(ast.nodes[0]->nodes[1]->identifiers),  // outer projections
-                             lookupSlots(ast.nodes[1]->nodes[0]->identifiers),  // inner conditions
-                             lookupSlots(ast.nodes[1]->nodes[1]->identifiers),  // inner projections
+        makeS<HashJoinStage>(std::move(outerNode->nodes[2]->stage),          // outer
+                             std::move(innerNode->nodes[2]->stage),          // inner
+                             lookupSlots(outerNode->nodes[0]->identifiers),  // outer conditions
+                             lookupSlots(outerNode->nodes[1]->identifiers),  // outer projections
+                             lookupSlots(innerNode->nodes[0]->identifiers),  // inner conditions
+                             lookupSlots(innerNode->nodes[1]->identifiers),  // inner projections
+                             collatorSlot,                                   // collator
                              getCurrentPlanNodeId());
 }
 
@@ -1691,16 +1709,20 @@ std::unique_ptr<PlanStage> Parser::parse(OperationContext* opCtx,
     return std::move(ast->stage);
 }
 
-NamespaceStringOrUUID Parser::getCollectionUuid(const std::string& collName) {
-    const auto ns = collName.find('.') == std::string::npos ? NamespaceString(_defaultDb, collName)
-                                                            : NamespaceString(collName);
-    if (_opCtx) {
-        AutoGetCollectionForRead collection(_opCtx, ns);
-        if (collection) {
-            return NamespaceStringOrUUID{ns.db().toString(), collection->uuid()};
-        }
+CollectionUUID Parser::getCollectionUuid(const std::string& collName) {
+    if (!_opCtx) {
+        // The SBE plan cannot actually run without a valid UUID, but it's useful to allow the
+        // parser to run in isolation for unit testing.
+        auto uuid = UUID::parse("00000000-0000-0000-0000-000000000000");
+        invariant(uuid.isOK());
+        return uuid.getValue();
     }
-    return ns;
+
+    auto uuid = CollectionCatalog::get(_opCtx)->lookupUUIDByNSS(_opCtx, NamespaceString{collName});
+    uassert(5162900,
+            str::stream() << "SBE command parser could not find collection: " << collName,
+            uuid);
+    return *uuid;
 }
 
 PlanNodeId Parser::getCurrentPlanNodeId() {

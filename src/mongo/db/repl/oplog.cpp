@@ -661,7 +661,7 @@ void createOplog(OperationContext* opCtx,
     });
 
     createSlimOplogView(opCtx, ctx.db());
-    tenant_migration_util::createRetryableWritesView(opCtx, ctx.db());
+    tenant_migration_util::createOplogViewForTenantMigrations(opCtx, ctx.db());
 
     /* sync here so we don't get any surprising lag later when we try to sync */
     service->getStorageEngine()->flushAllFiles(opCtx, /*callerHoldsReadLock*/ false);
@@ -748,6 +748,12 @@ const StringMap<ApplyOpMetadata> kOpsMap = {
                                                  cmdWithoutIdIndex,
                                                  allowRenameOutOfTheWay,
                                                  idIndexElem.Obj());
+          }
+
+          // Collections clustered by _id do not need _id indexes.
+          if (auto clusteredElem = cmd["clusteredIndex"]) {
+              return createCollectionForApplyOps(
+                  opCtx, nss.db().toString(), ui, cmd, allowRenameOutOfTheWay, boost::none);
           }
 
           // No _id index spec was provided, so we should build a v:1 _id index.

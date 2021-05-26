@@ -36,7 +36,6 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_executor.h"
-#include "mongo/db/repl/tenant_migration_committed_info.h"
 #include "mongo/db/repl/tenant_migration_recipient_access_blocker.h"
 #include "mongo/logv2/log.h"
 #include "mongo/util/cancelation.h"
@@ -45,9 +44,19 @@
 
 namespace mongo {
 
+namespace {
+
+MONGO_FAIL_POINT_DEFINE(tenantMigrationRecipientNotRejectReads);
+
+}
+
 TenantMigrationRecipientAccessBlocker::TenantMigrationRecipientAccessBlocker(
-    ServiceContext* serviceContext, std::string tenantId, std::string donorConnString)
+    ServiceContext* serviceContext,
+    UUID migrationId,
+    std::string tenantId,
+    std::string donorConnString)
     : _serviceContext(serviceContext),
+      _migrationId(migrationId),
       _tenantId(std::move(tenantId)),
       _donorConnString(std::move(donorConnString)) {
     _asyncBlockingOperationsExecutor = TenantMigrationAccessBlockerExecutor::get(serviceContext)
@@ -69,6 +78,10 @@ Status TenantMigrationRecipientAccessBlocker::waitUntilCommittedOrAborted(
 
 SharedSemiFuture<void> TenantMigrationRecipientAccessBlocker::getCanReadFuture(
     OperationContext* opCtx) {
+    if (MONGO_unlikely(tenantMigrationRecipientNotRejectReads.shouldFail())) {
+        return SharedSemiFuture<void>();
+    }
+
     auto readConcernArgs = repl::ReadConcernArgs::get(opCtx);
     auto atClusterTime = [opCtx, &readConcernArgs]() -> boost::optional<Timestamp> {
         if (auto atClusterTime = readConcernArgs.getArgsAtClusterTime()) {
@@ -149,6 +162,10 @@ std::string TenantMigrationRecipientAccessBlocker::_stateToString(State state) c
         default:
             MONGO_UNREACHABLE;
     }
+}
+
+UUID TenantMigrationRecipientAccessBlocker::getMigrationId() const {
+    return _migrationId;
 }
 
 BSONObj TenantMigrationRecipientAccessBlocker::getDebugInfo() const {

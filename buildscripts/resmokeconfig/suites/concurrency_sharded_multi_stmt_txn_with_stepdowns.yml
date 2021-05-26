@@ -203,6 +203,11 @@ selector:
   - operations_longer_than_stepdown_interval_in_txns
   # mongos has no system.profile collection.
   - requires_profiling
+  # mongos does not support inserts on timeseries collections
+  - requires_timeseries
+  - requires_full_ddl_support
+  - does_not_support_transactions
+  - does_not_support_stepdowns
 
 executor:
   archive:
@@ -223,7 +228,6 @@ executor:
           runningWithShardStepdowns: true
           traceExceptions: false
           useStepdownPermittedFile: true
-          usingReplicaSetShards: true
   hooks:
   - class: ContinuousStepdown
     config_stepdown: true

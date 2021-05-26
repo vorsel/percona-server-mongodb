@@ -84,8 +84,8 @@ const NamespaceString NamespaceString::kShardConfigDatabasesNamespace(NamespaceS
                                                                       "cache.databases");
 const NamespaceString NamespaceString::kKeysCollectionNamespace(NamespaceString::kAdminDb,
                                                                 "system.keys");
-const NamespaceString NamespaceString::kExternalKeysCollectionNamespace(
-    NamespaceString::kAdminDb, "system.external_validation_keys");
+const NamespaceString NamespaceString::kExternalKeysCollectionNamespace(NamespaceString::kConfigDb,
+                                                                        "external_validation_keys");
 const NamespaceString NamespaceString::kRsOplogNamespace(NamespaceString::kLocalDb, "oplog.rs");
 const NamespaceString NamespaceString::kSystemReplSetNamespace(NamespaceString::kLocalDb,
                                                                "system.replset");
@@ -101,6 +101,9 @@ const NamespaceString NamespaceString::kDonorReshardingOperationsNamespace(
 
 const NamespaceString NamespaceString::kRecipientReshardingOperationsNamespace(
     NamespaceString::kConfigDb, "localReshardingOperations.recipient");
+
+const NamespaceString NamespaceString::kShardingDDLCoordinatorsNamespace(
+    NamespaceString::kConfigDb, "system.sharding_ddl_coordinators");
 
 const NamespaceString NamespaceString::kConfigSettingsNamespace(NamespaceString::kConfigDb,
                                                                 "settings");
@@ -129,8 +132,6 @@ bool NamespaceString::isLegalClientSystemNS() const {
             return true;
         if (coll() == kKeysCollectionNamespace.coll())
             return true;
-        if (coll() == kExternalKeysCollectionNamespace.coll())
-            return true;
         if (coll() == "system.backup_users")
             return true;
     } else if (db() == kConfigDb) {
@@ -139,6 +140,8 @@ bool NamespaceString::isLegalClientSystemNS() const {
         if (coll() == kIndexBuildEntryNamespace.coll())
             return true;
         if (coll().find(".system.resharding.") != std::string::npos)
+            return true;
+        if (coll() == kShardingDDLCoordinatorsNamespace.coll())
             return true;
     } else if (db() == kLocalDb) {
         if (coll() == kSystemReplSetNamespace.coll())

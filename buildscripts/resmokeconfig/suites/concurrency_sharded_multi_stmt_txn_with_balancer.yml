@@ -153,6 +153,10 @@ selector:
   - catches_command_failures
   # mongos has no system.profile collection.
   - requires_profiling
+  # mongos does not support inserts on timeseries collections
+  - requires_timeseries
+  - requires_full_ddl_support
+  - does_not_support_transactions
 
 executor:
   archive:
@@ -169,7 +173,6 @@ executor:
           runInsideTransaction: true
           runningWithSessions: true
           traceExceptions: false
-          usingReplicaSetShards: true
   hooks:
   - class: CheckReplDBHashInBackground
   - class: CheckReplDBHash

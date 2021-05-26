@@ -117,6 +117,21 @@ std::pair<value::TypeTags, value::Value> genericCompare(
             auto result = op(value::bitcastTo<int32_t>(val), 0);
             return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
         }
+    } else if (isObjectId(lhsTag) && isObjectId(rhsTag)) {
+        auto lhsObjId = lhsTag == value::TypeTags::ObjectId
+            ? value::getObjectIdView(lhsValue)->data()
+            : value::bitcastTo<uint8_t*>(lhsValue);
+        auto rhsObjId = rhsTag == value::TypeTags::ObjectId
+            ? value::getObjectIdView(rhsValue)->data()
+            : value::bitcastTo<uint8_t*>(rhsValue);
+        auto threeWayResult = memcmp(lhsObjId, rhsObjId, sizeof(value::ObjectIdType));
+        auto booleanResult = op(threeWayResult, 0);
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(booleanResult)};
+    } else if (lhsTag == value::TypeTags::bsonRegex && rhsTag == value::TypeTags::bsonRegex) {
+        auto lhsRegex = value::getBsonRegexView(lhsValue);
+        auto rhsRegex = value::getBsonRegexView(rhsValue);
+        auto result = op(lhsRegex.dataView(), rhsRegex.dataView());
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
     }
 
     return {value::TypeTags::Nothing, 0};
@@ -298,6 +313,7 @@ enum class Builtin : uint8_t {
     shardFilter,
     extractSubArray,
     isArrayEmpty,
+    reverseArray,
     dateAdd,
     hasNullBytes,
     getRegexPattern,
@@ -711,6 +727,7 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinShardFilter(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinExtractSubArray(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinIsArrayEmpty(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinReverseArray(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinDateAdd(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinHasNullBytes(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinGetRegexPattern(ArityType arity);

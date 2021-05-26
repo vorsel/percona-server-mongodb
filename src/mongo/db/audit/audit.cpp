@@ -655,18 +655,14 @@ namespace audit {
         }
     }
 
-    void logAuthentication(Client* client,
-                           StringData mechanism,
-                           const UserName& user,
-                           ErrorCodes::Error result) {
+    void logAuthentication(Client* client, const AuthenticateEvent& event) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("user" << user.getUser() <<
-                                    "db" << user.getDB() <<
-                                    "mechanism" << mechanism);
-        _auditEvent(client, "authenticate", params, result, false);
+        const BSONObj params = BSON("user" << event.getUser() << "db" << event.getDatabase()
+                                           << "mechanism" << event.getMechanism());
+        _auditEvent(client, "authenticate", params, event.getResult(), false);
     }
 
     void logCommandAuthzCheck(Client* client,
@@ -832,29 +828,27 @@ namespace audit {
     void logCreateIndex(Client* client,
                         const BSONObj* indexSpec,
                         StringData indexname,
-                        StringData nsname) {
+                        const NamespaceString& nsname) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("ns" << nsname <<
-                                    "indexName" << indexname <<
-                                    "indexSpec" << *indexSpec);
+        const BSONObj params =
+            BSON("ns" << nsname.ns() << "indexName" << indexname << "indexSpec" << *indexSpec);
         _auditEvent(client, "createIndex", params);
     }
 
-    void logCreateCollection(Client* client,
-                             StringData nsname) { 
+    void logCreateCollection(Client* client, const NamespaceString& nsname) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("ns" << nsname);
+        const BSONObj params = BSON("ns" << nsname.ns());
         _auditEvent(client, "createCollection", params);
     }
 
     void logCreateView(Client* client,
-                       StringData nsname,
+                       const NamespaceString& nsname,
                        StringData viewOn,
                        BSONArray pipeline,
                        ErrorCodes::Error code) {
@@ -862,16 +856,17 @@ namespace audit {
             return;
         }
 
-        const BSONObj params = BSON("ns" << nsname << "viewOn" << viewOn << "pipeline" << pipeline);
+        const BSONObj params =
+            BSON("ns" << nsname.ns() << "viewOn" << viewOn << "pipeline" << pipeline);
         _auditEvent(client, "createView", params, code);
     }
 
-    void logImportCollection(Client* client, StringData nsname) {
+    void logImportCollection(Client* client, const NamespaceString& nsname) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("ns" << nsname);
+        const BSONObj params = BSON("ns" << nsname.ns());
         _auditEvent(client, "importCollection", params);
     }
 
@@ -885,29 +880,26 @@ namespace audit {
         _auditEvent(client, "createDatabase", params);
     }
 
-    void logDropIndex(Client* client,
-                      StringData indexname,
-                      StringData nsname) {
+    void logDropIndex(Client* client, StringData indexname, const NamespaceString& nsname) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("ns" << nsname << "indexName" << indexname);
+        const BSONObj params = BSON("ns" << nsname.ns() << "indexName" << indexname);
         _auditEvent(client, "dropIndex", params);
     }
 
-    void logDropCollection(Client* client,
-                           StringData nsname) { 
+    void logDropCollection(Client* client, const NamespaceString& nsname) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params = BSON("ns" << nsname);
+        const BSONObj params = BSON("ns" << nsname.ns());
         _auditEvent(client, "dropCollection", params);
     }
 
     void logDropView(Client* client,
-                     StringData nsname,
+                     const NamespaceString& nsname,
                      StringData viewOn,
                      const std::vector<BSONObj>& pipeline,
                      ErrorCodes::Error code) {
@@ -916,7 +908,7 @@ namespace audit {
         }
 
         BSONObjBuilder params;
-        params.append("ns", nsname);
+        params.append("ns", nsname.ns());
         params.append("viewOn", viewOn);
         params.append("pipeline", pipeline);
         _auditEvent(client, "dropView", params.done(), code);

@@ -565,6 +565,7 @@ calloc
 cas
 catfmt
 cb
+cbt
 ccc
 ccr
 cd
@@ -1314,6 +1315,7 @@ sx
 sy
 sys
 syscall
+syscrypto
 sysinfo
 sz
 t's

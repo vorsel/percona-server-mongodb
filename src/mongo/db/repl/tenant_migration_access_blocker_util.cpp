@@ -72,6 +72,13 @@ std::shared_ptr<TenantMigrationDonorAccessBlocker> getTenantMigrationDonorAccess
             .getTenantMigrationAccessBlockerForTenantId(tenantId));
 }
 
+std::shared_ptr<TenantMigrationRecipientAccessBlocker> getTenantMigrationRecipientAccessBlocker(
+    ServiceContext* const serviceContext, StringData tenantId) {
+    return checked_pointer_cast<TenantMigrationRecipientAccessBlocker>(
+        TenantMigrationAccessBlockerRegistry::get(serviceContext)
+            .getTenantMigrationAccessBlockerForTenantId(tenantId));
+}
+
 TenantMigrationDonorDocument parseDonorStateDocument(const BSONObj& doc) {
     auto donorStateDoc =
         TenantMigrationDonorDocument::parse(IDLParserErrorContext("donorStateDoc"), doc);
@@ -123,28 +130,29 @@ TenantMigrationDonorDocument parseDonorStateDocument(const BSONObj& doc) {
     return donorStateDoc;
 }
 
-void checkIfCanReadOrBlock(OperationContext* opCtx, StringData dbName) {
+SemiFuture<void> checkIfCanReadOrBlock(OperationContext* opCtx, StringData dbName) {
     auto mtab = TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
                     .getTenantMigrationAccessBlockerForDbName(dbName);
 
     if (!mtab) {
-        return;
+        return Status::OK();
     }
 
     // Source to cancel the timeout if the operation completed in time.
     CancelationSource cancelTimeoutSource;
-    std::vector<ExecutorFuture<void>> futures;
 
-    auto executor = mtab->getAsyncBlockingOperationsExecutor();
-    futures.emplace_back(mtab->getCanReadFuture(opCtx).semi().thenRunOn(executor));
+    auto canReadFuture = mtab->getCanReadFuture(opCtx);
 
     // Optimisation: if the future is already ready, we are done.
-    if (futures[0].isReady()) {
-        auto status = futures[0].getNoThrow();
+    if (canReadFuture.isReady()) {
+        auto status = canReadFuture.getNoThrow();
         mtab->recordTenantMigrationError(status);
-        uassertStatusOK(status);
-        return;
+        return status;
     }
+
+    auto executor = mtab->getAsyncBlockingOperationsExecutor();
+    std::vector<ExecutorFuture<void>> futures;
+    futures.emplace_back(std::move(canReadFuture).semi().thenRunOn(executor));
 
     if (opCtx->hasDeadline()) {
         auto deadlineReachedFuture =
@@ -153,19 +161,28 @@ void checkIfCanReadOrBlock(OperationContext* opCtx, StringData dbName) {
         futures.push_back(std::move(deadlineReachedFuture));
     }
 
-    const auto& [status, idx] = whenAny(std::move(futures)).get();
-
-    if (idx == 0) {
-        // Read unblock condition finished first.
-        cancelTimeoutSource.cancel();
-        mtab->recordTenantMigrationError(status);
-        uassertStatusOK(status);
-    } else if (idx == 1) {
-        // Deadline finished first, throw error.
-        uassertStatusOK(Status(opCtx->getTimeoutError(),
-                               "Read timed out waiting for tenant migration blocker",
-                               mtab->getDebugInfo()));
-    }
+    return whenAny(std::move(futures))
+        .thenRunOn(executor)
+        .then([cancelTimeoutSource, opCtx, mtab, executor](WhenAnyResult<void> result) mutable {
+            const auto& [status, idx] = result;
+            if (idx == 0) {
+                // Read unblock condition finished first.
+                cancelTimeoutSource.cancel();
+                mtab->recordTenantMigrationError(status);
+                return status;
+            } else if (idx == 1) {
+                // Deadline finished first, throw error.
+                return Status(opCtx->getTimeoutError(),
+                              "Read timed out waiting for tenant migration blocker",
+                              mtab->getDebugInfo());
+            }
+            MONGO_UNREACHABLE;
+        })
+        .onError([cancelTimeoutSource](Status status) mutable {
+            cancelTimeoutSource.cancel();
+            return status;
+        })
+        .semi();  // To require continuation in the user executor.
 }
 
 void checkIfLinearizableReadWasAllowedOrThrow(OperationContext* opCtx, StringData dbName) {
@@ -216,15 +233,16 @@ void recoverTenantMigrationAccessBlockers(OperationContext* opCtx) {
         return;
     }
 
-    PersistentTaskStore<TenantMigrationDonorDocument> store(
+    // Recover TenantMigrationDonorAccessBlockers.
+    PersistentTaskStore<TenantMigrationDonorDocument> donorStore(
         NamespaceString::kTenantMigrationDonorsNamespace);
-    Query query;
 
-    store.forEach(opCtx, query, [&](const TenantMigrationDonorDocument& doc) {
+    donorStore.forEach(opCtx, {}, [&](const TenantMigrationDonorDocument& doc) {
         // Skip creating a TenantMigrationDonorAccessBlocker for aborted migrations that have been
         // marked as garbage collected.
-        if (doc.getExpireAt() && doc.getState() == TenantMigrationDonorStateEnum::kAborted)
+        if (doc.getExpireAt() && doc.getState() == TenantMigrationDonorStateEnum::kAborted) {
             return true;
+        }
 
         auto mtab = std::make_shared<TenantMigrationDonorAccessBlocker>(
             opCtx->getServiceContext(),
@@ -257,6 +275,45 @@ void recoverTenantMigrationAccessBlockers(OperationContext* opCtx) {
                 mtab->setAbortOpTime(opCtx, doc.getCommitOrAbortOpTime().get());
                 break;
             case TenantMigrationDonorStateEnum::kUninitialized:
+                MONGO_UNREACHABLE;
+        }
+        return true;
+    });
+
+    // Recover TenantMigrationRecipientAccessBlockers.
+    PersistentTaskStore<TenantMigrationRecipientDocument> recipientStore(
+        NamespaceString::kTenantMigrationRecipientsNamespace);
+
+    recipientStore.forEach(opCtx, {}, [&](const TenantMigrationRecipientDocument& doc) {
+        // Skip creating a TenantMigrationRecipientAccessBlocker for aborted migrations that have
+        // been marked as garbage collected.
+        if (doc.getExpireAt() && doc.getState() == TenantMigrationRecipientStateEnum::kStarted) {
+            return true;
+        }
+
+        if (!doc.getDataConsistentStopDonorOpTime()) {
+            return true;
+        }
+
+        auto mtab = std::make_shared<TenantMigrationRecipientAccessBlocker>(
+            opCtx->getServiceContext(),
+            doc.getId(),
+            doc.getTenantId().toString(),
+            doc.getDonorConnectionString().toString());
+
+        TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
+            .add(doc.getTenantId(), mtab);
+
+        switch (doc.getState()) {
+            case TenantMigrationRecipientStateEnum::kDone:
+            case TenantMigrationRecipientStateEnum::kStarted:
+                break;
+            case TenantMigrationRecipientStateEnum::kConsistent:
+                if (doc.getRejectReadsBeforeTimestamp()) {
+                    mtab->startRejectingReadsBefore(doc.getRejectReadsBeforeTimestamp().get());
+                }
+                break;
+            case TenantMigrationRecipientStateEnum::kUninitialized:
                 MONGO_UNREACHABLE;
         }
         return true;

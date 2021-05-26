@@ -88,31 +88,6 @@ function bulkWriteDocsUnordered(primaryHost, dbName, collName, numDocs) {
     return {res: res.getRawResponse(), ops: bulk.getOperations()};
 }
 
-/**
- * TODO SERVER-51764: Refine test cases to check if write errors are retried properly.
- * Looks through the write errors array and retries command against the recipient.
- */
-function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
-    jsTestLog("Retrying writes that errored during migration.");
-
-    writeErrors.forEach(err => {
-        let retryOp = ops[0].operations[err.index];
-        switch (ops[0].batchType) {
-            case kBatchTypes.insert:
-                assert.commandWorked(primaryDB[collName].insert(retryOp));
-                break;
-            case kBatchTypes.update:
-                assert.commandWorked(primaryDB[collName].update(retryOp.q, retryOp.u));
-                break;
-            case kBatchTypes.remove:
-                assert.commandWorked(primaryDB[collName].remove(retryOp));
-                break;
-            default:
-                throw new Error(`Invalid write op type ${retryOp.batchType}.`);
-        }
-    });
-}
-
 (() => {
     jsTestLog("Testing unordered bulk insert against a tenant migration that commits.");
 
@@ -152,7 +127,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     writeFp.wait();
 
     const migrationRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kCommitted);
 
     writeFp.off();
     bulkWriteThread.join();
@@ -171,10 +146,6 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
         } else {
             assert(!err.errmsg);
         }
-
-        assert.eq(err.errInfo.recipientConnectionString,
-                  tenantMigrationTest.getRecipientConnString());
-        assert.eq(err.errInfo.tenantId, tenantId);
     });
 
     tenantMigrationTest.stop();
@@ -238,7 +209,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     migrationThread.join();
 
     const migrationRes = assert.commandWorked(migrationThread.returnData());
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kCommitted);
 
     let bulkWriteRes = bulkWriteThread.returnData();
     let writeErrors = bulkWriteRes.res.writeErrors;
@@ -255,10 +226,6 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
         } else {
             assert.eq(err.errmsg, "");
         }
-
-        assert.eq(err.errInfo.recipientConnectionString,
-                  tenantMigrationTest.getRecipientConnString());
-        assert.eq(err.errInfo.tenantId, tenantId);
     });
 
     tenantMigrationTest.stop();
@@ -328,7 +295,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     abortFp.off();
 
     const migrationRes = assert.commandWorked(migrationThread.returnData());
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kAborted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kAborted);
 
     const bulkWriteRes = bulkWriteThread.returnData();
     const writeErrors = bulkWriteRes.res.writeErrors;
@@ -390,7 +357,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     writeFp.wait();
 
     const migrationRes = assert.commandWorked(tenantMigrationTest.runMigration(migrationOpts));
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kCommitted);
 
     writeFp.off();
     bulkWriteThread.join();
@@ -406,9 +373,6 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     // blocking writes.
     assert.eq(writeErrors[0].index, kNumWriteBatchesWithoutMigrationConflict * kMaxBatchSize);
     assert.eq(writeErrors[0].code, ErrorCodes.TenantMigrationCommitted);
-    assert.eq(writeErrors[0].errInfo.recipientConnectionString,
-              tenantMigrationTest.getRecipientConnString());
-    assert.eq(writeErrors[0].errInfo.tenantId, tenantId);
 
     tenantMigrationTest.stop();
     donorRst.stopSet();
@@ -471,7 +435,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     migrationThread.join();
 
     const migrationRes = assert.commandWorked(migrationThread.returnData());
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kCommitted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kCommitted);
 
     const bulkWriteRes = bulkWriteThread.returnData();
     const writeErrors = bulkWriteRes.res.writeErrors;
@@ -484,9 +448,6 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     // blocking writes.
     assert.eq(writeErrors[0].index, kNumWriteBatchesWithoutMigrationConflict * kMaxBatchSize);
     assert.eq(writeErrors[0].code, ErrorCodes.TenantMigrationCommitted);
-    assert.eq(writeErrors[0].errInfo.recipientConnectionString,
-              tenantMigrationTest.getRecipientConnString());
-    assert.eq(writeErrors[0].errInfo.tenantId, tenantId);
 
     tenantMigrationTest.stop();
     donorRst.stopSet();
@@ -555,7 +516,7 @@ function retryFailedWrites(primaryDB, collName, writeErrors, ops) {
     abortFp.off();
 
     const migrationRes = assert.commandWorked(migrationThread.returnData());
-    assert.eq(migrationRes.state, TenantMigrationTest.State.kAborted);
+    assert.eq(migrationRes.state, TenantMigrationTest.DonorState.kAborted);
 
     const bulkWriteRes = bulkWriteThread.returnData();
     const writeErrors = bulkWriteRes.res.writeErrors;

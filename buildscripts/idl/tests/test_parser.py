@@ -885,7 +885,7 @@ class TestParser(testcase.IDLTestcase):
                 deserializer: foo
                 default: foo
 
-        structs: 
+        structs:
             foo:
                 description: foo
                 strict: true
@@ -1235,7 +1235,7 @@ class TestParser(testcase.IDLTestcase):
         # Commands and structs with same name
         self.assert_parse_fail(
             test_preamble + textwrap.dedent("""
-            commands: 
+            commands:
                 foo:
                     description: foo
                     command_name: foo
@@ -1243,7 +1243,7 @@ class TestParser(testcase.IDLTestcase):
                     api_version: ""
                     fields:
                         foo: string
-            
+
             structs:
                 foo:
                     description: foo
@@ -1254,7 +1254,7 @@ class TestParser(testcase.IDLTestcase):
         # Commands and types with same name
         self.assert_parse_fail(
             test_preamble + textwrap.dedent("""
-            commands: 
+            commands:
                 string:
                     description: foo
                     command_name: foo
@@ -1322,7 +1322,7 @@ class TestParser(testcase.IDLTestcase):
                 fields:
                     foo:
                         type: bar
-                        supports_doc_sequence: false 
+                        supports_doc_sequence: false
             """))
 
         # supports_doc_sequence can be true
@@ -1446,7 +1446,7 @@ class TestParser(testcase.IDLTestcase):
         # type: () -> None
         """Negative unstable-field test cases."""
         self.assert_parse_fail(
-            textwrap.dedent(f"""
+            textwrap.dedent("""
         commands:
             foo:
                 description: foo
@@ -1459,82 +1459,6 @@ class TestParser(testcase.IDLTestcase):
                         unstable: true
                 reply_type: foo_reply_struct
             """), idl.errors.ERROR_ID_UNSTABLE_NO_API_VERSION)
-
-    def test_same_command_name_positive(self):
-        # type: () -> None
-        """Positive same command_name with different api_version test cases."""
-        self.assert_parse(
-            textwrap.dedent(f"""
-        commands:
-            foo:
-                description: foo
-                command_name: foo
-                namespace: ignored
-                api_version: "1"
-                reply_type: foo_reply_struct
-            fooV2:
-                description: foo
-                command_name: foo
-                namespace: ignored
-                api_version: "2"
-                reply_type: foo_reply_struct
-            """))
-
-        # No api_version
-        self.assert_parse(
-            textwrap.dedent("""
-        commands:
-            foo:
-                description: foo
-                command_name: foo
-                namespace: ignored
-                api_version: ""
-                reply_type: foo_reply_struct
-            fooV1:
-                description: foo
-                command_name: foo
-                namespace: ignored
-                api_version: "1"
-                reply_type: foo_reply_struct
-            """))
-
-    def test_same_command_name_negative(self):
-        # type: () -> None
-        """Negative same command_name with same api_version test cases."""
-        self.assert_parse_fail(
-            textwrap.dedent("""
-        commands:
-            foo:
-                description: foo
-                command_name: foo
-                namespace: ignored
-                api_version: "1"
-                reply_type: foo_reply_struct
-            fooV1:
-                description: foo
-                command_name: foo
-                namespace: ignored
-                api_version: "1"
-                reply_type: foo_reply_struct
-            """), idl.errors.ERROR_ID_DUPLICATE_SYMBOL)
-
-        # No api_version
-        self.assert_parse_fail(
-            textwrap.dedent("""
-        commands:
-            foo:
-                description: foo
-                command_name: foo
-                namespace: ignored
-                api_version: ""
-                reply_type: foo_reply_struct
-            foo2:
-                description: foo
-                command_name: foo
-                namespace: ignored
-                api_version: ""
-                reply_type: foo_reply_struct
-            """), idl.errors.ERROR_ID_DUPLICATE_SYMBOL)
 
     def test_scalar_or_mapping_negative(self):
         # type: () -> None
@@ -1692,7 +1616,7 @@ class TestParser(testcase.IDLTestcase):
 
         # The 'command_name' and 'command_alias' fields cannot have same value.
         self.assert_parse_fail(
-            textwrap.dedent(f"""
+            textwrap.dedent("""
         commands:
             foo:
                 description: foo
@@ -1705,6 +1629,64 @@ class TestParser(testcase.IDLTestcase):
                         type: bar
                 reply_type: foo_reply_struct
             """), idl.errors.ERROR_ID_COMMAND_DUPLICATES_NAME_AND_ALIAS)
+
+    def test_access_checks_positive(self):
+        # type: () -> None
+        """Positive access_check test cases."""
+
+        self.assert_parse(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    none: true
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """))
+
+        self.assert_parse(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    simple:
+                        check: is_authenticated
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """))
+
+    def test_access_checks_negative(self):
+        # type: () -> None
+        """Negative access_check test cases."""
+
+        # check is not a sequence
+        self.assert_parse_fail(
+            textwrap.dedent("""
+        commands:
+            foo:
+                description: foo
+                command_name: foo
+                api_version: 1
+                namespace: ignored
+                access_check:
+                    simple:
+                        check:
+                            - one
+                            - two
+                fields:
+                    foo: bar
+                reply_type: foo_reply_struct
+            """), idl.errors.ERROR_ID_IS_NODE_TYPE)
 
 
 if __name__ == '__main__':

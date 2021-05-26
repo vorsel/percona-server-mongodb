@@ -43,7 +43,7 @@ const auto getDistLockManager =
 
 }  // namespace
 
-const Seconds DistLockManager::kDefaultLockTimeout(20);
+const Minutes DistLockManager::kDefaultLockTimeout(5);
 const Milliseconds DistLockManager::kSingleLockAttemptTimeout(0);
 
 DistLockManager::ScopedDistLock::ScopedDistLock(OperationContext* opCtx,
@@ -74,6 +74,11 @@ DistLockManager::ScopedDistLock DistLockManager::ScopedDistLock::moveToAnotherTh
     auto unownedScopedDistLock(std::move(*this));
     unownedScopedDistLock._opCtx = nullptr;
     return unownedScopedDistLock;
+}
+
+void DistLockManager::ScopedDistLock::assignNewOpCtx(OperationContext* opCtx) {
+    invariant(!_opCtx);
+    _opCtx = opCtx;
 }
 
 DistLockManager::DistLockManager(OID lockSessionID) : _lockSessionID(std::move(lockSessionID)) {}
@@ -150,7 +155,7 @@ DistLockManager::ScopedLock::~ScopedLock() {
 
         iter->second->numWaiting--;
         iter->second->isInProgress = false;
-        iter->second->cvLocked.notify_all();
+        iter->second->cvLocked.notify_one();
 
         if (iter->second->numWaiting == 0) {
             _lockManager->_inProgressMap.erase(_ns);

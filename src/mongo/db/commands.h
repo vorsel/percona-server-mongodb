@@ -54,6 +54,7 @@
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/transport/service_executor.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/future.h"
 #include "mongo/util/string_map.h"
@@ -254,6 +255,15 @@ struct CommandHelpers {
      * It is illegal to call this if the command does not exist.
      */
     static BSONObj runCommandDirectly(OperationContext* opCtx, const OpMsgRequest& request);
+
+    /**
+     * Decides the command execution model (i.e., synchronous or asynchronous) based on the provided
+     * threading model.
+     */
+    static Future<void> runCommandInvocation(
+        std::shared_ptr<RequestExecutionContext> rec,
+        std::shared_ptr<CommandInvocation> invocation,
+        transport::ServiceExecutor::ThreadingModel threadingModel);
 
     /**
      * Runs a previously parsed CommandInvocation and propagates the result to the
@@ -1136,7 +1146,9 @@ public:
     InvocationBaseInternal(OperationContext* opCtx,
                            const Command* command,
                            const OpMsgRequest& opMsgRequest)
-        : CommandInvocation(command), _request{_parseRequest(opCtx, command, opMsgRequest)} {}
+        : CommandInvocation(command),
+          _request{_parseRequest(opCtx, command, opMsgRequest)},
+          _opMsgRequest{opMsgRequest} {}
 
 protected:
     const RequestType& request() const {
@@ -1164,6 +1176,8 @@ private:
     }
 
     RequestType _request;
+
+    const OpMsgRequest _opMsgRequest;
 };
 
 template <typename Derived>

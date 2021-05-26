@@ -291,7 +291,7 @@ void RecordStore::appendCustomStats(OperationContext* opCtx,
     result->appendBool("capped", _isCapped);
     if (_isCapped) {
         result->appendNumber("max", static_cast<long long>(_cappedMaxDocs));
-        result->appendNumber("maxSize", _cappedMaxSize / scale);
+        result->appendNumber("maxSize", static_cast<long long>(_cappedMaxSize / scale));
     }
 }
 

@@ -180,6 +180,9 @@ selector:
   - uses_curop_agg_stage
   # mongos has no system.profile collection.
   - requires_profiling
+  # mongos does not support inserts on timeseries collections
+  - requires_timeseries
+  - does_not_support_stepdowns
 
 executor:
   archive:
@@ -199,7 +202,6 @@ executor:
           runningWithAutoSplit: false
           runningWithBalancer: false
           useStepdownPermittedFile: true
-          usingReplicaSetShards: true
   hooks:
   - class: ContinuousStepdown
     config_stepdown: true

@@ -41,13 +41,13 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/query_request_helper.h"
+#include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/s/balancer/type_migration.h"
-#include "mongo/db/s/dist_lock_manager.h"
+#include "mongo/db/s/sharding_util.h"
 #include "mongo/db/s/type_lockpings.h"
 #include "mongo/db/s/type_locks.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
-#include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/catalog/config_server_version.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/catalog/type_chunk.h"
@@ -202,8 +202,8 @@ void updateConfigDocumentDBDirect(OperationContext* opCtx,
         return base;
     }());
 
-    auto commandResult = client.runCommand(OpMsgRequest::fromDBAndBody(
-        nss.db(), updateOp.toBSON(ShardingCatalogClient::kMajorityWriteConcern.toBSON())));
+    auto commandResult =
+        client.runCommand(OpMsgRequest::fromDBAndBody(nss.db(), updateOp.toBSON({})));
     uassertStatusOK([&] {
         BatchedCommandResponse response;
         std::string unusedErrmsg;
@@ -533,10 +533,8 @@ Status ShardingCatalogManager::setFeatureCompatibilityVersionOnShards(OperationC
     return Status::OK();
 }
 
-void ShardingCatalogManager::removePre49LegacyMetadata(OperationContext* opCtx) {
+void ShardingCatalogManager::_removePre49LegacyMetadata(OperationContext* opCtx) {
     const auto catalogClient = Grid::get(opCtx)->catalogClient();
-    DBDirectClient client(opCtx);
-
     // Delete all documents which have {dropped: true} from config.collections
     uassertStatusOK(
         catalogClient->removeConfigDocuments(opCtx,
@@ -545,43 +543,22 @@ void ShardingCatalogManager::removePre49LegacyMetadata(OperationContext* opCtx) 
                                              ShardingCatalogClient::kLocalWriteConcern));
 
     // Clear the {dropped:true} and {distributionMode:sharded} fields from config.collections
-    write_ops::Update clearDroppedAndDistributionMode(CollectionType::ConfigNS, [] {
-        write_ops::UpdateOpEntry u;
-        u.setQ({});
-        u.setU(write_ops::UpdateModification::parseFromClassicUpdate(BSON("$unset"
-                                                                          << BSON("dropped"
-                                                                                  << "")
-                                                                          << "$unset"
-                                                                          << BSON("distributionMode"
-                                                                                  << ""))));
-        u.setMulti(true);
-        return std::vector{u};
-    }());
-    clearDroppedAndDistributionMode.setWriteCommandBase([] {
-        write_ops::WriteCommandBase base;
-        base.setOrdered(false);
-        return base;
-    }());
-
-    auto commandResult = client.runCommand(
-        OpMsgRequest::fromDBAndBody(CollectionType::ConfigNS.db(),
-                                    clearDroppedAndDistributionMode.toBSON(
-                                        ShardingCatalogClient::kMajorityWriteConcern.toBSON())));
-    uassertStatusOK([&] {
-        BatchedCommandResponse response;
-        std::string unusedErrmsg;
-        response.parseBSON(
-            commandResult->getCommandReply(),
-            &unusedErrmsg);  // Return value intentionally ignored, because response.toStatus() will
-                             // contain any errors in more detail
-        return response.toStatus();
-    }());
-    uassertStatusOK(getWriteConcernStatusFromCommandResult(commandResult->getCommandReply()));
+    updateConfigDocumentDBDirect(opCtx,
+                                 CollectionType::ConfigNS,
+                                 {} /* query */,
+                                 BSON("$unset" << BSON("dropped"
+                                                       << "")
+                                               << "$unset"
+                                               << BSON("distributionMode"
+                                                       << "")),
+                                 false /* upsert */,
+                                 true /* multi */);
 }
 
 void ShardingCatalogManager::upgradeMetadataFor49(OperationContext* opCtx) {
     LOGV2(5276704, "Starting metadata upgrade to 4.9");
 
+    _removePre49LegacyMetadata(opCtx);
     if (feature_flags::gShardingFullDDLSupportTimestampedVersion.isEnabledAndIgnoreFCV()) {
         _createDBTimestampsFor49(opCtx);
         _upgradeCollectionsAndChunksMetadataFor49(opCtx);
@@ -604,7 +581,6 @@ void ShardingCatalogManager::downgradeMetadataToPre49(OperationContext* opCtx) {
 void ShardingCatalogManager::_createDBTimestampsFor49(OperationContext* opCtx) {
     LOGV2(5258802, "Starting upgrade of config.databases");
 
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
     auto const catalogCache = Grid::get(opCtx)->catalogCache();
     auto const configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
     const auto dbDocs =
@@ -620,7 +596,6 @@ void ShardingCatalogManager::_createDBTimestampsFor49(OperationContext* opCtx) {
                 boost::none))
             .docs;
 
-
     for (const auto& doc : dbDocs) {
         const DatabaseType db = uassertStatusOK(DatabaseType::fromBSON(doc));
         const auto name = db.getName();
@@ -628,16 +603,31 @@ void ShardingCatalogManager::_createDBTimestampsFor49(OperationContext* opCtx) {
         auto now = VectorClock::get(opCtx)->getTime();
         auto clusterTime = now.clusterTime().asTimestamp();
 
-        uassertStatusOK(catalogClient->updateConfigDocument(
+        updateConfigDocumentDBDirect(
             opCtx,
             DatabaseType::ConfigNS,
             BSON(DatabaseType::name << name),
             BSON("$set" << BSON(DatabaseType::version() + "." + DatabaseVersion::kTimestampFieldName
                                 << clusterTime)),
             false /* upsert */,
-            ShardingCatalogClient::kMajorityWriteConcern));
+            false /* multi*/);
+    }
+
+    // Wait until the last operation is majority-committed
+    WriteConcernResult ignoreResult;
+    const auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    uassertStatusOK(waitForWriteConcern(
+        opCtx, latestOpTime, ShardingCatalogClient::kMajorityWriteConcern, &ignoreResult));
+
+    // Forcing a refresh of each DB on each shard
+    const auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+    const auto fixedExecutor = Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor();
+    for (const auto& doc : dbDocs) {
+        const DatabaseType db = uassertStatusOK(DatabaseType::fromBSON(doc));
+        const auto name = db.getName();
 
         catalogCache->invalidateDatabaseEntry_LINEARIZABLE(name);
+        sharding_util::tellShardsToRefreshDatabase(opCtx, shardIds, name, fixedExecutor);
     }
 
     LOGV2(5258803, "Successfully upgraded config.databases");
@@ -646,38 +636,46 @@ void ShardingCatalogManager::_createDBTimestampsFor49(OperationContext* opCtx) {
 void ShardingCatalogManager::_downgradeConfigDatabasesEntriesToPre49(OperationContext* opCtx) {
     LOGV2(5258806, "Starting downgrade of config.databases");
 
-    DBDirectClient client(opCtx);
+    updateConfigDocumentDBDirect(
+        opCtx,
+        DatabaseType::ConfigNS,
+        {} /* query */,
+        BSON("$unset" << BSON(DatabaseType::version() + "." + DatabaseVersion::kTimestampFieldName
+                              << "")),
+        false /* upsert */,
+        true /* multi */);
 
-    // Clear the 'timestamp' fields from config.databases
-    write_ops::Update unsetTimestamp(DatabaseType::ConfigNS, [] {
-        write_ops::UpdateOpEntry u;
-        u.setQ({});
-        u.setU(write_ops::UpdateModification::parseFromClassicUpdate(
-            BSON("$unset" << BSON(
-                     DatabaseType::version() + "." + DatabaseVersion::kTimestampFieldName << ""))));
-        u.setMulti(true);
-        return std::vector{u};
-    }());
-    unsetTimestamp.setWriteCommandBase([] {
-        write_ops::WriteCommandBase base;
-        base.setOrdered(false);
-        return base;
-    }());
+    auto const catalogCache = Grid::get(opCtx)->catalogCache();
+    auto const configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+    const auto dbDocs =
+        uassertStatusOK(
+            configShard->exhaustiveFindOnConfig(
+                opCtx,
+                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                repl::ReadConcernLevel::kLocalReadConcern,
+                DatabaseType::ConfigNS,
+                BSON(DatabaseType::version() + "." + DatabaseVersion::kTimestampFieldName
+                     << BSON("$exists" << false)),
+                BSONObj(),
+                boost::none))
+            .docs;
 
-    auto commandResult = client.runCommand(OpMsgRequest::fromDBAndBody(
-        DatabaseType::ConfigNS.db(),
-        unsetTimestamp.toBSON(ShardingCatalogClient::kMajorityWriteConcern.toBSON())));
+    // Wait until the last operation is majority-committed
+    WriteConcernResult ignoreResult;
+    const auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    uassertStatusOK(waitForWriteConcern(
+        opCtx, latestOpTime, ShardingCatalogClient::kMajorityWriteConcern, &ignoreResult));
 
-    uassertStatusOK([&] {
-        BatchedCommandResponse response;
-        std::string unusedErrmsg;
-        response.parseBSON(
-            commandResult->getCommandReply(),
-            &unusedErrmsg);  // Return value intentionally ignored, because response.toStatus()
-                             // will contain any errors in more detail
-        return response.toStatus();
-    }());
-    uassertStatusOK(getWriteConcernStatusFromCommandResult(commandResult->getCommandReply()));
+    // Forcing a refresh of each DB on each shard
+    const auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+    const auto fixedExecutor = Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor();
+    for (const auto& doc : dbDocs) {
+        const DatabaseType db = uassertStatusOK(DatabaseType::fromBSON(doc));
+        const auto name = db.getName();
+
+        catalogCache->invalidateDatabaseEntry_LINEARIZABLE(name);
+        sharding_util::tellShardsToRefreshDatabase(opCtx, shardIds, name, fixedExecutor);
+    }
 
     LOGV2(5258807, "Successfully downgraded config.databases");
 }
@@ -687,12 +685,6 @@ void ShardingCatalogManager::_upgradeCollectionsAndChunksMetadataFor49(Operation
 
     auto const catalogCache = Grid::get(opCtx)->catalogCache();
     auto const configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
-
-    DistLockManager::ScopedDistLock dbDistLock(uassertStatusOK(DistLockManager::get(opCtx)->lock(
-        opCtx,
-        DistLockManager::kShardingRoutingInfoFormatStabilityLockName,
-        "fcvUpgrade",
-        DistLockManager::kDefaultLockTimeout)));
 
     auto collectionDocs =
         uassertStatusOK(
@@ -713,6 +705,11 @@ void ShardingCatalogManager::_upgradeCollectionsAndChunksMetadataFor49(Operation
         const CollectionType coll(doc);
         const auto uuid = coll.getUuid();
         const auto nss = coll.getNss();
+
+        uassert(547900,
+                str::stream() << "The 'allowMigrations' field of the " << nss
+                              << " collection must be true",
+                coll.getAllowMigrations());
 
         const auto now = VectorClock::get(opCtx)->getTime();
         const auto newTimestamp = now.clusterTime().asTimestamp();
@@ -751,8 +748,22 @@ void ShardingCatalogManager::_upgradeCollectionsAndChunksMetadataFor49(Operation
                                                          << timestampMap.at(nss))) /* update */,
                                      false /* upsert */,
                                      false /* multi */);
+    }
 
+    // Wait until the last operation is majority-committed
+    WriteConcernResult ignoreResult;
+    const auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    uassertStatusOK(waitForWriteConcern(
+        opCtx, latestOpTime, ShardingCatalogClient::kMajorityWriteConcern, &ignoreResult));
+
+    // Forcing a refresh of each collection on each shard
+    const auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+    const auto fixedExecutor = Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor();
+    for (const auto& doc : collectionDocs) {
+        const CollectionType coll(doc);
+        const auto nss = coll.getNss();
         catalogCache->invalidateCollectionEntry_LINEARIZABLE(nss);
+        sharding_util::tellShardsToRefreshCollection(opCtx, shardIds, nss, fixedExecutor);
     }
 
     // Drop ns_* indexes of config.chunks
@@ -803,12 +814,6 @@ void ShardingCatalogManager::_downgradeCollectionsAndChunksMetadataToPre49(
     auto const catalogCache = Grid::get(opCtx)->catalogCache();
     auto const configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
-    DistLockManager::ScopedDistLock dbDistLock(uassertStatusOK(DistLockManager::get(opCtx)->lock(
-        opCtx,
-        DistLockManager::kShardingRoutingInfoFormatStabilityLockName,
-        "fcvDowngrade",
-        DistLockManager::kDefaultLockTimeout)));
-
     auto collectionDocs =
         uassertStatusOK(
             configShard->exhaustiveFindOnConfig(
@@ -831,6 +836,11 @@ void ShardingCatalogManager::_downgradeCollectionsAndChunksMetadataToPre49(
         const auto uuid = coll.getUuid();
         const auto nss = coll.getNss();
 
+        uassert(547901,
+                str::stream() << "The 'allowMigrations' field of the " << nss
+                              << " collection must be true",
+                coll.getAllowMigrations());
+
         updateConfigDocumentDBDirect(opCtx,
                                      ChunkType::ConfigNS,
                                      BSON(ChunkType::collectionUUID << uuid) /* query */,
@@ -842,24 +852,35 @@ void ShardingCatalogManager::_downgradeCollectionsAndChunksMetadataToPre49(
     // Create ns_* indexes for config.chunks
     uassertStatusOK(createNsIndexesForConfigChunks(opCtx));
 
-    // Unset timestamp for all collections
-    for (const auto& doc : collectionDocs) {
+    // Unset the timestamp field on all collections
+    {
         // Take _kChunkOpLock in exclusive mode to prevent concurrent chunk splits, merges, and
         // migrations.
         Lock::ExclusiveLock lk(opCtx->lockState(), _kChunkOpLock);
 
-        const CollectionType coll(doc);
-        const auto nss = coll.getNss();
-
         updateConfigDocumentDBDirect(
             opCtx,
             CollectionType::ConfigNS,
-            BSON(CollectionType::kNssFieldName << nss.ns()) /* query */,
+            {} /* query */,
             BSON("$unset" << BSON(CollectionType::kTimestampFieldName << "")) /* update */,
             false /* upsert */,
-            false /* multi */);
+            true /* multi */);
+    }
 
+    // Wait until the last operation is majority-committed
+    WriteConcernResult ignoreResult;
+    const auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    uassertStatusOK(waitForWriteConcern(
+        opCtx, latestOpTime, ShardingCatalogClient::kMajorityWriteConcern, &ignoreResult));
+
+    // Forcing a refresh of each collection on each shard
+    const auto shardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+    const auto fixedExecutor = Grid::get(_serviceContext)->getExecutorPool()->getFixedExecutor();
+    for (const auto& doc : collectionDocs) {
+        const CollectionType coll(doc);
+        const auto nss = coll.getNss();
         catalogCache->invalidateCollectionEntry_LINEARIZABLE(nss);
+        sharding_util::tellShardsToRefreshCollection(opCtx, shardIds, nss, fixedExecutor);
     }
 
     // Drop uuid_* indexes for config.chunks
@@ -886,7 +907,7 @@ void ShardingCatalogManager::_downgradeCollectionsAndChunksMetadataToPre49(
             uassertStatusOK(getStatusFromCommandResult(info));
     }
 
-    // Unset uuid for all chunks on config.chunks
+    // Unset the timestamp and the uuid for all chunks on config.chunks
     {
         // Take _kChunkOpLock in exclusive mode to prevent concurrent chunk splits, merges, and
         // migrations.
@@ -901,7 +922,6 @@ void ShardingCatalogManager::_downgradeCollectionsAndChunksMetadataToPre49(
             false /* upsert */,
             true /* multi */);
     }
-
 
     LOGV2(5276703, "Successfully downgraded config.collections and config.chunks");
 }
@@ -977,8 +997,7 @@ BSONObj ShardingCatalogManager::writeToConfigDocumentInTxn(OperationContext* opC
                         opCtx, nss.db(), false /* startTransaction */, txnNumber, request.toBSON())
                         .body;
 
-    uassertStatusOK(getStatusFromCommandResult(response));
-    uassertStatusOK(getWriteConcernStatusFromCommandResult(response));
+    uassertStatusOK(getStatusFromWriteCommandReply(response));
 
     return response;
 }
