@@ -118,6 +118,7 @@ env.Library(
         'accumulation_statement.cpp',
         'accumulator_add_to_set.cpp',
         'accumulator_avg.cpp',
+        'accumulator_covariance.cpp',
         'accumulator_first.cpp',
         'accumulator_js_reduce.cpp',
         'accumulator_last.cpp',
@@ -129,6 +130,7 @@ env.Library(
         'accumulator_sum.cpp',
         'window_function/window_bounds.cpp',
         'window_function/window_function_expression.cpp',
+        'window_function/window_function_sum.cpp'
         ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/exec/document_value/document_value',
@@ -174,7 +176,6 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/s/async_requests_sender',
         '$BUILD_DIR/mongo/s/commands/shared_cluster_commands',
-        '$BUILD_DIR/mongo/s/common_s',
         '$BUILD_DIR/mongo/s/query/cluster_query',
         'aggregation',
     ],
@@ -329,16 +330,19 @@ env.Library(
     target='document_sources_idl',
     source=[
         'document_source_change_stream.idl',
+        'document_source_coll_stats.idl',
         'document_source_list_sessions.idl',
         'document_source_merge.idl',
         'document_source_merge_modes.idl',
+        'document_source_merge_spec.cpp',
+        'document_source_parsing_validators.cpp',
         'document_source_replace_root.idl',
         'document_source_set_window_fields.idl',
         'document_source_union_with.idl',
         'exchange_spec.idl',
+        'resume_token.cpp',
+        'storage_stats_spec.idl',
         'value.idl',
-        'document_source_merge_spec.cpp',
-        'resume_token.cpp'
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -394,9 +398,11 @@ env.CppUnitTest(
         'document_source_union_with_test.cpp',
         'document_source_internal_unpack_bucket_test/extract_or_build_project_to_internalize_test.cpp',
         'document_source_internal_unpack_bucket_test/create_predicates_on_bucket_level_field_test.cpp',
+        'document_source_internal_unpack_bucket_test/group_reorder_test.cpp',
         'document_source_internal_unpack_bucket_test/internalize_project_test.cpp',
         'document_source_internal_unpack_bucket_test/sort_reorder_test.cpp',
         'document_source_internal_unpack_bucket_test/unpack_bucket_exec_test.cpp',
+        'document_source_internal_unpack_bucket_test/split_match_on_meta_and_rename_test.cpp',
         'document_source_unwind_test.cpp',
         'expression_and_test.cpp',
         'expression_compare_test.cpp',
@@ -437,6 +443,8 @@ env.CppUnitTest(
         'window_function/window_function_push_test.cpp',
         'window_function/window_function_std_dev_test.cpp',
         'window_function/window_function_exec_first_last_test.cpp',
+        'window_function/window_function_avg_test.cpp',
+        'window_function/window_function_sum_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',

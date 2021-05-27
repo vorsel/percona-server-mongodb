@@ -37,6 +37,7 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/query/plan_explainer_impl.h"
 #include "mongo/db/query/projection_ast_util.h"
+#include "mongo/db/query/query_knobs_gen.h"
 
 namespace mongo {
 namespace {
@@ -47,7 +48,7 @@ void statsToBSON(const QuerySolutionNode* node,
     invariant(topLevelBob);
 
     // Stop as soon as the BSON object we're building exceeds the limit.
-    if (topLevelBob->len() > kMaxExplainStatsBSONSizeMB) {
+    if (topLevelBob->len() > internalQueryExplainSizeThresholdBytes.load()) {
         bob->append("warning", "stats tree exceeded BSON size limit for explain");
         return;
     }
@@ -114,7 +115,8 @@ void statsToBSON(const QuerySolutionNode* node,
             bob->append("direction", ixn->direction > 0 ? "forward" : "backward");
 
             auto bounds = ixn->bounds.toBSON();
-            if (topLevelBob->len() + bounds.objsize() > kMaxExplainStatsBSONSizeMB) {
+            if (topLevelBob->len() + bounds.objsize() >
+                internalQueryExplainSizeThresholdBytes.load()) {
                 bob->append("warning", "index bounds omitted due to BSON size limit for explain");
             } else {
                 bob->append("indexBounds", bounds);
@@ -156,8 +158,8 @@ void statsToBSON(const QuerySolutionNode* node,
             bob->append("sortPattern", smn->sort);
             break;
         }
-        case STAGE_TEXT: {
-            auto tn = static_cast<const TextNode*>(node);
+        case STAGE_TEXT_MATCH: {
+            auto tn = static_cast<const TextMatchNode*>(node);
 
             bob->append("indexPrefix", tn->indexPrefix);
             bob->append("indexName", tn->index.identifier.catalogName);
@@ -180,9 +182,8 @@ void statsToBSON(const QuerySolutionNode* node,
     // the output more readable by saving a level of nesting. Name the field 'inputStage'
     // rather than 'inputStages'.
     if (node->children.size() == 1) {
-        BSONObjBuilder childBob;
+        BSONObjBuilder childBob(bob->subobjStart("inputStage"));
         statsToBSON(node->children[0], &childBob, topLevelBob);
-        bob->append("inputStage", childBob.obj());
         return;
     }
 
@@ -204,7 +205,7 @@ void statsToBSON(const sbe::PlanStageStats* stats,
     invariant(topLevelBob);
 
     // Stop as soon as the BSON object we're building exceeds the limit.
-    if (topLevelBob->len() > kMaxExplainStatsBSONSizeMB) {
+    if (topLevelBob->len() > internalQueryExplainSizeThresholdBytes.load()) {
         bob->append("warning", "stats tree exceeded BSON size limit for explain");
         return;
     }
@@ -238,9 +239,8 @@ void statsToBSON(const sbe::PlanStageStats* stats,
     // the output more readable by saving a level of nesting. Name the field 'inputStage'
     // rather than 'inputStages'.
     if (stats->children.size() == 1) {
-        BSONObjBuilder childBob;
+        BSONObjBuilder childBob(bob->subobjStart("inputStage"));
         statsToBSON(stats->children[0].get(), &childBob, topLevelBob);
-        bob->append("inputStage"_sd, childBob.obj());
         return;
     }
 
@@ -248,7 +248,8 @@ void statsToBSON(const sbe::PlanStageStats* stats,
     auto overridenNames = [stageType]() -> std::vector<StringData> {
         if (stageType == "branch"_sd) {
             return {"thenStage"_sd, "elseStage"_sd};
-        } else if (stageType == "nlj"_sd || stageType == "traverse"_sd) {
+        } else if (stageType == "nlj"_sd || stageType == "traverse"_sd || stageType == "mj"_sd ||
+                   stageType == "hj"_sd) {
             return {"outerStage"_sd, "innerStage"_sd};
         }
         return {};
@@ -257,9 +258,8 @@ void statsToBSON(const sbe::PlanStageStats* stats,
         invariant(overridenNames.size() == stats->children.size());
 
         for (size_t idx = 0; idx < stats->children.size(); ++idx) {
-            BSONObjBuilder childBob;
+            BSONObjBuilder childBob(bob->subobjStart(overridenNames[idx]));
             statsToBSON(stats->children[idx].get(), &childBob, topLevelBob);
-            bob->append(overridenNames[idx], childBob.obj());
         }
         return;
     }
@@ -388,8 +388,8 @@ std::string PlanExplainerSBE::getPlanSummary() const {
                     sb << " " << keyPattern;
                     break;
                 }
-                case STAGE_TEXT: {
-                    auto tn = static_cast<const TextNode*>(node);
+                case STAGE_TEXT_MATCH: {
+                    auto tn = static_cast<const TextMatchNode*>(node);
                     const KeyPattern keyPattern{tn->indexPrefix};
                     sb << " " << keyPattern;
                     break;
@@ -414,11 +414,15 @@ void PlanExplainerSBE::getSummaryStats(PlanSummaryStats* statsOut) const {
         return;
     }
 
+    // If the exec tree _root was provided, so must be _rootData holding auxiliary data.
+    tassert(5323806, "exec tree data is not provided", _rootData);
+
     auto common = _root->getCommonStats();
     statsOut->nReturned = common->advances;
     statsOut->fromMultiPlanner = isMultiPlan();
     statsOut->totalKeysExamined = 0;
     statsOut->totalDocsExamined = 0;
+    statsOut->replanReason = _rootData->replanReason;
 
     // Collect cumulative execution stats for the plan.
     _root->accumulate(kEmptyPlanNodeId, *statsOut);
@@ -427,8 +431,6 @@ void PlanExplainerSBE::getSummaryStats(PlanSummaryStats* statsOut) const {
     queue.push(_solution->root());
 
     // Look through the QuerySolution to collect some static stat details.
-    //
-    // TODO SERVER-51138: handle replan reason for cached plan.
     while (!queue.empty()) {
         auto node = queue.front();
         queue.pop();
@@ -460,8 +462,8 @@ void PlanExplainerSBE::getSummaryStats(PlanSummaryStats* statsOut) const {
                 statsOut->indexesUsed.insert(ixn->index.identifier.catalogName);
                 break;
             }
-            case STAGE_TEXT: {
-                auto tn = static_cast<const TextNode*>(node);
+            case STAGE_TEXT_MATCH: {
+                auto tn = static_cast<const TextMatchNode*>(node);
                 statsOut->indexesUsed.insert(tn->index.identifier.catalogName);
                 break;
             }

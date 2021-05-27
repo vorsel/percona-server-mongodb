@@ -3,7 +3,6 @@
  * time-series collections.
  *
  * @tags: [
- *     does_not_support_retryable_writes,  # Batches containing more than one measurement
  *     does_not_support_stepdowns,
  *     requires_fcv_49,
  *     requires_find_command,
@@ -89,7 +88,6 @@ expectedStats.bucketCount++;
 expectedStats.numBucketInserts++;
 expectedStats.numBucketsOpenedDueToMetadata++;
 expectedStats.numCommits++;
-expectedStats.numWaits++;
 expectedStats.numMeasurementsCommitted += 2;
 expectedStats.avgNumMeasurementsPerCommit = 2;
 checkCollStats();
@@ -115,7 +113,6 @@ docs = Array(5).fill({[timeFieldName]: ISODate(), [metaFieldName]: {a: 2}});
 assert.commandWorked(coll.insert(docs, {ordered: false}));
 expectedStats.numBucketUpdates++;
 expectedStats.numCommits++;
-expectedStats.numWaits += 4;
 expectedStats.numMeasurementsCommitted += 5;
 expectedStats.avgNumMeasurementsPerCommit = 2;
 checkCollStats();
@@ -139,7 +136,6 @@ expectedStats.numBucketInserts += 2;
 expectedStats.numBucketsOpenedDueToMetadata++;
 expectedStats.numBucketsClosedDueToCount++;
 expectedStats.numCommits += 2;
-expectedStats.numWaits += numDocs - 2;
 expectedStats.numMeasurementsCommitted += numDocs;
 expectedStats.avgNumMeasurementsPerCommit =
     Math.floor(expectedStats.numMeasurementsCommitted / expectedStats.numCommits);

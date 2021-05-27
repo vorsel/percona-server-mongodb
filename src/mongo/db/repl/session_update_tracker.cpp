@@ -65,7 +65,7 @@ OplogEntry createOplogEntryForTransactionTableUpdate(repl::OpTime opTime,
                                     {},    // sessionInfo
                                     true,  // upsert
                                     wallClockTime,
-                                    boost::none,    // statementId
+                                    {},             // statementIds
                                     boost::none,    // prevWriteOpTime
                                     boost::none,    // preImageOpTime
                                     boost::none,    // postImageOpTime
@@ -113,8 +113,13 @@ boost::optional<repl::OplogEntry> createMatchingTransactionTableUpdate(
  * 2) Be a no-op entry
  * 3) Have sessionId and txnNumber
  */
-bool isTransactionEntryFromTenantMigrations(OplogEntry& entry) {
+bool isTransactionEntryFromTenantMigrations(const OplogEntry& entry) {
     if (!entry.getFromTenantMigration()) {
+        return false;
+    }
+
+    if (entry.getFromMigrate()) {
+        // Retryable writes have fromMigrate set.
         return false;
     }
 
@@ -129,10 +134,9 @@ bool isTransactionEntryFromTenantMigrations(OplogEntry& entry) {
     return true;
 }
 
-/**
- * Returns true if the oplog entry represents an operation in a transaction and false otherwise.
- */
-bool isTransactionEntry(OplogEntry entry) {
+}  // namespace
+
+bool SessionUpdateTracker::isTransactionEntry(const OplogEntry& entry) {
     if (isTransactionEntryFromTenantMigrations(entry)) {
         return true;
     }
@@ -147,8 +151,6 @@ bool isTransactionEntry(OplogEntry entry) {
         entry.getCommandType() == repl::OplogEntry::CommandType::kCommitTransaction ||
         entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps;
 }
-
-}  // namespace
 
 boost::optional<std::vector<OplogEntry>> SessionUpdateTracker::_updateOrFlush(
     const OplogEntry& entry) {

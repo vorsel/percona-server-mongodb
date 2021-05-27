@@ -48,7 +48,9 @@
 #include "mongo/db/s/active_shard_collection_registry.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
 #include "mongo/db/s/config/initial_split_policy.h"
+#include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/dist_lock_manager.h"
+#include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/shard_collection_legacy.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/shard_key_util.h"
@@ -202,14 +204,14 @@ void checkCollation(OperationContext* opCtx, const ShardsvrShardCollectionReques
             CollatorInterface::collatorsMatch(requestedCollator.get(), actualCollator));
 }
 
-/**
- * Compares the proposed shard key with the shard key of the collection's existing zones
- * to ensure they are a legal combination.
- */
-void validateShardKeyAgainstExistingZones(OperationContext* opCtx,
-                                          const BSONObj& proposedKey,
-                                          const ShardKeyPattern& shardKeyPattern,
-                                          const std::vector<TagsType>& tags) {
+std::vector<TagsType> getTagsAndValidate(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         const BSONObj& proposedKey) {
+    const auto catalogClient = Grid::get(opCtx)->catalogClient();
+    auto tags = uassertStatusOK(catalogClient->getTagsForCollection(opCtx, nss));
+
+    // Compares the proposed shard key with the shard key of the collection's existing zones to
+    // ensure they are a legal combination
     for (const auto& tag : tags) {
         BSONObjIterator tagMinFields(tag.getMinKey());
         BSONObjIterator tagMaxFields(tag.getMaxKey());
@@ -235,7 +237,7 @@ void validateShardKeyAgainstExistingZones(OperationContext* opCtx,
                                   << tag.getMinKey() << " -->> " << tag.getMaxKey(),
                     match);
 
-            // If the field is hashed, make sure that the min and max values are of supported type.
+            // If the field is hashed, make sure that the min and max values are of supported type
             uassert(
                 ErrorCodes::InvalidOptions,
                 str::stream() << "cannot do hash sharding with the proposed key "
@@ -246,19 +248,6 @@ void validateShardKeyAgainstExistingZones(OperationContext* opCtx,
                     (ShardKeyPattern::isValidHashedValue(tagMinKeyElement) &&
                      ShardKeyPattern::isValidHashedValue(tagMaxKeyElement)));
         }
-    }
-}
-
-std::vector<TagsType> getTagsAndValidate(OperationContext* opCtx,
-                                         const NamespaceString& nss,
-                                         const BSONObj& proposedKey,
-                                         const ShardKeyPattern& shardKeyPattern) {
-    // Read zone info
-    const auto catalogClient = Grid::get(opCtx)->catalogClient();
-    auto tags = uassertStatusOK(catalogClient->getTagsForCollection(opCtx, nss));
-
-    if (!tags.empty()) {
-        validateShardKeyAgainstExistingZones(opCtx, proposedKey, shardKeyPattern, tags);
     }
 
     return tags;
@@ -302,16 +291,6 @@ boost::optional<UUID> getUUIDFromPrimaryShard(OperationContext* opCtx, const Nam
     return uassertStatusOK(UUID::parse(collectionInfo["uuid"]));
 }
 
-UUID getOrGenerateUUID(OperationContext* opCtx,
-                       const NamespaceString& nss,
-                       const ShardsvrShardCollectionRequest& request) {
-    if (request.getGetUUIDfromPrimaryShard()) {
-        return *getUUIDFromPrimaryShard(opCtx, nss);
-    }
-
-    return UUID::gen();
-}
-
 bool checkIfCollectionIsEmpty(OperationContext* opCtx, const NamespaceString& nss) {
     // Use find with predicate instead of count in order to ensure that the count
     // command doesn't just consult the cached metadata, which may not always be
@@ -329,30 +308,12 @@ int getNumShards(OperationContext* opCtx) {
 ShardCollectionTargetState calculateTargetState(OperationContext* opCtx,
                                                 const NamespaceString& nss,
                                                 const ShardsvrShardCollectionRequest& request) {
-    auto proposedKey(request.getKey().getOwned());
-    ShardKeyPattern shardKeyPattern(proposedKey);
-
-    shardkeyutil::validateShardKeyIndexExistsOrCreateIfPossible(
-        opCtx,
-        nss,
-        proposedKey,
-        shardKeyPattern,
-        *request.getCollation(),
-        request.getUnique(),
-        shardkeyutil::ValidationBehaviorsShardCollection(opCtx));
-
-    // Wait until the index is majority written, to prevent having the collection commited to the
-    // config server, but the index creation rolled backed on stepdowns.
-    WriteConcernResult ignoreResult;
-    auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
-    uassertStatusOK(waitForWriteConcern(
-        opCtx, latestOpTime, ShardingCatalogClient::kMajorityWriteConcern, &ignoreResult));
-
-    auto tags = getTagsAndValidate(opCtx, nss, proposedKey, shardKeyPattern);
-    auto uuid = getOrGenerateUUID(opCtx, nss, request);
+    auto tags = getTagsAndValidate(opCtx, nss, request.getKey());
+    auto uuid =
+        request.getGetUUIDfromPrimaryShard() ? *getUUIDFromPrimaryShard(opCtx, nss) : UUID::gen();
 
     const bool isEmpty = checkIfCollectionIsEmpty(opCtx, nss);
-    return {uuid, std::move(shardKeyPattern), tags, isEmpty};
+    return {uuid, ShardKeyPattern(request.getKey()), tags, isEmpty};
 }
 
 void logStartShardCollection(OperationContext* opCtx,
@@ -533,7 +494,6 @@ CreateCollectionResponse shardCollection(OperationContext* opCtx,
                                          const ShardsvrShardCollectionRequest& request,
                                          const ShardId& dbPrimaryShardId,
                                          bool mustTakeDistLock) {
-    CreateCollectionResponse shardCollectionResponse;
     // Fast check for whether the collection is already sharded without taking any locks
     if (auto createCollectionResponseOpt =
             checkIfCollectionAlreadyShardedWithSameOptions(opCtx, request)) {
@@ -579,11 +539,13 @@ CreateCollectionResponse shardCollection(OperationContext* opCtx,
                 serverGlobalParams.featureCompatibility);
     }
 
+    CreateCollectionResponse shardCollectionResponse;
+
     {
         pauseShardCollectionBeforeCriticalSection.pauseWhileSet();
 
-        // Make the distlocks boost::optional so that they can be emplaced only on the non legacy
-        // path.
+        // Make the distlocks boost::optional so that they can be emplaced only if the request came
+        // from the router.
         boost::optional<DistLockManager::ScopedDistLock> dbDistLock;
         boost::optional<DistLockManager::ScopedDistLock> collDistLock;
         if (mustTakeDistLock) {
@@ -604,9 +566,9 @@ CreateCollectionResponse shardCollection(OperationContext* opCtx,
             return *createCollectionResponseOpt;
         }
 
-        // If DistLock must not be taken, then the request came from the config server, there is no
-        // need to check this here.
         if (mustTakeDistLock) {
+            // If DistLock must be taken, then the request came from a router, there is no need to
+            // check for the count here because it was already done on the config server.
             if (nss.db() == NamespaceString::kConfigDb) {
                 auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
@@ -628,6 +590,13 @@ CreateCollectionResponse shardCollection(OperationContext* opCtx,
             } else {
                 const auto dbInfo = uassertStatusOK(
                     Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, nss.db()));
+
+                // Check under the dbLock if this is still the primary shard for the database. This
+                // is an unstable check because the shard version might change right after the
+                // check, this is added to fix some tests where a movePrimary might be issued from a
+                // stale router.
+                DatabaseShardingState::checkIsPrimaryShardForDb(opCtx, nss.db());
+
                 auto shardId = ShardingState::get(opCtx)->shardId();
 
                 uassert(ErrorCodes::IllegalOperation,
@@ -640,12 +609,25 @@ CreateCollectionResponse shardCollection(OperationContext* opCtx,
 
         // Fail if there are partially written chunks from a previous failed shardCollection.
         checkForExistingChunks(opCtx, nss);
-
         checkCollation(opCtx, request);
 
-        targetState = calculateTargetState(opCtx, nss, request);
+        // Create the collection locally
+        shardkeyutil::validateShardKeyIndexExistsOrCreateIfPossible(
+            opCtx,
+            nss,
+            ShardKeyPattern(request.getKey()),
+            *request.getCollation(),
+            request.getUnique(),
+            shardkeyutil::ValidationBehaviorsShardCollection(opCtx));
 
-        shardCollectionResponse.setCollectionUUID(targetState->uuid);
+        // Wait until the index is majority written, to prevent having the collection commited to
+        // the config server, but the index creation rolled backed on stepdowns.
+        WriteConcernResult ignoreResult;
+        auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+        uassertStatusOK(waitForWriteConcern(
+            opCtx, latestOpTime, ShardingCatalogClient::kMajorityWriteConcern, &ignoreResult));
+
+        targetState = calculateTargetState(opCtx, nss, request);
 
         splitPolicy =
             InitialSplitPolicy::calculateOptimizationStrategy(opCtx,
@@ -667,6 +649,7 @@ CreateCollectionResponse shardCollection(OperationContext* opCtx,
         // There must be at least one chunk.
         invariant(initialChunks.chunks.size());
 
+        shardCollectionResponse.setCollectionUUID(targetState->uuid);
         shardCollectionResponse.setCollectionVersion(
             initialChunks.chunks[initialChunks.chunks.size() - 1].getVersion());
 
@@ -699,7 +682,6 @@ CreateCollectionResponse shardCollection(OperationContext* opCtx,
           "namespace"_attr = nss,
           "initialCollectionVersion"_attr = initialChunks.collVersion());
 
-
     ShardingLogging::get(opCtx)->logChange(
         opCtx,
         "shardCollection.end",
@@ -718,7 +700,7 @@ CreateCollectionResponse shardCollectionLegacy(OperationContext* opCtx,
                                                const BSONObj& cmdObj,
                                                bool requestFromCSRS) {
     auto request = ShardsvrShardCollectionRequest::parse(
-        IDLParserErrorContext("_shardsvrShardCollection"), cmdObj);
+        IDLParserErrorContext("shardCollectionLegacy"), cmdObj);
     if (!request.getCollation())
         request.setCollation(BSONObj());
     if (!request.getCollation()->isEmpty()) {

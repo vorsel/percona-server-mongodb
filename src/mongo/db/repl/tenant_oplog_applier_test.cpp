@@ -212,6 +212,7 @@ TEST_F(TenantOplogApplierTest, NoOpsForSingleBatch) {
     ASSERT_EQ(2, entries.size());
     assertNoOpMatches(srcOps[0], entries[0]);
     assertNoOpMatches(srcOps[1], entries[1]);
+    ASSERT_EQ(srcOps.size(), applier->getNumOpsApplied());
     applier->shutdown();
     applier->join();
 }
@@ -237,6 +238,7 @@ TEST_F(TenantOplogApplierTest, NoOpsForLargeBatch) {
     for (size_t i = 0; i < srcOps.size(); i++) {
         assertNoOpMatches(srcOps[i], entries[i]);
     }
+    ASSERT_EQ(srcOps.size(), applier->getNumOpsApplied());
     applier->shutdown();
     applier->join();
 }
@@ -420,7 +422,7 @@ TEST_F(TenantOplogApplierTest, ApplyInserts_Grouped) {
     std::vector<OplogEntry> entries;
     bool onInsertsCalledNss1 = false;
     bool onInsertsCalledNss2 = false;
-    // Despite the odd one in the middle, all the others should be grouped into a single inserrt.
+    // Despite the odd one in the middle, all the others should be grouped into a single insert.
     entries.push_back(makeInsertOplogEntry(1, nss1, uuid1));
     entries.push_back(makeInsertOplogEntry(2, nss1, uuid1));
     entries.push_back(makeInsertOplogEntry(3, nss1, uuid1));

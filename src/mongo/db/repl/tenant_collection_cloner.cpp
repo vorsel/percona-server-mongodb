@@ -42,6 +42,7 @@
 #include "mongo/db/repl/database_cloner_gen.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/tenant_collection_cloner.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/rpc/metadata/repl_set_metadata.h"
@@ -175,10 +176,27 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::countStage() {
         count = 0;
     }
 
+    BSONObj res;
+    getClient()->runCommand(
+        _sourceNss.db().toString(), BSON("collStats" << _sourceNss.coll()), res);
+    auto status = getStatusFromCommandResult(res);
+    if (!status.isOK()) {
+        LOGV2_WARNING(5426601,
+                      "Skipping recording of data size metrics for collection due to failure in the"
+                      " 'collStats' command, tenant migration stats may be inaccurate.",
+                      "nss"_attr = _sourceNss,
+                      "migrationId"_attr = getSharedData()->getMigrationId(),
+                      "tenantId"_attr = _tenantId,
+                      "status"_attr = status);
+    }
+
     _progressMeter.setTotalWhileRunning(static_cast<unsigned long long>(count));
     {
         stdx::lock_guard<Latch> lk(_mutex);
         _stats.documentToCopy = count;
+        _stats.approxTotalDataSize = status.isOK() ? res.getField("size").safeNumberLong() : 0;
+        _stats.avgObjSize =
+            _stats.approxTotalDataSize ? res.getField("avgObjSize").safeNumberLong() : 0;
     }
     return kContinueNormally;
 }
@@ -270,14 +288,15 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::listIndexesStage() {
     };
 
     // Tenant collections are replicated collections and it's impossible to have an empty _id index
-    // and collection options 'autoIndexId' as false. These are extra sanity checks made on the
-    // response received from the remote node.
+    // and collection options 'autoIndexId' as false except for collections that use clustered
+    // index. These are extra sanity checks made on the response received from the remote node.
     uassert(
         ErrorCodes::IllegalOperation,
         str::stream() << "Found empty '_id' index spec but the collection is not specified with "
                          "'autoIndexId' as false, tenantId: "
                       << _tenantId << ", namespace: " << this->_sourceNss,
-        !_idIndexSpec.isEmpty() || _collectionOptions.autoIndexId == CollectionOptions::NO);
+        _collectionOptions.clusteredIndex || !_idIndexSpec.isEmpty() ||
+            _collectionOptions.autoIndexId == CollectionOptions::NO);
 
     if (!_idIndexSpec.isEmpty() && _collectionOptions.autoIndexId == CollectionOptions::NO) {
         LOGV2_WARNING(4884504,
@@ -321,6 +340,13 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::createCollectionStage() {
         // We are resuming and the collection already exists.
         DBDirectClient client(opCtx.get());
 
+        // Set the recipient info on the opCtx to bypass the access blocker for local reads.
+        tenantMigrationRecipientInfo(opCtx.get()) =
+            boost::make_optional<TenantMigrationRecipientInfo>(getSharedData()->getMigrationId());
+        // Reset the recipient info after local reads so oplog entries for future writes
+        // (createCollection/createIndex) don't get stamped with the fromTenantMigration field.
+        ON_BLOCK_EXIT([&opCtx] { tenantMigrationRecipientInfo(opCtx.get()) = boost::none; });
+
         auto fieldsToReturn = BSON("_id" << 1);
         _lastDocId =
             client.findOne(_existingNss->ns(), Query().sort(BSON("_id" << -1)), &fieldsToReturn);
@@ -333,6 +359,7 @@ BaseCloner::AfterStageBehavior TenantCollectionCloner::createCollectionStage() {
             {
                 stdx::lock_guard<Latch> lk(_mutex);
                 _stats.documentsCopied += count;
+                _stats.approxTotalBytesCopied = ((long)_stats.documentsCopied) * _stats.avgObjSize;
                 _progressMeter.hit(count);
             }
         } else {
@@ -422,7 +449,12 @@ void TenantCollectionCloner::runQuery() {
         ? QUERY("query" << BSONObj())
         // Use $expr and the aggregation version of $gt to avoid type bracketing.
         : QUERY("$expr" << BSON("$gt" << BSON_ARRAY("$_id" << _lastDocId["_id"])));
-    query.hint(BSON("_id" << 1));
+    if (_collectionOptions.clusteredIndex) {
+        // RecordIds are _id values and has no separate _id index
+        query.hint(BSON("$natural" << 1));
+    } else {
+        query.hint(BSON("_id" << 1));
+    }
 
     // Any errors that are thrown here (including NamespaceNotFound) will be handled on the stage
     // level.
@@ -494,6 +526,7 @@ void TenantCollectionCloner::insertDocumentsCallback(
         }
         _documentsToInsert.swap(docs);
         _stats.documentsCopied += docs.size();
+        _stats.approxTotalBytesCopied = ((long)_stats.documentsCopied) * _stats.avgObjSize;
         ++_stats.insertedBatches;
         _progressMeter.hit(int(docs.size()));
     }
@@ -513,6 +546,11 @@ void TenantCollectionCloner::insertDocumentsCallback(
         wcb.setOrdered(true);
         return wcb;
     }());
+
+    // Set the recipient info on the opCtx to skip checking user permissions in
+    // 'write_ops_exec::performInserts()'.
+    tenantMigrationRecipientInfo(cbd.opCtx) =
+        boost::make_optional<TenantMigrationRecipientInfo>(getSharedData()->getMigrationId());
 
     // write_ops_exec::PerformInserts() will handle limiting the batch size
     // that gets inserted in a single WUOW.

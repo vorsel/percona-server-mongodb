@@ -52,7 +52,7 @@ structs:
         strict: false
         fields:
             comment:
-                type: object
+                type: object_owned
                 description: "The comment assiociated with the operation."
                 optional: true
             impersonatedUserMetadata:

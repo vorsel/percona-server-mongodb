@@ -59,6 +59,7 @@
 #include "mongo/db/repl/tenant_migration_recipient_entry_helpers.h"
 #include "mongo/db/repl/tenant_migration_recipient_service.h"
 #include "mongo/db/repl/tenant_migration_state_machine_gen.h"
+#include "mongo/db/repl/tenant_migration_statistics.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/session_txn_record_gen.h"
@@ -68,6 +69,7 @@
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/cancelation.h"
 #include "mongo/util/future_util.h"
 
 namespace mongo {
@@ -325,6 +327,23 @@ boost::optional<BSONObj> TenantMigrationRecipientService::Instance::reportForCur
                _stateDoc.getNumRestartsDueToDonorConnectionFailure());
     bob.append("numRestartsDueToRecipientFailure", _stateDoc.getNumRestartsDueToRecipientFailure());
 
+    if (_tenantAllDatabaseCloner) {
+        auto stats = _tenantAllDatabaseCloner->getStats();
+        bob.append("approxTotalDataSize", stats.approxTotalDataSize);
+        bob.append("approxTotalBytesCopied", stats.approxTotalBytesCopied);
+
+        long long elapsedMillis = duration_cast<Milliseconds>(Date_t::now() - stats.start).count();
+        bob.append("totalReceiveElapsedMillis", elapsedMillis);
+
+        // Perform the multiplication first to avoid rounding errors, and add one to avoid division
+        // by 0.
+        long long timeRemainingMillis =
+            ((stats.approxTotalDataSize - stats.approxTotalBytesCopied) * elapsedMillis) /
+            (stats.approxTotalBytesCopied + 1);
+
+        bob.append("remainingReceiveEstimatedMillis", timeRemainingMillis);
+    }
+
     if (_stateDoc.getStartFetchingDonorOpTime())
         bob.append("startFetchingDonorOpTime", _stateDoc.getStartFetchingDonorOpTime()->toBSON());
     if (_stateDoc.getStartApplyingDonorOpTime())
@@ -337,10 +356,25 @@ boost::optional<BSONObj> TenantMigrationRecipientService::Instance::reportForCur
                    _stateDoc.getCloneFinishedRecipientOpTime()->toBSON());
 
     if (_stateDoc.getExpireAt())
-        bob.append("expireAt", _stateDoc.getExpireAt()->toString());
+        bob.append("expireAt", *_stateDoc.getExpireAt());
 
     if (_client) {
         bob.append("donorSyncSource", _client->getServerAddress());
+    }
+
+    if (_stateDoc.getStartAt()) {
+        bob.append("receiveStart", *_stateDoc.getStartAt());
+    }
+
+    if (_tenantOplogApplier) {
+        bob.appendNumber("numOpsApplied",
+                         static_cast<long long>(_tenantOplogApplier->getNumOpsApplied()));
+    }
+
+    if (_tenantAllDatabaseCloner) {
+        BSONObjBuilder dbsBuilder(bob.subobjStart("databases"));
+        _tenantAllDatabaseCloner->getStats().append(&dbsBuilder);
+        dbsBuilder.doneFast();
     }
 
     return bob.obj();
@@ -391,8 +425,12 @@ TenantMigrationRecipientService::Instance::waitUntilMigrationReachesReturnAfterR
     }
 
     auto getWaitOpTimeFuture = [&]() {
-        stdx::lock_guard lk(_mutex);
-
+        stdx::unique_lock lk(_mutex);
+        // In the event of a donor failover, it is possible that a new donor has stepped up and
+        // initiated this 'recipientSyncData' cmd. Make sure the recipient is not in the middle of
+        // restarting the oplog applier to retry the future chain.
+        opCtx->waitForConditionOrInterrupt(
+            _restartOplogApplierCondVar, lk, [&] { return !_isRestartingOplogApplier; });
         if (_dataSyncCompletionPromise.getFuture().isReady()) {
             // When the data sync is done, we reset _tenantOplogApplier, so just throw the data sync
             // completion future result.
@@ -732,7 +770,7 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::_initializeStateDoc(
 
     // Persist the state doc before starting the data sync.
     _stateDoc.setState(TenantMigrationRecipientStateEnum::kStarted);
-
+    _stateDoc.setStartAt(getGlobalServiceContext()->getFastClockSource()->now());
 
     return ExecutorFuture(**_scopedExecutor)
         .then([this, self = shared_from_this(), stateDoc = _stateDoc] {
@@ -758,7 +796,7 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::_initializeStateDoc(
             // doesn't rollback.
             auto writeOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
             return WaitForMajorityService::get(opCtx->getServiceContext())
-                .waitUntilMajority(writeOpTime);
+                .waitUntilMajority(writeOpTime, CancelationToken::uncancelable());
         })
         .semi();
 }
@@ -1015,7 +1053,6 @@ void TenantMigrationRecipientService::Instance::_createOplogBuffer() {
         _donorOplogBuffer = std::move(bufferCollection);
     }
 
-    stdx::unique_lock lk(_mutex);
     invariant(_stateDoc.getStartFetchingDonorOpTime());
     {
         // Ensure we are primary when trying to startup and create the oplog buffer collection.
@@ -1123,7 +1160,7 @@ TenantMigrationRecipientService::Instance::_fetchRetryableWritesOplogBeforeStart
             // Wait for enough space.
             _donorOplogBuffer->waitForSpace(opCtx.get(), toApplyDocumentBytes);
             // Buffer retryable writes entries.
-            _donorOplogBuffer->push(
+            _donorOplogBuffer->preload(
                 opCtx.get(), retryableWritesEntries.begin(), retryableWritesEntries.end());
         }
 
@@ -1409,7 +1446,7 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::_onCloneSuccess() {
 
             auto writeOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
             return WaitForMajorityService::get(opCtx->getServiceContext())
-                .waitUntilMajority(writeOpTime);
+                .waitUntilMajority(writeOpTime, CancelationToken::uncancelable());
         })
         .semi();
 }
@@ -1438,7 +1475,8 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::_getDataConsistentFu
             uassertStatusOK(
                 tenantMigrationRecipientEntryHelpers::updateStateDoc(opCtx.get(), stateDoc));
             return WaitForMajorityService::get(opCtx->getServiceContext())
-                .waitUntilMajority(repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp());
+                .waitUntilMajority(repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp(),
+                                   CancelationToken::uncancelable());
         })
         .semi();
 }
@@ -1530,7 +1568,7 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::_markStateDocAsGarba
 
             auto writeOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
             return WaitForMajorityService::get(opCtx->getServiceContext())
-                .waitUntilMajority(writeOpTime);
+                .waitUntilMajority(writeOpTime, CancelationToken::uncancelable());
         })
         .semi();
 }
@@ -1636,6 +1674,8 @@ void TenantMigrationRecipientService::Instance::_cleanupOnDataSyncCompletion(Sta
     std::unique_ptr<ThreadPool> savedWriterPool;
     {
         stdx::lock_guard lk(_mutex);
+        _isRestartingOplogApplier = false;
+        _restartOplogApplierCondVar.notify_all();
 
         _cancelRemainingWork(lk);
 
@@ -1690,7 +1730,7 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::_updateStateDocForMa
 
             auto writeOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
             return WaitForMajorityService::get(opCtx->getServiceContext())
-                .waitUntilMajority(writeOpTime);
+                .waitUntilMajority(writeOpTime, CancelationToken::uncancelable());
         })
         .semi();
 }
@@ -1747,6 +1787,8 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
     const CancelationToken& token) noexcept {
     _scopedExecutor = executor;
+    auto scopedOutstandingMigrationCounter =
+        TenantMigrationStatistics::get(_serviceContext)->getScopedOutstandingReceivingCount();
 
     LOGV2(4879607,
           "Starting tenant migration recipient instance: ",
@@ -2012,6 +2054,8 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
                        {
                            stdx::lock_guard lk(_mutex);
                            uassertStatusOK(_tenantOplogApplier->startup());
+                           _isRestartingOplogApplier = false;
+                           _restartOplogApplierCondVar.notify_all();
                        }
                        _stopOrHangOnFailPoint(
                            &fpAfterStartingOplogApplierMigrationRecipientInstance);
@@ -2032,9 +2076,19 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
                            _dataConsistentPromise.emplaceValue(
                                _stateDoc.getDataConsistentStopDonorOpTime().get());
                        }
+                   })
+                   .then([this, self = shared_from_this()] {
+                       _stopOrHangOnFailPoint(&fpAfterDataConsistentMigrationRecipientInstance);
+                       stdx::lock_guard lk(_mutex);
+                       // wait for oplog applier to complete/stop.
+                       // The oplog applier does not exit normally; it must be shut down externally,
+                       // e.g. by recipientForgetMigration.
+                       return _tenantOplogApplier->getNotificationForOpTime(OpTime::max());
                    });
            })
-        .until([this, self = shared_from_this()](Status status) {
+        .until([this, self = shared_from_this()](
+                   StatusOrStatusWith<TenantOplogApplier::OpTimePair> applierStatus) {
+            auto status = applierStatus.getStatus();
             stdx::unique_lock lk(_mutex);
             if (_taskState.isInterrupted()) {
                 status = _taskState.getInterruptStatus();
@@ -2045,7 +2099,7 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
                 if (!_taskState.isRunning()) {
                     _taskState.setState(TaskState::kRunning);
                 }
-                _taskState.clearInterruptStatus();
+                _isRestartingOplogApplier = true;
                 // Clean up the async components before retrying the future chain.
                 _oplogFetcherStatus = boost::none;
                 std::unique_ptr<OplogFetcher> savedDonorOplogFetcher;
@@ -2070,15 +2124,6 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
         .withBackoffBetweenIterations(kExponentialBackoff)
         .on(_recipientService->getInstanceCleanupExecutor(), token)
         .semi()
-        .thenRunOn(**_scopedExecutor)
-        .then([this, self = shared_from_this()] {
-            _stopOrHangOnFailPoint(&fpAfterDataConsistentMigrationRecipientInstance);
-            stdx::lock_guard lk(_mutex);
-            // wait for oplog applier to complete/stop.
-            // The oplog applier does not exit normally; it must be shut down externally,
-            // e.g. by recipientForgetMigration.
-            return _tenantOplogApplier->getNotificationForOpTime(OpTime::max());
-        })
         .thenRunOn(_recipientService->getInstanceCleanupExecutor())
         .onCompletion([this, self = shared_from_this()](
                           StatusOrStatusWith<TenantOplogApplier::OpTimePair> applierStatus) {
@@ -2112,6 +2157,15 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
                           "completionStatus"_attr = status,
                           "interruptStatus"_attr = _taskState.getInterruptStatus());
                     status = _taskState.getInterruptStatus();
+                } else if (status == ErrorCodes::CallbackCanceled) {
+                    // All of our async components don't exit with CallbackCanceled normally unless
+                    // they are shut down by the instance itself via interrupt. If we get a
+                    // CallbackCanceled error without an interrupt, it is coming from the service's
+                    // cancellation token on failovers. It is possible for the token to get canceled
+                    // before the instance is interrupted, so we replace the CallbackCanceled error
+                    // with InterruptedDueToReplStateChange and treat it as a retryable error.
+                    status = Status{ErrorCodes::InterruptedDueToReplStateChange,
+                                    "operation was interrupted"};
                 }
             }
 
@@ -2129,6 +2183,7 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
             }
 
             _cleanupOnDataSyncCompletion(status);
+            _setMigrationStatsOnCompletion(status);
 
             // Handle recipientForgetMigration.
             stdx::lock_guard lk(_mutex);
@@ -2169,7 +2224,9 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
                                                     getOplogBufferNs(getMigrationUUID()));
         })
         .thenRunOn(_recipientService->getInstanceCleanupExecutor())
-        .onCompletion([this, self = shared_from_this()](Status status) {
+        .onCompletion([this,
+                       self = shared_from_this(),
+                       scopedCounter{std::move(scopedOutstandingMigrationCounter)}](Status status) {
             // Schedule on the parent executor to mark the completion of the whole chain so this
             // is safe even on shutDown/stepDown.
             stdx::lock_guard lk(_mutex);
@@ -2196,6 +2253,34 @@ SemiFuture<void> TenantMigrationRecipientService::Instance::run(
             _taskState.setState(TaskState::kDone);
         })
         .semi();
+}
+
+void TenantMigrationRecipientService::Instance::_setMigrationStatsOnCompletion(
+    Status completionStatus) const {
+    bool success = false;
+
+    if (completionStatus.code() == ErrorCodes::TenantMigrationForgotten) {
+        if (_stateDoc.getExpireAt()) {
+            // Avoid double counting tenant migration statistics after failover.
+            return;
+        }
+        // The migration committed if and only if it received recipientForgetMigration after it has
+        // applied data past the returnAfterReachingDonorTimestamp, saved in state doc as
+        // rejectReadsBeforeTimestamp.
+        if (_stateDoc.getRejectReadsBeforeTimestamp().has_value()) {
+            success = true;
+        }
+    } else if (ErrorCodes::isRetriableError(completionStatus)) {
+        // The migration was interrupted due to shutdown or stepdown, avoid incrementing the count
+        // for failed migrations since the migration will be resumed on stepup.
+        return;
+    }
+
+    if (success) {
+        TenantMigrationStatistics::get(_serviceContext)->incTotalSuccessfulMigrationsReceived();
+    } else {
+        TenantMigrationStatistics::get(_serviceContext)->incTotalFailedMigrationsReceived();
+    }
 }
 
 const UUID& TenantMigrationRecipientService::Instance::getMigrationUUID() const {

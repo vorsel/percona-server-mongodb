@@ -39,11 +39,11 @@
 #include "mongo/db/exec/sbe/stages/limit_skip.h"
 #include "mongo/db/exec/sbe/stages/loop_join.h"
 #include "mongo/db/exec/sbe/stages/makeobj.h"
+#include "mongo/db/exec/sbe/stages/merge_join.h"
 #include "mongo/db/exec/sbe/stages/project.h"
 #include "mongo/db/exec/sbe/stages/scan.h"
 #include "mongo/db/exec/sbe/stages/sort.h"
 #include "mongo/db/exec/sbe/stages/sorted_merge.h"
-#include "mongo/db/exec/sbe/stages/text_match.h"
 #include "mongo/db/exec/sbe/stages/traverse.h"
 #include "mongo/db/exec/sbe/stages/union.h"
 #include "mongo/db/exec/sbe/stages/unique.h"
@@ -207,7 +207,6 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> generateEofPlan(
 }
 }  // namespace
 
-
 std::unique_ptr<sbe::RuntimeEnvironment> makeRuntimeEnvironment(
     const CanonicalQuery& cq,
     OperationContext* opCtx,
@@ -283,6 +282,36 @@ sbe::LockAcquisitionCallback makeLockAcquisitionCallback(bool checkNodeCanServeR
         uassertStatusOK(repl::ReplicationCoordinator::get(opCtx)->checkCanServeReadsFor(
             opCtx, coll.getNss(), true));
     };
+}
+
+std::unique_ptr<fts::FTSMatcher> makeFtsMatcher(OperationContext* opCtx,
+                                                const CollectionPtr& collection,
+                                                const std::string& indexName,
+                                                const fts::FTSQuery* ftsQuery) {
+    auto desc = collection->getIndexCatalog()->findIndexByName(opCtx, indexName);
+    tassert(5432209,
+            str::stream() << "index descriptor not found for index named '" << indexName
+                          << "' in collection '" << collection->ns() << "'",
+            desc);
+
+    auto entry = collection->getIndexCatalog()->getEntry(desc);
+    tassert(5432210,
+            str::stream() << "index entry not found for index named '" << indexName
+                          << "' in collection '" << collection->ns() << "'",
+            entry);
+
+    auto accessMethod = static_cast<const FTSAccessMethod*>(entry->accessMethod());
+    tassert(5432211,
+            str::stream() << "access method is not defined for index named '" << indexName
+                          << "' in collection '" << collection->ns() << "'",
+            accessMethod);
+
+    // We assume here that node->ftsQuery is an FTSQueryImpl, not an FTSQueryNoop. In practice, this
+    // means that it is illegal to use the StageBuilder on a QuerySolution created by planning a
+    // query that contains "no-op" expressions.
+    auto query = dynamic_cast<const fts::FTSQueryImpl*>(ftsQuery);
+    tassert(5432220, "expected FTSQueryImpl", query);
+    return std::make_unique<fts::FTSMatcher>(*query, accessMethod->getSpec());
 }
 }  // namespace
 
@@ -425,11 +454,10 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
         for (auto&& field : vsn->indexKeyPattern) {
             if (reqs.getIndexKeyBitset()->test(indexKeyPos)) {
                 indexKeySlots.push_back(_slotIdGenerator.generate());
-                projections.emplace(
-                    indexKeySlots.back(),
-                    makeFunction("getField"sv,
-                                 sbe::makeE<sbe::EVariable>(resultSlot),
-                                 makeConstant(std::string_view{field.fieldName()})));
+                projections.emplace(indexKeySlots.back(),
+                                    makeFunction("getField"_sd,
+                                                 sbe::makeE<sbe::EVariable>(resultSlot),
+                                                 makeConstant(field.fieldName())));
             }
             ++indexKeyPos;
         }
@@ -486,10 +514,7 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
 
         size_t i = 0;
         for (auto&& elem : ixn->index.keyPattern) {
-            auto fieldName = elem.fieldNameStringData();
-
-            mkObjArgs.emplace_back(sbe::makeE<sbe::EConstant>(
-                std::string_view{fieldName.rawData(), fieldName.size()}));
+            mkObjArgs.emplace_back(sbe::makeE<sbe::EConstant>(elem.fieldNameStringData()));
             mkObjArgs.emplace_back(sbe::makeE<sbe::EVariable>((*outputs.getIndexKeySlots())[i++]));
         }
 
@@ -689,20 +714,19 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
         // Generate projection to get the value of the sort key. Ideally, this should be
         // tracked by a 'reference tracker' at higher level.
         auto fieldName = part.fieldPath->getFieldName(0);
-        auto fieldNameSV = std::string_view{fieldName.rawData(), fieldName.size()};
 
-        auto getSortFieldExpr = makeFunction("getField"sv,
+        auto getSortFieldExpr = makeFunction("getField"_sd,
                                              sbe::makeE<sbe::EVariable>(outputs.get(kResult)),
-                                             sbe::makeE<sbe::EConstant>(fieldNameSV));
+                                             sbe::makeE<sbe::EConstant>(fieldName));
 
         if (auto collatorSlot = _data.env->getSlotIfExists("collator"_sd); collatorSlot) {
-            getSortFieldExpr = makeFunction("collComparisonKey"sv,
+            getSortFieldExpr = makeFunction("collComparisonKey"_sd,
                                             std::move(getSortFieldExpr),
                                             sbe::makeE<sbe::EVariable>(*collatorSlot));
         }
 
         // According to MQL semantics, missing values are treated as nulls during sorting.
-        getSortFieldExpr = makeFunction("fillEmpty"sv,
+        getSortFieldExpr = makeFunction("fillEmpty"_sd,
                                         std::move(getSortFieldExpr),
                                         makeConstant(sbe::value::TypeTags::Null, 0));
 
@@ -1073,116 +1097,56 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
     return {std::move(stage), std::move(outputs)};
 }
 
-std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder::buildText(
+std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder::buildTextMatch(
     const QuerySolutionNode* root, const PlanStageReqs& reqs) {
-    invariant(_collection);
-    invariant(!reqs.getIndexKeyBitset());
+    tassert(5432212, "no collection object", _collection);
+    tassert(5432213, "index keys requsted for text match node", !reqs.getIndexKeyBitset());
+    tassert(5432214, "oplogTs requsted for text match node", !reqs.has(kOplogTs));
+    tassert(5432215,
+            str::stream() << "text match node must have one child, but got "
+                          << root->children.size(),
+            root->children.size() == 1);
+    // TextMatchNode guarantees to produce a fetched sub-plan, but it doesn't fetch itself. Instead,
+    // its child sub-plan must be fully fetched, and a text match plan is constructed under this
+    // assumption.
+    tassert(5432216, "text match input must be fetched", root->children[0]->fetched());
 
-    // At present, makeLoopJoinForFetch() doesn't have the necessary logic for producing an
-    // oplogTsSlot, so assert that the caller doesn't need oplogTsSlot.
-    invariant(!reqs.has(kOplogTs));
+    auto textNode = static_cast<const TextMatchNode*>(root);
 
-    auto textNode = static_cast<const TextNode*>(root);
+    auto childReqs = reqs.copy().set(kResult);
+    auto [stage, outputs] = build(textNode->children[0], childReqs);
+    tassert(5432217, "result slot is not produced by text match sub-plan", outputs.has(kResult));
 
-    auto&& indexName = textNode->index.identifier.catalogName;
-    const auto desc = _collection->getIndexCatalog()->findIndexByName(_opCtx, indexName);
-    invariant(desc);
-    const auto accessMethod = static_cast<const FTSAccessMethod*>(
-        _collection->getIndexCatalog()->getEntry(desc)->accessMethod());
-    invariant(accessMethod);
-    auto&& ftsSpec = accessMethod->getSpec();
+    // Create an FTS 'matcher' to apply 'ftsQuery' to matching documents.
+    auto matcher = makeFtsMatcher(
+        _opCtx, _collection, textNode->index.identifier.catalogName, textNode->ftsQuery.get());
 
-    // We assume here that node->ftsQuery is an FTSQueryImpl, not an FTSQueryNoop. In practice, this
-    // means that it is illegal to use the StageBuilder on a QuerySolution created by planning a
-    // query that contains "no-op" expressions.
-    auto ftsQuery = static_cast<fts::FTSQueryImpl&>(*textNode->ftsQuery);
+    // Build an 'ftsMatch' expression to match a document stored in the 'kResult' slot using the
+    // 'matcher' instance.
+    auto ftsMatch =
+        makeFunction("ftsMatch",
+                     makeConstant(sbe::value::TypeTags::ftsMatcher,
+                                  sbe::value::bitcastFrom<fts::FTSMatcher*>(matcher.release())),
+                     makeVariable(outputs.get(kResult)));
 
-    // A vector of the output slots for each index scan stage. Each stage outputs a record id and a
-    // record, so we expect each inner vector to be of length two.
-    std::vector<sbe::value::SlotVector> ixscanOutputSlots;
+    // Wrap the 'ftsMatch' expression into an 'if' expression to ensure that it can be applied only
+    // to a document.
+    auto filter =
+        sbe::makeE<sbe::EIf>(makeFunction("isObject", makeVariable(outputs.get(kResult))),
+                             std::move(ftsMatch),
+                             sbe::makeE<sbe::EFail>(ErrorCodes::Error{4623400},
+                                                    "textmatch requires input to be an object"));
 
-    const bool forward = true;
-    const bool inclusive = true;
-    auto makeKeyString = [&](const BSONObj& bsonKey) {
-        return std::make_unique<KeyString::Value>(
-            IndexEntryComparison::makeKeyStringFromBSONKeyForSeek(
-                bsonKey,
-                accessMethod->getSortedDataInterface()->getKeyStringVersion(),
-                accessMethod->getSortedDataInterface()->getOrdering(),
-                forward,
-                inclusive));
-    };
-
-    std::vector<std::unique_ptr<sbe::PlanStage>> indexScanList;
-    for (const auto& term : ftsQuery.getTermsForBounds()) {
-        // TODO: Should we scan in the opposite direction?
-        auto startKeyBson = fts::FTSIndexFormat::getIndexKey(
-            0, term, textNode->indexPrefix, ftsSpec.getTextIndexVersion());
-        auto endKeyBson = fts::FTSIndexFormat::getIndexKey(
-            fts::MAX_WEIGHT, term, textNode->indexPrefix, ftsSpec.getTextIndexVersion());
-
-        auto&& [recordIdSlot, ixscan] =
-            generateSingleIntervalIndexScan(_collection,
-                                            indexName,
-                                            forward,
-                                            makeKeyString(startKeyBson),
-                                            makeKeyString(endKeyBson),
-                                            sbe::IndexKeysInclusionSet{},
-                                            sbe::makeSV(),
-                                            boost::none,  // recordSlot
-                                            &_slotIdGenerator,
-                                            _yieldPolicy,
-                                            root->nodeId(),
-                                            _lockAcquisitionCallback);
-        indexScanList.push_back(std::move(ixscan));
-        ixscanOutputSlots.push_back(sbe::makeSV(recordIdSlot));
-    }
-
-    // If we don't have any index scan stages, produce an EOF plan.
-    if (indexScanList.empty()) {
-        return generateEofPlan(root->nodeId(), reqs, &_slotIdGenerator);
-    }
-
-    PlanStageSlots outputs;
-
-    // Union will output a slot for the record id and another for the record.
-    auto recordIdSlot = _slotIdGenerator.generate();
-    auto unionOutputSlots = sbe::makeSV(recordIdSlot);
-
-    // Index scan output slots become the input slots to the union.
-    auto stage = sbe::makeS<sbe::UnionStage>(
-        std::move(indexScanList), ixscanOutputSlots, unionOutputSlots, root->nodeId());
-
-    // TODO: If text score metadata is requested, then we should sum over the text scores inside the
-    // index keys for a given document. This will require expression evaluation to be able to
-    // extract the score directly from the key string.
+    // Add a filter stage to apply 'ftsQuery' to matching documents and discard documents which do
+    // not match.
     stage =
-        sbe::makeS<sbe::UniqueStage>(std::move(stage), sbe::makeSV(recordIdSlot), root->nodeId());
-
-    sbe::value::SlotId resultSlot;
-    std::tie(resultSlot, recordIdSlot, stage) =
-        makeLoopJoinForFetch(std::move(stage), recordIdSlot, root->nodeId());
-
-    // Add a special stage to apply 'ftsQuery' to matching documents, and then add a FilterStage to
-    // discard documents which do not match.
-    auto textMatchResultSlot = _slotIdGenerator.generate();
-    stage = sbe::makeS<sbe::TextMatchStage>(
-        std::move(stage), ftsQuery, ftsSpec, resultSlot, textMatchResultSlot, root->nodeId());
-
-    // Filter based on the contents of the slot filled out by the TextMatchStage.
-    stage = sbe::makeS<sbe::FilterStage<false>>(
-        std::move(stage), sbe::makeE<sbe::EVariable>(textMatchResultSlot), root->nodeId());
-
-    outputs.set(kResult, resultSlot);
-    outputs.set(kRecordId, recordIdSlot);
+        sbe::makeS<sbe::FilterStage<false>>(std::move(stage), std::move(filter), root->nodeId());
 
     if (reqs.has(kReturnKey)) {
         // Assign the 'returnKeySlot' to be the empty object.
         outputs.set(kReturnKey, _slotIdGenerator.generate());
-        stage = sbe::makeProjectStage(std::move(stage),
-                                      root->nodeId(),
-                                      outputs.get(kReturnKey),
-                                      sbe::makeE<sbe::EFunction>("newObj", sbe::makeEs()));
+        stage = sbe::makeProjectStage(
+            std::move(stage), root->nodeId(), outputs.get(kReturnKey), makeFunction("newObj"));
     }
 
     return {std::move(stage), std::move(outputs)};
@@ -1218,12 +1182,12 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
     const QuerySolutionNode* root, const PlanStageReqs& reqs) {
     auto andHashNode = static_cast<const AndHashNode*>(root);
 
-    invariant(andHashNode->children.size() >= 2);
+    tassert(5073711, "need at least two children for AND_HASH", andHashNode->children.size() >= 2);
 
     auto childReqs = reqs.copy().set(kResult).set(kRecordId);
 
-    auto innerChild = andHashNode->children[0];
-    auto outerChild = andHashNode->children[1];
+    auto outerChild = andHashNode->children[0];
+    auto innerChild = andHashNode->children[1];
 
     auto [outerStage, outerOutputs] = build(outerChild, childReqs);
     auto outerIdSlot = outerOutputs.get(kRecordId);
@@ -1232,10 +1196,14 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
     auto outerProjectSlots = sbe::makeSV(outerResultSlot);
 
     auto [innerStage, innerOutputs] = build(innerChild, childReqs);
+    tassert(5073712, "innerOutputs must contain kRecordId slot", innerOutputs.has(kRecordId));
+    tassert(5073713, "innerOutputs must contain kResult slot", innerOutputs.has(kResult));
     auto innerIdSlot = innerOutputs.get(kRecordId);
     auto innerResultSlot = innerOutputs.get(kResult);
     auto innerCondSlots = sbe::makeSV(innerIdSlot);
     auto innerProjectSlots = sbe::makeSV(innerResultSlot);
+
+    auto collatorSlot = _data.env->getSlotIfExists("collator"_sd);
 
     // Designate outputs.
     PlanStageSlots outputs(reqs, &_slotIdGenerator);
@@ -1252,12 +1220,15 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
                                                         outerProjectSlots,
                                                         innerCondSlots,
                                                         innerProjectSlots,
+                                                        collatorSlot,
                                                         root->nodeId());
 
     // If there are more than 2 children, iterate all remaining children and hash
     // join together.
     for (size_t i = 2; i < andHashNode->children.size(); i++) {
         auto [stage, outputs] = build(andHashNode->children[i], childReqs);
+        tassert(5073714, "outputs must contain kRecordId slot", outputs.has(kRecordId));
+        tassert(5073715, "outputs must contain kResult slot", outputs.has(kResult));
         auto idSlot = outputs.get(kRecordId);
         auto resultSlot = outputs.get(kResult);
         auto condSlots = sbe::makeSV(idSlot);
@@ -1271,10 +1242,84 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
                                                        projectSlots,
                                                        innerCondSlots,
                                                        innerProjectSlots,
+                                                       collatorSlot,
                                                        root->nodeId());
     }
 
     return {std::move(hashJoinStage), std::move(outputs)};
+}
+
+std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder::buildAndSorted(
+    const QuerySolutionNode* root, const PlanStageReqs& reqs) {
+    auto andSortedNode = static_cast<const AndSortedNode*>(root);
+
+    // Need at least two children.
+    tassert(
+        5073706, "need at least two children for AND_SORTED", andSortedNode->children.size() >= 2);
+
+    auto childReqs = reqs.copy().set(kResult).set(kRecordId);
+
+    auto outerChild = andSortedNode->children[0];
+    auto innerChild = andSortedNode->children[1];
+
+    auto [outerStage, outerOutputs] = build(outerChild, childReqs);
+    auto outerIdSlot = outerOutputs.get(kRecordId);
+    auto outerResultSlot = outerOutputs.get(kResult);
+
+    auto outerKeySlots = sbe::makeSV(outerIdSlot);
+    auto outerProjectSlots = sbe::makeSV(outerResultSlot);
+
+    auto [innerStage, innerOutputs] = build(innerChild, childReqs);
+    tassert(5073707, "innerOutputs must contain kRecordId slot", innerOutputs.has(kRecordId));
+    tassert(5073708, "innerOutputs must contain kResult slot", innerOutputs.has(kResult));
+    auto innerIdSlot = innerOutputs.get(kRecordId);
+    auto innerResultSlot = innerOutputs.get(kResult);
+
+    auto innerKeySlots = sbe::makeSV(innerIdSlot);
+    auto innerProjectSlots = sbe::makeSV(innerResultSlot);
+
+    PlanStageSlots outputs(reqs, &_slotIdGenerator);
+    if (reqs.has(kRecordId)) {
+        outputs.set(kRecordId, innerIdSlot);
+    }
+    if (reqs.has(kResult)) {
+        outputs.set(kResult, innerResultSlot);
+    }
+
+    std::vector<sbe::value::SortDirection> sortDirs(outerKeySlots.size(),
+                                                    sbe::value::SortDirection::Ascending);
+
+    auto mergeJoinStage = sbe::makeS<sbe::MergeJoinStage>(std::move(outerStage),
+                                                          std::move(innerStage),
+                                                          outerKeySlots,
+                                                          outerProjectSlots,
+                                                          innerKeySlots,
+                                                          innerProjectSlots,
+                                                          sortDirs,
+                                                          root->nodeId());
+
+    // If there are more than 2 children, iterate all remaining children and merge
+    // join together.
+    for (size_t i = 2; i < andSortedNode->children.size(); i++) {
+        auto [stage, outputs] = build(andSortedNode->children[i], childReqs);
+        tassert(5073709, "outputs must contain kRecordId slot", outputs.has(kRecordId));
+        tassert(5073710, "outputs must contain kResult slot", outputs.has(kResult));
+        auto idSlot = outputs.get(kRecordId);
+        auto resultSlot = outputs.get(kResult);
+        auto keySlots = sbe::makeSV(idSlot);
+        auto projectSlots = sbe::makeSV(resultSlot);
+
+        mergeJoinStage = sbe::makeS<sbe::MergeJoinStage>(std::move(stage),
+                                                         std::move(mergeJoinStage),
+                                                         keySlots,
+                                                         projectSlots,
+                                                         innerKeySlots,
+                                                         innerProjectSlots,
+                                                         sortDirs,
+                                                         root->nodeId());
+    }
+
+    return {std::move(mergeJoinStage), std::move(outputs)};
 }
 
 std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots>
@@ -1317,7 +1362,7 @@ SlotBasedStageBuilder::makeUnionForTailableCollScan(const QuerySolutionNode* roo
     auto&& [anchorBranchSlots, anchorBranch] = makeUnionBranch(false);
     anchorBranch = sbe::makeS<sbe::FilterStage<true>>(
         std::move(anchorBranch),
-        makeNot(makeFunction("exists"sv, sbe::makeE<sbe::EVariable>(resumeRecordIdSlot))),
+        makeNot(makeFunction("exists"_sd, sbe::makeE<sbe::EVariable>(resumeRecordIdSlot))),
         root->nodeId());
 
     // Build a resume branch of the union and add a constant filter on op of it, so that it would
@@ -1325,7 +1370,7 @@ SlotBasedStageBuilder::makeUnionForTailableCollScan(const QuerySolutionNode* roo
     auto&& [resumeBranchSlots, resumeBranch] = makeUnionBranch(true);
     resumeBranch = sbe::makeS<sbe::FilterStage<true>>(
         sbe::makeS<sbe::LimitSkipStage>(std::move(resumeBranch), boost::none, 1, root->nodeId()),
-        sbe::makeE<sbe::EFunction>("exists"sv,
+        sbe::makeE<sbe::EFunction>("exists"_sd,
                                    sbe::makeEs(sbe::makeE<sbe::EVariable>(resumeRecordIdSlot))),
         root->nodeId());
 
@@ -1561,10 +1606,14 @@ std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> SlotBasedStageBuilder
             {STAGE_PROJECTION_DEFAULT, &SlotBasedStageBuilder::buildProjectionDefault},
             {STAGE_PROJECTION_COVERED, &SlotBasedStageBuilder::buildProjectionCovered},
             {STAGE_OR, &SlotBasedStageBuilder::buildOr},
-            {STAGE_TEXT, &SlotBasedStageBuilder::buildText},
+            // In SBE TEXT_OR behaves like a regular OR. All the work to support "textScore"
+            // metadata is done outside of TEXT_OR, unlike the legacy implementation.
+            {STAGE_TEXT_OR, &SlotBasedStageBuilder::buildOr},
+            {STAGE_TEXT_MATCH, &SlotBasedStageBuilder::buildTextMatch},
             {STAGE_RETURN_KEY, &SlotBasedStageBuilder::buildReturnKey},
             {STAGE_EOF, &SlotBasedStageBuilder::buildEof},
             {STAGE_AND_HASH, &SlotBasedStageBuilder::buildAndHash},
+            {STAGE_AND_SORTED, &SlotBasedStageBuilder::buildAndSorted},
             {STAGE_SORT_MERGE, &SlotBasedStageBuilder::buildSortMerge},
             {STAGE_SHARDING_FILTER, &SlotBasedStageBuilder::buildShardFilter}};
 

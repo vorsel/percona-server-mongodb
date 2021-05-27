@@ -65,37 +65,20 @@ void normalizeObject(BSONObjBuilder* builder, const BSONObj& obj) {
     }
 }
 
-KeyString::Value toKeyString(const BSONObj& obj, const CollatorInterface* collator) {
-    // TODO SERVER-54736: Change KeyString API to allow building subobjects in place and avoid
-    // temporary BSONObjBuilder
-    BSONObjBuilder objBuilder;
-    normalizeObject(&objBuilder, obj);
-
-    KeyString::StringTransformFn getComparisonString = [&](StringData stringData) {
-        return collator->getComparisonString(stringData);
-    };
-    const KeyString::StringTransformFn& transform = collator ? getComparisonString : nullptr;
-
-    KeyString::HeapBuilder ksBuilder{KeyString::Version::kLatestVersion, KeyString::ALL_ASCENDING};
-    for (auto&& elem : objBuilder.obj()) {
-        ksBuilder.appendBSONElement(elem, transform);
+UUID getLsid(OperationContext* opCtx, BucketCatalog::CombineWithInsertsFromOtherClients combine) {
+    static const UUID common{UUID::gen()};
+    switch (combine) {
+        case BucketCatalog::CombineWithInsertsFromOtherClients::kAllow:
+            return common;
+        case BucketCatalog::CombineWithInsertsFromOtherClients::kDisallow:
+            return opCtx->getLogicalSessionId()->getId();
     }
-    ksBuilder.appendDiscriminator(KeyString::Discriminator::kInclusive);
-    return ksBuilder.release();
+    MONGO_UNREACHABLE;
 }
-
 }  // namespace
 
 const std::shared_ptr<BucketCatalog::ExecutionStats> BucketCatalog::kEmptyStats{
     std::make_shared<BucketCatalog::ExecutionStats>()};
-
-BSONObj BucketCatalog::CommitData::toBSON() const {
-    return BSON("docs" << docs << "bucketMin" << bucketMin << "bucketMax" << bucketMax
-                       << "numCommittedMeasurements" << int(numCommittedMeasurements)
-                       << "newFieldNamesToBeInserted"
-                       << std::set<std::string>(newFieldNamesToBeInserted.begin(),
-                                                newFieldNamesToBeInserted.end()));
-}
 
 BucketCatalog& BucketCatalog::get(ServiceContext* svcCtx) {
     return getBucketCatalog(svcCtx);
@@ -114,9 +97,11 @@ BSONObj BucketCatalog::getMetadata(const BucketId& bucketId) const {
     return bucket->metadata.toBSON();
 }
 
-StatusWith<BucketCatalog::InsertResult> BucketCatalog::insert(OperationContext* opCtx,
-                                                              const NamespaceString& ns,
-                                                              const BSONObj& doc) {
+StatusWith<std::shared_ptr<BucketCatalog::WriteBatch>> BucketCatalog::insert(
+    OperationContext* opCtx,
+    const NamespaceString& ns,
+    const BSONObj& doc,
+    CombineWithInsertsFromOtherClients combine) {
     auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, ns.db());
     invariant(viewCatalog);
     auto viewDef = viewCatalog->lookup(opCtx, ns.ns());
@@ -167,13 +152,13 @@ StatusWith<BucketCatalog::InsertResult> BucketCatalog::insert(OperationContext* 
             return true;
         }
         auto bucketTime = (*bucket).getTime();
-        if (time - bucketTime >= kTimeseriesBucketMaxTimeRange) {
+        if (time - bucketTime >= Seconds(options.getBucketMaxSpanSeconds())) {
             stats->numBucketsClosedDueToTimeForward.fetchAndAddRelaxed(1);
             return true;
         }
         if (time < bucketTime) {
             if (!(*bucket)->hasBeenCommitted() &&
-                (*bucket)->latestTime - time < kTimeseriesBucketMaxTimeRange) {
+                (*bucket)->latestTime - time < Seconds(options.getBucketMaxSpanSeconds())) {
                 (*bucket).setTime();
             } else {
                 stats->numBucketsClosedDueToTimeBackward.fetchAndAddRelaxed(1);
@@ -192,22 +177,12 @@ StatusWith<BucketCatalog::InsertResult> BucketCatalog::insert(OperationContext* 
                                                    &sizeToBeAdded);
     }
 
-    // If this is the first uncommitted measurement, the caller is the committer. Otherwise, it is a
-    // waiter.
-    boost::optional<Future<CommitInfo>> commitInfoFuture;
-    if (bucket->numMeasurements > bucket->numCommittedMeasurements) {
-        auto [promise, future] = makePromiseFuture<CommitInfo>();
-        bucket->promises.push(std::move(promise));
-        commitInfoFuture = std::move(future);
-    } else {
-        bucket->promises.push(boost::none);
-    }
+    auto batch = bucket->activeBatch(getLsid(opCtx, combine), stats);
+    batch->_addMeasurement(doc);
+    batch->_recordNewFields(std::move(newFieldNamesToBeInserted));
 
-    bucket->numWriters++;
     bucket->numMeasurements++;
     bucket->size += sizeToBeAdded;
-    bucket->measurementsToBeInserted.push_back(doc);
-    bucket->newFieldNamesToBeInserted.merge(newFieldNamesToBeInserted);
     if (time > bucket->latestTime) {
         bucket->latestTime = time;
     }
@@ -227,74 +202,56 @@ StatusWith<BucketCatalog::InsertResult> BucketCatalog::insert(OperationContext* 
     } else {
         _memoryUsage.fetchAndSubtract(bucket->memoryUsage);
     }
-    bucket->memoryUsage -= bucket->min.getMemoryUsage() + bucket->max.getMemoryUsage();
-    bucket->min.update(doc, options.getMetaField(), viewDef->defaultCollator(), std::less<>());
-    bucket->max.update(doc, options.getMetaField(), viewDef->defaultCollator(), std::greater<>());
-    bucket->memoryUsage +=
-        newFieldNamesSize + bucket->min.getMemoryUsage() + bucket->max.getMemoryUsage();
     _memoryUsage.fetchAndAdd(bucket->memoryUsage);
 
-    return {InsertResult{bucket->id, std::move(commitInfoFuture)}};
+    return batch;
 }
 
-BucketCatalog::CommitData BucketCatalog::commit(const BucketId& bucketId,
-                                                boost::optional<CommitInfo> previousCommitInfo) {
-    BucketAccess bucket{this, bucketId};
-    invariant(bucket);
+void BucketCatalog::prepareCommit(std::shared_ptr<WriteBatch> batch) {
+    invariant(!batch->finished());
 
-    // The only case in which previousCommitInfo should not be provided is the first time a given
-    // committer calls this function.
-    invariant(!previousCommitInfo || bucket->hasBeenCommitted());
+    _waitToCommitBatch(batch);
 
-    auto newFieldNamesToBeInserted = bucket->newFieldNamesToBeInserted;
-    bucket->fieldNames.merge(bucket->newFieldNamesToBeInserted);
-    bucket->newFieldNamesToBeInserted.clear();
+    BucketAccess bucket(this, batch->bucket());
 
-    std::vector<BSONObj> measurements;
-    bucket->measurementsToBeInserted.swap(measurements);
+    auto prevMemoryUsage = bucket->memoryUsage;
+    batch->_prepareCommit();
+    _memoryUsage.fetchAndAdd(bucket->memoryUsage - prevMemoryUsage);
 
-    auto stats = _getExecutionStats(bucket->ns);
-    stats->numMeasurementsCommitted.fetchAndAddRelaxed(measurements.size());
+    bucket->batches.erase(batch->_lsid);
+}
 
-    // Inform waiters that their measurements have been committed.
-    for (uint32_t i = 0; i < bucket->numPendingCommitMeasurements; i++) {
-        if (auto& promise = bucket->promises.front()) {
-            promise->emplaceValue(*previousCommitInfo);
-        }
-        bucket->promises.pop();
-    }
-    if (bucket->numPendingCommitMeasurements) {
-        stats->numWaits.fetchAndAddRelaxed(bucket->numPendingCommitMeasurements - 1);
-    }
+void BucketCatalog::finish(std::shared_ptr<WriteBatch> batch, const CommitInfo& info) {
+    invariant(!batch->finished());
+    invariant(!batch->active());
 
-    bucket->numWriters -= bucket->numPendingCommitMeasurements;
-    bucket->numCommittedMeasurements +=
-        std::exchange(bucket->numPendingCommitMeasurements, measurements.size());
+    auto stats = _getExecutionStats(batch->bucket()->ns);
 
-    auto [bucketMin, bucketMax] = [&bucket]() -> std::pair<BSONObj, BSONObj> {
+    BucketAccess bucket(this, batch->bucket());
+
+    batch->_finish(info);
+    bucket->preparedBatch.reset();
+
+    if (info.result.isOK()) {
+        stats->numCommits.fetchAndAddRelaxed(1);
         if (bucket->numCommittedMeasurements == 0) {
-            return {bucket->min.toBSON(), bucket->max.toBSON()};
+            stats->numBucketInserts.fetchAndAddRelaxed(1);
         } else {
-            return {bucket->min.getUpdates(), bucket->max.getUpdates()};
+            stats->numBucketUpdates.fetchAndAddRelaxed(1);
         }
-    }();
 
-    auto allCommitted = measurements.empty();
-    CommitData data = {std::move(measurements),
-                       std::move(bucketMin),
-                       std::move(bucketMax),
-                       bucket->numCommittedMeasurements,
-                       std::move(newFieldNamesToBeInserted)};
+        stats->numMeasurementsCommitted.fetchAndAddRelaxed(batch->measurements().size());
+        bucket->numCommittedMeasurements += batch->measurements().size();
+    }
 
-    if (allCommitted) {
+    if (bucket->allCommitted()) {
         if (bucket->full) {
             // Everything in the bucket has been committed, and nothing more will be added since the
             // bucket is full. Thus, we can remove it.
             _memoryUsage.fetchAndSubtract(bucket->memoryUsage);
 
-            invariant(bucket->promises.empty());
-
             std::shared_ptr<Bucket> ptr(bucket);
+            BucketId bucketId = bucket->id;
             bucket.release();
             auto lk = _lockExclusive();
 
@@ -303,45 +260,55 @@ BucketCatalog::CommitData BucketCatalog::commit(const BucketId& bucketId,
             // this metadata.
             _markBucketNotIdle(ptr);
             _allBuckets.erase(bucketId);
-        } else if (bucket->numWriters == 0) {
+        } else {
             _markBucketIdle(bucket);
         }
-    } else {
-        stats->numCommits.fetchAndAddRelaxed(1);
-        if (bucket->numCommittedMeasurements == 0) {
-            stats->numBucketInserts.fetchAndAddRelaxed(1);
-        } else {
-            stats->numBucketUpdates.fetchAndAddRelaxed(1);
-        }
     }
-
-    return data;
 }
 
-void BucketCatalog::clear(const BucketId& bucketId) {
-    BucketAccess bucket{this, bucketId};
-    if (!bucket) {
-        return;
-    }
+void BucketCatalog::abort(std::shared_ptr<WriteBatch> batch) {
+    invariant(batch);
+    auto bucket = batch->_bucket;
 
-    // Retain pointer to bucket, release so we can get an exclusive lock.
-    std::shared_ptr<Bucket> underlyingBucket{bucket};
-    bucket.release();
-    auto lk = _lockExclusive();
+    while (true) {
+        std::vector<std::shared_ptr<WriteBatch>> batchesToWaitOn;
 
-    {
-        stdx::lock_guard blk{underlyingBucket->mutex};
-        while (!underlyingBucket->promises.empty()) {
-            if (auto& promise = underlyingBucket->promises.front()) {
-                promise->setError({ErrorCodes::TimeseriesBucketCleared,
-                                   str::stream() << "Time-series bucket " << *bucketId << " for "
-                                                 << underlyingBucket->ns << " was cleared"});
+        {
+            auto lk = _lockExclusive();
+            stdx::unique_lock blk{bucket->mutex};
+            if (bucket->batches.empty() && !bucket->preparedBatch) {
+                // No uncommitted batches left to abort, go ahead and remove the bucket.
+                blk.unlock();
+                _removeBucket(bucket->id, true /* bucketIsUnused */);
+                break;
             }
-            underlyingBucket->promises.pop();
+
+            // For any uncommitted batches that we need to abort, see if we already have the rights,
+            // otherwise try to claim the rights and abort it. If we don't get the rights, then wait
+            // for the other writer to resolve the batch.
+            for (const auto& [_, active] : bucket->batches) {
+                if (active == batch || active->claimCommitRights()) {
+                    active->_abort();
+                } else {
+                    batchesToWaitOn.push_back(active);
+                }
+            }
+            bucket->batches.clear();
+
+            if (auto& committing = bucket->preparedBatch) {
+                if (committing == batch) {
+                    committing->_abort();
+                } else {
+                    batchesToWaitOn.push_back(committing);
+                }
+                committing.reset();
+            }
+        }
+
+        for (const auto& batchToWaitOn : batchesToWaitOn) {
+            batchToWaitOn->getResult().getStatus().ignore();
         }
     }
-
-    _removeBucket(bucketId, false /* bucketIsUnused */);
 }
 
 void BucketCatalog::clear(const NamespaceString& ns) {
@@ -417,6 +384,22 @@ BucketCatalog::StripedMutex::SharedLock BucketCatalog::_lockShared() const {
 
 BucketCatalog::StripedMutex::ExclusiveLock BucketCatalog::_lockExclusive() const {
     return _bucketMutex.lockExclusive();
+}
+
+void BucketCatalog::_waitToCommitBatch(const std::shared_ptr<WriteBatch>& batch) {
+    while (true) {
+        BucketAccess bucket{this, batch->bucket()};
+        auto current = bucket->preparedBatch;
+        if (!current) {
+            // No other batches for this bucket are currently committing, so we can proceed.
+            bucket->preparedBatch = batch;
+            break;
+        }
+
+        // We have to wait for someone else to finish.
+        bucket.release();
+        current->getResult().getStatus().ignore();  // We don't care about the result.
+    }
 }
 
 bool BucketCatalog::_removeBucket(const BucketId& bucketId, bool bucketIsUnused) {
@@ -538,15 +521,26 @@ void BucketCatalog::_setIdTimestamp(BucketId* id, const Date_t& time) {
 
 BucketCatalog::BucketMetadata::BucketMetadata(BSONObj&& obj,
                                               std::shared_ptr<const ViewDefinition>& v)
-    : _metadata(obj), _view(v), _keyString(toKeyString(_metadata, _view->defaultCollator())) {}
+    : _metadata(obj), _view(v) {
+    BSONObjBuilder objBuilder;
+    normalizeObject(&objBuilder, _metadata);
+    _sorted = objBuilder.obj();
+}
 
 bool BucketCatalog::BucketMetadata::operator==(const BucketMetadata& other) const {
-    return _view->defaultCollator() == other._view->defaultCollator() &&
-        _keyString == other._keyString;
+    return _sorted.binaryEqual(other._sorted);
 }
 
 const BSONObj& BucketCatalog::BucketMetadata::toBSON() const {
     return _metadata;
+}
+
+StringData BucketCatalog::BucketMetadata::getMetaField() const {
+    return _metadata.firstElementFieldNameStringData();
+}
+
+const CollatorInterface* BucketCatalog::BucketMetadata::getCollator() const {
+    return _view->defaultCollator();
 }
 
 BucketCatalog::Bucket::Bucket(const BucketId& i) : id(i) {}
@@ -582,7 +576,22 @@ void BucketCatalog::Bucket::calculateBucketFieldsAndSizeChange(
 }
 
 bool BucketCatalog::Bucket::hasBeenCommitted() const {
-    return numCommittedMeasurements != 0 || numPendingCommitMeasurements != 0;
+    return numCommittedMeasurements != 0 || preparedBatch;
+}
+
+bool BucketCatalog::Bucket::allCommitted() const {
+    return batches.empty() && !preparedBatch;
+}
+
+std::shared_ptr<BucketCatalog::WriteBatch> BucketCatalog::Bucket::activeBatch(
+    const UUID& lsid, const std::shared_ptr<ExecutionStats>& stats) {
+    auto it = batches.find(lsid);
+    if (it == batches.end()) {
+        it =
+            batches.try_emplace(lsid, std::make_shared<WriteBatch>(shared_from_this(), lsid, stats))
+                .first;
+    }
+    return it->second;
 }
 
 BucketCatalog::BucketAccess::BucketAccess(BucketCatalog* catalog,
@@ -615,6 +624,14 @@ BucketCatalog::BucketAccess::BucketAccess(BucketCatalog* catalog, const BucketId
         _bucket = it->second;
         _acquire();
     }
+}
+
+BucketCatalog::BucketAccess::BucketAccess(BucketCatalog* catalog,
+                                          const std::shared_ptr<Bucket>& bucket)
+    : _catalog(catalog) {
+    auto lk = _catalog->_lockShared();
+    _bucket = bucket;
+    _acquire();
 }
 
 BucketCatalog::BucketAccess::~BucketAccess() {
@@ -705,8 +722,7 @@ void BucketCatalog::BucketAccess::rollover(const std::function<bool(BucketAccess
     bool newBucket = oldId != _id;  // Only record stats if bucket has changed, don't double-count.
     if (!newBucket || isBucketFull(this)) {
         // The bucket is indeed full, so create a new one.
-        if (_bucket->numPendingCommitMeasurements == 0 &&
-            _bucket->numCommittedMeasurements == _bucket->numMeasurements) {
+        if (_bucket->allCommitted()) {
             // The bucket does not contain any measurements that are yet to be committed, so we can
             // remove it now. Otherwise, we must keep the bucket around until it is committed.
             release();
@@ -983,6 +999,130 @@ BucketCatalog::BucketId BucketCatalog::BucketId::min() {
 }
 
 BucketCatalog::BucketId::BucketId(uint64_t num) : _num(num) {}
+
+BucketCatalog::WriteBatch::WriteBatch(const std::shared_ptr<Bucket>& bucket,
+                                      const UUID& lsid,
+                                      const std::shared_ptr<ExecutionStats>& stats)
+    : _bucket{bucket}, _bucketId{bucket->id}, _lsid(lsid), _stats{stats} {}
+
+bool BucketCatalog::WriteBatch::claimCommitRights() {
+    return !_commitRights.swap(true);
+}
+
+StatusWith<BucketCatalog::CommitInfo> BucketCatalog::WriteBatch::getResult() const {
+    if (!_promise.getFuture().isReady()) {
+        _stats->numWaits.fetchAndAddRelaxed(1);
+    }
+    return _promise.getFuture().getNoThrow();
+}
+
+std::shared_ptr<BucketCatalog::Bucket> BucketCatalog::WriteBatch::bucket() const {
+    invariant(!finished());
+    return _bucket;
+}
+
+BucketCatalog::BucketId BucketCatalog::WriteBatch::bucketId() const {
+    return _bucketId;
+}
+
+const std::vector<BSONObj>& BucketCatalog::WriteBatch::measurements() const {
+    invariant(!_active);
+    return _measurements;
+}
+
+const BSONObj& BucketCatalog::WriteBatch::min() const {
+    invariant(!_active);
+    return _min;
+}
+
+const BSONObj& BucketCatalog::WriteBatch::max() const {
+    invariant(!_active);
+    return _max;
+}
+
+const StringSet& BucketCatalog::WriteBatch::newFieldNamesToBeInserted() const {
+    invariant(!_active);
+    return _newFieldNamesToBeInserted;
+}
+
+uint32_t BucketCatalog::WriteBatch::numPreviouslyCommittedMeasurements() const {
+    invariant(!_active);
+    return _numPreviouslyCommittedMeasurements;
+}
+
+bool BucketCatalog::WriteBatch::active() const {
+    return _active;
+}
+
+bool BucketCatalog::WriteBatch::finished() const {
+    return _promise.getFuture().isReady();
+}
+
+BSONObj BucketCatalog::WriteBatch::toBSON() const {
+    return BSON("docs" << _measurements << "bucketMin" << _min << "bucketMax" << _max
+                       << "numCommittedMeasurements" << int(_numPreviouslyCommittedMeasurements)
+                       << "newFieldNamesToBeInserted"
+                       << std::set<std::string>(_newFieldNamesToBeInserted.begin(),
+                                                _newFieldNamesToBeInserted.end()));
+}
+
+void BucketCatalog::WriteBatch::_addMeasurement(const BSONObj& doc) {
+    invariant(_active);
+    _measurements.push_back(doc);
+}
+
+void BucketCatalog::WriteBatch::_recordNewFields(StringSet&& fields) {
+    invariant(_active);
+    _newFieldNamesToBeInserted.merge(fields);
+}
+
+void BucketCatalog::WriteBatch::_prepareCommit() {
+    invariant(_commitRights.load());
+    invariant(_active);
+    _active = false;
+    _numPreviouslyCommittedMeasurements = _bucket->numCommittedMeasurements;
+
+    // Filter out field names that were new at the time of insertion, but have since been committed
+    // by someone else.
+    StringSet newFieldNamesToBeInserted;
+    for (auto& fieldName : _newFieldNamesToBeInserted) {
+        if (!_bucket->fieldNames.contains(fieldName)) {
+            _bucket->fieldNames.insert(fieldName);
+            newFieldNamesToBeInserted.insert(std::move(fieldName));
+        }
+    }
+    _newFieldNamesToBeInserted = std::move(newFieldNamesToBeInserted);
+
+    _bucket->memoryUsage -= _bucket->min.getMemoryUsage() + _bucket->max.getMemoryUsage();
+    for (const auto& doc : _measurements) {
+        _bucket->min.update(
+            doc, _bucket->metadata.getMetaField(), _bucket->metadata.getCollator(), std::less<>{});
+        _bucket->max.update(doc,
+                            _bucket->metadata.getMetaField(),
+                            _bucket->metadata.getCollator(),
+                            std::greater<>{});
+    }
+    _bucket->memoryUsage += _bucket->min.getMemoryUsage() + _bucket->max.getMemoryUsage();
+
+    const bool isUpdate = _numPreviouslyCommittedMeasurements > 0;
+    _min = isUpdate ? _bucket->min.getUpdates() : _bucket->min.toBSON();
+    _max = isUpdate ? _bucket->max.getUpdates() : _bucket->max.toBSON();
+}
+
+void BucketCatalog::WriteBatch::_finish(const CommitInfo& info) {
+    invariant(_commitRights.load());
+    invariant(!_active);
+    _promise.emplaceValue(info);
+    _bucket.reset();
+}
+
+void BucketCatalog::WriteBatch::_abort() {
+    invariant(_commitRights.load());
+    _promise.setError({ErrorCodes::TimeseriesBucketCleared,
+                       str::stream() << "Time-series bucket " << *_bucketId << " for "
+                                     << _bucket->ns << " was cleared"});
+    _bucket.reset();
+}
 
 class BucketCatalog::ServerStatus : public ServerStatusSection {
 public:

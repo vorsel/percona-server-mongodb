@@ -37,28 +37,100 @@ directories containing the old IDL files from previous releases.
 """
 
 import argparse
-import logging
 import os
 import sys
 from typing import Dict, List, Optional, Tuple, Union
 
 from idl import parser, syntax, errors, common
 from idl.compiler import CompilerImportResolver
-from idl_compatibility_errors import IDLCompatibilityContext, IDLCompatibilityErrorCollection
+from idl_compatibility_errors import IDLCompatibilityContext, IDLCompatibilityErrorCollection, dump_errors
 
 ALLOW_ANY_TYPE_LIST: List[str] = [
-    "commandAllowedAnyTypes", "commandAllowedAnyTypes-param-anyTypeParam",
-    "commandAllowedAnyTypes-reply-anyTypeField", "oldTypeBsonAnyAllowList",
+    "commandAllowedAnyTypes",
+    "commandAllowedAnyTypes-param-anyTypeParam",
+    "commandAllowedAnyTypes-reply-anyTypeField",
+    "oldTypeBsonAnyAllowList",
     "newTypeBsonAnyAllowList",
     "oldReplyFieldTypeBsonAnyAllowList-reply-oldBsonSerializationTypeAnyReplyField",
     "newReplyFieldTypeBsonAnyAllowList-reply-newBsonSerializationTypeAnyReplyField",
     "oldParamTypeBsonAnyAllowList-param-bsonTypeAnyParam",
     "newParamTypeBsonAnyAllowList-param-bsonTypeAnyParam",
     "commandAllowedAnyTypesWithVariant-reply-anyTypeField",
-    "replyFieldTypeBsonAnyWithVariant-reply-bsonSerializationTypeAnyReplyField",
-    "replyFieldCppTypeNotEqual-reply-cppTypeNotEqualReplyField", "commandCppTypeNotEqual",
-    "commandParameterCppTypeNotEqual-param-cppTypeNotEqualParam"
+    "replyFieldTypeBsonAnyWithVariant-reply-bsonSerializationTypeAnyStructField",
+    "replyFieldTypeBsonAnyWithVariantWithArray-reply-bsonSerializationTypeAnyStructField",
+    "parameterFieldTypeBsonAnyWithVariant-param-bsonSerializationTypeAnyStructField",
+    "parameterFieldTypeBsonAnyWithVariantWithArray-param-bsonSerializationTypeAnyStructField",
+    "commandTypeBsonAnyWithVariant",
+    "commandTypeBsonAnyWithVariantWithArray",
+    "replyFieldCppTypeNotEqual-reply-cppTypeNotEqualReplyField",
+    "commandCppTypeNotEqual",
+    "commandParameterCppTypeNotEqual-param-cppTypeNotEqualParam",
+
+    # TODO (SERVER-54956): Decide what to do with commands: (create, createIndexes).
+    'create-param-backwards',
+    'createIndexes-param-commitQuorum',
+    'createIndexes-reply-commitQuorum',
+
+    # TODO (SERVER-54923): Decide what to do with commands: (saslStart, saslContinue).
+    'saslStart-param-payload',
+    'explain-param-use44SortKeys',
+    'explain-param-useNewUpsert',
+    'saslStart-param-payload',
+    'saslStart-reply-payload',
+    'saslContinue-param-payload',
+    'saslContinue-reply-payload',
+
+    # TODO (SERVER-54925): Decide what to do with commands:
+    # (aggregate, find, update, delete, findAndModify, explain).
+    'aggregate-param-pipeline',
+    'aggregate-param-explain',
+    'aggregate-param-allowDiskUse',
+    'aggregate-param-cursor',
+    'aggregate-param-hint',
+    'aggregate-param-needsMerge',
+    'aggregate-param-fromMongos',
+    'aggregate-param-$_requestReshardingResumeToken',
+    'aggregate-param-isMapReduceCommand',
+    'find-param-filter',
+    'find-param-projection',
+    'find-param-sort',
+    'find-param-hint',
+    'find-param-collation',
+    'find-param-singleBatch',
+    'find-param-allowDiskUse',
+    'find-param-min',
+    'find-param-max',
+    'find-param-returnKey',
+    'find-param-showRecordId',
+    'find-param-$queryOptions',
+    'find-param-tailable',
+    'find-param-oplogReplay',
+    'find-param-noCursorTimeout',
+    'find-param-awaitData',
+    'find-param-allowPartialResults',
+    'find-param-readOnce',
+    'find-param-allowSpeculativeMajorityRead',
+    'find-param-$_requestResumeToken',
+    'find-param-$_resumeAfter',
+    'find-param-maxTimeMS',
+    'update-param-u',
+    'update-param-hint',
+    'update-param-upsertSupplied',
+    'update-reply-_id',
+    'delete-param-limit',
+    'delete-param-hint',
+    'findAndModify-param-hint',
+    'findAndModify-param-update',
+    'findAndModify-reply-upserted',
+    'explain-param-collation',
+    'explain-param-use44SortKeys',
+    'explain-param-useNewUpsert',
+
+    # TODO (SERVER-54927): Decide what to do with commands: (hello).
+    'hello-param-saslSupportedMechs'
 ]
+
+SKIPPED_FILES = ["unittest.idl"]
 
 
 def get_new_commands(
@@ -71,7 +143,7 @@ def get_new_commands(
 
     for dirpath, _, filenames in os.walk(new_idl_dir):
         for new_filename in filenames:
-            if not new_filename.endswith('.idl'):
+            if not new_filename.endswith('.idl') or new_filename in SKIPPED_FILES:
                 continue
 
             new_idl_file_path = os.path.join(dirpath, new_filename)
@@ -123,7 +195,7 @@ def check_subset(ctxt: IDLCompatibilityContext, cmd_name: str, field_name: str, 
     # pylint: disable=too-many-arguments
     """Check if sub_list is a subset of the super_list and log an error if not."""
     if not set(sub_list).issubset(super_list):
-        ctxt.add_command_not_subset_error(cmd_name, field_name, type_name, file_path)
+        ctxt.add_reply_field_not_subset_error(cmd_name, field_name, type_name, file_path)
 
 
 def check_superset(ctxt: IDLCompatibilityContext, cmd_name: str, type_name: str,
@@ -185,9 +257,9 @@ def check_reply_field_type_recursive(
             for old_variant_type in old_variant_types:
                 if old_variant_type.name == new_variant_type.name:
                     # Check that the old and new version of each variant type is also compatible.
-                    check_reply_field_type_recursive(
-                        ctxt, old_variant_type, new_variant_type, cmd_name, field_name,
-                        old_idl_file, new_idl_file, old_idl_file_path, new_idl_file_path)
+                    check_reply_field_type(ctxt, old_variant_type, new_variant_type, cmd_name,
+                                           field_name, old_idl_file, new_idl_file,
+                                           old_idl_file_path, new_idl_file_path)
                     break
 
             else:
@@ -226,6 +298,11 @@ def check_reply_field_type(ctxt: IDLCompatibilityContext,
                            new_idl_file_path: str):
     """Check compatibility between old and new reply field type."""
     # pylint: disable=too-many-arguments,too-many-branches
+    if check_array_type(ctxt, "reply_field", old_field_type, new_field_type, cmd_name, 'type',
+                        old_idl_file_path, new_idl_file_path):
+        old_field_type = old_field_type.element_type
+        new_field_type = new_field_type.element_type
+
     if old_field_type is None:
         ctxt.add_reply_field_type_invalid_error(cmd_name, field_name, old_idl_file_path)
         ctxt.errors.dump_errors()
@@ -254,6 +331,27 @@ def check_reply_field_type(ctxt: IDLCompatibilityContext,
         else:
             ctxt.add_new_reply_field_type_not_struct_error(
                 cmd_name, field_name, new_field_type.name, old_field_type.name, new_idl_file_path)
+
+
+def check_array_type(ctxt: IDLCompatibilityContext, symbol: str,
+                     old_type: Optional[Union[syntax.Enum, syntax.Struct, syntax.Type]],
+                     new_type: Optional[Union[syntax.Enum, syntax.Struct, syntax.Type]],
+                     cmd_name: str, symbol_name: str, old_idl_file_path: str,
+                     new_idl_file_path: str) -> bool:
+    """Check compatibility between old and new ArrayTypes."""
+    # pylint: disable=too-many-arguments,too-many-branches
+    old_is_array = isinstance(old_type, syntax.ArrayType)
+    new_is_array = isinstance(new_type, syntax.ArrayType)
+    if not old_is_array and not new_is_array:
+        return False
+
+    if not old_is_array or not new_is_array:
+        ctxt.add_type_not_array_error(symbol, cmd_name, symbol_name, new_type.name, old_type.name,
+                                      new_idl_file_path if old_is_array else old_idl_file_path)
+        ctxt.errors.dump_errors()
+        sys.exit(1)
+
+    return True
 
 
 def check_reply_field(ctxt: IDLCompatibilityContext, old_field: syntax.Field,
@@ -364,10 +462,10 @@ def check_param_or_command_type_recursive(
                 for new_variant_type in new_variant_types:
                     if old_variant_type.name == new_variant_type.name:
                         # Check that the old and new version of each variant type is also compatible.
-                        check_param_or_command_type_recursive(
-                            ctxt, old_variant_type, new_variant_type, cmd_name, old_idl_file,
-                            new_idl_file, old_idl_file_path, new_idl_file_path, param_name,
-                            is_command_parameter)
+                        check_param_or_command_type(ctxt, old_variant_type, new_variant_type,
+                                                    cmd_name, old_idl_file, new_idl_file,
+                                                    old_idl_file_path, new_idl_file_path,
+                                                    param_name, is_command_parameter)
                         break
                 else:
                     # old_variant_type was not found in new_variant_types.
@@ -405,6 +503,13 @@ def check_param_or_command_type(ctxt: IDLCompatibilityContext,
                                 is_command_parameter: bool):
     """Check compatibility between old and new command parameter type or command type."""
     # pylint: disable=too-many-arguments,too-many-branches
+    if check_array_type(ctxt, "command_parameter" if is_command_parameter else "command_namespace",
+                        old_type, new_type, cmd_name,
+                        param_name if is_command_parameter else "type", old_idl_file_path,
+                        new_idl_file_path):
+        old_type = old_type.element_type
+        new_type = new_type.element_type
+
     if old_type is None:
         ctxt.add_command_or_param_type_invalid_error(cmd_name, old_idl_file_path, param_name,
                                                      is_command_parameter)
@@ -505,8 +610,10 @@ def check_command_param_or_type_struct_field(
     if not old_field.unstable and new_field.unstable:
         ctxt.add_new_param_or_command_type_field_unstable_error(
             cmd_name, old_field.name, old_idl_file_path, type_name, is_command_parameter)
-    if old_field.unstable and not new_field.optional and not new_field.unstable:
-        ctxt.add_new_param_or_command_type_field_stable_required_error(
+    # If old field is unstable and new field is stable, the new field should either be optional or
+    # have a default value.
+    if old_field.unstable and not new_field.unstable and not new_field.optional and new_field.default is None:
+        ctxt.add_new_param_or_command_type_field_stable_required_no_default_error(
             cmd_name, old_field.name, old_idl_file_path, type_name, is_command_parameter)
 
     if old_field.optional and not new_field.optional:
@@ -581,7 +688,7 @@ def check_error_reply(old_basic_types_path: str, new_basic_types_path: str,
         old_error_reply_struct = old_idl_file.spec.symbols.get_struct("ErrorReply")
 
         if old_error_reply_struct is None:
-            ctxt.add_missing_error_reply_error(old_basic_types_path)
+            ctxt.add_missing_error_reply_struct_error(old_basic_types_path)
         else:
             with open(new_basic_types_path) as new_file:
                 new_idl_file = parser.parse(new_file, new_basic_types_path,
@@ -592,13 +699,91 @@ def check_error_reply(old_basic_types_path: str, new_basic_types_path: str,
 
                 new_error_reply_struct = new_idl_file.spec.symbols.get_struct("ErrorReply")
                 if new_error_reply_struct is None:
-                    ctxt.add_missing_error_reply_error(new_basic_types_path)
+                    ctxt.add_missing_error_reply_struct_error(new_basic_types_path)
                 else:
                     check_reply_fields(ctxt, old_error_reply_struct, new_error_reply_struct, "n/a",
                                        old_idl_file, new_idl_file, old_basic_types_path,
                                        new_basic_types_path)
-    ctxt.errors.dump_errors()
+
+    # TODO (SERVER-55203): Remove error_skipped logic.
+    ctxt.errors.remove_skipped_errors_and_dump_all_errors("ErrorReply", old_basic_types_path,
+                                                          new_basic_types_path)
     return ctxt.errors
+
+
+def split_complex_checks(
+        complex_checks: List[syntax.AccessCheck]) -> Tuple[List[str], List[syntax.Privilege]]:
+    """Split a list of AccessCheck into checks and privileges."""
+    checks = [x.check for x in complex_checks if x.check is not None]
+    privileges = [x.privilege for x in complex_checks if x.privilege is not None]
+    # Sort the list of privileges by the length of the action_type list, in decreasing order
+    # so that two lists of privileges can be compared later.
+    return checks, sorted(privileges, key=lambda x: len(x.action_type), reverse=True)
+
+
+def check_security_access_checks(ctxt: IDLCompatibilityContext,
+                                 old_access_checks: syntax.AccessChecks,
+                                 new_access_checks: syntax.AccessChecks, cmd: syntax.Command,
+                                 new_idl_file_path: str) -> None:
+    """Check the compatibility between security access checks of the old and new command."""
+    # pylint:disable=too-many-locals,too-many-branches,too-many-nested-blocks
+    cmd_name = cmd.command_name
+    if old_access_checks is not None and new_access_checks is not None:
+        old_access_check_type = old_access_checks.get_access_check_type()
+        new_access_check_type = new_access_checks.get_access_check_type()
+        if old_access_check_type != new_access_check_type:
+            ctxt.add_access_check_type_not_equal_error(cmd_name, old_access_check_type,
+                                                       new_access_check_type, new_idl_file_path)
+        else:
+            old_simple_check = old_access_checks.simple
+            new_simple_check = new_access_checks.simple
+            if old_simple_check is not None and new_simple_check is not None:
+                if old_simple_check.check != new_simple_check.check:
+                    ctxt.add_check_not_equal_error(cmd_name, old_simple_check.check,
+                                                   new_simple_check.check, new_idl_file_path)
+                else:
+                    old_privilege = old_simple_check.privilege
+                    new_privilege = new_simple_check.privilege
+                    if old_privilege is not None and new_privilege is not None:
+                        if old_privilege.resource_pattern != new_privilege.resource_pattern:
+                            ctxt.add_resource_pattern_not_equal_error(
+                                cmd_name, old_privilege.resource_pattern,
+                                new_privilege.resource_pattern, new_idl_file_path)
+                        if not set(new_privilege.action_type).issubset(old_privilege.action_type):
+                            ctxt.add_new_action_types_not_subset_error(cmd_name, new_idl_file_path)
+
+            old_complex_checks = old_access_checks.complex
+            new_complex_checks = new_access_checks.complex
+            if old_complex_checks is not None and new_complex_checks is not None:
+                if len(new_complex_checks) > len(old_complex_checks):
+                    ctxt.add_new_additional_complex_access_check_error(cmd_name, new_idl_file_path)
+                else:
+                    old_checks, old_privileges = split_complex_checks(old_complex_checks)
+                    new_checks, new_privileges = split_complex_checks(new_complex_checks)
+                    if not set(new_checks).issubset(old_checks):
+                        ctxt.add_new_complex_checks_not_subset_error(cmd_name, new_idl_file_path)
+
+                    if len(new_privileges) > len(old_privileges):
+                        ctxt.add_new_complex_privileges_not_subset_error(
+                            cmd_name, new_idl_file_path)
+                    else:
+                        # Check that each new_privilege matches an old_privilege (the resource_pattern is
+                        # equal and the action_types are a subset of the old action_types).
+                        for new_privilege in new_privileges:
+                            for old_privilege in old_privileges:
+                                if (new_privilege.resource_pattern == old_privilege.resource_pattern
+                                        and set(new_privilege.action_type).issubset(
+                                            old_privilege.action_type)):
+                                    old_privileges.remove(old_privilege)
+                                    break
+                            else:
+                                ctxt.add_new_complex_privileges_not_subset_error(
+                                    cmd_name, new_idl_file_path)
+
+    elif new_access_checks is None and old_access_checks is not None:
+        ctxt.add_removed_access_check_field_error(cmd_name, new_idl_file_path)
+    elif old_access_checks is None and new_access_checks is not None and cmd.api_version == '1':
+        ctxt.add_added_access_check_field_error(cmd_name, new_idl_file_path)
 
 
 def check_compatibility(old_idl_dir: str, new_idl_dir: str,
@@ -616,7 +801,7 @@ def check_compatibility(old_idl_dir: str, new_idl_dir: str,
     old_commands: Dict[str, syntax.Command] = dict()
     for dirpath, _, filenames in os.walk(old_idl_dir):
         for old_filename in filenames:
-            if not old_filename.endswith('.idl'):
+            if not old_filename.endswith('.idl') or old_filename in SKIPPED_FILES:
                 continue
 
             old_idl_file_path = os.path.join(dirpath, old_filename)
@@ -669,7 +854,12 @@ def check_compatibility(old_idl_dir: str, new_idl_dir: str,
                                        old_idl_file, new_idl_file, old_idl_file_path,
                                        new_idl_file_path)
 
-    ctxt.errors.dump_errors()
+                    check_security_access_checks(ctxt, old_cmd.access_check, new_cmd.access_check,
+                                                 old_cmd, new_idl_file_path)
+
+    # TODO (SERVER-55203): Remove error_skipped logic.
+    ctxt.errors.remove_skipped_errors_and_dump_all_errors("Commands", old_idl_dir, new_idl_dir)
+
     return ctxt.errors
 
 
@@ -677,19 +867,21 @@ def main():
     """Run the script."""
     arg_parser = argparse.ArgumentParser(description=__doc__)
     arg_parser.add_argument("-v", "--verbose", action="count", help="Enable verbose logging")
+    arg_parser.add_argument("--include", type=str, action="append",
+                            help="Directory to search for IDL import files")
     arg_parser.add_argument("old_idl_dir", metavar="OLD_IDL_DIR",
                             help="Directory where old IDL files are located")
     arg_parser.add_argument("new_idl_dir", metavar="NEW_IDL_DIR",
                             help="Directory where new IDL files are located")
     args = arg_parser.parse_args()
 
-    error_coll = check_compatibility(args.old_idl_dir, args.new_idl_dir, [])
-    if error_coll.errors.has_errors():
+    error_coll = check_compatibility(args.old_idl_dir, args.new_idl_dir, args.include)
+    if error_coll.has_errors():
         sys.exit(1)
 
     old_basic_types_path = os.path.join(args.old_idl_dir, "mongo/idl/basic_types.idl")
     new_basic_types_path = os.path.join(args.new_idl_dir, "mongo/idl/basic_types.idl")
-    error_reply_coll = check_error_reply(old_basic_types_path, new_basic_types_path, [])
+    error_reply_coll = check_error_reply(old_basic_types_path, new_basic_types_path, args.include)
     if error_reply_coll.has_errors():
         sys.exit(1)
 

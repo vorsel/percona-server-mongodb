@@ -122,6 +122,14 @@ public:
         }
 
         /**
+         * Returns a Future that will be resolved when a migration has called the run() method and
+         * instantiated the CancelationSource.
+         */
+        SharedSemiFuture<void> getMigrationCancelableFuture() const {
+            return _migrationCancelablePromise.getFuture();
+        }
+
+        /**
          * Returns a Future that will be resolved when the donor has majority-committed the write to
          * insert the donor state doc for the migration.
          */
@@ -235,6 +243,16 @@ public:
         TenantMigrationDonorDocument _stateDoc;
         const std::string _instanceName;
         const MongoURI _recipientUri;
+
+        // This data is provided in the initial state doc and never changes.  We keep copies to
+        // avoid having to obtain the mutex to access them.
+        const std::string _tenantId;
+        const std::string _recipientConnectionString;
+        const ReadPreferenceSetting _readPreference;
+        const UUID _migrationUuid;
+        const boost::optional<TenantMigrationPEMPayload> _donorCertificateForRecipient;
+        const boost::optional<TenantMigrationPEMPayload> _recipientCertificateForDonor;
+
         // TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
         const transport::ConnectSSLMode _sslMode;
 
@@ -247,11 +265,15 @@ public:
 
         boost::optional<Status> _abortReason;
 
-        // Protects the durable state and the promises below.
+        // Protects the durable state, state document, and the promises below.
         mutable Mutex _mutex = MONGO_MAKE_LATCH("TenantMigrationDonorService::_mutex");
 
         // The latest majority-committed migration state.
         DurableState _durableState;
+
+        // Promise that is resolved when run() has been called and the CancelationSource has been
+        // instantiated.
+        SharedPromise<void> _migrationCancelablePromise;
 
         // Promise that is resolved when the donor has majority-committed the write to insert the
         // donor state doc for the migration.

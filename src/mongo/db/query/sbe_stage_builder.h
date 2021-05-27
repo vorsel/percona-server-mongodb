@@ -236,6 +236,10 @@ struct PlanStageData {
     bool shouldTrackLatestOplogTimestamp{false};
     bool shouldTrackResumeToken{false};
     bool shouldUseTailableScan{false};
+
+    // If this execution tree was built as a result of replanning of the cached plan, this string
+    // will include the reason for replanning.
+    std::optional<std::string> replanReason;
 };
 
 /**
@@ -304,7 +308,7 @@ private:
     std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildOr(
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
 
-    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildText(
+    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildTextMatch(
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
 
     std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildReturnKey(
@@ -314,6 +318,9 @@ private:
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
 
     std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildAndHash(
+        const QuerySolutionNode* root, const PlanStageReqs& reqs);
+
+    std::pair<std::unique_ptr<sbe::PlanStage>, PlanStageSlots> buildAndSorted(
         const QuerySolutionNode* root, const PlanStageReqs& reqs);
 
     std::tuple<sbe::value::SlotId, sbe::value::SlotId, std::unique_ptr<sbe::PlanStage>>

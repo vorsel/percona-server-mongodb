@@ -32,18 +32,19 @@
 #include "mongo/bson/timestamp.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/commands/create_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 
 namespace mongo {
+
 class IndexConsistency;
 class CollectionCatalog;
+
 class CollectionImpl final : public Collection {
 public:
     explicit CollectionImpl(OperationContext* opCtx,
                             const NamespaceString& nss,
                             RecordId catalogId,
-                            UUID uuid,
+                            const CollectionOptions& options,
                             std::unique_ptr<RecordStore> recordStore);
 
     ~CollectionImpl();
@@ -55,7 +56,7 @@ public:
         std::shared_ptr<Collection> make(OperationContext* opCtx,
                                          const NamespaceString& nss,
                                          RecordId catalogId,
-                                         CollectionUUID uuid,
+                                         const CollectionOptions& options,
                                          std::unique_ptr<RecordStore> rs) const final;
     };
 
@@ -301,11 +302,15 @@ public:
 
     bool isClustered() const final;
 
+    Status updateCappedSize(OperationContext* opCtx, long long newCappedSize) final;
+
     //
     // Stats
     //
 
     bool isCapped() const final;
+    long long getCappedMaxDocs() const final;
+    long long getCappedMaxSize() const final;
 
     CappedCallback* getCappedCallback() final;
     const CappedCallback* getCappedCallback() const final;
@@ -318,9 +323,9 @@ public:
      */
     std::shared_ptr<CappedInsertNotifier> getCappedInsertNotifier() const final;
 
-    uint64_t numRecords(OperationContext* opCtx) const final;
+    long long numRecords(OperationContext* opCtx) const final;
 
-    uint64_t dataSize(OperationContext* opCtx) const final;
+    long long dataSize(OperationContext* opCtx) const final;
 
     /**
      * Currently fast counts are prone to false negative as it is not tolerant to unclean shutdowns.
@@ -400,13 +405,27 @@ private:
                             OpDebug* opDebug) const;
 
     /**
+     * Checks whether the collection is capped and if the current data size or number of records
+     * exceeds _cappedMaxSize or _cappedMaxDocs respectively.
+     */
+    bool _cappedAndNeedDelete(OperationContext* opCtx) const;
+
+    /**
+     * Deletes records from this capped collection as needed while _cappedMaxSize or _cappedMaxDocs
+     * is exceeded.
+     */
+    void _cappedDeleteAsNeeded(OperationContext* opCtx) const;
+
+    /**
      * Holder of shared state between CollectionImpl clones. Also implements CappedCallback, a
      * pointer to which is given to the RecordStore, so that the CappedCallback logic can always be
      * performed on the latest CollectionImpl instance without needing to know about copy-on-write
      * on CollectionImpl instances.
      */
     struct SharedState : public CappedCallback {
-        SharedState(CollectionImpl* collection, std::unique_ptr<RecordStore> recordStore);
+        SharedState(CollectionImpl* collection,
+                    std::unique_ptr<RecordStore> recordStore,
+                    const CollectionOptions& options);
         ~SharedState();
 
         /**
@@ -455,6 +474,15 @@ private:
         const bool _needCappedLock;
 
         AtomicWord<bool> _committed{true};
+
+        // Capped information.
+        const bool _isCapped;
+        const long long _cappedMaxDocs;
+        long long _cappedMaxSize;
+
+        // Only one operation can do capped deletes at a time.
+        mutable Mutex _cappedDeleterMutex =
+            MONGO_MAKE_LATCH("CollectionImpl::SharedState::_cappedDeleterMutex");
     };
 
     NamespaceString _ns;

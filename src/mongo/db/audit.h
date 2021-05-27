@@ -88,6 +88,11 @@ public:
 };
 
 /**
+ * Logs the metadata for a client connection once it is finalized.
+ */
+void logClientMetadata(Client* client);
+
+/**
  * AuthenticateEvent is a opaque view into a finished authentication handshake.
  *
  * This object is only valid within its initial stack context.
@@ -340,7 +345,9 @@ void logLogout(Client* client,
 void logCreateIndex(Client* client,
                     const BSONObj* indexSpec,
                     StringData indexname,
-                    const NamespaceString& nsname);
+                    const NamespaceString& nsname,
+                    StringData indexBuildState,
+                    ErrorCodes::Error result);
 
 /**
  * Logs the result of a createCollection command.

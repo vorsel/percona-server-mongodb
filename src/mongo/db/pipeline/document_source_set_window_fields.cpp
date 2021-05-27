@@ -37,6 +37,7 @@
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/util/visit_helper.h"
 
 using boost::intrusive_ptr;
@@ -51,6 +52,7 @@ REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(
     LiteParsedDocumentSourceDefault::parse,
     document_source_set_window_fields::createFromBson,
     LiteParsedDocumentSource::AllowedWithApiStrict::kAlways,
+    LiteParsedDocumentSource::AllowedWithClientType::kAny,
     boost::none,
     ::mongo::feature_flags::gFeatureFlagWindowFunctions.isEnabledAndIgnoreFCV());
 
@@ -59,6 +61,7 @@ REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(
     LiteParsedDocumentSourceDefault::parse,
     DocumentSourceInternalSetWindowFields::createFromBson,
     LiteParsedDocumentSource::AllowedWithApiStrict::kInternal,
+    LiteParsedDocumentSource::AllowedWithClientType::kAny,
     boost::none,
     ::mongo::feature_flags::gFeatureFlagWindowFunctions.isEnabledAndIgnoreFCV());
 
@@ -117,23 +120,23 @@ list<intrusive_ptr<DocumentSource>> document_source_set_window_fields::create(
     std::vector<WindowFunctionStatement> outputFields) {
 
     // Starting with an input like this:
-    //     {$setWindowFields: {partitionBy: {$foo: "$x"}, sortBy: {y: 1}, fields: {...}}}
+    //     {$setWindowFields: {partitionBy: {$foo: "$x"}, sortBy: {y: 1}, output: {...}}}
 
     // We move the partitionBy expression out into its own $set stage:
     //     {$set: {__tmp: {$foo: "$x"}}}
-    //     {$setWindowFields: {partitionBy: "$__tmp", sortBy: {y: 1}, fields: {...}}}
+    //     {$setWindowFields: {partitionBy: "$__tmp", sortBy: {y: 1}, output: {...}}}
     //     {$unset: '__tmp'}
 
     // This lets us insert a $sort in between:
     //     {$set: {__tmp: {$foo: "$x"}}}
     //     {$sort: {__tmp: 1, y: 1}}
-    //     {$setWindowFields: {partitionBy: "$__tmp", sortBy: {y: 1}, fields: {...}}}
+    //     {$setWindowFields: {partitionBy: "$__tmp", sortBy: {y: 1}, output: {...}}}
     //     {$unset: '__tmp'}
 
     // Which lets us replace $setWindowFields with $_internalSetWindowFields:
     //     {$set: {__tmp: {$foo: "$x"}}}
     //     {$sort: {__tmp: 1, y: 1}}
-    //     {$_internalSetWindowFields: {partitionBy: "$__tmp", sortBy: {y: 1}, fields: {...}}}
+    //     {$_internalSetWindowFields: {partitionBy: "$__tmp", sortBy: {y: 1}, output: {...}}}
     //     {$unset: '__tmp'}
 
     // If partitionBy is a field path, we can $sort by that field directly and avoid creating a
@@ -151,13 +154,16 @@ list<intrusive_ptr<DocumentSource>> document_source_set_window_fields::create(
     optional<intrusive_ptr<Expression>> complexPartitionBy;
     optional<FieldPath> simplePartitionBy;
     optional<intrusive_ptr<Expression>> simplePartitionByExpr;
-    // If there is no partitionBy, both are empty.
+    // If partitionBy is a constant or there is no partitionBy, both are empty.
     // If partitionBy is already a field path, we only fill in simplePartitionBy.
     // If partitionBy is a more complex expression, we will need to generate a $set stage,
     // which will bind the value of the expression to the name in simplePartitionBy.
     if (partitionBy) {
-        auto exprFieldPath = dynamic_cast<ExpressionFieldPath*>(partitionBy->get());
-        if (exprFieldPath && exprFieldPath->isRootFieldPath()) {
+        partitionBy = (*partitionBy)->optimize();
+        if (dynamic_cast<ExpressionConstant*>(partitionBy->get())) {
+            // partitionBy optimizes to a constant expression, equivalent to a single partition.
+        } else if (auto exprFieldPath = dynamic_cast<ExpressionFieldPath*>(partitionBy->get());
+                   exprFieldPath && exprFieldPath->isRootFieldPath()) {
             // ExpressionFieldPath has "CURRENT" as an explicit first component,
             // but for $sort we don't want that.
             simplePartitionBy = exprFieldPath->getFieldPath().tail();
@@ -265,6 +271,7 @@ boost::intrusive_ptr<DocumentSource> DocumentSourceInternalSetWindowFields::crea
 }
 
 void DocumentSourceInternalSetWindowFields::initialize() {
+    _maxMemory = internalDocumentSourceSetWindowFieldsMaxMemoryBytes.load();
     for (auto& wfs : _outputFields) {
         _executableOutputs[wfs.fieldName] = WindowFunctionExec::create(&_iterator, wfs);
     }
@@ -288,8 +295,13 @@ DocumentSource::GetNextResult DocumentSourceInternalSetWindowFields::doGetNext()
 
     // Populate the output document with the result from each window function.
     MutableDocument addFieldsSpec;
+    size_t functionMemUsage = 0;
     for (auto&& [fieldName, function] : _executableOutputs) {
         addFieldsSpec.addField(fieldName, function->getNext());
+        functionMemUsage += function->getApproximateSize();
+        uassert(5414201,
+                "Exceeded memory limit in DocumentSourceSetWindowFields",
+                functionMemUsage + _iterator.getApproximateSize() < _maxMemory);
     }
 
     // Advance the iterator and handle partition/EOF edge cases.

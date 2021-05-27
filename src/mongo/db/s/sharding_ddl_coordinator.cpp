@@ -51,10 +51,29 @@ ShardingDDLCoordinator::ShardingDDLCoordinator(const BSONObj& coorDoc)
 
 ShardingDDLCoordinator::~ShardingDDLCoordinator() {
     invariant(_constructionCompletionPromise.getFuture().isReady());
+    invariant(_completionPromise.getFuture().isReady());
+}
+
+void ShardingDDLCoordinator::interrupt(Status status) {
+    LOGV2_DEBUG(5390535,
+                1,
+                "Sharding DDL Coordinator received an interrupt",
+                "coordinatorId"_attr = _coorMetadata.getId(),
+                "reason"_attr = redact(status));
+    _interruptImpl(status);
+    // Resolve any unresolved promises to avoid hanging.
+    stdx::lock_guard<Latch> lg(_mutex);
+    if (!_constructionCompletionPromise.getFuture().isReady()) {
+        _constructionCompletionPromise.setError(status);
+    }
+    if (!_completionPromise.getFuture().isReady()) {
+        _completionPromise.setError(status);
+    }
 }
 
 SemiFuture<void> ShardingDDLCoordinator::run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                                              const CancelationToken& token) noexcept {
+
     return ExecutorFuture<void>(**executor)
         .then([this, executor, token, anchor = shared_from_this()] {
             auto opCtxHolder = cc().makeOperationContext();
@@ -82,15 +101,19 @@ SemiFuture<void> ShardingDDLCoordinator::run(std::shared_ptr<executor::ScopedTas
                 _scopedLocks.emplace(collDistLock.moveToAnotherThread());
             }
 
-            _constructionCompletionPromise.emplaceValue();
+            stdx::lock_guard<Latch> lg(_mutex);
+            if (!_constructionCompletionPromise.getFuture().isReady()) {
+                _constructionCompletionPromise.emplaceValue();
+            }
         })
         .onError([this, anchor = shared_from_this()](const Status& status) {
+            static constexpr auto& errorMsg =
+                "Failed to complete construction of sharding DDL coordinator";
             LOGV2_ERROR(5390530,
-                        "Failed to complete construction of sharding DDL coordinator",
+                        errorMsg,
                         "coordinatorId"_attr = _coorMetadata.getId(),
                         "reason"_attr = redact(status));
-            _constructionCompletionPromise.setError(
-                status.withContext("Failed to complete construction of sharding DDL coordinator"));
+            interrupt(status.withContext(errorMsg));
             return status;
         })
         .then([this, executor, token, anchor = shared_from_this()] {
@@ -103,6 +126,10 @@ SemiFuture<void> ShardingDDLCoordinator::run(std::shared_ptr<executor::ScopedTas
             while (!_scopedLocks.empty()) {
                 _scopedLocks.top().assignNewOpCtx(opCtx);
                 _scopedLocks.pop();
+            }
+            stdx::lock_guard<Latch> lg(_mutex);
+            if (!_completionPromise.getFuture().isReady()) {
+                _completionPromise.setFrom(status);
             }
             return status;
         })

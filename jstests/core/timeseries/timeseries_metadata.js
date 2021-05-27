@@ -3,7 +3,6 @@
  * in a time-series collection.
  * @tags: [
  *     assumes_no_implicit_collection_creation_after_drop,
- *     does_not_support_retryable_writes,  # Batches containing more than one measurement
  *     does_not_support_stepdowns,
  *     requires_fcv_49,
  *     requires_find_command,
@@ -118,10 +117,13 @@ runTest(
     ]);
 
 runTest(
-    // No metadata field in first bucket.
+    // Null metadata field in first bucket. Temporarily use null meta instead of missing meta
+    // to accomodate the new $_internalUnpackBucket behavior which is null meta in a bucket
+    // is materialized as "null" meta.
+    // TODO SERVER-55213: Need to test both missing meta case and null meta case.
     [
-        {_id: 0, time: t[0], x: 0},
-        {_id: 1, time: t[1], x: 10},
+        {_id: 0, time: t[0], meta: null, x: 0},
+        {_id: 1, time: t[1], meta: null, x: 10},
     ],
     [
         {_id: 2, time: t[2], meta: 123, x: 20},
@@ -134,10 +136,13 @@ runTest(
         {_id: 0, time: t[0], meta: [1, 2, 3], x: 0},
         {_id: 1, time: t[1], meta: [1, 2, 3], x: 10},
     ],
-    // No metadata field in second bucket.
+    // Null metadata field in second bucket. Temporarily use null meta instead of missing meta
+    // to accomodate the new $_internalUnpackBucket behavior which is null meta in a bucket
+    // is materialized as "null" meta.
+    // TODO SERVER-55213: Need to test both missing meta case and null meta case.
     [
-        {_id: 2, time: t[2], x: 20},
-        {_id: 3, time: t[3], x: 30},
+        {_id: 2, time: t[2], meta: null, x: 20},
+        {_id: 3, time: t[3], meta: null, x: 30},
     ]);
 
 runTest(

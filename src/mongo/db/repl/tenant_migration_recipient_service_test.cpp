@@ -96,7 +96,7 @@ OplogEntry makeOplogEntry(OpTime opTime,
                               {},                         // sessionInfo
                               boost::none,                // upsert
                               Date_t(),                   // wall clock time
-                              boost::none,                // statement id
+                              {},                         // statement ids
                               boost::none,    // optime of previous write within same transaction
                               boost::none,    // pre-image optime
                               boost::none,    // post-image optime
@@ -179,7 +179,7 @@ public:
         serviceContext->setPreciseClockSource(
             std::make_unique<SharedClockSourceAdapter>(_clkSource));
 
-        WaitForMajorityService::get(getServiceContext()).setUp(getServiceContext());
+        WaitForMajorityService::get(serviceContext).startup(serviceContext);
 
         // Automatically mark the state doc garbage collectable after data sync completion.
         globalFailPointRegistry()

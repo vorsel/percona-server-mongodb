@@ -41,7 +41,9 @@ protected:
           _m2(AccumulatorSum::create(expCtx)),
           _isSamp(isSamp),
           _count(0),
-          _nonfiniteValueCount(0) {}
+          _nonfiniteValueCount(0) {
+        _memUsageBytes = sizeof(*this);
+    }
 
 public:
     static Value getDefault() {
@@ -62,12 +64,23 @@ public:
         const long long adjustedCount = _isSamp ? _count - 1 : _count;
         if (adjustedCount == 0)
             return getDefault();
+        double squaredDifferences = _m2->getValue(false).coerceToDouble();
+        if (squaredDifferences < 0 || (!_isSamp && _count == 1)) {
+            // _m2 is the sum of squared differences from the mean, so it should always be
+            // nonnegative. It may take on a small negative value due to floating point error, which
+            // breaks the sqrt calculation. In this case, the closest valid value for _m2 is 0, so
+            // we reset _m2 and return 0 for the standard deviation.
+            // If we're doing a population std dev of one element, it is also correct to return 0.
+            _m2->reset();
+            return Value{0};
+        }
         return Value(sqrt(_m2->getValue(false).coerceToDouble() / adjustedCount));
     }
 
     void reset() {
         _m2->reset();
         _sum->reset();
+        _memUsageBytes = sizeof(*this);
         _count = 0;
         _nonfiniteValueCount = 0;
     }
@@ -96,6 +109,7 @@ private:
         _count += quantity;
         _sum->process(Value{value.coerceToDouble() * quantity}, false);
         _m2->process(Value{x * x * quantity / (_count * (_count - quantity))}, false);
+        _memUsageBytes = sizeof(*this) + _sum->getMemUsage() + _m2->getMemUsage();
     }
 
     // Std dev cannot make use of RemovableSum because of its specific handling of non-finite

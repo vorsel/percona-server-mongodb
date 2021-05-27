@@ -242,11 +242,6 @@ public:
                 _isExternalInterrupt = isExternalInterrupt;
             }
 
-            void clearInterruptStatus() {
-                _interruptStatus = Status{ErrorCodes::InternalError, "Uninitialized value"};
-                _isExternalInterrupt = false;
-            }
-
             bool isExternalInterrupt() const {
                 return (_state == kInterrupted) && _isExternalInterrupt;
             }
@@ -483,6 +478,12 @@ public:
          */
         void _compareRecipientAndDonorFCV() const;
 
+        /**
+         * Increments either 'totalSuccessfulMigrationsReceived' or 'totalFailedMigrationsReceived'
+         * in TenantMigrationStatistics by examining status and promises.
+         */
+        void _setMigrationStatsOnCompletion(Status completionStatus) const;
+
         mutable Mutex _mutex = MONGO_MAKE_LATCH("TenantMigrationRecipientService::_mutex");
 
         // All member variables are labeled with one of the following codes indicating the
@@ -557,6 +558,12 @@ public:
         // Promise that is resolved when the chain of work kicked off by run() has completed to
         // indicate whether the state doc is successfully marked as garbage collectable.
         SharedPromise<void> _taskCompletionPromise;  // (W)
+
+        // Waiters are notified when 'tenantOplogApplier' is valid on restart.
+        stdx::condition_variable _restartOplogApplierCondVar;  // (M)
+        // Indicates that the oplog applier is being cleaned up due to restart of the future chain.
+        // This is set to true when the oplog applier is started up again.
+        bool _isRestartingOplogApplier = false;  // (M)
     };
 
 private:

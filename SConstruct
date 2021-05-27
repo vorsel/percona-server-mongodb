@@ -302,7 +302,7 @@ add_option('experimental-optimization',
     action="append",
     choices=experimental_optimization_choices,
     const=experimental_optimization_choices[0],
-    default=[],
+    default=['+sandybridge'],
     help='Enable experimental optimizations',
     nargs='?',
     type='choice'
@@ -2557,21 +2557,21 @@ if not env.TargetOSIs('windows') and (env.ToolchainIs('GCC', 'clang')):
     # setting it for both C and C++ by setting both of CFLAGS and
     # CXXFLAGS.
 
-    arm_march_flag = "armv8-a"
-    if get_option('use-hardware-crc32') == "on":
-        arm_march_flag += "+crc"
-
     default_targeting_flags_for_architecture = {
-        "aarch64"    : { "-march=" : arm_march_flag, "-mtune=" : "generic"                        },
+        "aarch64"    : { "-march=" : "armv8.2-a",    "-mtune=" : "generic"                        },
         "i386"       : { "-march=" : "nocona",       "-mtune=" : "generic"                        },
         "ppc64le"    : { "-mcpu="  : "power8",       "-mtune=" : "power8", "-mcmodel=" : "medium" },
         "s390x"      : { "-march=" : "z196",         "-mtune=" : "zEC12"                          },
     }
 
+    # If we are enabling vectorization in sandybridge mode, we'd
+    # rather not hit the 256 wide vector instructions because the
+    # heavy versions can cause clock speed reductions.
     if "sandybridge" in selected_experimental_optimizations:
         default_targeting_flags_for_architecture["x86_64"] = {
-            "-march=" : "sandybridge",
-            "-mtune=" : "generic",
+            "-march="                : "sandybridge",
+            "-mtune="                : "generic",
+            "-mprefer-vector-width=" : "128",
         }
 
     default_targeting_flags = default_targeting_flags_for_architecture.get(env['TARGET_ARCH'])
@@ -2944,10 +2944,6 @@ def doConfigure(myenv):
 
         # Warn about moves of prvalues, which can inhibit copy elision.
         AddToCXXFLAGSIfSupported(myenv, "-Wpessimizing-move")
-
-        # Warn about redundant moves, such as moving a local variable in a return that is different
-        # than the return type.
-        AddToCXXFLAGSIfSupported(myenv, "-Wredundant-move")
 
         # Disable warning about variables that may not be initialized
         # Failures are triggered in the case of boost::optional in GCC 4.8.x

@@ -36,22 +36,21 @@ const migrationX509Options = TenantMigrationUtil.makeX509OptionsForTest();
  * Runs the donorStartMigration command to start a migration, and interrupts the migration on the
  * donor using the 'interruptFunc', and asserts that migration eventually commits.
  */
-function testDonorStartMigrationInterrupt(interruptFunc) {
+function testDonorStartMigrationInterrupt(interruptFunc, donorRestarted) {
     const donorRst =
         new ReplSetTest({nodes: 3, name: "donorRst", nodeOptions: migrationX509Options.donor});
 
     donorRst.startSet();
     donorRst.initiate();
 
-    // TODO SERVER-52719: Remove 'enableRecipientTesting: false'.
-    const tenantMigrationTest =
-        new TenantMigrationTest({name: jsTestName(), donorRst, enableRecipientTesting: false});
+    const tenantMigrationTest = new TenantMigrationTest({name: jsTestName(), donorRst});
     if (!tenantMigrationTest.isFeatureFlagEnabled()) {
         jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
         donorRst.stopSet();
         return;
     }
-    const donorPrimary = tenantMigrationTest.getDonorPrimary();
+    let donorPrimary = tenantMigrationTest.getDonorPrimary();
+    const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 
     const migrationId = UUID();
     const migrationOpts = {
@@ -82,6 +81,23 @@ function testDonorStartMigrationInterrupt(interruptFunc) {
                                                       TenantMigrationTest.DonorState.kCommitted);
     assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 
+    donorPrimary = tenantMigrationTest.getDonorPrimary();  // Could change after interrupt.
+    const donorStats = tenantMigrationTest.getTenantMigrationStats(donorPrimary);
+    jsTestLog(`Stats at the donor primary: ${tojson(donorStats)}`);
+    if (donorRestarted) {
+        // If full restart happened the count could be lost completely.
+        assert.gte(1, donorStats.totalSuccessfulMigrationsDonated);
+    } else {
+        // The double counting happens when the failover happens after migration completes
+        // but before the state doc GC mark is persisted. While this test is targeting this
+        // scenario it is low probability in production.
+        assert(1 == donorStats.totalSuccessfulMigrationsDonated ||
+               2 == donorStats.totalSuccessfulMigrationsDonated);
+    }
+    // Skip checking the stats on the recipient since enableRecipientTesting is false
+    // so the recipient is forced to respond to recipientSyncData without starting the
+    // migration.
+
     tenantMigrationTest.stop();
     donorRst.stopSet();
 }
@@ -107,9 +123,6 @@ function testDonorForgetMigrationInterrupt(interruptFunc) {
         name: "recipientRst",
         nodeOptions: Object.assign(migrationX509Options.recipient, {
             setParameter: {
-                // TODO SERVER-52719: Remove the failpoint
-                // 'returnResponseOkForRecipientSyncDataCmd'.
-                'failpoint.returnResponseOkForRecipientSyncDataCmd': tojson({mode: 'alwaysOn'}),
                 tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
                 ttlMonitorSleepSecs: kTTLMonitorSleepSecs,
             }
@@ -191,9 +204,6 @@ function testDonorAbortMigrationInterrupt(interruptFunc, fpName, isShutdown = fa
         name: "recipientRst",
         nodeOptions: Object.assign(migrationX509Options.recipient, {
             setParameter: {
-                // TODO SERVER-52719: Remove the failpoint
-                // 'returnResponseOkForRecipientSyncDataCmd'.
-                'failpoint.returnResponseOkForRecipientSyncDataCmd': tojson({mode: 'alwaysOn'}),
                 tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
                 ttlMonitorSleepSecs: kTTLMonitorSleepSecs,
             }
@@ -293,9 +303,6 @@ function testStateDocPersistenceOnFailover(interruptFunc, fpName, isShutdown = f
         name: "recipientRst",
         nodeOptions: Object.assign(migrationX509Options.recipient, {
             setParameter: {
-                // TODO SERVER-52719: Remove the failpoint
-                // 'returnResponseOkForRecipientSyncDataCmd'.
-                'failpoint.returnResponseOkForRecipientSyncDataCmd': tojson({mode: 'alwaysOn'}),
                 tenantMigrationGarbageCollectionDelayMS: kGarbageCollectionDelayMS,
                 ttlMonitorSleepSecs: kTTLMonitorSleepSecs,
             }
@@ -377,7 +384,7 @@ function testStateDocPersistenceOnFailover(interruptFunc, fpName, isShutdown = f
         assert.commandWorked(
             donorPrimary.adminCommand({replSetStepDown: ReplSetTest.kForeverSecs, force: true}));
         assert.commandWorked(donorPrimary.adminCommand({replSetFreeze: 0}));
-    });
+    }, false /* donor restarted */);
 })();
 
 (() => {
@@ -385,7 +392,7 @@ function testStateDocPersistenceOnFailover(interruptFunc, fpName, isShutdown = f
     testDonorStartMigrationInterrupt((donorRst) => {
         donorRst.stopSet(null /* signal */, true /*forRestart */);
         donorRst.startSet({restart: true});
-    });
+    }, true /* donor restarted */);
 })();
 
 (() => {

@@ -100,7 +100,7 @@ structs:
                     or 'aborted'.
                 optional: true
             abortReason:
-                type: object
+                type: object_owned
                 description: "The error that caused the migration to abort."
                 optional: true
             expireAt:
@@ -251,3 +251,8 @@ structs:
                     'config.transactions'
                 type: bool
                 default: false
+            startAt:
+                type: date
+                description: >-
+                    The wall-clock time at which the state machine document is initialized.
+                optional: true

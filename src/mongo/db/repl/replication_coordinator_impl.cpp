@@ -84,6 +84,7 @@
 #include "mongo/db/repl/replication_process.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_util.h"
+#include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
 #include "mongo/db/repl/update_position_args.h"
 #include "mongo/db/repl/vote_requester.h"
@@ -496,7 +497,7 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
             "for information on how to recover from this. Got \"{error}\" while parsing "
             "{config}",
             "Locally stored replica set configuration does not parse; See "
-            "hhttp://www.mongodb.org/dochub/core/recover-replica-set-from-invalid-config "
+            "http://www.mongodb.org/dochub/core/recover-replica-set-from-invalid-config "
             "for information on how to recover from this",
             "error"_attr = status,
             "config"_attr = cfg.getValue());
@@ -2955,7 +2956,7 @@ bool ReplicationCoordinatorImpl::isInPrimaryOrSecondaryState_UNSAFE() const {
 
 bool ReplicationCoordinatorImpl::shouldRelaxIndexConstraints(OperationContext* opCtx,
                                                              const NamespaceString& ns) {
-    if (ReplSettings::shouldRecoverFromOplogAsStandalone()) {
+    if (ReplSettings::shouldRecoverFromOplogAsStandalone() || tenantMigrationRecipientInfo(opCtx)) {
         return true;
     }
     return !canAcceptWritesFor(opCtx, ns);
@@ -3580,6 +3581,11 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
     if (isForceReconfig && _shouldStepDownOnReconfig(lk, newConfig, myIndex)) {
         _topCoord->prepareForUnconditionalStepDown();
         lk.unlock();
+
+        // To prevent a deadlock between session checkout and RSTL lock taking, disallow new
+        // sessions from being checked out. Existing sessions currently checked out will be killed
+        // by the killOpThread.
+        ScopedBlockSessionCheckouts blockSessions(opCtx);
 
         // Primary node won't be electable or removed after the configuration change.
         // So, finish the reconfig under RSTL, so that the step down occurs safely.

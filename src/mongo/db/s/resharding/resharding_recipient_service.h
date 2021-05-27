@@ -143,13 +143,14 @@ private:
 
     ExecutorFuture<void> _cloneThenTransitionToApplying(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
-        const CancelationToken& cancelToken);
+        const CancelationToken& abortToken);
 
     ExecutorFuture<void> _applyThenTransitionToSteadyState(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
     ExecutorFuture<void> _awaitAllDonorsBlockingWritesThenTransitionToStrictConsistency(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        const CancelationToken& abortToken);
 
     ExecutorFuture<void> _awaitCoordinatorHasDecisionPersistedThenTransitionToRenaming(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
@@ -195,10 +196,16 @@ private:
     // (abort resharding).
     void _onAbortOrStepdown(WithLock, Status status);
 
+    // Initializes the _abortSource and generates a token from it to return back the caller.
+    //
+    // Should only be called once per lifetime.
+    CancelationToken _initAbortSource(const CancelationToken& stepdownToken);
+
     // The in-memory representation of the immutable portion of the document in
     // config.localReshardingOperations.recipient.
     const CommonReshardingMetadata _metadata;
     const std::vector<ShardId> _donorShardIds;
+    const Milliseconds _minimumOperationDuration;
 
     // The in-memory representation of the mutable portion of the document in
     // config.localReshardingOperations.recipient.
@@ -219,6 +226,9 @@ private:
 
     // Protects the promises below
     Mutex _mutex = MONGO_MAKE_LATCH("RecipientStateMachine::_mutex");
+
+    // Canceled when there is an unrecoverable error or stepdown.
+    boost::optional<CancelationSource> _abortSource;
 
     boost::optional<ReshardingCriticalSection> _critSec;
 

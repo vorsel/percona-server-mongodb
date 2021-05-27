@@ -39,6 +39,7 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/stdx/unordered_map.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/cancelation.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/interruptible.h"
@@ -129,6 +130,8 @@ public:
     // please make sure that the new type is also BSON-compatible.
     using EntryCountT = long long;
 
+    using PredicateFunction = std::function<bool(const BSONObj&)>;
+
 private:
     class Impl {
     private:
@@ -161,6 +164,20 @@ private:
              */
             bool isActive() const {
                 return MONGO_unlikely(_hit);
+            }
+
+            /**
+             * Returns true if the fail point is still enabled.
+             *
+             * This function does not increment the underlying counter. Note that the fail point
+             * may have been changed in various ways while a LockHandle is held:
+             * - The fail point may be in the process of mutation which toggles to disabled until
+             *   LockHandles are released.
+             * - The fail point may have the modes "activationProbability", "skip", or
+             *   "times".
+             */
+            bool isStillEnabled() const {
+                return _impl->_shouldFail(AlreadyCounted{true}, PredicateFunction{});
             }
 
             /** May only be called if isActive() is true. */
@@ -206,7 +223,9 @@ private:
         void pauseWhileSetAndNotCanceled(Interruptible* interruptible,
                                          const CancelationToken& token) {
             auto alreadyCounted = AlreadyCounted{false};
-            while (MONGO_unlikely(_shouldFail(alreadyCounted, nullptr)) && !token.isCanceled()) {
+            while (MONGO_unlikely(_shouldFail(alreadyCounted, nullptr))) {
+                uassert(
+                    ErrorCodes::Interrupted, "Failpoint has been canceled", !token.isCanceled());
                 interruptible->sleepFor(_kWaitGranularity);
                 alreadyCounted = AlreadyCounted{true};
             }
@@ -272,7 +291,7 @@ private:
 
             // Slow path. Wrap in `std::function` to deal with nullptr_t
             // or other predicates that are not bool-convertible.
-            std::function<bool(const BSONObj&)> predWrap(std::move(pred));
+            auto predWrap = PredicateFunction(std::move(pred));
 
             // The caller-supplied predicate, if provided, can force a miss that
             // bypasses the `_evaluateByMode()` call.
@@ -513,7 +532,8 @@ public:
 
     /**
      * Like `pauseWhileSet`, but will also unpause as soon as the cancellation token is canceled.
-     * This method does not generate any cancellation related error by itself, it only waits.
+     * This method will throw if the token is canceled, to match the behavior when the
+     * Interruptible* is interrupted.
      */
     void pauseWhileSetAndNotCanceled(Interruptible* interruptible, const CancelationToken& token) {
         _impl()->pauseWhileSetAndNotCanceled(interruptible, token);

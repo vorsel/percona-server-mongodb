@@ -126,12 +126,13 @@ Status insertOplogAndUpdateConfigForRetryable(OperationContext* opCtx,
 
     // If it's not a CRUD type, it's an oplog related to transaction, so convert it to
     // incompleteHistory stmtId.
-    const auto stmtId = oplog.isCrudOpType() ? *oplog.getStatementId() : kIncompleteHistoryStmtId;
+    const auto stmtIds = oplog.isCrudOpType() ? oplog.getStatementIds()
+                                              : std::vector<StmtId>{kIncompleteHistoryStmtId};
 
     try {
         txnParticipant.beginOrContinue(opCtx, txnNumber, boost::none, boost::none);
 
-        if (txnParticipant.checkStatementExecuted(opCtx, stmtId)) {
+        if (txnParticipant.checkStatementExecuted(opCtx, stmtIds.front())) {
             // Skip the incoming statement because it has already been logged locally.
             return Status::OK();
         }
@@ -221,7 +222,7 @@ Status insertOplogAndUpdateConfigForRetryable(OperationContext* opCtx,
             // Use the same wallTime as oplog since SessionUpdateTracker looks at the oplog entry
             // wallTime when replicating.
             sessionTxnRecord.setLastWriteDate(noOpOplog.getWallClockTime());
-            txnParticipant.onRetryableWriteCloningCompleted(opCtx, {stmtId}, sessionTxnRecord);
+            txnParticipant.onRetryableWriteCloningCompleted(opCtx, stmtIds, sessionTxnRecord);
 
             wunit.commit();
         });
@@ -271,35 +272,36 @@ ReshardingOplogApplier::ReshardingOplogApplier(
       _writerPool(writerPool),
       _oplogIter(std::move(oplogIterator)) {}
 
-ExecutorFuture<void> ReshardingOplogApplier::applyUntilCloneFinishedTs() {
+ExecutorFuture<void> ReshardingOplogApplier::applyUntilCloneFinishedTs(
+    CancelationToken cancelToken) {
     invariant(_stage == ReshardingOplogApplier::Stage::kStarted);
 
     // It is safe to capture `this` because PrimaryOnlyService and RecipientStateMachine
     // collectively guarantee that the ReshardingOplogApplier instances will outlive `_executor` and
     // `_writerPool`.
     return ExecutorFuture(_executor)
-        .then([this] { return _scheduleNextBatch(); })
+        .then([this, cancelToken] { return _scheduleNextBatch(cancelToken); })
         .onError([this](Status status) { return _onError(status); });
 }
 
-ExecutorFuture<void> ReshardingOplogApplier::applyUntilDone() {
+ExecutorFuture<void> ReshardingOplogApplier::applyUntilDone(CancelationToken cancelToken) {
     invariant(_stage == ReshardingOplogApplier::Stage::kReachedCloningTS);
 
     // It is safe to capture `this` because PrimaryOnlyService and RecipientStateMachine
     // collectively guarantee that the ReshardingOplogApplier instances will outlive `_executor` and
     // `_writerPool`.
     return ExecutorFuture(_executor)
-        .then([this] { return _scheduleNextBatch(); })
+        .then([this, cancelToken] { return _scheduleNextBatch(cancelToken); })
         .onError([this](Status status) { return _onError(status); });
 }
 
-ExecutorFuture<void> ReshardingOplogApplier::_scheduleNextBatch() {
+ExecutorFuture<void> ReshardingOplogApplier::_scheduleNextBatch(CancelationToken cancelToken) {
     return ExecutorFuture(_executor)
-        .then([this] {
+        .then([this, cancelToken] {
             auto batchClient = makeKillableClient(_service(), kClientName);
             AlternativeClientRegion acr(batchClient);
 
-            return _oplogIter->getNextBatch(_executor);
+            return _oplogIter->getNextBatch(_executor, cancelToken);
         })
         .then([this](OplogBatch batch) {
             LOGV2_DEBUG(5391002, 3, "Starting batch", "batchSize"_attr = batch.size());
@@ -349,11 +351,18 @@ ExecutorFuture<void> ReshardingOplogApplier::_scheduleNextBatch() {
 
             return true;
         })
-        .then([this](bool moreToApply) {
+        .then([this, cancelToken](bool moreToApply) {
             if (!moreToApply) {
                 return ExecutorFuture(_executor);
             }
-            return _scheduleNextBatch();
+
+            if (cancelToken.isCanceled()) {
+                return ExecutorFuture<void>(
+                    _executor,
+                    Status{ErrorCodes::CallbackCanceled,
+                           "Resharding oplog applier aborting due to abort or stepdown"});
+            }
+            return _scheduleNextBatch(cancelToken);
         });
 }
 

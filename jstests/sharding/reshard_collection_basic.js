@@ -12,7 +12,13 @@ load("jstests/sharding/libs/find_chunks_util.js");
 (function() {
 'use strict';
 
-const st = new ShardingTest({mongos: 1, shards: 2});
+const st = new ShardingTest({
+    mongos: 1,
+    mongosOptions: {setParameter: {featureFlagResharding: true}},
+    configOptions: {setParameter: {featureFlagResharding: true}},
+    shards: 2,
+    shardOptions: {setParameter: {featureFlagResharding: true}},
+});
 const kDbName = 'db';
 const collName = 'foo';
 const ns = kDbName + '.' + collName;
@@ -206,6 +212,10 @@ assert.commandFailedWithCode(mongos.adminCommand({
     numInitialChunks: 2,
 }),
                              ErrorCodes.BadValue);
+
+jsTestLog("Fail if attempting insert to an unsharded 'system.resharding.' collection");
+assert.commandFailedWithCode(mongos.getDB('test').system.resharding.mycoll.insert({_id: 1, a: 1}),
+                             ErrorCodes.NamespaceNotSharded);
 
 /**
  * Success cases

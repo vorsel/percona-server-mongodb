@@ -141,6 +141,9 @@ public:
     // Namespace for pending range deletions.
     static const NamespaceString kRangeDeletionNamespace;
 
+    // Namespace containing pending range deletions snapshots for rename operations.
+    static const NamespaceString kRangeDeletionForRenameNamespace;
+
     // Namespace for the coordinator's resharding operation state.
     static const NamespaceString kConfigReshardingOperationsNamespace;
 
@@ -164,6 +167,9 @@ public:
 
     // Namespace for storing config.transactions cloner progress for resharding.
     static const NamespaceString kReshardingTxnClonerProgressNamespace;
+
+    // Namespace for storing config.collectionCriticalSections documents
+    static const NamespaceString kCollectionCriticalSectionsNamespace;
 
     /**
      * Constructs an empty NamespaceString.
@@ -349,6 +355,11 @@ public:
      * Returns the time-series buckets namespace for this view.
      */
     NamespaceString makeTimeseriesBucketsNamespace() const;
+
+    /**
+     * Returns the time-series view namespace for this buckets namespace.
+     */
+    NamespaceString bucketsNamespaceToTimeseries() const;
 
     /**
      * Returns whether a namespace is replicated, based only on its string value. One notable

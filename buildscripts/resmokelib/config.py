@@ -110,6 +110,7 @@ DEFAULTS = {
     "internal_params": [],
 
     # Evergreen options.
+    "evergreen_url": "evergreen.mongodb.com",
     "build_id": None,
     "distro_id": None,
     "execution_number": 0,
@@ -119,6 +120,7 @@ DEFAULTS = {
     "revision_order_id": None,
     "task_id": None,
     "task_name": None,
+    "task_doc": None,
     "variant_name": None,
     "version_id": None,
 
@@ -272,6 +274,9 @@ DBTEST_EXECUTABLE = None
 # actually running them).
 DRY_RUN = None
 
+# URL to connect to the Evergreen service.
+EVERGREEN_URL = None
+
 # An identifier consisting of the project name, build variant name, commit hash, and the timestamp.
 # For patch builds, it also includes the patch version id.
 EVERGREEN_BUILD_ID = None
@@ -300,6 +305,9 @@ EVERGREEN_TASK_ID = None
 
 # The name of the Evergreen task that resmoke.py is being run for.
 EVERGREEN_TASK_NAME = None
+
+# The documentation that describes what Evergreen task does.
+EVERGREEN_TASK_DOC = None
 
 # The name of the Evergreen build variant that resmoke.py is being run on.
 EVERGREEN_VARIANT_NAME = None

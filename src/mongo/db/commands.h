@@ -67,6 +67,7 @@ extern const OperationContext::Decoration<boost::optional<BSONArray>> errorLabel
 extern const std::set<std::string> kNoApiVersions;
 extern const std::set<std::string> kApiVersions1;
 
+class AuthorizationContract;
 class Command;
 class CommandInvocation;
 class OperationContext;
@@ -575,6 +576,15 @@ public:
      */
     virtual bool auditAuthorizationFailure() const {
         return true;
+    }
+
+
+    /**
+     * Get the authorization contract for this command. nullptr means no contract has been
+     * specified.
+     */
+    virtual const AuthorizationContract* getAuthorizationContract() const {
+        return nullptr;
     }
 
 private:
@@ -1300,6 +1310,22 @@ CommandRegistry* globalCommandRegistry();
 #define MONGO_REGISTER_TEST_COMMAND(CmdType)                                \
     MONGO_INITIALIZER(RegisterTestCommand_##CmdType)(InitializerContext*) { \
         if (getTestCommandsEnabled()) {                                     \
+            new CmdType();                                                  \
+        }                                                                   \
+    }
+
+/**
+ * Creates a command object of type CmdType if the featureFlag is enabled for
+ * this process, regardless of the current FCV. Prefer this syntax to using
+ * MONGO_INITIALIZER directly. The created Command object is "leaked"
+ * intentionally, since it will register itself.
+ *
+ * The command objects will be created after the "default" initializer, and all
+ * startup option processing happens prior to "default" (see base/init.h).
+ */
+#define MONGO_REGISTER_FEATURE_FLAGGED_COMMAND(CmdType, featureFlag)        \
+    MONGO_INITIALIZER(RegisterTestCommand_##CmdType)(InitializerContext*) { \
+        if (featureFlag.isEnabledAndIgnoreFCV()) {                          \
             new CmdType();                                                  \
         }                                                                   \
     }

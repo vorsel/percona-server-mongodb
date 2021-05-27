@@ -64,6 +64,9 @@ namespace mongo {
  * To ensure atClusterTime and afterClusterTime reads are consistent, when the recipient receives a
  * recipientSyncData command with a returnAfterReachingTimestamp after the consistent point, the
  * `rejectBeforeTimestamp` will be advanced to the given returnAfterReachingTimestamp.
+ *
+ * Blocker excludes all operations with 'tenantMigrationRecipientInfo' decoration set, as they are
+ * internal.
  */
 class TenantMigrationRecipientAccessBlocker
     : public std::enable_shared_from_this<TenantMigrationRecipientAccessBlocker>,
@@ -94,6 +97,12 @@ public:
     // after registering the build.
     //
     Status checkIfCanBuildIndex() final;
+
+    // @return true if TTL is blocked
+    bool checkIfShouldBlockTTL() const final;
+
+    // Clear TTL blocker once the state doc is garbage collectable.
+    void stopBlockingTTL();
 
     /**
      * Called when an optime is majority committed.
@@ -135,6 +144,10 @@ private:
     State _state{State::kReject};
 
     boost::optional<Timestamp> _rejectBeforeTimestamp;
+
+    // Start with blocked TTL, unblock when the migration document is marked as
+    // garbage collectable.
+    bool _ttlIsBlocked = true;
 
     std::shared_ptr<executor::TaskExecutor> _asyncBlockingOperationsExecutor;
 };

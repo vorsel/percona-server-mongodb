@@ -218,13 +218,11 @@ StatusWith<ChunkManager> CatalogCache::_getCollectionRoutingInfoAt(
                 if (acquireTries == kMaxInconsistentRoutingInfoRefreshAttempts) {
                     return ex.toStatus();
                 }
-            } catch (ExceptionFor<ErrorCodes::BadValue>& ex) {
+            } catch (ExceptionFor<ErrorCodes::QueryPlanKilled>& ex) {
                 // TODO SERVER-53283: Remove once 5.0 has branched out.
-                // This would happen when the query to config.chunks fails because the index
-                // specified in the 'hint' provided by ConfigServerCatalogCache loader does no
-                // longer exist because it was dropped as part of the FCV upgrade/downgrade process
-                // to/from 5.0.
-                LOGV2_FOR_CATALOG_REFRESH(5310502,
+                // This would happen when the query to config.chunks is killed because the index it
+                // relied on has been dropped while the query was ongoing.
+                LOGV2_FOR_CATALOG_REFRESH(5310503,
                                           0,
                                           "Collection refresh failed",
                                           "namespace"_attr = nss,
@@ -234,11 +232,8 @@ StatusWith<ChunkManager> CatalogCache::_getCollectionRoutingInfoAt(
                 if (acquireTries == kMaxInconsistentRoutingInfoRefreshAttempts) {
                     return ex.toStatus();
                 }
-            } catch (ExceptionFor<ErrorCodes::QueryPlanKilled>& ex) {
-                // TODO SERVER-53283: Remove once 5.0 has branched out.
-                // This would happen when the query to config.chunks is killed because the index it
-                // relied on has been dropped while the query was ongoing.
-                LOGV2_FOR_CATALOG_REFRESH(5310503,
+            } catch (ExceptionForCat<ErrorCategory::SnapshotError>& ex) {
+                LOGV2_FOR_CATALOG_REFRESH(5487402,
                                           0,
                                           "Collection refresh failed",
                                           "namespace"_attr = nss,
@@ -631,7 +626,8 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
                                   1,
                                   "Refreshing cached collection",
                                   "namespace"_attr = nss,
-                                  "currentVersion"_attr = previousVersion.toBSONForLogging());
+                                  "lookupSinceVersion"_attr = lookupVersion,
+                                  "timeInStore"_attr = previousVersion.toBSONForLogging());
 
         auto collectionAndChunks = _catalogCacheLoader.getChunksSince(nss, lookupVersion).get();
 
@@ -689,31 +685,42 @@ CatalogCache::CollectionCache::LookupResult CatalogCache::CollectionCache::_look
                                                      << " references shard which does not exist");
         }
 
-        auto newVersion = (mustReplaceEntryDueToUpgradeOrDowngrade)
-            ? ComparableChunkVersion::makeComparableChunkVersionForForcedRefresh(
-                  newRoutingHistory.getVersion())
-            : ComparableChunkVersion::makeComparableChunkVersion(newRoutingHistory.getVersion());
+        const ChunkVersion newVersion = newRoutingHistory.getVersion();
 
-        invariant(isIncremental == false ||
-                      (existingHistory->optRt->getVersion().epoch() !=
-                           newRoutingHistory.getVersion().epoch() ||
-                       existingHistory->optRt->getVersion().isOlderThan(
-                           newRoutingHistory.getVersion())) ||
-                      (newRoutingHistory.sameAllowMigrations(*existingHistory->optRt) &&
-                       newRoutingHistory.sameReshardingFields(*existingHistory->optRt)),
-                  "Unconsistent routing table info value for collections of the same version");
+        // This object will define the new time in store
+        auto newComparableVersion = (mustReplaceEntryDueToUpgradeOrDowngrade)
+            ? ComparableChunkVersion::makeComparableChunkVersionForForcedRefresh(newVersion)
+            : ComparableChunkVersion::makeComparableChunkVersion(newVersion);
+
+        if (isIncremental && existingHistory->optRt->getVersion() == newVersion) {
+            invariant(newRoutingHistory.sameAllowMigrations(*existingHistory->optRt),
+                      str::stream() << "allowMigrations field of " << nss
+                                    << "collection changed without changing the collection version "
+                                    << newVersion.toString()
+                                    << ". Old value: " << existingHistory->optRt->allowMigrations()
+                                    << ", new value: " << newRoutingHistory.allowMigrations());
+
+            invariant(newRoutingHistory.sameReshardingFields(*existingHistory->optRt),
+                      str::stream()
+                          << "reshardingFields field of " << nss
+                          << "collection changed without changing the collection version "
+                          << newVersion.toString() << ". Old value: "
+                          << existingHistory->optRt->getReshardingFields()->toBSON()
+                          << ", new value: " << newRoutingHistory.getReshardingFields()->toBSON());
+        }
 
         LOGV2_FOR_CATALOG_REFRESH(4619901,
-                                  isIncremental || newVersion != previousVersion ? 0 : 1,
+                                  isIncremental || newComparableVersion != previousVersion ? 0 : 1,
                                   "Refreshed cached collection",
                                   "namespace"_attr = nss,
-                                  "newVersion"_attr = newVersion.toBSONForLogging(),
-                                  "oldVersion"_attr = previousVersion.toBSONForLogging(),
+                                  "lookupSinceVersion"_attr = lookupVersion,
+                                  "newVersion"_attr = newComparableVersion.toBSONForLogging(),
+                                  "timeInStore"_attr = previousVersion.toBSONForLogging(),
                                   "duration"_attr = Milliseconds(t.millis()));
         _updateRefreshesStats(isIncremental, false);
 
         return LookupResult(OptionalRoutingTableHistory(std::move(newRoutingHistory)),
-                            std::move(newVersion));
+                            std::move(newComparableVersion));
     } catch (const DBException& ex) {
         _stats.countFailedRefreshes.addAndFetch(1);
         _updateRefreshesStats(isIncremental, false);

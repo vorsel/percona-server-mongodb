@@ -50,6 +50,7 @@
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/service_context_test_fixture.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/transport_layer_mock.h"
 #include "mongo/unittest/unittest.h"
@@ -83,22 +84,12 @@ private:
 
 class AuthorizationSessionTest : public ScopedGlobalServiceContextForTest, public unittest::Test {
 public:
-    FailureCapableAuthzManagerExternalStateMock* managerState;
-    transport::TransportLayerMock transportLayer;
-    transport::SessionHandle session;
-    ServiceContext::UniqueClient client;
-    ServiceContext::UniqueOperationContext _opCtx;
-    AuthzSessionExternalStateMock* sessionState;
-    AuthorizationManager* authzManager;
-    std::unique_ptr<AuthorizationSessionForTest> authzSession;
-    BSONObj credentials;
-
     void setUp() {
-        session = transportLayer.createSession();
-        client = getServiceContext()->makeClient("testClient", session);
+        _session = transportLayer.createSession();
+        _client = getServiceContext()->makeClient("testClient", _session);
         RestrictionEnvironment::set(
-            session, std::make_unique<RestrictionEnvironment>(SockAddr(), SockAddr()));
-        _opCtx = client->makeOperationContext();
+            _session, std::make_unique<RestrictionEnvironment>(SockAddr(), SockAddr()));
+        _opCtx = _client->makeOperationContext();
         auto localManagerState = std::make_unique<FailureCapableAuthzManagerExternalStateMock>();
         managerState = localManagerState.get();
         managerState->setAuthzVersion(AuthorizationManager::schemaVersion26Final);
@@ -120,6 +111,22 @@ public:
                                << scram::Secrets<SHA256Block>::generateCredentials(
                                       "a", saslGlobalParams.scramSHA256IterationCount.load()));
     }
+
+    void tearDown() override {
+        authzSession->logoutAllDatabases(_client.get(), "Ending AuthorizationSessionTest");
+    }
+
+protected:
+    FailureCapableAuthzManagerExternalStateMock* managerState;
+    transport::TransportLayerMock transportLayer;
+    transport::SessionHandle _session;
+    ServiceContext::UniqueClient _client;
+    ServiceContext::UniqueOperationContext _opCtx;
+    AuthzSessionExternalStateMock* sessionState;
+    AuthorizationManager* authzManager;
+    std::unique_ptr<AuthorizationSessionForTest> authzSession;
+    BSONObj credentials;
+    RAIIServerParameterControllerForTest controller{"featureFlagAuthorizationContract", 1};
 };
 
 const NamespaceString testFooNss("test.foo");
@@ -218,7 +225,7 @@ TEST_F(AuthorizationSessionTest, AddUserAndCheckAuthorization) {
     ASSERT_TRUE(
         authzSession->isAuthorizedForActionsOnResource(testFooCollResource, ActionType::insert));
 
-    authzSession->logoutDatabase(_opCtx.get(), "test");
+    authzSession->logoutDatabase(_client.get(), "test", "Kill the test!");
     ASSERT_TRUE(
         authzSession->isAuthorizedForActionsOnResource(otherFooCollResource, ActionType::insert));
     ASSERT_TRUE(
@@ -226,13 +233,33 @@ TEST_F(AuthorizationSessionTest, AddUserAndCheckAuthorization) {
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(testFooCollResource, ActionType::collMod));
 
-    authzSession->logoutDatabase(_opCtx.get(), "admin");
+    authzSession->logoutDatabase(_client.get(), "admin", "Fire the admin!");
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(otherFooCollResource, ActionType::insert));
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(testFooCollResource, ActionType::insert));
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(testFooCollResource, ActionType::collMod));
+
+    // Verify we recorded the all the auth checks correctly
+    AuthorizationContract ac(
+        std::initializer_list<AccessCheckEnum>{},
+        std::initializer_list<Privilege>{
+            Privilege(ResourcePattern::forDatabaseName("ignored"),
+                      {ActionType::insert, ActionType::dbStats}),
+            Privilege(ResourcePattern::forExactNamespace(NamespaceString("ignored.ignored")),
+                      {ActionType::insert, ActionType::collMod}),
+        });
+
+    authzSession->verifyContract(&ac);
+
+    // Verify against a smaller contract that verifyContract fails
+    AuthorizationContract acMissing(std::initializer_list<AccessCheckEnum>{},
+                                    std::initializer_list<Privilege>{
+                                        Privilege(ResourcePattern::forDatabaseName("ignored"),
+                                                  {ActionType::insert, ActionType::dbStats}),
+                                    });
+    ASSERT_THROWS_CODE(authzSession->verifyContract(&acMissing), AssertionException, 5452401);
 }
 
 TEST_F(AuthorizationSessionTest, DuplicateRolesOK) {
@@ -542,7 +569,7 @@ TEST_F(AuthorizationSessionTest, AcquireUserObtainsAndValidatesAuthenticationRes
 
     auto assertWorks = [this](StringData clientSource, StringData serverAddress) {
         RestrictionEnvironment::set(
-            session,
+            _session,
             std::make_unique<RestrictionEnvironment>(SockAddr(clientSource, 5555, AF_UNSPEC),
                                                      SockAddr(serverAddress, 27017, AF_UNSPEC)));
         ASSERT_OK(authzSession->addAndAuthorizeUser(_opCtx.get(), UserName("spencer", "test")));
@@ -550,7 +577,7 @@ TEST_F(AuthorizationSessionTest, AcquireUserObtainsAndValidatesAuthenticationRes
 
     auto assertFails = [this](StringData clientSource, StringData serverAddress) {
         RestrictionEnvironment::set(
-            session,
+            _session,
             std::make_unique<RestrictionEnvironment>(SockAddr(clientSource, 5555, AF_UNSPEC),
                                                      SockAddr(serverAddress, 27017, AF_UNSPEC)));
         ASSERT_NOT_OK(authzSession->addAndAuthorizeUser(_opCtx.get(), UserName("spencer", "test")));
@@ -1338,6 +1365,15 @@ TEST_F(AuthorizationSessionTest, CanUseUUIDNamespacesWithPrivilege) {
     ASSERT_THROWS_CODE(authzSession->isAuthorizedToParseNamespaceElement(invalidObj.firstElement()),
                        AssertionException,
                        ErrorCodes::InvalidNamespace);
+
+    // Verify we recorded the all the auth checks correctly
+    AuthorizationContract ac(
+        std::initializer_list<AccessCheckEnum>{
+            AccessCheckEnum::kIsAuthorizedToParseNamespaceElement},
+        std::initializer_list<Privilege>{
+            Privilege(ResourcePattern::forClusterResource(), ActionType::useUUID)});
+
+    authzSession->verifyContract(&ac);
 }
 
 

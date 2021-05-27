@@ -655,6 +655,13 @@ namespace audit {
         }
     }
 
+    void logClientMetadata(Client* client) {
+        if (!_auditLog) {
+            return;
+        }
+
+        _auditEvent(client, "clientMetadata", BSONObj{}, ErrorCodes::OK, false);
+    }
     void logAuthentication(Client* client, const AuthenticateEvent& event) {
         if (!_auditLog) {
             return;
@@ -828,14 +835,19 @@ namespace audit {
     void logCreateIndex(Client* client,
                         const BSONObj* indexSpec,
                         StringData indexname,
-                        const NamespaceString& nsname) {
+                        const NamespaceString& nsname,
+                        StringData indexBuildState,
+                        ErrorCodes::Error result) {
         if (!_auditLog) {
             return;
         }
 
-        const BSONObj params =
-            BSON("ns" << nsname.ns() << "indexName" << indexname << "indexSpec" << *indexSpec);
-        _auditEvent(client, "createIndex", params);
+        BSONObjBuilder params;
+        params.append("ns", nsname.ns());
+        params.append("indexName", indexname);
+        params.append("indexSpec", *indexSpec);
+        params.append("indexBuildState", indexBuildState);
+        _auditEvent(client, "createIndex", params.done(), result);
     }
 
     void logCreateCollection(Client* client, const NamespaceString& nsname) {

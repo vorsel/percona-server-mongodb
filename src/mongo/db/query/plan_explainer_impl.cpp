@@ -45,10 +45,11 @@
 #include "mongo/db/exec/plan_stats.h"
 #include "mongo/db/exec/sort.h"
 #include "mongo/db/exec/subplan.h"
-#include "mongo/db/exec/text.h"
+#include "mongo/db/exec/text_match.h"
 #include "mongo/db/exec/trial_stage.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/query/explain.h"
+#include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -83,8 +84,8 @@ void addStageSummaryStr(const PlanStage* stage, StringBuilder& sb) {
         const IndexScanStats* spec = static_cast<const IndexScanStats*>(specific);
         const KeyPattern keyPattern{spec->keyPattern};
         sb << " " << keyPattern;
-    } else if (STAGE_TEXT == stage->stageType()) {
-        const TextStats* spec = static_cast<const TextStats*>(specific);
+    } else if (STAGE_TEXT_MATCH == stage->stageType()) {
+        const TextMatchStats* spec = static_cast<const TextMatchStats*>(specific);
         const KeyPattern keyPattern{spec->indexPrefix};
         sb << " " << keyPattern;
     }
@@ -190,7 +191,7 @@ void statsToBSON(const PlanStageStats& stats,
     invariant(topLevelBob);
 
     // Stop as soon as the BSON object we're building exceeds the limit.
-    if (topLevelBob->len() > kMaxExplainStatsBSONSizeMB) {
+    if (topLevelBob->len() > internalQueryExplainSizeThresholdBytes.load()) {
         bob->append("warning", "stats tree exceeded BSON size limit for explain");
         return;
     }
@@ -297,12 +298,11 @@ void statsToBSON(const PlanStageStats& stats,
         bob->appendBool("isPartial", spec->isPartial);
         bob->append("indexVersion", spec->indexVersion);
 
-        BSONObjBuilder indexBoundsBob;
+        BSONObjBuilder indexBoundsBob(bob->subobjStart("indexBounds"));
         indexBoundsBob.append("startKey", spec->startKey);
         indexBoundsBob.append("startKeyInclusive", spec->startKeyInclusive);
         indexBoundsBob.append("endKey", spec->endKey);
         indexBoundsBob.append("endKeyInclusive", spec->endKeyInclusive);
-        bob->append("indexBounds", indexBoundsBob.obj());
     } else if (STAGE_DELETE == stats.stageType) {
         DeleteStats* spec = static_cast<DeleteStats*>(stats.specific.get());
 
@@ -327,7 +327,8 @@ void statsToBSON(const PlanStageStats& stats,
         bob->append("indexVersion", spec->indexVersion);
         bob->append("direction", spec->direction > 0 ? "forward" : "backward");
 
-        if ((topLevelBob->len() + spec->indexBounds.objsize()) > kMaxExplainStatsBSONSizeMB) {
+        if ((topLevelBob->len() + spec->indexBounds.objsize()) >
+            internalQueryExplainSizeThresholdBytes.load()) {
             bob->append("warning", "index bounds omitted due to BSON size limit for explain");
         } else {
             bob->append("indexBounds", spec->indexBounds);
@@ -393,7 +394,8 @@ void statsToBSON(const PlanStageStats& stats,
         bob->append("indexVersion", spec->indexVersion);
         bob->append("direction", spec->direction > 0 ? "forward" : "backward");
 
-        if ((topLevelBob->len() + spec->indexBounds.objsize()) > kMaxExplainStatsBSONSizeMB) {
+        if ((topLevelBob->len() + spec->indexBounds.objsize()) >
+            internalQueryExplainSizeThresholdBytes.load()) {
             bob->append("warning", "index bounds omitted due to BSON size limit for explain");
         } else {
             bob->append("indexBounds", spec->indexBounds);
@@ -458,15 +460,13 @@ void statsToBSON(const PlanStageStats& stats,
             bob->appendNumber("dupsTested", static_cast<long long>(spec->dupsTested));
             bob->appendNumber("dupsDropped", static_cast<long long>(spec->dupsDropped));
         }
-    } else if (STAGE_TEXT == stats.stageType) {
-        TextStats* spec = static_cast<TextStats*>(stats.specific.get());
+    } else if (STAGE_TEXT_MATCH == stats.stageType) {
+        TextMatchStats* spec = static_cast<TextMatchStats*>(stats.specific.get());
 
         bob->append("indexPrefix", spec->indexPrefix);
         bob->append("indexName", spec->indexName);
         bob->append("parsedTextQuery", spec->parsedTextQuery);
         bob->append("textIndexVersion", spec->textIndexVersion);
-    } else if (STAGE_TEXT_MATCH == stats.stageType) {
-        TextMatchStats* spec = static_cast<TextMatchStats*>(stats.specific.get());
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("docsRejected", static_cast<long long>(spec->docsRejected));
@@ -496,9 +496,8 @@ void statsToBSON(const PlanStageStats& stats,
     // the output more readable by saving a level of nesting. Name the field 'inputStage'
     // rather than 'inputStages'.
     if (1 == stats.children.size()) {
-        BSONObjBuilder childBob;
+        BSONObjBuilder childBob(bob->subobjStart("inputStage"));
         statsToBSON(*stats.children[0], verbosity, planIdx, &childBob, topLevelBob);
-        bob->append("inputStage", childBob.obj());
         return;
     }
 
@@ -684,10 +683,10 @@ void PlanExplainerImpl::getSummaryStats(PlanSummaryStats* statsOut) const {
             const DistinctScanStats* distinctScanStats =
                 static_cast<const DistinctScanStats*>(distinctScan->getSpecificStats());
             statsOut->indexesUsed.insert(distinctScanStats->indexName);
-        } else if (STAGE_TEXT == stages[i]->stageType()) {
-            const TextStage* textStage = static_cast<const TextStage*>(stages[i]);
-            const TextStats* textStats =
-                static_cast<const TextStats*>(textStage->getSpecificStats());
+        } else if (STAGE_TEXT_MATCH == stages[i]->stageType()) {
+            const TextMatchStage* textStage = static_cast<const TextMatchStage*>(stages[i]);
+            const TextMatchStats* textStats =
+                static_cast<const TextMatchStats*>(textStage->getSpecificStats());
             statsOut->indexesUsed.insert(textStats->indexName);
         } else if (STAGE_GEO_NEAR_2D == stages[i]->stageType() ||
                    STAGE_GEO_NEAR_2DSPHERE == stages[i]->stageType()) {

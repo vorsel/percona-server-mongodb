@@ -40,6 +40,7 @@
 #include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding_util.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_util.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
 #include "mongo/db/vector_clock.h"
@@ -197,10 +198,14 @@ void writeToCoordinatorStateNss(OperationContext* opCtx,
  */
 TypeCollectionRecipientFields constructRecipientFields(
     const ReshardingCoordinatorDocument& coordinatorDoc) {
-    auto donorShardIds = resharding::extractShardIds(coordinatorDoc.getDonorShards());
     TypeCollectionRecipientFields recipientFields(
-        std::move(donorShardIds), coordinatorDoc.getSourceUUID(), coordinatorDoc.getSourceNss());
+        resharding::extractShardIds(coordinatorDoc.getDonorShards()),
+        coordinatorDoc.getSourceUUID(),
+        coordinatorDoc.getSourceNss(),
+        resharding::gReshardingMinimumOperationDurationMillis.load());
+
     emplaceFetchTimestampIfExists(recipientFields, coordinatorDoc.getFetchTimestamp());
+
     return recipientFields;
 }
 
@@ -503,46 +508,8 @@ void updateChunkAndTagsDocsForTempNss(OperationContext* opCtx,
         opCtx, TagsType::ConfigNS, tagsRequest, txnNumber);
 }
 
-//
-// Helper methods for ensuring donors/ recipients are able to notice when certain state transitions
-// occur.
-//
-// Donors/recipients learn when to transition states by noticing a change in shard versions for one
-// of the two collections involved in the resharding operations.
-//
-// Before the resharding operation persists the decision whether to succeed or fail:
-// * Donors are notified when the original resharding collection's shard versions are incremented.
-// * Recipients are notified when the temporary resharding collection's shard versions are
-//   incremented.
-//
-// After the resharding operation persists its decision:
-// * Both donors and recipients are notified when the original resharding collection's shard
-//   versions are incremented.
-//
-
 /**
- * Maps which participants are to be notified when the coordinator transitions into a given state.
- */
-enum class ParticipantsToNotifyEnum {
-    kDonors,
-    kRecipients,
-    kAllParticipantsPostDecisionPersisted,
-    kNone
-};
-stdx::unordered_map<CoordinatorStateEnum, ParticipantsToNotifyEnum> notifyForStateTransition{
-    {CoordinatorStateEnum::kUnused, ParticipantsToNotifyEnum::kNone},
-    {CoordinatorStateEnum::kInitializing, ParticipantsToNotifyEnum::kNone},
-    {CoordinatorStateEnum::kPreparingToDonate, ParticipantsToNotifyEnum::kDonors},
-    {CoordinatorStateEnum::kCloning, ParticipantsToNotifyEnum::kRecipients},
-    {CoordinatorStateEnum::kApplying, ParticipantsToNotifyEnum::kDonors},
-    {CoordinatorStateEnum::kBlockingWrites, ParticipantsToNotifyEnum::kDonors},
-    {CoordinatorStateEnum::kDecisionPersisted, ParticipantsToNotifyEnum::kNone},
-    {CoordinatorStateEnum::kDone, ParticipantsToNotifyEnum::kNone},
-    {CoordinatorStateEnum::kError, ParticipantsToNotifyEnum::kDonors},
-};
-
-/**
- * Executes metadata changes in a transaction.
+ * Executes metadata changes in a transaction without bumping the collection version.
  */
 void executeMetadataChangesInTxn(
     OperationContext* opCtx,
@@ -552,73 +519,6 @@ void executeMetadataChangesInTxn(
                                             [&](OperationContext* opCtx, TxnNumber txnNumber) {
                                                 changeMetadataFunc(opCtx, txnNumber);
                                             });
-}
-
-/**
- * Runs resharding metadata changes in a transaction.
- *
- * This function should only be called if donor and recipient shards DO NOT need to be informed of
- * the updatedCoordinatorDoc's state transition. If donor or recipient shards need to be informed,
- * instead call bumpShardVersionsThenExecuteStateTransitionAndMetadataChangesInTxn().
- */
-void executeStateTransitionAndMetadataChangesInTxn(
-    OperationContext* opCtx,
-    const ReshardingCoordinatorDocument& updatedCoordinatorDoc,
-    unique_function<void(OperationContext*, TxnNumber)> changeMetadataFunc) {
-    const auto& state = updatedCoordinatorDoc.getState();
-    invariant(notifyForStateTransition.find(state) != notifyForStateTransition.end());
-    invariant(notifyForStateTransition[state] == ParticipantsToNotifyEnum::kNone);
-
-    // Neither donors nor recipients need to be informed of the transition to
-    // updatedCoordinatorDoc's state.
-    executeMetadataChangesInTxn(opCtx, std::move(changeMetadataFunc));
-}
-
-/**
- * In a single transaction, bumps the shard version for each shard spanning the corresponding
- * resharding collection and executes changeMetadataFunc.
- *
- * This function should only be called if donor or recipient shards need to be informed of the
- * updatedCoordinatorDoc's state transition. If donor or recipient shards do not need to be
- * informed, instead call executeStateTransitionAndMetadataChangesInTxn().
- */
-void bumpShardVersionsThenExecuteStateTransitionAndMetadataChangesInTxn(
-    OperationContext* opCtx,
-    const ReshardingCoordinatorDocument& updatedCoordinatorDoc,
-    unique_function<void(OperationContext*, TxnNumber)> changeMetadataFunc) {
-    const auto& state = updatedCoordinatorDoc.getState();
-    invariant(notifyForStateTransition.find(state) != notifyForStateTransition.end());
-    invariant(notifyForStateTransition[state] != ParticipantsToNotifyEnum::kNone);
-
-    auto participantsToNotify = notifyForStateTransition[state];
-    if (participantsToNotify == ParticipantsToNotifyEnum::kDonors) {
-        // Bump the donor shard versions for the original namespace along with updating the
-        // metadata.
-        ShardingCatalogManager::get(opCtx)->bumpCollShardVersionsAndChangeMetadataInTxn(
-            opCtx,
-            updatedCoordinatorDoc.getSourceNss(),
-            resharding::extractShardIds(updatedCoordinatorDoc.getDonorShards()),
-            std::move(changeMetadataFunc));
-    } else if (participantsToNotify == ParticipantsToNotifyEnum::kRecipients) {
-        // Bump the recipient shard versions for the temporary resharding namespace along with
-        // updating the metadata.
-        ShardingCatalogManager::get(opCtx)->bumpCollShardVersionsAndChangeMetadataInTxn(
-            opCtx,
-            updatedCoordinatorDoc.getTempReshardingNss(),
-            resharding::extractShardIds(updatedCoordinatorDoc.getRecipientShards()),
-            std::move(changeMetadataFunc));
-    } else if (participantsToNotify ==
-               ParticipantsToNotifyEnum::kAllParticipantsPostDecisionPersisted) {
-        // Bump the recipient shard versions for the original resharding namespace along with
-        // updating the metadata. Only the recipient shards will have chunks for the namespace after
-        // the coordinator is in state kDecisionPersisted, bumping chunk versions on the donor
-        // shards would not apply.
-        ShardingCatalogManager::get(opCtx)->bumpCollShardVersionsAndChangeMetadataInTxn(
-            opCtx,
-            updatedCoordinatorDoc.getSourceNss(),
-            resharding::extractShardIds(updatedCoordinatorDoc.getRecipientShards()),
-            std::move(changeMetadataFunc));
-    }
 }
 }  // namespace
 
@@ -653,29 +553,30 @@ void insertCoordDocAndChangeOrigCollEntry(OperationContext* opCtx,
         opCtx, coordinatorDoc.getSourceNss(), repl::ReadConcernLevel::kMajorityReadConcern);
     const auto collation = originalCollType.getDefaultCollation();
 
-    executeMetadataChangesInTxn(opCtx, [&](OperationContext* opCtx, TxnNumber txnNumber) {
-        // Insert the coordinator document to config.reshardingOperations.
-        invariant(coordinatorDoc.getActive());
-        try {
-            writeToCoordinatorStateNss(opCtx, coordinatorDoc, txnNumber);
-        } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
-            auto extraInfo = ex.extraInfo<DuplicateKeyErrorInfo>();
-            if (extraInfo->getKeyPattern().woCompare(BSON("active" << 1)) == 0) {
-                uasserted(ErrorCodes::ReshardCollectionInProgress,
-                          str::stream()
-                              << "Only one resharding operation is allowed to be active at a "
-                                 "time, aborting resharding op for "
-                              << coordinatorDoc.getSourceNss());
+    ShardingCatalogManager::get(opCtx)->bumpCollectionVersionAndChangeMetadataInTxn(
+        opCtx, coordinatorDoc.getSourceNss(), [&](OperationContext* opCtx, TxnNumber txnNumber) {
+            // Insert the coordinator document to config.reshardingOperations.
+            invariant(coordinatorDoc.getActive());
+            try {
+                writeToCoordinatorStateNss(opCtx, coordinatorDoc, txnNumber);
+            } catch (const ExceptionFor<ErrorCodes::DuplicateKey>& ex) {
+                auto extraInfo = ex.extraInfo<DuplicateKeyErrorInfo>();
+                if (extraInfo->getKeyPattern().woCompare(BSON("active" << 1)) == 0) {
+                    uasserted(ErrorCodes::ReshardCollectionInProgress,
+                              str::stream()
+                                  << "Only one resharding operation is allowed to be active at a "
+                                     "time, aborting resharding op for "
+                                  << coordinatorDoc.getSourceNss());
+                }
+
+                throw;
             }
 
-            throw;
-        }
-
-        // Update the config.collections entry for the original collection to include
-        // 'reshardingFields'
-        updateConfigCollectionsForOriginalNss(
-            opCtx, coordinatorDoc, boost::none, boost::none, txnNumber);
-    });
+            // Update the config.collections entry for the original collection to include
+            // 'reshardingFields'
+            updateConfigCollectionsForOriginalNss(
+                opCtx, coordinatorDoc, boost::none, boost::none, txnNumber);
+        });
 }
 
 ChunkVersion calculateChunkVersionForInitialChunks(OperationContext* opCtx) {
@@ -787,8 +688,10 @@ void writeParticipantShardsAndTempCollInfo(
     const ReshardingCoordinatorDocument& updatedCoordinatorDoc,
     std::vector<ChunkType> initialChunks,
     std::vector<BSONObj> zones) {
-    bumpShardVersionsThenExecuteStateTransitionAndMetadataChangesInTxn(
-        opCtx, updatedCoordinatorDoc, [&](OperationContext* opCtx, TxnNumber txnNumber) {
+    ShardingCatalogManager::get(opCtx)->bumpCollectionVersionAndChangeMetadataInTxn(
+        opCtx,
+        updatedCoordinatorDoc.getSourceNss(),
+        [&](OperationContext* opCtx, TxnNumber txnNumber) {
             // Update on-disk state to reflect latest state transition.
             writeToCoordinatorStateNss(opCtx, updatedCoordinatorDoc, txnNumber);
             updateConfigCollectionsForOriginalNss(
@@ -808,61 +711,60 @@ void writeDecisionPersistedState(OperationContext* opCtx,
                                  const ReshardingCoordinatorDocument& coordinatorDoc,
                                  OID newCollectionEpoch,
                                  boost::optional<Timestamp> newCollectionTimestamp) {
-    executeStateTransitionAndMetadataChangesInTxn(
-        opCtx, coordinatorDoc, [&](OperationContext* opCtx, TxnNumber txnNumber) {
-            // Update the config.reshardingOperations entry
-            writeToCoordinatorStateNss(opCtx, coordinatorDoc, txnNumber);
+    // No need to bump originalNss version because its epoch will be changed.
+    executeMetadataChangesInTxn(opCtx, [&](OperationContext* opCtx, TxnNumber txnNumber) {
+        // Update the config.reshardingOperations entry
+        writeToCoordinatorStateNss(opCtx, coordinatorDoc, txnNumber);
 
-            // Remove the config.collections entry for the temporary collection
-            writeToConfigCollectionsForTempNss(
-                opCtx, coordinatorDoc, boost::none, boost::none, txnNumber);
+        // Remove the config.collections entry for the temporary collection
+        writeToConfigCollectionsForTempNss(
+            opCtx, coordinatorDoc, boost::none, boost::none, txnNumber);
 
-            // Update the config.collections entry for the original namespace to reflect the new
-            // shard key, new epoch, and new UUID
-            updateConfigCollectionsForOriginalNss(
-                opCtx, coordinatorDoc, newCollectionEpoch, newCollectionTimestamp, txnNumber);
+        // Update the config.collections entry for the original namespace to reflect the new
+        // shard key, new epoch, and new UUID
+        updateConfigCollectionsForOriginalNss(
+            opCtx, coordinatorDoc, newCollectionEpoch, newCollectionTimestamp, txnNumber);
 
-            // Remove all chunk and tag documents associated with the original collection, then
-            // update the chunk and tag docs currently associated with the temp nss to be associated
-            // with the original nss
-            removeChunkAndTagsDocsForOriginalNss(
-                opCtx, coordinatorDoc, newCollectionTimestamp, txnNumber);
-            updateChunkAndTagsDocsForTempNss(
-                opCtx, coordinatorDoc, newCollectionEpoch, newCollectionTimestamp, txnNumber);
-        });
+        // Remove all chunk and tag documents associated with the original collection, then
+        // update the chunk and tag docs currently associated with the temp nss to be associated
+        // with the original nss
+        removeChunkAndTagsDocsForOriginalNss(
+            opCtx, coordinatorDoc, newCollectionTimestamp, txnNumber);
+        updateChunkAndTagsDocsForTempNss(
+            opCtx, coordinatorDoc, newCollectionEpoch, newCollectionTimestamp, txnNumber);
+    });
 }
 
 void writeStateTransitionAndCatalogUpdatesThenBumpShardVersions(
     OperationContext* opCtx, const ReshardingCoordinatorDocument& coordinatorDoc) {
     // Run updates to config.reshardingOperations and config.collections in a transaction
     auto nextState = coordinatorDoc.getState();
-    invariant(notifyForStateTransition.find(nextState) != notifyForStateTransition.end());
-    invariant(notifyForStateTransition[nextState] != ParticipantsToNotifyEnum::kNone,
-              "failed to write state transition with nextState {}"_format(
-                  CoordinatorState_serializer(nextState)));
 
-    // Resharding metadata changes to be executed.
-    auto changeMetadataFunc = [&](OperationContext* opCtx, TxnNumber txnNumber) {
-        // Update the config.reshardingOperations entry
-        writeToCoordinatorStateNss(opCtx, coordinatorDoc, txnNumber);
+    std::vector<NamespaceString> collNames = {coordinatorDoc.getSourceNss()};
+    if (nextState < CoordinatorStateEnum::kDecisionPersisted ||
+        nextState == CoordinatorStateEnum::kError) {
+        collNames.emplace_back(coordinatorDoc.getTempReshardingNss());
+    }
 
-        // Update the config.collections entry for the original collection
-        updateConfigCollectionsForOriginalNss(
-            opCtx, coordinatorDoc, boost::none, boost::none, txnNumber);
+    ShardingCatalogManager::get(opCtx)->bumpMultipleCollectionVersionsAndChangeMetadataInTxn(
+        opCtx, collNames, [&](OperationContext* opCtx, TxnNumber txnNumber) {
+            // Update the config.reshardingOperations entry
+            writeToCoordinatorStateNss(opCtx, coordinatorDoc, txnNumber);
 
-        // Update the config.collections entry for the temporary resharding collection. If we've
-        // already persisted the decision that the operation will succeed, we've removed the entry
-        // for the temporary collection and updated the entry with original namespace to have the
-        // new shard key, UUID, and epoch
-        if (nextState < CoordinatorStateEnum::kDecisionPersisted ||
-            nextState == CoordinatorStateEnum::kError) {
-            writeToConfigCollectionsForTempNss(
+            // Update the config.collections entry for the original collection
+            updateConfigCollectionsForOriginalNss(
                 opCtx, coordinatorDoc, boost::none, boost::none, txnNumber);
-        }
-    };
 
-    bumpShardVersionsThenExecuteStateTransitionAndMetadataChangesInTxn(
-        opCtx, coordinatorDoc, std::move(changeMetadataFunc));
+            // Update the config.collections entry for the temporary resharding collection. If we've
+            // already persisted the decision that the operation will succeed, we've removed the
+            // entry for the temporary collection and updated the entry with original namespace to
+            // have the new shard key, UUID, and epoch
+            if (nextState < CoordinatorStateEnum::kDecisionPersisted ||
+                nextState == CoordinatorStateEnum::kError) {
+                writeToConfigCollectionsForTempNss(
+                    opCtx, coordinatorDoc, boost::none, boost::none, txnNumber);
+            }
+        });
 }
 
 void removeCoordinatorDocAndReshardingFields(OperationContext* opCtx,
@@ -872,8 +774,10 @@ void removeCoordinatorDocAndReshardingFields(OperationContext* opCtx,
     ReshardingCoordinatorDocument updatedCoordinatorDoc = coordinatorDoc;
     updatedCoordinatorDoc.setState(CoordinatorStateEnum::kDone);
 
-    executeStateTransitionAndMetadataChangesInTxn(
-        opCtx, updatedCoordinatorDoc, [&](OperationContext* opCtx, TxnNumber txnNumber) {
+    ShardingCatalogManager::get(opCtx)->bumpCollectionVersionAndChangeMetadataInTxn(
+        opCtx,
+        updatedCoordinatorDoc.getSourceNss(),
+        [&](OperationContext* opCtx, TxnNumber txnNumber) {
             // Remove entry for this resharding operation from config.reshardingOperations
             writeToCoordinatorStateNss(opCtx, updatedCoordinatorDoc, txnNumber);
 
@@ -928,8 +832,20 @@ ReshardingCoordinatorService::ReshardingCoordinator::~ReshardingCoordinator() {
 }
 
 void ReshardingCoordinatorService::ReshardingCoordinator::installCoordinatorDoc(
-    const ReshardingCoordinatorDocument& doc) {
+    OperationContext* opCtx, const ReshardingCoordinatorDocument& doc) {
     invariant(doc.getReshardingUUID() == _coordinatorDoc.getReshardingUUID());
+
+    BSONObjBuilder bob;
+    bob.append("newState", CoordinatorState_serializer(doc.getState()));
+    bob.append("oldState", CoordinatorState_serializer(_coordinatorDoc.getState()));
+    bob.append("namespace", doc.getSourceNss().toString());
+    bob.append("collectionUUID", doc.getSourceUUID().toString());
+    bob.append("reshardingUUID", doc.getReshardingUUID().toString());
+    ShardingLogging::get(opCtx)->logChange(opCtx,
+                                           "resharding.coordinator.transition",
+                                           doc.getSourceNss().toString(),
+                                           bob.obj(),
+                                           ShardingCatalogClient::kMajorityWriteConcern);
 
     LOGV2_INFO(5343001,
                "Transitioned resharding coordinator state",
@@ -950,9 +866,6 @@ ExecutorFuture<void> waitForMinimumOperationDuration(
         Milliseconds(resharding::gReshardingMinimumOperationDurationMillis.load());
     const auto elapsed =
         ReshardingMetrics::get(cc().getServiceContext())->getOperationElapsedTime().get();
-
-    if (elapsed >= minDuration)
-        return ExecutorFuture<void>(executor);
 
     // As `ReshardingMetrics` may use a different clock source, the following is to estimate the
     // time on the executor clock source when the operation was started. This estimation also allows
@@ -1123,7 +1036,7 @@ void ReshardingCoordinatorService::ReshardingCoordinator::_insertCoordDocAndChan
     updatedCoordinatorDoc.setState(CoordinatorStateEnum::kInitializing);
 
     resharding::insertCoordDocAndChangeOrigCollEntry(opCtx.get(), updatedCoordinatorDoc);
-    installCoordinatorDoc(updatedCoordinatorDoc);
+    installCoordinatorDoc(opCtx.get(), updatedCoordinatorDoc);
 
     // TODO SERVER-53914 to accommodate loading metrics for the coordinator.
     ReshardingMetrics::get(cc().getServiceContext())->onStart();
@@ -1158,7 +1071,7 @@ void ReshardingCoordinatorService::ReshardingCoordinator::
                                                       updatedCoordinatorDoc,
                                                       std::move(shardsAndChunks.initialChunks),
                                                       std::move(zones));
-    installCoordinatorDoc(updatedCoordinatorDoc);
+    installCoordinatorDoc(opCtx.get(), updatedCoordinatorDoc);
 };
 
 
@@ -1309,7 +1222,7 @@ Future<void> ReshardingCoordinatorService::ReshardingCoordinator::_persistDecisi
         opCtx.get(), updatedCoordinatorDoc, newCollectionEpoch, newCollectionTimestamp);
 
     // Update the in memory state
-    installCoordinatorDoc(updatedCoordinatorDoc);
+    installCoordinatorDoc(opCtx.get(), updatedCoordinatorDoc);
 
     return Status::OK();
 };
@@ -1357,7 +1270,7 @@ void ReshardingCoordinatorService::ReshardingCoordinator::
                                                                            updatedCoordinatorDoc);
 
     // Update in-memory coordinator doc
-    installCoordinatorDoc(updatedCoordinatorDoc);
+    installCoordinatorDoc(opCtx.get(), updatedCoordinatorDoc);
 }
 
 void ReshardingCoordinatorService::ReshardingCoordinator::_tellAllRecipientsToRefresh(
@@ -1399,6 +1312,7 @@ void ReshardingCoordinatorService::ReshardingCoordinator::_tellAllParticipantsTo
     participantShardIds.insert(recipientShardIds.begin(), recipientShardIds.end());
 
     sharding_util::sendCommandToShards(opCtx.get(),
+                                       NamespaceString::kAdminDb,
                                        refreshCmd,
                                        {participantShardIds.begin(), participantShardIds.end()},
                                        **executor);

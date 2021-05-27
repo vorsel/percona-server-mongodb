@@ -154,13 +154,11 @@ public:
             // Populating the set of donor shard ids isn't necessary to test the functionality of
             // creating the temporary resharding collection.
             recipientFields.setDonorShardIds({});
+            recipientFields.setMinimumOperationDurationMillis(5000);
 
             reshardingFields.setRecipientFields(recipientFields);
             coll.setReshardingFields(reshardingFields);
 
-            return std::vector<BSONObj>{coll.toBSON()};
-        }());
-        expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
             ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
 
             ChunkType chunk(tempNss,
@@ -170,7 +168,10 @@ public:
             chunk.setName(OID::gen());
             version.incMinor();
 
-            return std::vector<BSONObj>{chunk.toConfigBSON()};
+
+            const auto aggResultObj =
+                coll.toBSON().addFields(BSON("chunks" << chunk.toConfigBSON()));
+            return std::vector<BSONObj>{aggResultObj};
         }());
 
         future.default_timed_get();
@@ -184,10 +185,7 @@ public:
             CollectionType coll(origNss, epoch, Date_t::now(), uuid);
             coll.setKeyPattern(skey.getKeyPattern());
             coll.setUnique(false);
-            return std::vector<BSONObj>{coll.toBSON()};
-        }());
 
-        expectFindSendBSONObjVector(kConfigHostAndPort, [&]() {
             ChunkVersion version(1, 0, epoch, boost::none /* timestamp */);
 
             ChunkType chunk(origNss,
@@ -197,7 +195,9 @@ public:
             chunk.setName(OID::gen());
             version.incMinor();
 
-            return std::vector<BSONObj>{chunk.toConfigBSON()};
+            const auto aggResultObj =
+                coll.toBSON().addFields(BSON("chunks" << chunk.toConfigBSON()));
+            return std::vector<BSONObj>{aggResultObj};
         }());
     }
 

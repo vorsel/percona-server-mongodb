@@ -257,7 +257,7 @@ public:
                     {POLLHUP, "POLLHUP"},
                     {POLLNVAL, "POLLNVAL"}
                 };
-                if (shouldLog(logv2::LogSeverity::Debug(2))) {
+                if (shouldLog(MONGO_LOGV2_DEFAULT_COMPONENT, logv2::LogSeverity::Debug(2))) {
                     for (auto const& f: flags) {
                         for (auto const& fd: fds) {
                             if (fd.revents & f.v) {

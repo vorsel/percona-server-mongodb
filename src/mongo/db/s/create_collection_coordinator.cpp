@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
@@ -397,7 +397,7 @@ void CreateCollectionCoordinator::_checkCommandArguments(OperationContext* opCtx
     uassert(ErrorCodes::IllegalOperation,
             "can't shard system namespaces",
             !_nss.isSystem() || _nss == NamespaceString::kLogicalSessionsNamespace ||
-                _nss.isTemporaryReshardingCollection());
+                _nss.isTemporaryReshardingCollection() || _nss.isTimeseriesBucketsCollection());
 
     if (_request.getNumInitialChunks()) {
         // Ensure numInitialChunks is within valid bounds.
@@ -467,7 +467,6 @@ void CreateCollectionCoordinator::_createCollectionAndIndexes(OperationContext* 
     shardkeyutil::validateShardKeyIndexExistsOrCreateIfPossible(
         opCtx,
         _nss,
-        _shardKeyPattern->toBSON(),
         *_shardKeyPattern,
         _collation,
         _request.getUnique() ? *_request.getUnique() : false,

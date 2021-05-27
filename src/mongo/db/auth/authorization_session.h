@@ -41,13 +41,13 @@
 #include "mongo/db/auth/privilege.h"
 #include "mongo/db/auth/user_name.h"
 #include "mongo/db/auth/user_set.h"
-#include "mongo/db/commands/create_gen.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 
 namespace mongo {
 
 class Client;
+class AuthorizationContract;
 
 /**
  * Contains all the authorization logic for a single client connection.  It contains a set of
@@ -137,6 +137,11 @@ public:
     virtual void startRequest(OperationContext* opCtx) = 0;
 
     /**
+     * Start tracking permissions and privileges in the authorization contract.
+     */
+    virtual void startContractTracking() = 0;
+
+    /**
      * Adds the User identified by "UserName" to the authorization session, acquiring privileges
      * for it in the process.
      */
@@ -164,23 +169,20 @@ public:
     // Gets an iterator over the roles of all authenticated users stored in this manager.
     virtual RoleNameIterator getAuthenticatedRoleNames() = 0;
 
+    // Removes any authenticated principals and revokes any privileges that were granted via those
+    // principals. This function modifies state. Synchronizes with the Client lock.
+    virtual void logoutAllDatabases(Client* client, StringData reason) = 0;
+
     // Removes any authenticated principals whose authorization credentials came from the given
     // database, and revokes any privileges that were granted via that principal. This function
     // modifies state. Synchronizes with the Client lock.
-    virtual void logoutDatabase(OperationContext* opCtx, StringData dbname) = 0;
+    virtual void logoutDatabase(Client* client, StringData dbname, StringData reason) = 0;
 
     // Adds the internalSecurity user to the set of authenticated users.
     // Used to grant internal threads full access. Takes in the Client
     // as a parameter so it can take out a lock on the client.
     virtual void grantInternalAuthorization(Client* client) = 0;
     virtual void grantInternalAuthorization(OperationContext* opCtx) = 0;
-
-    // Generates a vector of default privileges that are granted to any user,
-    // regardless of which roles that user does or does not possess.
-    // If localhost exception is active, the permissions include the ability to create
-    // the first user and the ability to run the commands needed to bootstrap the system
-    // into a state where the first user can be created.
-    virtual PrivilegeVector getDefaultPrivileges() = 0;
 
     // Checks if the current session is authorized to list the collections in the given
     // database. If it is, return a privilegeVector containing the privileges used to authorize
@@ -286,6 +288,9 @@ public:
     // nature of session inaccessibility when the session is not accessible.
     virtual Status checkCursorSessionPrivilege(
         OperationContext* const opCtx, boost::optional<LogicalSessionId> cursorSessionId) = 0;
+
+    // Verify the authorization contract. If contract == nullptr, no check is performed.
+    virtual void verifyContract(const AuthorizationContract* contract) const = 0;
 
 protected:
     virtual std::tuple<std::vector<UserName>*, std::vector<RoleName>*> _getImpersonations() = 0;

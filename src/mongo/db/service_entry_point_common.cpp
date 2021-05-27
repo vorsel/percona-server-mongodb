@@ -600,6 +600,10 @@ public:
                 // Ensure the lifetime of `_scopedMetrics` ends here.
                 _scopedMetrics = boost::none;
 
+                auto authzSession = AuthorizationSession::get(_execContext->client());
+                authzSession->verifyContract(
+                    _execContext->getCommand()->getAuthorizationContract());
+
                 if (status.isOK())
                     return;
                 _handleFailure(std::move(status));
@@ -1332,6 +1336,11 @@ void ExecCommandDatabase::_initiateCommand() {
                                                      replCoord->getReplicationMode() ==
                                                          repl::ReplicationCoordinator::modeReplSet);
 
+    // Start authz contract tracking before we evaluate failpoints
+    auto authzSession = AuthorizationSession::get(client);
+
+    authzSession->startContractTracking();
+
     CommandHelpers::evaluateFailCommandFailPoint(opCtx, _invocation.get());
 
     const auto dbname = request.getDatabase().toString();
@@ -1355,7 +1364,6 @@ void ExecCommandDatabase::_initiateCommand() {
 
     BSONElement cmdOptionMaxTimeMSField;
     BSONElement maxTimeMSOpOnlyField;
-    BSONElement allowImplicitCollectionCreationField;
     BSONElement helpField;
 
     StringMap<int> topLevelFields;
@@ -1368,8 +1376,6 @@ void ExecCommandDatabase::_initiateCommand() {
                     "Can not specify maxTimeMSOpOnly for non internal clients",
                     _isInternalClient());
             maxTimeMSOpOnlyField = element;
-        } else if (fieldName == "allowImplicitCollectionCreation") {
-            allowImplicitCollectionCreationField = element;
         } else if (fieldName == CommandHelpers::kHelpFieldName) {
             helpField = element;
         } else if (fieldName == "comment") {
@@ -1397,6 +1403,13 @@ void ExecCommandDatabase::_initiateCommand() {
     }
 
     _impersonationSessionGuard.emplace(opCtx);
+
+    // Restart contract tracking afer the impersonation guard checks for impersonate if using
+    // impersonation.
+    if (_impersonationSessionGuard->isActive()) {
+        authzSession->startContractTracking();
+    }
+
     _invocation->checkAuthorization(opCtx, request);
 
     const bool iAmPrimary = replCoord->canAcceptWritesForDatabase_UNSAFE(opCtx, dbname);
@@ -1559,7 +1572,6 @@ void ExecCommandDatabase::_initiateCommand() {
         _execContext->behaviors->advanceConfigOpTimeFromRequestMetadata(opCtx);
     }
 
-    oss.setAllowImplicitCollectionCreation(allowImplicitCollectionCreationField);
     _scoped = _execContext->behaviors->scopedOperationCompletionShardingActions(opCtx);
 
     // This may trigger the maxTimeAlwaysTimeOut failpoint.
@@ -1959,7 +1971,7 @@ void receivedKillCursors(OperationContext* opCtx, const Message& m) {
     const char* cursorArray = dbmessage.getArray(n);
     int found = runOpKillCursors(opCtx, static_cast<size_t>(n), cursorArray);
 
-    if (shouldLog(logv2::LogSeverity::Debug(1)) || found != n) {
+    if (shouldLog(MONGO_LOGV2_DEFAULT_COMPONENT, logv2::LogSeverity::Debug(1)) || found != n) {
         LOGV2_DEBUG(21967,
                     found == n ? 1 : 0,
                     "killCursors: found {found} of {numCursors}",

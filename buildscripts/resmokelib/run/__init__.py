@@ -7,14 +7,11 @@ import os
 import os.path
 import random
 import shlex
-import subprocess
 import sys
-import tarfile
 import time
 
 import curatorbin
 import pkg_resources
-import requests
 
 try:
     import grpc_tools.protoc
@@ -34,7 +31,6 @@ from buildscripts.resmokelib import testing
 from buildscripts.resmokelib import utils
 from buildscripts.resmokelib.core import process
 from buildscripts.resmokelib.core import jasper_process
-from buildscripts.resmokelib.core import redirect as redirect_lib
 from buildscripts.resmokelib.plugin import PluginInterface, Subcommand
 
 _INTERNAL_OPTIONS_TITLE = "Internal Options"
@@ -170,6 +166,18 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
         """Run the suite and tests specified."""
         self._resmoke_logger.info("verbatim resmoke.py invocation: %s",
                                   " ".join([shlex.quote(arg) for arg in sys.argv]))
+
+        if config.EVERGREEN_TASK_DOC:
+            self._resmoke_logger.info("Evergreen task documentation:\n%s",
+                                      config.EVERGREEN_TASK_DOC)
+        elif config.EVERGREEN_TASK_NAME:
+            self._resmoke_logger.info("Evergreen task documentation is absent for this task.")
+            task_name = utils.get_task_name_without_suffix(config.EVERGREEN_TASK_NAME,
+                                                           config.EVERGREEN_VARIANT_NAME)
+            self._resmoke_logger.info(
+                "If you are familiar with the functionality of %s task, "
+                "please consider adding documentation for it in %s", task_name,
+                os.path.join(config.CONFIG_DIR, "evg_task_doc", "evg_task_doc.yml"))
 
         if config.FUZZ_MONGOD_CONFIGS:
             local_args = to_local_args()
@@ -314,7 +322,7 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
 
     def _setup_jasper(self):
         """Start up the jasper process manager."""
-        curator_path = self._get_jasper_reqs()
+        curator_path = _get_jasper_reqs()
 
         from jasper import jasper_pb2
         from jasper import jasper_pb2_grpc
@@ -907,6 +915,10 @@ class RunPlugin(PluginInterface):
             title=_EVERGREEN_ARGUMENT_TITLE, description=(
                 "Options used to propagate information about the Evergreen task running this"
                 " script."))
+
+        evergreen_options.add_argument("--evergreenURL", dest="evergreen_url",
+                                       metavar="EVERGREEN_URL",
+                                       help=("The URL of the Evergreen service."))
 
         evergreen_options.add_argument(
             "--archiveLimitMb", type=int, dest="archive_limit_mb", metavar="ARCHIVE_LIMIT_MB",
