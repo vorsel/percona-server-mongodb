@@ -172,8 +172,8 @@ void ScanStage::open(bool reOpen) {
 
     if (_open) {
         tassert(5071001, "reopened ScanStage but reOpen=false", reOpen);
-        tassert(5071002, "ScanStage is open but _coll is not held", _coll.has_value());
-        tassert(5071003, "ScanStage is open but don't have _cursor", static_cast<bool>(_cursor));
+        tassert(5071002, "ScanStage is open but _coll is not held", _coll);
+        tassert(5071003, "ScanStage is open but don't have _cursor", _cursor);
     } else {
         tassert(5071004, "first open to ScanStage but reOpen=true", !reOpen);
         if (!_coll) {
@@ -476,7 +476,7 @@ void ParallelScanStage::open(bool reOpen) {
     if (!_coll) {
         // we're being opened after 'close()'. we need to re-acquire '_coll' in this case and
         // make some validity checks (the collection has not been dropped, renamed, etc.).
-        tassert(5071008, "ParallelScanStage is not open but have _cursor", !_cursor);
+        tassert(5071013, "ParallelScanStage is not open but have _cursor", !_cursor);
         restoreCollection(_opCtx, _collName, _collUuid, nullptr, _coll);
     }
 

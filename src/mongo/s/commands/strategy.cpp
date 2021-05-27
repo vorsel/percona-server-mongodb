@@ -57,7 +57,7 @@
 #include "mongo/db/operation_time_tracker.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/query/find_common.h"
-#include "mongo/db/query/getmore_request.h"
+#include "mongo/db/query/getmore_command_gen.h"
 #include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/stats/api_version_metrics.h"
@@ -260,7 +260,7 @@ void ExecCommandClient::_prologue() {
             auto body = result->getBodyBuilder();
             body.append("help", "help for: {} {}"_format(c->getName(), c->help()));
             CommandHelpers::appendSimpleCommandStatus(body, true, "");
-            iassert(Status{ErrorCodes::SkipCommandExecution, "Already served help command"});
+            iassert(Status(ErrorCodes::SkipCommandExecution, "Already served help command"));
         }
 
         uassert(ErrorCodes::FailedToParse,
@@ -273,7 +273,7 @@ void ExecCommandClient::_prologue() {
     } catch (const DBException& e) {
         auto body = result->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(body, e.toStatus());
-        iassert(Status{ErrorCodes::SkipCommandExecution, "Failed to check authorization"});
+        iassert(Status(ErrorCodes::SkipCommandExecution, "Failed to check authorization"));
     }
 
     // attach tracking
@@ -486,7 +486,7 @@ void ParseAndRunCommand::_parseCommand() {
                                                    {ErrorCodes::CommandNotFound, errorMsg});
         globalCommandRegistry()->incrementUnknownCommands();
         appendRequiredFieldsToResponse(opCtx, &builder);
-        iassert(Status{ErrorCodes::SkipCommandExecution, errorMsg});
+        iassert(Status(ErrorCodes::SkipCommandExecution, errorMsg));
     }
 
     _rec->setCommand(command);
@@ -574,7 +574,7 @@ void ParseAndRunCommand::_parseCommand() {
     if (!readConcernParseStatus.isOK()) {
         auto builder = replyBuilder->getBodyBuilder();
         CommandHelpers::appendCommandStatusNoThrow(builder, readConcernParseStatus);
-        iassert(Status{ErrorCodes::SkipCommandExecution, "Failed to parse read concern"});
+        iassert(Status(ErrorCodes::SkipCommandExecution, "Failed to parse read concern"));
     }
 }
 
@@ -1331,18 +1331,17 @@ DbResponse Strategy::getMore(OperationContext* opCtx, const NamespaceString& nss
     }
     uassertStatusOK(statusGetDb);
 
-    boost::optional<std::int64_t> batchSize;
+    GetMoreCommand getMoreCmd(cursorId, nss.coll().toString());
+    getMoreCmd.setDbName(nss.db());
     if (ntoreturn) {
-        batchSize = ntoreturn;
+        getMoreCmd.setBatchSize(ntoreturn);
     }
-
-    GetMoreRequest getMoreRequest(nss, cursorId, batchSize, boost::none, boost::none, boost::none);
 
     // Set the upconverted getMore as the CurOp command object.
     CurOp::get(opCtx)->setGenericOpRequestDetails(
-        opCtx, nss, nullptr, getMoreRequest.toBSON(), dbm->msg().operation());
+        opCtx, nss, nullptr, getMoreCmd.toBSON({}), dbm->msg().operation());
 
-    auto cursorResponse = ClusterFind::runGetMore(opCtx, getMoreRequest);
+    auto cursorResponse = ClusterFind::runGetMore(opCtx, getMoreCmd);
     if (cursorResponse == ErrorCodes::CursorNotFound) {
         return replyToQuery(ResultFlag_CursorNotFound, nullptr, 0, 0);
     }

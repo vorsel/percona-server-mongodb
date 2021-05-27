@@ -1001,13 +1001,21 @@ public:
                            sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::NumberInt32,
                                                       sbe::value::bitcastFrom<int32_t>(0)));
 
-        // If either operand evaluates to "Nothing," then the entire operation expressed by 'cmp'
-        // will also evaluate to "Nothing." MQL comparisons, however, treat "Nothing" as if it is a
+        // If either operand evaluates to "Nothing", then the entire operation expressed by 'cmp'
+        // will also evaluate to "Nothing". MQL comparisons, however, treat "Nothing" as if it is a
         // value that is less than everything other than MinKey. (Notably, two expressions that
         // evaluate to "Nothing" are considered equal to each other.)
-        auto nothingFallbackCmp = makeBinaryOp(comparisonOperator,
-                                               makeFunction("exists", lhsRef.clone()),
-                                               makeFunction("exists", rhsRef.clone()));
+        // We also need to explicitly check for 'bsonUndefined' type because it is considered equal
+        // to "Nothing" according to MQL semantics.
+        auto generateExists = [&](const sbe::EVariable& var) {
+            return makeBinaryOp(
+                sbe::EPrimBinary::logicAnd,
+                makeFunction("exists", var.clone()),
+                sbe::makeE<sbe::ETypeMatch>(var.clone(), ~getBSONTypeMask(BSONType::Undefined)));
+        };
+
+        auto nothingFallbackCmp =
+            makeBinaryOp(comparisonOperator, generateExists(lhsRef), generateExists(rhsRef));
 
         auto cmpWithFallback =
             makeFunction("fillEmpty", std::move(cmp), std::move(nothingFallbackCmp));
@@ -1125,7 +1133,6 @@ public:
             makeLimitTree(std::move(unionWithNullStage.stage), _context->planNodeId, numChildren);
 
         // Create a group stage to aggregate elements into a single array.
-        auto collatorSlot = _context->runtimeEnvironment->getSlotIfExists("collator"_sd);
         auto addToArrayExpr =
             makeFunction("addToArray", sbe::makeE<sbe::EVariable>(unionWithNullSlot));
         auto groupSlot = _context->slotIdGenerator->generate();
@@ -1133,7 +1140,6 @@ public:
             sbe::makeS<sbe::HashAggStage>(std::move(limitNumChildren),
                                           sbe::makeSV(),
                                           sbe::makeEM(groupSlot, std::move(addToArrayExpr)),
-                                          collatorSlot,
                                           _context->planNodeId);
         EvalStage groupEvalStage = {std::move(groupStage), sbe::makeSV(groupSlot)};
 
@@ -1162,7 +1168,6 @@ public:
             std::move(unwindEvalStage.stage),
             sbe::makeSV(),
             sbe::makeEM(finalGroupSlot, std::move(finalAddToArrayExpr)),
-            collatorSlot,
             _context->planNodeId);
 
         // Create a branch stage to select between the branch that produces one null if any eleemnts

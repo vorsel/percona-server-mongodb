@@ -2188,8 +2188,6 @@ env.Library(
         # please add that library as a private libdep of
         # mongod_initializers.
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
-        '$BUILD_DIR/mongo/db/commands/shell_protocol',
-        '$BUILD_DIR/mongo/db/repl/tenant_migration_donor_service',
         '$BUILD_DIR/mongo/s/grid',
         '$BUILD_DIR/mongo/s/sessions_collection_sharded',
         '$BUILD_DIR/mongo/scripting/scripting',
@@ -2207,6 +2205,7 @@ env.Library(
         'catalog/collection',
         'catalog/health_log',
         'commands/mongod',
+        'commands/shell_protocol',
         'concurrency/flow_control_ticketholder',
         'concurrency/lock_manager',
         'fcv_op_observer',
@@ -2232,6 +2231,7 @@ env.Library(
         'repl/replication_recovery',
         'repl/serveronly_repl',
         'repl/storage_interface_impl',
+        'repl/tenant_migration_donor_service',
         'repl/tenant_migration_recipient_service',
         'repl/topology_coordinator',
         'repl/wait_for_majority_service',

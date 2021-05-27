@@ -67,6 +67,13 @@ types:
                       parameter's type to [int, string] in the new command parameter's type"
         cpp_type: "std::int32_t"
 
+    bsonSerializationTypeAnyAllowed:
+        bson_serialization_type:
+                                - int
+                                - any
+        description: "The bson_serialization_type contains 'any'"
+        cpp_type: "std::int32_t"
+
 enums:
     NewReplyFieldEnumSubset:
         description: "The new reply type is an enum that is a subset of the old reply type's
@@ -179,6 +186,14 @@ structs:
                 type: 
                     variant: [int, string]
     
+    NewVariantSubsetReplyTwo:
+        description: "This reply contains a field whose new variant types are a subset
+                      of the old variant types"
+        fields:
+            variantSubsetReplyFieldTwo:
+                type: 
+                    variant: [int, string]
+
     VariantRecursiveReply:
         description: "This reply contains a field that has a new variant type that is compatible
                       with the old variant type"
@@ -203,17 +218,32 @@ structs:
                 type: 
                     variant: [int, StructFieldTypeRecursiveReplyTwo]
 
-    OldCommandTypeValidatorStruct:
+    CommandParamStructRecursiveOne:
+        description: "This command parameter struct type contains a stable and optional
+                      field while the old struct field is unstable"
+        fields:
+            unstableToStableOptionalField:
+                type: string
+                optional: true
+
+    CommandParamStructRecursiveTwo:
+        description: "This command parameter struct type contains a field whose new type is
+                      a superset of the old field type"
+        fields:
+            supersetField:
+                type: intToIntString
+
+    OldValidatorStruct:
         description: "This struct contains a field where the old version contains a validator while
                       the new version does not"
         fields:
-            oldCommandTypeValidatorField:
+            oldValidatorField:
                 type: int
 
-    CommandTypeValidatorsEqualStruct:
+    ValidatorsEqualStruct:
         description: "This struct contains a field where the new and old validator are exactly equal"
         fields:
-            commandTypeValidatorsEqualField:
+            validatorsEqualField:
                 type: double
                 validator:
                     lt: 0.0
@@ -259,6 +289,74 @@ structs:
             keptUnstableTypeField:
                 type: string
                 unstable: true
+    StructCommandParameterTypeRecursive:
+        description: "This param struct type contains a field that is compatible between the
+                      old and new versions"
+        fields:
+            structCommandParameterTypeRecursiveField:
+                type: intStringToIntStringBool
+
+    VariantSupersetStruct:
+        description: "This struct contains a field where the new variant types are a superset
+                      of the old variant types"
+        fields:
+            variantSupersetField:
+                type: 
+                    variant: [int, bool, string]
+
+    VariantSupersetStructTwo:
+        description: "This struct contains a field where the new variant types are a superset
+                      of the old variant types"
+        fields:
+            variantSupersetFieldTwo:
+                type: 
+                    variant: [int, bool, string, double]
+
+    OldTypeNotVariantStruct:
+        description: "This struct contains a field where the new type is variant while the
+                      old one is not"
+        fields:
+            variantField:
+                type:
+                    variant: [int, bool]
+
+    VariantRecursiveStruct:
+        description: "This struct contains a field where the new variant types are
+                      compatible with the old variant types"
+        fields:
+            variantRecursiveField:
+                type: 
+                    variant: [int, intStringToIntStringBool]
+
+    VariantStructSupersetStruct:
+        description: "This struct contains a field where the new variant types contains a struct
+                      while the old one does not"
+        fields:
+            variantStructSupersetField:
+                type: 
+                    variant: [int, string, NewCommandParameterStruct]
+
+    VariantStructRecursiveStruct:
+        description: "This struct contains a field where the old variant struct and the new
+                      variant struct are compatible"
+        fields:
+            variantStructRecursiveField:
+                type:
+                    variant: [int, string, StructCommandParameterTypeRecursive]
+
+    BsonSerializationTypeAnyReply:
+        description: "This reply contains a field whose type is 'any' and is explicitly allowed"
+        fields:
+            anyTypeField:
+                type: bsonSerializationTypeAnyAllowed
+
+    BsonSerializationTypeAnyWithVariantReply:
+        description: "This reply contains a new reply field with variant types where one of the
+                      bson serialization types is 'any' and is explicitly allowed"
+        fields:
+            anyTypeField:
+                type:
+                    variant: [bsonSerializationTypeAnyAllowed, StructFieldTypeRecursiveReplyTwo]
 
 commands:
     testCommand:
@@ -412,6 +510,32 @@ commands:
             bsonSupersetParam:
                 type: intToIntString
 
+    newCommandParameterTypeStructRecursiveOne:
+        description: "new command passes because its parameter type is a struct that is
+                      compatible with the old parameter type struct"
+        command_name: newCommandParameterTypeStructRecursiveOne
+        namespace: ignored
+        cpp_name: newCommandParameterTypeStructRecursiveOne
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        fields:
+            unstableToStableOptionalStructParameter:
+                type: CommandParamStructRecursiveOne
+
+    newCommandParameterTypeStructRecursiveTwo:
+        description: "new command passes because its parameter type is a struct that is
+                      compatible with the old parameter type struct"
+        command_name: newCommandParameterTypeStructRecursiveTwo
+        namespace: ignored
+        cpp_name: newCommandParameterTypeStructRecursiveTwo
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        fields:
+            supersetStructParameter:
+                type: CommandParamStructRecursiveTwo
+
     oldCommandParameterValidator:
         description: "new command passes when it contains a parameter that does not contain a validator
                       that is present in the old parameter"
@@ -449,7 +573,7 @@ commands:
                       that is present in the old type"
         command_name: oldCommandTypeValidator
         namespace: type
-        type: OldCommandTypeValidatorStruct
+        type: OldValidatorStruct
         cpp_name: oldCommandTypeValidator
         strict: true
         api_version: "1"
@@ -460,7 +584,7 @@ commands:
                       that is exactly equal to the old type validator"
         command_name: commandTypeValidatorsEqual
         namespace: type
-        type: CommandTypeValidatorsEqualStruct
+        type: ValidatorsEqualStruct
         cpp_name: commandTypeValidatorsEqual
         strict: true
         api_version: "1"
@@ -721,6 +845,16 @@ commands:
         api_version: "1"
         reply_type: NewVariantSubsetReply
 
+    newReplyFieldVariantSubsetTwo:
+        description: "new command when its reply field type is a variant type that is
+                      a subset of the old reply field variant types"
+        command_name: newReplyFieldVariantSubsetTwo
+        namespace: ignored
+        cpp_name: newReplyFieldVariantSubsetTwo
+        strict: true
+        api_version: "1"
+        reply_type: NewVariantSubsetReplyTwo
+
     replyFieldVariantRecursive:
         description: "new command passes when its reply field type is a variant type that is
                       compatible with the old reply field variant type"
@@ -750,3 +884,199 @@ commands:
         strict: true
         api_version: "1"
         reply_type: VariantStructRecursiveReply
+
+    commandAllowedAnyTypes:
+        description: "new command that has parameter and reply type with
+                      explicitly allowed 'any' bson serialization type passes"
+        command_name: commandAllowedAnyTypes
+        namespace: type
+        type: bsonSerializationTypeAnyAllowed
+        cpp_name: commandAllowedAnyTypes
+        strict: true
+        api_version: "1"
+        reply_type: BsonSerializationTypeAnyReply
+        fields:
+            anyTypeParam:
+                type: bsonSerializationTypeAnyAllowed
+
+    commandAllowedAnyTypesWithVariant:
+        description: "command that has reply variant types with
+                      explicitly allowed 'any' bson serialization type passes"
+        command_name: commandAllowedAnyTypesWithVariant
+        namespace: ignored
+        cpp_name: commandAllowedAnyTypesWithVariant
+        strict: true
+        api_version: "1"
+        reply_type: BsonSerializationTypeAnyWithVariantReply
+
+    newParamVariantSuperset:
+        description: "new command passes because its parameter type is a variant type that is
+                      a superset of the old parameter variant types"
+        command_name: newParamVariantSuperset
+        namespace: ignored
+        cpp_name: newParamVariantSuperset
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        fields:
+            variantSupersetParam:
+                type: 
+                    variant: [int, bool, string]
+
+    newParamVariantSupersetTwo:
+        description: "new command passes because its parameter type is a variant type that is
+                      a superset of the old parameter variant types"
+        command_name: newParamVariantSupersetTwo
+        namespace: ignored
+        cpp_name: newParamVariantSupersetTwo
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        fields:
+            variantSupersetParam:
+                type: 
+                    variant: [int, string, bool, double]
+
+    oldParamTypeNotVariant:
+        description: "new command passes because its parameter type is variant while the old
+                      param type is not"
+        command_name: newParamTypeNotVariant
+        namespace: ignored
+        cpp_name: newParamTypeNotVariant
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        fields:
+            variantParam:
+                type: 
+                    variant: [int, string]
+
+    newParamVariantRecursive:
+        description: "new command passes because its param type is a variant type that is
+                      compatible with the old param variant type"
+        command_name: newParamVariantRecursive
+        namespace: ignored
+        cpp_name: newParamVariantRecursive
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        fields:
+            variantRecursiveParam:
+                type: 
+                    variant: [int, intStringToIntStringBool]
+
+    newParamVariantStructSuperset:
+        description: "new command passes because its parameter type is a variant type that is
+                      a subset of the old parameter variant types"
+        command_name: newParamVariantStructSuperset
+        namespace: ignored
+        cpp_name: newParamVariantStructSuperset
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        fields:
+            variantStructSupersetParam:
+                type: 
+                    variant: [int, string, NewCommandParameterStruct]
+
+    newParamVariantStructRecursive:
+        description: "new command passes because its parameter type has a variant
+                      struct type that is compatible with the old parameter variant
+                      struct type"
+        command_name: newParamVariantStructRecursive
+        namespace: ignored
+        cpp_name: newParamVariantStructRecursive
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+        fields:
+            variantStructRecursiveParam:
+                type:
+                    variant: [int, string, StructCommandParameterTypeRecursive]
+
+    newCommandTypeVariantSuperset:
+        description: "new command passes because its type is a variant type that is
+                      a superset of the old type variant types"
+        command_name: newCommandTypeVariantSuperset
+        namespace: type
+        type: VariantSupersetStruct
+        cpp_name: newCommandTypeVariantSuperset
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+
+    newCommandTypeVariantSupersetTwo:
+        description: "new command passes because its type is a variant type that is
+                      a superset of the old command type variant types"
+        command_name: newCommandTypeVariantSupersetTwo
+        namespace: type
+        type: VariantSupersetStructTwo
+        cpp_name: newCommandTypeVariantSupersetTwo
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+
+    oldCommandTypeNotVariant:
+        description: "new command passes because its type is variant while the old
+                      type is not"
+        command_name: oldCommandTypeNotVariant
+        namespace: type
+        type: OldTypeNotVariantStruct
+        cpp_name: oldCommandTypeNotVariant
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+
+    newCommandTypeVariantRecursive:
+        description: "new command passes because its type is a variant type that is passes
+                      compatible with the old command type variant type"
+        command_name: newCommandTypeVariantRecursive
+        namespace: type
+        type: VariantRecursiveStruct
+        cpp_name: newCommandTypeVariantRecursive
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+
+    newCommandTypeVariantStructSuperset:
+        description: "new command passes because its type is a variant type that is
+                      a superset of the old command type variant types"
+        command_name: newCommandTypeVariantStructSuperset
+        namespace: type
+        type: VariantStructSupersetStruct
+        cpp_name: newCommandTypeVariantStructSuperset
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+
+    newCommandTypeVariantStructRecursive:
+        description: "new command passes because its type has a variant
+                      struct type that is compatible with the old command type variant
+                      struct type"
+        command_name: newCommandTypeVariantStructRecursive
+        namespace: type
+        type: VariantStructRecursiveStruct
+        cpp_name: newCommandTypeVariantStructRecursive
+        strict: true
+        api_version: "1"
+        reply_type: OkReply
+
+    oldReplyFieldValidator:
+        description: "new command passes because it contains a reply field that does not contain a validator
+                      that is present in the old reply field"
+        command_name: oldReplyFieldValidator
+        namespace: ignored
+        cpp_name: oldReplyFieldValidator
+        strict: true
+        api_version: "1"
+        reply_type: OldValidatorStruct
+
+    replyFieldValidatorsEqual:
+        description: "new command passes because it contains a reply field that contains a validator
+                      that is exactly equal to the old reply field validator"
+        command_name: replyFieldValidatorsEqual
+        namespace: ignored
+        cpp_name: replyFieldValidatorsEqual
+        strict: true
+        api_version: "1"
+        reply_type: ValidatorsEqualStruct

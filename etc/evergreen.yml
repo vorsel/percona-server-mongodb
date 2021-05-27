@@ -327,6 +327,7 @@ variables:
   - enterprise-ubuntu1804-ppc64le
   - enterprise-ubuntu1804-s390x
   - enterprise-ubuntu2004-64
+  - enterprise-windows
   - enterprise-windows-suggested
   - enterprise-windows-compile-all
   - enterprise-windows-debug-unoptimized
@@ -352,6 +353,7 @@ variables:
   - enterprise-amazon2-arm64
   - enterprise-ubuntu1604-64
   - enterprise-ubuntu1804-64
+  - enterprise-windows
   - enterprise-windows-suggested
   - enterprise-windows-required
 
@@ -405,6 +407,7 @@ variables:
   - enterprise-ubuntu1804-ppc64le
   - enterprise-ubuntu1804-s390x
   - enterprise-ubuntu2004-64
+  - enterprise-windows
   - enterprise-windows-suggested
   - windows
 
@@ -1016,6 +1019,7 @@ functions:
           --build-variant ${build_variant}             \
           --evg-alias '${alias|}'                      \
           --timeout ${timeout_secs|0}                  \
+          --exec-timeout ${exec_timeout_secs|0}        \
           --out-file task_timeout_expansions.yml
 
   "update task timeout expansions": &update_task_timeout_expansions
@@ -1618,7 +1622,7 @@ functions:
         remote_file: ${project}/${build_variant}/${revision}/burn_in_tags_gen/burn_in_tags_gen-${build_id}.tgz
         bucket: mciuploads
         permissions: public-read
-        content_type: ${content_type|application/gzip}
+        content_type: application/gzip
         display_name: Burn_in_tags Task Config - Execution ${execution}
     - command: generate.tasks
       params:
@@ -1671,13 +1675,14 @@ functions:
         remote_file: ${project}/${build_variant}/${revision}/generate_tasks/${task_name}-${build_id}.tgz
         bucket: mciuploads
         permissions: public-read
-        content_type: ${content_type|application/gzip}
+        content_type: application/gzip
         display_name: Generated Task Config - Execution ${execution}
         optional: true
 
     - command: timeout.update
       params:
         exec_timeout_secs: 10800  # 3 hours
+        timeout_secs: 10800  # 3 hours
 
     - command: generate.tasks
       params:
@@ -1721,13 +1726,14 @@ functions:
         remote_file: ${project}/${build_variant}/${revision}/generate_tasks/${task_name}-${build_id}.tgz
         bucket: mciuploads
         permissions: public-read
-        content_type: ${content_type|application/gzip}
+        content_type: application/gzip
         display_name: Generated Task Config - Execution ${execution}
         optional: true
 
     - command: timeout.update
       params:
         exec_timeout_secs: 10800  # 3 hours
+        timeout_secs: 10800  # 3 hours
 
     - command: generate.tasks
       params:
@@ -1846,7 +1852,7 @@ functions:
         # for tasks that don't support the one we set here. A better plan would be
         # to support install-action for Ninja builds directly.
         # TODO: https://jira.mongodb.org/browse/SERVER-48203
-        extra_args="--install-action=hardlink"
+        extra_args="--install-action=${task_install_action|hardlink}"
 
         # By default, limit link jobs to one quarter of our overall -j
         # concurrency unless locally overridden. We do this because in
@@ -1894,16 +1900,10 @@ functions:
 
         ${activate_virtualenv}
 
-        chmod -R ugo-w ./src
-        ls -la src/mongo/stdx/sigaltstack_location_test.cpp || true
-
         ${compile_env|} $python ./buildscripts/scons.py                                     \
             ${compile_flags|} ${task_compile_flags|} ${task_compile_flags_extra|}           \
-            ${scons_cache_args|} $extra_args MONGO_VERSION=${version}                       \
-            ${patch_compile_flags|} ${targets} || exit_status=$?
-
-        chmod -R ugo+w ./src
-        ls -la src/mongo/stdx/sigaltstack_location_test.cpp || true
+            ${scons_cache_args|} $extra_args                                                \
+            ${targets} MONGO_VERSION=${version} ${patch_compile_flags|} || exit_status=$?
 
         # If compile fails we do not run any tests
         if [[ $exit_status -ne 0 ]]; then
@@ -2156,13 +2156,14 @@ functions:
         remote_file: ${project}/${build_variant}/${revision}/generate_tasks/${task_name}-${build_id}.tgz
         bucket: mciuploads
         permissions: public-read
-        content_type: ${content_type|application/gzip}
+        content_type: application/gzip
         display_name: Generated Task Config - Execution ${execution}
         optional: true
 
     - command: timeout.update
       params:
         exec_timeout_secs: 10800  # 3 hours
+        timeout_secs: 10800  # 3 hours
 
     - command: generate.tasks
       params:
@@ -2206,13 +2207,14 @@ functions:
         remote_file: ${project}/${build_variant}/${revision}/generate_tasks/${task_name}-${build_id}.tgz
         bucket: mciuploads
         permissions: public-read
-        content_type: ${content_type|application/gzip}
+        content_type: application/gzip
         display_name: Generated Task Config - Execution ${execution}
         optional: true
 
     - command: timeout.update
       params:
         exec_timeout_secs: 10800  # 3 hours
+        timeout_secs: 10800  # 3 hours
 
     - command: generate.tasks
       params:
@@ -2258,12 +2260,13 @@ functions:
         remote_file: ${project}/${build_variant}/${revision}/generate_tasks/${name}_gen-${build_id}.tgz
         bucket: mciuploads
         permissions: public-read
-        content_type: ${content_type|application/gzip}
+        content_type: application/gzip
         display_name: Generated Task Config - Execution ${execution}
 
     - command: timeout.update
       params:
         exec_timeout_secs: 10800  # 3 hours
+        timeout_secs: 10800  # 3 hours
 
     - command: generate.tasks
       params:
@@ -2357,7 +2360,7 @@ functions:
         bucket: mciuploads
         permissions: private
         visibility: signed
-        content_type: ${content_type|application/gzip}
+        content_type: application/gzip
         display_name: Generated Tests - Execution ${execution}
 
   "run idl tests":
@@ -2793,7 +2796,7 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/gcov/gcov-intermediate-files-${task_id}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
-      content_type: ${content_type|application/gzip}
+      content_type: application/gzip
       display_name: gcov intermediate files - Execution ${execution}
       optional: true
 
@@ -2819,7 +2822,7 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/jepsen/jepsen-mongod-logs-${task_id}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
-      content_type: ${content_type|application/gzip}
+      content_type: application/gzip
       display_name: Jepsen mongod Logs - ${execution}
       optional: true
 
@@ -2840,7 +2843,7 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/jepsen/jepsen-results-${task_id}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
-      content_type: ${content_type|application/gzip}
+      content_type: application/gzip
       display_name: Jepsen Test Results - ${execution}
       optional: true
 
@@ -2885,7 +2888,7 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/coredumps/mongo-coredumps-${build_id}-${task_name}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
-      content_type: ${content_type|application/gzip}
+      content_type: application/gzip
       display_name: Core Dumps - Execution ${execution}
       optional: true
 
@@ -2986,7 +2989,7 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/unittests/mongo-unittests-${build_id}-${task_name}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
-      content_type: ${content_type|application/gzip}
+      content_type: application/gzip
       display_name: Unit tests - Execution ${execution}
       optional: true
 
@@ -3098,7 +3101,7 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/hanganalyzer/mongo-hanganalyzer-${build_id}-${task_name}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
-      content_type: ${content_type|application/gzip}
+      content_type: application/gzip
       display_name: Hang Analyzer Output - Execution ${execution}
       optional: true
 
@@ -3125,7 +3128,7 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/diskstats/mongo-diskstats-${task_id}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
-      content_type: ${content_type|application/gzip}
+      content_type: application/gzip
       display_name: Disk Stats - Execution ${execution}
       optional: true
 
@@ -3151,7 +3154,7 @@ functions:
       remote_file: ${project}/${build_variant}/${revision}/systemresourceinfo/mongo-system-resource-info-${task_id}-${execution}.tgz
       bucket: mciuploads
       permissions: public-read
-      content_type: ${content_type|application/gzip}
+      content_type: application/gzip
       display_name: System Resource Info - Execution ${execution}
       optional: true
 
@@ -3359,7 +3362,7 @@ tasks:
         remote_file: ${mongo_binaries}
         bucket: mciuploads
         permissions: public-read
-        content_type: ${content_type|application/gzip}
+        content_type: application/gzip
         display_name: Binaries
 
     - command: s3.put
@@ -3387,33 +3390,31 @@ tasks:
   commands:
     - func: "scons compile"
       vars:
+        task_install_action:
+            default
         task_compile_flags: >-
           --ninja
         targets:
-          generate-ninja
+          build.ninja
     - command: shell.exec
       params:
         working_dir: src
         shell: bash
         script: |
-          set -o errexit
-          set -o verbose
-
           ${activate_virtualenv}
-          python -m pip install ninja
           if [ "Windows_NT" = "$OS" ]; then
             vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"
-            echo "call \"$vcvars/vcvarsall.bat\" amd64" > msvc.bat
-            echo "ninja install-core" >> msvc.bat
-            cmd /C msvc.bat
-          else
-            ninja install-core
+            cd "$vcvars" && cmd /K "vcvarsall.bat amd64 && cd ${workdir}\src"
           fi
+          python -m pip install ninja
+          ninja install-core
 
 - name: compile_ninja_next
   commands:
     - func: "scons compile"
       vars:
+        task_install_action:
+            default
         task_compile_flags: >-
           --build-tools=next
           --ninja
@@ -3424,24 +3425,21 @@ tasks:
         working_dir: src
         shell: bash
         script: |
-          set -o errexit
-          set -o verbose
-
           ${activate_virtualenv}
-          python -m pip install ninja
           if [ "Windows_NT" = "$OS" ]; then
             vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"
-            echo "call \"$vcvars/vcvarsall.bat\" amd64" > msvc.bat
-            echo "ninja install-core" >> msvc.bat
-            cmd /C msvc.bat
-          else
-            ninja install-core
+            cd "$vcvars" && cmd /K "vcvarsall.bat amd64 && cd ${workdir}\src"
           fi
+          python -m pip install ninja
+          ninja install-core
+
 
 - name: compile_build_tools_next
   commands:
     - func: "scons compile"
       vars:
+        task_install_action:
+            default
         task_compile_flags: >-
           --build-tools=next
         targets:
@@ -4129,7 +4127,7 @@ tasks:
       remote_file: ${project}/${build_variant}/${revision}/burn_in_tests_gen/burn_in_tests_gen-${build_id}.tgz
       bucket: mciuploads
       permissions: public-read
-      content_type: ${content_type|application/gzip}
+      content_type: application/gzip
       display_name: Burn_in_tests Task Config - Execution ${execution}
   - command: generate.tasks
     params:
@@ -4191,7 +4189,7 @@ tasks:
       remote_file: ${project}/${build_variant}/${revision}/generate_tasks/burn_in_tests_multiversion_gen-${build_id}.tgz
       bucket: mciuploads
       permissions: public-read
-      content_type: ${content_type|application/gzip}
+      content_type: application/gzip
       optional: true
       display_name: Generated Multiversion Resmoke.py Suite Config - Execution ${execution}
 
@@ -4203,7 +4201,7 @@ tasks:
       remote_file: ${project}/${build_variant}/${revision}/generate_tasks/burn_in_tests_multiversion_gen_config-${build_id}.tgz
       bucket: mciuploads
       permissions: public-read
-      content_type: ${content_type|application/gzip}
+      content_type: application/gzip
       display_name: Burn_in_tests Task Config - Execution ${execution}
 
   - command: generate.tasks
@@ -9980,6 +9978,7 @@ buildvariants:
     push_name: windows
     push_arch: x86_64-enterprise
     test_flags: *windows_common_test_excludes
+    exec_timeout_secs: 14400 # 3 hour timeout
   tasks:
   - name: compile_test_and_package_serial_TG
     distros:
@@ -9997,7 +9996,6 @@ buildvariants:
       - windows-64-vs2019-large
   - name: .concurrency .common
   - name: disk_wiredtiger
-  - name: free_monitoring
   - name: .jscore .common !.auth
   - name: jsonSchema
   - name: .jstestfuzz !.initsync !.flow_control !.stepdowns
@@ -10943,7 +10941,7 @@ buildvariants:
     # strip from the top of the default path before appending to the GCOV_PREFIX (if any).
     gcov_environment: GCOV_PREFIX=$(pwd) GCOV_PREFIX_STRIP=4
     # Mixing --cache and --gcov doesn't work correctly yet. See SERVER-11084
-    timeout_secs: 10800 # 3 hour timeout
+    exec_timeout_secs: 14400 # 4 hour timeout
     use_scons_cache: false
   tasks:
     - name: compile_test_and_package_serial_TG
@@ -12417,6 +12415,7 @@ buildvariants:
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under ASAN build.
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
+    exec_timeout_secs: 14400 # 3 hour timeout
   tasks:
   - name: compile_test_and_package_serial_TG
   - name: compile_benchmarks
@@ -12488,6 +12487,7 @@ buildvariants:
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under ASAN build.
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
+    exec_timeout_secs: 14400 # 3 hour timeout
     test_flags: >-
         --excludeWithAnyTags=requires_fast_memory,requires_ocsp_stapling
         --mongodSetParameters="{
