@@ -29,15 +29,17 @@
 
 #pragma once
 
+#include "mongo/base/initializer.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_set_window_fields_gen.h"
 #include "mongo/db/pipeline/window_function/window_bounds.h"
 #include "mongo/db/pipeline/window_function/window_function.h"
+#include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/sort_pattern.h"
 
-#define REGISTER_NON_REMOVABLE_WINDOW_FUNCTION(name, parser)                         \
+#define REGISTER_WINDOW_FUNCTION(name, parser)                                       \
     MONGO_INITIALIZER_GENERAL(                                                       \
         addToWindowFunctionMap_##name, ("default"), ("windowFunctionExpressionMap")) \
     (InitializerContext*) {                                                          \
@@ -95,6 +97,22 @@ public:
     using Parser = std::function<decltype(parse)>;
     static void registerParser(std::string functionName, Parser parser);
 
+    /**
+     * Is this a function that the parser knows about?
+     */
+    inline static bool isFunction(const mongo::StringData& name) {
+        return parserMap.find(name) != parserMap.end();
+    }
+
+    /**
+     * Optimizes the input expression using its own optimize() method.
+     */
+    void optimize() {
+        if (_input) {
+            _input = _input->optimize();
+        }
+    }
+
     Expression(ExpressionContext* expCtx,
                std::string accumulatorName,
                boost::intrusive_ptr<::mongo::Expression> input,
@@ -116,6 +134,10 @@ public:
         return _input;
     }
 
+    auto expCtx() const {
+        return _expCtx;
+    }
+
     virtual boost::intrusive_ptr<AccumulatorState> buildAccumulatorOnly() const = 0;
 
     virtual std::unique_ptr<WindowFunctionState> buildRemovable() const = 0;
@@ -130,11 +152,15 @@ public:
         return args.freezeToValue();
     }
 
-
 protected:
     ExpressionContext* _expCtx;
     std::string _accumulatorName;
     boost::intrusive_ptr<::mongo::Expression> _input;
+
+    /**
+     * Some window functions do not accept bounds in their syntax ($rank).
+     * In these cases, this field is ignored.
+     */
     WindowBounds _bounds;
     static StringMap<Parser> parserMap;
 };
@@ -156,7 +182,7 @@ public:
                         "'window' field must be an object",
                         arg.type() == BSONType::Object);
                 bounds = WindowBounds::parse(arg.embeddedObject(), sortBy, expCtx);
-            } else if (parserMap.find(argName) != parserMap.end()) {
+            } else if (isFunction(argName)) {
                 uassert(ErrorCodes::FailedToParse,
                         "Cannot specify two functions in window function spec",
                         !accumulatorName);
@@ -209,7 +235,7 @@ public:
                         "'window' field must be an object",
                         obj[kWindowArg].type() == BSONType::Object);
                 bounds = WindowBounds::parse(arg.embeddedObject(), sortBy, expCtx);
-            } else if (parserMap.find(argName) != parserMap.end()) {
+            } else if (isFunction(argName)) {
                 uassert(ErrorCodes::FailedToParse,
                         "Cannot specify two functions in window function spec",
                         !accumulatorName);
@@ -256,10 +282,9 @@ public:
         // Rank based accumulators are always unbounded to current.
         WindowBounds bounds = WindowBounds{
             WindowBounds::DocumentBased{WindowBounds::Unbounded{}, WindowBounds::Current{}}};
-        boost::intrusive_ptr<::mongo::Expression> input;
         auto arg = obj.firstElement();
         auto argName = arg.fieldNameStringData();
-        if (parserMap.find(argName) != parserMap.end()) {
+        if (isFunction(argName)) {
             uassert(5371603,
                     str::stream() << accumulatorName << " must be specified with '{}' as the value",
                     arg.type() == BSONType::Object && arg.embeddedObject().nFields() == 0);
@@ -309,6 +334,199 @@ public:
         args.addField(_accumulatorName, Value(Document()));
         return args.freezeToValue();
     }
+};
+
+class ExpressionExpMovingAvg : public Expression {
+public:
+    static constexpr StringData kAccName = "$expMovingAvg"_sd;
+    static constexpr StringData kInputArg = "input"_sd;
+    static constexpr StringData kNArg = "N"_sd;
+    static constexpr StringData kAlphaArg = "alpha"_sd;
+    static boost::intrusive_ptr<Expression> parse(BSONObj obj,
+                                                  const boost::optional<SortPattern>& sortBy,
+                                                  ExpressionContext* expCtx);
+
+    ExpressionExpMovingAvg(ExpressionContext* expCtx,
+                           std::string accumulatorName,
+                           boost::intrusive_ptr<::mongo::Expression> input,
+                           WindowBounds bounds,
+                           long long nValue)
+        : Expression(expCtx, std::move(accumulatorName), std::move(input), std::move(bounds)),
+          _N(nValue) {}
+
+    ExpressionExpMovingAvg(ExpressionContext* expCtx,
+                           std::string accumulatorName,
+                           boost::intrusive_ptr<::mongo::Expression> input,
+                           WindowBounds bounds,
+                           Decimal128 alpha)
+        : Expression(expCtx, std::move(accumulatorName), std::move(input), std::move(bounds)),
+          _alpha(alpha) {}
+
+    boost::intrusive_ptr<AccumulatorState> buildAccumulatorOnly() const final {
+        if (_N) {
+            return AccumulatorExpMovingAvg::create(
+                _expCtx, Decimal128(2).divide(Decimal128(_N.get()).add(Decimal128(1))));
+        } else if (_alpha) {
+            return AccumulatorExpMovingAvg::create(_expCtx, _alpha.get());
+        }
+        tasserted(5433602, "ExpMovingAvg neither N nor alpha was set");
+    }
+
+    std::unique_ptr<WindowFunctionState> buildRemovable() const final {
+        tasserted(5433603,
+                  str::stream() << "Window function " << _accumulatorName
+                                << " is not supported with a removable window");
+    }
+
+    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final {
+        MutableDocument subObj;
+        tassert(5433604, "ExpMovingAvg neither N nor alpha was set", _N || _alpha);
+        if (_N) {
+            subObj[kNArg] = Value(_N.get());
+        } else {
+            subObj[kAlphaArg] = Value(_alpha.get());
+        }
+        subObj[kInputArg] = _input->serialize(static_cast<bool>(explain));
+        MutableDocument outerObj;
+        outerObj[kAccName] = subObj.freezeToValue();
+        return outerObj.freezeToValue();
+    }
+
+protected:
+    boost::optional<long long> _N;
+    boost::optional<Decimal128> _alpha;
+};
+
+class ExpressionDerivative : public Expression {
+public:
+    static constexpr StringData kArgInput = "input"_sd;
+    static constexpr StringData kArgOutputUnit = "outputUnit"_sd;
+
+    ExpressionDerivative(ExpressionContext* expCtx,
+                         boost::intrusive_ptr<::mongo::Expression> input,
+                         WindowBounds bounds,
+                         boost::optional<TimeUnit> outputUnit)
+        : Expression(expCtx, "$derivative", std::move(input), std::move(bounds)),
+          _outputUnit(outputUnit) {}
+
+    static boost::intrusive_ptr<Expression> parse(BSONObj obj,
+                                                  const boost::optional<SortPattern>& sortBy,
+                                                  ExpressionContext* expCtx) {
+        // {
+        //   $derivative: {
+        //     input: <expr>,
+        //     outputUnit: <string>, // optional
+        //   }
+        //   window: {...} // optional
+        // }
+
+        uassert(ErrorCodes::FailedToParse, "$derivative requires a sortBy", sortBy);
+        uassert(ErrorCodes::FailedToParse,
+                "$derivative requires a non-compound sortBy",
+                sortBy->size() == 1);
+        uassert(ErrorCodes::FailedToParse,
+                "$derivative requires a non-expression sortBy",
+                !sortBy->begin()->expression);
+        uassert(ErrorCodes::FailedToParse,
+                "$derivative requires an ascending sortBy",
+                sortBy->begin()->isAscending);
+
+        boost::optional<WindowBounds> bounds;
+        BSONElement derivativeArgs;
+        for (const auto& arg : obj) {
+            auto argName = arg.fieldNameStringData();
+            if (argName == kWindowArg) {
+                uassert(ErrorCodes::FailedToParse,
+                        "'window' field must be an object",
+                        obj[kWindowArg].type() == BSONType::Object);
+                bounds = WindowBounds::parse(arg.embeddedObject(), sortBy, expCtx);
+            } else if (argName == "$derivative"_sd) {
+                derivativeArgs = arg;
+            } else {
+                uasserted(ErrorCodes::FailedToParse,
+                          str::stream() << "$derivative got unexpected argument: " << argName);
+            }
+        }
+        tassert(5490700,
+                "$derivative parser called on object with no $derivative key",
+                derivativeArgs.ok());
+        uassert(ErrorCodes::FailedToParse,
+                str::stream() << "$derivative expects an object, but got a "
+                              << derivativeArgs.type() << ": " << derivativeArgs,
+                derivativeArgs.type() == BSONType::Object);
+
+        boost::intrusive_ptr<::mongo::Expression> input;
+        boost::optional<TimeUnit> outputUnit;
+        for (const auto& arg : derivativeArgs.Obj()) {
+            auto argName = arg.fieldNameStringData();
+            if (argName == kArgInput) {
+                input = ::mongo::Expression::parseOperand(expCtx, arg, expCtx->variablesParseState);
+            } else if (argName == kArgOutputUnit) {
+                uassert(ErrorCodes::FailedToParse,
+                        str::stream() << "$derivative '" << kArgOutputUnit
+                                      << "' must be a string, but got " << arg.type(),
+                        arg.type() == String);
+                outputUnit = parseTimeUnit(arg.valueStringData());
+                switch (*outputUnit) {
+                    // These larger time units vary so much, it doesn't make sense to define a
+                    // fixed conversion from milliseconds. (See 'timeUnitTypicalMilliseconds'.)
+                    case TimeUnit::year:
+                    case TimeUnit::quarter:
+                    case TimeUnit::month:
+                        uasserted(5490704, "$derivative outputUnit must be 'week' or smaller");
+                    // Only these time units are allowed.
+                    case TimeUnit::week:
+                    case TimeUnit::day:
+                    case TimeUnit::hour:
+                    case TimeUnit::minute:
+                    case TimeUnit::second:
+                    case TimeUnit::millisecond:
+                        break;
+                }
+            } else {
+                uasserted(ErrorCodes::FailedToParse,
+                          str::stream() << "$derivative got unexpected argument: " << argName);
+            }
+        }
+        uassert(ErrorCodes::FailedToParse, "$derivative requires an 'input' expression", input);
+
+        // The default window bounds are [unbounded, unbounded], which may be a surprising default
+        // for $derivative.
+        uassert(ErrorCodes::FailedToParse,
+                "$derivative requires explicit window bounds",
+                bounds != boost::none);
+
+        return make_intrusive<ExpressionDerivative>(
+            expCtx, std::move(input), std::move(*bounds), outputUnit);
+    }
+
+    Value serialize(boost::optional<ExplainOptions::Verbosity> explain) const final {
+        MutableDocument result;
+        result[_accumulatorName][kArgInput] = _input->serialize(static_cast<bool>(explain));
+        if (_outputUnit) {
+            result[_accumulatorName][kArgOutputUnit] = Value(serializeTimeUnit(*_outputUnit));
+        }
+
+        MutableDocument windowField;
+        _bounds.serialize(windowField);
+        result[kWindowArg] = windowField.freezeToValue();
+        return result.freezeToValue();
+    }
+
+    boost::intrusive_ptr<AccumulatorState> buildAccumulatorOnly() const final {
+        MONGO_UNREACHABLE_TASSERT(5490701);
+    }
+
+    std::unique_ptr<WindowFunctionState> buildRemovable() const final {
+        MONGO_UNREACHABLE_TASSERT(5490702);
+    }
+
+    auto outputUnit() const {
+        return _outputUnit;
+    }
+
+private:
+    boost::optional<TimeUnit> _outputUnit;
 };
 
 }  // namespace mongo::window_function

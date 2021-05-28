@@ -21,7 +21,7 @@ load("jstests/replsets/rslib.js");
 
 // Run a command, return the result if it worked, or assert with a message otherwise.
 let checkedRunCommand = (db, cmd) =>
-    ((res, msg) => (assert.commandWorked(res, msg), res))(db.runCommand(cmd), tojson(cmd));
+    ((res, msg) => ((assert.commandWorked(res, msg), res)))(db.runCommand(cmd), tojson(cmd));
 
 // Like db.getCollectionNames, but allows a filter.
 let getCollectionNames = (db, filter) => checkedRunCommand(db, {listCollections: 1, filter})
@@ -63,6 +63,10 @@ replTest.waitForState(replTest.nodes[0], ReplSetTest.State.PRIMARY);
 let nodeA = conns[0];
 let nodeB = conns[1];
 let arbiter = conns[2];
+
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(nodeA.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 let a1 = nodeA.getDB("test1");
 let b1 = nodeB.getDB("test1");

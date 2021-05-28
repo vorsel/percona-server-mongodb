@@ -141,7 +141,7 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listCollectionsStage() {
                     .reason());
         }
         NamespaceString collectionNamespace(_dbName, result.getName());
-        if (collectionNamespace.isSystem() && !collectionNamespace.isLegalClientSystemNS()) {
+        if (collectionNamespace.isSystem() && !collectionNamespace.isReplicated()) {
             LOGV2_DEBUG(4881602,
                         1,
                         "Database cloner skipping 'system' collection",
@@ -178,6 +178,9 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listExistingCollectionsStag
     tenantMigrationRecipientInfo(opCtx.get()) =
         boost::make_optional<TenantMigrationRecipientInfo>(getSharedData()->getMigrationId());
 
+    long long sizeOfCurrCollOnDisk = 0;
+    long long approxTotalDBSizeOnDisk = 0;
+
     std::vector<UUID> clonedCollectionUUIDs;
     auto collectionInfos =
         client.getCollectionInfos(_dbName, ListCollectionsFilter::makeTypeCollectionFilter());
@@ -194,7 +197,7 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listExistingCollectionsStag
                     .reason());
         }
         NamespaceString collectionNamespace(_dbName, result.getName());
-        if (collectionNamespace.isSystem() && !collectionNamespace.isLegalClientSystemNS()) {
+        if (collectionNamespace.isSystem() && !collectionNamespace.isReplicated()) {
             LOGV2_DEBUG(5271600,
                         1,
                         "Tenant database cloner skipping 'system' collection",
@@ -204,6 +207,22 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listExistingCollectionsStag
             continue;
         }
         clonedCollectionUUIDs.emplace_back(result.getInfo().getUuid());
+
+        BSONObj res;
+        client.runCommand(_dbName, BSON("collStats" << result.getName()), res);
+        if (auto status = getStatusFromCommandResult(res); !status.isOK()) {
+            LOGV2_WARNING(5522901,
+                          "Skipping recording of data size metrics for database due to failure "
+                          "in the 'collStats' command, tenant migration stats may be inaccurate.",
+                          "db"_attr = _dbName,
+                          "coll"_attr = result.getName(),
+                          "migrationId"_attr = getSharedData()->getMigrationId(),
+                          "tenantId"_attr = _tenantId,
+                          "status"_attr = status);
+        } else {
+            sizeOfCurrCollOnDisk = res.getField("size").safeNumberLong();
+            approxTotalDBSizeOnDisk += sizeOfCurrCollOnDisk;
+        }
     }
 
     if (!getSharedData()->isResuming()) {
@@ -228,8 +247,14 @@ BaseCloner::AfterStageBehavior TenantDatabaseCloner::listExistingCollectionsStag
             if (startingCollection != _collections.end() &&
                 startingCollection->second.uuid == lastClonedCollectionUUID) {
                 _stats.clonedCollectionsBeforeFailover = clonedCollectionUUIDs.size() - 1;
+
+                // When the last collection is partially cloned, we exclude it from the total size
+                // on disk, as the partially cloned collections stats will be added by the cloner
+                // on demand.
+                _stats.approxTotalBytesCopied = approxTotalDBSizeOnDisk - sizeOfCurrCollOnDisk;
             } else {
                 _stats.clonedCollectionsBeforeFailover = clonedCollectionUUIDs.size();
+                _stats.approxTotalBytesCopied = approxTotalDBSizeOnDisk;
             }
         }
         _collections.erase(_collections.begin(), startingCollection);

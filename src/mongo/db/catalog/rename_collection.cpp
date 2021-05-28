@@ -51,6 +51,7 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
@@ -438,7 +439,17 @@ Status renameBetweenDBs(OperationContext* opCtx,
                         const NamespaceString& source,
                         const NamespaceString& target,
                         const RenameCollectionOptions& options) {
-    invariant(source.db() != target.db());
+    invariant(
+        source.db() != target.db(),
+        str::stream()
+            << "cannot rename within same database (use renameCollectionWithinDB instead): source: "
+            << source << "; target: " << target);
+
+    // Refer to txnCmdWhitelist in commands.cpp.
+    invariant(
+        !opCtx->inMultiDocumentTransaction(),
+        str::stream() << "renameBetweenDBs not supported in multi-document transaction: source: "
+                      << source << "; target: " << target);
 
     boost::optional<Lock::DBLock> sourceDbLock;
     boost::optional<Lock::CollectionLock> sourceCollLock;
@@ -638,6 +649,18 @@ Status renameBetweenDBs(OperationContext* opCtx,
                                         << "' was removed while renaming collection across DBs");
         }
 
+        auto replCoord = repl::ReplicationCoordinator::get(opCtx);
+        auto isOplogDisabledForTmpColl = replCoord->isOplogDisabledFor(opCtx, tmpName);
+
+        auto batchSize = internalInsertMaxBatchSize.load();
+
+        // Inserts to indexed capped collections cannot be batched.
+        // Otherwise, CollectionImpl::_insertDocuments() will fail with OperationCannotBeBatched.
+        // See SERVER-21512.
+        if (autoTmpColl->isCapped() && autoTmpColl->getIndexCatalog()->haveAnyIndexes()) {
+            batchSize = 1;
+        }
+
         auto cursor = sourceColl->getCursor(opCtx);
         auto record = cursor->next();
         while (record) {
@@ -645,26 +668,38 @@ Status renameBetweenDBs(OperationContext* opCtx,
             // Cursor is left one past the end of the batch inside writeConflictRetry.
             auto beginBatchId = record->id;
             Status status = writeConflictRetry(opCtx, "renameCollection", tmpName.ns(), [&] {
-                // Need to reset cursor if it gets a WCE midway through.
-                if (!record || (beginBatchId != record->id)) {
-                    record = cursor->seekExact(beginBatchId);
-                }
-                for (int i = 0; record && (i < internalInsertMaxBatchSize.load()); i++) {
-                    WriteUnitOfWork wunit(opCtx);
-                    const InsertStatement stmt(record->data.releaseToBson());
-                    OpDebug* const opDebug = nullptr;
-                    auto status = autoTmpColl->insertDocument(opCtx, stmt, opDebug, true);
-                    if (!status.isOK()) {
-                        return status;
-                    }
-                    record = cursor->next();
+                // Always reposition cursor in case it gets a WCE midway through.
+                record = cursor->seekExact(beginBatchId);
 
-                    // Used to make sure that a WCE can be handled by this logic without data loss.
-                    if (MONGO_unlikely(writeConflictInRenameCollCopyToTmp.shouldFail())) {
-                        throw WriteConflictException();
-                    }
-                    wunit.commit();
+                std::vector<InsertStatement> stmts;
+                for (int i = 0; record && (i < batchSize); i++) {
+                    stmts.push_back(InsertStatement(record->data.getOwned().releaseToBson()));
+                    record = cursor->next();
                 }
+
+                WriteUnitOfWork wunit(opCtx);
+
+                if (!isOplogDisabledForTmpColl) {
+                    auto oplogInfo = repl::LocalOplogInfo::get(opCtx);
+                    auto slots = oplogInfo->getNextOpTimes(opCtx, stmts.size());
+                    for (std::size_t i = 0; i < stmts.size(); ++i) {
+                        stmts[i].oplogSlot = slots[i];
+                    }
+                }
+
+                OpDebug* const opDebug = nullptr;
+                auto status =
+                    autoTmpColl->insertDocuments(opCtx, stmts.begin(), stmts.end(), opDebug, true);
+                if (!status.isOK()) {
+                    return status;
+                }
+
+                // Used to make sure that a WCE can be handled by this logic without data loss.
+                if (MONGO_unlikely(writeConflictInRenameCollCopyToTmp.shouldFail())) {
+                    throw WriteConflictException();
+                }
+
+                wunit.commit();
 
                 // Time to yield; make a safe copy of the current record before releasing our
                 // cursor.
@@ -747,10 +782,9 @@ void doLocalRenameIfOptionsAndIndexesHaveNotChanged(OperationContext* opCtx,
     validateAndRunRenameCollection(opCtx, sourceNs, targetNs, options);
 }
 
-void validateAndRunRenameCollection(OperationContext* opCtx,
-                                    const NamespaceString& source,
-                                    const NamespaceString& target,
-                                    const RenameCollectionOptions& options) {
+void validateNamespacesForRenameCollection(OperationContext* opCtx,
+                                           const NamespaceString& source,
+                                           const NamespaceString& target) {
     uassert(ErrorCodes::InvalidNamespace,
             str::stream() << "Invalid source namespace: " << source.ns(),
             source.isValid());
@@ -772,11 +806,11 @@ void validateAndRunRenameCollection(OperationContext* opCtx,
             "If either the source or target of a rename is an oplog name, both must be",
             source.isOplog() == target.isOplog());
 
-    Status sourceStatus = userAllowedWriteNS(source);
+    Status sourceStatus = userAllowedWriteNS(opCtx, source);
     uassert(ErrorCodes::IllegalOperation,
             "error with source namespace: " + sourceStatus.reason(),
             sourceStatus.isOK());
-    Status targetStatus = userAllowedWriteNS(target);
+    Status targetStatus = userAllowedWriteNS(opCtx, target);
     uassert(ErrorCodes::IllegalOperation,
             "error with target namespace: " + targetStatus.reason(),
             targetStatus.isOK());
@@ -787,6 +821,23 @@ void validateAndRunRenameCollection(OperationContext* opCtx,
                   "collection (admin.system.version) is not "
                   "allowed");
     }
+
+    uassert(ErrorCodes::NamespaceNotFound,
+            str::stream() << "renameCollection cannot accept a source collection that is in a "
+                             "drop-pending state: "
+                          << source,
+            !source.isDropPendingNamespace());
+
+    uassert(ErrorCodes::IllegalOperation,
+            "renaming system.views collection or renaming to system.views is not allowed",
+            !source.isSystemDotViews() && !target.isSystemDotViews());
+}
+
+void validateAndRunRenameCollection(OperationContext* opCtx,
+                                    const NamespaceString& source,
+                                    const NamespaceString& target,
+                                    const RenameCollectionOptions& options) {
+    validateNamespacesForRenameCollection(opCtx, source, target);
 
     OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE unsafeCreateCollection(
         opCtx);
@@ -866,7 +917,7 @@ Status renameCollectionForApplyOps(OperationContext* opCtx,
     }
 
     // Check that the target namespace is in the correct form, "database.collection".
-    auto targetStatus = userAllowedCreateNS(targetNss);
+    auto targetStatus = userAllowedCreateNS(opCtx, targetNss);
     if (!targetStatus.isOK()) {
         return Status(targetStatus.code(),
                       str::stream() << "error with target namespace: " << targetStatus.reason());

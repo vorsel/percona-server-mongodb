@@ -42,8 +42,9 @@ function getUnionWithStage(explain) {
 }
 
 function buildErrorString(unionExplain, realExplain, field) {
-    return "Explains did not match in field " + field + ". Union:\n" + tojson(unionExplain) +
-        "\nRegular:\n" + tojson(realExplain);
+    const toString = e => typeof e !== 'string' ? tojson(e) : e;
+    return "Explains did not match in field " + field + ". Union:\n" + toString(unionExplain) +
+        "\nRegular:\n" + toString(realExplain);
 }
 
 function docEqWithIgnoredFields(union, regular) {
@@ -85,9 +86,11 @@ function assertExplainEq(unionExplain, regularExplain) {
             assert(docEqWithIgnoredFields(unionSubStats, realStats),
                    buildErrorString(unionSubStats, realStats));
         } else {
+            // Tolerate different values for the "NOW" slot when comparing explain output.
+            const toString = e => tojson(e).replace(/^.* NOW = s[0-9]+ \([0-9]+\).*$/gm, "");
             const realExplain = regularExplain.stages;
-            assert(arrayEq(unionSubExplain, realExplain),
-                   buildErrorString(unionSubExplain, realExplain));
+            assert(toString(unionSubExplain) == toString(realExplain),
+                   buildErrorString(toString(unionSubExplain), toString(realExplain)));
         }
     }
 }

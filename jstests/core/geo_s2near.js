@@ -1,5 +1,6 @@
 // @tags: [
 //   requires_getmore,
+//   requires_fcv_49,
 // ]
 
 // Test 2dsphere near search, called via find and $geoNear.
@@ -56,12 +57,18 @@ assert.throws(function() {
 assert.throws(function() {
     return t.find({"geo": {"$near": {"$geometry": somepoly}}}).count();
 });
-assert.throws(function() {
-    return t.aggregate({$geoNear: {near: someline, distanceField: "dis", spherical: true}});
-});
-assert.throws(function() {
-    return t.aggregate({$geoNear: {near: somepoly, distanceField: "dis", spherical: true}});
-});
+assert.commandFailedWithCode(db.runCommand({
+    aggregate: t.getName(),
+    cursor: {},
+    pipeline: [{$geoNear: {near: someline, distanceField: "dis", spherical: true}}]
+}),
+                             2);
+assert.commandFailedWithCode(db.runCommand({
+    aggregate: t.getName(),
+    cursor: {},
+    pipeline: [{$geoNear: {near: somepoly, distanceField: "dis", spherical: true}}]
+}),
+                             2);
 
 // Do some basic near searches.
 res = t.find({"geo": {"$near": {"$geometry": origin, $maxDistance: 2000}}}).limit(10);
@@ -152,5 +159,5 @@ assert.commandFailedWithCode(db.runCommand({
         }
     }]
 }),
-                             17444);
+                             2);
 }());

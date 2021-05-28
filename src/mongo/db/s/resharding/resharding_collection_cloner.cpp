@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include "mongo/platform/basic.h"
 
@@ -42,7 +42,7 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/exec/document_value/document.h"
-#include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/logical_session_id_helpers.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/document_source_lookup.h"
 #include "mongo/db/pipeline/document_source_match.h"
@@ -50,6 +50,8 @@
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
 #include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/s/resharding/resharding_data_copy_util.h"
+#include "mongo/db/s/resharding/resharding_future_util.h"
+#include "mongo/db/s/resharding/resharding_metrics.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
 #include "mongo/db/s/resharding_util.h"
 #include "mongo/db/service_context.h"
@@ -57,7 +59,6 @@
 #include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/stale_shard_version_helpers.h"
-#include "mongo/util/future_util.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
@@ -215,7 +216,13 @@ std::unique_ptr<Pipeline, PipelineDeleter> ReshardingCollectionCloner::makePipel
 
 std::unique_ptr<Pipeline, PipelineDeleter> ReshardingCollectionCloner::_targetAggregationRequest(
     OperationContext* opCtx, const Pipeline& pipeline) {
-    AggregateCommand request(_sourceNss, pipeline.serializeToBson());
+    // We associate the aggregation cursors established on each donor shard with a logical session
+    // to prevent them from killing the cursor when it is idle locally. Due to the cursor's merging
+    // behavior across all donor shards, it is possible for the cursor to be active on one donor
+    // shard while idle for a long period on another donor shard.
+    opCtx->setLogicalSessionId(makeLogicalSessionId(opCtx));
+
+    AggregateCommandRequest request(_sourceNss, pipeline.serializeToBson());
     request.setCollectionUUID(_sourceUUID);
 
     auto hint = collectionHasSimpleCollation(opCtx, _sourceNss)
@@ -245,99 +252,74 @@ std::unique_ptr<Pipeline, PipelineDeleter> ReshardingCollectionCloner::_targetAg
                              });
 }
 
-std::vector<InsertStatement> ReshardingCollectionCloner::_fillBatch(Pipeline& pipeline) {
-    std::vector<InsertStatement> batch;
-
-    int numBytes = 0;
-    do {
-        auto doc = pipeline.getNext();
-        if (!doc) {
-            break;
-        }
-
-        auto obj = doc->toBson();
-        batch.emplace_back(obj.getOwned());
-        numBytes += obj.objsize();
-    } while (numBytes < resharding::gReshardingCollectionClonerBatchSizeInBytes);
-
-    return batch;
-}
-
-void ReshardingCollectionCloner::_insertBatch(OperationContext* opCtx,
-                                              std::vector<InsertStatement>& batch) {
-    // TODO SERVER-55102: Use CancelableOperationContext to prevent retrying once the operation has
-    // been canceled.
-    writeConflictRetry(opCtx, "ReshardingCollectionCloner::_insertBatch", _outputNss.ns(), [&] {
-        AutoGetCollection outputColl(opCtx, _outputNss, MODE_IX);
+std::unique_ptr<Pipeline, PipelineDeleter> ReshardingCollectionCloner::_restartPipeline(
+    OperationContext* opCtx) {
+    auto idToResumeFrom = [&] {
+        AutoGetCollection outputColl(opCtx, _outputNss, MODE_IS);
         uassert(ErrorCodes::NamespaceNotFound,
                 str::stream() << "Resharding collection cloner's output collection '" << _outputNss
                               << "' did not already exist",
                 outputColl);
-        WriteUnitOfWork wuow(opCtx);
-
-        // Populate 'slots' with new optimes for each insert.
-        // This also notifies the storage engine of each new timestamp.
-        auto oplogSlots = repl::getNextOpTimes(opCtx, batch.size());
-        for (auto [insert, slot] = std::make_pair(batch.begin(), oplogSlots.begin());
-             slot != oplogSlots.end();
-             ++insert, ++slot) {
-            invariant(insert != batch.end());
-            insert->oplogSlot = *slot;
-        }
-
-        uassertStatusOK(outputColl->insertDocuments(opCtx, batch.begin(), batch.end(), nullptr));
-        wuow.commit();
-        _env->metrics()->onDocumentsCopied(
-            batch.size(),
-            std::accumulate(batch.begin(), batch.end(), int64_t{0}, [](auto n, auto&& stmt) {
-                return n + stmt.doc.objsize();
-            }));
-    });
-}
-
-/**
- * Invokes the 'callable' function with a fresh OperationContext.
- *
- * The OperationContext is configured so the RstlKillOpThread would always interrupt the operation
- * on step-up or stepdown, regardless of whether the operation has acquired any locks. This
- * interruption is best-effort to stop doing wasteful work on stepdown as quickly as possible. It
- * isn't required for the ReshardingCollectionCloner's correctness. In particular, it is possible
- * for an OperationContext to be constructed after stepdown has finished, for the
- * ReshardingCollectionCloner to run a getMore on the aggregation against the donor shards, and for
- * the ReshardingCollectionCloner to only discover afterwards the recipient had already stepped down
- * from a NotPrimary error when inserting a batch of documents locally.
- *
- * Note that the recipient's primary-only service is responsible for managing the
- * ReshardingCollectionCloner and would shut down the ReshardingCollectionCloner's task executor
- * following the recipient stepping down.
- *
- * Also note that the ReshardingCollectionCloner is only created after step-up as part of the
- * recipient's primary-only service and therefore would never be interrupted by step-up.
- */
-template <typename Callable>
-auto ReshardingCollectionCloner::_withTemporaryOperationContext(Callable&& callable) {
-    auto& client = cc();
-    {
-        stdx::lock_guard<Client> lk(client);
-        invariant(client.canKillSystemOperationInStepdown(lk));
-    }
-
-    auto opCtx = client.makeOperationContext();
-    opCtx->setAlwaysInterruptAtStepDownOrUp();
+        return resharding::data_copy::findHighestInsertedId(opCtx, *outputColl);
+    }();
 
     // The BlockingResultsMerger underlying by the $mergeCursors stage records how long the
     // recipient spent waiting for documents from the donor shards. It doing so requires the CurOp
     // to be marked as having started.
-    auto* curOp = CurOp::get(opCtx.get());
+    auto* curOp = CurOp::get(opCtx);
     curOp->ensureStarted();
-    {
-        ON_BLOCK_EXIT([curOp] { curOp->done(); });
-        return callable(opCtx.get());
+    ON_BLOCK_EXIT([curOp] { curOp->done(); });
+
+    auto pipeline = _targetAggregationRequest(
+        opCtx, *makePipeline(opCtx, MongoProcessInterface::create(opCtx), idToResumeFrom));
+
+    if (!idToResumeFrom.missing()) {
+        // Skip inserting the first document retrieved after resuming because $gte was used in the
+        // aggregation pipeline.
+        auto firstDoc = pipeline->getNext();
+        uassert(4929301,
+                str::stream() << "Expected pipeline to retrieve document with _id: "
+                              << redact(idToResumeFrom.toString()),
+                firstDoc);
+
+        // Note that the following uassert() could throw because we're using the simple string
+        // comparator and the collection could have a non-simple collation. However, it would still
+        // be correct to throw an exception because it would mean the collection being resharded
+        // contains multiple documents with the same _id value as far as global uniqueness is
+        // concerned.
+        const auto& firstId = (*firstDoc)["_id"];
+        uassert(4929302,
+                str::stream() << "Expected pipeline to retrieve document with _id: "
+                              << redact(idToResumeFrom.toString())
+                              << ", but got _id: " << redact(firstId.toString()),
+                ValueComparator::kInstance.evaluate(firstId == idToResumeFrom));
     }
+
+    pipeline->detachFromOperationContext();
+    pipeline.get_deleter().dismissDisposal();
+    return pipeline;
 }
 
-ExecutorFuture<void> ReshardingCollectionCloner::run(
-    std::shared_ptr<executor::TaskExecutor> executor, CancelationToken cancelToken) {
+bool ReshardingCollectionCloner::doOneBatch(OperationContext* opCtx, Pipeline& pipeline) {
+    pipeline.reattachToOperationContext(opCtx);
+    ON_BLOCK_EXIT([&pipeline] { pipeline.detachFromOperationContext(); });
+    auto batch = resharding::data_copy::fillBatchForInsert(
+        pipeline, resharding::gReshardingCollectionClonerBatchSizeInBytes);
+
+    if (batch.empty()) {
+        return false;
+    }
+
+    int bytesInserted = resharding::data_copy::insertBatch(opCtx, _outputNss, batch);
+    _env->metrics()->onDocumentsCopied(batch.size(), bytesInserted);
+    return true;
+}
+
+SemiFuture<void> ReshardingCollectionCloner::run(
+    std::shared_ptr<executor::TaskExecutor> executor,
+    std::shared_ptr<executor::TaskExecutor> cleanupExecutor,
+    CancellationToken cancelToken,
+    CancelableOperationContextFactory factory) {
     struct ChainContext {
         std::unique_ptr<Pipeline, PipelineDeleter> pipeline;
         bool moreToCome = true;
@@ -345,128 +327,62 @@ ExecutorFuture<void> ReshardingCollectionCloner::run(
 
     auto chainCtx = std::make_shared<ChainContext>();
 
-    return AsyncTry([this, chainCtx] {
+    return resharding::WithAutomaticRetry([this, chainCtx, factory] {
                if (!chainCtx->pipeline) {
-                   chainCtx->pipeline = _withTemporaryOperationContext([&](auto* opCtx) {
-                       auto idToResumeFrom = [&] {
-                           AutoGetCollection outputColl(opCtx, _outputNss, MODE_IS);
-                           uassert(ErrorCodes::NamespaceNotFound,
-                                   str::stream()
-                                       << "Resharding collection cloner's output collection '"
-                                       << _outputNss << "' did not already exist",
-                                   outputColl);
-                           return resharding::data_copy::findHighestInsertedId(opCtx, *outputColl);
-                       }();
-                       auto pipeline = _targetAggregationRequest(
-                           opCtx,
-                           *makePipeline(
-                               opCtx, MongoProcessInterface::create(opCtx), idToResumeFrom));
-
-                       if (!idToResumeFrom.missing()) {
-                           // Skip inserting the first document retrieved after resuming because
-                           // $gte was used in the aggregation pipeline.
-                           auto firstDoc = pipeline->getNext();
-                           uassert(4929301,
-                                   str::stream()
-                                       << "Expected pipeline to retrieve document with _id: "
-                                       << redact(idToResumeFrom.toString()),
-                                   firstDoc);
-
-                           // Note that the following uassert() could throw because we're using the
-                           // simple string comparator and the collection could have a non-simple
-                           // collation. However, it would still be correct to throw an exception
-                           // because it would mean the collection being resharded contains multiple
-                           // documents with the same _id value as far as global uniqueness is
-                           // concerned.
-                           const auto& firstId = (*firstDoc)["_id"];
-                           uassert(4929302,
-                                   str::stream()
-                                       << "Expected pipeline to retrieve document with _id: "
-                                       << redact(idToResumeFrom.toString())
-                                       << ", but got _id: " << redact(firstId.toString()),
-                                   ValueComparator::kInstance.evaluate(firstId == idToResumeFrom));
-                       }
-
-                       pipeline->detachFromOperationContext();
-                       pipeline.get_deleter().dismissDisposal();
-                       return pipeline;
-                   });
+                   auto opCtx = factory.makeOperationContext(&cc());
+                   chainCtx->pipeline = _restartPipeline(opCtx.get());
                }
 
-               chainCtx->moreToCome = _withTemporaryOperationContext([&](auto* opCtx) {
-                   chainCtx->pipeline->reattachToOperationContext(opCtx);
-                   auto batch = _fillBatch(*chainCtx->pipeline);
-                   chainCtx->pipeline->detachFromOperationContext();
-
-                   if (batch.empty()) {
-                       return false;
-                   }
-
-                   _insertBatch(opCtx, batch);
-                   return true;
-               });
+               auto opCtx = factory.makeOperationContext(&cc());
+               chainCtx->moreToCome = doOneBatch(opCtx.get(), *chainCtx->pipeline);
            })
-        .until([this, chainCtx, cancelToken](Status status) {
-            if (status.isOK() && chainCtx->moreToCome) {
-                return false;
-            }
-
-            if (chainCtx->pipeline) {
-                _withTemporaryOperationContext([&](auto* opCtx) {
-                    chainCtx->pipeline->dispose(opCtx);
-                    chainCtx->pipeline.reset();
-                });
-            }
-
-            if (status.isA<ErrorCategory::CancelationError>() ||
-                status.isA<ErrorCategory::NotPrimaryError>()) {
-                // Cancellation and NotPrimary errors indicate the primary-only service Instance
-                // will be shut down or is shutting down now - provided the cancelToken is also
-                // canceled. Otherwise, the errors may have originated from a remote response rather
-                // than the shard itself.
-                //
-                // Don't retry when primary-only service Instance is shutting down.
-                return cancelToken.isCanceled();
-            }
-
-            if (status.isA<ErrorCategory::RetriableError>() ||
-                status.isA<ErrorCategory::CursorInvalidatedError>() ||
-                status == ErrorCodes::Interrupted) {
-                // Do retry on any other types of retryable errors though. Also retry on errors from
-                // stray killCursors and killOp commands being run.
-                LOGV2(5269300,
-                      "Transient error while cloning sharded collection",
-                      "sourceNamespace"_attr = _sourceNss,
-                      "outputNamespace"_attr = _outputNss,
-                      "readTimestamp"_attr = _atClusterTime,
-                      "error"_attr = redact(status));
-                return false;
-            }
-
-            if (!status.isOK()) {
-                LOGV2(5352400,
-                      "Operation-fatal error for resharding while cloning sharded collection",
-                      "sourceNamespace"_attr = _sourceNss,
-                      "outputNamespace"_attr = _outputNss,
-                      "readTimestamp"_attr = _atClusterTime,
-                      "error"_attr = redact(status));
-            }
-
-            return true;
+        .onTransientError([this](const Status& status) {
+            LOGV2(5269300,
+                  "Transient error while cloning sharded collection",
+                  "sourceNamespace"_attr = _sourceNss,
+                  "outputNamespace"_attr = _outputNss,
+                  "readTimestamp"_attr = _atClusterTime,
+                  "error"_attr = redact(status));
         })
-        .on(executor, cancelToken)
-        .onCompletion([this, chainCtx](Status status) {
+        .onUnrecoverableError([this](const Status& status) {
+            LOGV2_ERROR(5352400,
+                        "Operation-fatal error for resharding while cloning sharded collection",
+                        "sourceNamespace"_attr = _sourceNss,
+                        "outputNamespace"_attr = _outputNss,
+                        "readTimestamp"_attr = _atClusterTime,
+                        "error"_attr = redact(status));
+        })
+        .until([chainCtx, factory](const Status& status) {
+            if (!status.isOK() && chainCtx->pipeline) {
+                auto opCtx = factory.makeOperationContext(&cc());
+                chainCtx->pipeline->dispose(opCtx.get());
+                chainCtx->pipeline.reset();
+            }
+
+            return status.isOK() && !chainCtx->moreToCome;
+        })
+        .on(std::move(executor), std::move(cancelToken))
+        .thenRunOn(std::move(cleanupExecutor))
+        // It is unsafe to capture `this` once the task is running on the cleanupExecutor because
+        // RecipientStateMachine, along with its ReshardingCollectionCloner member, may have already
+        // been destructed.
+        .onCompletion([chainCtx](Status status) {
             if (chainCtx->pipeline) {
-                // Guarantee the pipeline is always cleaned up - even upon cancelation.
-                _withTemporaryOperationContext([&](auto* opCtx) {
-                    chainCtx->pipeline->dispose(opCtx);
-                    chainCtx->pipeline.reset();
-                });
+                auto client =
+                    cc().getServiceContext()->makeClient("ReshardingCollectionClonerCleanupClient");
+
+                AlternativeClientRegion acr(client);
+                auto opCtx = cc().makeOperationContext();
+
+                // Guarantee the pipeline is always cleaned up - even upon cancellation.
+                chainCtx->pipeline->dispose(opCtx.get());
+                chainCtx->pipeline.reset();
             }
 
             // Propagate the result of the AsyncTry.
             return status;
-        });
+        })
+        .semi();
 }
 
 }  // namespace mongo

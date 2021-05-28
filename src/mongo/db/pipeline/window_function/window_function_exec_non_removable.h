@@ -59,7 +59,8 @@ public:
                                    boost::intrusive_ptr<Expression> input,
                                    boost::intrusive_ptr<WindowFunc> function,
                                    WindowBounds::Bound<int> upperDocumentBound)
-        : WindowFunctionExec(iter),
+        : WindowFunctionExec(
+              PartitionAccessor(iter, PartitionAccessor::Policy::kDefaultSequential)),
           _input(std::move(input)),
           _function(std::move(function)),
           _upperDocumentBound(upperDocumentBound){};
@@ -77,8 +78,9 @@ public:
                     return stdx::get<int>(_upperDocumentBound);
             }();
 
-            if (auto doc = (*this->_iter)[upperIndex])
-                _function->process(_input->evaluate(*doc, nullptr), false);
+            if (auto doc = (this->_iter)[upperIndex])
+                _function->process(
+                    _input->evaluate(*doc, &_input->getExpressionContext()->variables), false);
             else {
                 // Upper bound is out of range, but may be because it's off of the end of the
                 // partition. For instance, for bounds [unbounded, -1] we won't be able to
@@ -120,8 +122,9 @@ private:
 
         _initialized = true;
         for (int i = 0; needMore(i); i++) {
-            if (auto doc = (*this->_iter)[i]) {
-                _function->process(_input->evaluate(*doc, nullptr), false);
+            if (auto doc = (this->_iter)[i]) {
+                _function->process(
+                    _input->evaluate(*doc, &_input->getExpressionContext()->variables), false);
             } else {
                 // Already reached the end of partition for the first value to compute.
                 break;

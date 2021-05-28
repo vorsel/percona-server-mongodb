@@ -133,7 +133,7 @@ public:
 
     virtual Seconds getSecondaryDelaySecs() const override;
 
-    virtual void clearSyncSourceBlacklist() override;
+    virtual void clearSyncSourceDenylist() override;
 
     virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
         OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern);
@@ -259,6 +259,8 @@ public:
                                      GetNewConfigFn getNewConfig,
                                      bool force) override;
 
+    virtual Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn) override;
+
     virtual Status awaitConfigCommitment(OperationContext* opCtx,
                                          bool waitForOplogCommitment) override;
 
@@ -281,7 +283,7 @@ public:
 
     virtual HostAndPort chooseNewSyncSource(const OpTime& lastOpTimeFetched) override;
 
-    virtual void blacklistSyncSource(const HostAndPort& host, Date_t until) override;
+    virtual void denylistSyncSource(const HostAndPort& host, Date_t until) override;
 
     virtual void resetLastOpTimesFromOplog(OperationContext* opCtx) override;
 
@@ -1171,13 +1173,13 @@ private:
     void _onFollowerModeStateChange();
 
     /**
-     * Removes 'host' from the sync source blacklist. If 'host' isn't found, it's simply
+     * Removes 'host' from the sync source denylist. If 'host' isn't found, it's simply
      * ignored and no error is thrown.
      *
      * Must be scheduled as a callback.
      */
-    void _unblacklistSyncSource(const executor::TaskExecutor::CallbackArgs& cbData,
-                                const HostAndPort& host);
+    void _undenylistSyncSource(const executor::TaskExecutor::CallbackArgs& cbData,
+                               const HostAndPort& host);
 
     /**
      * Schedules stepdown to run with the global exclusive lock.
@@ -1469,6 +1471,11 @@ private:
                                           ConfigVersionAndTerm versionAndTerm);
 
     /**
+     * Sets the implicit default write concern on startup.
+     */
+    void _setImplicitDefaultWriteConcern(OperationContext* opCtx, WithLock lk);
+
+    /**
      * Checks whether replication coordinator supports automatic reconfig.
      */
     bool _supportsAutomaticReconfig() const;
@@ -1477,6 +1484,15 @@ private:
      * Calculates and returns the read preference for the node.
      */
     const ReadPreference _getSyncSourceReadPreference(WithLock);
+
+    /*
+     * Performs the replica set reconfig procedure. Certain consensus safety checks are omitted when
+     * either 'force' or 'skipSafetyChecks' are true.
+     */
+    Status _doReplSetReconfig(OperationContext* opCtx,
+                              GetNewConfigFn getNewConfig,
+                              bool force,
+                              bool skipSafetyChecks);
 
     //
     // All member variables are labeled with one of the following codes indicating the

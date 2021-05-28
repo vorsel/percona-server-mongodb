@@ -2,14 +2,9 @@
 "use strict";
 
 load("jstests/aggregation/extras/utils.js");  // For arrayEq and orderedArrayEq.
+load("jstests/libs/sbe_util.js");             // For checkSBEEnabled.
 
-// Note that the "getParameter" command is expected to fail in versions of mongod that do not yet
-// include the slot-based execution engine. When that happens, however, 'isSBEEnabled' still
-// correctly evaluates to false.
-const isSBEEnabled = (() => {
-    const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
-    return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
-})();
+const isSBEEnabled = checkSBEEnabled(db);
 if (isSBEEnabled) {
     // Override error-code-checking APIs. We only load this when SBE is explicitly enabled, because
     // it causes failures in the parallel suites.
@@ -56,7 +51,8 @@ const documents = [
     {_id: 23, i1: NumberInt(1), i2: NumberInt(-1), i3: NumberInt(-2147483648)},
     {_id: 24, l1: NumberLong("12345678900"), l2: NumberLong("-12345678900")},
     {_id: 25, s: "string", l: NumberLong("-9223372036854775808"), n: null},
-    {_id: 26, d1: 4.6, d2: -4.6, dec1: NumberDecimal("4.6"), dec2: NumberDecimal("-4.6")}
+    {_id: 26, d1: 4.6, d2: -4.6, dec1: NumberDecimal("4.6"), dec2: NumberDecimal("-4.6")},
+    {_id: 27, dec1: NumberDecimal("-1.0"), dec2: NumberDecimal("2.0"), dec3: NumberDecimal("3.0")}
 ];
 assert.commandWorked(coll.insert(documents));
 
@@ -83,7 +79,7 @@ const testCases = [
             {_id: 10},          {_id: 11},          {_id: 12},         {_id: 13}, {_id: 14},
             {_id: 15, foo: 10}, {_id: 16, foo: 10}, {_id: 17},         {_id: 18}, {_id: 19},
             {_id: 20},          {_id: 21},          {_id: 22, foo: 1}, {_id: 23}, {_id: 24},
-            {_id: 25},          {_id: 26}
+            {_id: 25},          {_id: 26},          {_id: 27}
         ],
         query: {},
         proj: {_id: 1, foo: "$a"}
@@ -96,7 +92,7 @@ const testCases = [
             {_id: 10},          {_id: 11},          {_id: 12},         {_id: 13}, {_id: 14},
             {_id: 15, foo: 10}, {_id: 16, foo: 10}, {_id: 17},         {_id: 18}, {_id: 19},
             {_id: 20},          {_id: 21},          {_id: 22, foo: 1}, {_id: 23}, {_id: 24},
-            {_id: 25},          {_id: 26}
+            {_id: 25},          {_id: 26},          {_id: 27}
         ],
         query: {},
         proj: {foo: "$a"}
@@ -105,7 +101,7 @@ const testCases = [
         desc: "Single-level path 3",
         expected: [
             {foo: 1}, {foo: 2},  {foo: 3},  {}, {}, {}, {}, {}, {},       {}, {}, {}, {}, {},
-            {},       {foo: 10}, {foo: 10}, {}, {}, {}, {}, {}, {foo: 1}, {}, {}, {}, {}
+            {},       {foo: 10}, {foo: 10}, {}, {}, {}, {}, {}, {foo: 1}, {}, {}, {}, {}, {}
         ],
         query: {},
         proj: {_id: 0, foo: "$a"}
@@ -139,7 +135,8 @@ const testCases = [
             {_id: 23},
             {_id: 24},
             {_id: 25},
-            {_id: 26}
+            {_id: 26},
+            {_id: 27}
         ],
         query: {},
         proj: {_id: 1, foo: "$a", bar: "$b"}
@@ -149,6 +146,12 @@ const testCases = [
         expected: [{_id: 0, foo: 11}, {_id: 1, foo: 13}, {_id: 2, foo: 15}],
         query: {c: {$gt: 0}},
         proj: {foo: {$add: ["$a", "$c"]}}
+    },
+    {
+        desc: "$add with arity 1 and 3",
+        expected: [{_id: 27, add1: NumberDecimal("-1.0"), add3: NumberDecimal("4.0")}],
+        query: {dec1: NumberDecimal("-1.0")},
+        proj: {add1: {$add: "$dec1"}, add3: {$add: ["$dec1", "$dec2", "$dec3"]}}
     },
     {
         desc: "Single-level path 4",
@@ -179,7 +182,8 @@ const testCases = [
             {_id: 23},
             {_id: 24},
             {_id: 25},
-            {_id: 26}
+            {_id: 26},
+            {_id: 27}
         ],
         query: {},
         proj: {a: 1, foo: "$b"}
@@ -213,7 +217,8 @@ const testCases = [
             {_id: 23},
             {_id: 24},
             {_id: 25},
-            {_id: 26}
+            {_id: 26},
+            {_id: 27}
         ],
         query: {},
         proj: {_id: 1, foo: "$x.y"}
@@ -247,7 +252,8 @@ const testCases = [
             {_id: 23},
             {_id: 24},
             {_id: 25},
-            {_id: 26}
+            {_id: 26},
+            {_id: 27}
         ],
         query: {},
         proj: {foo: "$x.y"}
@@ -277,6 +283,7 @@ const testCases = [
             {},
             {foo: [3, 4, 6]},
             {foo: [3, {z: 2}, 6]},
+            {},
             {},
             {},
             {},
@@ -315,7 +322,8 @@ const testCases = [
             {_id: 23},
             {_id: 24},
             {_id: 25},
-            {_id: 26}
+            {_id: 26},
+            {_id: 27}
         ],
         query: {},
         proj: {foo: "$x.y", bar: "$v.w"}
@@ -358,7 +366,8 @@ const testCases = [
             {_id: 23},
             {_id: 24},
             {_id: 25},
-            {_id: 26}
+            {_id: 26},
+            {_id: 27}
         ],
         query: {},
         proj: {"x.y": 1, foo: "$v.w"}
@@ -427,7 +436,8 @@ const testCases = [
             {_id: 15, foo: true},  {_id: 16, foo: true},  {_id: 17, foo: false},
             {_id: 18, foo: false}, {_id: 19, foo: false}, {_id: 20, foo: false},
             {_id: 21, foo: false}, {_id: 22, foo: true},  {_id: 23, foo: false},
-            {_id: 24, foo: false}, {_id: 25, foo: false}, {_id: 26, foo: false}
+            {_id: 24, foo: false}, {_id: 25, foo: false}, {_id: 26, foo: false},
+            {_id: 27, foo: false}
         ],
         query: {},
         proj: {foo: {$and: ["$a"]}}
@@ -443,7 +453,8 @@ const testCases = [
             {_id: 15, foo: true},  {_id: 16, foo: true},  {_id: 17, foo: false},
             {_id: 18, foo: false}, {_id: 19, foo: false}, {_id: 20, foo: false},
             {_id: 21, foo: false}, {_id: 22, foo: true},  {_id: 23, foo: false},
-            {_id: 24, foo: false}, {_id: 25, foo: false}, {_id: 26, foo: false}
+            {_id: 24, foo: false}, {_id: 25, foo: false}, {_id: 26, foo: false},
+            {_id: 27, foo: false}
         ],
         query: {},
         proj: {foo: {$or: ["$a"]}}
@@ -513,7 +524,7 @@ const testCases = [
             {_id: 10},          {_id: 11},         {_id: 12},         {_id: 13}, {_id: 14},
             {_id: 15},          {_id: 16},         {_id: 17},         {_id: 18}, {_id: 19},
             {_id: 20},          {_id: 21},         {_id: 22, foo: 0}, {_id: 23}, {_id: 24},
-            {_id: 25},          {_id: 26}
+            {_id: 25},          {_id: 26},         {_id: 27}
         ],
         query: {},
         proj: {foo: {$switch: {branches: [{case: {$eq: ["$a", 1]}, then: "$b"}], default: "$c"}}}
@@ -526,7 +537,7 @@ const testCases = [
             {_id: 10},          {_id: 11},         {_id: 12},         {_id: 13}, {_id: 14},
             {_id: 15},          {_id: 16},         {_id: 17},         {_id: 18}, {_id: 19},
             {_id: 20},          {_id: 21},         {_id: 22, foo: 0}, {_id: 23}, {_id: 24},
-            {_id: 25},          {_id: 26}
+            {_id: 25},          {_id: 26},         {_id: 27}
         ],
         query: {},
         proj: {foo: {$cond: {if: {$eq: ["$a", 1]}, then: "$b", else: "$c"}}}
@@ -539,7 +550,7 @@ const testCases = [
             {_id: 10},          {_id: 11},        {_id: 12},         {_id: 13}, {_id: 14},
             {_id: 15},          {_id: 16},        {_id: 17},         {_id: 18}, {_id: 19},
             {_id: 20},          {_id: 21},        {_id: 22, foo: 0}, {_id: 23}, {_id: 24},
-            {_id: 25},          {_id: 26}
+            {_id: 25},          {_id: 26},        {_id: 27}
         ],
         query: {},
         proj: {
@@ -759,7 +770,8 @@ const testCases = [
             {_id: 23},
             {_id: 24},
             {_id: 25},
-            {_id: 26}
+            {_id: 26},
+            {_id: 27}
         ],
         query: {},
         proj: {foo: {$let: {vars: {va: "$x"}, "in": "$$va.y"}}}
@@ -802,7 +814,7 @@ const testCases = [
             {_id: 10},          {_id: 11},          {_id: 12},         {_id: 13}, {_id: 14},
             {_id: 15, foo: 10}, {_id: 16, foo: 10}, {_id: 17},         {_id: 18}, {_id: 19},
             {_id: 20},          {_id: 21},          {_id: 22, foo: 1}, {_id: 23}, {_id: 24},
-            {_id: 25},          {_id: 26}
+            {_id: 25},          {_id: 26},          {_id: 27}
         ],
         query: {},
         proj: {foo: {$let: {vars: {doc: "$$CURRENT"}, "in": "$$doc.a"}}}
@@ -815,7 +827,7 @@ const testCases = [
             {_id: 10},          {_id: 11},          {_id: 12},         {_id: 13}, {_id: 14},
             {_id: 15, foo: 10}, {_id: 16, foo: 10}, {_id: 17},         {_id: 18}, {_id: 19},
             {_id: 20},          {_id: 21},          {_id: 22, foo: 1}, {_id: 23}, {_id: 24},
-            {_id: 25},          {_id: 26}
+            {_id: 25},          {_id: 26},          {_id: 27}
         ],
         query: {},
         proj: {foo: {$let: {vars: {CURRENT: "$$CURRENT.a"}, "in": "$$CURRENT"}}}
@@ -847,13 +859,17 @@ const testCases = [
     {
         desc: "$lte",
         expected: computedProjectionWithBoolValues({
-            foo: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26],
-            bar: [
-                0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11,
-                12, 13, 14, 17, 18, 19, 20, 21, 23, 24, 25, 26
+            foo: [
+                3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14,
+                16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27
             ],
-            baz: [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 22, 23, 24, 25, 26],
-            qux: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 23, 24, 25, 26]
+            bar: [
+                0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12,
+                13, 14, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27
+            ],
+            baz: [0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19, 22, 23, 24, 25, 26, 27],
+            qux:
+                [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27]
         }),
         query: {},
         proj: {
@@ -882,18 +898,18 @@ const testCases = [
     {
         desc: "$gte",
         expected: computedProjectionWithBoolValues({
-            foo: [0, 1, 2, 10, 11, 12, 13, 14, 15, 16, 19, 22, 23, 24, 25, 26],
+            foo: [0, 1, 2, 10, 11, 12, 13, 14, 15, 16, 19, 22, 23, 24, 25, 26, 27],
             bar: [
-                3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14,
-                15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26
+                3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
+                16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27
             ],
             baz: [
-                0,  1,  2,  3,  4,  6,  7,  10, 11, 12, 13, 14,
-                15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26
+                0,  1,  2,  3,  4,  6,  7,  10, 11, 12, 13, 14, 15,
+                16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27
             ],
             qux: [
                 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13,
-                14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26
+                14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27
             ]
         }),
         query: {},
@@ -907,10 +923,11 @@ const testCases = [
     {
         desc: "$eq",
         expected: computedProjectionWithBoolValues({
-            foo: [10, 11, 12, 13, 14, 16, 19, 23, 24, 25, 26],
-            bar: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 23, 24, 25, 26],
-            baz: [0, 1, 2, 6, 7, 10, 11, 12, 13, 14, 15, 16, 19, 22, 23, 24, 25, 26],
-            qux: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 23, 24, 25, 26]
+            foo: [10, 11, 12, 13, 14, 16, 19, 23, 24, 25, 26, 27],
+            bar: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27],
+            baz: [0, 1, 2, 6, 7, 10, 11, 12, 13, 14, 15, 16, 19, 22, 23, 24, 25, 26, 27],
+            qux:
+                [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27]
         }),
         query: {},
         proj: {
@@ -952,7 +969,7 @@ const testCases = [
             {_id: 20, foo: -1, bar: 0, baz: 1, qux: 0}, {_id: 21, foo: -1, bar: 0, baz: 1, qux: 0},
             {_id: 22, foo: 1, bar: 1, baz: 0, qux: 1},  {_id: 23, foo: 0, bar: 0, baz: 0, qux: 0},
             {_id: 24, foo: 0, bar: 0, baz: 0, qux: 0},  {_id: 25, foo: 0, bar: 0, baz: 0, qux: 0},
-            {_id: 26, foo: 0, bar: 0, baz: 0, qux: 0}
+            {_id: 26, foo: 0, bar: 0, baz: 0, qux: 0},  {_id: 27, foo: 0, bar: 0, baz: 0, qux: 0}
         ],
         query: {},
         proj: {
@@ -1033,7 +1050,8 @@ const testCases = [
             {_id: 23, foo: false, baz: false},
             {_id: 24, foo: false, baz: false},
             {_id: 25, foo: false, baz: false},
-            {_id: 26, foo: false, baz: false}
+            {_id: 26, foo: false, baz: false},
+            {_id: 27, foo: false, baz: false}
         ],
         query: {},
         proj: {

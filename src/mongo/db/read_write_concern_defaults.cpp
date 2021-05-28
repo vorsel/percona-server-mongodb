@@ -32,7 +32,8 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/read_write_concern_defaults.h"
-
+#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/logv2/log.h"
 
@@ -130,6 +131,19 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewConcerns(
     if (!wc && current) {
         rwc.setDefaultWriteConcern(current->getDefaultWriteConcern());
     }
+    // If the setDefaultRWConcern command tries to unset the global default write concern when it
+    // has already been set, throw an error.
+    // wc->usedDefault indicates that the defaultWriteConcern given in the setDefaultRWConcern
+    // command was empty (i.e. {defaultWriteConcern: {}})
+    // If current->getDefaultWriteConcern exists, that means the global default write concern has
+    // already been set.
+    if (repl::feature_flags::gDefaultWCMajority.isEnabled(
+            serverGlobalParams.featureCompatibility) &&
+        wc && wc->usedDefault && current) {
+        uassert(ErrorCodes::IllegalOperation,
+                str::stream() << "The global default write concern cannot be unset once it is set.",
+                !current->getDefaultWriteConcern());
+    }
 
     return rwc;
 }
@@ -196,6 +210,17 @@ ReadWriteConcernDefaults::_getDefault(OperationContext* opCtx) {
     return boost::none;
 }
 
+void ReadWriteConcernDefaults::setImplicitDefaultWriteConcernMajority(
+    bool newImplicitDefaultWCMajority) {
+    invariant(!_implicitDefaultWriteConcernMajority ||
+              repl::enableDefaultWriteConcernUpdatesForInitiate.load());
+    _implicitDefaultWriteConcernMajority = newImplicitDefaultWCMajority;
+}
+
+boost::optional<bool> ReadWriteConcernDefaults::getImplicitDefaultWriteConcernMajority_forTest() {
+    return _implicitDefaultWriteConcernMajority;
+}
+
 boost::optional<ReadWriteConcernDefaults::ReadConcern>
 ReadWriteConcernDefaults::getDefaultReadConcern(OperationContext* opCtx) {
     auto current = getDefault(opCtx);
@@ -222,14 +247,16 @@ void ReadWriteConcernDefaults::create(ServiceContext* service, FetchDefaultsFn f
 
 ReadWriteConcernDefaults::ReadWriteConcernDefaults(ServiceContext* service,
                                                    FetchDefaultsFn fetchDefaultsFn)
-    : _defaults(service, _threadPool, std::move(fetchDefaultsFn)), _threadPool([] {
+    : _defaults(service, _threadPool, std::move(fetchDefaultsFn)),
+      _threadPool([] {
           ThreadPool::Options options;
           options.poolName = "ReadWriteConcernDefaults";
           options.minThreads = 0;
           options.maxThreads = 1;
 
           return options;
-      }()) {
+      }()),
+      _implicitDefaultWriteConcernMajority(boost::none) {
     _threadPool.startup();
 }
 

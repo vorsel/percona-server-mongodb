@@ -42,6 +42,7 @@
 #include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/document_source_merge_gen.h"
+#include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/variable_validation.h"
@@ -117,6 +118,33 @@ NamespaceString parseLookupFromAndResolveNamespace(const BSONElement& elem, Stri
         nss.isConfigDotCacheDotChunks() || nss == NamespaceString::kRsOplogNamespace ||
             nss == NamespaceString::kTenantMigrationOplogView);
     return nss;
+}
+
+/**
+ * Checks if a sort stage's pattern is suitable to push the stage before $lookup. The sort stage
+ * must not share the same prefix with any field created or modified by the lookup stage.
+ */
+bool checkModifiedPathsSortReorder(const SortPattern& sortPattern,
+                                   const DocumentSource::GetModPathsReturn& modPaths) {
+    for (const auto& sortKey : sortPattern) {
+        if (!sortKey.fieldPath.has_value()) {
+            return false;
+        }
+        if (sortKey.fieldPath->getPathLength() < 1) {
+            return false;
+        }
+        auto sortField = sortKey.fieldPath->getFieldName(0);
+        auto it = std::find_if(
+            modPaths.paths.begin(), modPaths.paths.end(), [&sortField](const auto& modPath) {
+                // Finds if the shorter path is a prefix field of or the same as the longer one.
+                return sortField == modPath || expression::isPathPrefixOf(sortField, modPath) ||
+                    expression::isPathPrefixOf(modPath, sortField);
+            });
+        if (it != modPaths.paths.end()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -442,6 +470,19 @@ Pipeline::SourceContainer::iterator DocumentSourceLookUp::doOptimizeAt(
         return container->end();
     }
 
+    // If the following stage is $sort, consider pushing it ahead of $lookup.
+    if (auto sortPtr = dynamic_cast<DocumentSourceSort*>(std::next(itr)->get())) {
+        // TODO (SERVER-55417): Conditionally reorder $sort and $lookup depending on whether the
+        // query planner allows for an index-provided sort.
+        if (!_unwindSrc &&
+            checkModifiedPathsSortReorder(sortPtr->getSortKeyPattern(), getModifiedPaths())) {
+            // We have a sort not on as field following this stage. Reorder sort and current doc.
+            std::swap(*itr, *std::next(itr));
+
+            return itr == container->begin() ? itr : std::prev(itr);
+        }
+    }
+
     auto nextUnwind = dynamic_cast<DocumentSourceUnwind*>((*std::next(itr)).get());
 
     // If we are not already handling an $unwind stage internally, we can combine with the
@@ -749,6 +790,19 @@ void DocumentSourceLookUp::recordPlanSummaryStats(const Pipeline& pipeline) {
     }
 }
 
+void DocumentSourceLookUp::appendSpecificExecStats(MutableDocument& doc) const {
+    const PlanSummaryStats& stats = _stats.planSummaryStats;
+    doc["totalDocsExamined"] = Value(static_cast<long long>(stats.totalDocsExamined));
+    doc["totalKeysExamined"] = Value(static_cast<long long>(stats.totalKeysExamined));
+    doc["collectionScans"] = Value(stats.collectionScans);
+    std::vector<Value> indexesUsedVec;
+    std::transform(stats.indexesUsed.begin(),
+                   stats.indexesUsed.end(),
+                   std::back_inserter(indexesUsedVec),
+                   [](std::string idx) -> Value { return Value(idx); });
+    doc["indexesUsed"] = Value{std::move(indexesUsedVec)};
+}
+
 void DocumentSourceLookUp::serializeToArrayWithBothSyntaxes(
     std::vector<Value>& array, boost::optional<ExplainOptions::Verbosity> explain) const {
 
@@ -790,6 +844,11 @@ void DocumentSourceLookUp::serializeToArrayWithBothSyntaxes(
                           << _unwindSrc->preserveNullAndEmptyArrays() << "includeArrayIndex"
                           << (indexPath ? Value(indexPath->fullPath()) : Value())));
         }
+
+        if (explain.get() >= ExplainOptions::Verbosity::kExecStats) {
+            appendSpecificExecStats(output);
+        }
+
         array.push_back(output.freezeToValue());
     } else {
         array.push_back(output.freezeToValue());

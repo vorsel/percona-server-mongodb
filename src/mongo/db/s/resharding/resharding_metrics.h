@@ -52,7 +52,8 @@ public:
     ReshardingMetrics(const ReshardingMetrics&) = delete;
     ReshardingMetrics(ReshardingMetrics&&) = delete;
 
-    explicit ReshardingMetrics(ServiceContext* svcCtx) : _svcCtx(svcCtx) {}
+    explicit ReshardingMetrics(ServiceContext* svcCtx)
+        : _svcCtx(svcCtx), _cumulativeOp(svcCtx->getFastClockSource()) {}
 
     static ReshardingMetrics* get(ServiceContext*) noexcept;
 
@@ -84,7 +85,7 @@ public:
     void onCompletion(ReshardingOperationStatusEnum) noexcept;
 
     struct ReporterOptions {
-        enum class Role { kAll, kDonor, kRecipient, kCoordinator };
+        enum class Role { kDonor, kRecipient, kCoordinator };
         ReporterOptions(Role role, UUID id, NamespaceString nss, BSONObj shardKey, bool unique)
             : role(role),
               id(std::move(id)),
@@ -100,18 +101,17 @@ public:
     };
     BSONObj reportForCurrentOp(const ReporterOptions& options) const noexcept;
 
-    /**
-     * Append metrics to the builder in CurrentOp format for the given `role`.
-     * If `role` is omitted, append in ServerStatus format.
-     * There are significant format differences. ServerStatus:
-     *   - Uses integers instead of names for enum values to improve FTDC compression.
-     *   - Uses millisecond time intervals and + 'Millis' field name suffixes.
-     *   - Has no role. Any data from any available resharding role is merged in.
-     */
-    void serialize(BSONObjBuilder*, ReporterOptions::Role role = ReporterOptions::Role::kAll) const;
+    // Append metrics to the builder in CurrentOp format for the given `role`.
+    void serializeCurrentOpMetrics(BSONObjBuilder*, ReporterOptions::Role role) const;
+
+    // Append metrics to the builder in CumulativeOp (ServerStatus) format.
+    void serializeCumulativeOpMetrics(BSONObjBuilder*) const;
 
     // Reports the elapsed time for the active resharding operation, or `boost::none`.
     boost::optional<Milliseconds> getOperationElapsedTime() const;
+
+    // Reports the estimated remaining time for the active resharding operation, or `boost::none`.
+    boost::optional<Milliseconds> getOperationRemainingTime() const;
 
 private:
     ServiceContext* const _svcCtx;
@@ -125,7 +125,7 @@ private:
     int64_t _failed = 0;
     int64_t _canceled = 0;
 
-    // Metrics for an active resharding operation. Accesses must be serialized using `_mutex`.
+    // Metrics for resharding operation. Accesses must be serialized using `_mutex`.
     struct OperationMetrics {
         // Allows tracking elapsed time for the resharding operation and its sub operations (e.g.,
         // applying oplog entries).
@@ -135,7 +135,6 @@ private:
 
             void start() noexcept;
 
-            void tryEnd() noexcept;
             void end() noexcept;
 
             Milliseconds duration() const noexcept;
@@ -153,12 +152,11 @@ private:
               inCriticalSection(clockSource) {}
 
         using Role = ReporterOptions::Role;
-        void append(BSONObjBuilder*, Role) const;
+        void appendCurrentOpMetrics(BSONObjBuilder*, Role) const;
 
-        bool isCompleted() const noexcept {
-            return !(opStatus == ReshardingOperationStatusEnum::kRunning ||
-                     opStatus == ReshardingOperationStatusEnum::kInactive);
-        }
+        void appendCumulativeOpMetrics(BSONObjBuilder*) const;
+
+        boost::optional<Milliseconds> remainingOperationTime() const;
 
         TimeInterval runningOperation;
         ReshardingOperationStatusEnum opStatus = ReshardingOperationStatusEnum::kInactive;
@@ -181,6 +179,7 @@ private:
         CoordinatorStateEnum coordinatorState = CoordinatorStateEnum::kUnused;
     };
     boost::optional<OperationMetrics> _currentOp;
+    OperationMetrics _cumulativeOp;
 };
 
 }  // namespace mongo

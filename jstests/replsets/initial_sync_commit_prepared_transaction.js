@@ -3,7 +3,10 @@
  * test this, we have to pause collection cloning and run commitTransaction so that the oplog entry
  * is applied during the oplog application phase of initial sync.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
 (function() {
@@ -25,6 +28,10 @@ replTest.initiate(config);
 
 const primary = replTest.getPrimary();
 let secondary = replTest.getSecondary();
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 const dbName = "test";
 const collName = "initial_sync_commit_prepared_transaction";

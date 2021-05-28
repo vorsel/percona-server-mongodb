@@ -29,7 +29,6 @@
 
 #pragma once
 
-#include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/expression.h"
 

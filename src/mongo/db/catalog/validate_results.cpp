@@ -37,18 +37,31 @@ void ValidateResults::appendToResultObj(BSONObjBuilder* resultObj, bool debuggin
     if (readTimestamp) {
         resultObj->append("readTimestamp", readTimestamp.get());
     }
-    resultObj->append("warnings", warnings);
-    resultObj->append("errors", errors);
+
+    static constexpr std::size_t kMaxErrorWarningSizeBytes = 2 * 1024 * 1024;
+    auto appendRangeSizeLimited = [resultObj](StringData fieldName, const auto& values) {
+        std::size_t usedSize = 0;
+        BSONArrayBuilder arr(resultObj->subarrayStart(fieldName));
+        for (auto it = values.begin(), end = values.end();
+             it != end && usedSize < kMaxErrorWarningSizeBytes;
+             ++it) {
+            arr.append(*it);
+            usedSize += it->size();
+        }
+    };
+
+    appendRangeSizeLimited("warnings"_sd, warnings);
+    appendRangeSizeLimited("errors"_sd, errors);
+
     resultObj->append("extraIndexEntries", extraIndexEntries);
     resultObj->append("missingIndexEntries", missingIndexEntries);
 
-    // Need to convert RecordId to the appropriate type.
+    // Need to convert RecordId to a printable type.
     BSONArrayBuilder builder;
     for (const RecordId& corruptRecord : corruptRecords) {
-        corruptRecord.withFormat(
-            [&](RecordId::Null n) { builder.append("null"); },
-            [&](const int64_t rid) { builder.append(rid); },
-            [&](const char* str, int size) { builder.append(OID::from(str)); });
+        BSONObjBuilder objBuilder;
+        corruptRecord.serializeToken("", &objBuilder);
+        builder.append(objBuilder.done().firstElement());
     }
     resultObj->append("corruptRecords", builder.arr());
 

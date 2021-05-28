@@ -5,6 +5,8 @@
 // classes in mongos.
 "use strict";
 
+load("jstests/libs/sbe_assert_error_override.js");  // Override error-code-checking APIs.
+
 var st = new ShardingTest({mongos: 1, shards: 1, rs: {nodes: 3}});
 
 var db = st.getDB('test');

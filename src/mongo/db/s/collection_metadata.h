@@ -170,10 +170,16 @@ public:
      */
     void toBSONBasic(BSONObjBuilder& bb) const;
 
+    BSONObj toBSON() const;
+
     /**
      * String output of the collection and shard versions.
      */
     std::string toStringBasic() const;
+
+    std::string toString() const {
+        return toStringBasic();
+    }
 
     //
     // Methods used for orphan filtering and general introspection of the chunks owned by the shard
@@ -253,6 +259,11 @@ public:
     const boost::optional<TypeCollectionReshardingFields>& getReshardingFields() const {
         invariant(isSharded());
         return _cm->getReshardingFields();
+    }
+
+    const boost::optional<TypeCollectionTimeseriesFields>& getTimeseriesFields() const {
+        invariant(isSharded());
+        return _cm->getTimeseriesFields();
     }
 
 private:

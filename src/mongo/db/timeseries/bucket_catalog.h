@@ -29,7 +29,8 @@
 
 #pragma once
 
-#include <deque>
+#include <boost/container/small_vector.hpp>
+#include <boost/container/static_vector.hpp>
 #include <queue>
 
 #include "mongo/bson/unordered_fields_bsonobj_comparator.h"
@@ -37,48 +38,28 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/timeseries/timeseries_gen.h"
 #include "mongo/db/views/view.h"
+#include "mongo/stdx/unordered_map.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 class BucketCatalog {
-    struct Bucket;
     struct ExecutionStats;
     class MinMax;
-    using IdleList = std::list<Bucket*>;
+
+    // Number of new field names we can hold in NewFieldNames without needing to allocate memory.
+    static constexpr std::size_t kNumStaticNewFields = 10;
+    using NewFieldNames = boost::container::small_vector<StringMapHashedKey, kNumStaticNewFields>;
 
 public:
+    class Bucket;
+
     enum class CombineWithInsertsFromOtherClients {
         kAllow,
         kDisallow,
     };
 
-    class BucketId {
-        friend class BucketCatalog;
-
-    public:
-        const OID& operator*() const;
-        const OID* operator->() const;
-
-        bool operator==(const BucketId& other) const;
-        bool operator!=(const BucketId& other) const;
-        bool operator<(const BucketId& other) const;
-
-        template <typename H>
-        friend H AbslHashValue(H h, const BucketId& bucketId) {
-            return H::combine(std::move(h), bucketId._num);
-        }
-
-        static BucketId min();
-
-    private:
-        BucketId(uint64_t num);
-
-        std::shared_ptr<OID> _id{std::make_shared<OID>(OID::gen())};
-        uint64_t _num;
-    };
-
     struct CommitInfo {
-        StatusWith<SingleWriteResult> result;
         boost::optional<repl::OpTime> opTime;
         boost::optional<OID> electionId;
     };
@@ -98,9 +79,8 @@ public:
 
     public:
         WriteBatch() = delete;
-        WriteBatch(const std::shared_ptr<Bucket>& bucket,
-                   const UUID& lsid,
-                   const std::shared_ptr<ExecutionStats>& stats);
+
+        WriteBatch(Bucket* bucket, const UUID& lsid, const std::shared_ptr<ExecutionStats>& stats);
 
         /**
          * Attempt to claim the right to commit (or abort) a batch. If it returns true, rights are
@@ -115,13 +95,12 @@ public:
          */
         StatusWith<CommitInfo> getResult() const;
 
-        std::shared_ptr<Bucket> bucket() const;
-        BucketId bucketId() const;
+        Bucket* bucket() const;
 
         const std::vector<BSONObj>& measurements() const;
         const BSONObj& min() const;
         const BSONObj& max() const;
-        const StringSet& newFieldNamesToBeInserted() const;
+        const StringMap<std::size_t>& newFieldNamesToBeInserted() const;
         uint32_t numPreviouslyCommittedMeasurements() const;
 
         /**
@@ -145,7 +124,7 @@ public:
         /**
          * Record a set of new-to-the-bucket fields. Active batches only.
          */
-        void _recordNewFields(StringSet&& fields);
+        void _recordNewFields(NewFieldNames&& fields);
 
         /**
          * Prepare the batch for commit. Sets min/max appropriately, records the number of documents
@@ -162,27 +141,27 @@ public:
 
         /**
          * Abandon the write batch and notify any waiters that the bucket has been cleared. Must
-         * have commit rights.
+         * have commit rights. Parameter controls whether the function is allowed to access the
+         * bucket.
          */
-        void _abort();
+        void _abort(const boost::optional<Status>& status, bool canAccessBucket);
 
-        std::shared_ptr<Bucket> _bucket;
-        const BucketId _bucketId;
+
+        Bucket* _bucket;
         const UUID _lsid;
         std::shared_ptr<ExecutionStats> _stats;
 
         std::vector<BSONObj> _measurements;
         BSONObj _min;  // Batch-local min; full if first batch, updates otherwise.
         BSONObj _max;  // Batch-local max; full if first batch, updates otherwise.
-        uint32_t _numPreviouslyCommittedMeasurements;
-        StringSet _newFieldNamesToBeInserted;
+        uint32_t _numPreviouslyCommittedMeasurements = 0;
+        StringMap<std::size_t> _newFieldNamesToBeInserted;  // Value is hash of string key
 
         bool _active = true;
 
         AtomicWord<bool> _commitRights{false};
         SharedPromise<CommitInfo> _promise;
     };
-
 
     static BucketCatalog& get(ServiceContext* svcCtx);
     static BucketCatalog& get(OperationContext* opCtx);
@@ -200,32 +179,47 @@ public:
      * Returns an empty document if the given bucket cannot be found or if this time-series
      * collection was not created with a metadata field name.
      */
-    BSONObj getMetadata(const BucketId& bucketId) const;
+    BSONObj getMetadata(Bucket* bucket) const;
 
     /**
      * Returns the WriteBatch into which the document was inserted. Any caller who receives the same
-     * batch may commit or abort the batch. See WriteBatch for more details.
+     * batch may commit or abort the batch after claiming commit rights. See WriteBatch for more
+     * details.
      */
-    StatusWith<std::shared_ptr<WriteBatch>> insert(OperationContext* opCtx,
-                                                   const NamespaceString& ns,
-                                                   const BSONObj& doc,
-                                                   CombineWithInsertsFromOtherClients combine);
+    StatusWith<std::shared_ptr<WriteBatch>> insert(
+        OperationContext* opCtx,
+        const NamespaceString& ns,
+        const StringData::ComparatorInterface* comparator,
+        const TimeseriesOptions& options,
+        const BSONObj& doc,
+        CombineWithInsertsFromOtherClients combine);
 
     /**
-     * Prepares a batch for commit, transitioning it to an inactive state.
+     * Prepares a batch for commit, transitioning it to an inactive state. Caller must already have
+     * commit rights on batch. Returns true if the batch was successfully prepared, or false if the
+     * batch was aborted.
      */
-    void prepareCommit(std::shared_ptr<WriteBatch> batch);
+    bool prepareCommit(std::shared_ptr<WriteBatch> batch);
 
     /**
-     * Records the result of a batch commit.
+     * Records the result of a batch commit. Caller must already have commit rights on batch, and
+     * batch must have been previously prepared.
      */
     void finish(std::shared_ptr<WriteBatch> batch, const CommitInfo& info);
 
     /**
      * Aborts the given write batch and any other outstanding batches on the same bucket. Caller
-     * must already have commit rights on batch, and batch must not be finished.
+     * must already have commit rights on batch. Uses the provided status when clearing the bucket,
+     * or TimeseriesBucketCleared if not provided.
      */
-    void abort(std::shared_ptr<WriteBatch> batch);
+    void abort(std::shared_ptr<WriteBatch> batch,
+               const boost::optional<Status>& status = boost::none);
+
+    /**
+     * Marks any bucket with the specified OID as cleared and prevents any future inserts from
+     * landing in that bucket.
+     */
+    void clear(const OID& oid);
 
     /**
      * Clears the buckets for the given namespace.
@@ -282,7 +276,12 @@ private:
     struct BucketMetadata {
     public:
         BucketMetadata() = default;
-        BucketMetadata(BSONObj&& obj, std::shared_ptr<const ViewDefinition>& view);
+        BucketMetadata(BSONObj&& obj, const StringData::ComparatorInterface* comparator);
+
+        bool normalized() const {
+            return _normalized;
+        }
+        void normalize();
 
         bool operator==(const BucketMetadata& other) const;
 
@@ -290,45 +289,44 @@ private:
 
         StringData getMetaField() const;
 
-        const CollatorInterface* getCollator() const;
+        const StringData::ComparatorInterface* getComparator() const;
 
         template <typename H>
         friend H AbslHashValue(H h, const BucketMetadata& metadata) {
             return H::combine(std::move(h),
-                              std::hash<std::string_view>()(std::string_view(
-                                  metadata._sorted.objdata(), metadata._sorted.objsize())));
+                              absl::Hash<absl::string_view>()(absl::string_view(
+                                  metadata._metadata.objdata(), metadata._metadata.objsize())));
         }
 
     private:
         BSONObj _metadata;
-        std::shared_ptr<const ViewDefinition> _view;
-
-        // This stores the _metadata object with all fields sorted to allow for binary comparisons.
-        BSONObj _sorted;
+        const StringData::ComparatorInterface* _comparator = nullptr;
+        bool _normalized = false;
     };
 
     class MinMax {
     public:
-        /*
+        /**
          * Updates the min/max according to 'comp', ignoring the 'metaField' field.
          */
         void update(const BSONObj& doc,
                     boost::optional<StringData> metaField,
-                    const StringData::ComparatorInterface* stringComparator,
-                    const std::function<bool(int, int)>& comp);
+                    const StringData::ComparatorInterface* stringComparator);
 
         /**
          * Returns the full min/max object.
          */
-        BSONObj toBSON() const;
+        BSONObj min() const;
+        BSONObj max() const;
 
         /**
          * Returns the updates since the previous time this function was called in the format for
          * an update op.
          */
-        BSONObj getUpdates();
+        BSONObj minUpdates();
+        BSONObj maxUpdates();
 
-        /*
+        /**
          * Returns the approximate memory usage of this MinMax.
          */
         uint64_t getMemoryUsage() const;
@@ -341,119 +339,230 @@ private:
             kUnset,
         };
 
-        void _update(BSONElement elem,
-                     const StringData::ComparatorInterface* stringComparator,
-                     const std::function<bool(int, int)>& comp);
+        void _update(BSONElement elem, const StringData::ComparatorInterface* stringComparator);
         void _updateWithMemoryUsage(MinMax* minMax,
                                     BSONElement elem,
-                                    const StringData::ComparatorInterface* stringComparator,
-                                    const std::function<bool(int, int)>& comp);
+                                    const StringData::ComparatorInterface* stringComparator);
 
-        void _append(BSONObjBuilder* builder) const;
-        void _append(BSONArrayBuilder* builder) const;
+        template <typename GetDataFn>
+        void _append(BSONObjBuilder* builder, GetDataFn getData) const;
+        template <typename GetDataFn>
+        void _append(BSONArrayBuilder* builder, GetDataFn getData) const;
 
-        /*
+        /**
          * Appends updates, if any, to the builder. Returns whether any updates were appended by
          * this MinMax or any MinMaxes below it.
          */
-        bool _appendUpdates(BSONObjBuilder* builder);
+        template <typename GetDataFn>
+        bool _appendUpdates(BSONObjBuilder* builder, GetDataFn getData);
 
-        /*
+        /**
          * Clears the '_updated' flag on this MinMax and all MinMaxes below it.
          */
-        void _clearUpdated();
+        template <typename GetDataFn>
+        void _clearUpdated(GetDataFn getData);
 
         StringMap<MinMax> _object;
         std::vector<MinMax> _array;
-        BSONObj _value;
 
-        Type _type = Type::kUnset;
+        /**
+         * Data bearing representation for MinMax. Can represent unset, Object, Array or Value
+         * (BSONElement).
+         */
+        class Data {
+        public:
+            /**
+             * Set type to value and store provided element without its field name.
+             */
+            void setValue(const BSONElement& elem);
 
-        bool _updated = false;
+            /**
+             * Set type to object.
+             */
+            void setObject();
 
+            /**
+             * Set type to array.
+             */
+            void setArray();
+
+            /**
+             * Set to be the root object.
+             */
+            void setRootObject();
+
+            /**
+             * Returns stored BSONElement with field name as empty string..
+             */
+            BSONElement value() const;
+
+            /**
+             * Returns stored value type and size without needing to construct BSONElement above.
+             */
+            BSONType valueType() const;
+            int valueSize() const;
+
+            /**
+             * Type this MinMax::Data represents, Object, Array, Value or Unset.
+             */
+            Type type() const {
+                return _type;
+            }
+
+            /**
+             * Flag to indicate if this MinMax::Data was updated since last clear.
+             */
+            bool updated() const {
+                return _updated;
+            }
+
+            /**
+             * Clear update flag.
+             */
+            void clearUpdated() {
+                _updated = false;
+            }
+
+        private:
+            // Memory buffer to store BSONElement without the field name
+            std::unique_ptr<char[]> _value;
+
+            // Size of buffer above
+            int _totalSize = 0;
+
+            // Type that this MinMax::Data represents
+            Type _type = Type::kUnset;
+
+            // Flag to indicate if we got updated as part of this MinMax update.
+            bool _updated = false;
+        };
+
+        /**
+         * Helper for the recursive internal functions to access the min data component.
+         */
+        struct GetMin {
+            Data& operator()(MinMax& minmax) const {
+                return minmax._min;
+            }
+            const Data& operator()(const MinMax& minmax) const {
+                return minmax._min;
+            }
+        };
+
+        /**
+         * Helper for the recursive internal functions to access the max data component.
+         */
+        struct GetMax {
+            Data& operator()(MinMax& minmax) const {
+                return minmax._max;
+            }
+            const Data& operator()(const MinMax& minmax) const {
+                return minmax._max;
+            }
+        };
+
+        Data _min;
+        Data _max;
         uint64_t _memoryUsage = 0;
     };
 
-    struct Bucket : public std::enable_shared_from_this<Bucket> {
-        explicit Bucket(const BucketId&);
+    using IdleList = std::list<Bucket*>;
 
-        // Access to the bucket is controlled by this lock
-        mutable Mutex mutex;
+public:
+    class Bucket {
+    public:
+        friend class BucketAccess;
+        friend class BucketCatalog;
 
-        // The ID of the bucket
-        BucketId id;
+        /**
+         * Returns the ID for the underlying bucket.
+         */
+        const OID& id() const;
 
-        // The namespace that this bucket is used for.
-        NamespaceString ns;
+        /**
+         * Returns whether all measurements have been committed.
+         */
+        bool allCommitted() const;
 
-        // The metadata of the data that this bucket contains.
-        BucketMetadata metadata;
-
-        // Top-level field names of the measurements that have been inserted into the bucket.
-        StringSet fieldNames;
-
-        // The minimum values for each field in the bucket.
-        MinMax min;
-
-        // The maximum values for each field in the bucket.
-        MinMax max;
-
-        // The latest time that has been inserted into the bucket.
-        Date_t latestTime;
-
-        // The total size in bytes of the bucket's BSON serialization, including measurements to be
-        // inserted.
-        uint64_t size = 0;
-
-        // The total number of measurements in the bucket, including uncommitted measurements and
-        // measurements to be inserted.
-        uint32_t numMeasurements = 0;
-
-        // The number of committed measurements in the bucket.
-        uint32_t numCommittedMeasurements = 0;
-
-        // Whether the bucket is full. This can be due to number of measurements, size, or time
-        // range.
-        bool full = false;
-
-        // The batch that has been prepared and is currently in the process of being committed, if
-        // any.
-        std::shared_ptr<WriteBatch> preparedBatch;
-
-        // Per-logical session batches that are actively being inserted into.
-        stdx::unordered_map<UUID, std::shared_ptr<WriteBatch>, UUID::Hash> batches;
-
-        // If the bucket is in the _idleList, then its position is recorded here.
-        boost::optional<IdleList::iterator> idleListEntry = boost::none;
-
-        // Approximate memory usage of this bucket.
-        uint64_t memoryUsage = sizeof(*this);
-
+    private:
         /**
          * Determines the effect of adding 'doc' to this bucket. If adding 'doc' causes this bucket
          * to overflow, we will create a new bucket and recalculate the change to the bucket size
          * and data fields.
          */
-        void calculateBucketFieldsAndSizeChange(const BSONObj& doc,
-                                                boost::optional<StringData> metaField,
-                                                StringSet* newFieldNamesToBeInserted,
-                                                uint32_t* newFieldNamesSize,
-                                                uint32_t* sizeToBeAdded) const;
+        void _calculateBucketFieldsAndSizeChange(const BSONObj& doc,
+                                                 boost::optional<StringData> metaField,
+                                                 NewFieldNames* newFieldNamesToBeInserted,
+                                                 uint32_t* newFieldNamesSize,
+                                                 uint32_t* sizeToBeAdded) const;
 
         /**
          * Returns whether BucketCatalog::commit has been called at least once on this bucket.
          */
-        bool hasBeenCommitted() const;
+        bool _hasBeenCommitted() const;
 
         /**
-         * Returns whether all measurements have been committed
+         * Return a pointer to the current, open batch.
          */
-        bool allCommitted() const;
+        std::shared_ptr<WriteBatch> _activeBatch(const UUID& lsid,
+                                                 const std::shared_ptr<ExecutionStats>& stats);
 
-        std::shared_ptr<WriteBatch> activeBatch(const UUID& lsid,
-                                                const std::shared_ptr<ExecutionStats>& stats);
+        // Access to the bucket is controlled by this lock
+        mutable Mutex _mutex;
+
+        // The bucket ID for the underlying document
+        OID _id = OID::gen();
+
+        // The namespace that this bucket is used for.
+        NamespaceString _ns;
+
+        // The metadata of the data that this bucket contains.
+        BucketMetadata _metadata;
+
+        // Extra metadata combinations that are supported without normalizing the metadata object.
+        static constexpr std::size_t kNumFieldOrderCombinationsWithoutNormalizing = 1;
+        boost::container::static_vector<BSONObj, kNumFieldOrderCombinationsWithoutNormalizing>
+            _nonNormalizedKeyMetadatas;
+
+        // Top-level field names of the measurements that have been inserted into the bucket.
+        StringSet _fieldNames;
+
+        // The minimum and maximum values for each field in the bucket.
+        MinMax _minmax;
+
+        // The latest time that has been inserted into the bucket.
+        Date_t _latestTime;
+
+        // The total size in bytes of the bucket's BSON serialization, including measurements to be
+        // inserted.
+        uint64_t _size = 0;
+
+        // The total number of measurements in the bucket, including uncommitted measurements and
+        // measurements to be inserted.
+        uint32_t _numMeasurements = 0;
+
+        // The number of committed measurements in the bucket.
+        uint32_t _numCommittedMeasurements = 0;
+
+        // Whether the bucket is full. This can be due to number of measurements, size, or time
+        // range.
+        bool _full = false;
+
+        // The batch that has been prepared and is currently in the process of being committed, if
+        // any.
+        std::shared_ptr<WriteBatch> _preparedBatch;
+
+        // Batches, per logical session, that haven't been committed or aborted yet.
+        stdx::unordered_map<UUID, std::shared_ptr<WriteBatch>, UUID::Hash> _batches;
+
+        // If the bucket is in _idleBuckets, then its position is recorded here.
+        boost::optional<IdleList::iterator> _idleListEntry = boost::none;
+
+        // Approximate memory usage of this bucket.
+        uint64_t _memoryUsage = sizeof(*this);
     };
 
+private:
     struct ExecutionStats {
         AtomicWord<long long> numBucketInserts;
         AtomicWord<long long> numBucketUpdates;
@@ -468,6 +577,103 @@ private:
         AtomicWord<long long> numMeasurementsCommitted;
     };
 
+    enum class BucketState {
+        // Bucket can be inserted into, and does not have an outstanding prepared commit
+        kNormal,
+        // Bucket can be inserted into, and has a prepared commit outstanding.
+        kPrepared,
+        // Bucket can no longer be inserted into, does not have an outstanding prepared
+        // commit.
+        kCleared,
+        // Bucket can no longer be inserted into, but still has an outstanding
+        // prepared commit. Any writer other than the one who prepared the
+        // commit should receive a WriteConflictException.
+        kPreparedAndCleared,
+    };
+
+    /**
+     * Key to lookup open Bucket for namespace and metadata.
+     */
+    struct BucketKey {
+        NamespaceString ns;
+        BucketMetadata metadata;
+
+        /**
+         * Creates a new BucketKey with a different internal metadata object.
+         */
+        BucketKey withMetadata(BSONObj meta) const {
+            return {ns, {std::move(meta), metadata.getComparator()}};
+        }
+
+        bool operator==(const BucketKey& other) const {
+            return ns == other.ns && metadata == other.metadata;
+        }
+
+        template <typename H>
+        friend H AbslHashValue(H h, const BucketKey& key) {
+            return H::combine(std::move(h), key.ns, key.metadata);
+        }
+    };
+
+    /**
+     * BucketKey with pre-calculated hash. To avoiding calculating the hash while holding locks.
+     *
+     * The unhashed BucketKey is stored inside HashedBucketKey by reference and must not go out of
+     * scope for the lifetime of the returned HashedBucketKey.
+     */
+    struct HashedBucketKey {
+        operator BucketKey() const {
+            return *key;
+        }
+        const BucketKey* key;
+        std::size_t hash;
+    };
+
+    /**
+     * Hasher to support heterogeneous lookup for BucketKey and HashedBucketKey.
+     */
+    struct BucketHasher {
+        // This using directive activates heterogeneous lookup in the hash table
+        using is_transparent = void;
+
+        std::size_t operator()(const BucketKey& key) const {
+            // Use the default absl hasher.
+            return absl::Hash<BucketKey>{}(key);
+        }
+
+        std::size_t operator()(const HashedBucketKey& key) const {
+            return key.hash;
+        }
+
+        /**
+         * Pre-calculates a hashed BucketKey.
+         */
+        HashedBucketKey hashed_key(const BucketKey& key) {
+            return HashedBucketKey{&key, operator()(key)};
+        }
+    };
+
+    /**
+     * Equality, provides comparison between hashed and unhashed bucket keys.
+     */
+    struct BucketEq {
+        // This using directive activates heterogeneous lookup in the hash table
+        using is_transparent = void;
+
+        bool operator()(const BucketKey& lhs, const BucketKey& rhs) const {
+            return lhs == rhs;
+        }
+        bool operator()(const BucketKey& lhs, const HashedBucketKey& rhs) const {
+            return lhs == *rhs.key;
+        }
+        bool operator()(const HashedBucketKey& lhs, const BucketKey& rhs) const {
+            return *lhs.key == rhs;
+        }
+        bool operator()(const HashedBucketKey& lhs, const HashedBucketKey& rhs) const {
+            return *lhs.key == *rhs.key;
+        }
+    };
+
     /**
      * Helper class to handle all the locking necessary to lookup and lock a bucket for use. This
      * is intended primarily for using a single bucket, including replacing it when it becomes full.
@@ -478,17 +684,16 @@ private:
     public:
         BucketAccess() = delete;
         BucketAccess(BucketCatalog* catalog,
-                     const std::tuple<NamespaceString, BucketMetadata>& key,
+                     BucketKey& key,
                      ExecutionStats* stats,
                      const Date_t& time);
-        BucketAccess(BucketCatalog* catalog, const BucketId& bucketId);
-        BucketAccess(BucketCatalog* catalog, const std::shared_ptr<Bucket>& bucket);
+        BucketAccess(BucketCatalog* catalog, Bucket* bucket);
         ~BucketAccess();
 
         bool isLocked() const;
         Bucket* operator->();
         operator bool() const;
-        operator std::shared_ptr<Bucket>() const;
+        operator Bucket*() const;
 
         // Release the bucket lock, typically in order to reacquire the catalog lock.
         void release();
@@ -508,28 +713,50 @@ private:
         Date_t getTime() const;
 
     private:
-        // Helper to find and lock an open bucket for the given metadata if it exists. Requires a
-        // shared lock on the catalog. Returns true if the bucket exists and was locked.
-        bool _findOpenBucketAndLock(std::size_t hash);
+        /**
+         * Helper to find and lock an open bucket for the given metadata if it exists. Takes a
+         * shared lock on the catalog. Returns the state of the bucket if it is locked and usable.
+         * In case the bucket does not exist or was previously cleared and thus is not usable, the
+         * return value will be BucketState::kCleared.
+         */
+        BucketState _findOpenBucketThenLock(const HashedBucketKey& key);
+
+        /**
+         * Same as _findOpenBucketThenLock above but takes an exclusive lock on the catalog. In
+         * addition to finding the bucket it also store a non-normalized key if there are available
+         * slots in the bucket.
+         */
+        BucketState _findOpenBucketThenLockAndStoreKey(const HashedBucketKey& normalizedKey,
+                                                       const HashedBucketKey& key,
+                                                       BSONObj&& metadata);
+
+        /**
+         * Helper to determine the state of the bucket that is found by _findOpenBucketThenLock and
+         * _findOpenBucketThenLockAndStoreKey. Requires the bucket lock to be acquired before
+         * calling this function and it may release the lock depending on the state.
+         */
+        BucketState _confirmStateForAcquiredBucket();
 
         // Helper to find an open bucket for the given metadata if it exists, create it if it
         // doesn't, and lock it. Requires an exclusive lock on the catalog.
-        void _findOrCreateOpenBucketAndLock(std::size_t hash);
+        void _findOrCreateOpenBucketThenLock(const HashedBucketKey& normalizedKey,
+                                             const HashedBucketKey& key);
 
         // Lock _bucket.
         void _acquire();
 
-        // Allocate a new bucket in the catalog, set the local state to that bucket, and aquire
+        // Allocate a new bucket in the catalog, set the local state to that bucket, and acquire
         // a lock on it.
-        void _create(bool openedDuetoMetadata = true);
+        void _create(const HashedBucketKey& normalizedKey,
+                     const HashedBucketKey& key,
+                     bool openedDuetoMetadata = true);
 
         BucketCatalog* _catalog;
-        const std::tuple<NamespaceString, BucketMetadata>* _key = nullptr;
+        BucketKey* _key = nullptr;
         ExecutionStats* _stats = nullptr;
         const Date_t* _time = nullptr;
 
-        BucketId _id = BucketId::min();
-        std::shared_ptr<Bucket> _bucket;
+        Bucket* _bucket = nullptr;
         stdx::unique_lock<Mutex> _guard;
     };
 
@@ -543,23 +770,39 @@ private:
     /**
      * Removes the given bucket from the bucket catalog's internal data structures.
      */
-    bool _removeBucket(const BucketId& bucketId, bool bucketIsUnused);
+    bool _removeBucket(Bucket* bucket, bool expiringBuckets);
+
+    /**
+     * Removes extra non-normalized BucketKey's for the given bucket from the
+     * bucket catalog's internal data structures.
+     */
+    void _removeNonNormalizedKeysForBucket(Bucket* bucket);
+
+    /**
+     * Aborts any batches it can for the given bucket, then removes the bucket. If batch is
+     * non-null, it is assumed that the caller has commit rights for that batch.
+     */
+    void _abort(stdx::unique_lock<Mutex>& lk,
+                Bucket* bucket,
+                std::shared_ptr<WriteBatch> batch,
+                const boost::optional<Status>& status);
 
     /**
      * Adds the bucket to a list of idle buckets to be expired at a later date
      */
-    void _markBucketIdle(const std::shared_ptr<Bucket>& bucket);
+    void _markBucketIdle(Bucket* bucket);
 
     /**
-     * Remove the bucket from the list of idle buckets
+     * Remove the bucket from the list of idle buckets. The second parameter encodes whether the
+     * caller holds a lock on _idleMutex.
      */
-    void _markBucketNotIdle(const std::shared_ptr<Bucket>& bucket);
+    void _markBucketNotIdle(Bucket* bucket, bool locked);
 
     /**
      * Verify the bucket is currently unused by taking a lock on it. Must hold exclusive lock from
      * the outside for the result to be meaningful.
      */
-    void _verifyBucketIsUnused(const Bucket* bucket) const;
+    void _verifyBucketIsUnused(Bucket* bucket) const;
 
     /**
      * Expires idle buckets until the bucket catalog's memory usage is below the expiry threshold.
@@ -569,15 +812,25 @@ private:
     std::size_t _numberOfIdleBuckets() const;
 
     // Allocate a new bucket (and ID) and add it to the catalog
-    std::shared_ptr<Bucket> _allocateBucket(const std::tuple<NamespaceString, BucketMetadata>& key,
-                                            const Date_t& time,
-                                            ExecutionStats* stats,
-                                            bool openedDuetoMetadata);
+    Bucket* _allocateBucket(const BucketKey& key,
+                            const Date_t& time,
+                            ExecutionStats* stats,
+                            bool openedDuetoMetadata);
 
     std::shared_ptr<ExecutionStats> _getExecutionStats(const NamespaceString& ns);
     const std::shared_ptr<ExecutionStats> _getExecutionStats(const NamespaceString& ns) const;
 
-    void _setIdTimestamp(BucketId* id, const Date_t& time);
+    void _setIdTimestamp(Bucket* bucket, const Date_t& time);
+
+    /**
+     * Changes the bucket state, taking into account the current state, the specified target state,
+     * and allowed state transitions. The return value, if set, is the final state of the bucket
+     * with the given id; if no such bucket exists, the return value will not be set.
+     *
+     * Ex. For a bucket with state kPrepared, and a target of kCleared, the return will be
+     * kPreparedAndCleared.
+     */
+    boost::optional<BucketState> _setBucketState(const OID& id, BucketState target);
 
     /**
      * You must hold a lock on _bucketMutex when accessing _allBuckets or _openBuckets.
@@ -598,11 +851,14 @@ private:
     mutable StripedMutex _bucketMutex;
 
     // All buckets currently in the catalog, including buckets which are full but not yet committed.
-    stdx::unordered_map<BucketId, std::shared_ptr<Bucket>> _allBuckets;
+    stdx::unordered_set<std::unique_ptr<Bucket>> _allBuckets;
 
     // The current open bucket for each namespace and metadata pair.
-    stdx::unordered_map<std::tuple<NamespaceString, BucketMetadata>, std::shared_ptr<Bucket>>
-        _openBuckets;
+    stdx::unordered_map<BucketKey, Bucket*, BucketHasher, BucketEq> _openBuckets;
+
+    // Bucket state
+    mutable Mutex _statesMutex = MONGO_MAKE_LATCH("BucketCatalog::_statesMutex");
+    stdx::unordered_map<OID, BucketState, OID::Hasher> _bucketStates;
 
     // This mutex protects access to _idleBuckets
     mutable Mutex _idleMutex = MONGO_MAKE_LATCH("BucketCatalog::_idleMutex");

@@ -90,7 +90,7 @@ protected:
                                           {DonorShardEntry(ShardId("shard0000"), {})},
                                           {RecipientShardEntry(ShardId("shard0001"), {})});
         doc.setCommonReshardingMetadata(meta);
-        emplaceFetchTimestampIfExists(doc, std::move(fetchTimestamp));
+        emplaceCloneTimestampIfExists(doc, std::move(fetchTimestamp));
         return doc;
     }
 
@@ -200,7 +200,7 @@ protected:
         reshardingFields.setDonorFields(TypeCollectionDonorFields(
             coordinatorDoc.getTempReshardingNss(),
             coordinatorDoc.getReshardingKey(),
-            resharding::extractShardIds(coordinatorDoc.getRecipientShards())));
+            extractShardIdsFromParticipantEntries(coordinatorDoc.getRecipientShards())));
 
         auto originalNssCatalogEntry = makeOriginalCollectionCatalogEntry(
             coordinatorDoc,
@@ -251,12 +251,12 @@ protected:
                       0);
         ASSERT(coordinatorDoc.getState() == expectedCoordinatorDoc.getState());
         ASSERT(coordinatorDoc.getActive());
-        if (expectedCoordinatorDoc.getFetchTimestamp()) {
-            ASSERT(coordinatorDoc.getFetchTimestamp());
-            ASSERT_EQUALS(coordinatorDoc.getFetchTimestamp().get(),
-                          expectedCoordinatorDoc.getFetchTimestamp().get());
+        if (expectedCoordinatorDoc.getCloneTimestamp()) {
+            ASSERT(coordinatorDoc.getCloneTimestamp());
+            ASSERT_EQUALS(coordinatorDoc.getCloneTimestamp().get(),
+                          expectedCoordinatorDoc.getCloneTimestamp().get());
         } else {
-            ASSERT(!coordinatorDoc.getFetchTimestamp());
+            ASSERT(!coordinatorDoc.getCloneTimestamp());
         }
 
         // Confirm the (non)existence of the CoordinatorDocument abortReason.
@@ -398,12 +398,12 @@ protected:
         ASSERT_EQUALS(onDiskReshardingFields.getRecipientFields()->getSourceNss(),
                       expectedReshardingFields.getRecipientFields()->getSourceNss());
 
-        if (expectedReshardingFields.getRecipientFields()->getFetchTimestamp()) {
-            ASSERT(onDiskReshardingFields.getRecipientFields()->getFetchTimestamp());
-            ASSERT_EQUALS(onDiskReshardingFields.getRecipientFields()->getFetchTimestamp().get(),
-                          expectedReshardingFields.getRecipientFields()->getFetchTimestamp().get());
+        if (expectedReshardingFields.getRecipientFields()->getCloneTimestamp()) {
+            ASSERT(onDiskReshardingFields.getRecipientFields()->getCloneTimestamp());
+            ASSERT_EQUALS(onDiskReshardingFields.getRecipientFields()->getCloneTimestamp().get(),
+                          expectedReshardingFields.getRecipientFields()->getCloneTimestamp().get());
         } else {
-            ASSERT(!onDiskReshardingFields.getRecipientFields()->getFetchTimestamp());
+            ASSERT(!onDiskReshardingFields.getRecipientFields()->getCloneTimestamp());
         }
 
         if (onDiskReshardingFields.getState() == CoordinatorStateEnum::kError) {
@@ -475,7 +475,7 @@ protected:
         TypeCollectionDonorFields donorField(
             expectedCoordinatorDoc.getTempReshardingNss(),
             expectedCoordinatorDoc.getReshardingKey(),
-            resharding::extractShardIds(expectedCoordinatorDoc.getRecipientShards()));
+            extractShardIdsFromParticipantEntries(expectedCoordinatorDoc.getRecipientShards()));
         expectedReshardingFields.setDonorFields(donorField);
         if (auto abortReason = expectedCoordinatorDoc.getAbortReason()) {
             AbortReason abortReasonStruct;
@@ -522,10 +522,11 @@ protected:
             TypeCollectionReshardingFields reshardingFields(
                 expectedCoordinatorDoc.getReshardingUUID());
             reshardingFields.setState(expectedCoordinatorDoc.getState());
-            reshardingFields.setDonorFields(TypeCollectionDonorFields(
-                expectedCoordinatorDoc.getTempReshardingNss(),
-                expectedCoordinatorDoc.getReshardingKey(),
-                resharding::extractShardIds(expectedCoordinatorDoc.getRecipientShards())));
+            reshardingFields.setDonorFields(
+                TypeCollectionDonorFields(expectedCoordinatorDoc.getTempReshardingNss(),
+                                          expectedCoordinatorDoc.getReshardingKey(),
+                                          extractShardIdsFromParticipantEntries(
+                                              expectedCoordinatorDoc.getRecipientShards())));
 
             auto originalNssCatalogEntry = makeOriginalCollectionCatalogEntry(
                 expectedCoordinatorDoc,
@@ -545,10 +546,14 @@ protected:
                 true));
         }
 
-        resharding::insertCoordDocAndChangeOrigCollEntry(opCtx, expectedCoordinatorDoc);
+        auto reshardingCoordinatorExternalState = ReshardingCoordinatorExternalStateImpl();
+
+        reshardingCoordinatorExternalState.insertCoordDocAndChangeOrigCollEntry(
+            opCtx, expectedCoordinatorDoc);
 
         auto shardsAndChunks =
-            resharding::calculateParticipantShardsAndChunks(opCtx, expectedCoordinatorDoc);
+            reshardingCoordinatorExternalState.calculateParticipantShardsAndChunks(
+                opCtx, expectedCoordinatorDoc);
 
         expectedCoordinatorDoc.setDonorShards(std::move(shardsAndChunks.donorShards));
         expectedCoordinatorDoc.setRecipientShards(std::move(shardsAndChunks.recipientShards));
@@ -562,7 +567,7 @@ protected:
         expectedCoordinatorDoc.setZones(boost::none);
         expectedCoordinatorDoc.setPresetReshardedChunks(boost::none);
 
-        resharding::writeParticipantShardsAndTempCollInfo(
+        reshardingCoordinatorExternalState.writeParticipantShardsAndTempCollInfo(
             opCtx, expectedCoordinatorDoc, initialChunks, zones);
 
         // Check that config.reshardingOperations and config.collections entries are updated
@@ -576,8 +581,10 @@ protected:
 
     void writeStateTransitionUpdateExpectSuccess(
         OperationContext* opCtx, ReshardingCoordinatorDocument expectedCoordinatorDoc) {
-        resharding::writeStateTransitionAndCatalogUpdatesThenBumpShardVersions(
-            opCtx, expectedCoordinatorDoc);
+        auto reshardingCoordinatorExternalState = ReshardingCoordinatorExternalStateImpl();
+        reshardingCoordinatorExternalState
+            .writeStateTransitionAndCatalogUpdatesThenBumpShardVersions(opCtx,
+                                                                        expectedCoordinatorDoc);
 
         // Check that config.reshardingOperations and config.collections entries are updated
         // correctly
@@ -614,7 +621,9 @@ protected:
 
     void removeCoordinatorDocAndReshardingFieldsExpectSuccess(
         OperationContext* opCtx, const ReshardingCoordinatorDocument& coordinatorDoc) {
-        resharding::removeCoordinatorDocAndReshardingFields(opCtx, coordinatorDoc);
+        auto reshardingCoordinatorExternalState = ReshardingCoordinatorExternalStateImpl();
+        reshardingCoordinatorExternalState.removeCoordinatorDocAndReshardingFields(opCtx,
+                                                                                   coordinatorDoc);
 
         auto expectedCoordinatorDoc = coordinatorDoc;
         expectedCoordinatorDoc.setState(CoordinatorStateEnum::kDone);
@@ -695,10 +704,17 @@ TEST_F(ReshardingCoordinatorPersistenceTest, WriteInitialInfoSucceeds) {
         zonesBSON.push_back(zone.toBSON());
     }
 
+    std::vector<BSONObj> presetBSONChunks;
+    for (const auto& chunk : initialChunks) {
+        ReshardedChunk reshardChunk(chunk.getShard(), chunk.getMin(), chunk.getMax());
+        presetBSONChunks.push_back(reshardChunk.toBSON());
+    }
+
     // Persist the updates on disk
     auto expectedCoordinatorDoc = coordinatorDoc;
     expectedCoordinatorDoc.setState(CoordinatorStateEnum::kInitializing);
     expectedCoordinatorDoc.setZones(zonesBSON);
+    expectedCoordinatorDoc.setPresetReshardedChunks(presetBSONChunks);
 
     writeInitialStateAndCatalogUpdatesExpectSuccess(
         operationContext(), expectedCoordinatorDoc, initialChunks, newZones);
@@ -753,7 +769,13 @@ TEST_F(ReshardingCoordinatorPersistenceTest, StateTransitionWithFetchTimestampSu
     // Persist the updates on disk
     auto expectedCoordinatorDoc = coordinatorDoc;
     expectedCoordinatorDoc.setState(CoordinatorStateEnum::kCloning);
-    emplaceFetchTimestampIfExists(expectedCoordinatorDoc, Timestamp(1, 1));
+    emplaceCloneTimestampIfExists(expectedCoordinatorDoc, Timestamp(1, 1));
+    emplaceApproxBytesToCopyIfExists(expectedCoordinatorDoc, [] {
+        ReshardingApproxCopySize approxCopySize;
+        approxCopySize.setApproxBytesToCopy(0);
+        approxCopySize.setApproxDocumentsToCopy(0);
+        return approxCopySize;
+    }());
 
     writeStateTransitionUpdateExpectSuccess(operationContext(), expectedCoordinatorDoc);
     assertChunkVersionIncreasedAfterStateTransition(donorChunk, donorCollectionVersion);
@@ -831,8 +853,10 @@ TEST_F(ReshardingCoordinatorPersistenceTest, StateTransitionWhenCoordinatorDocDo
     // Do not insert initial entry into config.reshardingOperations. Attempt to update coordinator
     // state documents.
     auto coordinatorDoc = makeCoordinatorDoc(CoordinatorStateEnum::kCloning, Timestamp(1, 1));
-    ASSERT_THROWS_CODE(resharding::writeStateTransitionAndCatalogUpdatesThenBumpShardVersions(
-                           operationContext(), coordinatorDoc),
+    auto reshardingCoordinatorExternalState = ReshardingCoordinatorExternalStateImpl();
+    ASSERT_THROWS_CODE(reshardingCoordinatorExternalState
+                           .writeStateTransitionAndCatalogUpdatesThenBumpShardVersions(
+                               operationContext(), coordinatorDoc),
                        AssertionException,
                        5514600);
 }
@@ -845,10 +869,11 @@ TEST_F(ReshardingCoordinatorPersistenceTest,
     expectedCoordinatorDoc.setState(CoordinatorStateEnum::kPreparingToDonate);
 
     // Do not create the config.collections entry for the original collection
-    ASSERT_THROWS_CODE(
-        resharding::insertCoordDocAndChangeOrigCollEntry(operationContext(), coordinatorDoc),
-        AssertionException,
-        ErrorCodes::NamespaceNotFound);
+    auto reshardingCoordinatorExternalState = ReshardingCoordinatorExternalStateImpl();
+    ASSERT_THROWS_CODE(reshardingCoordinatorExternalState.insertCoordDocAndChangeOrigCollEntry(
+                           operationContext(), coordinatorDoc),
+                       AssertionException,
+                       ErrorCodes::NamespaceNotFound);
 }
 
 }  // namespace

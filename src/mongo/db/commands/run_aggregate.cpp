@@ -49,6 +49,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/pipeline/change_stream_invalidation_info.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_exchange.h"
 #include "mongo/db/pipeline/document_source_geo_near.h"
@@ -101,7 +102,7 @@ namespace {
  */
 bool canOptimizeAwayPipeline(const Pipeline* pipeline,
                              const PlanExecutor* exec,
-                             const AggregateCommand& request,
+                             const AggregateCommandRequest& request,
                              bool hasGeoNearStage,
                              bool hasChangeStreamStage) {
     return pipeline && exec && !hasGeoNearStage && !hasChangeStreamStage &&
@@ -121,7 +122,7 @@ bool handleCursorCommand(OperationContext* opCtx,
                          boost::intrusive_ptr<ExpressionContext> expCtx,
                          const NamespaceString& nsForCursor,
                          std::vector<ClientCursor*> cursors,
-                         const AggregateCommand& request,
+                         const AggregateCommandRequest& request,
                          const BSONObj& cmdObj,
                          rpc::ReplyBuilderInterface* result) {
     invariant(!cursors.empty());
@@ -186,6 +187,20 @@ bool handleCursorCommand(OperationContext* opCtx,
         } catch (const ExceptionFor<ErrorCodes::CloseChangeStream>&) {
             // This exception is thrown when a $changeStream stage encounters an event that
             // invalidates the cursor. We should close the cursor and return without error.
+            cursor = nullptr;
+            exec = nullptr;
+            break;
+        } catch (const ExceptionFor<ErrorCodes::ChangeStreamInvalidated>& ex) {
+            // This exception is thrown when a change-stream cursor is invalidated. Set the PBRT
+            // to the resume token of the invalidating event, and mark the cursor response as
+            // invalidated. We expect ExtraInfo to always be present for this exception.
+            const auto extraInfo = ex.extraInfo<ChangeStreamInvalidationInfo>();
+            tassert(
+                5493701, "Missing ChangeStreamInvalidationInfo on exception", extraInfo != nullptr);
+
+            responseBuilder.setPostBatchResumeToken(extraInfo->getInvalidateResumeToken());
+            responseBuilder.setInvalidated();
+
             cursor = nullptr;
             exec = nullptr;
             break;
@@ -266,7 +281,7 @@ bool handleCursorCommand(OperationContext* opCtx,
 }
 
 StatusWith<StringMap<ExpressionContext::ResolvedNamespace>> resolveInvolvedNamespaces(
-    OperationContext* opCtx, const AggregateCommand& request) {
+    OperationContext* opCtx, const AggregateCommandRequest& request) {
     const LiteParsedPipeline liteParsedPipeline(request);
     const auto& pipelineInvolvedNamespaces = liteParsedPipeline.getInvolvedNamespaces();
 
@@ -418,7 +433,7 @@ Status collatorCompatibleWithPipeline(OperationContext* opCtx,
 // versioned. This can happen in the case where we are running in a cluster with a 4.4 mongoS, which
 // does not set any shard version on a $mergeCursors pipeline.
 void setIgnoredShardVersionForMergeCursors(OperationContext* opCtx,
-                                           const AggregateCommand& request) {
+                                           const AggregateCommandRequest& request) {
     auto isMergeCursors = request.getFromMongos() && request.getPipeline().size() > 0 &&
         request.getPipeline().front().firstElementFieldNameStringData() == "$mergeCursors"_sd;
     if (isMergeCursors && !OperationShardingState::isOperationVersioned(opCtx)) {
@@ -429,9 +444,10 @@ void setIgnoredShardVersionForMergeCursors(OperationContext* opCtx,
 
 boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
     OperationContext* opCtx,
-    const AggregateCommand& request,
+    const AggregateCommandRequest& request,
     std::unique_ptr<CollatorInterface> collator,
-    boost::optional<UUID> uuid) {
+    boost::optional<UUID> uuid,
+    ExpressionContext::CollationMatchesDefault collationMatchesDefault) {
     setIgnoredShardVersionForMergeCursors(opCtx, request);
     boost::intrusive_ptr<ExpressionContext> expCtx =
         new ExpressionContext(opCtx,
@@ -443,6 +459,7 @@ boost::intrusive_ptr<ExpressionContext> makeExpressionContext(
                               CurOp::get(opCtx)->dbProfileLevel() > 0);
     expCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
     expCtx->inMultiDocumentTransaction = opCtx->inMultiDocumentTransaction();
+    expCtx->collationMatchesDefault = collationMatchesDefault;
 
     return expCtx;
 }
@@ -489,7 +506,7 @@ void _adjustChangeStreamReadConcern(OperationContext* opCtx) {
 std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createExchangePipelinesIfNeeded(
     OperationContext* opCtx,
     boost::intrusive_ptr<ExpressionContext> expCtx,
-    const AggregateCommand& request,
+    const AggregateCommandRequest& request,
     std::unique_ptr<Pipeline, PipelineDeleter> pipeline,
     boost::optional<UUID> uuid) {
     std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> pipelines;
@@ -507,7 +524,8 @@ std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createExchangePipelinesI
                                            request,
                                            expCtx->getCollator() ? expCtx->getCollator()->clone()
                                                                  : nullptr,
-                                           uuid);
+                                           uuid,
+                                           expCtx->collationMatchesDefault);
 
             // Create a new pipeline for the consumer consisting of a single
             // DocumentSourceExchange.
@@ -526,11 +544,11 @@ std::vector<std::unique_ptr<Pipeline, PipelineDeleter>> createExchangePipelinesI
  * Performs validations related to API versioning and time-series stages.
  * Throws UserAssertion if any of the validations fails
  *     - validation of API versioning on each stage on the pipeline
- *     - validation of API versioning on 'AggregateCommand' request
+ *     - validation of API versioning on 'AggregateCommandRequest' request
  *     - validation of time-series related stages
  */
 void performValidationChecks(const OperationContext* opCtx,
-                             const AggregateCommand& request,
+                             const AggregateCommandRequest& request,
                              const LiteParsedPipeline& liteParsedPipeline) {
     liteParsedPipeline.validate(opCtx);
     aggregation_request_helper::validateRequestForAPIVersion(opCtx, request);
@@ -540,7 +558,7 @@ void performValidationChecks(const OperationContext* opCtx,
 
 Status runAggregate(OperationContext* opCtx,
                     const NamespaceString& nss,
-                    const AggregateCommand& request,
+                    const AggregateCommandRequest& request,
                     const BSONObj& cmdObj,
                     const PrivilegeVector& privileges,
                     rpc::ReplyBuilderInterface* result) {
@@ -549,7 +567,7 @@ Status runAggregate(OperationContext* opCtx,
 
 Status runAggregate(OperationContext* opCtx,
                     const NamespaceString& origNss,
-                    const AggregateCommand& request,
+                    const AggregateCommandRequest& request,
                     const LiteParsedPipeline& liteParsedPipeline,
                     const BSONObj& cmdObj,
                     const PrivilegeVector& privileges,
@@ -564,6 +582,7 @@ Status runAggregate(OperationContext* opCtx,
     // The collation to use for this aggregation. boost::optional to distinguish between the case
     // where the collation has not yet been resolved, and where it has been resolved to nullptr.
     boost::optional<std::unique_ptr<CollatorInterface>> collatorToUse;
+    ExpressionContext::CollationMatchesDefault collatorToUseMatchesDefault;
 
     // The UUID of the collection for the execution namespace of this aggregation.
     boost::optional<UUID> uuid;
@@ -592,7 +611,7 @@ Status runAggregate(OperationContext* opCtx,
         // If this is a change stream, perform special checks and change the execution namespace.
         if (liteParsedPipeline.hasChangeStream()) {
             uassert(4928900,
-                    str::stream() << AggregateCommand::kCollectionUUIDFieldName
+                    str::stream() << AggregateCommandRequest::kCollectionUUIDFieldName
                                   << " is not supported for a change stream",
                     !request.getCollectionUUID());
 
@@ -622,14 +641,16 @@ Status runAggregate(OperationContext* opCtx,
             // If the user specified an explicit collation, adopt it; otherwise, use the simple
             // collation. We do not inherit the collection's default collation or UUID, since
             // the stream may be resuming from a point before the current UUID existed.
-            collatorToUse.emplace(PipelineD::resolveCollator(
-                opCtx, request.getCollation().get_value_or(BSONObj()), nullptr));
+            auto [collator, match] = PipelineD::resolveCollator(
+                opCtx, request.getCollation().get_value_or(BSONObj()), nullptr);
+            collatorToUse.emplace(std::move(collator));
+            collatorToUseMatchesDefault = match;
 
             // Obtain collection locks on the execution namespace; that is, the oplog.
             ctx.emplace(opCtx, nss, AutoGetCollectionViewMode::kViewsForbidden);
         } else if (nss.isCollectionlessAggregateNS() && pipelineInvolvedNamespaces.empty()) {
             uassert(4928901,
-                    str::stream() << AggregateCommand::kCollectionUUIDFieldName
+                    str::stream() << AggregateCommandRequest::kCollectionUUIDFieldName
                                   << " is not supported for a collectionless aggregation",
                     !request.getCollectionUUID());
 
@@ -639,13 +660,17 @@ Status runAggregate(OperationContext* opCtx,
                                  Top::LockType::NotLocked,
                                  AutoStatsTracker::LogMode::kUpdateTopAndCurOp,
                                  0);
-            collatorToUse.emplace(PipelineD::resolveCollator(
-                opCtx, request.getCollation().get_value_or(BSONObj()), nullptr));
+            auto [collator, match] = PipelineD::resolveCollator(
+                opCtx, request.getCollation().get_value_or(BSONObj()), nullptr);
+            collatorToUse.emplace(std::move(collator));
+            collatorToUseMatchesDefault = match;
         } else {
             // This is a regular aggregation. Lock the collection or view.
             ctx.emplace(opCtx, nss, AutoGetCollectionViewMode::kViewsPermitted);
-            collatorToUse.emplace(PipelineD::resolveCollator(
-                opCtx, request.getCollation().get_value_or(BSONObj()), ctx->getCollection()));
+            auto [collator, match] = PipelineD::resolveCollator(
+                opCtx, request.getCollation().get_value_or(BSONObj()), ctx->getCollection());
+            collatorToUse.emplace(std::move(collator));
+            collatorToUseMatchesDefault = match;
             if (ctx->getCollection()) {
                 uuid = ctx->getCollection()->uuid();
             }
@@ -662,7 +687,7 @@ Status runAggregate(OperationContext* opCtx,
             invariant(nss != NamespaceString::kRsOplogNamespace);
             invariant(!nss.isCollectionlessAggregateNS());
             uassert(ErrorCodes::OptionNotSupportedOnView,
-                    str::stream() << AggregateCommand::kCollectionUUIDFieldName
+                    str::stream() << AggregateCommandRequest::kCollectionUUIDFieldName
                                   << " is not supported against a view",
                     !request.getCollectionUUID());
 
@@ -737,7 +762,8 @@ Status runAggregate(OperationContext* opCtx,
         }
 
         invariant(collatorToUse);
-        expCtx = makeExpressionContext(opCtx, request, std::move(*collatorToUse), uuid);
+        expCtx = makeExpressionContext(
+            opCtx, request, std::move(*collatorToUse), uuid, collatorToUseMatchesDefault);
 
         auto pipeline = Pipeline::parse(request.getPipeline(), expCtx);
 

@@ -25,6 +25,7 @@
 # exception statement from all source files in the program, then also delete
 # it in the license file.
 #
+# pylint: disable=too-many-lines
 """
 Common error handling code for IDL compatibility checker.
 
@@ -108,22 +109,50 @@ ERROR_ID_NEW_COMPLEX_PRIVILEGES_NOT_SUBSET = "ID0064"
 ERROR_ID_NEW_ADDITIONAL_COMPLEX_ACCESS_CHECK = "ID0065"
 ERROR_ID_REMOVED_ACCESS_CHECK_FIELD = "ID0066"
 ERROR_ID_ADDED_ACCESS_CHECK_FIELD = "ID0067"
+ERROR_ID_COMMAND_STRICT_TRUE_ERROR = "ID0068"
+ERROR_ID_GENERIC_ARGUMENT_REMOVED = "ID0069"
+ERROR_ID_GENERIC_ARGUMENT_REMOVED_REPLY_FIELD = "ID0070"
+ERROR_ID_COMMAND_PARAMETER_SERIALIZER_NOT_EQUAL = "ID0071"
+ERROR_ID_COMMAND_SERIALIZER_NOT_EQUAL = "ID0072"
+ERROR_ID_REPLY_FIELD_SERIALIZER_NOT_EQUAL = "ID0073"
+ERROR_ID_COMMAND_DESERIALIZER_NOT_EQUAL = "ID0074"
+ERROR_ID_COMMAND_PARAMETER_DESERIALIZER_NOT_EQUAL = "ID0075"
+ERROR_ID_REPLY_FIELD_DESERIALIZER_NOT_EQUAL = "ID0076"
 
 # TODO (SERVER-55203): Remove SKIPPED_COMMANDS logic.
 # Any breaking changes added to API V1 before releasing 5.0 should be added to SKIPPED_COMMANDS to
 # be skipped from compatibility checking.
 SKIPPED_COMMANDS = {
-    "invalidReplySkippedCommand": [ERROR_ID_NEW_REPLY_FIELD_MISSING],
-    "dropDatabase": [ERROR_ID_NEW_REPLY_FIELD_MISSING, ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
-    "createIndexes": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
-    "drop": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
-    "saslStart": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
-    "saslContinue": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
-    "authenticate": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
-    "ping": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
-    "commitTransaction": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
     "abortTransaction": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
-    "hello": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "aggregate": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "authenticate": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "collMod": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "commitTransaction": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "create": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "createIndexes": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "delete": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "drop": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "dropDatabase": [ERROR_ID_NEW_REPLY_FIELD_MISSING, ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "dropIndexes": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "endSessions": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "explain": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "find": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "findAndModify": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "hello": [
+        ERROR_ID_ADDED_ACCESS_CHECK_FIELD,
+        ERROR_ID_OLD_COMMAND_PARAMETER_TYPE_BSON_SERIALIZATION_TYPE_ANY
+    ],
+    "insert": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "invalidReplySkippedCommand": [ERROR_ID_NEW_REPLY_FIELD_MISSING],
+    "killCursors": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "listCollections": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "listDatabases": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "listIndexes": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "ping": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "refreshSessions": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "saslContinue": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "saslStart": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
+    "update": [ERROR_ID_ADDED_ACCESS_CHECK_FIELD],
 }
 
 
@@ -305,6 +334,13 @@ class IDLCompatibilityContext(object):
         """Add an error about a command that was removed."""
         self._add_error(ERROR_ID_REMOVED_COMMAND, command_name,
                         "Old command '%s' was removed from new commands." % (command_name), file)
+
+    def add_command_strict_true_error(self, command_name: str, file: str) -> None:
+        """Add an error about a command that changes from strict: false to strict: true."""
+        self._add_error(
+            ERROR_ID_COMMAND_STRICT_TRUE_ERROR, command_name,
+            "'%s' changes from strict: false in the old version to strict: true in the new version."
+            % (command_name), file)
 
     def add_duplicate_command_name_error(self, command_name: str, dir_name: str, file: str) -> None:
         """Add an error about a duplicate command name within a directory."""
@@ -700,6 +736,22 @@ class IDLCompatibilityContext(object):
                          "that is not equal in the old and new versions.") %
                         (command_name, field_name, type_name), file)
 
+    def add_reply_field_serializer_not_equal_error(self, command_name: str, field_name: str,
+                                                   type_name: str, file: str) -> None:
+        """Add an error about the old and new reply field serializer not being equal."""
+        self._add_error(ERROR_ID_REPLY_FIELD_SERIALIZER_NOT_EQUAL, command_name,
+                        ("'%s' has a reply field or sub-field '%s' of type '%s' that has "
+                         "serializer that is not equal in the old and new versions.") %
+                        (command_name, field_name, type_name), file)
+
+    def add_reply_field_deserializer_not_equal_error(self, command_name: str, field_name: str,
+                                                     type_name: str, file: str) -> None:
+        """Add an error about the old and new reply field deserializer not being equal."""
+        self._add_error(ERROR_ID_REPLY_FIELD_DESERIALIZER_NOT_EQUAL, command_name,
+                        ("'%s' has a reply field or sub-field '%s' of type '%s' that has "
+                         "deserializer that is not equal in the old and new versions.") %
+                        (command_name, field_name, type_name), file)
+
     def add_new_reply_field_type_not_enum_error(self, command_name: str, field_name: str,
                                                 new_field_type: str, old_field_type: str,
                                                 file: str) -> None:
@@ -834,6 +886,38 @@ class IDLCompatibilityContext(object):
                 ("'%s' or its sub-struct has command type '%s' that has cpp_type "
                  "that is not equal in the old and new versions") % (command_name, type_name), file)
 
+    def add_command_or_param_serializer_not_equal_error(self, command_name: str, type_name: str,
+                                                        file: str, field_name: Optional[str],
+                                                        is_command_parameter: bool) -> None:
+        # pylint: disable=too-many-arguments,invalid-name
+        """Add an error about the old and new command or param serializer not being equal."""
+        if is_command_parameter:
+            self._add_error(ERROR_ID_COMMAND_PARAMETER_SERIALIZER_NOT_EQUAL, command_name,
+                            ("'%s' has field or sub-field '%s' of type '%s' that has  "
+                             "serializer that is not equal in the old and new versions") %
+                            (command_name, field_name, type_name), file)
+        else:
+            self._add_error(
+                ERROR_ID_COMMAND_SERIALIZER_NOT_EQUAL, command_name,
+                ("'%s' or its sub-struct has command type '%s' that has serializer "
+                 "that is not equal in the old and new versions") % (command_name, type_name), file)
+
+    def add_command_or_param_deserializer_not_equal_error(self, command_name: str, type_name: str,
+                                                          file: str, field_name: Optional[str],
+                                                          is_command_parameter: bool) -> None:
+        # pylint: disable=too-many-arguments,invalid-name
+        """Add an error about the old and new command or param deserializer not being equal."""
+        if is_command_parameter:
+            self._add_error(ERROR_ID_COMMAND_PARAMETER_DESERIALIZER_NOT_EQUAL, command_name,
+                            ("'%s' has field or sub-field '%s' of type '%s' that has  "
+                             "deserializer that is not equal in the old and new versions") %
+                            (command_name, field_name, type_name), file)
+        else:
+            self._add_error(
+                ERROR_ID_COMMAND_DESERIALIZER_NOT_EQUAL, command_name,
+                ("'%s' or its sub-struct has command type '%s' that has deserializer "
+                 "that is not equal in the old and new versions") % (command_name, type_name), file)
+
     def add_old_reply_field_bson_any_error(self, command_name: str, field_name: str,
                                            old_field_type: str, file: str) -> None:
         """
@@ -943,6 +1027,20 @@ class IDLCompatibilityContext(object):
         self._add_error(ERROR_ID_ADDED_ACCESS_CHECK_FIELD, command_name, (
             "'%s' has added the access_check field in the new command when it did not exist in the "
             "old command and the api_version is '1'") % (command_name), file)
+
+    def add_generic_argument_removed(self, field_name: str, file: str) -> None:
+        """Add an error about a generic argument that was removed."""
+        self._add_error(
+            ERROR_ID_GENERIC_ARGUMENT_REMOVED, field_name,
+            ("The generic argument '%s' was removed from the new generic_argument.idl file") %
+            (field_name), file)
+
+    def add_generic_argument_removed_reply_field(self, field_name: str, file: str) -> None:
+        """Add an error about a generic reply field that was removed."""
+        self._add_error(
+            ERROR_ID_GENERIC_ARGUMENT_REMOVED_REPLY_FIELD, field_name,
+            ("The generic reply field '%s' was removed from the new generic_argument.idl file") %
+            (field_name), file)
 
 
 def _assert_unique_error_messages() -> None:

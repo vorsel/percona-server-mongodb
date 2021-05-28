@@ -2,8 +2,8 @@
 // We need to use a readConcern in this test, which requires read commands.
 // @tags: [
 //   requires_find_command,
+//   requires_majority_read_concern,
 //   uses_change_streams,
-//   requires_majority_read_concern
 // ]
 (function() {
 "use strict";
@@ -103,8 +103,7 @@ function testResume(mongosColl, collToWatch) {
         // everything in the oplog is newer than what used to be the newest entry.
         return bsonWoCompare(
                    mostRecentOplogEntry.ts,
-                   getLeastRecentOp({server: shardWithResumeToken, readConcern: "majority"}).ts) <
-            0;
+                   getFirstOplogEntry(shardWithResumeToken, {readConcern: "majority"}).ts) < 0;
     }
 
     while (!oplogIsRolledOver()) {

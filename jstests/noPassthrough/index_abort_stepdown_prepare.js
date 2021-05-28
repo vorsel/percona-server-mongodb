@@ -1,4 +1,4 @@
-/*
+/**
  * Tests that we don't hit 3 way deadlock between a interrupted index build, prepared txn and step
  * down thread.
  *
@@ -13,10 +13,8 @@
  *    eventually completes on the new primary.
  *
  * @tags: [
- *     # TODO SERVER-54889: Re-enable this test with SBE.
- *     sbe_incompatible,
- *     uses_transactions,
- *     uses_prepare_transaction,
+ *   uses_prepare_transaction,
+ *   uses_transactions,
  * ]
  */
 load('jstests/noPassthrough/libs/index_build.js');

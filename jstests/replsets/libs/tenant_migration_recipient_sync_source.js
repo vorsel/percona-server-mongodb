@@ -23,9 +23,14 @@ const setUpMigrationSyncSourceTest = function() {
         name: `${jsTestName()}_donor`,
         nodes: 3,
         settings: {chainingAllowed: false},
-        nodeOptions:
-            Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor,
-                          {setParameter: {tenantMigrationExcludeDonorHostTimeoutMS: 30 * 1000}}),
+        nodeOptions: Object.assign(TenantMigrationUtil.makeX509OptionsForTest().donor, {
+            setParameter: {
+                tenantMigrationExcludeDonorHostTimeoutMS: 30 * 1000,
+                // Allow non-timestamped reads on donor after migration completes for testing.
+                'failpoint.tenantMigrationDonorAllowsNonTimestampedReads':
+                    tojson({mode: 'alwaysOn'}),
+            }
+        }),
     });
     donorRst.startSet();
     donorRst.initiateWithHighElectionTimeout();
@@ -43,6 +48,11 @@ const setUpMigrationSyncSourceTest = function() {
     const donorPrimary = tenantMigrationTest.getDonorPrimary();
     const delayedSecondary = donorRst.getSecondaries()[0];
     const donorSecondary = donorRst.getSecondaries()[1];
+    // The default WC is majority and stopServerReplication will prevent satisfying any majority
+    // writes.
+    assert.commandWorked(donorPrimary.adminCommand(
+        {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+    donorRst.awaitReplication();
 
     const recipientRst = tenantMigrationTest.getRecipientRst();
     const recipientPrimary = tenantMigrationTest.getRecipientPrimary();

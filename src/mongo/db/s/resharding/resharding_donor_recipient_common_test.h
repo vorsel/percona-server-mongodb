@@ -44,6 +44,10 @@ namespace {
 
 using namespace fmt::literals;
 
+/**
+ * This test fixture does not create any resharding POSs and should be preferred to
+ * `ReshardingDonorRecipientCommonTest` when they are not required.
+ */
 class ReshardingDonorRecipientCommonInternalsTest : public ShardServerTestFixture {
 public:
     const UUID kExistingUUID = UUID::gen();
@@ -59,12 +63,14 @@ public:
     const OID kReshardingEpoch = OID::gen();
     const UUID kReshardingUUID = UUID::gen();
 
-    const ShardId kThisShard = ShardId("shardOne");
-    const ShardId kOtherShard = ShardId("shardTwo");
+    const DonorShardFetchTimestamp kThisShard =
+        makeDonorShardFetchTimestamp(ShardId("shardOne"), Timestamp(10, 0));
+    const DonorShardFetchTimestamp kOtherShard =
+        makeDonorShardFetchTimestamp(ShardId("shardTwo"), Timestamp(20, 0));
 
-    const std::vector<ShardId> kShardIds = {kThisShard, kOtherShard};
+    const std::vector<DonorShardFetchTimestamp> kShards = {kThisShard, kOtherShard};
 
-    const Timestamp kFetchTimestamp = Timestamp(1, 0);
+    const Timestamp kCloneTimestamp = Timestamp(20, 0);
 
 protected:
     CollectionMetadata makeShardedMetadataForOriginalCollection(
@@ -99,23 +105,24 @@ protected:
         auto range = ChunkRange(BSON(shardKey << MINKEY), BSON(shardKey << MAXKEY));
         auto chunk = ChunkType(
             nss, std::move(range), ChunkVersion(1, 0, epoch, boost::none), shardThatChunkExistsOn);
-        ChunkManager cm(
-            kThisShard,
-            DatabaseVersion(uuid),
-            makeStandaloneRoutingTableHistory(RoutingTableHistory::makeNew(nss,
-                                                                           uuid,
-                                                                           shardKeyPattern,
-                                                                           nullptr,
-                                                                           false,
-                                                                           epoch,
-                                                                           boost::none,
-                                                                           boost::none,
-                                                                           true,
-                                                                           {std::move(chunk)})),
-            boost::none);
+        ChunkManager cm(kThisShard.getShardId(),
+                        DatabaseVersion(uuid),
+                        makeStandaloneRoutingTableHistory(
+                            RoutingTableHistory::makeNew(nss,
+                                                         uuid,
+                                                         shardKeyPattern,
+                                                         nullptr,
+                                                         false,
+                                                         epoch,
+                                                         boost::none,
+                                                         boost::none /* timeseriesFields */,
+                                                         boost::none,
+                                                         true,
+                                                         {std::move(chunk)})),
+                        boost::none);
 
         if (!OperationShardingState::isOperationVersioned(opCtx)) {
-            const auto version = cm.getVersion(kThisShard);
+            const auto version = cm.getVersion(kThisShard.getShardId());
             BSONObjBuilder builder;
             version.appendToCommand(&builder);
 
@@ -123,7 +130,42 @@ protected:
             oss.initializeClientRoutingVersionsFromCommand(nss, builder.obj());
         }
 
-        return CollectionMetadata(std::move(cm), kThisShard);
+        return CollectionMetadata(std::move(cm), kThisShard.getShardId());
+    }
+
+    ReshardingDonorDocument makeDonorStateDoc() {
+        DonorShardContext donorCtx;
+        donorCtx.setState(DonorStateEnum::kPreparingToDonate);
+
+        ReshardingDonorDocument doc(std::move(donorCtx),
+                                    {kThisShard.getShardId(), kOtherShard.getShardId()});
+
+        NamespaceString sourceNss = kOriginalNss;
+        auto sourceUUID = UUID::gen();
+        auto commonMetadata = CommonReshardingMetadata(
+            UUID::gen(), sourceNss, sourceUUID, kTemporaryReshardingNss, kReshardingKeyPattern);
+
+        doc.setCommonReshardingMetadata(std::move(commonMetadata));
+        return doc;
+    }
+
+    ReshardingRecipientDocument makeRecipientStateDoc() {
+        RecipientShardContext recipCtx;
+        recipCtx.setState(RecipientStateEnum::kCloning);
+
+        ReshardingRecipientDocument doc(
+            std::move(recipCtx), {kThisShard.getShardId(), kOtherShard.getShardId()}, 1000);
+
+        NamespaceString sourceNss = kOriginalNss;
+        auto sourceUUID = UUID::gen();
+        auto commonMetadata = CommonReshardingMetadata(
+            UUID::gen(), sourceNss, sourceUUID, kTemporaryReshardingNss, kReshardingKeyPattern);
+
+        doc.setCommonReshardingMetadata(std::move(commonMetadata));
+
+        // A document in the cloning state requires a clone timestamp.
+        doc.setCloneTimestamp(kCloneTimestamp);
+        return doc;
     }
 
     ReshardingFields createCommonReshardingFields(const UUID& reshardingUUID,
@@ -135,19 +177,24 @@ protected:
 
     void appendDonorFieldsToReshardingFields(ReshardingFields& fields,
                                              const BSONObj& reshardingKey) {
+        std::vector<ShardId> donorShardIds;
+        for (const auto& shard : kShards) {
+            donorShardIds.emplace_back(shard.getShardId());
+        }
+
         fields.setDonorFields(
-            TypeCollectionDonorFields(kTemporaryReshardingNss, reshardingKey, kShardIds));
+            TypeCollectionDonorFields(kTemporaryReshardingNss, reshardingKey, donorShardIds));
     }
 
     void appendRecipientFieldsToReshardingFields(
         ReshardingFields& fields,
-        const std::vector<ShardId> donorShardIds,
+        const std::vector<DonorShardFetchTimestamp> donorShards,
         const UUID& existingUUID,
         const NamespaceString& originalNss,
-        const boost::optional<Timestamp>& fetchTimestamp = boost::none) {
+        const boost::optional<Timestamp>& cloneTimestamp = boost::none) {
         auto recipientFields =
-            TypeCollectionRecipientFields(donorShardIds, existingUUID, originalNss, 5000);
-        emplaceFetchTimestampIfExists(recipientFields, fetchTimestamp);
+            TypeCollectionRecipientFields(donorShards, existingUUID, originalNss, 5000);
+        emplaceCloneTimestampIfExists(recipientFields, cloneTimestamp);
         fields.setRecipientFields(std::move(recipientFields));
     }
 
@@ -190,21 +237,44 @@ protected:
 
         ASSERT(recipientDoc.getMutableState().getState() ==
                RecipientStateEnum::kAwaitingFetchTimestamp);
-        ASSERT(!recipientDoc.getFetchTimestamp());
+        ASSERT(!recipientDoc.getCloneTimestamp());
 
-        auto donorShardIds = reshardingFields.getRecipientFields()->getDonorShardIds();
-        auto donorShardIdsSet = std::set<ShardId>(donorShardIds.begin(), donorShardIds.end());
-
-        for (const auto& donorShardId : recipientDoc.getDonorShards()) {
-            auto reshardingFieldsDonorShardId = donorShardIdsSet.find(donorShardId);
-            ASSERT(reshardingFieldsDonorShardId != donorShardIdsSet.end());
-            donorShardIdsSet.erase(reshardingFieldsDonorShardId);
+        const auto donorShards = reshardingFields.getRecipientFields()->getDonorShards();
+        std::map<ShardId, DonorShardFetchTimestamp> donorShardMap;
+        for (const auto& donor : donorShards) {
+            donorShardMap.emplace(donor.getShardId(), donor);
         }
 
-        ASSERT(donorShardIdsSet.empty());
+        for (const auto& donorShardFromRecipientDoc : recipientDoc.getDonorShards()) {
+            auto donorIter = donorShardMap.find(donorShardFromRecipientDoc.getShardId());
+            ASSERT(donorIter != donorShardMap.end());
+            ASSERT_EQ(donorIter->second.getMinFetchTimestamp().has_value(),
+                      donorShardFromRecipientDoc.getMinFetchTimestamp().has_value());
+
+            if (donorIter->second.getMinFetchTimestamp()) {
+                ASSERT_EQ(*donorIter->second.getMinFetchTimestamp(),
+                          *donorShardFromRecipientDoc.getMinFetchTimestamp());
+            }
+
+            donorShardMap.erase(donorShardFromRecipientDoc.getShardId());
+        }
+
+        ASSERT(donorShardMap.empty());
+    }
+
+private:
+    DonorShardFetchTimestamp makeDonorShardFetchTimestamp(
+        ShardId shardId, boost::optional<Timestamp> fetchTimestamp) {
+        DonorShardFetchTimestamp donorFetchTimestamp(shardId);
+        donorFetchTimestamp.setMinFetchTimestamp(fetchTimestamp);
+        return donorFetchTimestamp;
     }
 };
 
+/**
+ * This fixture starts with the above internals test and also creates (notably) the resharding donor
+ * and recipient POSs.
+ */
 class ReshardingDonorRecipientCommonTest : public ReshardingDonorRecipientCommonInternalsTest {
 public:
     void setUp() override {
@@ -212,16 +282,16 @@ public:
 
         WaitForMajorityService::get(getServiceContext()).startup(getServiceContext());
 
-        _registry = repl::PrimaryOnlyServiceRegistry::get(getServiceContext());
+        _primaryOnlyServiceRegistry = repl::PrimaryOnlyServiceRegistry::get(getServiceContext());
 
         std::unique_ptr<ReshardingDonorService> donorService =
             std::make_unique<ReshardingDonorService>(getServiceContext());
-        _registry->registerService(std::move(donorService));
+        _primaryOnlyServiceRegistry->registerService(std::move(donorService));
 
         std::unique_ptr<ReshardingRecipientService> recipientService =
             std::make_unique<ReshardingRecipientService>(getServiceContext());
-        _registry->registerService(std::move(recipientService));
-        _registry->onStartup(operationContext());
+        _primaryOnlyServiceRegistry->registerService(std::move(recipientService));
+        _primaryOnlyServiceRegistry->onStartup(operationContext());
 
         stepUp();
     }
@@ -231,7 +301,7 @@ public:
 
         Grid::get(operationContext())->getExecutorPool()->shutdownAndJoin();
 
-        _registry->onShutdown();
+        _primaryOnlyServiceRegistry->onShutdown();
 
         Grid::get(operationContext())->clearForUnitTests();
 
@@ -249,11 +319,11 @@ public:
         replCoord->setMyLastAppliedOpTimeAndWallTime(
             repl::OpTimeAndWallTime(repl::OpTime(Timestamp(1, 1), _term), Date_t()));
 
-        _registry->onStepUpComplete(operationContext(), _term);
+        _primaryOnlyServiceRegistry->onStepUpComplete(operationContext(), _term);
     }
 
 protected:
-    repl::PrimaryOnlyServiceRegistry* _registry;
+    repl::PrimaryOnlyServiceRegistry* _primaryOnlyServiceRegistry;
     long long _term = 0;
 };
 

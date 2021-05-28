@@ -85,15 +85,12 @@ std::unique_ptr<MatchExpression> RewriteExpr::_rewriteAndExpression(
 
     auto andMatch = std::make_unique<AndMatchExpression>();
 
-    for (auto&& child : currExprNode->getOperandList()) {
-        if (auto childMatch = _rewriteExpression(child)) {
-            andMatch->add(childMatch.release());
-        }
-    }
+    for (auto&& child : currExprNode->getOperandList())
+        if (auto childMatch = _rewriteExpression(child))
+            andMatch->add(std::move(childMatch));
 
-    if (andMatch->numChildren() > 0) {
+    if (andMatch->numChildren() > 0)
         return andMatch;
-    }
 
     return nullptr;
 }
@@ -102,19 +99,16 @@ std::unique_ptr<MatchExpression> RewriteExpr::_rewriteOrExpression(
     const boost::intrusive_ptr<ExpressionOr>& currExprNode) {
 
     auto orMatch = std::make_unique<OrMatchExpression>();
-    for (auto&& child : currExprNode->getOperandList()) {
-        if (auto childExpr = _rewriteExpression(child)) {
-            orMatch->add(childExpr.release());
-        } else {
+    for (auto&& child : currExprNode->getOperandList())
+        if (auto childExpr = _rewriteExpression(child))
+            orMatch->add(std::move(childExpr));
+        else
             // If any child cannot be rewritten to a MatchExpression then we must abandon adding
             // this $or clause.
             return nullptr;
-        }
-    }
 
-    if (orMatch->numChildren() > 0) {
+    if (orMatch->numChildren() > 0)
         return orMatch;
-    }
 
     return nullptr;
 }
@@ -239,7 +233,7 @@ bool RewriteExpr::_canRewriteComparison(
 
     for (auto operand : operandList) {
         if (auto exprFieldPath = dynamic_cast<ExpressionFieldPath*>(operand.get())) {
-            if (!exprFieldPath->isRootFieldPath()) {
+            if (exprFieldPath->isVariableReference()) {
                 // This field path refers to a variable rather than a local document field path.
                 return false;
             }

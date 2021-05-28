@@ -1,5 +1,8 @@
 // Tests the behavior of a change stream on a whole database in a sharded cluster.
-// @tags: [uses_change_streams, requires_majority_read_concern]
+// @tags: [
+//   requires_majority_read_concern,
+//   uses_change_streams,
+// ]
 (function() {
 "use strict";
 

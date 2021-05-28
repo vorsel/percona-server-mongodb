@@ -1,7 +1,8 @@
 /**
  * Tests that in a tenant migration, the recipient primary will use majority read concern when
  * cloning documents from the donor.
- * @tags: [requires_majority_read_concern, requires_fcv_49, incompatible_with_windows_tls]
+ * @tags: [requires_majority_read_concern, requires_fcv_49, incompatible_with_windows_tls,
+ * incompatible_with_eft, incompatible_with_macos, requires_persistence]
  */
 
 (function() {
@@ -28,6 +29,11 @@ const donorPrimary = tenantMigrationTest.getDonorPrimary();
 const recipientPrimary = tenantMigrationTest.getRecipientPrimary();
 const donorRst = tenantMigrationTest.getDonorRst();
 const donorTestColl = donorPrimary.getDB(dbName).getCollection(collName);
+
+// The default WC is majority and stopReplicationOnSecondaries will prevent satisfying any majority
+assert.commandWorked(recipientPrimary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+tenantMigrationTest.getRecipientRst().awaitReplication();
 
 // Populate the donor replica set with some initial data and make sure it is majority committed.
 const majorityCommittedDocs = [{_id: 0, x: 0}, {_id: 1, x: 1}];

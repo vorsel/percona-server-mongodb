@@ -6,7 +6,10 @@
  * transaction, then roll back that commit entry, the success of which depends on the prevOpTime
  * being set properly.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 (function() {
 "use strict";

@@ -822,7 +822,7 @@ Status StorageEngineImpl::_dropCollectionsNoTimestamp(OperationContext* opCtx,
         while (ii->more()) {
             const IndexCatalogEntry* ice = ii->next();
 
-            audit::logDropIndex(&cc(), ice->descriptor()->indexName(), coll->ns());
+            audit::logDropIndex(opCtx->getClient(), ice->descriptor()->indexName(), coll->ns());
 
             catalog::removeIndex(opCtx,
                                  ice->descriptor()->indexName(),
@@ -832,7 +832,7 @@ Status StorageEngineImpl::_dropCollectionsNoTimestamp(OperationContext* opCtx,
                                  ice->getSharedIdent());
         }
 
-        audit::logDropCollection(&cc(), coll->ns());
+        audit::logDropCollection(opCtx->getClient(), coll->ns());
 
         Status result = catalog::dropCollection(
             opCtx, coll->ns(), coll->getCatalogId(), coll->getSharedIdent());
@@ -1219,7 +1219,7 @@ void StorageEngineImpl::TimestampMonitor::startup() {
                 _currentTimestamps.stable = stable;
                 _currentTimestamps.minOfCheckpointAndOldest = minOfCheckpointAndOldest;
             } catch (const ExceptionForCat<ErrorCategory::Interruption>& ex) {
-                if (!ErrorCodes::isCancelationError(ex))
+                if (!ErrorCodes::isCancellationError(ex))
                     throw;
                 // If we're interrupted at shutdown or after PeriodicRunner's client has been
                 // killed, it's fine to give up on future notifications.

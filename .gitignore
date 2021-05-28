@@ -2,6 +2,7 @@
 /build
 /src/mongo/db/modules
 /.jsdbshell
+/.cache
 /.dbshell
 /*.ninja
 /*.ninja.*
@@ -203,3 +204,11 @@ resmoke.ini
 
 # UndoDB Recordings
 *.undo
+
+# Resmoke runtime trackers
+.resmoke_start_time.yml
+
+# libfuzzer artifacts
+default.profraw
+/corpora
+/corpora-merged

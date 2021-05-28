@@ -43,10 +43,10 @@
 
 namespace mongo {
 
-using write_ops::Delete;
+using write_ops::DeleteCommandRequest;
 using write_ops::DeleteOpEntry;
-using write_ops::Insert;
-using write_ops::Update;
+using write_ops::InsertCommandRequest;
+using write_ops::UpdateCommandRequest;
 using write_ops::UpdateOpEntry;
 
 namespace {
@@ -58,7 +58,7 @@ void checkOpCountForCommand(const T& op, size_t numOps) {
                           << write_ops::kMaxWriteBatchSize << ". Got " << numOps << " operations.",
             numOps != 0 && numOps <= write_ops::kMaxWriteBatchSize);
 
-    if (const auto& stmtIds = op.getWriteCommandBase().getStmtIds()) {
+    if (const auto& stmtIds = op.getWriteCommandRequestBase().getStmtIds()) {
         uassert(
             ErrorCodes::InvalidLength,
             str::stream() << "Number of statement ids must match the number of batch entries. Got "
@@ -68,10 +68,10 @@ void checkOpCountForCommand(const T& op, size_t numOps) {
             stmtIds->size() == numOps);
         uassert(ErrorCodes::InvalidOptions,
                 str::stream() << "May not specify both stmtId and stmtIds in write command. Got "
-                              << BSON("stmtId" << *op.getWriteCommandBase().getStmtId() << "stmtIds"
-                                               << *stmtIds)
+                              << BSON("stmtId" << *op.getWriteCommandRequestBase().getStmtId()
+                                               << "stmtIds" << *stmtIds)
                               << ". Write command: " << redact(op.toBSON({})),
-                !op.getWriteCommandBase().getStmtId());
+                !op.getWriteCommandRequestBase().getStmtId());
     }
 }
 
@@ -79,6 +79,10 @@ void checkOpCountForCommand(const T& op, size_t numOps) {
 
 namespace write_ops {
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 bool readMultiDeleteProperty(const BSONElement& limitElement) {
     // Using a double to avoid throwing away illegal fractional portion. Don't want to accept 0.5
     // here
@@ -90,6 +94,10 @@ bool readMultiDeleteProperty(const BSONElement& limitElement) {
     return limit == 0;
 }
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 void writeMultiDeleteProperty(bool isMulti, StringData fieldName, BSONObjBuilder* builder) {
     builder->append(fieldName, isMulti ? 0 : 1);
 }
@@ -114,7 +122,7 @@ repl::OpTime opTimeParser(BSONElement elem) {
                             << BSONType::bsonTimestamp << ", but found " << elem.type());
 }
 
-int32_t getStmtIdForWriteAt(const WriteCommandBase& writeCommandBase, size_t writePos) {
+int32_t getStmtIdForWriteAt(const WriteCommandRequestBase& writeCommandBase, size_t writePos) {
     const auto& stmtIds = writeCommandBase.getStmtIds();
 
     if (stmtIds) {
@@ -128,23 +136,23 @@ int32_t getStmtIdForWriteAt(const WriteCommandBase& writeCommandBase, size_t wri
 
 }  // namespace write_ops
 
-write_ops::Insert InsertOp::parse(const OpMsgRequest& request) {
-    auto insertOp = Insert::parse(IDLParserErrorContext("insert"), request);
+write_ops::InsertCommandRequest InsertOp::parse(const OpMsgRequest& request) {
+    auto insertOp = InsertCommandRequest::parse(IDLParserErrorContext("insert"), request);
 
     validate(insertOp);
     return insertOp;
 }
 
-write_ops::Insert InsertOp::parseLegacy(const Message& msgRaw) {
+write_ops::InsertCommandRequest InsertOp::parseLegacy(const Message& msgRaw) {
     DbMessage msg(msgRaw);
 
-    Insert op(NamespaceString(msg.getns()));
+    InsertCommandRequest op(NamespaceString(msg.getns()));
 
     {
-        write_ops::WriteCommandBase writeCommandBase;
+        write_ops::WriteCommandRequestBase writeCommandBase;
         writeCommandBase.setBypassDocumentValidation(false);
         writeCommandBase.setOrdered(!(msg.reservedField() & InsertOption_ContinueOnError));
-        op.setWriteCommandBase(std::move(writeCommandBase));
+        op.setWriteCommandRequestBase(std::move(writeCommandBase));
     }
 
     uassert(ErrorCodes::InvalidLength, "Need at least one object to insert", msg.moreJSObjs());
@@ -162,28 +170,28 @@ write_ops::Insert InsertOp::parseLegacy(const Message& msgRaw) {
     return op;
 }
 
-void InsertOp::validate(const write_ops::Insert& insertOp) {
+void InsertOp::validate(const write_ops::InsertCommandRequest& insertOp) {
     const auto& docs = insertOp.getDocuments();
     checkOpCountForCommand(insertOp, docs.size());
 }
 
-write_ops::Update UpdateOp::parse(const OpMsgRequest& request) {
-    auto updateOp = Update::parse(IDLParserErrorContext("update"), request);
+write_ops::UpdateCommandRequest UpdateOp::parse(const OpMsgRequest& request) {
+    auto updateOp = UpdateCommandRequest::parse(IDLParserErrorContext("update"), request);
 
     checkOpCountForCommand(updateOp, updateOp.getUpdates().size());
     return updateOp;
 }
 
-write_ops::Update UpdateOp::parseLegacy(const Message& msgRaw) {
+write_ops::UpdateCommandRequest UpdateOp::parseLegacy(const Message& msgRaw) {
     DbMessage msg(msgRaw);
 
-    Update op(NamespaceString(msg.getns()));
+    UpdateCommandRequest op(NamespaceString(msg.getns()));
 
     {
-        write_ops::WriteCommandBase writeCommandBase;
+        write_ops::WriteCommandRequestBase writeCommandBase;
         writeCommandBase.setBypassDocumentValidation(false);
         writeCommandBase.setOrdered(true);
-        op.setWriteCommandBase(std::move(writeCommandBase));
+        op.setWriteCommandRequestBase(std::move(writeCommandBase));
     }
 
     op.setUpdates([&] {
@@ -205,39 +213,40 @@ write_ops::Update UpdateOp::parseLegacy(const Message& msgRaw) {
     return op;
 }
 
-write_ops::UpdateReply UpdateOp::parseResponse(const BSONObj& obj) {
+write_ops::UpdateCommandReply UpdateOp::parseResponse(const BSONObj& obj) {
     uassertStatusOK(getStatusFromCommandResult(obj));
 
-    return write_ops::UpdateReply::parse(IDLParserErrorContext("updateReply"), obj);
+    return write_ops::UpdateCommandReply::parse(IDLParserErrorContext("updateReply"), obj);
 }
 
-void UpdateOp::validate(const Update& updateOp) {
+void UpdateOp::validate(const UpdateCommandRequest& updateOp) {
     checkOpCountForCommand(updateOp, updateOp.getUpdates().size());
 }
 
-write_ops::FindAndModifyReply FindAndModifyOp::parseResponse(const BSONObj& obj) {
+write_ops::FindAndModifyCommandReply FindAndModifyOp::parseResponse(const BSONObj& obj) {
     uassertStatusOK(getStatusFromCommandResult(obj));
 
-    return write_ops::FindAndModifyReply::parse(IDLParserErrorContext("findAndModifyReply"), obj);
+    return write_ops::FindAndModifyCommandReply::parse(IDLParserErrorContext("findAndModifyReply"),
+                                                       obj);
 }
 
-write_ops::Delete DeleteOp::parse(const OpMsgRequest& request) {
-    auto deleteOp = Delete::parse(IDLParserErrorContext("delete"), request);
+write_ops::DeleteCommandRequest DeleteOp::parse(const OpMsgRequest& request) {
+    auto deleteOp = DeleteCommandRequest::parse(IDLParserErrorContext("delete"), request);
 
     checkOpCountForCommand(deleteOp, deleteOp.getDeletes().size());
     return deleteOp;
 }
 
-write_ops::Delete DeleteOp::parseLegacy(const Message& msgRaw) {
+write_ops::DeleteCommandRequest DeleteOp::parseLegacy(const Message& msgRaw) {
     DbMessage msg(msgRaw);
 
-    Delete op(NamespaceString(msg.getns()));
+    DeleteCommandRequest op(NamespaceString(msg.getns()));
 
     {
-        write_ops::WriteCommandBase writeCommandBase;
+        write_ops::WriteCommandRequestBase writeCommandBase;
         writeCommandBase.setBypassDocumentValidation(false);
         writeCommandBase.setOrdered(true);
-        op.setWriteCommandBase(std::move(writeCommandBase));
+        op.setWriteCommandRequestBase(std::move(writeCommandBase));
     }
 
     op.setDeletes([&] {
@@ -256,12 +265,12 @@ write_ops::Delete DeleteOp::parseLegacy(const Message& msgRaw) {
     return op;
 }
 
-void DeleteOp::validate(const Delete& deleteOp) {
+void DeleteOp::validate(const DeleteCommandRequest& deleteOp) {
     checkOpCountForCommand(deleteOp, deleteOp.getDeletes().size());
 }
 
 write_ops::UpdateModification write_ops::UpdateModification::parseFromOplogEntry(
-    const BSONObj& oField) {
+    const BSONObj& oField, const DiffOptions& options) {
     BSONElement vField = oField[kUpdateOplogEntryVersionFieldName];
 
     // If this field appears it should be an integer.
@@ -279,7 +288,7 @@ write_ops::UpdateModification write_ops::UpdateModification::parseFromOplogEntry
                               << diff.type(),
                 diff.type() == BSONType::Object);
 
-        return UpdateModification(doc_diff::Diff{diff.embeddedObject()}, DiffTag{});
+        return UpdateModification(doc_diff::Diff{diff.embeddedObject()}, options);
     } else if (!vField.ok() ||
                vField.numberInt() == static_cast<int>(UpdateOplogEntryVersion::kUpdateNodeV1)) {
         // Treat it as a "classic" update which can either be a full replacement or a
@@ -294,8 +303,8 @@ write_ops::UpdateModification write_ops::UpdateModification::parseFromOplogEntry
                             << vField.numberInt());
 }
 
-write_ops::UpdateModification::UpdateModification(doc_diff::Diff diff, DiffTag)
-    : _update(std::move(diff)) {}
+write_ops::UpdateModification::UpdateModification(doc_diff::Diff diff, DiffOptions options)
+    : _update(DeltaUpdate{std::move(diff), options}) {}
 
 write_ops::UpdateModification::UpdateModification(BSONElement update) {
     const auto type = update.type();
@@ -327,6 +336,10 @@ write_ops::UpdateModification::UpdateModification(const BSONObj& update, Classic
 write_ops::UpdateModification::UpdateModification(std::vector<BSONObj> pipeline)
     : _update{PipelineUpdate{std::move(pipeline)}} {}
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 write_ops::UpdateModification write_ops::UpdateModification::parseFromBSON(BSONElement elem) {
     return UpdateModification(elem);
 }
@@ -348,7 +361,7 @@ int write_ops::UpdateModification::objsize() const {
 
                 return size + kWriteCommandBSONArrayPerElementOverheadBytes;
             },
-            [](const doc_diff::Diff& diff) -> int { return diff.objsize(); }},
+            [](const DeltaUpdate& delta) -> int { return delta.diff.objsize(); }},
         _update);
 }
 
@@ -358,10 +371,14 @@ write_ops::UpdateModification::Type write_ops::UpdateModification::type() const 
         visit_helper::Overloaded{
             [](const ClassicUpdate& classic) { return Type::kClassic; },
             [](const PipelineUpdate& pipelineUpdate) { return Type::kPipeline; },
-            [](const doc_diff::Diff& diff) { return Type::kDelta; }},
+            [](const DeltaUpdate& delta) { return Type::kDelta; }},
         _update);
 }
 
+/**
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
+ */
 void write_ops::UpdateModification::serializeToBSON(StringData fieldName,
                                                     BSONObjBuilder* bob) const {
 
@@ -375,7 +392,7 @@ void write_ops::UpdateModification::serializeToBSON(StringData fieldName,
                 }
                 arrayBuilder.doneFast();
             },
-            [fieldName, bob](const doc_diff::Diff& diff) { *bob << fieldName << diff; }},
+            [fieldName, bob](const DeltaUpdate& delta) { *bob << fieldName << delta.diff; }},
         _update);
 }
 

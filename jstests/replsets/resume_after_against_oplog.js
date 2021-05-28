@@ -2,7 +2,9 @@
  * Tests the behavior of the 'postBatchResumeToken' and '$_resumeAfter' fields in 'find' and
  * 'getMore' requests and responses on the oplog.
  *
- * @tags: [requires_fcv_47]
+ * @tags: [
+ *   requires_fcv_47,
+ * ]
  */
 
 (function() {
@@ -52,7 +54,7 @@ jsTestLog("Running initial query on the oplog");
 
     // Assert resume token is non-null.
     const resumeToken1 = assertExpectedResumeTokenFormat(res);
-    assert.eq(timestampCmp(resumeToken1.ts, kNullTS), 1);
+    assert.eq(timestampCmp(resumeToken1.ts, kNullTS), 1, res);
 
     // Kill the cursor before attempting to resume.
     assert.commandWorked(localDb.runCommand({killCursors: "oplog.rs", cursors: [res.cursor.id]}));
@@ -85,7 +87,7 @@ jsTestLog("Running initial query on the oplog");
     assert.eq(res2.cursor.firstBatch[0].o._id, 1, res);
 
     const resumeToken2 = assertExpectedResumeTokenFormat(res2);
-    assert.eq(timestampCmp(resumeToken2.ts, resumeToken1.ts), 1);
+    assert.eq(timestampCmp(resumeToken2.ts, resumeToken1.ts), 1, res2);
 
     const res3 = assert.commandWorked(localDb.runCommand({
         find: "oplog.rs",
@@ -99,7 +101,7 @@ jsTestLog("Running initial query on the oplog");
     assert.eq(res3.cursor.firstBatch[0].o._id, 2, res);
 
     const resumeToken3 = assertExpectedResumeTokenFormat(res3);
-    assert.eq(timestampCmp(resumeToken3.ts, resumeToken2.ts), 1);
+    assert.eq(timestampCmp(resumeToken3.ts, resumeToken2.ts), 1, res3);
 }
 // ---------------------------------------------------------------------------------------
 jsTestLog("Running initial tailable query on the oplog");
@@ -119,7 +121,7 @@ jsTestLog("Running initial tailable query on the oplog");
 
     // Resume token should be non-null.
     const resumeToken1 = assertExpectedResumeTokenFormat(res);
-    assert.eq(timestampCmp(resumeToken1.ts, kNullTS), 1);
+    assert.eq(timestampCmp(resumeToken1.ts, kNullTS), 1, res);
 
     const cursorId = res.cursor.id;
 
@@ -133,7 +135,7 @@ jsTestLog("Running initial tailable query on the oplog");
 
     // Resume token should be greater than the find command's.
     const resumeToken2 = assertExpectedResumeTokenFormat(resGetMore1);
-    assert.eq(timestampCmp(resumeToken2.ts, resumeToken1.ts), 1);
+    assert.eq(timestampCmp(resumeToken2.ts, resumeToken1.ts), 1, resGetMore1);
 
     jsTest.log(
         "Ensure that postBatchResumeToken attribute is returned for getMore command with no results");

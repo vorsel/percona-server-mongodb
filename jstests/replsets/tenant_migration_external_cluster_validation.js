@@ -3,7 +3,7 @@
  * cluster times.
  *
  * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
- * incompatible_with_windows_tls]
+ * incompatible_with_windows_tls, incompatible_with_macos, requires_persistence]
  */
 
 (function() {
@@ -39,6 +39,7 @@ function createUsers(rst) {
         assert.commandWorked(testDB.runCommand(
             {createUser: kTestUser.name, pwd: kTestUser.pwd, roles: ["readWrite"]}));
     });
+    rst.awaitReplication();
 }
 
 const kTenantId = "testTenantId";
@@ -51,9 +52,13 @@ const donorRst = new ReplSetTest({
     nodes: 2,
     name: "donor",
     keyFile: "jstests/libs/key1",
-    nodeOptions: Object.assign(
-        x509Options.donor,
-        {setParameter: {"failpoint.alwaysValidateClientsClusterTime": tojson({mode: "alwaysOn"})}}),
+    nodeOptions: Object.assign(x509Options.donor, {
+        setParameter: {
+            "failpoint.alwaysValidateClientsClusterTime": tojson({mode: "alwaysOn"}),
+            // Allow non-timestamped reads on donor after migration completes for testing.
+            'failpoint.tenantMigrationDonorAllowsNonTimestampedReads': tojson({mode: 'alwaysOn'}),
+        }
+    }),
 });
 
 const recipientRst = new ReplSetTest({

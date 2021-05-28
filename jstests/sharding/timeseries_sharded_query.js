@@ -13,11 +13,10 @@ load("jstests/sharding/libs/find_chunks_util.js");
 
 Random.setRandomSeed();
 
-const st = new ShardingTest({shards: 2, rs: {nodes: 2}});
+const st = new ShardingTest({shards: 2});
 
 const dbName = 'test';
 const sDB = st.s.getDB(dbName);
-const configDB = st.s0.getDB('config');
 
 if (!TimeseriesTest.timeseriesCollectionsEnabled(st.shard0)) {
     jsTestLog("Skipping test because the time-series collection feature flag is disabled");
@@ -25,8 +24,9 @@ if (!TimeseriesTest.timeseriesCollectionsEnabled(st.shard0)) {
     return;
 }
 
-// Simple shard key on the metadata field.
-(function metaShardKey() {
+(function timeseriesCollectionsCannotBeSharded() {
+    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
+
     assert.commandWorked(
         sDB.createCollection('ts', {timeseries: {timeField: 'time', metaField: 'hostId'}}));
 
@@ -50,141 +50,78 @@ if (!TimeseriesTest.timeseriesCollectionsEnabled(st.shard0)) {
     // This index gets created as {meta: 1} on the buckets collection.
     assert.commandWorked(tsColl.createIndex({hostId: 1}));
 
-    st.shardColl('system.buckets.ts',
-                 {meta: 1} /* Shard key */,
-                 {meta: 10} /* Split at */,
-                 {meta: 10} /* Move the chunk containing {meta: 10} to its own shard */,
-                 dbName, /* dbName */
-                 true /* Wait until documents orphaned by the move get deleted */);
+    // Trying to shard a time-series collection -> error
+    assert.commandFailed(st.s.adminCommand({shardCollection: 'test.ts', key: {hostId: 1}}));
 
-    let counts = st.chunkCounts('system.buckets.ts', 'test');
-    assert.eq(1, counts[st.shard0.shardName]);
-    assert.eq(1, counts[st.shard1.shardName]);
-
-    // Query with shard key
-    assert.docEq([docs[0]], sDB.ts.find({hostId: 0}).toArray());
-    assert.docEq([docs[numDocs - 1]], sDB.ts.find({hostId: (numDocs - 1)}).toArray());
-
-    // Query without shard key
-    assert.docEq(docs, sDB.ts.find().sort({time: 1}).toArray());
+    // Trying to shard the buckets collection -> error
+    assert.commandFailed(
+        st.s.adminCommand({shardCollection: 'test.system.buckets.ts', key: {meta: 1}}));
 
     assert.commandWorked(sDB.dropDatabase());
 })();
 
-// Create a time-series collection with a non-default collation, but an index with the simple
-// collation, which makes it eligible as a shard key.
-(function metaShardKeyCollation() {
-    assert.commandWorked(sDB.createCollection('ts', {
-        timeseries: {timeField: 'time', metaField: 'hostName'},
-        collation: {locale: 'en', strength: 1, numericOrdering: true}
-    }));
+(function manuallyCraftedShardedTimeseriesCollectionCannotBeUsed() {
+    assert.commandWorked(st.s.adminCommand({enableSharding: dbName}));
 
-    // Insert directly on the primary shard because mongos does not know how to insert into a TS
-    // collection.
+    assert.commandWorked(sDB.createCollection('coll'));
+
     st.ensurePrimaryShard(dbName, st.shard0.shardName);
-    const tsColl = st.shard0.getDB(dbName).ts;
-
-    const numDocs = 20;
-    let docs = [];
-    for (let i = 0; i < numDocs; i++) {
-        const doc = {
-            time: ISODate(),
-            hostName: 'host_' + i,
-            _id: i,
-            data: Random.rand(),
-        };
-        docs.push(doc);
-        assert.commandWorked(tsColl.insert(doc));
+    for (let i = 0; i < 20; i++) {
+        assert.commandWorked(st.shard0.getDB(dbName).coll.insert({a: i}));
     }
 
-    // This index gets created as {meta: 1} on the buckets collection.
-    assert.commandWorked(tsColl.createIndex({hostName: 1}, {collation: {locale: 'simple'}}));
+    assert.commandWorked(st.shard0.getDB(dbName).coll.createIndex({a: 1}));
+    assert.commandWorked(st.s.adminCommand({shardCollection: 'test.coll', key: {a: 1}}));
 
-    st.shardColl('system.buckets.ts',
-                 {meta: 1} /* Shard key */,
-                 {meta: 'host_10'} /* Split at */,
-                 {meta: 'host_10'} /* Move the chunk containing {meta: 10} to its own shard */,
-                 dbName, /* dbName */
-                 true /* Wait until documents orphaned by the move get deleted */);
+    // It modifies the time-series metadata on the CS and on the shards
+    let modifyTimeseriesMetadata = (opTimeseriesMetadata) => {
+        st.s.getDB('config').collections.update({_id: 'test.coll'}, opTimeseriesMetadata);
+        st.shard0.getDB('config').cache.collections.update({_id: 'test.coll'},
+                                                           opTimeseriesMetadata);
+        st.shard1.getDB('config').cache.collections.update({_id: 'test.coll'},
+                                                           opTimeseriesMetadata);
+    };
 
-    let counts = st.chunkCounts('system.buckets.ts', 'test');
-    assert.eq(1, counts[st.shard0.shardName]);
-    assert.eq(1, counts[st.shard1.shardName]);
+    // It forces a bump of the collection version moving the {a: 0} chunk to destShardName
+    let bumpCollectionVersionThroughMoveChunk = (destShardName) => {
+        assert.commandWorked(
+            st.s.adminCommand({moveChunk: 'test.coll', find: {a: 0}, to: destShardName}));
+    };
 
-    // Query with shard key
-    assert.docEq([docs[0]], sDB.ts.find({hostName: 'host_0'}).toArray());
-    assert.docEq([docs[numDocs - 1]], sDB.ts.find({hostName: 'host_' + (numDocs - 1)}).toArray());
+    // It forces a refresh of the routing info on the shards
+    let forceRefreshOnShards = () => {
+        assert.commandWorked(st.shard0.adminCommand(
+            {_flushRoutingTableCacheUpdates: 'test.coll', syncFromConfig: true}));
+        assert.commandWorked(st.shard1.adminCommand(
+            {_flushRoutingTableCacheUpdates: 'test.coll', syncFromConfig: true}));
+    };
 
-    // Query without shard key
-    assert.docEq(docs, sDB.ts.find().sort({time: 1}).toArray());
-    assert.commandWorked(sDB.dropDatabase());
-})();
+    // Hacky code to simulate that 'test.coll' is a sharded time-series collection
+    modifyTimeseriesMetadata({$set: {timeseriesFields: {timeField: "a"}}});
+    bumpCollectionVersionThroughMoveChunk(st.shard1.shardName);
+    forceRefreshOnShards();
 
-// Create a time-series collection with a shard key compounded with a metadata subfield and time.
-(function compoundShardKey() {
-    assert.commandWorked(
-        sDB.createCollection('ts', {timeseries: {timeField: 'time', metaField: 'meta'}}));
+    let check = (cmdRes) => {
+        assert.commandFailedWithCode(cmdRes, ErrorCodes.NotImplemented);
+    };
 
-    // Insert directly on the primary shard because mongos does not know how to insert into a TS
-    // collection.
-    st.ensurePrimaryShard(dbName, st.shard0.shardName);
+    // CRUD ops & drop collection
+    check(st.s.getDB(dbName).runCommand({find: 'coll', filter: {a: 1}}));
+    check(st.s.getDB(dbName).runCommand({find: 'coll', filter: {}}));
+    check(st.s.getDB(dbName).runCommand({insert: 'coll', documents: [{a: 21}]}));
+    check(st.s.getDB(dbName).runCommand({insert: 'coll', documents: [{a: 21}, {a: 22}]}));
+    check(st.s.getDB(dbName).runCommand(
+        {update: 'coll', updates: [{q: {a: 1}, u: {$set: {b: 10}}}]}));
+    check(st.s.getDB(dbName).runCommand({update: 'coll', updates: [{q: {}, u: {$set: {b: 10}}}]}));
+    check(st.s.getDB(dbName).runCommand({delete: 'coll', deletes: [{q: {a: 1}, limit: 1}]}));
+    check(st.s.getDB(dbName).runCommand({delete: 'coll', deletes: [{q: {}, limit: 0}]}));
+    check(st.s.getDB(dbName).runCommand({drop: 'coll'}), ErrorCodes.IllegalOperation);
 
-    const tsColl = st.shard0.getDB(dbName).ts;
-    const numDocs = 20;
-    let docs = [];
-    for (let i = 0; i < numDocs; i++) {
-        const doc = {
-            time: ISODate(),
-            meta: {id: i},
-            _id: i,
-            data: Random.rand(),
-        };
-        docs.push(doc);
-        assert.commandWorked(tsColl.insert(doc));
-    }
+    // Hacky code again to restore the previous environment to finish this test properly
+    modifyTimeseriesMetadata({$unset: {timeseriesFields: 1}});
+    bumpCollectionVersionThroughMoveChunk(st.shard0.shardName);
+    forceRefreshOnShards();
 
-    // This index gets created as {meta.id: 1, control.min.time: 1, control.max.time: 1} on the
-    // buckets collection.
-    assert.commandWorked(tsColl.createIndex({'meta.id': 'hashed', time: 1}));
-
-    assert.commandWorked(st.s.adminCommand({enableSharding: 'test'}));
-    assert.commandWorked(st.s.adminCommand({
-        shardCollection: 'test.system.buckets.ts',
-        key: {'meta.id': 'hashed', 'control.min.time': 1, 'control.max.time': 1}
-    }));
-
-    let counts = st.chunkCounts('system.buckets.ts', 'test');
-    assert.eq(1, counts[st.shard0.shardName], counts);
-    assert.eq(0, counts[st.shard1.shardName], counts);
-
-    // Split the chunk based on 'bounds' and verify total chunks increased by one.
-    const lowestChunk = findChunksUtil.findChunksByNs(configDB, 'test.system.buckets.ts')
-                            .sort({min: 1})
-                            .limit(1)
-                            .next();
-    assert(lowestChunk);
-
-    assert.commandWorked(st.s.adminCommand(
-        {split: 'test.system.buckets.ts', bounds: [lowestChunk.min, lowestChunk.max]}));
-
-    let otherShard = st.getOther(st.getPrimaryShard(dbName)).name;
-    assert.commandWorked(st.s.adminCommand({
-        movechunk: 'test.system.buckets.ts',
-        find: {'meta.id': 10, 'control.min.time': 0, 'control.max.time': 0},
-        to: otherShard,
-        _waitForDelete: true
-    }));
-
-    counts = st.chunkCounts('system.buckets.ts', 'test');
-    assert.eq(1, counts[st.shard0.shardName], counts);
-    assert.eq(1, counts[st.shard1.shardName], counts);
-
-    // Query with shard key
-    assert.docEq([docs[0]], sDB.ts.find({'meta.id': 0}).toArray());
-    assert.docEq([docs[numDocs - 1]], sDB.ts.find({'meta.id': (numDocs - 1)}).toArray());
-
-    // Query without shard key
-    assert.docEq(docs, sDB.ts.find().sort({time: 1}).toArray());
     assert.commandWorked(sDB.dropDatabase());
 })();
 

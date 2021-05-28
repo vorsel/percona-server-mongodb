@@ -46,6 +46,7 @@
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/working_set_common.h"
+#include "mongo/db/pipeline/change_stream_invalidation_info.h"
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find.h"
 #include "mongo/db/query/find_common.h"
@@ -71,7 +72,7 @@ namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(rsStopGetMoreCmd);
-MONGO_FAIL_POINT_DEFINE(GetMoreHangBeforeReadLock);
+MONGO_FAIL_POINT_DEFINE(getMoreHangAfterPinCursor);
 
 // The timeout when waiting for linearizable read concern on a getMore command.
 static constexpr int kLinearizableReadConcernTimeout = 15000;
@@ -149,7 +150,6 @@ void applyCursorReadConcern(OperationContext* opCtx, repl::ReadConcernArgs rcArg
         switch (rcArgs.getMajorityReadMechanism()) {
             case repl::ReadConcernArgs::MajorityReadMechanism::kMajoritySnapshot: {
                 // Make sure we read from the majority snapshot.
-                opCtx->recoveryUnit()->abandonSnapshot();
                 opCtx->recoveryUnit()->setTimestampReadSource(
                     RecoveryUnit::ReadSource::kMajorityCommitted);
                 uassertStatusOK(opCtx->recoveryUnit()->majorityCommittedSnapshotAvailable());
@@ -158,7 +158,6 @@ void applyCursorReadConcern(OperationContext* opCtx, repl::ReadConcernArgs rcArg
             case repl::ReadConcernArgs::MajorityReadMechanism::kSpeculative: {
                 // Mark the operation as speculative and select the correct read source.
                 repl::SpeculativeMajorityReadInfo::get(opCtx).setIsSpeculativeRead();
-                opCtx->recoveryUnit()->abandonSnapshot();
                 opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kNoOverlap);
                 break;
             }
@@ -170,7 +169,6 @@ void applyCursorReadConcern(OperationContext* opCtx, repl::ReadConcernArgs rcArg
         !opCtx->inMultiDocumentTransaction()) {
         auto atClusterTime = rcArgs.getArgsAtClusterTime();
         invariant(atClusterTime && *atClusterTime != LogicalTime::kUninitialized);
-        opCtx->recoveryUnit()->abandonSnapshot();
         opCtx->recoveryUnit()->setTimestampReadSource(RecoveryUnit::ReadSource::kProvided,
                                                       atClusterTime->asTimestamp());
     }
@@ -191,7 +189,7 @@ void applyCursorReadConcern(OperationContext* opCtx, repl::ReadConcernArgs rcArg
  */
 void setUpOperationDeadline(OperationContext* opCtx,
                             const ClientCursor& cursor,
-                            const GetMoreCommand& cmd,
+                            const GetMoreCommandRequest& cmd,
                             bool disableAwaitDataFailpointActive) {
 
     // We assume that cursors created through a DBDirectClient are always used from their
@@ -217,7 +215,7 @@ void setUpOperationDeadline(OperationContext* opCtx,
  */
 void setUpOperationContextStateForGetMore(OperationContext* opCtx,
                                           const ClientCursor& cursor,
-                                          const GetMoreCommand& cmd,
+                                          const GetMoreCommandRequest& cmd,
                                           bool disableAwaitDataFailpointActive) {
     applyCursorReadConcern(opCtx, cursor.getReadConcernArgs());
     opCtx->setWriteConcern(cursor.getWriteConcernOptions());
@@ -257,7 +255,8 @@ public:
     class Invocation final : public CommandInvocation {
     public:
         Invocation(Command* cmd, const OpMsgRequest& request)
-            : CommandInvocation(cmd), _cmd(GetMoreCommand::parse({"getMore"}, request.body)) {
+            : CommandInvocation(cmd),
+              _cmd(GetMoreCommandRequest::parse({"getMore"}, request.body)) {
             NamespaceString nss(_cmd.getDbName(), _cmd.getCollection());
             uassert(ErrorCodes::InvalidNamespace,
                     str::stream() << "Invalid namespace for getMore: " << nss.ns(),
@@ -306,7 +305,7 @@ public:
          */
         bool generateBatch(OperationContext* opCtx,
                            ClientCursor* cursor,
-                           const GetMoreCommand& cmd,
+                           const GetMoreCommandRequest& cmd,
                            const bool isTailable,
                            CursorResponseBuilder* nextBatch,
                            std::uint64_t* numResults,
@@ -340,6 +339,18 @@ public:
             } catch (const ExceptionFor<ErrorCodes::CloseChangeStream>&) {
                 // This exception indicates that we should close the cursor without reporting an
                 // error.
+                return false;
+            } catch (const ExceptionFor<ErrorCodes::ChangeStreamInvalidated>& ex) {
+                // This exception is thrown when a change-stream cursor is invalidated. Set the PBRT
+                // to the resume token of the invalidating event, and mark the cursor response as
+                // invalidated. We always expect to have ExtraInfo for this error code.
+                const auto extraInfo = ex.extraInfo<ChangeStreamInvalidationInfo>();
+                tassert(5493700,
+                        "Missing ChangeStreamInvalidationInfo on exception",
+                        extraInfo != nullptr);
+
+                nextBatch->setPostBatchResumeToken(extraInfo->getInvalidateResumeToken());
+                nextBatch->setInvalidated();
                 return false;
             } catch (DBException& exception) {
                 nextBatch->abandon();
@@ -397,6 +408,20 @@ public:
             NamespaceString nss(_cmd.getDbName(), _cmd.getCollection());
             int64_t cursorId = _cmd.getCommandParameter();
 
+            // Setup OperationContext state for this operation which will set the correct read
+            // source if needed. Do this before instantiating the AutoGetCollection* object so we
+            // don't attept to override the state that has been setup. Ensure the lsid and txnNumber
+            // of the getMore match that of the originating command.
+            validateLSID(opCtx, cursorId, cursorPin.getCursor());
+            validateTxnNumber(opCtx, cursorId, cursorPin.getCursor());
+
+            const bool disableAwaitDataFailpointActive =
+                MONGO_unlikely(disableAwaitDataForGetMoreCmd.shouldFail());
+
+            // Inherit properties like readConcern and maxTimeMS from our originating cursor.
+            setUpOperationContextStateForGetMore(
+                opCtx, *cursorPin.getCursor(), _cmd, disableAwaitDataFailpointActive);
+
             if (cursorPin->getExecutor()->lockPolicy() ==
                 PlanExecutor::LockPolicy::kLocksInternally) {
                 if (!nss.isCollectionlessCursorNamespace()) {
@@ -410,13 +435,6 @@ public:
             } else {
                 invariant(cursorPin->getExecutor()->lockPolicy() ==
                           PlanExecutor::LockPolicy::kLockExternally);
-
-                if (MONGO_unlikely(GetMoreHangBeforeReadLock.shouldFail())) {
-                    LOGV2(20477,
-                          "GetMoreHangBeforeReadLock fail point enabled. Blocking until fail "
-                          "point is disabled");
-                    GetMoreHangBeforeReadLock.pauseWhileSet(opCtx);
-                }
 
                 // Lock the backing collection by using the executor's namespace. Note that it may
                 // be different from the cursor's namespace. One such possible scenario is when
@@ -466,10 +484,6 @@ public:
                                         << cursorPin->nss().ns());
             }
 
-            // Ensure the lsid and txnNumber of the getMore match that of the originating command.
-            validateLSID(opCtx, cursorId, cursorPin.getCursor());
-            validateTxnNumber(opCtx, cursorId, cursorPin.getCursor());
-
             if (nss.isOplog() && MONGO_unlikely(rsStopGetMoreCmd.shouldFail())) {
                 uasserted(ErrorCodes::CommandFailed,
                           str::stream() << "getMore on " << nss.ns()
@@ -514,20 +528,13 @@ public:
                     nss);
             }
 
-            const bool disableAwaitDataFailpointActive =
-                MONGO_unlikely(disableAwaitDataForGetMoreCmd.shouldFail());
-
-            // Inherit properties like readConcern and maxTimeMS from our originating cursor.
-            setUpOperationContextStateForGetMore(
-                opCtx, *cursorPin.getCursor(), _cmd, disableAwaitDataFailpointActive);
-
             if (!cursorPin->isAwaitData()) {
                 opCtx->checkForInterrupt();  // May trigger maxTimeAlwaysTimeOut fail point.
             }
 
             PlanExecutor* exec = cursorPin->getExecutor();
             const auto* cq = exec->getCanonicalQuery();
-            if (cq && cq->getFindCommand().getReadOnce()) {
+            if (cq && cq->getFindCommandRequest().getReadOnce()) {
                 // The readOnce option causes any storage-layer cursors created during plan
                 // execution to assume read data will not be needed again and need not be cached.
                 opCtx->recoveryUnit()->setReadOnce(true);
@@ -725,6 +732,13 @@ public:
 
             acquireLocksAndIterateCursor(opCtx, reply, cursorManager, cursorPin, curOp);
 
+            if (MONGO_unlikely(getMoreHangAfterPinCursor.shouldFail())) {
+                LOGV2(20477,
+                      "getMoreHangAfterPinCursor fail point enabled. Blocking until fail "
+                      "point is disabled");
+                getMoreHangAfterPinCursor.pauseWhileSet(opCtx);
+            }
+
             if (isLinearizableReadConcern) {
                 // waitForLinearizableReadConcern performs a NoOp write and waits for that write
                 // to have been majority committed. awaitReplication requires that we release all
@@ -756,7 +770,7 @@ public:
             CursorGetMoreReply::parse({"CursorGetMoreReply"}, ret.removeField("ok"));
         }
 
-        const GetMoreCommand _cmd;
+        const GetMoreCommandRequest _cmd;
     };
 
     bool maintenanceOk() const override {

@@ -60,8 +60,6 @@ namespace index_key_validate {
 
 std::function<void(std::set<StringData>&)> filterAllowedIndexFieldNames;
 
-using std::string;
-
 using IndexVersion = IndexDescriptor::IndexVersion;
 
 namespace {
@@ -107,6 +105,21 @@ static const std::set<StringData> allowedIdIndexFieldNames = {
     IndexDescriptor::kNamespaceFieldName,
     // Index creation under legacy writeMode can result in an index spec with an _id field.
     "_id"};
+
+/**
+ * Returns Status::OK() if indexes of version 'indexVersion' are allowed to be created, and
+ * returns ErrorCodes::CannotCreateIndex otherwise.
+ */
+Status isIndexVersionAllowedForCreation(IndexVersion indexVersion, const BSONObj& indexSpec) {
+    switch (indexVersion) {
+        case IndexVersion::kV1:
+        case IndexVersion::kV2:
+            return Status::OK();
+    }
+    return {ErrorCodes::CannotCreateIndex,
+            str::stream() << "Invalid index specification " << indexSpec
+                          << "; cannot create an index with v=" << static_cast<int>(indexVersion)};
+}
 }  // namespace
 
 Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion indexVersion) {
@@ -118,7 +131,7 @@ Status validateKeyPattern(const BSONObj& key, IndexDescriptor::IndexVersion inde
     if (key.isEmpty())
         return Status(code, "Index keys cannot be empty.");
 
-    string pluginName = IndexNames::findPluginName(key);
+    auto pluginName = IndexNames::findPluginName(key);
     if (pluginName.size()) {
         if (!IndexNames::isKnownName(pluginName))
             return Status(code, str::stream() << "Unknown index plugin '" << pluginName << '\'');
@@ -254,15 +267,13 @@ BSONObj removeUnknownFields(const BSONObj& indexSpec) {
     return builder.obj();
 }
 
-StatusWith<BSONObj> validateIndexSpec(
-    OperationContext* opCtx,
-    const BSONObj& indexSpec,
-    const ServerGlobalParams::FeatureCompatibility& featureCompatibility) {
+StatusWith<BSONObj> validateIndexSpec(OperationContext* opCtx, const BSONObj& indexSpec) {
     bool hasKeyPatternField = false;
     bool hasIndexNameField = false;
     bool hasNamespaceField = false;
     bool hasVersionField = false;
     bool hasCollationField = false;
+    bool hasWeightsField = false;
     bool apiStrict = opCtx && APIParameters::get(opCtx).getAPIStrict().value_or(false);
 
     auto fieldNamesValidStatus = validateIndexSpecFieldNames(indexSpec);
@@ -271,6 +282,7 @@ StatusWith<BSONObj> validateIndexSpec(
     }
 
     boost::optional<IndexVersion> resolvedIndexVersion;
+    std::string indexType;
 
     for (auto&& indexSpecElem : indexSpec) {
         auto indexSpecElemFieldName = indexSpecElem.fieldNameStringData();
@@ -298,17 +310,17 @@ StatusWith<BSONObj> validateIndexSpec(
             // 'validateKeyPattern()'. It must currently be done here so that haystack indexes
             // continue to replicate correctly before the upgrade to FCV "4.9" is complete.
             const auto keyPattern = indexSpecElem.Obj();
-            const auto indexName = IndexNames::findPluginName(keyPattern);
-            if (indexName == IndexNames::GEO_HAYSTACK) {
+            indexType = IndexNames::findPluginName(keyPattern);
+            if (indexType == IndexNames::GEO_HAYSTACK) {
                 return {ErrorCodes::CannotCreateIndex,
                         str::stream()
                             << "GeoHaystack indexes cannot be created in version 4.9 and above"};
             }
 
-            if (apiStrict && indexName == IndexNames::TEXT) {
+            if (apiStrict && indexType == IndexNames::TEXT) {
                 return {ErrorCodes::APIStrictError,
                         str::stream()
-                            << indexName << " indexes cannot be created with apiStrict: true"};
+                            << indexType << " indexes cannot be created with apiStrict: true"};
             }
 
             // Here we always validate the key pattern according to the most recent rules, in order
@@ -365,8 +377,8 @@ StatusWith<BSONObj> validateIndexSpec(
 
             const IndexVersion requestedIndexVersion =
                 static_cast<IndexVersion>(*requestedIndexVersionAsInt);
-            auto creationAllowedStatus = IndexDescriptor::isIndexVersionAllowedForCreation(
-                requestedIndexVersion, featureCompatibility, indexSpec);
+            auto creationAllowedStatus =
+                isIndexVersionAllowedForCreation(requestedIndexVersion, indexSpec);
             if (!creationAllowedStatus.isOK()) {
                 return creationAllowedStatus;
             }
@@ -452,6 +464,14 @@ StatusWith<BSONObj> validateIndexSpec(
                 return ex.toStatus(str::stream() << "Failed to parse: "
                                                  << IndexDescriptor::kPathProjectionFieldName);
             }
+        } else if (IndexDescriptor::kWeightsFieldName == indexSpecElemFieldName) {
+            if (!indexSpecElem.isABSONObj() && indexSpecElem.type() != String) {
+                return {ErrorCodes::TypeMismatch,
+                        str::stream()
+                            << "The field '" << indexSpecElemFieldName
+                            << "' must be an object, but got " << typeName(indexSpecElem.type())};
+            }
+            hasWeightsField = true;
         } else if (IndexDescriptor::kGeoHaystackBucketSize == indexSpecElemFieldName) {
             return {ErrorCodes::CannotCreateIndex,
                     str::stream()
@@ -468,12 +488,6 @@ StatusWith<BSONObj> validateIndexSpec(
                     str::stream() << "The field '" << indexSpecElemFieldName << " has value "
                                   << indexSpecElem.toString()
                                   << ", which is not convertible to bool"};
-        } else if (IndexDescriptor::kWeightsFieldName == indexSpecElemFieldName &&
-                   !indexSpecElem.isABSONObj() && indexSpecElem.type() != String) {
-            return {ErrorCodes::TypeMismatch,
-                    str::stream() << "The field '" << indexSpecElemFieldName
-                                  << "' must be an object, but got "
-                                  << typeName(indexSpecElem.type())};
         } else if ((IndexDescriptor::kDefaultLanguageFieldName == indexSpecElemFieldName ||
                     IndexDescriptor::kLanguageOverrideFieldName == indexSpecElemFieldName) &&
                    indexSpecElem.type() != BSONType::String) {
@@ -521,6 +535,13 @@ StatusWith<BSONObj> validateIndexSpec(
                               << IndexDescriptor::kCollationFieldName << "' option and "
                               << IndexDescriptor::kIndexVersionFieldName << "="
                               << static_cast<int>(*resolvedIndexVersion)};
+    }
+
+    if (indexType != IndexNames::TEXT && hasWeightsField) {
+        return {ErrorCodes::CannotCreateIndex,
+                str::stream() << "Invalid index specification " << indexSpec << "; the field '"
+                              << IndexDescriptor::kWeightsFieldName
+                              << "' can only be specified with text indexes"};
     }
 
     BSONObj modifiedSpec = indexSpec;

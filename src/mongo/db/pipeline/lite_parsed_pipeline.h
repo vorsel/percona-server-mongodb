@@ -53,7 +53,7 @@ public:
      * May throw a AssertionException if there is an invalid stage specification, although full
      * validation happens later, during Pipeline construction.
      */
-    LiteParsedPipeline(const AggregateCommand& request)
+    LiteParsedPipeline(const AggregateCommandRequest& request)
         : LiteParsedPipeline(request.getNamespace(), request.getPipeline()) {}
 
     LiteParsedPipeline(const NamespaceString& nss, const std::vector<BSONObj>& pipelineStages) {
@@ -94,13 +94,6 @@ public:
      */
     bool startsWithCollStats() const {
         return !_stageSpecs.empty() && _stageSpecs.front()->isCollStats();
-    }
-
-    /**
-     * Returns true if the pipeline begins with a $collStats stage with the count option.
-     */
-    bool startsWithCollStatsWithCount() const {
-        return startsWithCollStats() && _stageSpecs.front()->isCollStatsWithCount();
     }
 
     /**

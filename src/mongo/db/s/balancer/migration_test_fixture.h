@@ -41,6 +41,7 @@
 #include "mongo/s/catalog/type_database.h"
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog/type_tags.h"
+#include "mongo/s/type_collection_timeseries_fields_gen.h"
 
 namespace mongo {
 
@@ -72,13 +73,18 @@ protected:
      * Inserts a document into the config.collections collection to indicate that "collName" is
      * sharded with version "version". The shard key pattern defaults to "_id".
      */
-    void setUpCollection(const NamespaceString& collName, ChunkVersion version);
+    void setUpCollection(
+        const NamespaceString& collName,
+        const UUID& collUUID,
+        const ChunkVersion& version,
+        boost::optional<TypeCollectionTimeseriesFields> timeseriesFields = boost::none);
 
     /**
      * Inserts a document into the config.chunks collection so that the chunk defined by the
      * parameters exists. Returns a ChunkType defined by the parameters.
      */
     ChunkType setUpChunk(const NamespaceString& collName,
+                         const UUID& collUUID,
                          const BSONObj& chunkMin,
                          const BSONObj& chunkMax,
                          const ShardId& shardId,

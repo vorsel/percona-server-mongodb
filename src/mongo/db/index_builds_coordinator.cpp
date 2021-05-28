@@ -2185,12 +2185,7 @@ void IndexBuildsCoordinator::_resumeIndexBuildFromPhase(
         resumeInfo.getPhase() == IndexBuildPhaseEnum::kCollectionScan) {
         boost::optional<RecordId> resumeAfterRecordId;
         if (resumeInfo.getCollectionScanPosition()) {
-            auto scanPosition = *resumeInfo.getCollectionScanPosition();
-            if (auto recordIdOIDPtr = stdx::get_if<OID>(&scanPosition)) {
-                resumeAfterRecordId.emplace(recordIdOIDPtr->view().view(), OID::kOIDSize);
-            } else if (auto recordIdLongPtr = stdx::get_if<int64_t>(&scanPosition)) {
-                resumeAfterRecordId.emplace(RecordId(*recordIdLongPtr));
-            }
+            resumeAfterRecordId = *resumeInfo.getCollectionScanPosition();
         }
 
         _scanCollectionAndInsertSortedKeysIntoIndex(opCtx, replState, resumeAfterRecordId);
@@ -2804,6 +2799,9 @@ std::vector<BSONObj> IndexBuildsCoordinator::normalizeIndexSpecs(
         const auto kProjectionName = IndexDescriptor::kPathProjectionFieldName;
         const auto pathProjectionSpec = spec.getObjectField(kProjectionName);
         static const auto kWildcardKeyPattern = BSON("$**" << 1);
+        // It's illegal for the user to explicitly specify an empty wildcardProjection for creating
+        // a {"$**":1} index, and specify any wildcardProjection for a {"field.$**": 1} index. If
+        // the projection is empty, then it means that there is no projection to normalize.
         if (pathProjectionSpec.isEmpty()) {
             return spec;
         }

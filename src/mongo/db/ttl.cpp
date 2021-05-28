@@ -49,6 +49,7 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/record_id_helpers.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_registry.h"
 #include "mongo/db/service_context.h"
@@ -81,6 +82,7 @@ Counter64 ttlDeletedDocuments;
 ServerStatusMetricField<Counter64> ttlPassesDisplay("ttl.passes", &ttlPasses);
 ServerStatusMetricField<Counter64> ttlDeletedDocumentsDisplay("ttl.deletedDocuments",
                                                               &ttlDeletedDocuments);
+using MtabType = TenantMigrationAccessBlocker::BlockerType;
 
 class TTLMonitor : public BackgroundJob {
 public:
@@ -244,13 +246,16 @@ private:
             return;
         }
 
-        uassertStatusOK(userAllowedWriteNS(nss));
+        uassertStatusOK(userAllowedWriteNS(opCtx, nss));
 
         AutoGetCollection coll(opCtx, nss, MODE_IX);
         // The collection with `uuid` might be renamed before the lock and the wrong namespace would
         // be locked and looked up so we double check here.
         if (!coll || coll->uuid() != uuid)
             return;
+
+        // TTL indexes are not compatible with capped collections.
+        invariant(!coll->isCapped());
 
         if (MONGO_unlikely(hangTTLMonitorWithLock.shouldFail())) {
             LOGV2(22534,
@@ -267,7 +272,8 @@ private:
         if (coll.getDb() &&
             nullptr !=
                 (mtab = TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
-                            .getTenantMigrationAccessBlockerForDbName(coll.getDb()->name())) &&
+                            .getTenantMigrationAccessBlockerForDbName(coll.getDb()->name(),
+                                                                      MtabType::kRecipient)) &&
             mtab->checkIfShouldBlockTTL()) {
             LOGV2_DEBUG(53768,
                         1,
@@ -298,17 +304,8 @@ private:
     Date_t safeExpirationDate(OperationContext* opCtx,
                               const CollectionPtr& coll,
                               std::int64_t expireAfterSeconds) const {
-        if (coll->ns().isTimeseriesBucketsCollection()) {
-            auto timeseriesNs = coll->ns().bucketsNamespaceToTimeseries();
-            auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, timeseriesNs.db());
-            invariant(viewCatalog);
-            auto viewDef = viewCatalog->lookup(opCtx, timeseriesNs.ns());
-            uassert(ErrorCodes::NamespaceNotFound,
-                    fmt::format("Could not find view definition for namespace: {}",
-                                timeseriesNs.toString()),
-                    viewDef);
-
-            const auto bucketMaxSpan = Seconds(viewDef->timeseries()->getBucketMaxSpanSeconds());
+        if (auto timeseries = coll->getTimeseriesOptions()) {
+            const auto bucketMaxSpan = Seconds(timeseries->getBucketMaxSpanSeconds());
 
             // Don't delete data unless it is safely out of range of the bucket maximum time
             // range. On time-series collections, the _id (and thus RecordId) is the minimum
@@ -404,7 +401,7 @@ private:
         const char* keyFieldName = key.firstElement().fieldName();
         BSONObj query =
             BSON(keyFieldName << BSON("$gte" << kDawnOfTime << "$lte" << expirationDate));
-        auto findCommand = std::make_unique<FindCommand>(collection->ns());
+        auto findCommand = std::make_unique<FindCommandRequest>(collection->ns());
         findCommand->setFilter(query);
         auto canonicalQuery = CanonicalQuery::canonicalize(opCtx, std::move(findCommand));
         invariant(canonicalQuery.getStatus());
@@ -479,7 +476,8 @@ private:
         // timestamp or lower.
         auto endOID = OID();
         endOID.init(expirationDate, true /* max */);
-        const auto endId = RecordId(endOID.view().view(), OID::kOIDSize);
+
+        const auto endId = record_id_helpers::keyForOID(endOID);
 
         auto params = std::make_unique<DeleteStageParams>();
         params->isMulti = true;

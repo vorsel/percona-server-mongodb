@@ -15,7 +15,6 @@ selector:
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
   - jstests/core/bulk_legacy_enforce_gle.js
-  - jstests/core/capped5.js
   - jstests/core/commands_with_uuid.js
   - jstests/core/dbcase.js
   - jstests/core/dbcase2.js
@@ -89,9 +88,6 @@ selector:
   - jstests/core/list_local_sessions.js
   - jstests/core/list_sessions.js
 
-  # $indexStats
-  - jstests/core/index_stats.js
-
   # $collStats
   - jstests/core/operation_latency_histogram.js
   - jstests/core/views/views_coll_stats.js
@@ -103,13 +99,11 @@ selector:
   - jstests/core/bulk_api_ordered.js
   - jstests/core/bulk_api_unordered.js
   - jstests/core/bulk_legacy_enforce_gle.js
-  - jstests/core/cappeda.js
   - jstests/core/doc_validation.js
   - jstests/core/doc_validation_options.js
   - jstests/core/field_name_validation.js
   - jstests/core/insert_illegal_doc.js
   - jstests/core/push_sort.js
-  - jstests/core/rename4.js
   - jstests/core/update_arrayFilters.js
   - jstests/core/update_dbref.js
   - jstests/core/updatel.js
@@ -127,7 +121,6 @@ selector:
   - jstests/core/dbref2.js
   - jstests/core/ref3.js
   - jstests/core/update3.js
-  - jstests/core/rename3.js
 
   ##
   ## Error: Unable to acquire lock within a max lock request timeout of '0ms' milliseconds
@@ -149,15 +142,6 @@ selector:
   - jstests/core/getmore_cmd_maxtimems.js
   - jstests/core/tailable_cursor_invalidation.js
   - jstests/core/tailable_getmore_batch_size.js
-
-  # SERVER-34918 The "max" option of a capped collection can be exceeded until the next insert.
-  # The reason is that we don't update the count of a collection until a transaction commits,
-  # by which point it is too late to complain that "max" has been exceeded.
-  - jstests/core/capped_max1.js
-
-  # The "max" option of a capped collection can be temporarily exceeded before a
-  # txn is committed.
-  - jstests/core/bulk_insert_capped.js
 
   # Wrong count for top info (WriteLock)
   - jstests/core/top.js
@@ -184,7 +168,6 @@ selector:
   - jstests/core/getmore_invalidated_cursors.js
   - jstests/core/getmore_invalidated_documents.js
   - jstests/core/kill_cursors.js
-  - jstests/core/list_collections1.js
   - jstests/core/list_indexes.js
   - jstests/core/oro.js
 
@@ -301,8 +284,7 @@ selector:
   - requires_profiling
   # Retrying a query can change whether a plan cache entry is active.
   - inspects_whether_plan_cache_entry_is_active
-  # $out is not supported in transactions
-  - uses_$out
+  - does_not_support_transactions
   # Operations in the main test shell aren't guaranteed to be causally consistent with operations
   # performed earlier in a parallel shell if multiple nodes are electable because the latest
   # operation and cluster times aren't shared between shells.

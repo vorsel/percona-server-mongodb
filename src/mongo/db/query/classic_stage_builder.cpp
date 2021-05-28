@@ -63,7 +63,6 @@
 #include "mongo/db/exec/text_or.h"
 #include "mongo/db/index/fts_access_method.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
-#include "mongo/db/record_id_helpers.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/logv2/log.h"
 
@@ -161,30 +160,33 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
         case STAGE_PROJECTION_DEFAULT: {
             auto pn = static_cast<const ProjectionNodeDefault*>(root);
             auto childStage = build(pn->children[0]);
-            return std::make_unique<ProjectionStageDefault>(_cq.getExpCtx(),
-                                                            _cq.getFindCommand().getProjection(),
-                                                            _cq.getProj(),
-                                                            _ws,
-                                                            std::move(childStage));
+            return std::make_unique<ProjectionStageDefault>(
+                _cq.getExpCtx(),
+                _cq.getFindCommandRequest().getProjection(),
+                _cq.getProj(),
+                _ws,
+                std::move(childStage));
         }
         case STAGE_PROJECTION_COVERED: {
             auto pn = static_cast<const ProjectionNodeCovered*>(root);
             auto childStage = build(pn->children[0]);
-            return std::make_unique<ProjectionStageCovered>(_cq.getExpCtxRaw(),
-                                                            _cq.getFindCommand().getProjection(),
-                                                            _cq.getProj(),
-                                                            _ws,
-                                                            std::move(childStage),
-                                                            pn->coveredKeyObj);
+            return std::make_unique<ProjectionStageCovered>(
+                _cq.getExpCtxRaw(),
+                _cq.getFindCommandRequest().getProjection(),
+                _cq.getProj(),
+                _ws,
+                std::move(childStage),
+                pn->coveredKeyObj);
         }
         case STAGE_PROJECTION_SIMPLE: {
             auto pn = static_cast<const ProjectionNodeSimple*>(root);
             auto childStage = build(pn->children[0]);
-            return std::make_unique<ProjectionStageSimple>(_cq.getExpCtxRaw(),
-                                                           _cq.getFindCommand().getProjection(),
-                                                           _cq.getProj(),
-                                                           _ws,
-                                                           std::move(childStage));
+            return std::make_unique<ProjectionStageSimple>(
+                _cq.getExpCtxRaw(),
+                _cq.getFindCommandRequest().getProjection(),
+                _cq.getProj(),
+                _ws,
+                std::move(childStage));
         }
         case STAGE_LIMIT: {
             const LimitNode* ln = static_cast<const LimitNode*>(root);
@@ -413,9 +415,11 @@ std::unique_ptr<PlanStage> ClassicStageBuilder::build(const QuerySolutionNode* r
         case STAGE_MULTI_PLAN:
         case STAGE_QUEUED_DATA:
         case STAGE_RECORD_STORE_FAST_COUNT:
+        case STAGE_SAMPLE_FROM_TIMESERIES_BUCKET:
         case STAGE_SUBPLAN:
         case STAGE_TRIAL:
         case STAGE_UNKNOWN:
+        case STAGE_UNPACK_TIMESERIES_BUCKET:
         case STAGE_UPDATE: {
             LOGV2_WARNING(4615604, "Can't build exec tree for node", "node"_attr = *root);
         }

@@ -26,11 +26,13 @@
  *    exception statement from all source files in the program, then also delete
  *    it in the license file.
  */
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include <algorithm>
 #include <memory>
 
 #include "mongo/db/s/resharding/resharding_metrics.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
 
 namespace mongo {
@@ -58,7 +60,7 @@ constexpr auto kCriticalSectionTimeElapsed = "totalCriticalSectionTimeElapsed";
 constexpr auto kCoordinatorState = "coordinatorState";
 constexpr auto kDonorState = "donorState";
 constexpr auto kRecipientState = "recipientState";
-constexpr auto kCompletionStatus = "opStatus";
+constexpr auto kOpStatus = "opStatus";
 
 using MetricsPtr = std::unique_ptr<ReshardingMetrics>;
 
@@ -89,8 +91,7 @@ ReshardingMetrics* ReshardingMetrics::get(ServiceContext* ctx) noexcept {
 
 void ReshardingMetrics::onStart() noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
-    invariant(!_currentOp.has_value() || _currentOp->isCompleted(), kAnotherOperationInProgress);
-
+    invariant(!_currentOp.has_value(), kAnotherOperationInProgress);
     // Create a new operation and record the time it started.
     _currentOp.emplace(_svcCtx->getFastClockSource());
     _currentOp->runningOperation.start();
@@ -100,7 +101,7 @@ void ReshardingMetrics::onStart() noexcept {
 
 void ReshardingMetrics::onCompletion(ReshardingOperationStatusEnum status) noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
-    invariant(_currentOp.has_value() && !_currentOp->isCompleted(), kNoOperationInProgress);
+    invariant(_currentOp.has_value(), kNoOperationInProgress);
     switch (status) {
         case ReshardingOperationStatusEnum::kSuccess:
             _succeeded++;
@@ -115,17 +116,13 @@ void ReshardingMetrics::onCompletion(ReshardingOperationStatusEnum status) noexc
             MONGO_UNREACHABLE;
     }
 
-    // Mark the active operation as completed and ensure all timers are stopped.
-    _currentOp->runningOperation.end();
-    _currentOp->copyingDocuments.tryEnd();
-    _currentOp->applyingOplogEntries.tryEnd();
-    _currentOp->inCriticalSection.tryEnd();
-    _currentOp->opStatus = status;
+    // Reset current op metrics.
+    _currentOp = boost::none;
 }
 
 void ReshardingMetrics::setDonorState(DonorStateEnum state) noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
-    invariant(_currentOp.has_value() && !_currentOp->isCompleted(), kNoOperationInProgress);
+    invariant(_currentOp.has_value(), kNoOperationInProgress);
 
     const auto oldState = std::exchange(_currentOp->donorState, state);
     invariant(oldState != state);
@@ -141,7 +138,7 @@ void ReshardingMetrics::setDonorState(DonorStateEnum state) noexcept {
 
 void ReshardingMetrics::setRecipientState(RecipientStateEnum state) noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
-    invariant(_currentOp.has_value() && !_currentOp->isCompleted(), kNoOperationInProgress);
+    invariant(_currentOp.has_value(), kNoOperationInProgress);
 
     const auto oldState = std::exchange(_currentOp->recipientState, state);
     invariant(oldState != state);
@@ -161,13 +158,42 @@ void ReshardingMetrics::setRecipientState(RecipientStateEnum state) noexcept {
 
 void ReshardingMetrics::setCoordinatorState(CoordinatorStateEnum state) noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
-    invariant(_currentOp.has_value() && !_currentOp->isCompleted(), kNoOperationInProgress);
+    invariant(_currentOp.has_value(), kNoOperationInProgress);
     _currentOp->coordinatorState = state;
+}
+
+static StringData serializeState(RecipientStateEnum e) {
+    return RecipientState_serializer(e);
+}
+
+static StringData serializeState(DonorStateEnum e) {
+    return DonorState_serializer(e);
+}
+
+template <typename T>
+static bool checkState(T state, std::initializer_list<T> validStates) {
+    invariant(validStates.size());
+    if (std::find(validStates.begin(), validStates.end(), state) != validStates.end())
+        return true;
+
+    std::stringstream ss;
+    StringData sep = "";
+    for (auto state : validStates) {
+        ss << sep << serializeState(state);
+        sep = ", "_sd;
+    }
+
+    LOGV2_FATAL_CONTINUE(5553300,
+                         "Invalid resharding state",
+                         "state"_attr = serializeState(state),
+                         "valid"_attr = ss.str());
+    return false;
 }
 
 void ReshardingMetrics::setDocumentsToCopy(int64_t documents, int64_t bytes) noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
-    invariant(_currentOp.has_value() && !_currentOp->isCompleted(), kNoOperationInProgress);
+    invariant(_currentOp.has_value(), kNoOperationInProgress);
+    invariant(_currentOp->recipientState == RecipientStateEnum::kCreatingCollection);
 
     _currentOp->documentsToCopy = documents;
     _currentOp->bytesToCopy = bytes;
@@ -175,36 +201,60 @@ void ReshardingMetrics::setDocumentsToCopy(int64_t documents, int64_t bytes) noe
 
 void ReshardingMetrics::onDocumentsCopied(int64_t documents, int64_t bytes) noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
-    invariant(_currentOp.has_value() && !_currentOp->isCompleted(), kNoOperationInProgress);
-    invariant(_currentOp->recipientState == RecipientStateEnum::kCloning);
+    if (!_currentOp)
+        return;
+
+    invariant(checkState(_currentOp->recipientState,
+                         {RecipientStateEnum::kCloning, RecipientStateEnum::kError}));
 
     _currentOp->documentsCopied += documents;
     _currentOp->bytesCopied += bytes;
+    _cumulativeOp.documentsCopied += documents;
+    _cumulativeOp.bytesCopied += bytes;
 }
 
 void ReshardingMetrics::onOplogEntriesFetched(int64_t entries) noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
-    invariant(_currentOp.has_value() && !_currentOp->isCompleted(), kNoOperationInProgress);
-    invariant(_currentOp->recipientState == RecipientStateEnum::kCloning ||
-              _currentOp->recipientState == RecipientStateEnum::kApplying ||
-              _currentOp->recipientState == RecipientStateEnum::kSteadyState);
+    if (!_currentOp)
+        return;
+
+    invariant(checkState(_currentOp->recipientState,
+                         {RecipientStateEnum::kCloning,
+                          RecipientStateEnum::kApplying,
+                          RecipientStateEnum::kSteadyState,
+                          RecipientStateEnum::kError}));
+
     _currentOp->oplogEntriesFetched += entries;
+    _cumulativeOp.oplogEntriesFetched += entries;
 }
 
 void ReshardingMetrics::onOplogEntriesApplied(int64_t entries) noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
-    invariant(_currentOp.has_value() && !_currentOp->isCompleted(), kNoOperationInProgress);
-    invariant(_currentOp->recipientState == RecipientStateEnum::kApplying ||
-              _currentOp->recipientState == RecipientStateEnum::kSteadyState);
+    if (!_currentOp)
+        return;
+
+    invariant(checkState(_currentOp->recipientState,
+                         {RecipientStateEnum::kApplying,
+                          RecipientStateEnum::kSteadyState,
+                          RecipientStateEnum::kError}));
+
     _currentOp->oplogEntriesApplied += entries;
+    _cumulativeOp.oplogEntriesApplied += entries;
 }
 
 void ReshardingMetrics::onWriteDuringCriticalSection(int64_t writes) noexcept {
     stdx::lock_guard<Latch> lk(_mutex);
-    invariant(_currentOp.has_value() && !_currentOp->isCompleted(), kNoOperationInProgress);
-    invariant(_currentOp->donorState == DonorStateEnum::kPreparingToBlockWrites ||
-              _currentOp->donorState == DonorStateEnum::kBlockingWrites);
+    if (!_currentOp)
+        return;
+
+    invariant(checkState(_currentOp->donorState,
+                         {DonorStateEnum::kDonatingOplogEntries,
+                          DonorStateEnum::kPreparingToBlockWrites,
+                          DonorStateEnum::kBlockingWrites,
+                          DonorStateEnum::kError}));
+
     _currentOp->writesDuringCriticalSection += writes;
+    _cumulativeOp.writesDuringCriticalSection += writes;
 }
 
 void ReshardingMetrics::OperationMetrics::TimeInterval::start() noexcept {
@@ -212,18 +262,10 @@ void ReshardingMetrics::OperationMetrics::TimeInterval::start() noexcept {
     _start.emplace(_clockSource->now());
 }
 
-void ReshardingMetrics::OperationMetrics::TimeInterval::tryEnd() noexcept {
-    if (!_start.has_value())
-        return;
-    if (_end.has_value())
-        return;
-    _end.emplace(_clockSource->now());
-}
-
 void ReshardingMetrics::OperationMetrics::TimeInterval::end() noexcept {
     invariant(_start.has_value(), "Not started");
     invariant(!_end.has_value(), "Already stopped");
-    tryEnd();
+    _end.emplace(_clockSource->now());
 }
 
 Milliseconds ReshardingMetrics::OperationMetrics::TimeInterval::duration() const noexcept {
@@ -234,96 +276,55 @@ Milliseconds ReshardingMetrics::OperationMetrics::TimeInterval::duration() const
     return duration_cast<Milliseconds>(_end.value() - _start.value());
 }
 
-void ReshardingMetrics::OperationMetrics::append(BSONObjBuilder* bob, Role role) const {
-    auto getElapsedTime = [role](const TimeInterval& interval) -> int64_t {
-        if (role == Role::kAll)
-            return durationCount<Milliseconds>(interval.duration());
-        else
-            return durationCount<Seconds>(interval.duration());
+void ReshardingMetrics::OperationMetrics::appendCurrentOpMetrics(BSONObjBuilder* bob,
+                                                                 Role role) const {
+    auto getElapsedTime = [](const TimeInterval& interval) -> int64_t {
+        return durationCount<Seconds>(interval.duration());
     };
 
-    auto remainingMsec = [&]() -> boost::optional<Milliseconds> {
-        if (oplogEntriesApplied > 0 && oplogEntriesFetched > 0) {
-            // All fetched oplogEntries must be applied. Some of them already have been.
-            return remainingTime(
-                applyingOplogEntries.duration(), oplogEntriesApplied, oplogEntriesFetched);
-        }
-        if (bytesCopied > 0 && bytesToCopy > 0) {
-            // Until the time to apply batches of oplog entries is measured, we assume that applying
-            // all of them will take as long as copying did.
-            return remainingTime(copyingDocuments.duration(), bytesCopied, 2 * bytesToCopy);
-        }
-        return {};
-    }();
 
+    const auto remainingMsec = remainingOperationTime();
 
-    const std::string kIntervalSuffix = role == Role::kAll ? "Millis" : "";
-    bob->append(kOpTimeElapsed + kIntervalSuffix, getElapsedTime(runningOperation));
+    bob->append(kOpTimeElapsed, getElapsedTime(runningOperation));
 
-    bob->append(kOpTimeRemaining + kIntervalSuffix,
+    bob->append(kOpTimeRemaining,
                 !remainingMsec ? int64_t{-1} /** -1 is a specified integer null value */
-                               : role == Role::kAll ? durationCount<Milliseconds>(*remainingMsec)
-                                                    : durationCount<Seconds>(*remainingMsec));
-
-    if (role == Role::kAll || role == Role::kRecipient) {
-        bob->append(kDocumentsToCopy, documentsToCopy);
-        bob->append(kDocumentsCopied, documentsCopied);
-        bob->append(kBytesToCopy, bytesToCopy);
-        bob->append(kBytesCopied, bytesCopied);
-        bob->append(kCopyTimeElapsed + kIntervalSuffix, getElapsedTime(copyingDocuments));
-
-        bob->append(kOplogsFetched, oplogEntriesFetched);
-        bob->append(kOplogsApplied, oplogEntriesApplied);
-        bob->append(kApplyTimeElapsed + kIntervalSuffix, getElapsedTime(applyingOplogEntries));
-    }
-
-    if (role == Role::kAll || role == Role::kDonor) {
-        bob->append(kWritesDuringCritialSection, writesDuringCriticalSection);
-        bob->append(kCriticalSectionTimeElapsed + kIntervalSuffix,
-                    getElapsedTime(inCriticalSection));
-    }
+                               : durationCount<Seconds>(*remainingMsec));
 
     switch (role) {
         case Role::kDonor:
+            bob->append(kWritesDuringCritialSection, writesDuringCriticalSection);
+            bob->append(kCriticalSectionTimeElapsed, getElapsedTime(inCriticalSection));
             bob->append(kDonorState, DonorState_serializer(donorState));
-            bob->append(kCompletionStatus, ReshardingOperationStatus_serializer(opStatus));
+            bob->append(kOpStatus, ReshardingOperationStatus_serializer(opStatus));
             break;
         case Role::kRecipient:
+            bob->append(kDocumentsToCopy, documentsToCopy);
+            bob->append(kDocumentsCopied, documentsCopied);
+            bob->append(kBytesToCopy, bytesToCopy);
+            bob->append(kBytesCopied, bytesCopied);
+            bob->append(kCopyTimeElapsed, getElapsedTime(copyingDocuments));
+
+            bob->append(kOplogsFetched, oplogEntriesFetched);
+            bob->append(kOplogsApplied, oplogEntriesApplied);
+            bob->append(kApplyTimeElapsed, getElapsedTime(applyingOplogEntries));
             bob->append(kRecipientState, RecipientState_serializer(recipientState));
-            bob->append(kCompletionStatus, ReshardingOperationStatus_serializer(opStatus));
+            bob->append(kOpStatus, ReshardingOperationStatus_serializer(opStatus));
             break;
         case Role::kCoordinator:
             bob->append(kCoordinatorState, CoordinatorState_serializer(coordinatorState));
-            bob->append(kCompletionStatus, ReshardingOperationStatus_serializer(opStatus));
-            break;
-        case Role::kAll:
-            bob->append(kDonorState, donorState);
-            bob->append(kRecipientState, recipientState);
-            bob->append(kCoordinatorState, coordinatorState);
-            bob->append(kCompletionStatus, opStatus);
+            bob->append(kOpStatus, ReshardingOperationStatus_serializer(opStatus));
             break;
         default:
             MONGO_UNREACHABLE;
     }
 }
 
-void ReshardingMetrics::serialize(BSONObjBuilder* bob, ReporterOptions::Role role) const {
+void ReshardingMetrics::serializeCurrentOpMetrics(BSONObjBuilder* bob,
+                                                  ReporterOptions::Role role) const {
     stdx::lock_guard<Latch> lk(_mutex);
-
-    if (role == ReporterOptions::Role::kAll) {
-        bob->append(kTotalOps, _started);
-        bob->append(kSuccessfulOps, _succeeded);
-        bob->append(kFailedOps, _failed);
-        bob->append(kCanceledOps, _canceled);
-    }
-
-    if (_currentOp) {
-        _currentOp->append(bob, role);
-    } else {
-        // There are no resharding operations in progress, so report the default metrics.
-        OperationMetrics opMetrics(_svcCtx->getFastClockSource());
-        opMetrics.append(bob, role);
-    }
+    if (_currentOp)
+        _currentOp->appendCurrentOpMetrics(bob, role);
 }
 
 BSONObj ReshardingMetrics::reportForCurrentOp(const ReporterOptions& options) const noexcept {
@@ -359,15 +360,55 @@ BSONObj ReshardingMetrics::reportForCurrentOp(const ReporterOptions& options) co
     bob.append("ns", options.nss.toString());
     bob.append("originatingCommand", originatingCommand);
 
-    serialize(&bob, options.role);
+    serializeCurrentOpMetrics(&bob, options.role);
 
     return bob.obj();
 }
 
 boost::optional<Milliseconds> ReshardingMetrics::getOperationElapsedTime() const {
+    stdx::lock_guard<Latch> lk(_mutex);
     if (!_currentOp)
         return boost::none;
     return _currentOp->runningOperation.duration();
+}
+
+boost::optional<Milliseconds> ReshardingMetrics::getOperationRemainingTime() const {
+    if (_currentOp)
+        return _currentOp->remainingOperationTime();
+    return boost::none;
+}
+
+void ReshardingMetrics::OperationMetrics::appendCumulativeOpMetrics(BSONObjBuilder* bob) const {
+    bob->append(kDocumentsCopied, documentsCopied);
+    bob->append(kBytesCopied, bytesCopied);
+    bob->append(kOplogsApplied, oplogEntriesApplied);
+    bob->append(kWritesDuringCritialSection, writesDuringCriticalSection);
+    bob->append(kOplogsFetched, oplogEntriesFetched);
+}
+
+boost::optional<Milliseconds> ReshardingMetrics::OperationMetrics::remainingOperationTime() const {
+    if (oplogEntriesApplied > 0 && oplogEntriesFetched > 0) {
+        // All fetched oplogEntries must be applied. Some of them already have been.
+        return remainingTime(
+            applyingOplogEntries.duration(), oplogEntriesApplied, oplogEntriesFetched);
+    }
+    if (bytesCopied > 0 && bytesToCopy > 0) {
+        // Until the time to apply batches of oplog entries is measured, we assume that applying all
+        // of them will take as long as copying did.
+        return remainingTime(copyingDocuments.duration(), bytesCopied, 2 * bytesToCopy);
+    }
+    return {};
+}
+
+void ReshardingMetrics::serializeCumulativeOpMetrics(BSONObjBuilder* bob) const {
+    stdx::lock_guard<Latch> lk(_mutex);
+
+    bob->append(kTotalOps, _started);
+    bob->append(kSuccessfulOps, _succeeded);
+    bob->append(kFailedOps, _failed);
+    bob->append(kCanceledOps, _canceled);
+
+    _cumulativeOp.appendCumulativeOpMetrics(bob);
 }
 
 }  // namespace mongo

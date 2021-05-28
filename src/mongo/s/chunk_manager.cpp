@@ -314,6 +314,7 @@ RoutingTableHistory::RoutingTableHistory(
     KeyPattern shardKeyPattern,
     std::unique_ptr<CollatorInterface> defaultCollator,
     bool unique,
+    boost::optional<TypeCollectionTimeseriesFields> timeseriesFields,
     boost::optional<TypeCollectionReshardingFields> reshardingFields,
     bool allowMigrations,
     ChunkMap chunkMap)
@@ -322,6 +323,7 @@ RoutingTableHistory::RoutingTableHistory(
       _shardKeyPattern(shardKeyPattern),
       _defaultCollator(std::move(defaultCollator)),
       _unique(unique),
+      _timeseriesFields(std::move(timeseriesFields)),
       _reshardingFields(std::move(reshardingFields)),
       _allowMigrations(allowMigrations),
       _chunkMap(std::move(chunkMap)),
@@ -384,7 +386,7 @@ void ChunkManager::getShardIdsForQuery(boost::intrusive_ptr<ExpressionContext> e
                                        const BSONObj& query,
                                        const BSONObj& collation,
                                        std::set<ShardId>* shardIds) const {
-    auto findCommand = std::make_unique<FindCommand>(_rt->optRt->nss());
+    auto findCommand = std::make_unique<FindCommandRequest>(_rt->optRt->nss());
     findCommand->setFilter(query.getOwned());
 
     if (auto uuid = getUUID())
@@ -736,6 +738,7 @@ RoutingTableHistory RoutingTableHistory::makeNew(
     bool unique,
     OID epoch,
     const boost::optional<Timestamp>& timestamp,
+    boost::optional<TypeCollectionTimeseriesFields> timeseriesFields,
     boost::optional<TypeCollectionReshardingFields> reshardingFields,
     bool allowMigrations,
     const std::vector<ChunkType>& chunks) {
@@ -744,6 +747,7 @@ RoutingTableHistory RoutingTableHistory::makeNew(
                                std::move(shardKeyPattern),
                                std::move(defaultCollator),
                                std::move(unique),
+                               std::move(timeseriesFields),
                                boost::none,
                                allowMigrations,
                                ChunkMap{epoch, timestamp})
@@ -768,6 +772,7 @@ RoutingTableHistory RoutingTableHistory::makeUpdated(
                                getShardKeyPattern().getKeyPattern(),
                                CollatorInterface::cloneCollator(getDefaultCollator()),
                                isUnique(),
+                               _timeseriesFields,
                                std::move(reshardingFields),
                                allowMigrations,
                                std::move(chunkMap));
@@ -798,6 +803,7 @@ RoutingTableHistory RoutingTableHistory::makeUpdatedReplacingTimestamp(
                                getShardKeyPattern().getKeyPattern(),
                                CollatorInterface::cloneCollator(getDefaultCollator()),
                                _unique,
+                               _timeseriesFields,
                                _reshardingFields,
                                _allowMigrations,
                                std::move(newMap));

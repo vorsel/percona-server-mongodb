@@ -61,6 +61,10 @@ public:
                     repl::feature_flags::gTenantMigrations.isEnabled(
                         serverGlobalParams.featureCompatibility));
 
+            uassert(ErrorCodes::IllegalOperation,
+                    "tenant migrations are not available in sharded clusters",
+                    serverGlobalParams.clusterRole == ClusterRole::None);
+
             // (Generic FCV reference): This FCV reference should exist across LTS binary versions.
             uassert(
                 5356100,
@@ -171,6 +175,10 @@ public:
                     repl::feature_flags::gTenantMigrations.isEnabled(
                         serverGlobalParams.featureCompatibility));
 
+            uassert(ErrorCodes::IllegalOperation,
+                    "tenant migrations are not available in sharded clusters",
+                    serverGlobalParams.clusterRole == ClusterRole::None);
+
             const auto& cmd = request();
 
             auto donorService =
@@ -239,6 +247,10 @@ public:
                     repl::feature_flags::gTenantMigrations.isEnabled(
                         serverGlobalParams.featureCompatibility));
 
+            uassert(ErrorCodes::IllegalOperation,
+                    "tenant migrations are not available in sharded clusters",
+                    serverGlobalParams.clusterRole == ClusterRole::None);
+
             const RequestType& cmd = request();
 
             auto donorService =
@@ -269,10 +281,6 @@ public:
 
             const auto& donor = donorPtr.get().get();
 
-            // Ensure that we only are able to run donorAbortMigration after the donor has called
-            // run() and has inserted a majority committed state document for the migration.
-            donor->getMigrationCancelableFuture().get(opCtx);
-            donor->getInitialDonorStateDurableFuture().get(opCtx);
             donor->onReceiveDonorAbortMigration();
             donor->getDecisionFuture().get(opCtx);
 

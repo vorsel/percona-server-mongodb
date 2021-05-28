@@ -53,6 +53,7 @@
 #include "mongo/db/service_context.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/timeseries/timeseries_lookup.h"
 #include "mongo/db/vector_clock.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/logv2/log.h"
@@ -90,7 +91,7 @@ std::unique_ptr<DropIndexes> makeTimeseriesDropIndexesCommand(OperationContext* 
     const auto& origIndex = origCmd.getIndex();
     if (auto keyPtr = stdx::get_if<BSONObj>(&origIndex)) {
         auto bucketsIndexSpecWithStatus =
-            timeseries::convertTimeseriesIndexSpecToBucketsIndexSpec(*timeseriesOptions, *keyPtr);
+            timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(*timeseriesOptions, *keyPtr);
 
         uassert(ErrorCodes::IndexNotFound,
                 str::stream() << bucketsIndexSpecWithStatus.getStatus().toString()

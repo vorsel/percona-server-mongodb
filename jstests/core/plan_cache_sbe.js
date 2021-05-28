@@ -16,17 +16,12 @@
 (function() {
 "use strict";
 
+load("jstests/libs/sbe_util.js");  // For checkSBEEnabled.
+
 const coll = db.plan_cache_sbe;
 coll.drop();
 
-// Note that the "getParameter" command is expected to fail in versions of mongod that do not yet
-// include the slot-based execution engine. When that happens, however, 'isSBEEnabled' still
-// correctly evaluates to false.
-const isSBEEnabled = (() => {
-    const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
-    return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
-})();
-
+const isSBECompat = checkSBECompatible(db);
 assert.commandWorked(coll.insert({a: 1, b: 1}));
 
 // We need two indexes so that the multi-planner is executed.
@@ -41,6 +36,6 @@ const allStats = coll.aggregate([{$planCacheStats: {}}]).toArray();
 assert.eq(allStats.length, 1, allStats);
 const stats = allStats[0];
 assert(stats.hasOwnProperty("cachedPlan"), stats);
-assert.eq(stats.cachedPlan.hasOwnProperty("queryPlan"), isSBEEnabled, stats);
-assert.eq(stats.cachedPlan.hasOwnProperty("slotBasedPlan"), isSBEEnabled, stats);
+assert.eq(stats.cachedPlan.hasOwnProperty("queryPlan"), isSBECompat, stats);
+assert.eq(stats.cachedPlan.hasOwnProperty("slotBasedPlan"), isSBECompat, stats);
 })();

@@ -32,27 +32,31 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/util/bson_extract.h"
+#include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/s/create_collection_coordinator.h"
 #include "mongo/db/s/shard_collection_legacy.h"
+#include "mongo/db/s/sharding_ddl_50_upgrade_downgrade.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/timeseries/timeseries_lookup.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
-#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 
 namespace mongo {
 namespace {
 
-void inferCollationFromLocalCollection(
-    OperationContext* opCtx,
-    const NamespaceString& nss,
-    const ShardsvrCreateCollection& request,
-    ShardsvrShardCollectionRequest* shardsvrShardCollectionRequest) {
+using FeatureCompatibility = ServerGlobalParams::FeatureCompatibility;
+using FCVersion = FeatureCompatibility::Version;
+
+BSONObj inferCollationFromLocalCollection(OperationContext* opCtx,
+                                          const NamespaceString& nss,
+                                          const ShardsvrCreateCollection& request) {
     auto& collation = request.getCollation().value();
     auto collator = uassertStatusOK(
         CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(collation));
@@ -78,7 +82,7 @@ void inferCollationFromLocalCollection(
     auto status =
         bsonExtractTypedField(collectionOptions, "collation", BSONType::Object, &collationElement);
     if (status.isOK()) {
-        defaultCollation = collationElement.Obj().getOwned();
+        defaultCollation = collationElement.Obj();
         uassert(ErrorCodes::BadValue,
                 "Default collation in collection metadata cannot be empty.",
                 !defaultCollation.isEmpty());
@@ -86,12 +90,14 @@ void inferCollationFromLocalCollection(
         uassertStatusOK(status);
     }
 
-    shardsvrShardCollectionRequest->setCollation(defaultCollation.getOwned());
+    return defaultCollation.getOwned();
 }
 
+// TODO (SERVER-54879): Remove this path after 5.0 branches
 CreateCollectionResponse createCollectionLegacy(OperationContext* opCtx,
                                                 const NamespaceString& nss,
-                                                const ShardsvrCreateCollection& request) {
+                                                const ShardsvrCreateCollection& request,
+                                                const FixedFCVRegion& fcvRegion) {
     const auto dbInfo =
         uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, nss.db()));
 
@@ -115,11 +121,16 @@ CreateCollectionResponse createCollectionLegacy(OperationContext* opCtx,
             !shardKeyPattern.isHashedPattern() ||
                 !(request.getUnique() && request.getUnique().value()));
 
+    // Ensure that a time-series collection cannot be sharded
+    uassert(ErrorCodes::IllegalOperation,
+            str::stream() << "can't shard time-series collection " << nss,
+            !timeseries::getTimeseriesOptions(opCtx, nss));
+
     // Ensure the namespace is valid.
     uassert(ErrorCodes::IllegalOperation,
             "can't shard system namespaces",
             !nss.isSystem() || nss == NamespaceString::kLogicalSessionsNamespace ||
-                nss.isTemporaryReshardingCollection() || nss.isTimeseriesBucketsCollection());
+                nss.isTemporaryReshardingCollection());
 
     auto optNumInitialChunks = request.getNumInitialChunks();
     if (optNumInitialChunks) {
@@ -155,10 +166,15 @@ CreateCollectionResponse createCollectionLegacy(OperationContext* opCtx,
             request.getInitialSplitPoints().value());
 
     if (request.getCollation()) {
-        inferCollationFromLocalCollection(opCtx, nss, request, &shardsvrShardCollectionRequest);
+        shardsvrShardCollectionRequest.setCollation(
+            inferCollationFromLocalCollection(opCtx, nss, request));
     }
 
-    return shardCollectionLegacy(opCtx, nss, shardsvrShardCollectionRequest.toBSON(), false);
+    return shardCollectionLegacy(opCtx,
+                                 nss,
+                                 shardsvrShardCollectionRequest.toBSON(),
+                                 false /* requestIsFromCSRS */,
+                                 fcvRegion);
 }
 
 CreateCollectionResponse createCollection(OperationContext* opCtx,
@@ -167,15 +183,18 @@ CreateCollectionResponse createCollection(OperationContext* opCtx,
     uassert(
         ErrorCodes::NotImplemented, "create collection not implemented yet", request.getShardKey());
 
-    DistLockManager::ScopedDistLock dbDistLock(uassertStatusOK(DistLockManager::get(opCtx)->lock(
-        opCtx, nss.db(), "shardCollection", DistLockManager::kDefaultLockTimeout)));
-    DistLockManager::ScopedDistLock collDistLock(uassertStatusOK(DistLockManager::get(opCtx)->lock(
-        opCtx, nss.ns(), "shardCollection", DistLockManager::kDefaultLockTimeout)));
+    audit::logShardCollection(
+        opCtx->getClient(), nss.ns(), *request.getShardKey(), request.getUnique().value_or(false));
 
-    auto createCollectionCoordinator =
-        std::make_shared<CreateCollectionCoordinator>(opCtx, request);
-    createCollectionCoordinator->run(opCtx).get(opCtx);
-    return createCollectionCoordinator->getResultOnSuccess();
+    auto coordinatorDoc = CreateCollectionCoordinatorDocument();
+    coordinatorDoc.setShardingDDLCoordinatorMetadata(
+        {{nss, DDLCoordinatorTypeEnum::kCreateCollection}});
+    coordinatorDoc.setCreateCollectionRequest(request.getCreateCollectionRequest());
+
+    auto service = ShardingDDLCoordinatorService::getService(opCtx);
+    auto createCollectionCoordinator = checked_pointer_cast<CreateCollectionCoordinator>(
+        service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
+    return createCollectionCoordinator->getResult(opCtx);
 }
 
 class ShardsvrCreateCollectionCommand final : public TypedCommand<ShardsvrCreateCollectionCommand> {
@@ -214,11 +233,11 @@ public:
                     "Create Collection path has not been implemented",
                     request().getShardKey());
 
+            FixedFCVRegion fcvRegion(opCtx);
+
             bool useNewPath = [&] {
-                return feature_flags::gShardingFullDDLSupport.isEnabled(
-                           serverGlobalParams.featureCompatibility) &&
-                    !feature_flags::gDisableIncompleteShardingDDLSupport.isEnabled(
-                        serverGlobalParams.featureCompatibility);
+                return fcvRegion->getVersion() == FCVersion::kVersion50 &&
+                    feature_flags::gShardingFullDDLSupport.isEnabled(*fcvRegion);
             }();
 
             if (!useNewPath) {
@@ -226,7 +245,7 @@ public:
                             1,
                             "Running legacy create collection procedure",
                             "namespace"_attr = ns());
-                return createCollectionLegacy(opCtx, ns(), request());
+                return createCollectionLegacy(opCtx, ns(), request(), fcvRegion);
             }
 
             LOGV2_DEBUG(

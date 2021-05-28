@@ -66,6 +66,12 @@ public:
     static CollectionShardingRuntime* get(OperationContext* opCtx, const NamespaceString& nss);
 
     /**
+     * Obtains the sharding runtime state from the the specified sharding collection state. The
+     * returned pointer should never be stored.
+     */
+    static CollectionShardingRuntime* get(CollectionShardingState* css);
+
+    /**
      * It is the caller's responsibility to ensure that the collection locks for this namespace are
      * held when this is called. The returned pointer should never be stored.
      */
@@ -125,11 +131,11 @@ public:
 
     /**
      * Method to control the collection's critical secion. Method listed below must be called with
-     * the collection lock in IX mode and the CSRLock in exclusive mode.
+     * the CSRLock in exclusive mode.
      *
      * In this method, the CSRLock ensures concurrent access to the critical section.
      */
-    void exitCriticalSection(OperationContext* opCtx);
+    void exitCriticalSection(const CSRLock&);
 
     /**
      * If the collection is currently in a critical section, returns the critical section signal to

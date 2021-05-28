@@ -98,8 +98,10 @@ PlanState BSONScanStage::getNext() {
         }
 
         if (auto fieldsToMatch = _fieldAccessors.size(); fieldsToMatch != 0) {
-            auto be = _bsonCurrent + 4;
-            auto end = _bsonCurrent + value::readFromMemory<uint32_t>(_bsonCurrent);
+            auto be = _bsonCurrent;
+            auto end = be + ConstDataView(be).read<LittleEndian<uint32_t>>();
+            // Skip document length.
+            be += 4;
             for (auto& [name, accessor] : _fieldAccessors) {
                 accessor->reset();
             }
@@ -122,20 +124,19 @@ PlanState BSONScanStage::getNext() {
         }
 
         // Advance to the next document.
-        _bsonCurrent += value::readFromMemory<uint32_t>(_bsonCurrent);
+        _bsonCurrent += ConstDataView(_bsonCurrent).read<LittleEndian<uint32_t>>();
 
         _specificStats.numReads++;
         return trackPlanState(PlanState::ADVANCED);
     }
 
-    _commonStats.isEOF = true;
     return trackPlanState(PlanState::IS_EOF);
 }
 
 void BSONScanStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
 }
 
 std::unique_ptr<PlanStageStats> BSONScanStage::getStats(bool includeDebugInfo) const {

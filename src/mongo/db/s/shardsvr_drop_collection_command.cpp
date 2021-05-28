@@ -36,12 +36,13 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/s/drop_collection_coordinator.h"
 #include "mongo/db/s/drop_collection_legacy.h"
+#include "mongo/db/s/sharding_ddl_50_upgrade_downgrade.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
-#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 
 namespace mongo {
 namespace {
@@ -76,15 +77,25 @@ public:
                                   << opCtx->getWriteConcern().wMode,
                     opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
-            const auto useNewPath = feature_flags::gShardingFullDDLSupport.isEnabled(
-                serverGlobalParams.featureCompatibility);
+            try {
+                const auto coll = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, ns());
 
+                uassert(ErrorCodes::NotImplemented,
+                        "drop collection of a sharded time-series collection is not supported",
+                        !coll.getTimeseriesFields());
+            } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+                // The collection is not sharded or doesn't exist.
+            }
+
+            FixedFCVRegion fcvRegion(opCtx);
+
+            bool useNewPath = feature_flags::gShardingFullDDLSupport.isEnabled(*fcvRegion);
             if (!useNewPath) {
                 LOGV2_DEBUG(5280951,
                             1,
                             "Running legacy drop collection procedure",
                             "namespace"_attr = ns());
-                dropCollectionLegacy(opCtx, ns());
+                dropCollectionLegacy(opCtx, ns(), fcvRegion);
                 return;
             }
 

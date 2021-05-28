@@ -7,9 +7,7 @@ TestData.skipCheckingUUIDsConsistentAcrossCluster = true;
 load("jstests/replsets/rslib.js");
 
 var s = new ShardingTest({shards: 2, mongos: 1, rs: {oplogSize: 10}});
-
 var db = s.getDB("test");
-var replTest = s.rs0;
 
 assert.commandWorked(db.foo.insert({_id: 1}));
 db.foo.renameCollection('bar');
@@ -25,60 +23,61 @@ assert.eq(db.bar.findOne(), {_id: 2}, '2.1');
 assert.eq(db.bar.count(), 1, '2.2');
 assert.eq(db.foo.count(), 0, '2.3');
 
-assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
+assert.commandWorked(s.s0.adminCommand({enablesharding: 'test'}));
 s.ensurePrimaryShard('test', s.shard0.shardName);
+assert.commandWorked(
+    s.s0.adminCommand({enablesharding: 'otherDBSamePrimary', primaryShard: s.shard0.shardName}));
 
-assert.commandWorked(s.s0.adminCommand({enablesharding: "samePrimary"}));
-s.ensurePrimaryShard('samePrimary', s.shard0.shardName);
+assert.commandWorked(s.s0.adminCommand(
+    {enablesharding: 'otherDBDifferentPrimary', primaryShard: s.shard1.shardName}));
 
-assert.commandWorked(s.s0.adminCommand({enablesharding: "otherPrimary"}));
-s.ensurePrimaryShard('otherPrimary', s.shard1.shardName);
+jsTest.log('Testing renaming sharded collections');
+assert.commandWorked(
+    s.s0.adminCommand({shardCollection: 'test.shardedColl', key: {_id: 'hashed'}}));
 
 const DDLFeatureFlagParam = assert.commandWorked(
     s.configRS.getPrimary().adminCommand({getParameter: 1, featureFlagShardingFullDDLSupport: 1}));
 const isDDLFeatureFlagEnabled = DDLFeatureFlagParam.featureFlagShardingFullDDLSupport.value;
+// Ensure renaming to or from a sharded collection fails in the legacy path.
 if (!isDDLFeatureFlagEnabled) {
-    // Ensure renaming to or from a sharded collection fails.
-    jsTest.log('Testing renaming sharded collections');
-    assert.commandWorked(
-        s.s0.adminCommand({shardCollection: 'test.shardedColl', key: {_id: 'hashed'}}));
-
     // Renaming from a sharded collection
     assert.commandFailed(db.shardedColl.renameCollection('somethingElse'));
-
-    // Renaming to a sharded collection
-    assert.commandFailed(db.bar.renameCollection('shardedColl'));
 
     // Renaming to a sharded collection with dropTarget=true
     const dropTarget = true;
     assert.commandFailed(db.bar.renameCollection('shardedColl', dropTarget));
 }
 
+// Renaming to a sharded collection without dropTarget=true
+assert.commandFailed(db.bar.renameCollection('shardedColl'));
+
 // Renaming unsharded collection to a different db with different primary shard.
 db.unSharded.insert({x: 1});
 assert.commandFailedWithCode(
-    db.adminCommand({renameCollection: 'test.unSharded', to: 'otherPrimary.foo'}),
-    [13137, 5448802],
-    "Source and destination collections must be on same shard");
+    db.adminCommand({renameCollection: 'test.unSharded', to: 'otherDBDifferentPrimary.foo'}),
+    // TODO SERVER-54879 just check for ErrorCodes.CommandFailed
+    [ErrorCodes.CommandFailed, 13137],
+    "Source and destination collections must be on the same database.");
 
 // Renaming unsharded collection to a different db with same primary shard.
-assert.commandWorked(db.adminCommand({renameCollection: 'test.unSharded', to: 'samePrimary.foo'}));
+assert.commandWorked(db.unSharded.renameCollection('otherDBSamePrimary.unsharded'));
 
-jsTest.log("Testing write concern (1)");
+jsTest.log("Testing that rename operations involving views are not allowed");
+{
+    assert.commandWorked(db.collForView.insert({_id: 1}));
+    assert.commandWorked(db.createView('view', 'collForView', []));
 
-assert.commandWorked(db.foo.insert({_id: 3}));
-db.foo.renameCollection('bar', true);
+    let toAView = db.unsharded.renameCollection('view', true /* dropTarget */);
+    assert.commandFailed(toAView);
 
-var ans = db.runCommand({getLastError: 1, w: 3});
-printjson(ans);
-assert.isnull(ans.err, '3.0');
-
-assert.eq(db.bar.findOne(), {_id: 3}, '3.1');
-assert.eq(db.bar.count(), 1, '3.2');
-assert.eq(db.foo.count(), 0, '3.3');
+    let fromAView = db.view.renameCollection('target');
+    assert.commandFailed(fromAView);
+}
 
 // Ensure write concern works by shutting down 1 node in a replica set shard
 jsTest.log("Testing write concern (2)");
+
+var replTest = s.rs0;
 
 // Kill any node. Don't care if it's a primary or secondary.
 replTest.stop(0);

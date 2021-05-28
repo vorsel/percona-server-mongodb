@@ -1,7 +1,8 @@
 /**
  * Tests that in a tenant migration, the recipient primary will resume oplog application on
  * failover.
- * @tags: [requires_majority_read_concern, requires_fcv_49, incompatible_with_windows_tls]
+ * @tags: [requires_majority_read_concern, requires_fcv_49, incompatible_with_windows_tls,
+ * incompatible_with_eft, incompatible_with_macos, requires_persistence]
  */
 
 (function() {
@@ -102,7 +103,8 @@ resultsArr = appliedNoOps.toArray();
 assert.eq(3, appliedNoOps.count(), appliedNoOps);
 assert.eq(docsToApply[2], resultsArr[2].o2.o, resultsArr);
 
-tenantMigrationTest.checkTenantDBHashes(tenantId);
+TenantMigrationUtil.checkTenantDBHashes(
+    tenantMigrationTest.getDonorRst(), tenantMigrationTest.getRecipientRst(), tenantId);
 tenantMigrationTest.stop();
 recipientRst.stopSet();
 })();

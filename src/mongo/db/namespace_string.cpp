@@ -107,6 +107,9 @@ const NamespaceString NamespaceString::kRecipientReshardingOperationsNamespace(
 const NamespaceString NamespaceString::kShardingDDLCoordinatorsNamespace(
     NamespaceString::kConfigDb, "system.sharding_ddl_coordinators");
 
+const NamespaceString NamespaceString::kShardingRenameParticipantsNamespace(
+    NamespaceString::kConfigDb, "localRenameParticipants");
+
 const NamespaceString NamespaceString::kConfigSettingsNamespace(NamespaceString::kConfigDb,
                                                                 "settings");
 const NamespaceString NamespaceString::kVectorClockNamespace(NamespaceString::kConfigDb,
@@ -121,6 +124,9 @@ const NamespaceString NamespaceString::kReshardingTxnClonerProgressNamespace(
 const NamespaceString NamespaceString::kCollectionCriticalSectionsNamespace(
     NamespaceString::kConfigDb, "collection_critical_sections");
 
+const NamespaceString NamespaceString::kForceOplogBatchBoundaryNamespace(
+    NamespaceString::kConfigDb, "system.forceOplogBatchBoundary");
+
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;
 }
@@ -129,7 +135,8 @@ bool NamespaceString::isCollectionlessAggregateNS() const {
     return coll() == collectionlessAggregateCursorCol;
 }
 
-bool NamespaceString::isLegalClientSystemNS() const {
+bool NamespaceString::isLegalClientSystemNS(
+    const ServerGlobalParams::FeatureCompatibility& currentFCV) const {
     if (db() == kAdminDb) {
         if (coll() == "system.roles")
             return true;
@@ -161,7 +168,11 @@ bool NamespaceString::isLegalClientSystemNS() const {
         return true;
     if (coll() == kSystemDotViewsCollectionName)
         return true;
-    if (isTemporaryReshardingCollection()) {
+    if (currentFCV.isGreaterThanOrEqualTo(
+            ServerGlobalParams::FeatureCompatibility::Version::kVersion47) &&
+        // While this FCV check is being added in 4.9, the namespace was allowed in 4.7 binaries
+        // without an FCV check.
+        isTemporaryReshardingCollection()) {
         return true;
     }
     if (isTimeseriesBucketsCollection()) {
@@ -180,7 +191,9 @@ bool NamespaceString::isLegalClientSystemNS() const {
  * processing each operation matches the primary's when committing that operation.
  */
 bool NamespaceString::mustBeAppliedInOwnOplogBatch() const {
-    return isSystemDotViews() || isServerConfigurationCollection() || isPrivilegeCollection();
+    return isSystemDotViews() || isServerConfigurationCollection() || isPrivilegeCollection() ||
+        _ns == kDonorReshardingOperationsNamespace.ns() ||
+        _ns == kForceOplogBatchBoundaryNamespace.ns();
 }
 
 NamespaceString NamespaceString::makeListCollectionsNSS(StringData dbName) {
@@ -315,7 +328,7 @@ NamespaceString NamespaceString::makeTimeseriesBucketsNamespace() const {
     return {db(), kTimeseriesBucketsCollectionPrefix.toString() + coll()};
 }
 
-NamespaceString NamespaceString::bucketsNamespaceToTimeseries() const {
+NamespaceString NamespaceString::getTimeseriesViewNamespace() const {
     invariant(isTimeseriesBucketsCollection());
     return {db(), coll().substr(kTimeseriesBucketsCollectionPrefix.size())};
 }

@@ -39,7 +39,7 @@
 #include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/db/repl/tenant_migration_recipient_access_blocker.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/cancelation.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/future_util.h"
 
@@ -56,7 +56,8 @@ TenantMigrationRecipientAccessBlocker::TenantMigrationRecipientAccessBlocker(
     UUID migrationId,
     std::string tenantId,
     std::string donorConnString)
-    : _serviceContext(serviceContext),
+    : TenantMigrationAccessBlocker(BlockerType::kRecipient),
+      _serviceContext(serviceContext),
       _migrationId(migrationId),
       _tenantId(std::move(tenantId)),
       _donorConnString(std::move(donorConnString)) {
@@ -78,7 +79,7 @@ Status TenantMigrationRecipientAccessBlocker::waitUntilCommittedOrAborted(
 }
 
 SharedSemiFuture<void> TenantMigrationRecipientAccessBlocker::getCanReadFuture(
-    OperationContext* opCtx) {
+    OperationContext* opCtx, StringData command) {
     if (MONGO_unlikely(tenantMigrationRecipientNotRejectReads.shouldFail())) {
         return SharedSemiFuture<void>();
     }
@@ -104,11 +105,11 @@ SharedSemiFuture<void> TenantMigrationRecipientAccessBlocker::getCanReadFuture(
     }();
 
     stdx::lock_guard<Latch> lk(_mutex);
-    if (_state == State::kReject) {
+    if (_state.isReject()) {
         return SharedSemiFuture<void>(Status(
             ErrorCodes::SnapshotTooOld, "Tenant read is not allowed before migration completes"));
     }
-    invariant(_state == State::kRejectBefore);
+    invariant(_state.isRejectBefore());
     invariant(_rejectBeforeTimestamp);
     if (atClusterTime && *atClusterTime < *_rejectBeforeTimestamp) {
         return SharedSemiFuture<void>(Status(
@@ -167,16 +168,18 @@ void TenantMigrationRecipientAccessBlocker::appendInfoForServerStatus(
     stdx::lock_guard<Latch> lg(_mutex);
 
     BSONObjBuilder tenantBuilder;
-    tenantBuilder.append("state", _stateToString(_state));
+    tenantBuilder.append("state", _state.toString());
     if (_rejectBeforeTimestamp) {
         tenantBuilder.append("rejectBeforeTimestamp", _rejectBeforeTimestamp.get());
     }
     tenantBuilder.append("ttlIsBlocked", _ttlIsBlocked);
-    builder->append(_tenantId, tenantBuilder.obj());
+    tenantBuilder.append("tenantId", _tenantId);
+
+    builder->append("recipient", tenantBuilder.obj());
 }
 
-std::string TenantMigrationRecipientAccessBlocker::_stateToString(State state) const {
-    switch (state) {
+std::string TenantMigrationRecipientAccessBlocker::BlockerState::toString() const {
+    switch (_state) {
         case State::kReject:
             return "reject";
         case State::kRejectBefore:
@@ -196,7 +199,7 @@ BSONObj TenantMigrationRecipientAccessBlocker::getDebugInfo() const {
 
 void TenantMigrationRecipientAccessBlocker::startRejectingReadsBefore(const Timestamp& timestamp) {
     stdx::lock_guard<Latch> lk(_mutex);
-    _state = State::kRejectBefore;
+    _state.transitionToRejectBefore();
     if (!_rejectBeforeTimestamp || timestamp > *_rejectBeforeTimestamp) {
         LOGV2(5358100,
               "Tenant migration recipient starting to reject reads before timestamp",

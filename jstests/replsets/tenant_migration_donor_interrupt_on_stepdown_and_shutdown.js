@@ -2,7 +2,7 @@
  * Tests that tenant migrations are interrupted successfully on stepdown and shutdown.
  *
  * @tags: [requires_fcv_47, requires_majority_read_concern, requires_persistence,
- * incompatible_with_eft, incompatible_with_windows_tls]
+ * incompatible_with_eft, incompatible_with_windows_tls, incompatible_with_macos]
  */
 
 (function() {
@@ -146,7 +146,7 @@ function testDonorAbortMigrationInterrupt(interruptFunc, verifyCmdResponseFunc, 
     assert.soon(() => {
         const res = assert.commandWorked(
             donorPrimary.adminCommand({currentOp: true, desc: "tenant donor migration"}));
-        return res.inprog[0].receivedCancelation;
+        return res.inprog[0].receivedCancellation;
     });
 
     interruptFunc(donorRst, migrationId, migrationOpts.tenantId);

@@ -60,12 +60,6 @@ variables:
       resmoke_args: --help
       resmoke_jobs_max: 0  # No cap on number of jobs.
 
-# Used for tests that invoke resmoke.py and require no additional setup.
-- &task_depending_on_all_template
-  <<: *task_template
-  depends_on:
-  - name: compile_all
-
 - &benchmark_template
   name: benchmark_template
   depends_on:
@@ -123,13 +117,6 @@ variables:
   commands:
   - func: "generate fuzzer tasks"
 
-- &multiversion_template
-  name: multiversion_template
-  exec_timeout_secs: 14400 # Time out the task if it runs for more than 4 hours.
-  depends_on: []
-  commands:
-  - func: "generate implicit multiversion tasks"
-
 # Templates used by powercycle
 - &powercycle_remote_credentials
   private_key_file: $(${posix_workdir})/src/powercycle.pem
@@ -141,7 +128,7 @@ variables:
   name: libfuzzertests!
   execution_tasks:
   - compile_and_archive_libfuzzertests
-  - run_libfuzzertests
+  - fetch_and_run_libfuzzertests
 
 - &compile_task_group_template
   name: compile_task_group_template
@@ -162,18 +149,7 @@ variables:
   - func: "save hang analyzer debugger files"
   - func: "save disk statistics"
   - func: "save system resource information"
-  - command: shell.exec
-    type: setup
-    params:
-      working_dir: src
-      shell: bash
-      script: |
-        set -o verbose
-        set -o errexit
-
-        ./buildscripts/merge_corpus.sh
-  - func: "archive new corpus"
-  - func: "upload new corpus"
+  - func: "save libfuzzertest corpora"
   - func: "remove files"
     vars:
       files: >-
@@ -194,10 +170,10 @@ variables:
         ${archive_file|src/archive.json}
   setup_group_can_fail_task: true
   setup_group:
-  - func: "kill processes"
-  - func: "cleanup environment"
   - command: manifest.load
   - func: "git get project"
+  - func: "kill processes"
+  - func: "cleanup environment"
   - func: "get all modified patch files"
   - func: "set task expansion macros"
   # The python virtual environment is installed in ${workdir}, which is created in
@@ -271,10 +247,10 @@ variables:
   - func: "attach scons logs"
   setup_group_can_fail_task: true
   setup_group:
-    - func: "kill processes"
-    - func: "cleanup environment"
     - command: manifest.load
     - func: "git get project"
+    - func: "kill processes"
+    - func: "cleanup environment"
     - func: "set task expansion macros"
     - func: "set up venv"
     - func: "upload pip requirements"
@@ -293,41 +269,28 @@ variables:
   - enterprise-debian10-64
   - enterprise-linux-64-amazon-ami
   - enterprise-macos
-  - enterprise-rhel-67-s390x
   - enterprise-rhel-70-64-bit
   - enterprise-rhel-70-64-bit-kitchen-sink
   - enterprise-rhel-70-64-bit-no-libunwind
-  - enterprise-rhel-71-ppc64le
   - enterprise-rhel-81-ppc64le
-  - enterprise-rhel-71-ppc64le-inmem
   - enterprise-rhel-72-s390x
   - enterprise-rhel-72-s390x-inmem
   - enterprise-rhel-80-64-bit
   - enterprise-rhel-80-64-bit-coverage
   - enterprise-rhel-80-64-bit-inmem
-  - enterprise-rhel-80-64-bit-logv2
-  - enterprise-rhel-80-64-bit-flow-control-off
   - enterprise-rhel-80-64-bit-multiversion
-  - enterprise-rhel-80-64-bit-multi-txn-oplog-entries
-  - enterprise-rhel-80-64-bit-required-inmem
-  - enterprise-rhel-80-64-bit-required-majority-read-concern-off
   - enterprise-rhel-80-64-bit-suggested
   - enterprise-rhel-82-arm64
   - enterprise-suse12-64
   - enterprise-suse15-64
-  - enterprise-suse12-s390x
   - enterprise-ubuntu1804-64
   - enterprise-ubuntu1804-arm64
   - enterprise-ubuntu2004-arm64
-  - enterprise-ubuntu1804-ppc64le
-  - enterprise-ubuntu1804-s390x
   - enterprise-ubuntu2004-64
   - enterprise-windows
   - enterprise-windows-suggested
-  - enterprise-windows-compile-all
   - enterprise-windows-debug-unoptimized
   - enterprise-windows-inmem
-  - enterprise-windows-nopush-template
   - enterprise-windows-required
   - enterprise-windows-wtdevelop
   - ubuntu1804-debug-asan
@@ -362,15 +325,13 @@ variables:
   - enterprise-debian10-64
   - debian92
   - enterprise-debian92-64
-  - rhel-67-s390x
-  - enterprise-rhel-67-s390x
   - rhel70
   - rhel76_compile_rhel70
   - enterprise-rhel-70-64-bit
   - rhel-72-s390x
-  - enterprise-rhel-71-ppc64le
   - enterprise-rhel-81-ppc64le
   - enterprise-rhel-72-s390x
+  - ubi8
   - rhel80
   - rhel-82-arm64
   - enterprise-rhel-80-64-bit
@@ -378,9 +339,7 @@ variables:
   - enterprise-rhel-80-64-bit-suggested
   - enterprise-rhel-82-arm64
   - suse12
-  - suse12-s390x
   - enterprise-suse12-64
-  - enterprise-suse12-s390x
   - suse15
   - enterprise-suse15-64
   - ubuntu1804-debug-suggested
@@ -388,13 +347,10 @@ variables:
   - ubuntu1804
   - ubuntu1804-arm64
   - ubuntu2004-arm64
-  - ubuntu1804-s390x
   - ubuntu2004
   - enterprise-ubuntu1804-64
   - enterprise-ubuntu1804-arm64
   - enterprise-ubuntu2004-arm64
-  - enterprise-ubuntu1804-ppc64le
-  - enterprise-ubuntu1804-s390x
   - enterprise-ubuntu2004-64
   - enterprise-windows
   - enterprise-windows-suggested
@@ -406,10 +362,10 @@ variables:
 #######################################
 
 functions:
-
   "remove files": &remove_files
     command: shell.exec
     params:
+      shell: bash
       script: |
         if [ -z "${files}" ]; then
           exit 0
@@ -426,6 +382,7 @@ functions:
     command: shell.exec
     type: test
     params:
+      shell: bash
       working_dir: src
       silent: true
       script: |
@@ -442,6 +399,7 @@ functions:
     params:
       working_dir: src
       silent: true
+      shell: bash
       script: |
         # Create the Evergreen API credentials
         cat > .selected_tests.yml <<END_OF_CREDS
@@ -452,12 +410,12 @@ functions:
         END_OF_CREDS
 
   "git get project": &git_get_project
-    command: git.get_project
-    params:
-      directory: ${git_project_directory|src}
-      revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
-        enterprise: ${enterprise_rev}
-        wtdevelop: ${wtdevelop_rev}
+    - command: git.get_project
+      params:
+        directory: ${git_project_directory|src}
+        revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
+          enterprise: ${enterprise_rev}
+          wtdevelop: ${wtdevelop_rev}
 
   "fetch artifacts": &fetch_artifacts
     command: s3.get
@@ -509,6 +467,7 @@ functions:
     command: shell.exec
     params:
       working_dir: src
+      shell: bash
       script: |
         set -o errexit
         ${decompress|tar xzvf} mongo-binaries.tgz
@@ -517,6 +476,7 @@ functions:
     command: shell.exec
     params:
       working_dir: src
+      shell: bash
       script: |
         set -o errexit
         mongo_binary=dist-test/bin/mongo${exe}
@@ -544,21 +504,25 @@ functions:
     params:
       aws_key: ${s3_access_key_id}
       aws_secret: ${s3_secret_access_key}
-      remote_file: ${project}/corpus/mongo-${build_variant}-latest.tgz
       bucket: fuzzer-artifacts
-      local_file: src/corpus.tgz
+      extract_to: src/corpora
+      remote_file: ${mongo_fuzzer_corpus}
 
-  "extract corpus": &extract_corpus
-    command: archive.auto_extract
+  "fetch legacy corpus": &fetch_legacy_corpus
+    command: s3.get
     params:
-        path: src/corpus.tgz
-        destination: src/corpus
+      aws_key: ${s3_access_key_id}
+      aws_secret: ${s3_secret_access_key}
+      bucket: fuzzer-artifacts
+      # Extract the legacy corpora to the merge directory to synthesize together until we burn in.
+      extract_to: src/corpora-merged
+      remote_file: ${project}/corpus/mongo-${build_variant}-latest.tgz
 
   "archive new corpus": &archive_new_corpus
     command: archive.targz_pack
     params:
-      target: corpus.tgz
-      source_dir: src/corpus
+      target: corpora.tgz
+      source_dir: src/corpora-merged
       include:
         - "**"
 
@@ -567,14 +531,28 @@ functions:
     params:
       aws_key: ${s3_access_key_id}
       aws_secret: ${s3_secret_access_key}
-      local_file: corpus.tgz
-      remote_file: ${project}/corpus/mongo-${build_variant}-latest.tgz
       bucket: fuzzer-artifacts
-      permissions: private
-      visibility: signed
       content_type: ${content_type|application/gzip}
       display_name: "Fuzzer Tests Corpus Tar Archive"
+      local_file: corpora.${ext|tgz}
       optional: true
+      permissions: private
+      remote_file: ${mongo_fuzzer_corpus}
+      visibility: signed
+
+  "upload new corpus for mciuploads": &upload_new_corpus_mciuploads
+    command: s3.put
+    params:
+      aws_key: ${aws_key}
+      aws_secret: ${aws_secret}
+      bucket: mciuploads
+      content_type: ${content_type|application/gzip}
+      display_name: Input Corpora
+      local_file: corpora.${ext|tgz}
+      optional: true
+      permissions: private
+      remote_file: ${mongo_fuzzer_corpus_mciuploads}
+      visibility: signed
 
   "get buildnumber": &get_buildnumber
     command: keyval.inc
@@ -583,33 +561,13 @@ functions:
       destination: "builder_num"
 
   "run diskstats": &run_diskstats
-    command: shell.exec
+    command: subprocess.exec
     params:
       background: true
       system_log: true
-      script: |
-        set -o errexit
-        set -o verbose
-
-        # On Windows we can use typeperf.exe to dump performance counters.
-        if [ "Windows_NT" = "$OS" ]; then
-            typeperf -qx PhysicalDisk | grep Disk | grep -v _Total > disk_counters.txt
-            typeperf -cf disk_counters.txt -si 5 -o mongo-diskstats
-        # Linux: iostat -t option for timestamp.
-        elif iostat -tdmx > /dev/null 2>&1; then
-            iostat -tdmx 5 > mongo-diskstats
-        # OSX: Simulate the iostat timestamp.
-        elif iostat -d > /dev/null 2>&1; then
-            iostat -d -w 5 | while IFS= read -r line; do printf '%s %s\n' "$(date +'%m/%d/%Y %H:%M:%S')" "$line" >> mongo-diskstats; done
-        # Check if vmstat -t is available.
-        elif vmstat -td  > /dev/null 2>&1; then
-            vmstat -td 5 > mongo-diskstats
-        # Check if vmstat -T d is available.
-        elif vmstat -T d > /dev/null 2>&1; then
-            vmstat -T d 5 > mongo-diskstats
-        else
-            printf "Cannot collect mongo-diskstats on this platform\n"
-        fi
+      binary: bash
+      args:
+        - "./src/evergreen/run_diskstats.sh"
 
   "collect system resource info": &collect_system_resource_info
     command: shell.exec
@@ -617,6 +575,7 @@ functions:
       working_dir: src
       background: true
       system_log: true
+      shell: bash
       script: |
         ${activate_virtualenv}
         $python buildscripts/collect_resource_info.py -o system_resource_info.json -i 5
@@ -628,6 +587,7 @@ functions:
     params:
       background: true
       system_log: true
+      shell: bash
       script: |
         proc_list="(java|lein|mongo|python|_test$|_test\.exe$)"
         if [ "Windows_NT" = "$OS" ]; then
@@ -680,6 +640,7 @@ functions:
     params:
       working_dir: src
       silent: true
+      shell: bash
       script: |
         cat > mci.buildlogger <<END_OF_CREDS
         slavename='${slave}'
@@ -706,21 +667,23 @@ functions:
     params:
       working_dir: src
       silent: true
+      shell: bash
       script: |
         set -o errexit
 
         cat <<EOF > notary_env.sh
-        export NOTARY_TOKEN=${signing_auth_token_49}
+        export NOTARY_TOKEN=${signing_auth_token_50}
         export BARQUE_USERNAME=${barque_user}
         export BARQUE_API_KEY=${barque_api_key}
         EOF
 
-        echo "${signing_auth_token_49}" > signing_auth_token
+        echo "${signing_auth_token_50}" > signing_auth_token
 
   "set up remote credentials": &set_up_remote_credentials
     command: shell.exec
     params:
       silent: true
+      shell: bash
       script: |
         set -o errexit
 
@@ -813,6 +776,7 @@ functions:
     command: shell.exec
     params:
       working_dir: src
+      shell: bash
       script: |
         set -o errexit
         set -o verbose
@@ -908,6 +872,7 @@ functions:
     command: shell.exec
     params:
       working_dir: src
+      shell: bash
       script: |
         set -o errexit
         set -o verbose
@@ -1096,6 +1061,10 @@ functions:
         value: ${project}/${build_variant}/${revision}/binaries/mongo-shell-${build_id}.${ext|tgz}
       - key: mongo_shell_debugsymbols
         value: ${project}/${build_variant}/${revision}/binaries/mongo-shell-debugsymbols-${build_id}.${ext|tgz}
+      - key: mongo_fuzzer_corpus_mciuploads
+        value: ${project}/${build_variant}/${revision}/libfuzzer-corpora/corpora-${build_id}.${ext|tgz}
+      - key: mongo_fuzzer_corpus
+        value: corpora-${project}-${build_variant}.${ext|tgz}
       - key: skip_tests
         value: skip_test-${build_id}
 
@@ -1107,11 +1076,9 @@ functions:
           # exit immediately if virtualenv is not found
           set -o errexit
 
-          virtualenv_loc=$(which ${virtualenv|virtualenv})
-
           python_loc=$(which ${python|/opt/mongodbtoolchain/v3/bin/python3})
           venv_dir="${workdir}/venv"
-          "$python_loc" -m venv --system-site-packages "$venv_dir"
+          "$python_loc" -m venv "$venv_dir"
 
           # venv creates its Scripts/activate file with CLRF endings, which
           # cygwin bash does not like. dos2unix it
@@ -1134,27 +1101,9 @@ functions:
           # Windows path separator
           toolchain_txt="$pip_dir/toolchain-requirements.txt"
           ${activate_virtualenv}
-          pip_resolver=""
-          # Upgrade pip only on x86_64 systems. The upgraded pip is incompatible
-          # with older versions of setuptools, including those available on
-          # s390x, and arm64. See SERVER-53250
-          uname_arch=$(uname -m || echo "unknown")
-          if [[ "$uname_arch" == "x86_64" ]]; then
-            echo "Upgrading pip to 20.3.1"
-            python -m pip install "pip==20.3.1"
-            # this flag is only supported on the 20.x versions of pip.
-            pip_resolver="--use-deprecated=legacy-resolver"
-            echo "Upgraded pip to 20.3.1, using legacy resolver"
-          else
-            echo "Skipping pip upgrade, architecture was: $uname_arch"
-          fi
-          python -m pip install $pip_resolver -r "$toolchain_txt" -q
-          packager_arch="${packager_arch}"
-          if [[ $packager_arch != "arm64" ]]; then
-            # For now, skip upgrading pip on ARM variants due to setup tools
-            # issue.
-            python -m pip install --upgrade pip
-          fi
+          echo "Upgrading pip to 21.0.1"
+          python -m pip install "pip==21.0.1"
+          python -m pip install -r "$toolchain_txt" -q
           python -m pip freeze > pip-requirements.txt
 
   "upload pip requirements": &upload_pip_requirements
@@ -1191,8 +1140,6 @@ functions:
   - *collect_system_resource_info
 
   "do non-compile setup":
-  - command: manifest.load
-  - *git_get_project
   - *set_task_expansion_macros
   - *set_up_venv
   - *upload_pip_requirements
@@ -1200,8 +1147,6 @@ functions:
   - *set_up_credentials
 
   "do benchmark setup":
-  - command: manifest.load
-  - *git_get_project
   - *set_task_expansion_macros
   - *set_up_venv
   - *upload_pip_requirements
@@ -1213,6 +1158,7 @@ functions:
     command: shell.exec
     params:
       working_dir: src
+      shell: bash
       script: |
         set -o errexit
         set -o verbose
@@ -1284,7 +1230,7 @@ functions:
           --platform $platform                               \
           --architecture $architecture                       \
           --githubOauthToken "${github_token}"               \
-          --useLatest 4.4 4.7 4.8
+          --useLatest 4.4 4.7 4.8 4.9
 
         # This is primarily for tests for infrastructure which don't always need the latest
         # binaries.
@@ -1300,15 +1246,11 @@ functions:
         fi
 
   "move multiversion binaries": &move_multiversion_binaries
-    command: shell.exec
+    command: subprocess.exec
     params:
-      working_dir: src
-      script: |
-        set -o verbose
-
-        # powercycle expects the binaries to be in dist-test/bin
-        mkdir -p dist-test/bin
-        mv /data/multiversion/* dist-test/bin/
+      binary: bash
+      args:
+        - "./src/evergreen/move_multiversion_binaries.sh"
 
   "execute resmoke tests": &execute_resmoke_tests
     command: shell.exec
@@ -1470,6 +1412,10 @@ functions:
         elif [ $resmoke_exit_code != 0 ]; then
           # On failure save the resmoke exit code.
           echo $resmoke_exit_code > resmoke_error_code
+        elif [ $resmoke_exit_code = 0 ]; then
+          # On success delete core files.
+          core_files=$(/usr/bin/find -H .. \( -name "*.core" -o -name "*.mdmp" \) 2> /dev/null)
+          rm -rf $core_files
         fi
         exit $resmoke_exit_code
         fi # end if [[ ${disable_unit_tests} && ! -f ${skip_tests|/dev/null} ]]
@@ -1484,20 +1430,12 @@ functions:
       local_file: "generate_tasks_config.tgz"
 
   "extract generated test configuration": &extract_generated_test_configuration
-    command: shell.exec
+    command: subprocess.exec
     type: test
     params:
-      shell: bash
-      script: |
-        set -o verbose
-        set -o errexit
-
-        target_dir="src/generated_resmoke_config"
-        mkdir -p $target_dir
-        mv generate_tasks_config.tgz $target_dir
-
-        cd $target_dir
-        tar xzf generate_tasks_config.tgz
+      binary: bash
+      args:
+        - "./src/evergreen/extract_generated_test_configuration.sh"
 
   "generate selected tests":
     - command: expansions.write
@@ -1583,8 +1521,6 @@ functions:
           - src/generated_burn_in_tags_config/burn_in_tags_gen.json
 
   "generate randomized multiversion tasks":
-    - command: manifest.load
-    - *git_get_project
     - *set_task_expansion_macros
     - *set_up_venv
     - *upload_pip_requirements
@@ -1597,6 +1533,7 @@ functions:
       type: test
       params:
         working_dir: src
+        shell: bash
         script: |
           set -o errexit
 
@@ -1606,6 +1543,7 @@ functions:
     - command: shell.exec
       params:
         working_dir: src
+        shell: bash
         script: |
           set -o errexit
           set -o verbose
@@ -1644,8 +1582,6 @@ functions:
           - src/generated_resmoke_config/*.json
 
   "generate resmoke tasks":
-    - command: manifest.load
-    - *git_get_project
     - *set_task_expansion_macros
     - *set_up_venv
     - *upload_pip_requirements
@@ -1658,6 +1594,7 @@ functions:
       type: test
       params:
         working_dir: src
+        shell: bash
         script: |
           set -o errexit
 
@@ -1694,6 +1631,7 @@ functions:
         files:
           - src/generated_resmoke_config/*.json
 
+  # Used by generator
   "run generated tests":
   - *retrieve_generated_test_configuration
   - *extract_generated_test_configuration
@@ -1713,15 +1651,12 @@ functions:
     # The existence of the "run_tests_infrastructure_failure" file indicates this failure isn't
     # directly actionable. We use type=setup rather than type=system or type=test for this command
     # because we don't intend for any human to look at this failure.
-  - command: shell.exec
+  - command: subprocess.exec
     type: setup
     params:
-      working_dir: src
-      script: |
-        set -o verbose
-        if [ -f run_tests_infrastructure_failure ]; then
-          exit $(cat run_tests_infrastructure_failure)
-        fi
+      binary: bash
+      args:
+        - "./src/evergreen/check_run_tests_infrastructure_failure.sh"
 
   "run tests":
     - *determine_task_timeout
@@ -1746,127 +1681,47 @@ functions:
       # The existence of the "run_tests_infrastructure_failure" file indicates this failure isn't
       # directly actionable. We use type=setup rather than type=system or type=test for this command
       # because we don't intend for any human to look at this failure.
-    - command: shell.exec
+    - command: subprocess.exec
       type: setup
       params:
-        working_dir: src
-        script: |
-          set -o verbose
-          if [ -f run_tests_infrastructure_failure ]; then
-            exit $(cat run_tests_infrastructure_failure)
-          fi
+        binary: bash
+        args:
+          - "./src/evergreen/check_run_tests_infrastructure_failure.sh"
 
   "scons lint":
-    - command: shell.exec
+    - command: expansions.write
+      params:
+        file: expansions.yml
+    - command: subprocess.exec
       type: test
       params:
-        working_dir: src
-        script: |
-          set -o errexit
-          set -o verbose
-
-          ${activate_virtualenv}
-          export MYPY="$(
-            if which cygpath 2>/dev/null; then
-                PATH+=":$(cypath "${workdir}")/venv_3/Scripts"
-            else
-                PATH+=":${workdir}/venv_3/bin"
-            fi
-            PATH+=':/opt/mongodbtoolchain/v3/bin'
-            which mypy
-          )"
-          echo "Found mypy executable at '$MYPY'"
-          export extra_flags=""
-          if [[ ${is_patch|false} == "true" ]]; then
-            extra_flags="--lint-scope=changed"
-          fi
-
-          ${compile_env|} python3 ./buildscripts/scons.py ${compile_flags|} $extra_flags --stack-size=1024 GITDIFFFLAGS="${revision}" REVISION="${revision|}" ENTERPRISE_REV="${enterprise_rev|}" ${targets}
+        binary: bash
+        args:
+          - "src/evergreen/scons_lint.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
 
   "scons compile":
-    command: shell.exec
-    type: test
-    params:
-      working_dir: src
-      shell: bash
-      script: |
-        set -o errexit
-        set -o verbose
-
-        rm -rf ${install_directory|/data/mongo-install-directory}
-
-        # Use hardlinks to reduce the disk space impact of installing
-        # all of the binaries and associated debug info.
-
-        # The expansion here is a workaround to let us set a different install-action
-        # for tasks that don't support the one we set here. A better plan would be
-        # to support install-action for Ninja builds directly.
-        # TODO: https://jira.mongodb.org/browse/SERVER-48203
-        extra_args="--install-action=${task_install_action|hardlink}"
-
-        # By default, limit link jobs to one quarter of our overall -j
-        # concurrency unless locally overridden. We do this because in
-        # static link environments, the memory consumption of each
-        # link job is so high that without constraining the number of
-        # links we are likely to OOM or thrash the machine. Dynamic
-        # builds, where htis is not a concern, override this value.
-        echo "Changing SCons to run with --jlink=${num_scons_link_jobs_available|0.25}"
-        extra_args="$extra_args --jlink=${num_scons_link_jobs_available|0.25}"
-
-        if [ "${scons_cache_scope|}" = "shared" ]; then
-          extra_args="$extra_args --cache-debug=scons_cache.log"
-        fi
-
-        # Conditionally enable scons time debugging
-        if [ "${show_scons_timings|true}" = "true" ]; then
-          extra_args="$extra_args --debug=time"
-        fi
-
-        # Build packages where the upload tasks expect them
-        if [ -n "${git_project_directory|}" ]; then
-            extra_args="$extra_args PKGDIR=${git_project_directory}"
-        else
-            extra_args="$extra_args PKGDIR=${workdir}/src"
-        fi
-
-        # If we are doing a patch build or we are building a non-push
-        # build on the waterfall, then we don't need the --release
-        # flag. Otherwise, this is potentially a build that "leaves
-        # the building", so we do want that flag. The non --release
-        # case should auto enale the faster decider when
-        # applicable. Furthermore, for the non --release cases we can
-        # accelerate the build slightly for situations where we invoke
-        # SCons multiple times on the same machine by allowing SCons
-        # to assume that implicit dependencies are cacheable across
-        # runs.
-        if [ "${is_patch|false}" = "true" ] || [ -z "${push_bucket|}" ] || [ "${compiling_for_test|false}" = "true" ]; then
-          extra_args="$extra_args --implicit-cache --build-fast-and-loose=on"
-        else
-          extra_args="$extra_args --release"
-        fi
-
-        if [ "Windows_NT" = "$OS" ]; then
-          vcvars="$(vswhere -latest -property installationPath | tr '\\' '/' | dos2unix.exe)/VC/Auxiliary/Build/"
-          export PATH="$(echo "$(cd "$vcvars" && cmd /C "vcvarsall.bat amd64 && C:/cygwin/bin/bash -c 'echo \$PATH'")" | tail -n +6)":$PATH
-        fi
-
-        ${activate_virtualenv}
-
-        ${compile_env|} $python ./buildscripts/scons.py                                     \
-            ${compile_flags|} ${task_compile_flags|} ${task_compile_flags_extra|}           \
-            ${scons_cache_args|} $extra_args                                                \
-            ${targets} MONGO_VERSION=${version} ${patch_compile_flags|} || exit_status=$?
-
-        # If compile fails we do not run any tests
-        if [[ $exit_status -ne 0 ]]; then
-          touch ${skip_tests}
-        fi
-        exit $exit_status
+    - command: expansions.write
+      params:
+        file: expansions.yml
+    - command: subprocess.exec
+      type: test
+      params:
+        binary: bash
+        args:
+          - "src/evergreen/scons_compile.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
+          patch_compile_flags: ${patch_compile_flags}
 
   "generate compile expansions":
     command: shell.exec
     params:
       working_dir: src
+      shell: bash
       script: |
         set -o errexit
         set -o verbose
@@ -1878,6 +1733,8 @@ functions:
         if [ "${is_patch}" = "true" ]; then
           MONGO_VERSION="$MONGO_VERSION-patch-${version_id}"
         fi
+
+        echo "MONGO_VERSION = ${MONGO_VERSION}"
 
         ${activate_virtualenv}
 
@@ -1933,50 +1790,29 @@ functions:
       file: src/compile_expansions.yml
 
   "do jepsen setup":
+    - command: subprocess.exec
+      params:
+        binary: bash
+        args:
+          - "./src/evergreen/do_jepsen_setup/build_libfaketime.sh"
+    - command: subprocess.exec
+      params:
+        binary: bash
+        args:
+          - "./src/evergreen/do_jepsen_setup/install_jepsen.sh"
     - command: shell.exec
       params:
         working_dir: src
-        script: |
-          set -o errexit
-
-          # Build libfaketime. A version of libfaketime at least as new as v0.9.6-9-g75896bd is
-          # required to use the FAKETIME_NO_CACHE and FAKETIME_TIMESTAMP_FILE environment variables.
-          # Additionally, a version of libfaketime containing the changes mentioned in SERVER-29336
-          # is required to avoid needing to use libfaketimeMT.so.1 and serializing all calls to
-          # fake_clock_gettime() with a mutex.
-          git clone --branch=for-jepsen --depth=1 git@github.com:10gen/libfaketime.git
-          cd libfaketime
-          branch=$(git symbolic-ref --short HEAD)
-          commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
-          echo "Git branch: $branch, commit: $commit"
-          make PREFIX=$(pwd)/build/ LIBDIRNAME='.' install
-    - command: shell.exec
-      params:
-        working_dir: src
-        script: |
-          set -o errexit
-          git clone --branch=jepsen-mongodb-master --depth=1 git@github.com:10gen/jepsen.git jepsen-mongodb
-          cd jepsen-mongodb
-          branch=$(git symbolic-ref --short HEAD)
-          commit=$(git show -s --pretty=format:"%h - %an, %ar: %s")
-          echo "Git branch: $branch, commit: $commit"
-
-          lein install
-    - command: shell.exec
-      params:
-        working_dir: src
+        shell: bash
         script: |
           set -o errexit
           ${activate_virtualenv}
           $python -c 'import socket; num_nodes = 5; print("\n".join(["%s:%d" % (socket.gethostname(), port) for port in range(20000, 20000 + num_nodes)]))' > nodes.txt
-    - command: shell.exec
+    - command: subprocess.exec
       params:
-        working_dir: src
-        script: |
-          set -o errexit
-
-          # Move binaries to CWD as Jepsen expects that.
-          mv dist-test/bin/* .
+        binary: bash
+        args:
+          - "./src/evergreen/do_jepsen_setup/move_binaries.sh"
 
   "run jepsen test":
     - command: shell.exec
@@ -1984,6 +1820,7 @@ functions:
       timeout_secs: 2700 # Timeout test if there is no output for more than 45 minutes.
       params:
         working_dir: src/jepsen-mongodb
+        shell: bash
         script: |
           set -o verbose
 
@@ -2045,6 +1882,7 @@ functions:
     - command: shell.exec
       params:
         working_dir: src/jepsen-mongodb
+        shell: bash
         script: |
           set -o verbose
           # Jepsen system failure if file exists.
@@ -2057,6 +1895,7 @@ functions:
       params:
         silent: true
         working_dir: src
+        shell: bash
         script: |
           set -o errexit
           echo "const AWS_KMS_SECRET_ID = '${aws_kms_access_key_id}';" >> src/mongo/db/modules/enterprise/jstests/fle/lib/aws_secrets.js
@@ -2071,8 +1910,6 @@ functions:
 
 
   "generate explicit multiversion tasks":
-    - command: manifest.load
-    - *git_get_project
     - *set_task_expansion_macros
     - *set_up_venv
     - *upload_pip_requirements
@@ -2086,6 +1923,7 @@ functions:
       type: test
       params:
         working_dir: src
+        shell: bash
         script: |
           set -o errexit
 
@@ -2124,8 +1962,6 @@ functions:
           - src/generated_resmoke_config/*.json
 
   "generate implicit multiversion tasks":
-    - command: manifest.load
-    - *git_get_project
     - *set_task_expansion_macros
     - *set_up_venv
     - *configure_evergreen_api_credentials
@@ -2136,6 +1972,7 @@ functions:
     - command: shell.exec
       params:
         working_dir: src
+        shell: bash
         script: |
           set -o errexit
           set -o verbose
@@ -2177,8 +2014,6 @@ functions:
           - src/generated_resmoke_config/*.json
 
   "generate fuzzer tasks":
-    - command: manifest.load
-    - *git_get_project
     - *set_task_expansion_macros
     - *set_up_venv
     - *upload_pip_requirements
@@ -2190,6 +2025,7 @@ functions:
     - command: shell.exec
       params:
         working_dir: src
+        shell: bash
         script: |
           set -o errexit
           set -o verbose
@@ -2274,21 +2110,18 @@ functions:
           # Run parse-jsfiles on 50 files at a time with 32 processes in parallel.
           find "$PWD/jstests" "$PWD/src/mongo/db/modules/enterprise" -name "*.js" -print | xargs -P 32 -L 50 npm run --prefix jstestfuzz parse-jsfiles --
 
+  # Used by generator
   "run jstestfuzz":
-    - command: shell.exec
+    - command: subprocess.exec
       params:
-        working_dir: src
-        script: |
-          set -o errexit
-          set -o verbose
-
-          git clone --depth 1 git@github.com:10gen/mongo-enterprise-modules.git jstests/enterprise_tests
-          git clone --depth 1 git@github.com:10gen/QA.git jstests/qa_tests
-
+        binary: bash
+        args:
+          - "./src/evergreen/run_jstestfuzz/clone_repos.sh"
     - command: shell.exec
       type: test
       params:
         working_dir: src/jstestfuzz
+        shell: bash
         script: |
           set -o errexit
           set -o verbose
@@ -2296,7 +2129,6 @@ functions:
           ${add_nodejs_to_path}
 
           npm run ${npm_command|jstestfuzz} -- ${jstestfuzz_vars} --branch ${branch_name}
-
     - command: archive.targz_pack
       params:
         target: "jstests.tgz"
@@ -2320,6 +2152,7 @@ functions:
       type: test
       params:
         working_dir: src
+        shell: bash
         script: |
           set -o verbose
           set -o errexit
@@ -2394,6 +2227,7 @@ functions:
     command: shell.exec
     params:
       working_dir: src
+      shell: bash
       script: |
         set -o errexit
         set -o verbose
@@ -2406,87 +2240,33 @@ functions:
         fi
 
   "do snmp setup":
-    command: shell.exec
+    command: subprocess.exec
     params:
-      working_dir: src
-      script: |
-        set -o errexit
-        set -o verbose
-
-        mkdir -p snmpconf
-        cp -f src/mongo/db/modules/enterprise/docs/mongod.conf.master snmpconf/mongod.conf
+      binary: bash
+      args:
+        - "./src/evergreen/do_snmp_setup.sh"
 
   "do watchdog setup":
-    command: shell.exec
+    command: subprocess.exec
     params:
-      working_dir: src
-      script: |
-        set -o errexit
-        set -o verbose
-
-        bash jstests/watchdog/charybdefs_setup.sh
+      binary: bash
+      args:
+        - "./src/evergreen/do_watchdog_setup.sh"
 
   "cleanup environment":
-    command: shell.exec
+    command: subprocess.exec
     params:
-      script: |
-        set -o verbose
-
-        rm -rf src /data/db/* mongo-diskstats* mongo-*.tgz ~/.aws ~/.boto venv
-        exit 0
+      binary: bash
+      args:
+        - "./src/evergreen/cleanup_environment.sh"
 
   "kill processes":
-    command: shell.exec
+    command: subprocess.exec
     params:
       silent: true
-      script: |
-        process_kill_list="(^cl\.exe$|java|lein|lldb|mongo|python|_test$|_test\.exe$)"
-        # Exclude Evergreen agent processes and other system daemons
-        process_exclude_list="(main|tuned|evergreen)"
-
-        if [ "Windows_NT" = "$OS" ]; then
-          # Get the list of Windows tasks (tasklist list format):
-          # - Transpose the Image Name and PID
-          # - The first column has the process ID
-          # - The second column (and beyond) has task name
-          # - Grep for the task names of interest while ignoring any names that are in the exclude list
-
-          processes=$(tasklist /fo:csv | awk -F'","' '{x=$1; gsub("\"","",x); print $2, x}' | grep -iE "$process_kill_list" | grep -ivE "$process_exclude_list")
-
-          # Kill the Windows process by process ID with force (/f)
-          kill_process () { pid=$(echo $1 | cut -f1 -d ' '); echo "Killing process $1"; taskkill /pid "$pid" /f; }
-        else
-          # Get the list of Unix tasks (pgrep full & long):
-          # - Grep for the task names of interest while ignoring any names that are in the exclude list
-          # - The first column has the process ID
-          # - The second column (and beyond) has task name
-
-          # There are 2 "styles" of pgrep, figure out which one works.
-          # Due to https://bugs.launchpad.net/ubuntu/+source/procps/+bug/1501916
-          # we cannot rely on the return status ($?) to detect if the option is supported.
-          pgrep -f --list-full ".*" 2>&1 | grep -qE "(illegal|invalid|unrecognized) option"
-          if [ $? -ne 0 ]; then
-            pgrep_list=$(pgrep -f --list-full "$process_kill_list")
-          else
-            pgrep_list=$(pgrep -f -l "$process_kill_list")
-          fi
-
-          # Since a process name might have a CR or LF in it, we need to delete any lines from
-          # pgrep which do not start with space(s) and 1 digit and trim any leading spaces.
-          processes=$(echo "$pgrep_list" | grep -ivE "$process_exclude_list" | sed -e '/^ *[0-9]/!d; s/^ *//; s/[[:cntrl:]]//g;')
-
-          # Kill the Unix process ID with signal KILL (9)
-          kill_process () { pid=$(echo $1 | cut -f1 -d ' '); echo "Killing process $1"; kill -9 $pid; }
-        fi
-        # Since a full process name can have spaces, the IFS (internal field separator)
-        # should not include a space, just a LF & CR
-        IFS=$(printf "\n\r")
-        for process in $processes
-        do
-          kill_process "$process"
-        done
-
-        exit 0
+      binary: bash
+      args:
+        - "./src/evergreen/kill_processes.sh"
 
   "run kitchen":
     command: shell.exec
@@ -2565,7 +2345,7 @@ functions:
           echo $user
 
           attempts=0
-          connection_attempts=${connection_attempts|25}
+          connection_attempts=${connection_attempts|60}
 
           # Check for remote connectivity
           while ! ssh \
@@ -2655,6 +2435,7 @@ functions:
     command: shell.exec
     params:
       working_dir: src
+      shell: bash
       script: |
         client_logs=$(ls crud*.log fsm*.log 2> /dev/null)
         if [ ! -z "$client_logs" ]; then
@@ -2680,52 +2461,19 @@ functions:
 
   ### Cleanup after the watchdog FUSE testing ###
   "cleanup FUSE watchdog":
-    command: shell.exec
+    command: subprocess.exec
     params:
-      working_dir: src
-      script: |
-        if [ -d /data/thrift ]; then
-          rm -rf /data/thrift
-        fi
-
-        if [ -d /data/charybdefs ]; then
-          rm -rf /data/charybdefs
-        fi
+      binary: bash
+      args:
+        - "./src/evergreen/cleanup_fuse_watchdog.sh"
 
   ### Process & archive Code Coverage artifacts ###
   "process code coverage data": &process_code_coverage_data
-    command: shell.exec
+    command: subprocess.exec
     params:
-      working_dir: src
-      script: |
-        set +o errexit
-        if [ -d "./build" ]; then
-          file_list=$(find ./build -type f -name "*.gcda")
-          if [ -n "$file_list" ]; then
-            for gcda_file in $file_list; do
-              echo "Processing file $gcda_file"
-              /opt/mongodbtoolchain/v3/bin/gcov -i $gcda_file
-              base_name=$(echo $gcda_file | rev | cut -f1 -d '/' | cut -f2 -d '.' | rev)
-              gcov_file=$base_name.gcda.gcov
-              if [ -f "$gcov_file" ]; then
-                # Add a prefix to the intermediate file, since it does not have a unique name.
-                # Convert the '/' to '#' in the file path.
-                file_prefix=$(echo $gcda_file | sed -e 's,^\./,,' | rev | cut -f2- -d '/' | rev | tr -s '/' '#')
-                new_gcov_file=$file_prefix#$base_name.gcda.gcov
-                if [ ! -f $new_gcov_file ]; then
-                  echo "Renaming gcov intermediate file $gcov_file to $new_gcov_file"
-                  mv $gcov_file $new_gcov_file
-                else
-                  # We treat this as a fatal condition and remove all of the coverage files.
-                  echo "Not renaming $gcov_file as $new_gcov_file already exists!"
-                  rm -f *.gcda.gcov
-                  exit 1
-                fi
-              fi
-              rm $gcda_file
-            done
-          fi
-        fi
+      binary: bash
+      args:
+        - "./src/evergreen/process_code_coverage_data.sh"
 
   "tar code coverage data": &tar_code_coverage_data
     command: archive.targz_pack
@@ -2803,20 +2551,11 @@ functions:
 
   ### Process & archive mongo coredumps ###
   "gather mongo coredumps": &gather_mongo_coredumps
-    command: shell.exec
+    command: subprocess.exec
     params:
-      working_dir: "src"
-      script: |
-        # Find all core files and move to src
-        core_files=$(/usr/bin/find -H .. \( -name "*.core" -o -name "*.mdmp" \) 2> /dev/null)
-        for core_file in $core_files
-        do
-          base_name=$(echo $core_file | sed "s/.*\///")
-          # Move file if it does not already exist
-          if [ ! -f $base_name ]; then
-            mv $core_file .
-          fi
-        done
+      binary: bash
+      args:
+        - "./src/evergreen/gather_mongo_coredumps.sh"
 
   "tar mongo coredumps": &tar_mongo_coredumps
     command: archive.targz_pack
@@ -2981,6 +2720,7 @@ functions:
     command: shell.exec
     params:
       working_dir: src
+      shell: bash
       script: |
         set -o verbose
 
@@ -3002,35 +2742,11 @@ functions:
         fi
 
   "wait for resmoke to shutdown":
-    command: shell.exec
+    command: subprocess.exec
     params:
-      working_dir: src
-      script: |
-        proc="resmoke.py"
-        if [ "Windows_NT" = "$OS" ]; then
-          check_resmoke() {
-            resmoke_info=$(wmic process | grep resmoke.py)
-          }
-          while [ 1 ]
-          do
-            check_resmoke
-            if ! [[ "$resmoke_info" =~ .*"$proc".* ]]; then
-              break
-            fi
-            sleep 5
-          done
-        else
-          get_pids() { proc_pids=$(pgrep -f $1); }
-          while [ 1 ]
-          do
-            get_pids $proc
-            if [ -z "$proc_pids" ]; then
-              break
-            fi
-            sleep 5
-          done
-        fi
-
+      binary: bash
+      args:
+        - "./src/evergreen/wait_for_resmoke_to_shutdown.sh"
 
   "tar hang analyzer debugger files": &tar_hang_analyzer_debugger_files
     command: archive.targz_pack
@@ -3083,6 +2799,11 @@ functions:
   "save disk statistics":
   - *tar_disk_statistics
   - *archive_disk_statistics
+
+  "save libfuzzertest corpora":
+  - *archive_new_corpus
+  - *upload_new_corpus
+  - *upload_new_corpus_mciuploads
 
   ### Process & archive system resource artifacts ###
   "tar system resource information": &tar_system_resource_information
@@ -3177,6 +2898,7 @@ functions:
   "attach wiki page":
     - command: shell.exec
       params:
+        shell: bash
         script: |
           set -o errexit
           set -o verbose
@@ -3196,6 +2918,8 @@ functions:
 
 # Pre task steps
 pre:
+  - command: manifest.load
+  - func: "git get project"
   - func: "kill processes"
   - func: "cleanup environment"
   - func: "set task expansion macros"
@@ -3270,6 +2994,19 @@ tasks:
         content_type: application/gzip
         display_name: Binaries
 
+    - command: expansions.write
+      params:
+        file: expansions.yml
+    - command: subprocess.exec
+      type: test
+      params:
+        binary: bash
+        args:
+          - "src/evergreen/gen_feature_flags.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
+
     - command: archive.targz_pack
       params:
         target: "artifacts.tgz"
@@ -3283,6 +3020,7 @@ tasks:
           - "artifacts.json"
           - "buildscripts/**"
           - "compile_expansions.yml"
+          - "all_feature_flags.txt"  # Must correspond to the definition in buildscripts/idl/lib.py.
           - "jstests/**"
           - "library_dependency_graph.json"
           - "patch_files.txt"
@@ -3396,13 +3134,17 @@ tasks:
 
 - name: libdeps_graph_linting
   commands:
-    - command: shell.exec
+    - command: expansions.write
       params:
-        working_dir: src
-        shell: bash
-        script: |
-          ${activate_virtualenv}
-          python -m pip install -r etc/pip/libdeps-requirements.txt
+        file: expansions.yml
+    - command: subprocess.exec
+      params:
+        binary: bash
+        args:
+          - "src/evergreen/libdeps_setup.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
 
     - func: "scons compile"
       vars:
@@ -3414,19 +3156,14 @@ tasks:
         targets:
           generate-libdeps-graph
 
-    - command: shell.exec
+    - command: subprocess.exec
       params:
-        working_dir: src
-        shell: bash
-        script: |
-          set -o errexit
-          set -o verbose
-
-          ${activate_virtualenv}
-          GRAPH_FILE=$(find build -name "libdeps.graphml")
-          python buildscripts/libdeps/gacli.py --graph-file $GRAPH_FILE > results.txt
-          gzip $GRAPH_FILE
-          mv $GRAPH_FILE.gz .
+        binary: bash
+        args:
+          - "src/evergreen/libdeps_run.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
 
     - command: s3.put
       params:
@@ -3470,24 +3207,13 @@ tasks:
       vars:
         targets: generated-sources compiledb
         compiling_for_test: true
-    - command: shell.exec
+    - command: subprocess.exec
       type: test
       timeout_secs: 3600 # 1 hour timeout for no output
       params:
-        working_dir: "src"
-        script: |
-          set -o errexit
-          set -o verbose
-          # TODO SERVER-49884 Remove this when we no longer check in generated Bison.
-          BISON_GENERATED_PATTERN=parser_gen\.cpp
-          jq -r '.[] | .file' compile_commands.json | \
-            grep src/mongo | \
-            grep -v $BISON_GENERATED_PATTERN | \
-            xargs -n 32 -P $(grep -c ^processor /proc/cpuinfo) -t \
-            /opt/mongodbtoolchain/v3/bin/clang-tidy \
-            -p ./compile_commands.json \
-            --checks="-*,bugprone-unused-raii,bugprone-use-after-move,readability-const-return-type,readability-avoid-const-params-in-decls" \
-            -warnings-as-errors="*"
+        binary: bash
+        args:
+          - "./src/evergreen/run_clang_tidy.sh"
 
 ## compile_unittests ##
 - name: compile_unittests
@@ -3520,6 +3246,7 @@ tasks:
       vars:
         targets: archive-fuzzertests
         compiling_for_test: true
+    # Store the fuzzer executable, which we use to generate and run fuzzer inputs.
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -3532,11 +3259,11 @@ tasks:
         content_type: application/tar
         display_name: "LibFuzzer Tests"
 
-## run_libfuzzertests - run libfuzzertests ##
-- name: run_libfuzzertests
+## fetch_and_run_libfuzzertests - get input corpora from s3 and run libfuzzertests ##
+- name: fetch_and_run_libfuzzertests
   commands:
     - func: "fetch corpus"
-    - func: "extract corpus"
+    - func: "fetch legacy corpus"
     - func: "run tests"
       vars:
         resmoke_args: --suites=libfuzzer
@@ -3626,43 +3353,21 @@ tasks:
 
 - name: embedded_sdk_build_cdriver
   commands:
-    - command: shell.exec
+    - command: expansions.write
       params:
-        script: |
-          set -o errexit
-          set -o verbose
-
-          VERSION=${version}
-          WORKDIR=${workdir}
-
-          # build in a different directory then we run tests so that we can verify that the linking
-          # of tests are not relying any built in absolute paths
-          FINAL_PREFIX=$WORKDIR/src/build/mongo-embedded-sdk-$VERSION
-          BUILD_PREFIX=$FINAL_PREFIX-tmp
-
-          rm -rf mongo-c-driver
-
-          # NOTE: If you change the C Driver version here, also change the substitution in the CocoaPod podspec below in the apple builder.
-          git clone --branch r1.13 --depth 1 https://github.com/mongodb/mongo-c-driver.git
-          cd mongo-c-driver
-
-          # Fixup VERSION so we don't end up with -dev on it. Remove this once we are building a stable version and CDRIVER-2861 is resolved.
-          cp -f VERSION_RELEASED VERSION_CURRENT
-
-          trap "cat CMakeFiles/CMakeOutput.log" EXIT
-          export ${compile_env|}
-          ${cmake_path|/opt/cmake/bin/cmake} -DCMAKE_INSTALL_PREFIX=$BUILD_PREFIX -DENABLE_SHM_COUNTERS=OFF -DENABLE_SNAPPY=OFF -DENABLE_AUTOMATIC_INIT_AND_CLEANUP=OFF -DENABLE_TESTS=OFF -DENABLE_EXAMPLES=OFF -DENABLE_STATIC=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=${cdriver_cmake_osx_deployment_target|} ${cdriver_cmake_flags}
-          trap - EXIT # cancel the previous trap '...' EXIT
-          make install VERBOSE=1
-
-          # TODO: Remove this when we upgrade to a version of the C driver that has CDRIVER-2854 fixed.
-          mkdir -p $BUILD_PREFIX/share/doc/mongo-c-driver
-          cp COPYING $BUILD_PREFIX/share/doc/mongo-c-driver
-          cp THIRD_PARTY_NOTICES $BUILD_PREFIX/share/doc/mongo-c-driver
-
-          mv $BUILD_PREFIX $FINAL_PREFIX
+        file: expansions.yml
+    - command: subprocess.exec
+      params:
+        binary: bash
+        args:
+          - "src/evergreen/embedded_sdk_build_cdriver.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
 
 - name: embedded_sdk_install_dev
+  depends_on:
+    - name: embedded_sdk_build_cdriver
   commands:
     - func: "scons compile"
       vars:
@@ -3683,24 +3388,20 @@ tasks:
           --link-model=dynamic-sdk
 
 - name: embedded_sdk_s3_put
+  depends_on:
+    - name: embedded_sdk_install_dev
   commands:
-    # Not using archive.targz_pack here because I can't get it to work.
-    - command: shell.exec
+    - command: expansions.write
       params:
-        working_dir: "src/build"
-        script: |
-          set -o errexit
-          set -o verbose
-
-          cat <<EOF > mongo-embedded-sdk-${version}/README-Licenses.txt
-          The software accompanying this file is Copyright (C) 2018 MongoDB, Inc. and
-          is licensed to you on the terms set forth in the following files:
-            - mongo-c-driver: share/doc/mongo-c-driver/COPYING
-            - mongo_embedded: share/doc/mongo_embedded/LICENSE-Embedded.txt
-            - mongoc_embedded: share/doc/mongo_embedded/LICENSE-Embedded.txt
-          EOF
-
-          tar cfvz embedded-sdk.tgz mongo-embedded-sdk-${version}
+        file: expansions.yml
+    - command: subprocess.exec
+      params:
+        binary: bash
+        args:
+          - "src/evergreen/embedded_sdk_s3_tar.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
 
     # Upload it so we can download from EVG.
     - command: s3.put
@@ -3716,6 +3417,8 @@ tasks:
         display_name: "Embedded SDK Tar Archive"
 
 - name: embedded_sdk_install_tests
+  depends_on:
+    - name: embedded_sdk_install_dev
   commands:
     - func: "scons compile"
       vars:
@@ -3731,16 +3434,21 @@ tasks:
         num_scons_link_jobs_available: 0.99
 
 - name: embedded_sdk_tests_s3_put
+  depends_on:
+    - name: embedded_sdk_install_tests
   commands:
-    # Not using archive.targz_pack here because I can't get it to work.
-    - command: shell.exec
+    - command: expansions.write
       params:
-        working_dir: "src/build"
-        script: |
-          set -o errexit
-          set -o verbose
-
-          tar cfvz embedded-sdk-tests.tgz mongo-embedded-sdk-${version}
+        file: expansions.yml
+    - command: subprocess.exec
+      type: test
+      params:
+        binary: bash
+        args:
+          - "src/evergreen/embedded_sdk_tests_s3_tar.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
 
     # Upload it so we can download from EVG.
     - command: s3.put
@@ -3756,33 +3464,33 @@ tasks:
         display_name: "Embedded SDK Tests Tar Archive"
 
 - name: embedded_sdk_run_tests
+  depends_on:
+    - name: embedded_sdk_install_tests
   commands:
-    - command: shell.exec
+    - command: expansions.write
+      params:
+        file: expansions.yml
+    - command: subprocess.exec
       type: test
       params:
-        working_dir: src
-        script: |
-          set -o verbose
-          set -o errexit
-
-          ${activate_virtualenv}
-          "build/mongo-embedded-sdk-${version}/bin/mongo_embedded_test"
-          "build/mongo-embedded-sdk-${version}/bin/mongoc_embedded_test"
-
-    # If this is a patch build, blow away the file so our subsequent and optional s3.put
-    # doesn't run. That way, we won't overwrite the latest part in our patches.
-    - command: shell.exec
+        binary: bash
+        args:
+          - "src/evergreen/embedded_sdk_run_tests.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
+    - command: subprocess.exec
       params:
-        working_dir: "src/build"
-        script: |
-          set -o errexit
-          set -o verbose
-
-          if [ "${is_patch}" = "true" ]; then
-            rm -f src/build/embedded-sdk.tgz
-          fi
+        binary: bash
+        args:
+          - "src/evergreen/embedded_sdk_run_tests_post.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
 
 - name: embedded_sdk_s3_put_latest
+  depends_on:
+    - name: embedded_sdk_run_tests
   commands:
     # A second put, this time to -latest, to give devs a reasonable
     # way to get the most recent build.
@@ -3799,6 +3507,8 @@ tasks:
         content_type: ${content_type|application/x-gzip}
 
 - name: embedded_sdk_tests_s3_put_latest
+  depends_on:
+    - name: embedded_sdk_run_tests
   commands:
     # A second put, this time to -latest, to give devs a reasonable
     # way to get the most recent build.
@@ -3828,14 +3538,17 @@ tasks:
           --modules=
           --separate-debug
           DESTDIR='$BUILD_ROOT/stitch-support-lib-$MONGO_VERSION'
-    - command: shell.exec
+    - command: expansions.write
       params:
-        working_dir: "src/build"
-        script: |
-          set -o errexit
-          set -o verbose
-
-          tar cfvz stitch-support.tgz stitch-support-lib-${version}
+        file: expansions.yml
+    - command: subprocess.exec
+      params:
+        binary: bash
+        args:
+          - "src/evergreen/stitch_support_create_lib_tar.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -3848,6 +3561,8 @@ tasks:
         display_name: "Stitch Support Library"
 
 - name: stitch_support_install_tests
+  depends_on:
+    - name: stitch_support_create_lib
   commands:
     - func: "scons compile"
       vars:
@@ -3863,22 +3578,25 @@ tasks:
           DESTDIR='$BUILD_ROOT/stitch-support-lib-$MONGO_VERSION'
 
 - name: stitch_support_run_tests
+  depends_on:
+    - name: stitch_support_install_tests
   commands:
-    - command: shell.exec
+    - command: expansions.write
+      params:
+        file: expansions.yml
+    - command: subprocess.exec
       type: test
       params:
-        working_dir: src
-        script: |
-          set -o errexit
-          set -o verbose
-
-          "build/stitch-support-lib-${version}/bin/stitch_support_test"
+        binary: bash
+        args:
+          - "src/evergreen/stitch_support_run_tests.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
 
 - name: compile_benchmarks
   depends_on: []
   commands:
-    - command: manifest.load
-    - func: "git get project"
     - func: "set task expansion macros"
     - func: "set up venv"
     - func: "upload pip requirements"
@@ -3922,8 +3640,6 @@ tasks:
       params:
         # 40 minutes
         exec_timeout_secs: 2400
-    - command: manifest.load
-    - func: "git get project"
     - func: "set task expansion macros"
     - func: "set up venv"
     - func: "upload pip requirements"
@@ -3937,8 +3653,6 @@ tasks:
       params:
         # 40 minutes
         exec_timeout_secs: 2400
-    - command: manifest.load
-    - func: "git get project"
     - func: "set task expansion macros"
     - func: "set up venv"
     - func: "upload pip requirements"
@@ -3952,8 +3666,6 @@ tasks:
       params:
         # 40 minutes
         exec_timeout_secs: 2400
-    - command: manifest.load
-    - func: "git get project"
     - func: "set task expansion macros"
     - func: "set up venv"
     - func: "upload pip requirements"
@@ -3967,8 +3679,6 @@ tasks:
       params:
         # 40 minutes
         exec_timeout_secs: 2400
-    - command: manifest.load
-    - func: "git get project"
     - func: "set task expansion macros"
     - func: "set up venv"
     - func: "upload pip requirements"
@@ -3979,26 +3689,33 @@ tasks:
 - name: lint_yaml
   depends_on: []
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "set task expansion macros"
   - func: "set up venv"
   - func: "upload pip requirements"
-  - command: shell.exec
+  - command: expansions.write
+    params:
+      file: expansions.yml
+  - command: subprocess.exec
     type: test
     params:
-      working_dir: src
-      script: |
-        set -o errexit
-        set -o verbose
+      binary: bash
+      args:
+        - "src/evergreen/lint_yaml.sh"
+      env:
+        python: ${python}
+        workdir: ${workdir}
 
-        ${activate_virtualenv}
-        find buildscripts etc jstests -name '*.y*ml' -exec yamllint -c etc/yamllint_config.yml {} +
+- name: lint_shellscripts
+  commands:
+  - command: subprocess.exec
+    type: test
+    params:
+      binary: bash
+      args:
+        - "src/evergreen/lint_shellscripts.sh"
 
 - name: lint_errorcodes
   commands:
-    - command: manifest.load
-    - func: "git get project"
     - func: "set task expansion macros"
     - func: "set up venv"
     - func: "upload pip requirements"
@@ -4010,62 +3727,42 @@ tasks:
   depends_on:
     - name: archive_dist_test_debug
   commands:
-    - command: manifest.load
-    - func: "git get project"
     - func: "set task expansion macros"
     - func: "set up venv"
     - func: "upload pip requirements"
     - func: "do setup"
-    - command: shell.exec
+    - command: expansions.write
+      params:
+        file: expansions.yml
+    - command: subprocess.exec
       type: test
       params:
-        working_dir: src
-        shell: bash
-        script: |
-          set -o errexit
-          set -o verbose
-          ${activate_virtualenv}
-
-          $python buildscripts/idl/check_versioned_api_commands_have_idl_definitions.py -v --include src --include src/mongo/db/modules/enterprise/src --installDir dist-test/bin 1
-          $python buildscripts/idl/checkout_idl_files_from_past_releases.py -v idls
-          find idls -maxdepth 1 -mindepth 1 -type d | while read dir;
-          do
-            echo "Performing idl check compatibility with release: $dir:";
-            $python buildscripts/idl/idl_check_compatibility.py -v --include src --include src/mongo/db/modules/enterprise/src "$dir/src" src;
-          done
+        binary: bash
+        args:
+          - "src/evergreen/check_idl_compat.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
 
 - name: burn_in_tests_gen
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "set task expansion macros"
   - func: "set up venv"
   - func: "upload pip requirements"
   - func: "configure evergreen api credentials"
   - *do_multiversion_setup
-  - command: shell.exec
+  - command: expansions.write
+    params:
+      file: expansions.yml
+  - command: subprocess.exec
     type: test
     params:
-      working_dir: src
-      shell: bash
-      script: |
-        set -o errexit
-        set -o verbose
-        ${activate_virtualenv}
-
-        # Multiversion exclusions can be used when selecting tests.
-        $python buildscripts/evergreen_gen_multiversion_tests.py generate-exclude-tags --task-path-suffix=/data/multiversion --output=multiversion_exclude_tags.yml
-
-        # Capture a list of new and modified tests. The expansion macro burn_in_tests_build_variant
-        # is used to for finding the associated tasks from a different build varaint than the
-        # burn_in_tests_gen task executes on.
-        build_variant_opts="--build-variant=${build_variant}"
-        if [ -n "${burn_in_tests_build_variant|}" ]; then
-          build_variant_opts="--build-variant=${burn_in_tests_build_variant} --run-build-variant=${build_variant}"
-        fi
-        burn_in_args="$burn_in_args --repeat-tests-min=2 --repeat-tests-max=1000 --repeat-tests-secs=600"
-        # Evergreen executable is in $HOME.
-        PATH=$PATH:$HOME $python buildscripts/burn_in_tests.py --project=${project} $build_variant_opts --distro=${distro_id} --generate-tasks-file=burn_in_tests_gen.json --task_id ${task_id} $burn_in_args --verbose
+      binary: bash
+      args:
+        - "src/evergreen/burn_in_tests.sh"
+      env:
+        python: ${python}
+        workdir: ${workdir}
   - command: archive.targz_pack
     params:
       target: src/burn_in_tests_gen.tgz
@@ -4090,36 +3787,23 @@ tasks:
 
 - name: burn_in_tests_multiversion_gen
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "set task expansion macros"
   - func: "set up venv"
   - func: "upload pip requirements"
   - func: "configure evergreen api credentials"
   - func: "do multiversion setup"
-  - command: shell.exec
+  - command: expansions.write
+    params:
+      file: expansions.yml
+  - command: subprocess.exec
     type: test
     params:
-      working_dir: src
-      shell: bash
-      script: |
-        set -o errexit
-        set -o verbose
-
-        ${activate_virtualenv}
-        # Capture a list of new and modified tests. The expansion macro burn_in_tests_build_variant
-        # is used for finding the associated tasks from a different build variant than the
-        # burn_in_tests_multiversion_gen task executes on.
-        build_variant_opts="--build-variant=${build_variant}"
-        if [ -n "${burn_in_tests_build_variant|}" ]; then
-          build_variant_opts="--build-variant=${burn_in_tests_build_variant} --run-build-variant=${build_variant}"
-        fi
-
-        burn_in_args="$burn_in_args"
-        # Evergreen executable is in $HOME.
-        PATH=$PATH:$HOME $python buildscripts/burn_in_tests_multiversion.py --task_id=${task_id} --project=${project} $build_variant_opts --distro=${distro_id} --generate-tasks-file=burn_in_tests_multiversion_gen.json $burn_in_args --verbose
-        $python buildscripts/evergreen_gen_multiversion_tests.py generate-exclude-tags --task-path-suffix=/data/multiversion
-
+      binary: bash
+      args:
+        - "src/evergreen/burn_in_tests_multiversion.sh"
+      env:
+        python: ${python}
+        workdir: ${workdir}
 
   - command: archive.targz_pack
     params:
@@ -4382,6 +4066,22 @@ tasks:
       suite: generational_fuzzer
       resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
       name: aggregation_wildcard_fuzzer
+
+## Standalone fuzzer for checking timeseries optimizations correctness ##
+- <<: *jstestfuzz_template
+  name: aggregation_timeseries_fuzzer_gen
+  tags: ["aggfuzzer", "common", "timeseries"]
+  commands:
+  - func: "generate fuzzer tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      num_files: 5
+      num_tasks: 5
+      jstestfuzz_vars: --diffTestingMode timeseries
+      npm_command: agg-fuzzer
+      suite: generational_fuzzer
+      resmoke_args: "--mongodSetParameters='{logComponentVerbosity: {command: 2}}'"
+      name: aggregation_timeseries_fuzzer
 
 ## jstestfuzz standalone fuzzer for checking find and aggregate equivalence ##
 - <<: *jstestfuzz_template
@@ -4988,8 +4688,6 @@ tasks:
 - name: lint_fuzzer_sanity_patch
   patch_only: true
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "set task expansion macros"
   - func: "get added and modified patch files"
   - func: "setup jstestfuzz"
@@ -4998,8 +4696,6 @@ tasks:
 # Check that the mutational fuzzer can parse all JS filess.
 - name: lint_fuzzer_sanity_all
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "set task expansion macros"
   - func: "setup jstestfuzz"
   - func: "lint fuzzer sanity all"
@@ -5168,8 +4864,6 @@ tasks:
   depends_on:
     - name: archive_dist_test_debug
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "set task expansion macros"
   - func: "set up venv"
     vars:
@@ -5186,8 +4880,6 @@ tasks:
 
 - name: selected_tests_gen
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "set task expansion macros"
   - func: "set up venv"
     vars:
@@ -5486,8 +5178,6 @@ tasks:
   name: integration_tests_standalone
   tags: ["integration", "standalone"]
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "do setup"
   - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
@@ -5505,8 +5195,6 @@ tasks:
   name: integration_tests_standalone_audit
   tags: ["integration", "audit"]
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "do setup"
   - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
@@ -5524,8 +5212,6 @@ tasks:
   name: integration_tests_replset
   tags: ["integration"]
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "do setup"
   - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
@@ -5543,8 +5229,6 @@ tasks:
   name: integration_tests_replset_ssl_auth
   tags: ["integration"]
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "do setup"
   - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
@@ -5562,8 +5246,6 @@ tasks:
   name: integration_tests_sharded
   tags: ["integration", "sharded"]
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "do setup"
   - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
@@ -5581,26 +5263,14 @@ tasks:
   name: external_auth
   commands:
   - func: "do setup"
-  - command: shell.exec
+  - command: subprocess.exec
     params:
-      shell: bash
-      script: |
-        set -o errexit
-        set -o verbose
-        ${activate_virtualenv}
-
-        # Not all git get project calls clone into ${workdir}/src so we allow
-        # callers to tell us where the pip requirements files are.
-        pip_dir="${pip_dir}"
-        if [[ -z $pip_dir ]]; then
-          # Default to most common location
-          pip_dir="${workdir}/src/etc/pip"
-        fi
-
-        # Same as above we have to use quotes to preserve the
-        # Windows path separator
-        external_auth_txt="$pip_dir/external-auth-requirements.txt"
-        python -m pip install -r "$external_auth_txt"
+      binary: bash
+      args:
+        - "src/evergreen/external_auth_pip.sh"
+      env:
+        python: ${python}
+        workdir: ${workdir}
   - func: "run tests"
     vars:
       resmoke_args: --suites=external_auth --excludeWithAnyTags=requires_domain_controller --storageEngine=wiredTiger
@@ -5609,53 +5279,26 @@ tasks:
   name: external_auth_aws
   commands:
   - func: "do setup"
-  - command: shell.exec
+  - command: expansions.write
     params:
-      working_dir: src
+      file: expansions.yml
+  - command: subprocess.exec
+    params:
+      binary: bash
       silent: true
-      shell: bash
-      script: |
-        set -o errexit
-        cat <<EOF > aws_e2e_setup.json
-        {
-            "iam_auth_ecs_account" : "${iam_auth_ecs_account}",
-            "iam_auth_ecs_secret_access_key" : "${iam_auth_ecs_secret_access_key}",
-            "iam_auth_ecs_account_arn": "arn:aws:iam::557821124784:user/authtest_fargate_user",
-            "iam_auth_ecs_cluster": "${iam_auth_ecs_cluster}",
-            "iam_auth_ecs_task_definition": "${iam_auth_ecs_task_definition}",
-            "iam_auth_ecs_subnet_a": "${iam_auth_ecs_subnet_a}",
-            "iam_auth_ecs_subnet_b": "${iam_auth_ecs_subnet_b}",
-            "iam_auth_ecs_security_group": "${iam_auth_ecs_security_group}",
-
-            "iam_auth_assume_aws_account" : "${iam_auth_assume_aws_account}",
-            "iam_auth_assume_aws_secret_access_key" : "${iam_auth_assume_aws_secret_access_key}",
-            "iam_auth_assume_role_name" : "${iam_auth_assume_role_name}",
-
-            "iam_auth_ec2_instance_account" : "${iam_auth_ec2_instance_account}",
-            "iam_auth_ec2_instance_secret_access_key" : "${iam_auth_ec2_instance_secret_access_key}",
-            "iam_auth_ec2_instance_profile" : "${iam_auth_ec2_instance_profile}"
-        }
-        EOF
-  - command: shell.exec
+      args:
+        - "src/evergreen/external_auth_aws_setup.sh"
+      env:
+        python: ${python}
+        workdir: ${workdir}
+  - command: subprocess.exec
     params:
-      shell: bash
-      script: |
-        set -o errexit
-        set -o verbose
-        ${activate_virtualenv}
-
-        # Not all git get project calls clone into ${workdir}/src so we allow
-        # callers to tell us where the pip requirements files are.
-        pip_dir="${pip_dir}"
-        if [[ -z $pip_dir ]]; then
-          # Default to most common location
-          pip_dir="${workdir}/src/etc/pip"
-        fi
-
-        # Same as above we have to use quotes to preserve the
-        # Windows path separator
-        external_auth_txt="$pip_dir/components/aws.req"
-        python -m pip install -r "$external_auth_txt"
+      binary: bash
+      args:
+        - "src/evergreen/external_auth_aws_pip.sh"
+      env:
+        python: ${python}
+        workdir: ${workdir}
   - func: "run tests"
     vars:
       resmoke_args: --suites=external_auth_aws --storageEngine=wiredTiger
@@ -6228,7 +5871,7 @@ tasks:
     vars:
       suite: sharding_jscore_passthrough
       depends_on: jsCore
-      resmoke_args: --storageEngine=wiredTiger --shellReadMode=legacy --shellWriteMode=compatibility --excludeWithAnyTags=requires_find_command
+      resmoke_args: --storageEngine=wiredTiger --shellReadMode=legacy --shellWriteMode=compatibility --excludeWithAnyTags=requires_find_command,requires_timeseries
       fallback_num_sub_suites: 11
 
 - <<: *task_template
@@ -6277,7 +5920,7 @@ tasks:
     vars:
       depends_on: jsCore
       use_large_distro: "true"
-      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{featureFlagDisableIncompleteShardingDDLSupport: true}'"
+      resmoke_args: --storageEngine=wiredTiger
       fallback_num_sub_suites: 48
 
 - name: multi_shard_multi_stmt_txn_stepdown_primary_jscore_passthrough_gen
@@ -6287,10 +5930,11 @@ tasks:
     vars:
       depends_on: jsCore
       use_large_distro: "true"
-      resmoke_args: "--storageEngine=wiredTiger --mongodSetParameters='{featureFlagDisableIncompleteShardingDDLSupport: true}'"
+      resmoke_args: --storageEngine=wiredTiger
       fallback_num_sub_suites: 37
 
 - name: tenant_migration_jscore_passthrough_gen
+  tags: ["tenant_migration"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -6300,6 +5944,27 @@ tasks:
       fallback_num_sub_suites: 10
 
 - name: tenant_migration_causally_consistent_jscore_passthrough_gen
+  tags: ["tenant_migration"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      depends_on: jsCore
+      use_large_distro: "true"
+      resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 10
+
+- name: tenant_migration_multi_stmt_txn_jscore_passthrough_gen
+  tags: ["tenant_migration", "txn"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      depends_on: jsCore
+      use_large_distro: "true"
+      resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 10
+
+- name: tenant_migration_stepdown_jscore_passthrough_gen
+  tags: ["tenant_migration"]
   commands:
   - func: "generate resmoke tasks"
     vars:
@@ -6437,15 +6102,14 @@ tasks:
       resmoke_jobs_max: 1
       fallback_num_sub_suites: 3
 
-- <<: *task_template
-  name: concurrency_replication_wiredtiger_eviction_debug
+- name: concurrency_replication_wiredtiger_eviction_debug_gen
   tags: ["concurrency", "repl", "debug_only"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
     vars:
-      resmoke_args: "--suites=concurrency_replication_wiredtiger_eviction_debug --storageEngine=wiredTiger"
+      resmoke_args: "--storageEngine=wiredTiger"
       resmoke_jobs_max: 1
+      fallback_num_sub_suites: 3
 
 - name: concurrency_sharded_replication_gen
   tags: ["concurrency", "common", "read_concern_maj", "large", "sharded"]
@@ -6641,25 +6305,14 @@ tasks:
       resmoke_jobs_max: 1
       fallback_num_sub_suites: 3
 
-# TODO (SERVER-54850): Remove once SERVER-54850 is completed.
-- <<: *task_template
-  name: concurrency_sharded_ddl_operations
-  commands:
-  - func: "do setup"
-  - func: "run tests"
-    vars:
-      resmoke_args: "--suites=concurrency_sharded_ddl_operations --storageEngine=wiredTiger --mongodSetParameters='{logComponentVerbosity: {command: 2, sharding: 2}}'"
-      resmoke_jobs_max: 1
-
-- <<: *task_template
-  name: concurrency_simultaneous
+- name: concurrency_simultaneous_gen
   tags: ["concurrency", "common"]
   commands:
-  - func: "do setup"
-  - func: "run tests"
+  - func: "generate resmoke tasks"
     vars:
-      resmoke_args: --suites=concurrency_simultaneous --storageEngine=wiredTiger
+      resmoke_args: --storageEngine=wiredTiger
       resmoke_jobs_max: 1
+      fallback_num_sub_suites: 3
 
 - <<: *task_template
   name: concurrency_simultaneous_replication
@@ -7238,8 +6891,6 @@ tasks:
 - name: powercycle_smoke_skip_compile
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   commands:
-    - command: manifest.load
-    - func: "git get project"
     - func: "set task expansion macros"
     - func: "set up venv"
     - func: "upload pip requirements"
@@ -7382,8 +7033,6 @@ tasks:
   depends_on:
   - name: archive_dist_test_debug
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "set task expansion macros"
   - func: "set up venv"
   - func: "upload pip requirements"
@@ -7393,46 +7042,38 @@ tasks:
   patchable: false
   commands:
   - func: "do non-compile setup"
-  - command: shell.exec
+  - command: expansions.write
+    params:
+      file: expansions.yml
+  - command: subprocess.exec
     type: setup
     params:
-      working_dir: src
+      binary: bash
       silent: true
-      script: |
-        # Create the Evergreen API credentials
-        cat > .restconfig.json <<END_OF_CREDS
-        {
-        "baseurl": "${blackduck_url}",
-        "username": "${blackduck_username}",
-        "password": "${blackduck_password}",
-        "debug": false,
-        "insecure" : false
-        }
-        END_OF_CREDS
-  - command: shell.exec
+      args:
+        - "src/evergreen/blackduck_setup.sh"
+      env:
+        python: ${python}
+        workdir: ${workdir}
+  - command: subprocess.exec
     type: test
     params:
-      working_dir: src/
-      script: |
-        set -o errexit
-        set -o verbose
-
-        # activate the virtualenv if it has been set up
-        ${activate_virtualenv}
-
-        python buildscripts/blackduck_hub.py -v scan_and_report --build_logger=mci.buildlogger --build_logger_task_id=${task_id} --report_file=report.json
+      binary: bash
+      args:
+        - "src/evergreen/blackduck_hub.sh"
+      env:
+        python: ${python}
+        workdir: ${workdir}
 
 - name: tla_plus
   commands:
   - func: "do non-compile setup"
-  - command: shell.exec
+  - command: subprocess.exec
     type: setup
     params:
-      working_dir: src/src/mongo/db/repl/tla_plus
-      script: |
-        set -o errexit
-        set -o verbose
-        ./download-tlc.sh
+      binary: bash
+      args:
+        - "./src/evergreen/download_tlc.sh"
   - func: "run tests"
     vars:
       resmoke_args: --suites=tla_plus
@@ -7462,7 +7103,6 @@ tasks:
   depends_on:
   - name: package
   commands:
-    - func: "git get project"
     - func: "fetch packages"
     - func: "set up remote credentials"
       vars:
@@ -7488,17 +7128,17 @@ tasks:
         task_compile_flags: >-
           --separate-debug
           --legacy-tarball
-    - command: shell.exec
+    - command: expansions.write
       params:
-        working_dir: src
-        script: |
-          set -o errexit
-          set -o verbose
-
-          if [ $(find . -name mongocryptd${exe} | wc -l) -eq 1 ] ; then
-            # Validate that this build_variant is listed as a known enterprise task for mongocryptd
-            PATH=$PATH:$HOME $python ../buildscripts/validate_mongocryptd.py --variant "${build_variant}" ../etc/evergreen.yml
-          fi
+        file: expansions.yml
+    - command: subprocess.exec
+      params:
+        binary: bash
+        args:
+          - "src/evergreen/package.sh"
+        env:
+          python: ${python}
+          workdir: ${workdir}
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -7645,6 +7285,7 @@ tasks:
     - command: shell.exec
       params:
         working_dir: src
+        shell: bash
         script: |
           . ./notary_env.sh
 
@@ -7715,6 +7356,7 @@ tasks:
       type: test
       params:
         working_dir: src
+        shell: bash
         script: |
           . ./notary_env.sh
 
@@ -7729,7 +7371,7 @@ tasks:
           mv distsrc.${ext|tgz} mongodb-src-${src_suffix}.${ext|tar.gz} || true
           /usr/bin/find build/ -type f | grep msi$ | xargs -I original_filename cp original_filename mongodb-${push_name}-${push_arch}-${suffix}.msi || true
 
-          /usr/local/bin/notary-client.py --key-name "server-4.9" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz} mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}
+          /usr/local/bin/notary-client.py --key-name "server-5.0" --auth-token-file ${workdir}/src/signing_auth_token --comment "Evergreen Automatic Signing ${revision} - ${build_variant} - ${branch_name}" --notary-url http://notary-service.build.10gen.cc:5000 --skip-missing mongodb-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-shell-${push_name}-${push_arch}-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-debugsymbols-${suffix}.${ext|tgz} mongodb-${push_name}-${push_arch}-${suffix}.msi mongodb-src-${src_suffix}.${ext|tar.gz} mongodb-cryptd-${push_name}-${push_arch}-${suffix}.${ext|tgz}
 
     # Put the binaries tarball/zipfile
     - command: s3.put
@@ -8255,24 +7897,18 @@ tasks:
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on: []
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "shared scons cache pruning"
 
 - name: win_shared_scons_cache_pruning
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on: []
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "set up win mount script"
   - func: "shared scons cache pruning"
 
 - name: validate_commit_message
   exec_timeout_secs: 600 # 10 minute timeout
   commands:
-  - command: manifest.load
-  - func: "git get project"
   - func: "set task expansion macros"
   - func: "set up venv"
   - command: shell.exec
@@ -8296,6 +7932,34 @@ tasks:
           ${activate_virtualenv}
           $python buildscripts/validate_commit_message.py "$commit_message_content"
         fi
+
+- name: check_for_todos
+  exec_timeout_secs: 600 # 10 minute timeout
+  commands:
+    - func: "set task expansion macros"
+    - func: "set up venv"
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src
+        shell: bash
+        script: |
+          set -o verbose
+          set -o errexit
+
+          if [ "${is_commit_queue}" = "true" ]; then
+            # Since `commit_message` is an evergreen expansion, we need a way to ensure we
+            # properly deal with any special characters that could cause issues (like "). To
+            # do this, we will write it out to a file, then read that file into a variable.
+            cat > commit_message.txt <<END_OF_COMMIT_MSG
+          ${commit_message}
+          END_OF_COMMIT_MSG
+
+            commit_message_content=$(cat commit_message.txt)
+
+            ${activate_virtualenv}
+            $python buildscripts/todo_check.py --commit-message "$commit_message_content"
+          fi
 
 - <<: *task_template
   name: mqlrun
@@ -8378,7 +8042,7 @@ task_groups:
   name: compile_archive_and_run_libfuzzertests_TG
   tasks:
   - compile_and_archive_libfuzzertests
-  - run_libfuzzertests
+  - fetch_and_run_libfuzzertests
 
 - <<: *compile_task_group_template
   name: compile_test_and_package_serial_TG
@@ -8429,9 +8093,9 @@ task_groups:
   setup_group_can_fail_task: true
   setup_group:
     - command: manifest.load
+    - func: "git get project"
     - func: "kill processes"
     - func: "cleanup environment"
-    - func: "git get project"
     - func: "set task expansion macros"
     - func: "set up venv"
     - func: "configure evergreen api credentials"
@@ -8672,7 +8336,7 @@ buildvariants:
   - name: bulk_gle_passthrough
   - name: .misc_js !.sharded
   - name: concurrency
-  - name: concurrency_simultaneous
+  - name: concurrency_simultaneous_gen
   - name: disk_wiredtiger
   - name: failpoints_auth
   - name: .jscore .common !.sharding !.decimal !.txns
@@ -8710,6 +8374,9 @@ buildvariants:
   - name: concurrency_replication_causal_consistency_gen
   - name: disk_wiredtiger
   - name: free_monitoring
+  - name: .jepsen
+    distros:
+    - ubuntu1804-build
   - name: .jscore .common
   - name: .jstestfuzz .common
   - name: libunwind_tests
@@ -8771,6 +8438,9 @@ buildvariants:
   - name: .encrypt !.aggregation !.replica_sets !.sharding !.jscore
   - name: external_auth
   - name: external_auth_aws
+  - name: .jepsen
+    distros:
+    - ubuntu1804-build
   - name: .jscore .common !.compat !.decimal !.sharding
   - name: jsCore_auth
   - name: .jstestfuzz .common
@@ -9529,7 +9199,6 @@ buildvariants:
   - name: burn_in_tests_gen
   - name: buildscripts_test
   - name: noPassthrough_gen
-  - name: powercycle_kill_mongod_smoke
   - name: server_discovery_and_monitoring_json_test_TG
   - name: server_selection_json_test_TG
   - name: compile_run_and_archive_dbtest_TG
@@ -9557,27 +9226,28 @@ buildvariants:
     target_resmoke_time: 20
     max_sub_suites: 5
     large_distro_name: windows-vsCurrent-large
+    # To force disable feature flags even on the all feature flags variant, please use this file:
+    # buildscripts/resmokeconfig/fully_disabled_feature_flags.yml
     test_flags: >-
-        --mongodSetParameters="{
-            featureFlagToaster: true,
-            featureFlagSpoon: true,
-            featureFlagAuthorizationContract: true,
-            featureFlagImprovedAuditing: true,
-            featureFlagRuntimeAuditConfig: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagShardingFullDDLSupport: true,
-            featureFlagShardingFullDDLSupportTimestampedVersion: true,
-            featureFlagWindowFunctions: true,
-            featureFlagUseSecondaryDelaySecs: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
-        --mongosSetParameters="{
-            featureFlagImprovedAuditing: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagWindowFunctions: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
+        --runAllFeatureFlagTests
         --excludeWithAnyTags=incompatible_with_windows_tls
+  tasks:
+    - name: compile_and_archive_dist_test_then_package_TG
+      distros:
+        - windows-vsCurrent-xlarge
+    - name: compile_build_tools_next_TG
+      distros:
+        - windows-vsCurrent-xlarge
+    - name: burn_in_tests_gen
+    - name: noPassthrough_gen
+# Disabling as the following tests are not aware of feature flags.
+#    - name: buildscripts_test
+#    - name: server_discovery_and_monitoring_json_test_TG
+#    - name: server_selection_json_test_TG
+#    - name: compile_run_and_archive_dbtest_TG
+#      distros:
+#        - windows-vsCurrent-xlarge
+#    - name: unittest_shell_hang_analyzer_gen
 
 - &enterprise-windows-suggested-template
   name: enterprise-windows-suggested
@@ -9631,6 +9301,8 @@ buildvariants:
     - name: mqlrun
     - name: noPassthrough_gen
     - name: noPassthroughWithMongod_gen
+    - name: powercycle_kill_mongod_smoke
+    - name: powercycle_smoke
     - name: .replica_sets .common
     - name: .replica_sets .multi_oplog
     - name: replica_sets_ese_gen
@@ -9663,27 +9335,48 @@ buildvariants:
     target_resmoke_time: 20
     max_sub_suites: 3
     large_distro_name: windows-vsCurrent-large
+    # To force disable feature flags even on the all feature flags variant, please use this file:
+    # buildscripts/resmokeconfig/fully_disabled_feature_flags.yml
     test_flags: >-
-        --mongodSetParameters="{
-            featureFlagToaster: true,
-            featureFlagSpoon: true,
-            featureFlagAuthorizationContract: true,
-            featureFlagImprovedAuditing: true,
-            featureFlagRuntimeAuditConfig: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagShardingFullDDLSupport: true,
-            featureFlagShardingFullDDLSupportTimestampedVersion: true,
-            featureFlagWindowFunctions: true,
-            featureFlagUseSecondaryDelaySecs: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
-        --mongosSetParameters="{
-            featureFlagImprovedAuditing: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagWindowFunctions: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
+        --runAllFeatureFlagTests
         --excludeWithAnyTags=incompatible_with_windows_tls
+  tasks:
+    - name: compile_test_and_package_serial_TG
+      distros:
+        - windows-vsCurrent-xlarge
+    - name: audit
+    - name: auth_audit_gen
+    - name: causally_consistent_jscore_txns_passthrough
+      distros:
+        - windows-vsCurrent-large
+    - name: .encrypt !.aggregation !.replica_sets !.sharding !.jscore
+    - name: external_auth
+    - name: external_auth_aws
+    - name: external_auth_windows
+      distros:
+        - windows-64-2016
+    - name: .jscore .common !.compat !.sharding
+    - name: jsCore_auth
+    - name: jsCore_ese
+    - name: jsCore_txns_large_txns_format
+    - name: .jstestfuzz .common
+    - name: mqlrun
+    - name: noPassthrough_gen
+    - name: noPassthroughWithMongod_gen
+    - name: .replica_sets .common
+    - name: .replica_sets .multi_oplog
+    - name: replica_sets_ese_gen
+    - name: sasl
+    - name: .sharding .txns
+    - name: sharding_auth_gen
+    - name: sharding_auth_audit_gen
+    - name: sharding_ese_gen
+    - name: snmp
+# Disabling as the following tests are not aware of feature flags.
+#    - name: buildscripts_test
+#    - name: unittest_shell_hang_analyzer_gen
+#    - name: server_selection_json_test_TG
+#    - name: server_discovery_and_monitoring_json_test_TG
 
 - <<: *enterprise-windows-nopush-template
   name: enterprise-windows-benchmarks
@@ -9914,6 +9607,7 @@ buildvariants:
   run_on:
   - macos-1014
   expansions:
+    test_flags: --excludeWithAnyTags=incompatible_with_macos
     push_path: osx
     push_bucket: downloads.mongodb.org
     push_name: macos
@@ -9966,6 +9660,7 @@ buildvariants:
   run_on:
   - macos-1014
   expansions:
+    test_flags: --excludeWithAnyTags=incompatible_with_macos
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug archive-mh archive-mh-debug
     push_path: osx
     push_bucket: downloads.10gen.com
@@ -10003,7 +9698,7 @@ buildvariants:
   - macos-1014
   batchtime: 10080 # 7 days
   expansions:
-    test_flags: --excludeWithAnyTags=uses_transactions
+    test_flags: --excludeWithAnyTags=uses_transactions,incompatible_with_macos
     cmake_path: /Applications/cmake-3.11.0-Darwin-x86_64/CMake.app/Contents/bin/cmake
     compile_env: DEVELOPER_DIR=/Applications/Xcode10.2.app
     compile_flags: >-
@@ -10011,7 +9706,7 @@ buildvariants:
       --variables-files=etc/scons/xcode_macosx.vars
       -j$(sysctl -n hw.logicalcpu)
       LIBPATH="\$BUILD_ROOT/mongo-embedded-sdk-\$MONGO_VERSION/lib"
-    cdriver_cmake_osx_deployment_target: "10.12"
+    cdriver_cmake_osx_deployment_target: "10.14"
     cdriver_cmake_flags: >-
         -DCMAKE_BUILD_TYPE=RelWithDebInfo
         -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)"
@@ -10195,6 +9890,7 @@ buildvariants:
   - name: lint_cpplint
   - name: lint_fuzzer_sanity_patch
   - name: lint_yaml
+  - name: lint_shellscripts
   - name: lint_errorcodes
   - name: test_api_version_compatibility
   - name: burn_in_tests_gen
@@ -10236,8 +9932,6 @@ buildvariants:
   - name: .multi_shard
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
   - name: multiversion_gen
-  - name: powercycle_smoke
-  - name: powercycle_kill_mongod_smoke
   - name: .query_fuzzer
   - name: .random_multiversion_ds
   - name: .read_write_concern .large
@@ -10301,37 +9995,20 @@ buildvariants:
     max_sub_suites: 5
     large_distro_name: rhel80-medium
     num_scons_link_jobs_available: 0.99
-    test_flags: >-
-        --mongodSetParameters="{
-            featureFlagToaster: true,
-            featureFlagSpoon: true,
-            featureFlagAuthorizationContract: true,
-            featureFlagTenantMigrations: true,
-            featureFlagImprovedAuditing: true,
-            featureFlagRuntimeAuditConfig: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagShardingFullDDLSupport: true,
-            featureFlagShardingFullDDLSupportTimestampedVersion: true,
-            featureFlagWindowFunctions: true,
-            featureFlagUseSecondaryDelaySecs: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
-        --mongosSetParameters="{
-            featureFlagImprovedAuditing: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagWindowFunctions: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
+    # To force disable feature flags even on the all feature flags variant, please use this file:
+    # buildscripts/resmokeconfig/fully_disabled_feature_flags.yml
+    test_flags: --runAllFeatureFlagTests
   tasks:
   - name: compile_test_and_package_parallel_core_stream_TG
     distros:
       - rhel80-large
-  - name: compile_test_and_package_parallel_unittest_stream_TG
-    distros:
-      - rhel80-large
-  - name: compile_test_and_package_parallel_dbtest_stream_TG
-    distros:
-    - rhel80-medium
+# Disabling as the following tests are not aware of feature flags.
+#  - name: compile_test_and_package_parallel_unittest_stream_TG
+#    distros:
+#      - rhel80-large
+#  - name: compile_test_and_package_parallel_dbtest_stream_TG
+#    distros:
+#    - rhel80-medium
   - name: libdeps_graph_linting_TG
     distros:
       - rhel80-large
@@ -10344,7 +10021,6 @@ buildvariants:
   - name: .causally_consistent !.sharding
   - name: .change_streams
   - name: .misc_js
-  - name: concurrency_sharded_ddl_operations
   - name: .concurrency !.large !.ubsan !.no_txns !.debug_only
   - name: .concurrency .large !.ubsan !.no_txns !.debug_only
     distros:
@@ -10367,8 +10043,6 @@ buildvariants:
   - name: mqlrun
   - name: .multi_shard
   - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
-  - name: tenant_migration_jscore_passthrough_gen
-  - name: tenant_migration_causally_consistent_jscore_passthrough_gen
   - name: multiversion_gen
   - name: .query_fuzzer
   - name: .random_multiversion_ds
@@ -10403,14 +10077,16 @@ buildvariants:
   - name: sharded_multi_stmt_txn_jscore_passthrough
   - name: snmp
   - name: .stitch
+  - name: .tenant_migration
   - name: .updatefuzzer
   - name: secondary_reads_passthrough_gen
-  - name: server_discovery_and_monitoring_json_test_TG
-    distros:
-      - rhel80-large
-  - name: server_selection_json_test_TG
-    distros:
-      - rhel80-large
+# Disabling as the following tests are not aware of feature flags.
+#  - name: server_discovery_and_monitoring_json_test_TG
+#    distros:
+#      - rhel80-large
+#  - name: server_selection_json_test_TG
+#    distros:
+#      - rhel80-large
 
 - name: enterprise-rhel-80-64-bit-dynamic-sbe
   display_name: "Shared Library Enterprise RHEL 8.0 (SBE)"
@@ -10435,22 +10111,64 @@ buildvariants:
     large_distro_name: rhel80-medium
     num_scons_link_jobs_available: 0.99
     test_flags: >-
-        --mongodSetParameters="{featureFlagSBE: true}"
-        --excludeWithAnyTags=sbe_incompatible
+      --additionalFeatureFlags=featureFlagSBE
+      --additionalFeatureFlags=featureFlagTimeseriesCollection
+      --excludeWithAnyTags=sbe_incompatible
   tasks:
   - name: compile_test_and_package_parallel_core_stream_TG
     distros:
       - rhel80-large
-  - name: compile_test_and_package_parallel_unittest_stream_TG
-    distros:
-      - rhel80-large
-  - name: compile_test_and_package_parallel_dbtest_stream_TG
-    distros:
-    - rhel80-medium
-  - name: .aggregation !.no_async !.secondary_reads !.read_write_concern !.sharded !.unwind !aggregation_disabled_optimization
-  - name: .concurrency !.large !.ubsan !.no_txns !.debug_only !.sharded !.repl
+# Disable the following tests as they are not aware of feature flags.
+#  - name: compile_test_and_package_parallel_unittest_stream_TG
+#    distros:
+#      - rhel80-large
+#  - name: compile_test_and_package_parallel_dbtest_stream_TG
+#    distros:
+#    - rhel80-medium
+  - name: .aggregation !.no_async !.secondary_reads !.sharded !.unwind !aggregation_disabled_optimization
+  - name: .aggfuzzer !.multiversion
+  - name: .change_streams
+  - name: .concurrency !.large !.ubsan !.debug_only
   - name: .jscore !.sharding !.decimal !.compat !cst_jscore_passthrough
+  - name: .jstestfuzz !.flow_control
+  - name: .read_write_concern
+  - name: .replica_sets
+  - name: .rollbackfuzzer
+  - name: causally_consistent_hedged_reads_jscore_passthrough_gen
+  - name: causally_consistent_jscore_passthrough_auth_gen
+  - name: causally_consistent_jscore_passthrough_gen
+  - name: causally_consistent_read_concern_snapshot_passthrough_gen
+  - name: initial_sync_fuzzer_gen
+  - name: multi_shard_multi_stmt_txn_jscore_passthrough_gen
+  - name: multi_shard_multi_stmt_txn_kill_primary_jscore_passthrough_gen
+  - name: multi_shard_multi_stmt_txn_stepdown_primary_jscore_passthrough_gen
+  - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
   - name: noPassthrough_gen
+  - name: noPassthroughWithMongod_gen
+  - name: replica_sets_multiversion_gen
+  - name: replica_sets_reconfig_jscore_passthrough_gen
+  - name: retryable_writes_jscore_passthrough_gen
+  - name: retryable_writes_jscore_stepdown_passthrough
+  - name: session_jscore_passthrough
+  - name: sharded_causally_consistent_jscore_passthrough_gen
+  - name: sharded_collections_jscore_passthrough
+  - name: sharding_auth_gen
+  - name: sharding_auth_audit_gen
+  - name: sharding_csrs_continuous_config_stepdown_gen
+  - name: sharding_ese_gcm_gen
+  - name: sharding_ese_gen
+  - name: sharding_gen
+  - name: sharding_jscore_passthrough
+  - name: sharding_jscore_passthrough_wire_ops_gen
+  - name: sharding_jscore_op_query_passthrough
+  - name: sharding_update_v1_oplog_jscore_passthrough
+  - name: sharding_last_lts_mongos_and_mixed_shards_gen
+  - name: sharding_max_mirroring_gen
+  - name: sharding_multiversion_gen
+  - name: sharding_op_query_gen
+  - name: sharding_update_v1_oplog_gen
+  - name: jsCore_compatibility
+  - name: ese
     distros:
     - rhel80-medium
 
@@ -10534,7 +10252,7 @@ buildvariants:
   - rhel80-small
   expansions: &enterprise-rhel-80-64-bit-multiversion
     test_flags: >-
-      --excludeWithAnyTags=requires_fcv_47,requires_fcv_48,requires_fcv_49,multiversion_incompatible
+      --excludeWithAnyTags=requires_fcv_47,requires_fcv_48,requires_fcv_49,requires_fcv_50,multiversion_incompatible
     compile_flags: >-
       -j$(grep -c ^processor /proc/cpuinfo)
       --ssl
@@ -10847,6 +10565,26 @@ buildvariants:
     distros:
     - rhel70-small
 
+- name: ubi8
+  display_name: "UBI 8"
+  run_on:
+  - ubi8
+  expansions:
+    resmoke_jobs_factor: 1
+    disable_shared_scons_cache: true
+    compile_flags: MONGO_DISTMOD=rhel80 --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    tooltags: ""
+    build_mongoreplay: true
+    test_flags: >-
+      --excludeWithAnyTags=requires_os_access
+  tasks:
+  - name: compile_and_archive_dist_test_then_package_TG
+    distros:
+    - rhel80-large
+  - name: jsCore
+  - name: sharding_gen
+  - name: replica_sets
+
 - &enterprise-rhel-80-64-bit-suggested-template
   name: enterprise-rhel-80-64-bit-suggested
   display_name: "* Enterprise RHEL 8.0"
@@ -10891,6 +10629,8 @@ buildvariants:
   - name: replica_sets_auth_gen
   - name: replica_sets_jscore_passthrough
   - name: .replica_sets .multi_oplog
+  - name: powercycle_kill_mongod_smoke
+  - name: powercycle_smoke
   - name: sasl
   - name: search
   - name: search_auth
@@ -11063,6 +10803,26 @@ buildvariants:
   - name: sharding_auth_gen
   - name: .stitch
   - name: unittest_shell_hang_analyzer_gen
+
+- name: ubuntu1804-container
+  display_name: "Ubuntu 18.04 Container"
+  run_on:
+  - ubuntu1804-container-server
+  expansions:
+    resmoke_jobs_factor: 1
+    disable_shared_scons_cache: true
+    compile_flags: MONGO_DISTMOD=ubuntu1804 --opt=on -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    tooltags: ""
+    build_mongoreplay: true
+    test_flags: >-
+      --excludeWithAnyTags=requires_os_access
+  tasks:
+  - name: compile_and_archive_dist_test_then_package_TG
+    distros:
+    - ubuntu1804-build
+  - name: jsCore
+  - name: sharding_gen
+  - name: replica_sets
 
 - name: rhel70
   display_name: RHEL 7.0
@@ -11379,27 +11139,10 @@ buildvariants:
     multiversion_platform: rhel72
     multiversion_architecture: s390x
     multiversion_edition: enterprise
+    # To force disable feature flags even on the all feature flags variant, please use this file:
+    # buildscripts/resmokeconfig/fully_disabled_feature_flags.yml
     test_flags: >-
-        --mongodSetParameters="{
-            featureFlagToaster: true,
-            featureFlagSpoon: true,
-            featureFlagAuthorizationContract: true,
-            featureFlagTenantMigrations: true,
-            featureFlagImprovedAuditing: true,
-            featureFlagRuntimeAuditConfig: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagShardingFullDDLSupport: true,
-            featureFlagShardingFullDDLSupportTimestampedVersion: true,
-            featureFlagWindowFunctions: true,
-            featureFlagUseSecondaryDelaySecs: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
-        --mongosSetParameters="{
-            featureFlagImprovedAuditing: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagWindowFunctions: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
+        --runAllFeatureFlagTests
   tasks:
   - name: compile_test_and_package_serial_TG
     distros:
@@ -11849,16 +11592,12 @@ buildvariants:
   modules:
   - enterprise
   run_on:
-  - centos6-perf
+  - rhel80-medium
   expansions:
     compile_flags: --ssl MONGO_DISTMOD=rhel80 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
   tasks:
   - name: compile_benchmarks
-    distros:
-    - rhel80-medium
   - name: .benchmarks
-    distros:
-    - centos6-perf
 
 - name: enterprise-rhel-80-64-bit-inmem
   display_name: Enterprise RHEL 8.0 (inMemory)
@@ -11934,7 +11673,7 @@ buildvariants:
     # correctly after rollbackViaRefetch.
     test_flags: >-
       --storageEngine=ephemeralForTest
-      --excludeWithAnyTags=requires_persistence,requires_fsync,SERVER-21420,SERVER-21658,requires_journaling,requires_wiredtiger,uses_transactions,uses_speculative_majority,requires_snapshot_read,requires_majority_read_concern,uses_change_streams,requires_sharding,incompatible_with_eft
+      --excludeWithAnyTags=requires_persistence,requires_fsync,requires_journaling,requires_wiredtiger,uses_transactions,uses_speculative_majority,requires_snapshot_read,requires_majority_read_concern,uses_change_streams,requires_sharding,incompatible_with_eft
       --mongodSetParameters="{oplogApplicationEnforcesSteadyStateConstraints: false}"
     compile_flags: -j$(grep -c ^processor /proc/cpuinfo) --dbg=off --opt=on --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     multiversion_platform: rhel80
@@ -11950,7 +11689,7 @@ buildvariants:
   # - name: concurrency
   # - name: concurrency_replication_gen
   # - name: concurrency_replication_causal_consistency_gen
-  # - name: concurrency_simultaneous
+  # - name: concurrency_simultaneous_gen
   # - name: concurrency_simultaneous_replication
   - name: .integration !.audit
   - name: .jscore .common !.txns !.decimal
@@ -12066,6 +11805,7 @@ buildvariants:
   - name: .retry
   - name: .read_only
   - name: .rollbackfuzzer
+  - name: .updatefuzzer
   - name: sasl
   - name: secondary_reads_passthrough_gen
   - name: session_jscore_passthrough
@@ -12100,35 +11840,16 @@ buildvariants:
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
     exec_timeout_secs: 14400 # 3 hour timeout
+    # To force disable feature flags even on the all feature flags variant, please use this file:
+    # buildscripts/resmokeconfig/fully_disabled_feature_flags.yml
     test_flags: >-
-        --excludeWithAnyTags=requires_fast_memory,requires_ocsp_stapling
-        --mongodSetParameters="{
-            featureFlagToaster: true,
-            featureFlagSpoon: true,
-            featureFlagAuthorizationContract: true,
-            featureFlagTenantMigrations: true,
-            featureFlagImprovedAuditing: true,
-            featureFlagRuntimeAuditConfig: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagShardingFullDDLSupport: true,
-            featureFlagShardingFullDDLSupportTimestampedVersion: true,
-            featureFlagWindowFunctions: true,
-            featureFlagUseSecondaryDelaySecs: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
-        --mongosSetParameters="{
-            featureFlagImprovedAuditing: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagWindowFunctions: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
+        --runAllFeatureFlagTests
   tasks:
   - name: compile_test_and_package_serial_TG
   - name: compile_benchmarks
   - name: .aggregation
 #  - name: .auth
   - name: audit
-  - name: .benchmarks
   - name: .causally_consistent !.wo_snapshot
   - name: .change_streams
   - name: .misc_js
@@ -12162,12 +11883,14 @@ buildvariants:
   - name: .sharding .jscore !.wo_snapshot
   - name: .sharding .common !.csrs
   - name: snmp
+  - name: .tenant_migration
   - name: .watchdog
   - name: .stitch
-  - name: unittest_shell_hang_analyzer_gen
-  - name: .updatefuzzer
-  - name: server_discovery_and_monitoring_json_test_TG
-  - name: server_selection_json_test_TG
+# Disabling the following tests as they are not aware of feature flags.
+#  - name: .benchmarks
+#  - name: unittest_shell_hang_analyzer_gen
+#  - name: server_discovery_and_monitoring_json_test_TG
+#  - name: server_selection_json_test_TG
 
 - name: ubuntu1804-asan
   display_name: ~ ASAN Ubuntu 18.04
@@ -12272,28 +11995,11 @@ buildvariants:
     # also made to SConstruct.
     san_options: UBSAN_OPTIONS="print_stacktrace=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer"
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --sanitize=undefined --ssl --ocsp-stapling=off --enable-free-mon=on -j$(grep -c ^processor /proc/cpuinfo)
+    # To force disable feature flags even on the all feature flags variant, please use this file:
+    # buildscripts/resmokeconfig/fully_disabled_feature_flags.yml
     test_flags: >-
         --excludeWithAnyTags=requires_ocsp_stapling
-        --mongodSetParameters="{
-            featureFlagToaster: true,
-            featureFlagSpoon: true,
-            featureFlagAuthorizationContract: true,
-            featureFlagTenantMigrations: true,
-            featureFlagImprovedAuditing: true,
-            featureFlagRuntimeAuditConfig: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagShardingFullDDLSupport: true,
-            featureFlagShardingFullDDLSupportTimestampedVersion: true,
-            featureFlagWindowFunctions: true,
-            featureFlagUseSecondaryDelaySecs: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
-        --mongosSetParameters="{
-            featureFlagImprovedAuditing: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagWindowFunctions: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
+        --runAllFeatureFlagTests
     multiversion_platform: ubuntu1804
     multiversion_edition: enterprise
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under UBSAN build.
@@ -12304,7 +12010,6 @@ buildvariants:
   - name: .aggregation
   - name: .auth
   - name: audit
-  - name: .benchmarks
   - name: .causally_consistent !.wo_snapshot
   - name: .change_streams
   - name: .misc_js
@@ -12336,10 +12041,13 @@ buildvariants:
   - name: .sharding .common !.csrs
   - name: snmp
   - name: .stitch
+  - name: .tenant_migration
   - name: .updatefuzzer
   - name: watchdog_wiredtiger
-  - name: server_discovery_and_monitoring_json_test_TG
-  - name: server_selection_json_test_TG
+# Disabling the following tests as they are not aware of feature flags.
+#  - name: .benchmarks
+#  - name: server_discovery_and_monitoring_json_test_TG
+#  - name: server_selection_json_test_TG
 
 - &ubuntu1804-debug-aubsan-lite-required-template
   name: ubuntu1804-debug-aubsan-lite-required
@@ -12389,28 +12097,11 @@ buildvariants:
     # also made to SConstruct.
     san_options: UBSAN_OPTIONS="print_stacktrace=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer" LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1" ASAN_OPTIONS="detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer"
     compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=undefined,address --ssl --ocsp-stapling=off -j$(grep -c ^processor /proc/cpuinfo) --link-model=dynamic
+    # To force disable feature flags even on the all feature flags variant, please use this file:
+    # buildscripts/resmokeconfig/fully_disabled_feature_flags.yml
     test_flags: >-
         --excludeWithAnyTags=requires_ocsp_stapling
-        --mongodSetParameters="{
-            featureFlagToaster: true,
-            featureFlagSpoon: true,
-            featureFlagAuthorizationContract: true,
-            featureFlagTenantMigrations: true,
-            featureFlagImprovedAuditing: true,
-            featureFlagRuntimeAuditConfig: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagShardingFullDDLSupport: true,
-            featureFlagShardingFullDDLSupportTimestampedVersion: true,
-            featureFlagWindowFunctions: true,
-            featureFlagUseSecondaryDelaySecs: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
-        --mongosSetParameters="{
-            featureFlagImprovedAuditing: true,
-            featureFlagTimeseriesCollection: true,
-            featureFlagWindowFunctions: true,
-            featureFlagChangeStreamsOptimization: true,
-        }"
+        --runAllFeatureFlagTests
     resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under {A,UB}SAN build.
     hang_analyzer_dump_core: false
     scons_cache_scope: shared
@@ -12421,15 +12112,16 @@ buildvariants:
   - name: compile_test_and_package_parallel_core_stream_TG
     distros:
       - ubuntu1804-xlarge
-  - name: compile_test_and_package_parallel_unittest_stream_TG
-    distros:
-      - ubuntu1804-xlarge
-  - name: compile_test_and_package_parallel_dbtest_stream_TG
-    distros:
-      - ubuntu1804-xlarge
   - name: jsCore
   - name: jsCore_txns
-  - name: unittest_shell_hang_analyzer_gen
+# Disabling these tests as they are not aware of feature flags.
+#  - name: compile_test_and_package_parallel_unittest_stream_TG
+#    distros:
+#      - ubuntu1804-xlarge
+#  - name: compile_test_and_package_parallel_dbtest_stream_TG
+#    distros:
+#      - ubuntu1804-xlarge
+#  - name: unittest_shell_hang_analyzer_gen
 
 - name: ubuntu1804-debug-aubsan-lite_fuzzer
   display_name: "{A,UB}SAN Enterprise Ubuntu 18.04 FUZZER"
@@ -12732,6 +12424,7 @@ buildvariants:
   stepback: false
   tasks:
   - name: validate_commit_message
+  - name: check_for_todos
 
 - name: live-record
   display_name: "~ RHEL 8.0 Shared Library (with UndoDB live-record)"

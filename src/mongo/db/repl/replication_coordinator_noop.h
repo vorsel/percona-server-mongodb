@@ -106,7 +106,7 @@ public:
 
     Seconds getSecondaryDelaySecs() const final;
 
-    void clearSyncSourceBlacklist() final;
+    void clearSyncSourceDenylist() final;
 
     ReplicationCoordinator::StatusAndDuration awaitReplication(OperationContext*,
                                                                const OpTime&,
@@ -199,6 +199,8 @@ public:
                              GetNewConfigFn getNewConfig,
                              bool force) final;
 
+    Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn) final;
+
     Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) final;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) final;
@@ -211,7 +213,7 @@ public:
 
     HostAndPort chooseNewSyncSource(const OpTime&) final;
 
-    void blacklistSyncSource(const HostAndPort&, Date_t) final;
+    void denylistSyncSource(const HostAndPort&, Date_t) final;
 
     void resetLastOpTimesFromOplog(OperationContext*) final;
 

@@ -50,7 +50,8 @@ namespace mongo::sbe {
  *
  * The "output" slots are
  *   - 'recordSlot': the "KeyString" representing the index entry,
- *   - 'recordIdSlot': a reference that can be used to fetch the entire document, and
+ *   - 'recordIdSlot': a reference that can be used to fetch the entire document,
+ *   - 'snapshotIdSlot': the storage snapshot that this index scan is reading from, and
  *   - 'vars': one slot for each value in the index key that should be "projected" out of the entry.
  *
  * The 'indexKeysToInclude' bitset determines which values are included in the projection based
@@ -64,6 +65,7 @@ public:
                    bool forward,
                    boost::optional<value::SlotId> recordSlot,
                    boost::optional<value::SlotId> recordIdSlot,
+                   boost::optional<value::SlotId> snapshotIdSlot,
                    IndexKeysInclusionSet indexKeysToInclude,
                    value::SlotVector vars,
                    boost::optional<value::SlotId> seekKeySlotLow,
@@ -100,34 +102,39 @@ private:
      */
     void restoreCollectionAndIndex();
 
+    const KeyString::Value& getSeekKeyLow() const;
+    const KeyString::Value* getSeekKeyHigh() const;
+
     const CollectionUUID _collUuid;
     const std::string _indexName;
     const bool _forward;
     const boost::optional<value::SlotId> _recordSlot;
     const boost::optional<value::SlotId> _recordIdSlot;
+    const boost::optional<value::SlotId> _snapshotIdSlot;
     const IndexKeysInclusionSet _indexKeysToInclude;
     const value::SlotVector _vars;
     const boost::optional<value::SlotId> _seekKeySlotLow;
     const boost::optional<value::SlotId> _seekKeySlotHigh;
 
     NamespaceString _collName;
+    uint64_t _catalogEpoch;
 
     LockAcquisitionCallback _lockAcquisitionCallback;
 
-    std::unique_ptr<value::ViewOfValueAccessor> _recordAccessor;
-    std::unique_ptr<value::ViewOfValueAccessor> _recordIdAccessor;
+    std::unique_ptr<value::OwnedValueAccessor> _recordAccessor;
+    std::unique_ptr<value::OwnedValueAccessor> _recordIdAccessor;
+    std::unique_ptr<value::OwnedValueAccessor> _snapshotIdAccessor;
 
     // One accessor and slot for each key component that this stage will bind from an index entry's
     // KeyString. The accessors are in the same order as the key components they bind to.
-    std::vector<value::ViewOfValueAccessor> _accessors;
+    std::vector<value::OwnedValueAccessor> _accessors;
     value::SlotAccessorMap _accessorMap;
 
     value::SlotAccessor* _seekKeyLowAccessor{nullptr};
     value::SlotAccessor* _seekKeyHiAccessor{nullptr};
 
-    KeyString::Value _startPoint;
-    KeyString::Value* _seekKeyLow{nullptr};
-    KeyString::Value* _seekKeyHi{nullptr};
+    std::unique_ptr<value::OwnedValueAccessor> _seekKeyLowHolder;
+    std::unique_ptr<value::OwnedValueAccessor> _seekKeyHighHolder;
 
     std::unique_ptr<SortedDataInterface::Cursor> _cursor;
     std::weak_ptr<const IndexCatalogEntry> _weakIndexCatalogEntry;

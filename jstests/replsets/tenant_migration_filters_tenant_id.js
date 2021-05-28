@@ -1,7 +1,8 @@
 /**
  * Tests that tenant migrations are correctly filtering DBs by tenantId.
  *
- * @tags: [requires_fcv_49, requires_majority_read_concern, incompatible_with_windows_tls]
+ * @tags: [requires_fcv_49, requires_majority_read_concern, incompatible_with_windows_tls,
+ * incompatible_with_eft, incompatible_with_macos, requires_persistence]
  */
 
 (function() {
@@ -9,6 +10,7 @@
 
 load("jstests/libs/uuid_util.js");
 load("jstests/replsets/libs/tenant_migration_test.js");
+load("jstests/replsets/libs/tenant_migration_util.js");
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
 if (!tenantMigrationTest.isFeatureFlagEnabled()) {
@@ -28,7 +30,7 @@ const makeBaseTenantId = () => {
 const runTest = (baseTenantId, dbName, shouldMatch) => {
     jsTestLog(`Running tenant migration with dbName ${dbName} and tenantId ${baseTenantId}`);
 
-    assert.eq(shouldMatch, tenantMigrationTest.isNamespaceForTenant(baseTenantId, dbName));
+    assert.eq(shouldMatch, TenantMigrationUtil.isNamespaceForTenant(baseTenantId, dbName));
     tenantMigrationTest.insertDonorDB(dbName, collName);
 
     // Run a migration with the base tenant ID.

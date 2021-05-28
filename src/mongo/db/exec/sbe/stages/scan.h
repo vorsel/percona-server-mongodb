@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/exec/sbe/expressions/expression.h"
 #include "mongo/db/exec/sbe/stages/collection_helpers.h"
 #include "mongo/db/exec/sbe/stages/stages.h"
 #include "mongo/db/exec/sbe/values/bson.h"
@@ -38,19 +39,39 @@ namespace mongo {
 namespace sbe {
 using ScanOpenCallback = std::function<void(OperationContext*, const CollectionPtr&, bool)>;
 
+struct ScanCallbacks {
+    ScanCallbacks(LockAcquisitionCallback lockAcquisition,
+                  IndexKeyCorruptionCheckCallback indexKeyCorruptionCheck = {},
+                  IndexKeyConsistencyCheckCallback indexKeyConsistencyCheck = {},
+                  ScanOpenCallback scanOpen = {})
+        : lockAcquisitionCallback(std::move(lockAcquisition)),
+          indexKeyCorruptionCheckCallback(std::move(indexKeyCorruptionCheck)),
+          indexKeyConsistencyCheckCallBack(std::move(indexKeyConsistencyCheck)),
+          scanOpenCallback(std::move(scanOpen)) {}
+
+    LockAcquisitionCallback lockAcquisitionCallback;
+    IndexKeyCorruptionCheckCallback indexKeyCorruptionCheckCallback;
+    IndexKeyConsistencyCheckCallback indexKeyConsistencyCheckCallBack;
+    ScanOpenCallback scanOpenCallback;
+};
+
 class ScanStage final : public PlanStage {
 public:
     ScanStage(CollectionUUID collectionUuid,
               boost::optional<value::SlotId> recordSlot,
               boost::optional<value::SlotId> recordIdSlot,
+              boost::optional<value::SlotId> snapshotIdSlot,
+              boost::optional<value::SlotId> indexIdSlot,
+              boost::optional<value::SlotId> indexKeySlot,
+              boost::optional<value::SlotId> indexKeyPatternSlot,
+              boost::optional<value::SlotId> oplogTsSlot,
               std::vector<std::string> fields,
               value::SlotVector vars,
               boost::optional<value::SlotId> seekKeySlot,
               bool forward,
               PlanYieldPolicy* yieldPolicy,
               PlanNodeId nodeId,
-              LockAcquisitionCallback lockAcquisitionCallback,
-              ScanOpenCallback openCallback = {});
+              ScanCallbacks scanCallbacks);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -76,22 +97,34 @@ private:
     const CollectionUUID _collUuid;
     const boost::optional<value::SlotId> _recordSlot;
     const boost::optional<value::SlotId> _recordIdSlot;
+    const boost::optional<value::SlotId> _snapshotIdSlot;
+    const boost::optional<value::SlotId> _indexIdSlot;
+    const boost::optional<value::SlotId> _indexKeySlot;
+    const boost::optional<value::SlotId> _indexKeyPatternSlot;
+    const boost::optional<value::SlotId> _oplogTsSlot;
+
     const std::vector<std::string> _fields;
     const value::SlotVector _vars;
+
     const boost::optional<value::SlotId> _seekKeySlot;
     const bool _forward;
 
     NamespaceString _collName;
+    uint64_t _catalogEpoch;
 
     // If provided, used during a trial run to accumulate certain execution stats. Once the trial
     // run is complete, this pointer is reset to nullptr.
     TrialRunTracker* _tracker{nullptr};
 
-    LockAcquisitionCallback _lockAcquisitionCallback;
-    ScanOpenCallback _openCallback;
+    const ScanCallbacks _scanCallbacks;
 
-    std::unique_ptr<value::ViewOfValueAccessor> _recordAccessor;
-    std::unique_ptr<value::ViewOfValueAccessor> _recordIdAccessor;
+    std::unique_ptr<value::OwnedValueAccessor> _recordAccessor;
+    std::unique_ptr<value::OwnedValueAccessor> _recordIdAccessor;
+    value::SlotAccessor* _snapshotIdAccessor{nullptr};
+    value::SlotAccessor* _indexIdAccessor{nullptr};
+    value::SlotAccessor* _indexKeyAccessor{nullptr};
+    value::SlotAccessor* _indexKeyPatternAccessor{nullptr};
+    RuntimeEnvironment::Accessor* _oplogTsAccessor{nullptr};
 
     value::FieldAccessorMap _fieldAccessors;
     value::SlotAccessorMap _varAccessors;
@@ -122,19 +155,29 @@ public:
     ParallelScanStage(CollectionUUID collectionUuid,
                       boost::optional<value::SlotId> recordSlot,
                       boost::optional<value::SlotId> recordIdSlot,
+                      boost::optional<value::SlotId> snapshotIdSlot,
+                      boost::optional<value::SlotId> indexIdSlot,
+                      boost::optional<value::SlotId> indexKeySlot,
+                      boost::optional<value::SlotId> indexKeyPatternSlot,
                       std::vector<std::string> fields,
                       value::SlotVector vars,
                       PlanYieldPolicy* yieldPolicy,
-                      PlanNodeId nodeId);
+                      PlanNodeId nodeId,
+                      ScanCallbacks callbacks);
 
     ParallelScanStage(const std::shared_ptr<ParallelState>& state,
                       CollectionUUID collectionUuid,
                       boost::optional<value::SlotId> recordSlot,
                       boost::optional<value::SlotId> recordIdSlot,
+                      boost::optional<value::SlotId> snapshotIdSlot,
+                      boost::optional<value::SlotId> indexIdSlot,
+                      boost::optional<value::SlotId> indexKeySlot,
+                      boost::optional<value::SlotId> indexKeyPatternSlot,
                       std::vector<std::string> fields,
                       value::SlotVector vars,
                       PlanYieldPolicy* yieldPolicy,
-                      PlanNodeId nodeId);
+                      PlanNodeId nodeId,
+                      ScanCallbacks callbacks);
 
     std::unique_ptr<PlanStage> clone() const final;
 
@@ -166,15 +209,26 @@ private:
     const CollectionUUID _collUuid;
     const boost::optional<value::SlotId> _recordSlot;
     const boost::optional<value::SlotId> _recordIdSlot;
+    const boost::optional<value::SlotId> _snapshotIdSlot;
+    const boost::optional<value::SlotId> _indexIdSlot;
+    const boost::optional<value::SlotId> _indexKeySlot;
+    const boost::optional<value::SlotId> _indexKeyPatternSlot;
     const std::vector<std::string> _fields;
     const value::SlotVector _vars;
 
     NamespaceString _collName;
+    uint64_t _catalogEpoch;
 
     std::shared_ptr<ParallelState> _state;
 
-    std::unique_ptr<value::ViewOfValueAccessor> _recordAccessor;
-    std::unique_ptr<value::ViewOfValueAccessor> _recordIdAccessor;
+    const ScanCallbacks _scanCallbacks;
+
+    std::unique_ptr<value::OwnedValueAccessor> _recordAccessor;
+    std::unique_ptr<value::OwnedValueAccessor> _recordIdAccessor;
+    value::SlotAccessor* _snapshotIdAccessor{nullptr};
+    value::SlotAccessor* _indexIdAccessor{nullptr};
+    value::SlotAccessor* _indexKeyAccessor{nullptr};
+    value::SlotAccessor* _indexKeyPatternAccessor{nullptr};
 
     value::FieldAccessorMap _fieldAccessors;
     value::SlotAccessorMap _varAccessors;

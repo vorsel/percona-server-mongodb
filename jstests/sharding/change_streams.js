@@ -1,5 +1,8 @@
 // Tests the behavior of change streams on sharded collections.
-// @tags: [uses_change_streams, requires_majority_read_concern]
+// @tags: [
+//   requires_majority_read_concern,
+//   uses_change_streams,
+// ]
 (function() {
 "use strict";
 
@@ -187,6 +190,7 @@ function runTest(collName, shardKey) {
     assert.eq(changeStream.next().operationType, "drop");
     assert.soon(() => changeStream.hasNext());
     assert.eq(changeStream.next().operationType, "invalidate");
+    assert(!changeStream.hasNext());
     assert(changeStream.isExhausted());
 
     jsTestLog('Testing aggregate command closes cursor for invalidate entries with shard key' +

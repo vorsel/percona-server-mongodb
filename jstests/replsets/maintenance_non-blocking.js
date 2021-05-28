@@ -11,6 +11,10 @@ doTest = function() {
     var sDB = s.getDB("test");
     var sColl = sDB.maint;
 
+    // The default WC is majority and fsyncLock will prevent satisfying any majority writes.
+    assert.commandWorked(replTest.getPrimary().adminCommand(
+        {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
     var status = assert.commandWorked(sDB.adminCommand("replSetGetStatus"));
     printjson(status);
 
@@ -32,6 +36,7 @@ doTest = function() {
 
     print("******* writing to primary ************* ");
     assert.commandWorked(mColl.save({_id: -1}));
+    printjson(sDB.currentOp());
     assert.neq(null, mColl.findOne());
 
     var hello = assert.commandWorked(sColl.runCommand("hello"));

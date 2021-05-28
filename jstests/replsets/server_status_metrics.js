@@ -89,6 +89,10 @@ var secondary = rt.getSecondary();
 var primary = rt.getPrimary();
 var testDB = primary.getDB("test");
 
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 // Record the base oplogGetMoresProcessed on primary and the base oplog getmores on secondary.
 const primaryBaseOplogGetMoresProcessedNum =
     primary.getDB("test").serverStatus().metrics.repl.network.oplogGetMoresProcessed.num;
@@ -194,9 +198,9 @@ var res = testDB.a.insert({x: 1});
 assert.commandFailedWithCode(res, ErrorCodes.UnsatisfiableWriteConcern);
 assert.eq(res.getWriteConcernError().errInfo.writeConcern.provenance, "customDefault");
 
-// Unset the default WC.
-assert.commandWorked(
-    testDB.adminCommand({setDefaultRWConcern: 1, defaultWriteConcern: {}, writeConcern: {w: 1}}));
+// Set the default WC back to {w: 1, wtimeout: 0}.
+assert.commandWorked(testDB.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1, wtimeout: 0}, writeConcern: {w: 1}}));
 
 // Validate counters.
 var endGLEMetrics = testDB.serverStatus().metrics.getLastError;

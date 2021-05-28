@@ -109,7 +109,7 @@ public:
 
     Seconds getSecondaryDelaySecs() const override;
 
-    void clearSyncSourceBlacklist() override;
+    void clearSyncSourceDenylist() override;
 
     repl::ReplicationCoordinator::StatusAndDuration awaitReplication(
         OperationContext*, const repl::OpTime&, const WriteConcernOptions&) override;
@@ -207,6 +207,8 @@ public:
                              GetNewConfigFn getNewConfig,
                              bool force) override;
 
+    Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn getNewConfig) override;
+
     Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment) override;
 
     Status processReplSetInitiate(OperationContext*, const BSONObj&, BSONObjBuilder*) override;
@@ -219,7 +221,7 @@ public:
 
     HostAndPort chooseNewSyncSource(const repl::OpTime&) override;
 
-    void blacklistSyncSource(const HostAndPort&, Date_t) override;
+    void denylistSyncSource(const HostAndPort&, Date_t) override;
 
     void resetLastOpTimesFromOplog(OperationContext*) override;
 

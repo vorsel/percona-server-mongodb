@@ -35,12 +35,14 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/s/shard_collection_legacy.h"
+#include "mongo/db/s/sharding_ddl_50_upgrade_downgrade.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/shard_collection_gen.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
+// TODO (SERVER-54879): Remove this command entirely after 5.0 branches
 namespace mongo {
 namespace {
 
@@ -90,7 +92,10 @@ public:
 
         const NamespaceString nss(parseNs(dbname, cmdObj));
 
-        auto createCollectionResponse = shardCollectionLegacy(opCtx, nss, cmdObj, true);
+        FixedFCVRegion fcvRegion(opCtx);
+
+        auto createCollectionResponse =
+            shardCollectionLegacy(opCtx, nss, cmdObj, true /* requestIsFromCSRS */, fcvRegion);
 
         createCollectionResponse.serialize(&result);
         result.append("collectionsharded", nss.toString());

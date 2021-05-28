@@ -76,9 +76,11 @@ using std::vector;
 const OperationContext::Decoration<repl::OpTime> clientsLastKnownCommittedOpTime =
     OperationContext::declareDecoration<repl::OpTime>();
 
-namespace {
-
+// This failpoint is also accessed by the SBE executor so we define it outside of an anonymous
+// namespace.
 MONGO_FAIL_POINT_DEFINE(planExecutorHangBeforeShouldWaitForInserts);
+
+namespace {
 
 /**
  * Constructs a PlanYieldPolicy based on 'policy'.
@@ -145,7 +147,8 @@ PlanExecutorImpl::PlanExecutorImpl(OperationContext* opCtx,
             _nss = collection->ns();
         } else {
             invariant(_cq);
-            _nss = _cq->getFindCommand().getNamespaceOrUUID().nss().value_or(NamespaceString());
+            _nss =
+                _cq->getFindCommandRequest().getNamespaceOrUUID().nss().value_or(NamespaceString());
         }
     }
 

@@ -33,6 +33,7 @@
 
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/s/sharding_ddl_util.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/s/sharding_util.h"
 #include "mongo/logv2/log.h"
@@ -107,40 +108,28 @@ void DropCollectionCoordinator::_enterPhase(Phase newPhase) {
     _updateStateDocument(std::move(newDoc));
 }
 
-void DropCollectionCoordinator::_removeStateDocument() {
-    auto opCtx = cc().makeOperationContext();
-    PersistentTaskStore<StateDoc> store(NamespaceString::kShardingDDLCoordinatorsNamespace);
-    LOGV2_DEBUG(5390502,
-                2,
-                "Removing state document for drop collection coordinator",
-                "namespace"_attr = nss());
-    store.remove(opCtx.get(),
-                 BSON(StateDoc::kIdFieldName << _doc.getId().toBSON()),
-                 WriteConcerns::kMajorityWriteConcern);
-
-    _doc = {};
-}
-
 ExecutorFuture<void> DropCollectionCoordinator::_runImpl(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
-    const CancelationToken& token) noexcept {
+    const CancellationToken& token) noexcept {
     return ExecutorFuture<void>(**executor)
-        .then(_executePhase(Phase::kFreezeCollection,
-                            [this, anchor = shared_from_this()] {
-                                auto opCtxHolder = cc().makeOperationContext();
-                                auto* opCtx = opCtxHolder.get();
-                                getForwardableOpMetadata().setOn(opCtx);
+        .then(_executePhase(
+            Phase::kFreezeCollection,
+            [this, anchor = shared_from_this()] {
+                auto opCtxHolder = cc().makeOperationContext();
+                auto* opCtx = opCtxHolder.get();
+                getForwardableOpMetadata().setOn(opCtx);
 
-                                try {
-                                    sharding_ddl_util::stopMigrations(opCtx, nss());
-                                    auto coll = Grid::get(opCtx)->catalogClient()->getCollection(
-                                        opCtx, nss());
-                                    _doc.setCollInfo(std::move(coll));
-                                } catch (ExceptionFor<ErrorCodes::NamespaceNotSharded>&) {
-                                    // The collection is not sharded or doesn't exist.
-                                    _doc.setCollInfo(boost::none);
-                                }
-                            }))
+                ShardingLogging::get(opCtx)->logChange(opCtx, "dropCollection.start", nss().ns());
+
+                try {
+                    sharding_ddl_util::stopMigrations(opCtx, nss());
+                    auto coll = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss());
+                    _doc.setCollInfo(std::move(coll));
+                } catch (ExceptionFor<ErrorCodes::NamespaceNotSharded>&) {
+                    // The collection is not sharded or doesn't exist.
+                    _doc.setCollInfo(boost::none);
+                }
+            }))
         .then(_executePhase(
             Phase::kDropCollection,
             [this, executor = executor, anchor = shared_from_this()] {
@@ -175,8 +164,6 @@ ExecutorFuture<void> DropCollectionCoordinator::_runImpl(
                     {primaryShardId},
                     **executor);
 
-                // TODO SERVER-55149 stop broadcasting to all shards for unsharded collections
-
                 // We need to send the drop to all the shards because both movePrimary and
                 // moveChunk leave garbage behind for sharded collections.
                 auto participants = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
@@ -191,37 +178,20 @@ ExecutorFuture<void> DropCollectionCoordinator::_runImpl(
                         dropCollectionParticipant.toBSON({})),
                     participants,
                     **executor);
-            }))
-        .onCompletion([this, anchor = shared_from_this()](const Status& status) {
-            if (!status.isOK() &&
-                (status.isA<ErrorCategory::NotPrimaryError>() ||
-                 status.isA<ErrorCategory::ShutdownError>())) {
-                LOGV2_DEBUG(5390506,
-                            1,
-                            "Drop collection coordinator has been interrupted and "
-                            " will continue on the next elected replicaset primary",
-                            "namespace"_attr = nss(),
-                            "error"_attr = status);
-                return;
-            }
 
-            if (status.isOK()) {
-                LOGV2_DEBUG(5390503, 1, "Collection dropped", "namespace"_attr = nss());
-            } else {
+                ShardingLogging::get(opCtx)->logChange(opCtx, "dropCollection", nss().ns());
+                LOGV2(5390503, "Collection dropped", "namespace"_attr = nss());
+            }))
+        .onError([this, anchor = shared_from_this()](const Status& status) {
+            if (!status.isA<ErrorCategory::NotPrimaryError>() &&
+                !status.isA<ErrorCategory::ShutdownError>()) {
+                // TODO SERVER-55396: retry operation until it succeeds.
                 LOGV2_ERROR(5280901,
                             "Error running drop collection",
                             "namespace"_attr = nss(),
                             "error"_attr = redact(status));
             }
-
-            try {
-                _removeStateDocument();
-            } catch (DBException& ex) {
-                ex.addContext("Failed to remove drop collection coordinator state document"_sd);
-                throw;
-            }
-
-            uassertStatusOK(status);
+            return status;
         });
 }
 

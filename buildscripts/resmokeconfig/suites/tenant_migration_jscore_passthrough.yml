@@ -1,3 +1,12 @@
+config_variables:
+- &keyFile jstests/libs/authTestsKey
+- &keyFileData Thiskeyisonlyforrunningthesuitewithauthenticationdontuseitinanytestsdirectly
+- &authOptions
+  authenticationDatabase: admin
+  authenticationMechanism: SCRAM-SHA-1
+  password: *keyFileData
+  username: __system
+
 test_kind: js_test
 
 selector:
@@ -5,6 +14,10 @@ selector:
   - jstests/core/**/*.js
   exclude_files:
   - jstests/core/txns/**/*.js
+  # Skip any tests that run with auth explicitly.
+  - jstests/core/*[aA]uth*.js
+  # Commands using UUIDs are not compatible with name-based auth.
+  - jstests/core/commands_with_uuid.js
   # These tests depend on hardcoded database name equality.
   - jstests/core/json_schema/misc_validation.js
   - jstests/core/list_databases.js
@@ -48,8 +61,32 @@ selector:
   # These tests use legacy read mode which does not use runCommand.
   - jstests/core/comment_field.js
   - jstests/core/invalidated_legacy_cursors.js
-  # TODO (SERVER-52727): Synchronize cloneCollectionAsCapped with tenant migrations.
-  - jstests/core/capped_convertToCapped1.js
+  # These tests run applyOps which is not supported in serverless.
+  - jstests/core/apply_ops1.js
+  - jstests/core/apply_ops1.js
+  - jstests/core/apply_ops2.js
+  - jstests/core/apply_ops_dups.js
+  - jstests/core/apply_ops_index_collation.js
+  - jstests/core/apply_ops_invalid_index_spec.js
+  - jstests/core/apply_ops_missing_field.js
+  - jstests/core/apply_ops_system_dot_views.js
+  - jstests/core/apply_ops_without_ns.js
+  - jstests/core/bypass_doc_validation.js
+  - jstests/core/collation.js
+  - jstests/core/collmod_without_uuid.js
+  - jstests/core/txns/commands_banning_txnnumber_outside_transactions.js
+  - jstests/core/txns/commands_not_allowed_in_txn.js
+  - jstests/core/txns/prepare_transaction_fails_on_temp_collections.js
+  - jstests/core/txns/statement_ids_accepted.js
+  - jstests/core/list_collections1.js
+  - jstests/core/list_collections_filter.js
+  - jstests/core/list_collections_no_views.js
+  - jstests/core/views/duplicate_ns.js
+  - jstests/core/views/view_with_invalid_dbname.js
+  - jstests/core/views/views_creation.js
+  - jstests/core/views/invalid_system_views.js
+  - jstests/core/views/views_all_commands.js
+  - jstests/core/rename_collection_staytemp.js
   # TODO (SERVER-52866): Synchronize getLastError with tenant migrations.
   - jstests/core/bulk_legacy_enforce_gle.js
   # This test contains assertions for the hostname that operations run on.
@@ -59,34 +96,6 @@ selector:
   # require a collection scan and return an error.
   - jstests/core/notablescan.js
   - jstests/core/notablescan_capped.js
-  # captrunc command is not blocked during tenant migration.
-  - jstests/core/capped6.js
-  # Multi-updates that conflict with tenant migration are not retried by inject_tenant_prefix.js.
-  - jstests/core/batch_write_collation_estsize.js
-  - jstests/core/bulk_api_ordered.js
-  - jstests/core/bulk_api_unordered.js
-  - jstests/core/fts_querylang.js
-  - jstests/core/idhack.js
-  - jstests/core/index_arr2.js
-  - jstests/core/role_management_helpers.js
-  - jstests/core/roles_info.js
-  - jstests/core/server1470.js
-  - jstests/core/update_arrayFilters.js
-  - jstests/core/update_arraymatch2.js
-  - jstests/core/update_arraymatch3.js
-  - jstests/core/update_arraymatch5.js
-  - jstests/core/update_hint.js
-  - jstests/core/update_multi3.js
-  - jstests/core/update_multi4.js
-  - jstests/core/update_multi5.js
-  - jstests/core/update_pipeline_shell_helpers.js
-  - jstests/core/update_with_pipeline.js
-  - jstests/core/update7.js
-  - jstests/core/updatei.js
-  - jstests/core/updatej.js
-  - jstests/core/updatel.js
-  - jstests/core/where_system_js.js
-  - jstests/core/write_result.js
 
   exclude_with_any_tags:
   - assumes_standalone_mongod
@@ -102,10 +111,13 @@ selector:
   - requires_profiling
   # emptycapped command is blocked during tenant migration.
   - requires_emptycapped
+  # Multi-updates that conflict with tenant migration are not retried by inject_tenant_prefix.js.
+  - requires_multi_updates
   - tenant_migration_incompatible
 
 executor:
   archive:
+    tests: true
     hooks:
       - CheckReplDBHash
       - CheckReplOplogs
@@ -115,20 +127,34 @@ executor:
       eval: >-
         testingReplication = true;
         load('jstests/libs/override_methods/inject_tenant_prefix.js');
+        jsTest.authenticate(db.getMongo());
       global_vars:
         TestData: &TestData
           tenantId: "tenantMigrationTenantId"
+          auth: true
+          authMechanism: SCRAM-SHA-1
+          keyFile: *keyFile
+          keyFileData: *keyFileData
+          roleGraphInvalidationIsFatal: true
       readMode: commands
   hooks:
   - class: ContinuousTenantMigration
     shell_options:
       global_vars:
-        TestData: *TestData
+        TestData:
+          <<: *TestData
+          authOptions: *authOptions
   # The CheckReplDBHash hook waits until all operations have replicated to and have been applied
   # on the secondaries, so we run the ValidateCollections hook after it to ensure we're
   # validating the entire contents of the collection.
   - class: CheckReplOplogs
+    shell_options:
+      global_vars:
+        TestData: *TestData
   - class: CheckReplDBHash
+    shell_options:
+      global_vars:
+        TestData: *TestData
   - class: ValidateCollections
   - class: CleanEveryN
     n: 20
@@ -152,6 +178,8 @@ executor:
       tlsMode: allowTLS
       tlsCAFile: jstests/libs/ca.pem
       tlsAllowInvalidHostnames: ''
+      auth: ''
+      keyFile: *keyFile
     per_mongod_options:
       # Each entry is for a different replica set's extra mongod options.
       - tlsCertificateKeyFile: jstests/libs/rs0.pem
@@ -159,3 +187,4 @@ executor:
     num_replica_sets: 2
     num_nodes_per_replica_set: 3
     use_replica_set_connection_string: true
+    auth_options: *authOptions

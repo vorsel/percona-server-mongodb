@@ -375,15 +375,25 @@ public:
     Status applyOplogBatchPerWorker(OperationContext* opCtx,
                                     std::vector<const OplogEntry*>* ops,
                                     WorkerMultikeyPathInfo* workerMultikeyPathInfo) override;
-    std::vector<OplogEntry> operationsApplied;
+
+    std::vector<OplogEntry> getOperationsApplied() {
+        stdx::lock_guard lk(_mutex);
+        return _operationsApplied;
+    }
+
+private:
+    std::vector<OplogEntry> _operationsApplied;
+    // Synchronize reads and writes to 'operationsApplied'.
+    Mutex _mutex = MONGO_MAKE_LATCH("TrackOpsAppliedApplier::_mutex");
 };
 
 Status TrackOpsAppliedApplier::applyOplogBatchPerWorker(
     OperationContext* opCtx,
     std::vector<const OplogEntry*>* ops,
     WorkerMultikeyPathInfo* workerMultikeyPathInfo) {
+    stdx::lock_guard lk(_mutex);
     for (auto&& opPtr : *ops) {
-        operationsApplied.push_back(*opPtr);
+        _operationsApplied.push_back(*opPtr);
     }
     return Status::OK();
 }
@@ -428,8 +438,9 @@ bool _testOplogEntryIsForCappedCollection(OperationContext* opCtx,
     auto lastOpTime = unittest::assertGet(oplogApplier.applyOplogBatch(opCtx, {op}));
     ASSERT_EQUALS(op.getOpTime(), lastOpTime);
 
-    ASSERT_EQUALS(1U, oplogApplier.operationsApplied.size());
-    const auto& opApplied = oplogApplier.operationsApplied.front();
+    const auto opsApplied = oplogApplier.getOperationsApplied();
+    ASSERT_EQUALS(1U, opsApplied.size());
+    const auto& opApplied = opsApplied.front();
     ASSERT_EQUALS(op.getEntry(), opApplied.getEntry());
     // "isForCappedCollection" is not parsed from raw oplog entry document.
     return opApplied.isForCappedCollection();
@@ -471,6 +482,57 @@ TEST_F(OplogApplierImplTest,
     ASSERT_OK(oplogApplier.applyOplogBatchPerWorker(_opCtx.get(), &ops, &pathInfo));
     // Collection should be created after applyOplogEntryOrGroupedInserts() processes operation.
     ASSERT_TRUE(AutoGetCollectionForReadCommand(_opCtx.get(), nss).getCollection());
+}
+
+TEST_F(OplogApplierImplTest,
+       TxnTableUpdatesDoNotGetCoalescedForRetryableWritesAcrossDifferentTxnNumbers) {
+    const auto sessionId = makeLogicalSessionIdForTest();
+    OperationSessionInfo sessionInfo;
+    sessionInfo.setSessionId(sessionId);
+    sessionInfo.setTxnNumber(3);
+    const NamespaceString& nss{"test", "foo"};
+    repl::OpTime firstInsertOpTime(Timestamp(1, 0), 1);
+    auto firstRetryableOp = makeInsertDocumentOplogEntryWithSessionInfo(
+        firstInsertOpTime, nss, BSON("_id" << 1), sessionInfo);
+
+    repl::OpTime secondInsertOpTime(Timestamp(2, 0), 1);
+    sessionInfo.setTxnNumber(4);
+    auto secondRetryableOp = makeInsertDocumentOplogEntryWithSessionInfo(
+        secondInsertOpTime, nss, BSON("_id" << 2), sessionInfo);
+
+    auto writerPool = makeReplWriterPool();
+    NoopOplogApplierObserver observer;
+    OplogApplierImpl oplogApplier(
+        nullptr,  // executor
+        nullptr,  // oplogBuffer
+        &observer,
+        ReplicationCoordinator::get(_opCtx.get()),
+        getConsistencyMarkers(),
+        getStorageInterface(),
+        repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
+        writerPool.get());
+
+    std::vector<std::vector<const OplogEntry*>> writerVectors(
+        writerPool->getStats().options.maxThreads);
+    std::vector<std::vector<OplogEntry>> derivedOps;
+    std::vector<OplogEntry> ops{firstRetryableOp, secondRetryableOp};
+    oplogApplier.fillWriterVectors_forTest(_opCtx.get(), &ops, &writerVectors, &derivedOps);
+    // We expect a total of two derived ops - one for each distinct 'txnNumber'.
+    ASSERT_EQUALS(2, derivedOps.size());
+    ASSERT_EQUALS(1, derivedOps[0].size());
+    ASSERT_EQUALS(1, derivedOps[1].size());
+    const auto firstDerivedOp = derivedOps[0][0];
+    ASSERT_EQUALS(firstInsertOpTime.getTimestamp(),
+                  firstDerivedOp.getObject()["lastWriteOpTime"]["ts"].timestamp());
+    ASSERT_EQUALS(NamespaceString::kSessionTransactionsTableNamespace, firstDerivedOp.getNss());
+    ASSERT_EQUALS(*firstRetryableOp.getTxnNumber(),
+                  firstDerivedOp.getObject()["txnNum"].numberInt());
+    const auto secondDerivedOp = derivedOps[1][0];
+    ASSERT_EQUALS(*secondRetryableOp.getTxnNumber(),
+                  secondDerivedOp.getObject()["txnNum"].numberInt());
+    ASSERT_EQUALS(NamespaceString::kSessionTransactionsTableNamespace, secondDerivedOp.getNss());
+    ASSERT_EQUALS(secondInsertOpTime.getTimestamp(),
+                  secondDerivedOp.getObject()["lastWriteOpTime"]["ts"].timestamp());
 }
 
 class MultiOplogEntryOplogApplierImplTest : public OplogApplierImplTest {
@@ -2346,7 +2408,7 @@ TEST_F(OplogApplierImplTest, LogSlowOpApplicationWhenSuccessful) {
     ASSERT_EQUALS(
         1,
         countBSONFormatLogLinesIsSubset(BSON(
-            "attr" << BSON("CRUD" << BSON("ts" << Timestamp(1, 1) << "t" << 1 << "v" << 2 << "op"
+            "attr" << BSON("CRUD" << BSON("ts" << Timestamp(1, 1) << "t" << 1LL << "v" << 2 << "op"
                                                << "i"
                                                << "ns"
                                                << "test.t"
@@ -2401,6 +2463,41 @@ TEST_F(OplogApplierImplTest, DoNotLogNonSlowOpApplicationWhenSuccessful) {
              << applyDuration << "ms";
     ASSERT_EQUALS(0, countTextFormatLogLinesContaining(expected.str()));
 }
+
+TEST_F(OplogApplierImplTest, SerializeOplogApplicationOfWritesToTenantMigrationNamespaces) {
+    auto writerPool = makeReplWriterPool();
+    NoopOplogApplierObserver observer;
+    TrackOpsAppliedApplier oplogApplier(
+        nullptr,  // executor
+        nullptr,  // oplogBuffer
+        &observer,
+        ReplicationCoordinator::get(_opCtx.get()),
+        getConsistencyMarkers(),
+        getStorageInterface(),
+        repl::OplogApplier::Options(repl::OplogApplication::Mode::kSecondary),
+        writerPool.get());
+
+    const auto donorNss = NamespaceString::kTenantMigrationDonorsNamespace;
+    const auto recipientNss = NamespaceString::kTenantMigrationRecipientsNamespace;
+
+    std::vector<OplogEntry> opsToApply;
+    opsToApply.push_back(makeOplogEntry(OpTypeEnum::kDelete, donorNss, {}, BSON("_id" << 2)));
+    opsToApply.push_back(makeInsertDocumentOplogEntry(
+        {Timestamp(Seconds(3), 0), 1LL}, recipientNss, BSON("_id" << 3)));
+    opsToApply.push_back(makeOplogEntry(OpTypeEnum::kDelete, recipientNss, {}, BSON("_id" << 3)));
+    opsToApply.push_back(
+        makeInsertDocumentOplogEntry({Timestamp(Seconds(4), 0), 1LL}, donorNss, BSON("_id" << 4)));
+
+    ASSERT_OK(oplogApplier.applyOplogBatch(_opCtx.get(), opsToApply));
+    const auto applied = oplogApplier.getOperationsApplied();
+    ASSERT_EQ(4U, applied.size());
+    ASSERT_BSONOBJ_EQ(opsToApply[0].getEntry().toBSON(), applied[0].getEntry().toBSON());
+    ASSERT_BSONOBJ_EQ(opsToApply[1].getEntry().toBSON(), applied[1].getEntry().toBSON());
+    ASSERT_BSONOBJ_EQ(opsToApply[2].getEntry().toBSON(), applied[2].getEntry().toBSON());
+    ASSERT_BSONOBJ_EQ(opsToApply[3].getEntry().toBSON(), applied[3].getEntry().toBSON());
+}
+
+
 class OplogApplierImplTxnTableTest : public OplogApplierImplTest {
 public:
     void setUp() override {

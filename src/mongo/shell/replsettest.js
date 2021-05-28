@@ -74,6 +74,7 @@
 
 var ReplSetTest = function(opts) {
     'use strict';
+    load("jstests/multiVersion/libs/verify_versions.js");
 
     if (!(this instanceof ReplSetTest)) {
         return new ReplSetTest(opts);
@@ -990,8 +991,8 @@ var ReplSetTest = function(opts) {
                         // Node sees two primaries.
                         if (nodesPrimary !== -1) {
                             print("AwaitNodesAgreeOnPrimary: Retrying because " + nodes[i].name +
-                                  " thinks both " + nodes[nodesPrimary].name + " and " +
-                                  nodes[j].name + " are primary.");
+                                  " thinks both " + self.nodes[nodesPrimary].name + " and " +
+                                  self.nodes[j].name + " are primary.");
 
                             return false;
                         }
@@ -1013,13 +1014,13 @@ var ReplSetTest = function(opts) {
                     primary = nodesPrimary;
                 } else if (primary !== nodesPrimary) {
                     print("AwaitNodesAgreeOnPrimary: Retrying because " + nodes[i].name +
-                          " thinks the primary is " + nodes[nodesPrimary].name + " instead of " +
-                          nodes[primary].name);
+                          " thinks the primary is " + self.nodes[nodesPrimary].name +
+                          " instead of " + self.nodes[primary].name);
                     return false;
                 }
             }
 
-            print("AwaitNodesAgreeOnPrimary: Nodes agreed on primary " + nodes[primary].name);
+            print("AwaitNodesAgreeOnPrimary: Nodes agreed on primary " + self.nodes[primary].name);
             return true;
         }, "Awaiting nodes to agree on primary timed out", timeout);
     };
@@ -1573,6 +1574,33 @@ var ReplSetTest = function(opts) {
                 self.awaitReplication();
             });
         }
+
+        // We need to disable the enableDefaultWriteConcernUpdatesForInitiate parameter
+        // to disallow updating the default write concern after initiating is complete.
+        asCluster(self.nodes, () => {
+            for (let node of self.nodes) {
+                // asCluster() currently does not validate connections with X509 authentication.
+                // If the test is using X509, we skip disabling the server parameter as the
+                // 'setParameter' command will fail.
+                const nodeId = "n" + self.getNodeId(node);
+                const nodeOptions = self.nodeOptions[nodeId] || {};
+                const options =
+                    (nodeOptions === {} || !self.startOptions) ? nodeOptions : self.startOptions;
+                const authMode = options.clusterAuthMode;
+                const notX509 =
+                    authMode != "sendX509" && authMode != "x509" && authMode != "sendKeyFile";
+                const currVersion = node.getBinVersion();
+                const binVersionLatest =
+                    MongoRunner.areBinVersionsTheSame(MongoRunner.getBinVersionFor(currVersion),
+                                                      MongoRunner.getBinVersionFor("latest"));
+                if (binVersionLatest && notX509) {
+                    assert.commandWorked(node.adminCommand({
+                        setParameter: 1,
+                        enableDefaultWriteConcernUpdatesForInitiate: false,
+                    }));
+                }
+            }
+        });
 
         const awaitTsStart = new Date();  // Measure duration of awaitLastStableRecoveryTimestamp.
         if (!doNotWaitForStableRecoveryTimestamp) {
@@ -2303,10 +2331,10 @@ var ReplSetTest = function(opts) {
         var collectionPrinted = new Set();
 
         function checkDBHashesForReplSet(
-            rst, dbBlacklist = [], secondaries, msgPrefix, ignoreUUIDs) {
+            rst, dbDenylist = [], secondaries, msgPrefix, ignoreUUIDs) {
             // We don't expect the local database to match because some of its
             // collections are not replicated.
-            dbBlacklist.push('local');
+            dbDenylist.push('local');
             secondaries = secondaries || rst._secondaries;
 
             let success = true;
@@ -2336,7 +2364,7 @@ var ReplSetTest = function(opts) {
             });
 
             for (const dbName of combinedDBs) {
-                if (Array.contains(dbBlacklist, dbName)) {
+                if (Array.contains(dbDenylist, dbName)) {
                     continue;
                 }
 
@@ -2793,6 +2821,12 @@ var ReplSetTest = function(opts) {
         // Reduce this to 100ms for faster shutdown.
         options.setParameter.shutdownTimeoutMillisForSignaledShutdown =
             options.setParameter.shutdownTimeoutMillisForSignaledShutdown || 100;
+
+        // This parameter is enabled to allow the default write concern to change while
+        // initiating a ReplSetTest. This is due to our testing optimization to initiate
+        // with a single node, and reconfig the full membership set in.
+        // We need to recalculate the DWC after each reconfig until the full set is included.
+        options.setParameter.enableDefaultWriteConcernUpdatesForInitiate = true;
 
         if (tojson(options) != tojson({}))
             printjson(options);

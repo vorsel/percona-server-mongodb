@@ -50,6 +50,7 @@
 #include "mongo/db/keypattern.h"
 #include "mongo/db/query/explain.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/record_id_helpers.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
@@ -256,16 +257,10 @@ void statsToBSON(const PlanStageStats& stats,
         CollectionScanStats* spec = static_cast<CollectionScanStats*>(stats.specific.get());
         bob->append("direction", spec->direction > 0 ? "forward" : "backward");
         if (spec->minRecord) {
-            spec->minRecord->withFormat(
-                [&](RecordId::Null n) { bob->appendNull("minRecord"); },
-                [&](int64_t rid) { bob->append("minRecord", rid); },
-                [&](const char* str, int size) { bob->append("minRecord", OID::from(str)); });
+            record_id_helpers::appendToBSONAs(*spec->minRecord, bob, "minRecord");
         }
         if (spec->maxRecord) {
-            spec->maxRecord->withFormat(
-                [&](RecordId::Null n) { bob->appendNull("maxRecord"); },
-                [&](int64_t rid) { bob->append("maxRecord", rid); },
-                [&](const char* str, int size) { bob->append("maxRecord", OID::from(str)); });
+            record_id_helpers::appendToBSONAs(*spec->maxRecord, bob, "maxRecord");
         }
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("docsExamined", static_cast<long long>(spec->docsTested));
@@ -427,6 +422,15 @@ void statsToBSON(const PlanStageStats& stats,
             bob->appendNumber("nCounted", spec->nCounted);
             bob->appendNumber("nSkipped", spec->nSkipped);
         }
+    } else if (STAGE_SAMPLE_FROM_TIMESERIES_BUCKET == stats.stageType) {
+        SampleFromTimeseriesBucketStats* spec =
+            static_cast<SampleFromTimeseriesBucketStats*>(stats.specific.get());
+
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+            bob->appendNumber("nBucketsDiscarded", static_cast<long long>(spec->nBucketsDiscarded));
+            bob->appendNumber("dupsTested", static_cast<long long>(spec->dupsTested));
+            bob->appendNumber("dupsDropped", static_cast<long long>(spec->dupsDropped));
+        }
     } else if (STAGE_SHARDING_FILTER == stats.stageType) {
         ShardingFilterStats* spec = static_cast<ShardingFilterStats*>(stats.specific.get());
 
@@ -476,6 +480,13 @@ void statsToBSON(const PlanStageStats& stats,
 
         if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
             bob->appendNumber("docsExamined", static_cast<long long>(spec->fetches));
+        }
+    } else if (STAGE_UNPACK_TIMESERIES_BUCKET == stats.stageType) {
+        UnpackTimeseriesBucketStats* spec =
+            static_cast<UnpackTimeseriesBucketStats*>(stats.specific.get());
+
+        if (verbosity >= ExplainOptions::Verbosity::kExecStats) {
+            bob->appendNumber("nBucketsUnpacked", static_cast<long long>(spec->nBucketsUnpacked));
         }
     } else if (STAGE_UPDATE == stats.stageType) {
         UpdateStats* spec = static_cast<UpdateStats*>(stats.specific.get());

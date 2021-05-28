@@ -404,20 +404,40 @@ public:
     Status setFeatureCompatibilityVersionOnShards(OperationContext* opCtx, const BSONObj& cmdObj);
 
     /**
-     * Patches-up persistent metadata for 4.9.
+     * Patches-up persistent metadata for 5.0.
      *
-     * It shall be called when upgrading to 4.9 or newer versions.
+     * It shall be called when upgrading to 5.0 or newer versions, when shards are in phase-1 of the
+     * setFCV protocol.
      * TODO SERVER-53283: Remove once 5.0 has been released.
      */
-    void upgradeMetadataFor49(OperationContext* opCtx);
+    void upgradeMetadataFor50Phase1(OperationContext* opCtx);
 
     /**
-     * Patches-up persistent metadata for downgrade from 4.9.
+     * Patches-up persistent metadata for 5.0.
      *
-     * It shall be called when downgrading from 4.9 to an earlier version.
+     * It shall be called when upgrading to 5.0 or newer versions, when shards are in phase-2 of the
+     * setFCV protocol.
      * TODO SERVER-53283: Remove once 5.0 has been released.
      */
-    void downgradeMetadataToPre49(OperationContext* opCtx);
+    void upgradeMetadataFor50Phase2(OperationContext* opCtx);
+
+    /**
+     * Patches-up persistent metadata for downgrade from 5.0.
+     *
+     * It shall be called when downgrading from 5.0 to an earlier version, when shards are in
+     * phase-1 of the setFCV protocol.
+     * TODO SERVER-53283: Remove once 5.0 has been released.
+     */
+    void downgradeMetadataToPre50Phase1(OperationContext* opCtx);
+
+    /**
+     * Patches-up persistent metadata for downgrade from 5.0.
+     *
+     * It shall be called when downgrading from 5.0 to an earlier version, when shards are in
+     * phase-2 of the setFCV protocol.
+     * TODO SERVER-53283: Remove once 5.0 has been released.
+     */
+    void downgradeMetadataToPre50Phase2(OperationContext* opCtx);
 
     //
     // For Diagnostics
@@ -538,53 +558,66 @@ private:
     /**
      * Removes all entries from the config server's config.collections where 'dropped' is true.
      *
-     * Before v5.0, when a collection was dropped, its entry in config.collections remained, tagged
+     * Before 5.0, when a collection was dropped, its entry in config.collections remained, tagged
      * as 'dropped: true'. As those are no longer needed, this method cleans up the leftover
      * metadata.
      *
-     * It shall be called when upgrading to 4.9 or newer versions.
+     * It shall be called when upgrading to 5.0 or newer versions.
      *
-     * TODO SERVER-53283: Remove once 5.0 has been released.
+     * TODO SERVER-53283: Remove once 5.0 has becomes last-lts.
      */
-    void _removePre49LegacyMetadata(OperationContext* opCtx);
+    void _removePre50LegacyMetadata(OperationContext* opCtx);
 
     /**
      * Creates a 'version.timestamp' for each one of the entries in the config server's
      * config.databases where it didn't already exist before.
      *
-     * TODO SERVER-53283: Remove once 5.0 has been released.
+     * TODO SERVER-53283: Remove once 5.0 becomes last-lts.
      */
-    void _createDBTimestampsFor49(OperationContext* opCtx);
+    void _upgradeDatabasesEntriesTo50(OperationContext* opCtx);
 
     /**
      * Downgrades the config.databases entries to prior 4.9 version. More specifically, it removes
      * the 'version.timestamp' field from all the documents in config.databases.
      *
-     * TODO SERVER-53283: Remove once 5.0 has been released.
+     * TODO SERVER-53283: Remove once 5.0 becomes last-lts.
      */
-    void _downgradeConfigDatabasesEntriesToPre49(OperationContext* opCtx);
+    void _downgradeDatabasesEntriesToPre50(OperationContext* opCtx);
 
     /**
-     * For each one of the entries in config.collections where there is no 'timestamp',
-     * transactionally:
-     * - Patches-up the entries in config.chunks with a 'ns' matching that of the collection to add
-     * a 'collectionUuid' field matching the uuid of the collection.
+     * For each one of the entries in config.collections where there is no 'timestamp':
+     * - Patches-up the entries in config.chunks to set their 'collectionUUID' and 'timestamp'
+     * fields.
      * - Creates a 'timestamp' in its entry in config.collections.
+     * , and builds the uuid_* indexes and drops the ns_* indexes on config.chunks.
      *
-     * TODO SERVER-53283: Remove once 5.0 has been released.
+     * TODO SERVER-53283: Remove once 5.0 becomes last-lts.
      */
-    void _upgradeCollectionsAndChunksMetadataFor49(OperationContext* opCtx);
+    void _upgradeCollectionsAndChunksEntriesTo50Phase1(OperationContext* opCtx);
 
     /**
-     * For each one of the entries in config.collections where there is a 'timestamp',
-     * transactionally:
-     * - Patches-up the entries in config.chunks with a 'ns' matching that of the collection to
-     * unset the 'collectionUuid' field.
-     * - Unsets the 'timestamp' in its entry in config.collections.
+     * Unsets the 'ns' field from all documents in config.chunks
      *
-     * TODO SERVER-53283: Remove once 5.0 has been released.
+     * TODO SERVER-53283: Remove once 5.0 becomes last-lts.
      */
-    void _downgradeCollectionsAndChunksMetadataToPre49(OperationContext* opCtx);
+    void _upgradeCollectionsAndChunksEntriesTo50Phase2(OperationContext* opCtx);
+
+    /**
+     * For each one of the entries in config.collections where there is a 'timestamp':
+     * - Patches-up the entries in config.chunks to set their 'ns' field.
+     * - Unsets the 'timestamp' field from its entry in config.collections.
+     * , and builds the ns_* indexes and drops the uuid_* indexes on config.chunks.
+     *
+     * TODO SERVER-53283: Remove once 5.0 becomes last-lts.
+     */
+    void _downgradeCollectionsAndChunksEntriesToPre50Phase1(OperationContext* opCtx);
+
+    /**
+     * Unsets the 'collectionUUID' and 'timestamp' fields from all documents in config.chunks
+     *
+     * TODO SERVER-53283: Remove once 5.0 becomes last-lts.
+     */
+    void _downgradeCollectionsAndChunksEntriesToPre50Phase2(OperationContext* opCtx);
 
     // The owning service context
     ServiceContext* const _serviceContext;
@@ -638,6 +671,16 @@ private:
      * taking this.
      */
     Lock::ResourceMutex _kZoneOpLock;
+
+    /**
+     * Lock for local database operations. This should be acquired when executing
+     * 'commitMovePrimary' and 'setFeatureCompatibilityVersion' commands which affect the
+     * config.databases collection. No other locks should be held when locking this. If an operation
+     * needs to take database locks (for example to write to a local collection) those locks should
+     * be taken after taking this.
+     * TODO (SERVER-53283): Remove once version 5.0 has been released.
+     */
+    Lock::ResourceMutex _kDatabaseOpLock;
 };
 
 }  // namespace mongo

@@ -40,6 +40,7 @@
 #include "mongo/db/exec/sbe/stages/traverse.h"
 #include "mongo/db/exec/sbe/stages/union.h"
 #include "mongo/db/exec/sbe/stages/unwind.h"
+#include "mongo/db/exec/sbe/values/bson.h"
 #include "mongo/db/matcher/matcher_type_set.h"
 #include <iterator>
 #include <numeric>
@@ -203,16 +204,25 @@ std::unique_ptr<sbe::EExpression> makeFillEmptyFalse(std::unique_ptr<sbe::EExpre
                                                    sbe::value::bitcastFrom<bool>(false)));
 }
 
-std::unique_ptr<sbe::EExpression> makeVariable(sbe::value::SlotId slotId,
-                                               boost::optional<sbe::FrameId> frameId) {
-    return frameId ? sbe::makeE<sbe::EVariable>(*frameId, slotId)
-                   : sbe::makeE<sbe::EVariable>(slotId);
+std::unique_ptr<sbe::EExpression> makeVariable(sbe::value::SlotId slotId) {
+    return sbe::makeE<sbe::EVariable>(slotId);
+}
+
+std::unique_ptr<sbe::EExpression> makeVariable(sbe::FrameId frameId, sbe::value::SlotId slotId) {
+    return sbe::makeE<sbe::EVariable>(frameId, slotId);
 }
 
 std::unique_ptr<sbe::EExpression> makeFillEmptyNull(std::unique_ptr<sbe::EExpression> e) {
     using namespace std::literals;
     return makeFunction(
         "fillEmpty"_sd, std::move(e), sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0));
+}
+
+std::unique_ptr<sbe::EExpression> makeFillEmptyUndefined(std::unique_ptr<sbe::EExpression> e) {
+    using namespace std::literals;
+    return makeFunction("fillEmpty"_sd,
+                        std::move(e),
+                        sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::bsonUndefined, 0));
 }
 
 std::unique_ptr<sbe::EExpression> makeNothingArrayCheck(
@@ -379,6 +389,29 @@ EvalStage makeTraverse(EvalStage outer,
             std::move(outSlots)};
 }
 
+EvalStage makeLimitSkip(EvalStage input,
+                        PlanNodeId planNodeId,
+                        boost::optional<long long> limit,
+                        boost::optional<long long> skip) {
+    return EvalStage{
+        sbe::makeS<sbe::LimitSkipStage>(std::move(input.stage), limit, skip, planNodeId),
+        std::move(input.outSlots)};
+}
+
+EvalStage makeUnion(std::vector<EvalStage> inputStages,
+                    std::vector<sbe::value::SlotVector> inputVals,
+                    sbe::value::SlotVector outputVals,
+                    PlanNodeId planNodeId) {
+    std::vector<std::unique_ptr<sbe::PlanStage>> branches;
+    branches.reserve(inputStages.size());
+    for (auto& inputStage : inputStages) {
+        branches.emplace_back(std::move(inputStage.stage));
+    }
+    return EvalStage{sbe::makeS<sbe::UnionStage>(
+                         std::move(branches), std::move(inputVals), outputVals, planNodeId),
+                     outputVals};
+}
+
 EvalExprStagePair generateUnion(std::vector<EvalExprStagePair> branches,
                                 BranchFn branchFn,
                                 PlanNodeId planNodeId,
@@ -538,9 +571,26 @@ std::pair<sbe::value::SlotVector, std::unique_ptr<sbe::PlanStage>> generateVirtu
                 std::move(scanStage), std::move(projections), kEmptyPlanNodeId)};
 }
 
+std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONObj& bo) {
+    return sbe::value::copyValue(sbe::value::TypeTags::bsonObject,
+                                 sbe::value::bitcastFrom<const char*>(bo.objdata()));
+}
+
 std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONArray& ba) {
     return sbe::value::copyValue(sbe::value::TypeTags::bsonArray,
                                  sbe::value::bitcastFrom<const char*>(ba.objdata()));
+}
+
+std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const Value& val) {
+    // TODO: Either make this conversion unnecessary by changing the value representation in
+    // ExpressionConstant, or provide a nicer way to convert directly from Document/Value to
+    // sbe::Value.
+    BSONObjBuilder bob;
+    val.addToBsonObj(&bob, ""_sd);
+    auto obj = bob.done();
+    auto be = obj.objdata();
+    auto end = be + obj.objsize();
+    return sbe::bson::convertFrom(false, be + 4, end, 0);
 }
 
 uint32_t dateTypeMask() {

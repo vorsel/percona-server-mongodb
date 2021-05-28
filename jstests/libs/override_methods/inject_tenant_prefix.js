@@ -14,10 +14,10 @@ load("jstests/libs/transactions_util.js");
 let originalRunCommand = Mongo.prototype.runCommand;
 let originalRunCommandWithMetadata = Mongo.prototype.runCommandWithMetadata;
 
-const blacklistedDbNames = ["config", "admin", "local"];
+const denylistedDbNames = ["config", "admin", "local"];
 
-function isBlacklistedDb(dbName) {
-    return blacklistedDbNames.includes(dbName);
+function isDenylistedDb(dbName) {
+    return denylistedDbNames.includes(dbName);
 }
 
 /**
@@ -31,7 +31,7 @@ function prependTenantIdToDbNameIfApplicable(dbName) {
         return dbName;
     }
     const prefix = TestData.tenantId + "_";
-    return isBlacklistedDb(dbName) || dbName.startsWith(prefix) ? dbName : prefix + dbName;
+    return isDenylistedDb(dbName) || dbName.startsWith(prefix) ? dbName : prefix + dbName;
 }
 
 /**
@@ -237,6 +237,11 @@ function reformatResObjForLogging(resObj) {
  * object so that only failed operations are retried.
  */
 function modifyCmdObjForRetry(cmdObj, resObj) {
+    if (!resObj.hasOwnProperty("writeErrors") && ErrorCodes.isTenantMigrationError(resObj.code)) {
+        // If we get a top level error without writeErrors, retry the entire command.
+        return;
+    }
+
     if (cmdObj.insert) {
         let retryOps = [];
         if (cmdObj.ordered === false) {
@@ -342,15 +347,26 @@ Mongo.prototype.recordRerouteDueToTenantMigration = function() {
     assert.neq(null, this.migrationStateDoc);
     assert.neq(null, this.reroutingMongo);
 
-    assert.commandWorked(originalRunCommand.apply(this, [
-        "testTenantMigration",
-        {
-            insert: "rerouted",
-            documents: [{_id: this.migrationStateDoc._id}],
-            writeConcern: {w: "majority"}
-        },
-        0
-    ]));
+    while (true) {
+        const res = originalRunCommand.apply(this, [
+            "testTenantMigration",
+            {
+                insert: "rerouted",
+                documents: [{_id: this.migrationStateDoc._id}],
+                writeConcern: {w: "majority"}
+            },
+            0
+        ]);
+        if (res.ok) {
+            return;
+        }
+        if (ErrorCodes.isNetworkError(res.code) || ErrorCodes.isNotPrimaryError(res.code)) {
+            jsTest.log("Failed to write to testTenantMigration.rerouted due to a retryable error " +
+                       tojson(res));
+            continue;
+        }
+        assert.commandWorked(res);
+    }
 };
 
 /**
@@ -373,6 +389,8 @@ Mongo.prototype.runCommandRetryOnTenantMigrationErrors = function(
     let nModified = 0;
     let upserted = [];
     let nonRetryableWriteErrors = [];
+    const isRetryableWrite =
+        cmdObjWithTenantId.txnNumber && !cmdObjWithTenantId.hasOwnProperty("autocommit");
 
     // 'indexMap' is a mapping from a write's index in the current cmdObj to its index in the
     // original cmdObj.
@@ -397,8 +415,8 @@ Mongo.prototype.runCommandRetryOnTenantMigrationErrors = function(
         numAttempts++;
         let resObj;
         if (this.reroutingMongo) {
-            resObj = reroutingRunCommandFunc();
             this.recordRerouteDueToTenantMigration();
+            resObj = reroutingRunCommandFunc();
         } else {
             resObj = originalRunCommandFunc();
         }
@@ -414,94 +432,132 @@ Mongo.prototype.runCommandRetryOnTenantMigrationErrors = function(
             return resObj;
         }
 
-        // Add/modify the shells's n, nModified, upserted, and writeErrors.
-        if (resObj.n) {
-            n += resObj.n;
-        }
-        if (resObj.nModified) {
-            nModified += resObj.nModified;
-        }
-        if (resObj.upserted || resObj.writeErrors) {
-            // This is an optimization to make later lookups into 'indexMap' faster, since it
-            // removes any key that is not pertinent in the current cmdObj execution.
-            indexMap = removeSuccessfulOpIndexesExceptForUpserted(
-                resObj, indexMap, cmdObjWithTenantId.ordered);
-
-            if (resObj.upserted) {
-                for (let upsert of resObj.upserted) {
-                    let currentUpsertedIndex = upsert.index;
-
-                    // Set the entry's index to the write's index in the original cmdObj.
-                    upsert.index = indexMap[upsert.index];
-
-                    // Track that this write resulted in an upsert.
-                    upserted.push(upsert);
-
-                    // This write will not need to be retried, so remove it from 'indexMap'.
-                    delete indexMap[currentUpsertedIndex];
-                }
+        // Add/modify the shells's n, nModified, upserted, and writeErrors, unless this command is
+        // part of a retryable write.
+        if (!isRetryableWrite) {
+            if (resObj.n) {
+                n += resObj.n;
             }
-            if (resObj.writeErrors) {
-                for (let writeError of resObj.writeErrors) {
-                    // If we encounter a TenantMigrationCommitted or TenantMigrationAborted error,
-                    // the rest of the batch must have failed with the same code.
-                    if (ErrorCodes.isTenantMigrationError(writeError.code)) {
-                        break;
+            if (resObj.nModified) {
+                nModified += resObj.nModified;
+            }
+            if (resObj.upserted || resObj.writeErrors) {
+                // This is an optimization to make later lookups into 'indexMap' faster, since it
+                // removes any key that is not pertinent in the current cmdObj execution.
+                indexMap = removeSuccessfulOpIndexesExceptForUpserted(
+                    resObj, indexMap, cmdObjWithTenantId.ordered);
+
+                if (resObj.upserted) {
+                    for (let upsert of resObj.upserted) {
+                        let currentUpsertedIndex = upsert.index;
+
+                        // Set the entry's index to the write's index in the original cmdObj.
+                        upsert.index = indexMap[upsert.index];
+
+                        // Track that this write resulted in an upsert.
+                        upserted.push(upsert);
+
+                        // This write will not need to be retried, so remove it from 'indexMap'.
+                        delete indexMap[currentUpsertedIndex];
                     }
+                }
+                if (resObj.writeErrors) {
+                    for (let writeError of resObj.writeErrors) {
+                        // If we encounter a TenantMigrationCommitted or TenantMigrationAborted
+                        // error, the rest of the batch must have failed with the same code.
+                        if (ErrorCodes.isTenantMigrationError(writeError.code)) {
+                            break;
+                        }
 
-                    let currentWriteErrorIndex = writeError.index;
+                        let currentWriteErrorIndex = writeError.index;
 
-                    // Set the entry's index to the write's index in the original cmdObj.
-                    writeError.index = indexMap[writeError.index];
+                        // Set the entry's index to the write's index in the original cmdObj.
+                        writeError.index = indexMap[writeError.index];
 
-                    // Track that this write resulted in a non-retryable error.
-                    nonRetryableWriteErrors.push(writeError);
+                        // Track that this write resulted in a non-retryable error.
+                        nonRetryableWriteErrors.push(writeError);
 
-                    // This write will not need to be retried, so remove it from 'indexMap'.
-                    delete indexMap[currentWriteErrorIndex];
+                        // This write will not need to be retried, so remove it from 'indexMap'.
+                        delete indexMap[currentWriteErrorIndex];
+                    }
                 }
             }
         }
 
         if (migrationCommittedErr || migrationAbortedErr) {
-            // Update the command for reroute/retry.
-            modifyCmdObjForRetry(cmdObjWithTenantId, resObj, true);
-            // It is safe to reformat this resObj since it will not be returned to the caller of
-            // runCommand.
-            reformatResObjForLogging(resObj);
+            // If the command was inside a transaction, skip modifying any objects or fields, since
+            // we will retry the entire transaction outside of this file.
+            if (!TransactionsUtil.isTransientTransactionError(resObj)) {
+                // Update the command for reroute/retry.
+                // In the case of retryable writes, we should always retry the entire batch of
+                // operations instead of modifying the original command object to only include
+                // failed writes.
+                if (!isRetryableWrite) {
+                    modifyCmdObjForRetry(cmdObjWithTenantId, resObj, true);
+                }
 
-            // Build a new indexMap where the keys are the index that each write that needs to be
-            // retried will have in the next attempt's cmdObj.
-            indexMap = resetIndices(indexMap);
+                // It is safe to reformat this resObj since it will not be returned to the caller of
+                // runCommand.
+                reformatResObjForLogging(resObj);
+
+                // Build a new indexMap where the keys are the index that each write that needs to
+                // be retried will have in the next attempt's cmdObj.
+                indexMap = resetIndices(indexMap);
+            }
 
             if (migrationCommittedErr) {
+                jsTestLog(`Got TenantMigrationCommitted for command against database ${
+                    dbNameWithTenantId} after trying ${numAttempts} times: ${tojson(resObj)}`);
                 // Store the connection to the recipient so the next commands can be rerouted.
                 this.migrationStateDoc = this.getTenantMigrationStateDoc();
                 this.reroutingMongo =
                     connect(this.migrationStateDoc.recipientConnectionString).getMongo();
 
-                jsTest.log(`Got TenantMigrationCommitted for command against database ` +
-                           `"${dbNameWithTenantId}" after trying ${numAttempts} times, rerouting ` +
-                           `the command: ${tojson(resObj)}`);
+                // After getting a TenantMigrationCommitted error, wait for the python test fixture
+                // to do a dbhash check on the donor and recipient primaries before we retry the
+                // command on the recipient.
+                assert.soon(() => {
+                    let findRes = assert.commandWorked(originalRunCommand.apply(this, [
+                        "testTenantMigration",
+                        {
+                            find: "dbhashCheck",
+                            filter: {_id: this.migrationStateDoc._id},
+                        },
+                        0
+                    ]));
+
+                    const docs = findRes.cursor.firstBatch;
+                    return docs[0] != null;
+                });
             } else if (migrationAbortedErr) {
-                jsTest.log(
-                    `Got TenantMigrationAborted for command against database ` +
-                    `"${dbNameWithTenantId}" after trying ${numAttempts} times, retrying the ` +
-                    `command: ${tojson(resObj)}`);
+                jsTestLog(`Got TenantMigrationAborted for command against database ${
+                    dbNameWithTenantId} after trying ${numAttempts} times: ${tojson(resObj)}`);
+            }
+
+            // If the result has a TransientTransactionError label, the entire transaction must be
+            // retried. Return immediately to let the retry be handled by
+            // 'network_error_and_txn_override.js'.
+            if (TransactionsUtil.isTransientTransactionError(resObj)) {
+                jsTestLog(`Got error for transaction against database ` +
+                          `${dbNameWithTenantId} with TransientTransactionError, retrying ` +
+                          `transaction against recipient: ${tojson(resObj)}`);
+                return resObj;
             }
         } else {
-            // Modify the resObj before returning the result.
-            if (resObj.n) {
-                resObj.n = n;
-            }
-            if (resObj.nModified) {
-                resObj.nModified = nModified;
-            }
-            if (upserted.length > 0) {
-                resObj.upserted = upserted;
-            }
-            if (nonRetryableWriteErrors.length > 0) {
-                resObj.writeErrors = nonRetryableWriteErrors;
+            if (!isRetryableWrite) {
+                // Modify the resObj before returning the result.
+                if (resObj.n) {
+                    resObj.n = n;
+                }
+                if (resObj.nModified) {
+                    resObj.nModified = nModified;
+                }
+                if (upserted.length > 0) {
+                    resObj.upserted = upserted;
+                }
+                if (nonRetryableWriteErrors.length > 0) {
+                    resObj.writeErrors = nonRetryableWriteErrors;
+                }
             }
             return resObj;
         }

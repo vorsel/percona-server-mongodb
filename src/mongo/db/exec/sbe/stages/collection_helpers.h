@@ -32,6 +32,7 @@
 #include <functional>
 
 #include "mongo/db/db_raii.h"
+#include "mongo/db/exec/sbe/values/slot.h"
 #include "mongo/db/operation_context.h"
 
 namespace mongo::sbe {
@@ -42,28 +43,48 @@ namespace mongo::sbe {
 using LockAcquisitionCallback =
     std::function<void(OperationContext*, const AutoGetCollectionForReadMaybeLockFree&)>;
 
+
+/**
+ * A callback which gets called whenever a SCAN stage asks an underlying index scan for a result.
+ */
+using IndexKeyConsistencyCheckCallback = std::function<bool(OperationContext* opCtx,
+                                                            value::SlotAccessor* snapshotIdAccessor,
+                                                            value::SlotAccessor* indexIdAccessor,
+                                                            value::SlotAccessor* indexKeyAccessor,
+                                                            const Record& nextRecord)>;
+
+using IndexKeyCorruptionCheckCallback =
+    std::function<void(OperationContext* opCtx,
+                       value::SlotAccessor* snapshotIdAccessor,
+                       value::SlotAccessor* indexKeyAccessor,
+                       value::SlotAccessor* indexKeyPatternAccessor,
+                       const RecordId& rid,
+                       const NamespaceString& nss)>;
+
 /**
  * Given a collection UUID, acquires 'coll', invokes the provided 'lockAcquisiionCallback', and
- * returns the collection's name.
+ * returns the collection's name as well as the current catalog epoch.
  *
  * This is intended for use during the preparation of an SBE plan. The caller must hold the
  * appropriate db_raii object in order to ensure that SBE plan preparation sees a consistent view of
  * the catalog.
  */
-NamespaceString acquireCollection(OperationContext* opCtx,
-                                  CollectionUUID collUuid,
-                                  const LockAcquisitionCallback& lockAcquisitionCallback,
-                                  boost::optional<AutoGetCollectionForReadMaybeLockFree>& coll);
+std::pair<NamespaceString, uint64_t> acquireCollection(
+    OperationContext* opCtx,
+    CollectionUUID collUuid,
+    const LockAcquisitionCallback& lockAcquisitionCallback,
+    boost::optional<AutoGetCollectionForReadMaybeLockFree>& coll);
 
 /**
  * Re-acquires 'coll', intended for use during SBE yield recovery or when a closed SBE plan is
  * re-opened. In addition to acquiring 'coll', throws a UserException if the collection has been
- * dropped or renamed. SBE query execution currently cannot survive such events if they occur during
- * a yield or between getMores.
+ * dropped or renamed, or if the catalog has been closed and re-opened. SBE query execution
+ * currently cannot survive such events if they occur during a yield or between getMores.
  */
 void restoreCollection(OperationContext* opCtx,
                        const NamespaceString& collName,
                        CollectionUUID collUuid,
+                       uint64_t catalogEpoch,
                        const LockAcquisitionCallback& lockAcquisitionCallback,
                        boost::optional<AutoGetCollectionForReadMaybeLockFree>& coll);
 }  // namespace mongo::sbe

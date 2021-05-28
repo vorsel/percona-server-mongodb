@@ -8,7 +8,7 @@
  * ephemeralForTest.
  *
  * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
- * incompatible_with_windows_tls]
+ * incompatible_with_windows_tls, incompatible_with_macos, requires_persistence]
  */
 (function() {
 'use strict';
@@ -19,7 +19,14 @@ load("jstests/libs/uuid_util.js");
 load("jstests/replsets/libs/tenant_migration_test.js");
 load("jstests/replsets/libs/tenant_migration_util.js");
 
-const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
+const tenantMigrationTest = new TenantMigrationTest({
+    name: jsTestName(),
+    sharedOptions: {
+        setParameter:
+            // Allow non-timestamped reads on donor after migration completes for testing.
+            {'failpoint.tenantMigrationDonorAllowsNonTimestampedReads': tojson({mode: 'alwaysOn'})}
+    }
+});
 if (!tenantMigrationTest.isFeatureFlagEnabled()) {
     jsTestLog("Skipping test because the tenant migrations feature flag is disabled");
     return;
@@ -58,7 +65,7 @@ function checkTenantMigrationAccessBlocker(node, tenantId, {
     numTenantMigrationCommittedErrors = 0,
     numTenantMigrationAbortedErrors = 0
 }) {
-    const mtab = TenantMigrationUtil.getTenantMigrationAccessBlocker(node, tenantId);
+    const mtab = TenantMigrationUtil.getTenantMigrationAccessBlocker(node, tenantId).donor;
     if (!mtab) {
         assert.eq(0, numBlockedWrites);
         assert.eq(0, numTenantMigrationCommittedErrors);
@@ -308,7 +315,7 @@ function testDoNotRejectWritesAfterMigrationAborted(testCase, testOpts) {
     assert.soon(() => {
         const mtabs =
             testOpts.primaryDB.adminCommand({serverStatus: 1}).tenantMigrationAccessBlocker;
-        return mtabs[tenantId].state === TenantMigrationTest.DonorAccessState.kAborted;
+        return mtabs[tenantId].donor.state === TenantMigrationTest.DonorAccessState.kAborted;
     });
 
     runCommand(testOpts);
@@ -434,6 +441,7 @@ function testRejectBlockedWritesAfterMigrationAborted(testCase, testOpts) {
 
 const isNotWriteCommand = "not a write command";
 const isNotRunOnUserDatabase = "not run on user database";
+const isNotSupportedInServerless = "not supported in serverless cluster";
 const isAuthCommand = "is an auth command";
 const isOnlySupportedOnStandalone = "is only supported on standalone";
 const isOnlySupportedOnShardedCluster = "is only supported on sharded cluster";
@@ -467,6 +475,7 @@ const testCases = {
     _configsvrUpdateZoneKeyRange: {skip: isNotRunOnUserDatabase},
     _flushDatabaseCacheUpdates: {skip: isNotRunOnUserDatabase},
     _flushDatabaseCacheUpdatesWithWriteConcern: {skip: isNotRunOnUserDatabase},
+    _flushReshardingStateChange: {skip: isNotRunOnUserDatabase},
     _flushRoutingTableCacheUpdates: {skip: isNotRunOnUserDatabase},
     _flushRoutingTableCacheUpdatesWithWriteConcern: {skip: isNotRunOnUserDatabase},
     _getNextSessionMods: {skip: isNotRunOnUserDatabase},
@@ -483,7 +492,6 @@ const testCases = {
     _shardsvrCloneCatalogData: {skip: isNotRunOnUserDatabase},
     _shardsvrCreateCollection: {skip: isOnlySupportedOnShardedCluster},
     _shardsvrCreateCollectionParticipant: {skip: isOnlySupportedOnShardedCluster},
-    _shardsvrFinishReshardCollection: {skip: isNotRunOnUserDatabase},
     _shardsvrMovePrimary: {skip: isNotRunOnUserDatabase},
     _shardsvrShardCollection: {skip: isNotRunOnUserDatabase},
     _shardsvrRenameCollection: {skip: isOnlySupportedOnShardedCluster},
@@ -509,85 +517,7 @@ const testCases = {
         }
     },
     appendOplogNote: {skip: isNotRunOnUserDatabase},
-    applyOpsCrudAllowAtomic: {
-        explicitlyCreateCollection: true,
-        command: function(dbName, collName) {
-            return {
-                applyOps: [
-                    {op: "i", ns: dbName + "." + collName, o: {_id: 0}},
-                    {op: "u", ns: dbName + "." + collName, o2: {_id: 0}, o: {$set: {a: 0}}},
-                ],
-                allowAtomic: true,
-            };
-        },
-        assertCommandSucceeded: function(db, dbName, collName) {
-            assert.eq(countDocs(db, collName, {_id: 0, a: 0}), 1);
-        },
-        assertCommandFailed: function(db, dbName, collName) {
-            assert.eq(countDocs(db, collName, {_id: 0}), 0);
-        }
-    },
-    applyOpsCrudNotAllowAtomic: {
-        explicitlyCreateCollection: true,
-        command: function(dbName, collName) {
-            return {
-                applyOps: [
-                    {op: "i", ns: dbName + "." + collName, o: {_id: 0}},
-                    {op: "i", ns: dbName + "." + collName, o: {_id: 1}},
-                    {op: "d", ns: dbName + "." + collName, o: {_id: 1}},
-                ],
-                allowAtomic: false,
-            };
-        },
-        assertCommandSucceeded: function(db, dbName, collName) {
-            assert.eq(countDocs(db, collName, {_id: 0}), 1);
-            assert.eq(countDocs(db, collName, {_id: 1}), 0);
-        },
-        assertCommandFailed: function(db, dbName, collName) {
-            assert.eq(countDocs(db, collName, {_id: 0}), 0);
-            assert.eq(countDocs(db, collName, {_id: 1}), 0);
-        }
-    },
-    applyOpsNonCrudAllowAtomic: {
-        command: function(dbName, collName) {
-            return {
-                applyOps: [
-                    {op: "c", ns: dbName + ".$cmd", o: {create: collName + "1"}},
-                    {op: "c", ns: dbName + ".$cmd", o: {create: collName + "2"}},
-                    {op: "c", ns: dbName + ".$cmd", o: {drop: collName + "2"}},
-                ],
-                allowAtomic: true,
-            };
-        },
-        assertCommandSucceeded: function(db, dbName, collName) {
-            assert(collectionExists(db, collName + "1"));
-            assert(!collectionExists(db, collName + "2"));
-        },
-        assertCommandFailed: function(db, dbName, collName) {
-            assert(!collectionExists(db, collName + "1"));
-            assert(!collectionExists(db, collName + "2"));
-        }
-    },
-    applyOpsNonCrudNotAllowAtomic: {
-        command: function(dbName, collName) {
-            return {
-                applyOps: [
-                    {op: "c", ns: dbName + ".$cmd", o: {create: collName + "1"}},
-                    {op: "c", ns: dbName + ".$cmd", o: {create: collName + "2"}},
-                    {op: "c", ns: dbName + ".$cmd", o: {drop: collName + "2"}},
-                ],
-                allowAtomic: false,
-            };
-        },
-        assertCommandSucceeded: function(db, dbName, collName) {
-            assert(collectionExists(db, collName + "1"));
-            assert(!collectionExists(db, collName + "2"));
-        },
-        assertCommandFailed: function(db, dbName, collName) {
-            assert(!collectionExists(db, collName + "1"));
-            assert(!collectionExists(db, collName + "2"));
-        }
-    },
+    applyOps: {skip: isNotSupportedInServerless},
     authenticate: {skip: isAuthCommand},
     availableQueryOptions: {skip: isNotWriteCommand},
     buildInfo: {skip: isNotWriteCommand},

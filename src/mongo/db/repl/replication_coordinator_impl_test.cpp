@@ -42,6 +42,7 @@
 #include "mongo/db/catalog/commit_quorum_options.h"
 #include "mongo/db/concurrency/lock_state.h"
 #include "mongo/db/concurrency/replication_state_transition_lock_guard.h"
+#include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/bson_extract_optime.h"
 #include "mongo/db/repl/data_replicator_external_state_impl.h"
 #include "mongo/db/repl/hello_response.h"
@@ -1120,6 +1121,168 @@ TEST_F(ReplCoordTest, NodeReturnsOkWhenAWriteConcernWithNoTimeoutHasBeenSatisfie
     ASSERT_OK(statusAndDur.status);
     awaiter.reset();
 }
+
+
+TEST_F(ReplCoordTest, NodeCalculatesDefaultWriteConcernOnStartupExistingLocalConfigMajority) {
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "members"
+                            << BSON_ARRAY(BSON("host"
+                                               << "node1:12345"
+                                               << "_id" << 0)
+                                          << BSON("host"
+                                                  << "node2:12345"
+                                                  << "_id" << 1)
+                                          << BSON("host"
+                                                  << "node3:12345"
+                                                  << "_id" << 2))),
+                       HostAndPort("node1", 12345));
+    auto& rwcDefaults = ReadWriteConcernDefaults::get(getServiceContext());
+    ASSERT(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest());
+    ASSERT(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest().get());
+}
+
+
+TEST_F(ReplCoordTest,
+       NodeCalculatesDefaultWriteConcernOnStartupExistingLocalConfigNoMajorityDueToArbiter) {
+    assertStartSuccess(BSON("_id"
+                            << "mySet"
+                            << "version" << 2 << "members"
+                            << BSON_ARRAY(BSON("host"
+                                               << "node1:12345"
+                                               << "_id" << 0)
+                                          << BSON("host"
+                                                  << "node2:12345"
+                                                  << "_id" << 1)
+                                          << BSON("host"
+                                                  << "node3:12345"
+                                                  << "_id" << 2 << "arbiterOnly" << true))),
+                       HostAndPort("node1", 12345));
+    auto& rwcDefaults = ReadWriteConcernDefaults::get(getServiceContext());
+    ASSERT(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest());
+    ASSERT_FALSE(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest().get());
+}
+
+
+TEST_F(ReplCoordTest, NodeCalculatesDefaultWriteConcernOnStartupNewConfigMajority) {
+    init("mySet");
+    start(HostAndPort("node1", 12345));
+    ASSERT_EQUALS(MemberState::RS_STARTUP, getReplCoord()->getMemberState().s);
+    auto opCtx = makeOperationContext();
+
+    ReplSetHeartbeatArgsV1 hbArgs;
+    hbArgs.setSetName("mySet");
+    hbArgs.setConfigVersion(1);
+    hbArgs.setConfigTerm(0);
+    hbArgs.setCheckEmpty();
+    hbArgs.setSenderHost(HostAndPort("node1", 12345));
+    hbArgs.setSenderId(0);
+    hbArgs.setTerm(0);
+    hbArgs.setHeartbeatVersion(1);
+
+    auto appliedTS = Timestamp(3, 3);
+    replCoordSetMyLastAppliedOpTime(OpTime(appliedTS, 1), Date_t() + Seconds(100));
+
+    stdx::thread prsiThread([&] {
+        BSONObjBuilder result1;
+        ASSERT_OK(
+            getReplCoord()->processReplSetInitiate(opCtx.get(),
+                                                   BSON("_id"
+                                                        << "mySet"
+                                                        << "version" << 1 << "members"
+                                                        << BSON_ARRAY(BSON("host"
+                                                                           << "node1:12345"
+                                                                           << "_id" << 0)
+                                                                      << BSON("host"
+                                                                              << "node2:12345"
+                                                                              << "_id" << 1))),
+                                                   &result1));
+    });
+    const Date_t startDate = getNet()->now();
+    getNet()->enterNetwork();
+    const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
+    ASSERT_EQUALS(HostAndPort("node2", 12345), noi->getRequest().target);
+    ASSERT_EQUALS("admin", noi->getRequest().dbname);
+    ASSERT_BSONOBJ_EQ(hbArgs.toBSON(), noi->getRequest().cmdObj);
+    ReplSetHeartbeatResponse hbResp;
+    hbResp.setConfigVersion(0);
+    hbResp.setAppliedOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
+    hbResp.setDurableOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
+    getNet()->scheduleResponse(
+        noi, startDate + Milliseconds(10), RemoteCommandResponse(hbResp.toBSON(), Milliseconds(8)));
+    getNet()->runUntil(startDate + Milliseconds(10));
+    getNet()->exitNetwork();
+    ASSERT_EQUALS(startDate + Milliseconds(10), getNet()->now());
+    prsiThread.join();
+    ASSERT_EQUALS(ReplicationCoordinator::modeReplSet, getReplCoord()->getReplicationMode());
+
+    ASSERT_EQUALS(getStorageInterface()->getInitialDataTimestamp(), appliedTS);
+
+    auto& rwcDefaults = ReadWriteConcernDefaults::get(getServiceContext());
+    ASSERT(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest());
+    ASSERT(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest().get());
+}
+
+
+TEST_F(ReplCoordTest, NodeCalculatesDefaultWriteConcernOnStartupNewConfigNoMajorityDueToArbiter) {
+    init("mySet");
+    start(HostAndPort("node1", 12345));
+    ASSERT_EQUALS(MemberState::RS_STARTUP, getReplCoord()->getMemberState().s);
+    auto opCtx = makeOperationContext();
+
+    ReplSetHeartbeatArgsV1 hbArgs;
+    hbArgs.setSetName("mySet");
+    hbArgs.setConfigVersion(1);
+    hbArgs.setConfigTerm(0);
+    hbArgs.setCheckEmpty();
+    hbArgs.setSenderHost(HostAndPort("node1", 12345));
+    hbArgs.setSenderId(0);
+    hbArgs.setTerm(0);
+    hbArgs.setHeartbeatVersion(1);
+
+    auto appliedTS = Timestamp(3, 3);
+    replCoordSetMyLastAppliedOpTime(OpTime(appliedTS, 1), Date_t() + Seconds(100));
+
+    stdx::thread prsiThread([&] {
+        BSONObjBuilder result1;
+        ASSERT_OK(getReplCoord()->processReplSetInitiate(
+            opCtx.get(),
+            BSON("_id"
+                 << "mySet"
+                 << "version" << 1 << "members"
+                 << BSON_ARRAY(BSON("host"
+                                    << "node1:12345"
+                                    << "_id" << 0)
+                               << BSON("host"
+                                       << "node2:12345"
+                                       << "_id" << 1 << "arbiterOnly" << true))),
+            &result1));
+    });
+    const Date_t startDate = getNet()->now();
+    getNet()->enterNetwork();
+    const NetworkInterfaceMock::NetworkOperationIterator noi = getNet()->getNextReadyRequest();
+    ASSERT_EQUALS(HostAndPort("node2", 12345), noi->getRequest().target);
+    ASSERT_EQUALS("admin", noi->getRequest().dbname);
+    ASSERT_BSONOBJ_EQ(hbArgs.toBSON(), noi->getRequest().cmdObj);
+    ReplSetHeartbeatResponse hbResp;
+    hbResp.setConfigVersion(0);
+    hbResp.setAppliedOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
+    hbResp.setDurableOpTimeAndWallTime({OpTime(Timestamp(100, 1), 0), Date_t() + Seconds(100)});
+    getNet()->scheduleResponse(
+        noi, startDate + Milliseconds(10), RemoteCommandResponse(hbResp.toBSON(), Milliseconds(8)));
+    getNet()->runUntil(startDate + Milliseconds(10));
+    getNet()->exitNetwork();
+    ASSERT_EQUALS(startDate + Milliseconds(10), getNet()->now());
+    prsiThread.join();
+    ASSERT_EQUALS(ReplicationCoordinator::modeReplSet, getReplCoord()->getReplicationMode());
+
+    ASSERT_EQUALS(getStorageInterface()->getInitialDataTimestamp(), appliedTS);
+
+    auto& rwcDefaults = ReadWriteConcernDefaults::get(getServiceContext());
+    ASSERT(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest());
+    ASSERT_FALSE(rwcDefaults.getImplicitDefaultWriteConcernMajority_forTest().get());
+}
+
 
 TEST_F(ReplCoordTest, NodeReturnsWriteConcernFailedWhenAWriteConcernTimesOutBeforeBeingSatisified) {
     assertStartSuccess(BSON("_id"
@@ -5980,9 +6143,9 @@ TEST_F(ReplCoordTest, DoNotIgnoreTheContentsOfMetadataWhenItsConfigVersionDoesNo
     auto lowerConfigVersion = 1;
     StatusWith<rpc::ReplSetMetadata> metadata = rpc::ReplSetMetadata::readFromMetadata(BSON(
         rpc::kReplSetMetadataFieldName << BSON(
-            "lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 2) << "lastCommittedWall"
+            "lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 2LL) << "lastCommittedWall"
                               << Date_t() + Seconds(100) << "lastOpVisible"
-                              << BSON("ts" << Timestamp(10, 0) << "t" << 2) << "configVersion"
+                              << BSON("ts" << Timestamp(10, 0) << "t" << 2LL) << "configVersion"
                               << lowerConfigVersion << "configTerm" << 2 << "term" << 2
                               << "syncSourceIndex" << 1 << "isPrimary" << true)));
     getReplCoord()->processReplSetMetadata(metadata.getValue());
@@ -5993,9 +6156,9 @@ TEST_F(ReplCoordTest, DoNotIgnoreTheContentsOfMetadataWhenItsConfigVersionDoesNo
     auto higherConfigVersion = 100;
     StatusWith<rpc::ReplSetMetadata> metadata2 = rpc::ReplSetMetadata::readFromMetadata(BSON(
         rpc::kReplSetMetadataFieldName << BSON(
-            "lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 2) << "lastCommittedWall"
+            "lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 2LL) << "lastCommittedWall"
                               << Date_t() + Seconds(100) << "lastOpVisible"
-                              << BSON("ts" << Timestamp(10, 0) << "t" << 2) << "configVersion"
+                              << BSON("ts" << Timestamp(10, 0) << "t" << 2LL) << "configVersion"
                               << higherConfigVersion << "configTerm" << 2 << "term" << 2
                               << "syncSourceIndex" << 1 << "isPrimary" << true)));
     getReplCoord()->processReplSetMetadata(metadata2.getValue());
@@ -6069,9 +6232,9 @@ TEST_F(ReplCoordTest, UpdateTermWhenTheTermFromMetadataIsNewerButNeverUpdateCurr
     // Higher term, should change.
     StatusWith<rpc::ReplSetMetadata> metadata = rpc::ReplSetMetadata::readFromMetadata(BSON(
         rpc::kReplSetMetadataFieldName
-        << BSON("lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 3)
+        << BSON("lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 3LL)
                                   << "lastCommittedWall" << Date_t() + Seconds(100)
-                                  << "lastOpVisible" << BSON("ts" << Timestamp(10, 0) << "t" << 3)
+                                  << "lastOpVisible" << BSON("ts" << Timestamp(10, 0) << "t" << 3LL)
                                   << "configVersion" << 2 << "configTerm" << 2 << "term" << 3
                                   << "syncSourceIndex" << 1 << "isPrimary" << true)));
     getReplCoord()->processReplSetMetadata(metadata.getValue());
@@ -6082,9 +6245,9 @@ TEST_F(ReplCoordTest, UpdateTermWhenTheTermFromMetadataIsNewerButNeverUpdateCurr
     // Lower term, should not change.
     StatusWith<rpc::ReplSetMetadata> metadata2 = rpc::ReplSetMetadata::readFromMetadata(BSON(
         rpc::kReplSetMetadataFieldName
-        << BSON("lastOpCommitted" << BSON("ts" << Timestamp(11, 0) << "t" << 3)
+        << BSON("lastOpCommitted" << BSON("ts" << Timestamp(11, 0) << "t" << 3LL)
                                   << "lastCommittedWall" << Date_t() + Seconds(100)
-                                  << "lastOpVisible" << BSON("ts" << Timestamp(11, 0) << "t" << 3)
+                                  << "lastOpVisible" << BSON("ts" << Timestamp(11, 0) << "t" << 3LL)
                                   << "configVersion" << 2 << "configTerm" << 2 << "term" << 2
                                   << "syncSourceIndex" << 1 << "isPrimary" << true)));
     getReplCoord()->processReplSetMetadata(metadata2.getValue());
@@ -6095,9 +6258,9 @@ TEST_F(ReplCoordTest, UpdateTermWhenTheTermFromMetadataIsNewerButNeverUpdateCurr
     // Same term, should not change.
     StatusWith<rpc::ReplSetMetadata> metadata3 = rpc::ReplSetMetadata::readFromMetadata(BSON(
         rpc::kReplSetMetadataFieldName
-        << BSON("lastOpCommitted" << BSON("ts" << Timestamp(11, 0) << "t" << 3)
+        << BSON("lastOpCommitted" << BSON("ts" << Timestamp(11, 0) << "t" << 3LL)
                                   << "lastCommittedWall" << Date_t() + Seconds(100)
-                                  << "lastOpVisible" << BSON("ts" << Timestamp(11, 0) << "t" << 3)
+                                  << "lastOpVisible" << BSON("ts" << Timestamp(11, 0) << "t" << 3LL)
                                   << "configVersion" << 2 << "configTerm" << 2 << "term" << 3
                                   << "syncSourceIndex" << 1 << "isPrimary" << true)));
     getReplCoord()->processReplSetMetadata(metadata3.getValue());
@@ -6133,9 +6296,9 @@ TEST_F(ReplCoordTest,
     // Higher term - should update term but not last committed optime.
     StatusWith<rpc::ReplSetMetadata> metadata = rpc::ReplSetMetadata::readFromMetadata(BSON(
         rpc::kReplSetMetadataFieldName << BSON(
-            "lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 3) << "lastCommittedWall"
+            "lastOpCommitted" << BSON("ts" << Timestamp(10, 0) << "t" << 3LL) << "lastCommittedWall"
                               << Date_t() + Seconds(100) << "lastOpVisible"
-                              << BSON("ts" << Timestamp(10, 0) << "t" << 3) << "configVersion"
+                              << BSON("ts" << Timestamp(10, 0) << "t" << 3LL) << "configVersion"
                               << config.getConfigVersion() << "configTerm" << config.getConfigTerm()
                               << "term" << 3 << "syncSourceIndex" << 1 << "isPrimary" << true)));
     BSONObjBuilder responseBuilder;
@@ -6272,9 +6435,9 @@ TEST_F(ReplCoordTest, TermAndLastCommittedOpTimeUpdatedFromHeartbeatWhenArbiter)
     // commit point via heartbeats.
     StatusWith<rpc::ReplSetMetadata> metadata = rpc::ReplSetMetadata::readFromMetadata(BSON(
         rpc::kReplSetMetadataFieldName << BSON(
-            "lastOpCommitted" << BSON("ts" << Timestamp(10, 1) << "t" << 3) << "lastCommittedWall"
+            "lastOpCommitted" << BSON("ts" << Timestamp(10, 1) << "t" << 3LL) << "lastCommittedWall"
                               << Date_t() + Seconds(100) << "lastOpVisible"
-                              << BSON("ts" << Timestamp(10, 1) << "t" << 3) << "configVersion"
+                              << BSON("ts" << Timestamp(10, 1) << "t" << 3LL) << "configVersion"
                               << config.getConfigVersion() << "configTerm" << config.getConfigTerm()
                               << "term" << 3 << "syncSourceIndex" << 1 << "isPrimary" << true)));
     BSONObjBuilder responseBuilder;

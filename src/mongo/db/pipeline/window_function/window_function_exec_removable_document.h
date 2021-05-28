@@ -54,18 +54,34 @@ public:
                                         std::unique_ptr<WindowFunctionState> function,
                                         WindowBounds::DocumentBased bounds);
 
+    /**
+     * Constructs a removable window function executor with the given input expression and sortBy
+     * expression to be evaluated and passed the evaluation of both "input" and "sortBy" as a single
+     * input Value of a 2-sized vector (Value{sortByValue, inputValue}) to the corresponding
+     * WindowFunc for each document in the window.
+     *
+     * The "bounds" parameter is the user supplied bounds for the window.
+     */
+    WindowFunctionExecRemovableDocument(PartitionIterator* iter,
+                                        boost::intrusive_ptr<Expression> input,
+                                        boost::intrusive_ptr<Expression> sortBy,
+                                        std::unique_ptr<WindowFunctionState> function,
+                                        WindowBounds::DocumentBased bounds)
+        : WindowFunctionExecRemovableDocument(iter, std::move(input), std::move(function), bounds) {
+        _sortBy = std::move(sortBy);
+        _memUsageBytes = sizeof(*this);
+    }
+
     void reset() final {
         _function->reset();
         _values = std::queue<Value>();
         _initialized = false;
+        _memUsageBytes = sizeof(*this);
     }
 
 private:
-    void processDocumentsToUpperBound() final;
-
-    void removeDocumentsUnderLowerBound() final;
-
-    void initialize() final;
+    void update() final;
+    void initialize();
 
     void removeFirstValueIfExists() {
         if (_values.size() == 0) {
@@ -75,6 +91,12 @@ private:
         _function->remove(_values.front());
         _values.pop();
     }
+
+    // In one of two states: either the initial window has not been populated or we are sliding and
+    // accumulating/removing values.
+    bool _initialized = false;
+
+    boost::intrusive_ptr<Expression> _sortBy = nullptr;
 
     int _lowerBound;
     // Will stay boost::none if right unbounded.

@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/logical_session_cache_noop.h"
 #include "mongo/db/pipeline/process_interface/shardsvr_process_interface.h"
@@ -346,18 +347,33 @@ protected:
     ExecutorFuture<void> runCloner(
         ReshardingTxnCloner& cloner,
         std::shared_ptr<executor::ThreadPoolTaskExecutor> executor,
-        boost::optional<CancelationToken> customCancelToken = boost::none) {
-        // Allows callers to control the cancelation of the cloner's run() function when specified.
+        std::shared_ptr<executor::ThreadPoolTaskExecutor> cleanupExecutor,
+        boost::optional<CancellationToken> customCancelToken = boost::none) {
+        // Allows callers to control the cancellation of the cloner's run() function when specified.
         auto cancelToken = customCancelToken.is_initialized()
             ? customCancelToken.get()
-            : operationContext()->getCancelationToken();
+            : operationContext()->getCancellationToken();
+
+        auto cancelableOpCtxExecutor = std::make_shared<ThreadPool>([] {
+            ThreadPool::Options options;
+            options.poolName = "TestReshardCloneConfigTransactionsCancelableOpCtxPool";
+            options.minThreads = 1;
+            options.maxThreads = 1;
+            return options;
+        }());
+        CancelableOperationContextFactory opCtxFactory(cancelToken, cancelableOpCtxExecutor);
 
         // There isn't a guarantee that the reference count to `executor` has been decremented after
         // .run() returns. We schedule a trivial task on the task executor to ensure the callback's
         // destructor has run. Otherwise `executor` could end up outliving the ServiceContext and
         // triggering an invariant due to the task executor's thread having a Client still.
         return cloner
-            .run(getServiceContext(), std::move(executor), cancelToken, makeMongoProcessInterface())
+            .run(executor,
+                 cleanupExecutor,
+                 cancelToken,
+                 std::move(opCtxFactory),
+                 makeMongoProcessInterface())
+            .thenRunOn(executor)
             .onCompletion([](auto x) { return x; });
     }
 
@@ -373,7 +389,7 @@ TEST_F(ReshardingTxnClonerTest, MergeTxnNotOnRecipient) {
     for (auto state : getDurableTxnStatesAndBoostNone()) {
         auto executor = makeTaskExecutorForCloner();
         ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
-        auto future = runCloner(cloner, executor);
+        auto future = runCloner(cloner, executor, executor);
 
         const auto sessionId = makeLogicalSessionIdForTest();
         TxnNumber txnNum = 3;
@@ -392,7 +408,7 @@ TEST_F(ReshardingTxnClonerTest, MergeTxnNotOnRecipient) {
 TEST_F(ReshardingTxnClonerTest, MergeUnParsableTxn) {
     auto executor = makeTaskExecutorForCloner();
     ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
-    auto future = runCloner(cloner, executor);
+    auto future = runCloner(cloner, executor, executor);
 
     const auto sessionId = makeLogicalSessionIdForTest();
     TxnNumber txnNum = 3;
@@ -415,7 +431,7 @@ TEST_F(ReshardingTxnClonerTest, MergeNewTxnOverMultiDocTxn) {
 
         auto executor = makeTaskExecutorForCloner();
         ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
-        auto future = runCloner(cloner, executor);
+        auto future = runCloner(cloner, executor, executor);
 
         auto txn = SessionTxnRecord(sessionId, donorTxnNum, repl::OpTime(), Date_t::now());
         txn.setState(state);
@@ -438,7 +454,7 @@ TEST_F(ReshardingTxnClonerTest, MergeNewTxnOverRetryableWriteTxn) {
 
         auto executor = makeTaskExecutorForCloner();
         ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
-        auto future = runCloner(cloner, executor);
+        auto future = runCloner(cloner, executor, executor);
 
         auto txn = SessionTxnRecord(sessionId, donorTxnNum, repl::OpTime(), Date_t::now());
         txn.setState(state);
@@ -460,7 +476,7 @@ TEST_F(ReshardingTxnClonerTest, MergeCurrentTxnOverRetryableWriteTxn) {
 
         auto executor = makeTaskExecutorForCloner();
         ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
-        auto future = runCloner(cloner, executor);
+        auto future = runCloner(cloner, executor, executor);
 
         auto txn = SessionTxnRecord(sessionId, txnNum, repl::OpTime(), Date_t::now());
         txn.setState(state);
@@ -482,7 +498,7 @@ TEST_F(ReshardingTxnClonerTest, MergeCurrentTxnOverMultiDocTxn) {
 
         auto executor = makeTaskExecutorForCloner();
         ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
-        auto future = runCloner(cloner, executor);
+        auto future = runCloner(cloner, executor, executor);
 
         auto txn = SessionTxnRecord(sessionId, txnNum, repl::OpTime(), Date_t::now());
         txn.setState(state);
@@ -506,7 +522,7 @@ TEST_F(ReshardingTxnClonerTest, MergeOldTxnOverTxn) {
 
         auto executor = makeTaskExecutorForCloner();
         ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
-        auto future = runCloner(cloner, executor);
+        auto future = runCloner(cloner, executor, executor);
 
         auto txn = SessionTxnRecord(sessionId, donorTxnNum, repl::OpTime(), Date_t::now());
         txn.setState(state);
@@ -526,7 +542,7 @@ TEST_F(ReshardingTxnClonerTest, MergeMultiDocTransactionAndRetryableWrite) {
 
     auto executor = makeTaskExecutorForCloner();
     ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
-    auto future = runCloner(cloner, executor);
+    auto future = runCloner(cloner, executor, executor);
 
     auto sessionRecordRetryableWrite =
         SessionTxnRecord(sessionIdRetryableWrite, txnNum, repl::OpTime(), Date_t::now());
@@ -551,15 +567,18 @@ TEST_F(ReshardingTxnClonerTest, ClonerOneBatchThenCanceled) {
     const auto txns = makeSortedTxns(4);
     auto executor = makeTaskExecutorForCloner();
     ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
-    auto opCtxToken = operationContext()->getCancelationToken();
-    auto cancelSource = CancelationSource(opCtxToken);
-    auto future = runCloner(cloner, executor, cancelSource.token());
+    auto opCtxToken = operationContext()->getCancellationToken();
+    auto cancelSource = CancellationSource(opCtxToken);
+    auto future = runCloner(cloner, executor, executor, cancelSource.token());
 
-    onCommandReturnTxnBatch(std::vector<BSONObj>(txns.begin(), txns.begin() + 2),
-                            CursorId{123},
-                            true /* isFirstBatch */);
+    onCommand([&](const executor::RemoteCommandRequest& request) {
+        cancelSource.cancel();
 
-    cancelSource.cancel();
+        return CursorResponse(NamespaceString::kSessionTransactionsTableNamespace,
+                              CursorId{123},
+                              std::vector<BSONObj>(txns.begin(), txns.begin() + 2))
+            .toBSON(CursorResponse::ResponseType::InitialResponse);
+    });
 
     auto status = future.getNoThrow();
     ASSERT_EQ(status.code(), ErrorCodes::CallbackCanceled);
@@ -575,7 +594,7 @@ TEST_F(ReshardingTxnClonerTest, ClonerStoresProgressSingleBatch) {
 
         auto executor = makeTaskExecutorForCloner();
         ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
-        auto future = runCloner(cloner, executor);
+        auto future = runCloner(cloner, executor, executor);
 
         onCommandReturnTxnBatch(txns, CursorId{0}, true /* isFirstBatch */);
 
@@ -594,7 +613,7 @@ TEST_F(ReshardingTxnClonerTest, ClonerStoresProgressSingleBatch) {
 
         auto executor = makeTaskExecutorForCloner();
         ReshardingTxnCloner cloner(kTwoSourceIdList[0], Timestamp::max());
-        auto future = runCloner(cloner, executor);
+        auto future = runCloner(cloner, executor, executor);
 
         onCommandReturnTxnBatch(txns, CursorId{0}, true /* isFirstBatch */);
 
@@ -620,8 +639,8 @@ TEST_F(ReshardingTxnClonerTest, ClonerStoresProgressMultipleBatches) {
 
     auto executor = makeTaskExecutorForCloner();
     ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
-    auto cancelSource = CancelationSource(operationContext()->getCancelationToken());
-    auto future = runCloner(cloner, executor, cancelSource.token());
+    auto cancelSource = CancellationSource(operationContext()->getCancellationToken());
+    auto future = runCloner(cloner, executor, executor, cancelSource.token());
 
     // The progress document is updated asynchronously after the session record is updated. We fake
     // the cloning operation being canceled to inspect the progress document after the first batch
@@ -633,8 +652,8 @@ TEST_F(ReshardingTxnClonerTest, ClonerStoresProgressMultipleBatches) {
         // Simulate a stepdown.
         cancelSource.cancel();
 
-        // With a non-mock network, disposing of the pipeline upon cancelation would also cancel the
-        // original request.
+        // With a non-mock network, disposing of the pipeline upon cancellation would also cancel
+        // the original request.
         return Status{ErrorCodes::CallbackCanceled, "Simulate cancellation"};
     });
     auto status = future.getNoThrow();
@@ -646,7 +665,7 @@ TEST_F(ReshardingTxnClonerTest, ClonerStoresProgressMultipleBatches) {
     ASSERT_EQ(*getProgressLsid(kTwoSourceIdList[1]), firstLsid);
 
     // Now we run the cloner again and give it the remaining documents.
-    future = runCloner(cloner, executor);
+    future = runCloner(cloner, executor, executor);
 
     onCommandReturnTxnBatch(
         std::vector<BSONObj>(txns.begin() + 1, txns.end()), CursorId{0}, false /* isFirstBatch */);
@@ -670,8 +689,8 @@ TEST_F(ReshardingTxnClonerTest, ClonerStoresProgressResume) {
 
     auto executor = makeTaskExecutorForCloner();
     ReshardingTxnCloner cloner(kTwoSourceIdList[1], Timestamp::max());
-    auto cancelSource = CancelationSource(operationContext()->getCancelationToken());
-    auto future = runCloner(cloner, executor, cancelSource.token());
+    auto cancelSource = CancellationSource(operationContext()->getCancellationToken());
+    auto future = runCloner(cloner, executor, executor, cancelSource.token());
 
     onCommandReturnTxnBatch({txns.front()}, CursorId{123}, true /* isFirstBatch */);
 
@@ -685,8 +704,8 @@ TEST_F(ReshardingTxnClonerTest, ClonerStoresProgressResume) {
         // Simulate a stepdown.
         cancelSource.cancel();
 
-        // With a non-mock network, disposing of the pipeline upon cancelation would also cancel the
-        // original request.
+        // With a non-mock network, disposing of the pipeline upon cancellation would also cancel
+        // the original request.
         return Status{ErrorCodes::CallbackCanceled, "Simulate cancellation"};
     });
 
@@ -699,7 +718,7 @@ TEST_F(ReshardingTxnClonerTest, ClonerStoresProgressResume) {
 
     // Simulate a resume on the new primary by creating a new fetcher that resumes after the lsid in
     // the progress document.
-    future = runCloner(cloner, executor);
+    future = runCloner(cloner, executor, executor);
 
     BSONObj cmdObj;
     onCommand([&](const executor::RemoteCommandRequest& request) {
@@ -728,7 +747,7 @@ TEST_F(ReshardingTxnClonerTest, ClonerStoresProgressResume) {
     // fetcher that resumes at the lsid from the first progress document. This verifies cloning is
     // idempotent on the cloning shard.
     cloner.updateProgressDocument_forTest(operationContext(), firstLsid);
-    future = runCloner(cloner, executor);
+    future = runCloner(cloner, executor, executor);
 
     onCommand([&](const executor::RemoteCommandRequest& request) {
         cmdObj = request.cmdObj.getOwned();
@@ -758,7 +777,7 @@ TEST_F(ReshardingTxnClonerTest, ClonerDoesNotUpdateProgressOnEmptyBatch) {
 
     auto executor = makeTaskExecutorForCloner();
     ReshardingTxnCloner cloner(kTwoSourceIdList[0], Timestamp::max());
-    auto future = runCloner(cloner, executor);
+    auto future = runCloner(cloner, executor, executor);
 
     onCommandReturnTxnBatch({}, CursorId{0}, true /* isFirstBatch */);
 

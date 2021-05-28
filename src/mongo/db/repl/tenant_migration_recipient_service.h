@@ -73,8 +73,7 @@ public:
 
     ThreadPool::Limits getThreadPoolLimits() const final;
 
-    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(
-        BSONObj initialStateDoc) const final;
+    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialStateDoc) final;
 
     class Instance final : public PrimaryOnlyService::TypedInstance<Instance> {
     public:
@@ -83,7 +82,7 @@ public:
                           BSONObj stateDoc);
 
         SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                             const CancelationToken& token) noexcept final;
+                             const CancellationToken& token) noexcept final;
 
         /*
          * Interrupts the running instance and cause the completion future to complete with
@@ -131,8 +130,8 @@ public:
 
         /**
          * To be called on the instance returned by PrimaryOnlyService::getOrCreate(). Returns an
-         * error if the options this Instance was created with are incompatible with a request for
-         * an instance with the options given in 'stateDoc'.
+         * error if the options this Instance was created with are incompatible with the options
+         * given in 'stateDoc'.
          */
         Status checkIfOptionsConflict(const TenantMigrationRecipientDocument& stateDoc) const;
 
@@ -338,7 +337,7 @@ public:
          * Fetches all key documents from the donor's admin.system.keys collection, stores them in
          * config.external_validation_keys, and refreshes the keys cache.
          */
-        void _fetchAndStoreDonorClusterTimeKeyDocs(const CancelationToken& token);
+        void _fetchAndStoreDonorClusterTimeKeyDocs(const CancellationToken& token);
 
         /**
          * Retrieves the start optimes from the donor and updates the in-memory state accordingly.
@@ -378,7 +377,7 @@ public:
          * Creates an aggregation pipeline to fetch transaction entries with 'lastWriteOpTime' <
          * 'startFetchingDonorOpTime' and 'state: committed'.
          */
-        AggregateCommand _makeCommittedTransactionsAggregation() const;
+        AggregateCommandRequest _makeCommittedTransactionsAggregation() const;
 
         /**
          * Processes a committed transaction entry from the donor. Updates the recipient's
@@ -501,11 +500,12 @@ public:
 
         // This data is provided in the initial state doc and never changes.  We keep copies to
         // avoid having to obtain the mutex to access them.
-        const std::string _tenantId;                  // (R)
-        const UUID _migrationUuid;                    // (R)
-        const std::string _donorConnectionString;     // (R)
-        const MongoURI _donorUri;                     // (R)
-        const ReadPreferenceSetting _readPreference;  // (R)
+        const std::string _tenantId;                                                     // (R)
+        const UUID _migrationUuid;                                                       // (R)
+        const std::string _donorConnectionString;                                        // (R)
+        const MongoURI _donorUri;                                                        // (R)
+        const ReadPreferenceSetting _readPreference;                                     // (R)
+        const boost::optional<TenantMigrationPEMPayload> _recipientCertificateForDonor;  // (R)
         // TODO (SERVER-54085): Remove server parameter tenantMigrationDisableX509Auth.
         // Transient SSL params created based on the state doc if the server parameter
         // 'tenantMigrationDisableX509Auth' is false.
@@ -540,8 +540,6 @@ public:
         std::unique_ptr<TenantMigrationSharedData> _sharedData;  // (S)
         // Indicates whether the main task future continuation chain state kicked off by run().
         TaskState _taskState;  // (M)
-        // Used to indicate whether the migration is able to be retried on fetcher error.
-        boost::optional<Status> _oplogFetcherStatus;  // (M)
 
         // Promise that is resolved when the state document is initialized and persisted.
         SharedPromise<void> _stateDocPersistedPromise;  // (W)
@@ -568,7 +566,7 @@ public:
 
 private:
     ExecutorFuture<void> _rebuildService(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                                         const CancelationToken& token) override;
+                                         const CancellationToken& token) override;
 
     ServiceContext* const _serviceContext;
 

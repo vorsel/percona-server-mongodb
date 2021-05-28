@@ -56,9 +56,9 @@
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/s/add_shard_cmd_gen.h"
 #include "mongo/db/s/add_shard_util.h"
+#include "mongo/db/s/sharding_ddl_50_upgrade_downgrade.h"
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/type_shard_identity.h"
-#include "mongo/db/vector_clock.h"
 #include "mongo/db/vector_clock_mutable.h"
 #include "mongo/db/wire_version.h"
 #include "mongo/executor/task_executor.h"
@@ -73,7 +73,6 @@
 #include "mongo/s/cluster_identity_loader.h"
 #include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 #include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/s/write_ops/batched_command_response.h"
 #include "mongo/util/fail_point.h"
@@ -87,7 +86,7 @@ using CallbackHandle = executor::TaskExecutor::CallbackHandle;
 using CallbackArgs = executor::TaskExecutor::CallbackArgs;
 using RemoteCommandCallbackArgs = executor::TaskExecutor::RemoteCommandCallbackArgs;
 using RemoteCommandCallbackFn = executor::TaskExecutor::RemoteCommandCallbackFn;
-using FeatureCompatibilityParams = ServerGlobalParams::FeatureCompatibility;
+using FeatureCompatibility = ServerGlobalParams::FeatureCompatibility;
 
 const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
 
@@ -343,25 +342,6 @@ StatusWith<ShardType> ShardingCatalogManager::_validateHostAsShard(
                                                 << "field when attempting to add "
                                                 << connectionString.toString() << " as a shard");
     }
-    const auto currentFcv = serverGlobalParams.featureCompatibility.getVersion();
-    // (Generic FCV reference): These FCV checks should exist across LTS binary versions.
-    if (currentFcv == FeatureCompatibilityParams::kLatest ||
-        currentFcv == FeatureCompatibilityParams::kDowngradingFromLatestToLastContinuous ||
-        currentFcv == FeatureCompatibilityParams::kDowngradingFromLatestToLastLTS ||
-        currentFcv == FeatureCompatibilityParams::kUpgradingFromLastContinuousToLatest ||
-        currentFcv == FeatureCompatibilityParams::kUpgradingFromLastLTSToLatest) {
-        // If the cluster's FCV is kLatest, or upgrading to / downgrading from kLatest, the node
-        // being added must be a version kLatest binary.
-        invariant(maxWireVersion == WireVersion::LATEST_WIRE_VERSION);
-    } else if (currentFcv == FeatureCompatibilityParams::kLastContinuous ||
-               currentFcv == FeatureCompatibilityParams::kUpgradingFromLastLTSToLastContinuous) {
-        // If we are using the kLastContinuous  or upgrading to kLastContinuous FCV, the node being
-        // added must be of the last-continuous or latest binary version.
-        invariant(maxWireVersion >= WireVersion::LAST_CONT_WIRE_VERSION);
-    } else {
-        // (Generic FCV reference): These FCV checks should exist across LTS binary versions.
-        invariant(currentFcv == FeatureCompatibilityParams::kLastLTS);
-    }
 
     // Check whether there is a master. If there isn't, the replica set may not have been
     // initiated. If the connection is a standalone, it will return true for isMaster.
@@ -544,6 +524,8 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
         return {ErrorCodes::BadValue, "shard name cannot be empty"};
     }
 
+    const auto shardRegistry = Grid::get(opCtx)->shardRegistry();
+
     // Only one addShard operation can be in progress at a time.
     Lock::ExclusiveLock lk(opCtx->lockState(), _kShardMembershipLock);
 
@@ -563,8 +545,7 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
         return existingShard.getValue()->getName();
     }
 
-    const std::shared_ptr<Shard> shard{
-        Grid::get(opCtx)->shardRegistry()->createConnection(shardConnectionString)};
+    const std::shared_ptr<Shard> shard{shardRegistry->createConnection(shardConnectionString)};
     auto targeter = shard->getTargeter();
 
     auto stopMonitoringGuard = makeGuard([&] {
@@ -606,7 +587,6 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
 
     // Check that the shard candidate does not have a local config.system.sessions collection
     auto res = _dropSessionsCollection(opCtx, targeter);
-
     if (!res.isOK()) {
         return res.withContext(
             "can't add shard with a local copy of config.system.sessions, please drop this "
@@ -646,52 +626,32 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
     // Use the _addShard command to add the shard, which in turn inserts a shardIdentity document
     // into the shard and triggers sharding state initialization.
     auto addShardStatus = runCmdOnNewShard(addShardCmd.toBSON({}));
-
     if (!addShardStatus.isOK()) {
         return addShardStatus;
     }
 
     {
-        // Hold the fcvLock across checking the FCV, sending setFCV to the new shard, and
-        // writing the entry for the new shard to config.shards. This ensures the FCV doesn't change
-        // after we send setFCV to the new shard, but before we write its entry to config.shards.
-        // (Note, we don't use a Global IX lock here, because we don't want to hold the global lock
+        // Keep the FCV stable across checking the FCV, sending setFCV to the new shard and writing
+        // the entry for the new shard to config.shards. This ensures the FCV doesn't change after
+        // we send setFCV to the new shard, but before we write its entry to config.shards.
+        //
+        // NOTE: We don't use a Global IX lock here, because we don't want to hold the global lock
         // while blocking on the network).
-        invariant(!opCtx->lockState()->isLocked());
-        Lock::SharedLock lk(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
+        FixedFCVRegion fcvRegion(opCtx);
 
-        // Get the target version that the newly added shard should be set to.
-        const FeatureCompatibilityParams::Version setVersion = [] {
-            const auto currentFcv = serverGlobalParams.featureCompatibility.getVersion();
-            // (Generic FCV reference): These FCV checks should exist across LTS binary versions.
-            if (currentFcv == FeatureCompatibilityParams::kLatest ||
-                currentFcv == FeatureCompatibilityParams::kUpgradingFromLastContinuousToLatest ||
-                currentFcv == FeatureCompatibilityParams::kUpgradingFromLastLTSToLatest) {
-                return FeatureCompatibilityParams::kLatest;
-            } else if (currentFcv == FeatureCompatibilityParams::kLastContinuous ||
-                       currentFcv ==
-                           FeatureCompatibilityParams::kDowngradingFromLatestToLastContinuous ||
-                       currentFcv ==
-                           FeatureCompatibilityParams::kUpgradingFromLastLTSToLastContinuous) {
-                // (Generic FCV reference): These FCV checks should exist across LTS binary
-                // versions.
-                return FeatureCompatibilityParams::kLastContinuous;
-            } else {
-                // (Generic FCV reference): This FCV reference should exist across LTS binary
-                // versions.
-                invariant(currentFcv ==
-                              FeatureCompatibilityParams::kDowngradingFromLatestToLastLTS ||
-                          currentFcv == FeatureCompatibilityParams::kLastLTS);
-                return FeatureCompatibilityParams::kLastLTS;
-            }
-        }();
+        uassert(5563603,
+                "Cannot add shard while in upgrading/downgrading FCV state",
+                !fcvRegion->isUpgradingOrDowngrading());
 
-        SetFeatureCompatibilityVersion setFcvCmd(setVersion);
+        // (Generic FCV reference): These FCV checks should exist across LTS binary versions.
+        invariant(fcvRegion == FeatureCompatibility::kLatest ||
+                  fcvRegion == FeatureCompatibility::kLastContinuous ||
+                  fcvRegion == FeatureCompatibility::kLastLTS);
+
+        SetFeatureCompatibilityVersion setFcvCmd(fcvRegion->getVersion());
         setFcvCmd.setDbName(NamespaceString::kAdminDb);
-        // TODO (SERVER-50954): Remove this FCV check once 4.4 is no longer the last LTS
-        // version.
-        if (serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
-                FeatureCompatibilityParams::Version::kVersion47)) {
+        // TODO (SERVER-50954): Remove this FCV check once 4.4 is no longer the last LTS version.
+        if (fcvRegion->isGreaterThanOrEqualTo(FeatureCompatibility::Version::kVersion47)) {
             // fromConfigServer is a new parameter added to 4.8 with intention to be backported
             // to 4.7.
             setFcvCmd.setFromConfigServer(true);
@@ -734,34 +694,33 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
                   "error"_attr = result.reason());
             return result;
         }
-    }
 
-    // Add all databases which were discovered on the new shard
-    for (const auto& dbName : dbNamesStatus.getValue()) {
-        boost::optional<Timestamp> clusterTime;
-        if (feature_flags::gShardingFullDDLSupportTimestampedVersion.isEnabled(
-                serverGlobalParams.featureCompatibility)) {
-            const auto now = VectorClock::get(opCtx)->getTime();
-            clusterTime = now.clusterTime().asTimestamp();
-        }
+        // Add all databases which were discovered on the new shard
+        for (const auto& dbName : dbNamesStatus.getValue()) {
+            boost::optional<Timestamp> clusterTime;
+            if (DatabaseEntryFormat::get(fcvRegion) == DatabaseEntryFormat::kUUIDandTimestamp) {
+                const auto now = VectorClock::get(opCtx)->getTime();
+                clusterTime = now.clusterTime().asTimestamp();
+            }
 
-        DatabaseType dbt(
-            dbName, shardType.getName(), false, DatabaseVersion(UUID::gen(), clusterTime));
+            DatabaseType dbt(
+                dbName, shardType.getName(), false, DatabaseVersion(UUID::gen(), clusterTime));
 
-        {
-            const auto status = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
-                opCtx,
-                DatabaseType::ConfigNS,
-                BSON(DatabaseType::name(dbName)),
-                dbt.toBSON(),
-                true,
-                ShardingCatalogClient::kLocalWriteConcern);
-            if (!status.isOK()) {
-                LOGV2(21944,
-                      "Adding shard {connectionString} even though could not add database {db}",
-                      "Adding shard even though we could not add database",
-                      "connectionString"_attr = shardConnectionString.toString(),
-                      "db"_attr = dbName);
+            {
+                const auto status = Grid::get(opCtx)->catalogClient()->updateConfigDocument(
+                    opCtx,
+                    DatabaseType::ConfigNS,
+                    BSON(DatabaseType::name(dbName)),
+                    dbt.toBSON(),
+                    true,
+                    ShardingCatalogClient::kLocalWriteConcern);
+                if (!status.isOK()) {
+                    LOGV2(21944,
+                          "Adding shard {connectionString} even though could not add database {db}",
+                          "Adding shard even though we could not add database",
+                          "connectionString"_attr = shardConnectionString.toString(),
+                          "db"_attr = dbName);
+                }
             }
         }
     }
@@ -775,7 +734,6 @@ StatusWith<std::string> ShardingCatalogManager::addShard(
         opCtx, "addShard", "", shardDetails.obj(), ShardingCatalogClient::kMajorityWriteConcern);
 
     // Ensure the added shard is visible to this process.
-    auto shardRegistry = Grid::get(opCtx)->shardRegistry();
     shardRegistry->reload(opCtx);
     if (!shardRegistry->getShard(opCtx, shardType.getName()).isOK()) {
         return {ErrorCodes::OperationFailed,
@@ -831,6 +789,7 @@ BSONObj makeCommitRemoveShardCommand(const std::string& removedShardName,
 RemoveShardProgress ShardingCatalogManager::removeShard(OperationContext* opCtx,
                                                         const ShardId& shardId) {
     const auto name = shardId.toString();
+    audit::logRemoveShard(opCtx->getClient(), name);
 
     const auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
@@ -936,7 +895,6 @@ RemoveShardProgress ShardingCatalogManager::removeShard(OperationContext* opCtx,
     // Draining is done, now finish removing the shard.
     LOGV2(
         21949, "Going to remove shard: {shardId}", "Going to remove shard", "shardId"_attr = name);
-    audit::logRemoveShard(opCtx->getClient(), name);
 
     // Find a controlShard to be updated.
     auto controlShardQueryStatus =

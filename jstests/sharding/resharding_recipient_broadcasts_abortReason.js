@@ -5,11 +5,7 @@
  * @tags: [
  *   requires_fcv_49,
  *   uses_atclustertime,
- *   __TEMPORARILY_DISABLED__
  * ]
- *
- * TODO SERVER-54474: Re-enable this test once donors engaged in the critical section are able to
- * abort resharding locally after the coordinator transitions to an error state.
  */
 (function() {
 "use strict";
@@ -47,7 +43,9 @@ const donor_host = topology.shards[donorShardNames[0]].primary;
 const donor0 = new Mongo(donor_host);
 const configsvr = new Mongo(topology.configsvr.nodes[0]);
 
-const fp = configureFailPoint(donor0, "reshardingDonorFailsBeforePreparingToMirror");
+const failBeforeMirroringFP =
+    configureFailPoint(donor0, "reshardingDonorFailsBeforePreparingToMirror");
+const removeDonorDocFP = configureFailPoint(donor0, "removeDonorDocFailpoint");
 
 reshardingTest.withReshardingInBackground(
     {
@@ -57,20 +55,22 @@ reshardingTest.withReshardingInBackground(
             {min: {newKey: 0}, max: {newKey: MaxKey}, shard: recipientShardNames[1]},
         ],
     },
-    (tempNs) => {
-        // TODO SERVER-51696: Review if these checks can be made in a cpp unittest instead.
-        // First, wait for the shard to encounter an unrecoverable error and persist it locally.
-        ReshardingTestUtil.assertDonorAbortsLocally(
-            donor0, donorShardNames[0], inputCollection.getFullName(), ErrorCodes.InternalError);
-    },
+    () => {},
     {
         expectedErrorCode: ErrorCodes.InternalError,
-        postAbortDecisionPersistedFn: () => {
-            ReshardingTestUtil.assertAllParticipantsReportAbortToCoordinator(
-                configsvr, inputCollection.getFullName(), ErrorCodes.InternalError);
+        postDecisionPersistedFn: () => {
+            ReshardingTestUtil.assertDonorAbortsLocally(donor0,
+                                                        donorShardNames[0],
+                                                        inputCollection.getFullName(),
+                                                        ErrorCodes.InternalError);
+
+            removeDonorDocFP.off();
+
+            ReshardingTestUtil.assertAllParticipantsReportDoneToCoordinator(
+                configsvr, inputCollection.getFullName());
         }
     });
 
-fp.off();
+failBeforeMirroringFP.off();
 reshardingTest.teardown();
 })();

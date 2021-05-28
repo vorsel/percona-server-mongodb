@@ -210,6 +210,15 @@ env.Library(
     ],
 )
 
+env.Benchmark(
+    target='fail_point_bm',
+    source=[
+        'fail_point_bm.cpp',
+    ],
+    LIBDEPS=[
+    ],
+)
+
 env.Library(
     target="testing_options",
     source=[
@@ -613,7 +622,7 @@ icuEnv.CppUnitTest(
         'background_job_test.cpp',
         'background_thread_clock_source_test.cpp',
         'base64_test.cpp',
-        'cancelation_test.cpp',
+        'cancellation_test.cpp',
         'clock_source_mock_test.cpp',
         'concepts_test.cpp',
         'container_size_helper_test.cpp',
@@ -669,7 +678,6 @@ icuEnv.CppUnitTest(
         'tick_source_test.cpp',
         'time_support_test.cpp',
         'unique_function_test.cpp',
-        'unowned_ptr_test.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
@@ -761,6 +769,9 @@ stacktraceEnv.CppUnitTest(
         'stacktrace_test.cpp',
     ],
     LIBDEPS=stacktrace_test_LIBDEPS,
+    EXPORT_SYMBOLS=[
+        'mongo_stacktrace_test_detail_testFunctionWithLinkage',
+    ],
 )
 
 stacktraceEnv.Benchmark(
@@ -776,8 +787,8 @@ env.Benchmark(
 )
 
 env.Benchmark(
-    target='cancelation_bm',
-    source='cancelation_bm.cpp',
+    target='cancellation_bm',
+    source='cancellation_bm.cpp',
 )
 
 env.Benchmark(

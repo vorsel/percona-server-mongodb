@@ -32,7 +32,7 @@
 #include <cmath>
 #include <limits>
 
-#include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/accumulator_for_window_functions.h"
 
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
@@ -45,11 +45,11 @@ namespace mongo {
 using boost::intrusive_ptr;
 
 // These don't make sense as accumulators, so only register them as window functions.
-REGISTER_NON_REMOVABLE_WINDOW_FUNCTION(
+REGISTER_WINDOW_FUNCTION(
     rank, mongo::window_function::ExpressionFromRankAccumulator<AccumulatorRank>::parse);
-REGISTER_NON_REMOVABLE_WINDOW_FUNCTION(
+REGISTER_WINDOW_FUNCTION(
     denseRank, mongo::window_function::ExpressionFromRankAccumulator<AccumulatorDenseRank>::parse);
-REGISTER_NON_REMOVABLE_WINDOW_FUNCTION(
+REGISTER_WINDOW_FUNCTION(
     documentNumber,
     mongo::window_function::ExpressionFromRankAccumulator<AccumulatorDocumentNumber>::parse);
 
@@ -107,7 +107,7 @@ intrusive_ptr<AccumulatorState> AccumulatorDocumentNumber::create(ExpressionCont
 }
 
 AccumulatorRankBase::AccumulatorRankBase(ExpressionContext* const expCtx)
-    : AccumulatorState(expCtx) {
+    : AccumulatorForWindowFunctions(expCtx) {
     _memUsageBytes = sizeof(*this);
 }
 

@@ -27,37 +27,22 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
 
-#include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/pipeline/document_source_internal_unpack_bucket.h"
-#include "mongo/db/views/view_catalog.h"
+#include "mongo/db/timeseries/timeseries_field_names.h"
+#include "mongo/db/timeseries/timeseries_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/logv2/redaction.h"
 
 namespace mongo {
 
 namespace timeseries {
 
-boost::optional<TimeseriesOptions> getTimeseriesOptions(OperationContext* opCtx,
-                                                        const NamespaceString& nss) {
-    auto viewCatalog = DatabaseHolder::get(opCtx)->getViewCatalog(opCtx, nss.db());
-    if (!viewCatalog) {
-        return {};
-    }
-
-    auto view = viewCatalog->lookupWithoutValidatingDurableViews(opCtx, nss.ns());
-    if (!view) {
-        return {};
-    }
-
-    // Return a copy of the time-series options so that we do not refer to the internal state of
-    // 'viewCatalog' after it goes out of scope.
-    return view->timeseries();
-}
-
-StatusWith<BSONObj> convertTimeseriesIndexSpecToBucketsIndexSpec(
+StatusWith<BSONObj> createBucketsIndexSpecFromTimeseriesIndexSpec(
     const TimeseriesOptions& timeseriesOptions, const BSONObj& timeseriesIndexSpecBSON) {
     auto timeField = timeseriesOptions.getTimeField();
     auto metaField = timeseriesOptions.getMetaField();
@@ -82,22 +67,14 @@ StatusWith<BSONObj> convertTimeseriesIndexSpecToBucketsIndexSpec(
             // the buckets collection for more efficient querying of buckets.
             if (elem.number() >= 0) {
                 builder.appendAs(
-                    elem,
-                    str::stream() << DocumentSourceInternalUnpackBucket::kControlMinFieldNamePrefix
-                                  << timeField);
+                    elem, str::stream() << timeseries::kControlMinFieldNamePrefix << timeField);
                 builder.appendAs(
-                    elem,
-                    str::stream() << DocumentSourceInternalUnpackBucket::kControlMaxFieldNamePrefix
-                                  << timeField);
+                    elem, str::stream() << timeseries::kControlMaxFieldNamePrefix << timeField);
             } else {
                 builder.appendAs(
-                    elem,
-                    str::stream() << DocumentSourceInternalUnpackBucket::kControlMaxFieldNamePrefix
-                                  << timeField);
+                    elem, str::stream() << timeseries::kControlMaxFieldNamePrefix << timeField);
                 builder.appendAs(
-                    elem,
-                    str::stream() << DocumentSourceInternalUnpackBucket::kControlMinFieldNamePrefix
-                                  << timeField);
+                    elem, str::stream() << timeseries::kControlMinFieldNamePrefix << timeField);
             }
             continue;
         }
@@ -105,14 +82,15 @@ StatusWith<BSONObj> convertTimeseriesIndexSpecToBucketsIndexSpec(
         if (!metaField) {
             return {ErrorCodes::BadValue,
                     str::stream() << "Invalid index spec for time-series collection: "
-                                  << redact(timeseriesIndexSpecBSON) << ". Index must be on the '"
-                                  << timeField << "' field: " << elem};
+                                  << redact(timeseriesIndexSpecBSON)
+                                  << ". Indexes are only allowed on the '" << timeField
+                                  << "' field, no other data fields are supported: " << elem};
         }
 
         if (elem.fieldNameStringData() == *metaField) {
             // The time-series 'metaField' field name always maps to a field named
-            // BucketUnpacker::kBucketMetaFieldName on the underlying buckets collection.
-            builder.appendAs(elem, BucketUnpacker::kBucketMetaFieldName);
+            // timeseries::kBucketMetaFieldName on the underlying buckets collection.
+            builder.appendAs(elem, timeseries::kBucketMetaFieldName);
             continue;
         }
 
@@ -120,7 +98,7 @@ StatusWith<BSONObj> convertTimeseriesIndexSpecToBucketsIndexSpec(
         if (elem.fieldNameStringData().startsWith(*metaField + ".")) {
             builder.appendAs(elem,
                              str::stream()
-                                 << BucketUnpacker::kBucketMetaFieldName << "."
+                                 << timeseries::kBucketMetaFieldName << "."
                                  << elem.fieldNameStringData().substr(metaField->size() + 1));
             continue;
         }
@@ -128,22 +106,22 @@ StatusWith<BSONObj> convertTimeseriesIndexSpecToBucketsIndexSpec(
         return {ErrorCodes::BadValue,
                 str::stream() << "Invalid index spec for time-series collection: "
                               << redact(timeseriesIndexSpecBSON)
-                              << ". Index must be either on the '" << *metaField << "' or '"
+                              << ". Indexes are only supported on the '" << *metaField << "' and '"
                               << timeField << "' fields: " << elem};
     }
 
     return builder.obj();
 }
 
-BSONObj convertBucketsIndexSpecToTimeseriesIndexSpec(const TimeseriesOptions& timeseriesOptions,
-                                                     const BSONObj& bucketsIndexSpecBSON) {
+boost::optional<BSONObj> createTimeseriesIndexSpecFromBucketsIndexSpec(
+    const TimeseriesOptions& timeseriesOptions, const BSONObj& bucketsIndexSpecBSON) {
     auto timeField = timeseriesOptions.getTimeField();
     auto metaField = timeseriesOptions.getMetaField();
 
     const std::string controlMinTimeField = str::stream()
-        << DocumentSourceInternalUnpackBucket::kControlMinFieldNamePrefix << timeField;
+        << timeseries::kControlMinFieldNamePrefix << timeField;
     const std::string controlMaxTimeField = str::stream()
-        << DocumentSourceInternalUnpackBucket::kControlMaxFieldNamePrefix << timeField;
+        << timeseries::kControlMaxFieldNamePrefix << timeField;
 
     BSONObjBuilder builder;
     for (const auto& elem : bucketsIndexSpecBSON) {
@@ -151,7 +129,7 @@ BSONObj convertBucketsIndexSpecToTimeseriesIndexSpec(const TimeseriesOptions& ti
         if (elem.fieldNameStringData() == controlMinTimeField) {
             if (!elem.isNumber()) {
                 // This index spec on the underlying buckets collection is not valid for
-                // time-series. Therefore, we will not convert the index spec..
+                // time-series. Therefore, we will not convert the index spec.
                 return {};
             }
 
@@ -170,16 +148,16 @@ BSONObj convertBucketsIndexSpecToTimeseriesIndexSpec(const TimeseriesOptions& ti
             return {};
         }
 
-        if (elem.fieldNameStringData() == BucketUnpacker::kBucketMetaFieldName) {
+        if (elem.fieldNameStringData() == timeseries::kBucketMetaFieldName) {
             builder.appendAs(elem, *metaField);
             continue;
         }
 
-        if (elem.fieldNameStringData().startsWith(BucketUnpacker::kBucketMetaFieldName + ".")) {
+        if (elem.fieldNameStringData().startsWith(timeseries::kBucketMetaFieldName + ".")) {
             builder.appendAs(elem,
                              str::stream() << *metaField << "."
                                            << elem.fieldNameStringData().substr(
-                                                  BucketUnpacker::kBucketMetaFieldName.size() + 1));
+                                                  timeseries::kBucketMetaFieldName.size() + 1));
             continue;
         }
 
@@ -189,6 +167,34 @@ BSONObj convertBucketsIndexSpecToTimeseriesIndexSpec(const TimeseriesOptions& ti
     }
 
     return builder.obj();
+}
+
+boost::optional<BSONObj> createTimeseriesIndexFromBucketsIndex(
+    const TimeseriesOptions& timeseriesOptions, const BSONObj& bucketsIndex) {
+    if (bucketsIndex.hasField(kKeyFieldName)) {
+        auto timeseriesKeyValue = createTimeseriesIndexSpecFromBucketsIndexSpec(
+            timeseriesOptions, bucketsIndex.getField(kKeyFieldName).Obj());
+        if (timeseriesKeyValue) {
+            // This creates a bsonobj copy with a modified kKeyFieldName field set to
+            // timeseriesKeyValue.
+            return bucketsIndex.addFields(BSON(kKeyFieldName << timeseriesKeyValue.get()),
+                                          StringDataSet{kKeyFieldName});
+        }
+    }
+    return boost::none;
+}
+
+std::list<BSONObj> createTimeseriesIndexesFromBucketsIndexes(
+    const TimeseriesOptions& timeseriesOptions, const std::list<BSONObj>& bucketsIndexes) {
+    std::list<BSONObj> indexSpecs;
+    for (const auto& bucketsIndex : bucketsIndexes) {
+        auto timeseriesIndex =
+            createTimeseriesIndexFromBucketsIndex(timeseriesOptions, bucketsIndex);
+        if (timeseriesIndex) {
+            indexSpecs.push_back(timeseriesIndex->getOwned());
+        }
+    }
+    return indexSpecs;
 }
 
 }  // namespace timeseries

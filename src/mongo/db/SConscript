@@ -171,6 +171,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         'auth/auth',
+        'auth/user_cache_acquisition_stats',
         'prepare_conflict_tracker',
         'stats/resource_consumption_metrics',
     ],
@@ -390,6 +391,7 @@ env.Library(
         "server_options_init.cpp",
     ],
     LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/db/audit",
         "$BUILD_DIR/mongo/util/processinfo",
         "$BUILD_DIR/mongo/util/signal_handlers",
     ],
@@ -473,8 +475,11 @@ env.Library(
         'write_concern_options',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/idl/feature_flag',
         '$BUILD_DIR/mongo/util/caching',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
+        'repl/repl_server_parameters',
+        'server_options_core',
         'vector_clock',
     ],
 )
@@ -628,7 +633,6 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         'api_parameters',
-        'create_indexes_idl',
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
@@ -643,6 +647,7 @@ env.Library(
         'auth/auth',
         'commands/server_status_core',
         'commands/test_commands_enabled',
+        'create_indexes_idl',
         'namespace_string',
     ],
 )
@@ -746,6 +751,7 @@ env.Library(
         'curop_failpoint_helpers',
         'dbdirectclient',
         'index/index_access_method',
+        'lasterror',
         'query_exec',
         'stats/fill_locker_info',
         'stats/top',
@@ -815,7 +821,6 @@ env.Library(
         'curop_metrics',
         'lasterror',
         'rw_concern_d',
-        's/sharding_runtime_d',
         'storage/storage_engine_common',
         'storage/storage_engine_lock_file',
         'storage/storage_engine_metadata',
@@ -824,6 +829,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         'commands/fsync_locked',
         'read_concern_d_impl',
+        's/sharding_runtime_d',
         'service_entry_point_common',
     ],
 )
@@ -864,6 +870,7 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
         '$BUILD_DIR/mongo/db/repl/tenant_migration_access_blocker',
+        "$BUILD_DIR/mongo/db/timeseries/bucket_catalog",
         '$BUILD_DIR/mongo/s/coreshard',
         "$BUILD_DIR/mongo/s/grid",
         'catalog/collection_options',
@@ -993,9 +1000,9 @@ env.Library(
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
         '$BUILD_DIR/mongo/db/catalog/index_build_entry_idl',
         '$BUILD_DIR/mongo/db/catalog/index_build_oplog_entry',
+        '$BUILD_DIR/mongo/db/catalog/multi_index_block',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
         '$BUILD_DIR/mongo/db/dbhelpers',
-
         '$BUILD_DIR/mongo/db/repl/cloner_utils',
         '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
         '$BUILD_DIR/mongo/db/repl/replica_set_messages',
@@ -1173,6 +1180,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/fsync_locked',
+        '$BUILD_DIR/mongo/db/record_id_helpers',
         '$BUILD_DIR/mongo/db/repl/tenant_migration_access_blocker',
         '$BUILD_DIR/mongo/idl/server_parameter',
         'catalog/database_holder',
@@ -1190,7 +1198,9 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
     ],
-)
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/storage/key_string',
+    ],)
 
 env.Library(
     target='query_exec',
@@ -1227,6 +1237,7 @@ env.Library(
         'exec/requires_collection_stage.cpp',
         'exec/requires_index_stage.cpp',
         'exec/return_key.cpp',
+        'exec/sample_from_timeseries_bucket.cpp',
         'exec/shard_filter.cpp',
         'exec/shard_filterer_impl.cpp',
         'exec/skip.cpp',
@@ -1238,6 +1249,7 @@ env.Library(
         'exec/trial_period_utils.cpp',
         'exec/trial_stage.cpp',
         'exec/update_stage.cpp',
+        'exec/unpack_timeseries_bucket.cpp',
         'exec/upsert_stage.cpp',
         'exec/working_set_common.cpp',
         'exec/write_stage_common.cpp',
@@ -1331,9 +1343,12 @@ env.Library(
         'update/update_driver',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/repl/local_oplog_info',
         'catalog/database_holder',
         'commands/server_status_core',
         'kill_sessions',
+        'lasterror',
+        'record_id_helpers',
         'stats/resource_consumption_metrics',
     ],
 )
@@ -1463,8 +1478,10 @@ env.Library(
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
         '$BUILD_DIR/mongo/s/write_ops/batch_write_types',
-        'create_indexes_idl',
         'logical_session_id',
+    ],
+    LIBDEPS_PRIVATE=[
+        'create_indexes_idl',
     ],
 )
 
@@ -1882,6 +1899,7 @@ env.Library(
         'commands/mongod',
         'index/index_access_methods',
         'index_builds_coordinator_mongod',
+        's/sharding_runtime_d',
         'service_context_d',
         'storage/devnull/storage_devnull',
         'storage/ephemeral_for_test/storage_ephemeral_for_test',
@@ -2141,13 +2159,9 @@ env.Library(
         'repl/storage_interface_impl',
         'repl/topology_coordinator',
         'rw_concern_d',
-        's/sessions_collection_config_server',
-        's/sharding_commands_d',
-        'service_context_d',
         'service_liaison_mongod',
         'sessions_collection_rs',
         'sessions_collection_standalone',
-        'startup_recovery',
         'startup_warnings_mongod',
         'stats/counters',
         'stats/serveronly_stats',
@@ -2318,19 +2332,19 @@ env.Library(
         '$BUILD_DIR/mongo/transport/transport_layer_mock',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/auth/auth',
-        '$BUILD_DIR/mongo/db/auth/authmocks',
-        '$BUILD_DIR/mongo/db/catalog/catalog_impl',
-        '$BUILD_DIR/mongo/db/index/index_access_methods',
-        '$BUILD_DIR/mongo/db/repl/replmocks',
-        '$BUILD_DIR/mongo/db/s/sharding_api_d',
-        '$BUILD_DIR/mongo/db/service_context_d',
-        '$BUILD_DIR/mongo/db/storage/ephemeral_for_test/storage_ephemeral_for_test',
-        '$BUILD_DIR/mongo/db/storage/storage_control',
-        '$BUILD_DIR/mongo/db/storage/storage_options',
         '$BUILD_DIR/mongo/rpc/rpc',
         '$BUILD_DIR/mongo/transport/service_entry_point',
         '$BUILD_DIR/mongo/unittest/unittest',
+        'auth/auth',
+        'auth/authmocks',
+        'catalog/catalog_impl',
+        'index/index_access_methods',
+        'repl/replmocks',
+        's/sharding_api_d',
+        'service_context_d',
+        'storage/ephemeral_for_test/storage_ephemeral_for_test',
+        'storage/storage_control',
+        'storage/storage_options',
     ],
 )
 
@@ -2454,9 +2468,11 @@ if wiredtiger:
             'query_exec',
             'range_arithmetic',
             'read_write_concern_defaults_mock',
+            'record_id_helpers',
             'repl/mock_repl_coord_server_fixture',
             'repl/oplog_interface_local',
             'repl/repl_coordinator_interface',
+            'repl/repl_server_parameters',
             'repl/replica_set_aware_service',
             'repl/replmocks',
             'repl/storage_interface_impl',

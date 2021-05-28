@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include "mongo/platform/basic.h"
 
@@ -77,8 +77,9 @@ UUID getCollectionUuid(OperationContext* opCtx, const NamespaceString& nss) {
 // are in a resharding operation so that we are guaranteed that migrations are suspended.
 bool documentBelongsToMe(OperationContext* opCtx,
                          CollectionShardingState* css,
+                         const ScopedCollectionDescription& collDesc,
                          const BSONObj& doc) {
-    auto currentKeyPattern = ShardKeyPattern(css->getCollectionDescription(opCtx).getKeyPattern());
+    auto currentKeyPattern = ShardKeyPattern(collDesc.getKeyPattern());
     auto ownershipFilter = css->getOwnershipFilter(
         opCtx, CollectionShardingState::OrphanCleanupPolicy::kAllowOrphanCleanup);
 
@@ -176,7 +177,6 @@ void validateReshardedChunks(const std::vector<mongo::BSONObj>& chunks,
             Grid::get(opCtx)->shardRegistry()->getShard(opCtx, chunk.getRecipientShardId()));
         validChunks.push_back(chunk);
     }
-
     checkForHolesAndOverlapsInChunks(validChunks, keyPattern);
 }
 
@@ -188,7 +188,7 @@ Timestamp getHighestMinFetchTimestamp(const std::vector<DonorShardEntry>& donorS
         auto donorFetchTimestamp = donor.getMutableState().getMinFetchTimestamp();
         uassert(4957300,
                 "All donors must have a minFetchTimestamp, but donor {} does not."_format(
-                    donor.getId()),
+                    StringData{donor.getId()}),
                 donorFetchTimestamp.is_initialized());
         if (maxMinFetchTimestamp < donorFetchTimestamp.value()) {
             maxMinFetchTimestamp = donorFetchTimestamp.value();
@@ -458,40 +458,32 @@ std::unique_ptr<Pipeline, PipelineDeleter> createOplogFetchingPipelineForReshard
 
 boost::optional<ShardId> getDestinedRecipient(OperationContext* opCtx,
                                               const NamespaceString& sourceNss,
-                                              const BSONObj& fullDocument) {
+                                              const BSONObj& fullDocument,
+                                              CollectionShardingState* css,
+                                              const ScopedCollectionDescription& collDesc) {
     if (!ShardingState::get(opCtx)->enabled()) {
         // Don't bother looking up the sharding state for the collection if the server isn't even
         // running with sharding enabled. We know there couldn't possibly be any resharding fields.
         return boost::none;
     }
 
-    auto css = CollectionShardingState::get(opCtx, sourceNss);
-
-    auto reshardingKeyPattern =
-        css->getCollectionDescription(opCtx).getReshardingKeyIfShouldForwardOps();
+    auto reshardingKeyPattern = collDesc.getReshardingKeyIfShouldForwardOps();
     if (!reshardingKeyPattern)
         return boost::none;
 
-    if (!documentBelongsToMe(opCtx, css, fullDocument))
+    if (!documentBelongsToMe(opCtx, css, collDesc, fullDocument))
         return boost::none;
 
     bool allowLocks = true;
-    auto tempNssRoutingInfo = Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
-        opCtx,
-        constructTemporaryReshardingNss(sourceNss.db(), getCollectionUuid(opCtx, sourceNss)),
-        allowLocks);
-
-    uassert(ShardInvalidatedForTargetingInfo(sourceNss),
-            "Routing information is not available for the temporary resharding collection.",
-            tempNssRoutingInfo.getStatus() != ErrorCodes::StaleShardVersion);
-
-    uassertStatusOK(tempNssRoutingInfo);
+    auto tempNssRoutingInfo =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(
+            opCtx,
+            constructTemporaryReshardingNss(sourceNss.db(), getCollectionUuid(opCtx, sourceNss)),
+            allowLocks));
 
     auto shardKey = reshardingKeyPattern->extractShardKeyFromDocThrows(fullDocument);
 
-    return tempNssRoutingInfo.getValue()
-        .findIntersectingChunkWithSimpleCollation(shardKey)
-        .getShardId();
+    return tempNssRoutingInfo.findIntersectingChunkWithSimpleCollation(shardKey).getShardId();
 }
 
 bool isFinalOplog(const repl::OplogEntry& oplog) {
@@ -527,5 +519,4 @@ NamespaceString getLocalConflictStashNamespace(UUID existingUUID, ShardId donorS
                            "localReshardingConflictStash.{}.{}"_format(existingUUID.toString(),
                                                                        donorShardId.toString())};
 }
-
 }  // namespace mongo

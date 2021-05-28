@@ -42,6 +42,7 @@
 #include "mongo/db/query/sbe_stage_builder.h"
 
 namespace mongo {
+class PlanYieldPolicy;
 namespace sbe {
 struct ParsedQueryTree {
     std::string identifier;
@@ -54,17 +55,20 @@ struct ParsedQueryTree {
     std::unique_ptr<PlanStage> stage;
     std::unique_ptr<EExpression> expr;
 
-    stdx::unordered_map<std::string, std::unique_ptr<EExpression>> projects;
+    // Sorted map for projects. Since by default the map will be sorted by the string, we will get
+    // deterministic order as we insert symbol string keys and expression values.
+    std::map<std::string, std::unique_ptr<EExpression>> projects;
 };
 
 using AstQuery = peg::AstBase<ParsedQueryTree>;
 
 class Parser {
 public:
-    Parser();
+    Parser(RuntimeEnvironment* env);
     std::unique_ptr<PlanStage> parse(OperationContext* opCtx,
                                      StringData defaultDb,
-                                     StringData line);
+                                     StringData line,
+                                     PlanYieldPolicy* yieldPolicy = nullptr);
 
     std::pair<boost::optional<value::SlotId>, boost::optional<value::SlotId>> getTopLevelSlots()
         const {
@@ -72,16 +76,18 @@ public:
     }
 
 private:
-    using SymbolTable = stdx::unordered_map<std::string, value::SlotId>;
-    using SpoolBufferLookupTable = stdx::unordered_map<std::string, SpoolId>;
+    using SymbolTable = std::map<std::string, value::SlotId>;
+    using SpoolBufferLookupTable = std::map<std::string, SpoolId>;
     peg::parser _parser;
     OperationContext* _opCtx{nullptr};
+    PlanYieldPolicy* _yieldPolicy{nullptr};
     std::string _defaultDb;
     SymbolTable _symbolsLookupTable;
     SpoolBufferLookupTable _spoolBuffersLookupTable;
     value::SlotIdGenerator _slotIdGenerator;
     value::SpoolIdGenerator _spoolIdGenerator;
     FrameId _frameId{0};
+    RuntimeEnvironment* _env;
     struct FrameSymbolTable {
         FrameId id;
         SymbolTable table;
@@ -121,7 +127,7 @@ private:
         return boost::none;
     }
     boost::optional<value::SlotId> lookupSlot(const std::string& name) {
-        if (name.empty()) {
+        if (name.empty() || name == DebugPrinter::kNoneKeyword) {
             return boost::none;
         } else if (_symbolsLookupTable.find(name) == _symbolsLookupTable.end()) {
             _symbolsLookupTable[name] = _slotIdGenerator.generate();
@@ -151,10 +157,10 @@ private:
     }
 
     template <typename T>
-    sbe::value::SlotMap<T> lookupSlots(stdx::unordered_map<std::string, T> map) {
+    sbe::value::SlotMap<T> lookupSlots(std::map<std::string, T> indentifiers) {
         sbe::value::SlotMap<T> result;
-        for (auto&& [k, v] : map) {
-            result[lookupSlotStrict(k)] = std::move(v);
+        for (auto&& [name, value] : indentifiers) {
+            result[lookupSlotStrict(name)] = std::move(value);
         }
         return result;
     }

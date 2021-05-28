@@ -91,6 +91,7 @@
 #include "mongo/db/stats/storage_stats.h"
 #include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/timeseries/timeseries_lookup.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/db/write_concern.h"
 #include "mongo/executor/async_request_executor.h"
@@ -122,7 +123,7 @@ std::unique_ptr<CollMod> makeTimeseriesCollModCommand(OperationContext* opCtx,
 
     auto index = origCmd.getIndex();
     if (index && index->getKeyPattern()) {
-        auto bucketsIndexSpecWithStatus = timeseries::convertTimeseriesIndexSpecToBucketsIndexSpec(
+        auto bucketsIndexSpecWithStatus = timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(
             *timeseriesOptions, *index->getKeyPattern());
 
         uassert(ErrorCodes::IndexNotFound,
@@ -397,7 +398,7 @@ public:
                 return 1;
             }
             exec = InternalPlanner::collectionScan(
-                opCtx, ns, &collection.getCollection(), PlanYieldPolicy::YieldPolicy::NO_YIELD);
+                opCtx, &collection.getCollection(), PlanYieldPolicy::YieldPolicy::NO_YIELD);
         } else if (min.isEmpty() || max.isEmpty()) {
             errmsg = "only one of min or max specified";
             return false;
@@ -576,8 +577,6 @@ public:
         // - It avoids any accidental changes to critical view-specific properties of the
         //   time-series collection, which are important for maintaining the view-bucket
         //   relationship.
-        // - It disallows hiding/unhiding indexes on the time-series collection due to a
-        //   restriction on system collections. TODO(SERVER-54646): Update this comment.
         //
         // 'timeseriesCmd' is null if the request namespace does not refer to a time-series
         // collection. Otherwise, transforms the user time-series index request to one on the
@@ -596,6 +595,9 @@ public:
         coll_mod_reply_validation::validateReply(reply);
     }
 
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::CollMod::kAuthorizationContract;
+    }
 } collectionModCommand;
 
 class DBStats : public ErrmsgCommandDeprecated {

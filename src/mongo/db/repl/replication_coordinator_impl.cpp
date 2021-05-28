@@ -63,6 +63,7 @@
 #include "mongo/db/kill_sessions_local.h"
 #include "mongo/db/mongod_options_storage_gen.h"
 #include "mongo/db/prepare_conflict_tracker.h"
+#include "mongo/db/read_write_concern_defaults.h"
 #include "mongo/db/repl/always_allow_non_local_writes.h"
 #include "mongo/db/repl/check_quorum_for_config_change.h"
 #include "mongo/db/repl/data_replicator_external_state_initial_sync.h"
@@ -702,6 +703,7 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         stdx::lock_guard<Latch> lk(_mutex);
         // Step down is impossible, so we don't need to wait for the returned event.
         _updateTerm_inlock(term);
+        _setImplicitDefaultWriteConcern(opCtx.get(), lk);
     }
     LOGV2_DEBUG(21320, 1, "Current term is now {term}", "Updated term", "term"_attr = term);
     _performPostMemberStateUpdateAction(action);
@@ -901,6 +903,14 @@ void ReplicationCoordinatorImpl::startup(
     }
 }
 
+void ReplicationCoordinatorImpl::_setImplicitDefaultWriteConcern(OperationContext* opCtx,
+                                                                 WithLock lk) {
+    auto& rwcDefaults = ReadWriteConcernDefaults::get(opCtx);
+    bool isImplicitDefaultWriteConcernMajority = _rsConfig.isImplicitDefaultWriteConcernMajority();
+    // TODO (SERVER-55689): Add validation for shard and config servers
+    rwcDefaults.setImplicitDefaultWriteConcernMajority(isImplicitDefaultWriteConcernMajority);
+}
+
 void ReplicationCoordinatorImpl::enterTerminalShutdown() {
     stdx::lock_guard lk(_mutex);
     _inTerminalShutdown = true;
@@ -1045,9 +1055,9 @@ Seconds ReplicationCoordinatorImpl::getSecondaryDelaySecs() const {
     return _rsConfig.getMemberAt(_selfIndex).getSecondaryDelay();
 }
 
-void ReplicationCoordinatorImpl::clearSyncSourceBlacklist() {
+void ReplicationCoordinatorImpl::clearSyncSourceDenylist() {
     stdx::lock_guard<Latch> lk(_mutex);
-    _topCoord->clearSyncSourceBlacklist();
+    _topCoord->clearSyncSourceDenylist();
 }
 
 Status ReplicationCoordinatorImpl::setFollowerModeRollback(OperationContext* opCtx) {
@@ -1187,7 +1197,9 @@ void ReplicationCoordinatorImpl::signalDrainComplete(OperationContext* opCtx,
                 return ReplSetConfig(std::move(config));
             };
             LOGV2(4508103, "Increment the config term via reconfig");
-            auto reconfigStatus = doReplSetReconfig(opCtx, getNewConfig, true /* force */);
+            // Since we are only bumping the config term, we can skip the config replication and
+            // quorum checks in reconfig.
+            auto reconfigStatus = doOptimizedReconfig(opCtx, getNewConfig);
             if (!reconfigStatus.isOK()) {
                 LOGV2(4508100,
                       "Automatic reconfig to increment the config term on stepup failed",
@@ -2956,7 +2968,8 @@ bool ReplicationCoordinatorImpl::isInPrimaryOrSecondaryState_UNSAFE() const {
 
 bool ReplicationCoordinatorImpl::shouldRelaxIndexConstraints(OperationContext* opCtx,
                                                              const NamespaceString& ns) {
-    if (ReplSettings::shouldRecoverFromOplogAsStandalone() || tenantMigrationRecipientInfo(opCtx)) {
+    if (ReplSettings::shouldRecoverFromOplogAsStandalone() || !recoverToOplogTimestamp.empty() ||
+        tenantMigrationRecipientInfo(opCtx)) {
         return true;
     }
     return !canAcceptWritesFor(opCtx, ns);
@@ -3317,9 +3330,21 @@ Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* opCt
     return doReplSetReconfig(opCtx, getNewConfig, args.force);
 }
 
+Status ReplicationCoordinatorImpl::doOptimizedReconfig(OperationContext* opCtx,
+                                                       GetNewConfigFn getNewConfig) {
+    return _doReplSetReconfig(opCtx, getNewConfig, false /* force */, true /* skipSafetyChecks*/);
+}
+
 Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
                                                      GetNewConfigFn getNewConfig,
                                                      bool force) {
+    return _doReplSetReconfig(opCtx, getNewConfig, force, false /* skipSafetyChecks*/);
+}
+
+Status ReplicationCoordinatorImpl::_doReplSetReconfig(OperationContext* opCtx,
+                                                      GetNewConfigFn getNewConfig,
+                                                      bool force,
+                                                      bool skipSafetyChecks) {
     stdx::unique_lock<Latch> lk(_mutex);
 
     while (_rsConfigState == kConfigPreStart || _rsConfigState == kConfigStartingUp) {
@@ -3350,7 +3375,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
 
     invariant(_rsConfig.isInitialized());
 
-    if (!force && !_readWriteAbility->canAcceptNonLocalWrites(lk)) {
+    if (!force && !_readWriteAbility->canAcceptNonLocalWrites(lk) && !skipSafetyChecks) {
         return Status(
             ErrorCodes::NotWritablePrimary,
             str::stream()
@@ -3359,7 +3384,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     }
     auto topCoordTerm = _topCoord->getTerm();
 
-    if (!force) {
+    if (!force && !skipSafetyChecks) {
         // For safety of reconfig, since we must commit a config in our own term before executing a
         // reconfig, so we should never have a config in an older term. If the current config was
         // installed via a force reconfig, we aren't concerned about this safety guarantee.
@@ -3371,7 +3396,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     // Construct a fake OpTime that can be accepted but isn't used.
     OpTime fakeOpTime(Timestamp(1, 1), topCoordTerm);
 
-    if (!force) {
+    if (!force && !skipSafetyChecks) {
         if (!_doneWaitingForReplication_inlock(fakeOpTime, configWriteConcern)) {
             return Status(ErrorCodes::CurrentConfigNotCommittedYet,
                           str::stream()
@@ -3419,7 +3444,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     // So, acquire FCV mutex lock in shared mode to block writers from modifying the fcv document
     // to make sure fcv is not changed between getNewConfig() and storing the new config
     // document locally.
-    FixedFCVRegion fixedFcvRegion(opCtx);
+    boost::optional<FixedFCVRegion> fixedFcvRegion(opCtx);
 
     // Call the callback to get the new config given the old one.
     auto newConfigStatus = getNewConfig(oldConfig, topCoordTerm);
@@ -3432,10 +3457,24 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     BSONObj newConfigObj = newConfig.toBSON();
     audit::logReplSetReconfig(opCtx->getClient(), &oldConfigObj, &newConfigObj);
 
-    bool isManualReconfig = opCtx->getClient()->hasRemote();
-    Status validateStatus = isManualReconfig
-        ? validateConfigForReconfig(oldConfig, newConfig, force)
-        : validateConfigForOplogReconfig(oldConfig, newConfig);
+    // Stepdown can interrupt the setFeatureCompatibilityVersion command after we've transitioned
+    // to the intermediary kUpgrading/kDowngrading state but before the reconfig to change the
+    // 'secondaryDelaySecs' field name. During a subsequent stepup's automatic reconfig, the config
+    // could have an incompatible field name based on the intermediate FCV, but since we must retry
+    // setFeatureCompatibilityVersion until we complete the upgrade/downgrade procedure, the
+    // reconfig to change the delay field name to the correct value will eventually succeed.
+    // Therefore, it is safe for us to skip the FCV compatibility check during the stepup reconfig
+    // to avoid crashing.
+    //
+    // (Generic FCV reference): feature flag support
+    // TODO (SERVER-53354): Remove this check once 5.0 becomes 'lastLTS'.
+    bool skipFCVCompatibilityCheck =
+        serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading() && skipSafetyChecks;
+
+    bool allowSplitHorizonIP = !opCtx->getClient()->hasRemote();
+
+    Status validateStatus = validateConfigForReconfig(
+        oldConfig, newConfig, force, allowSplitHorizonIP, skipFCVCompatibilityCheck);
     if (!validateStatus.isOK()) {
         LOGV2_ERROR(21420,
                     "replSetReconfig got {error} while validating {newConfig}",
@@ -3476,7 +3515,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     // 2) For fcv 4.7+, only if the current config doesn't contain the 'newlyAdded' field but the
     // new config got mutated to append 'newlyAdded' field.
     if (force || !needsFcvLock()) {
-        fixedFcvRegion.release();
+        fixedFcvRegion.reset();
     }
 
     if (MONGO_unlikely(ReconfigHangBeforeConfigValidationCheck.shouldFail())) {
@@ -3510,7 +3549,7 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
           "replSetReconfig config object parses ok",
           "numMembers"_attr = newConfig.getNumMembers());
 
-    if (!force && !MONGO_unlikely(omitConfigQuorumCheck.shouldFail())) {
+    if (!force && !skipSafetyChecks && !MONGO_unlikely(omitConfigQuorumCheck.shouldFail())) {
         LOGV2(4509600, "Executing quorum check for reconfig");
         status =
             checkQuorumForReconfig(_replExecutor.get(), newConfig, myIndex, _topCoord->getTerm());
@@ -3526,14 +3565,20 @@ Status ReplicationCoordinatorImpl::doReplSetReconfig(OperationContext* opCtx,
     LOGV2(51814, "Persisting new config to disk");
     {
         Lock::GlobalLock globalLock(opCtx, LockMode::MODE_IX);
-        if (!force && !_readWriteAbility->canAcceptNonLocalWrites(opCtx)) {
+        if (!force && !_readWriteAbility->canAcceptNonLocalWrites(opCtx) && !skipSafetyChecks) {
             return {ErrorCodes::NotWritablePrimary, "Stepped down when persisting new config"};
         }
 
         // Don't write no-op for internal and external force reconfig.
-        // For non-force reconfig, we are guaranteed the node is a writable primary.
+        // For non-force reconfigs with 'skipSafetyChecks' set to false, we are guaranteed that the
+        // node is a writable primary.
+        // When 'skipSafetyChecks' is true, it is possible the node is not yet a writable primary
+        // (eg. in the case where reconfig is called during stepup). In all other cases, we should
+        // still do the no-op write when possible.
         status = _externalState->storeLocalConfigDocument(
-            opCtx, newConfig.toBSON(), !force /* writeOplog */);
+            opCtx,
+            newConfig.toBSON(),
+            !force && _readWriteAbility->canAcceptNonLocalWrites(opCtx) /* writeOplog */);
         if (!status.isOK()) {
             LOGV2_ERROR(21422,
                         "replSetReconfig failed to store config document; {error}",
@@ -3646,6 +3691,16 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
         SimpleBSONObjComparator::kInstance.evaluate(oldConfig.toBSON() != newConfigCopy.toBSON());
     if (defaultDurableChanged || (isForceReconfig && contentChanged)) {
         _clearCommittedSnapshot_inlock();
+    }
+
+    // If 'enableDefaultWriteConcernUpdatesForInitiate' is enabled, we allow the IDWC to be
+    // recalculated after a reconfig. However, this logic is only relevant for testing,
+    // and should not be executed outside of our test infrastructure. This is needed due to an
+    // optimization in our ReplSetTest jstest fixture that initiates replica sets with only the
+    // primary, and then reconfigs the full membership set in. As a result, we must calculate
+    // the final IDWC only after the last node has been added to the set.
+    if (repl::enableDefaultWriteConcernUpdatesForInitiate.load()) {
+        _setImplicitDefaultWriteConcern(opCtx, lk);
     }
 
     lk.unlock();
@@ -3952,6 +4007,7 @@ void ReplicationCoordinatorImpl::_finishReplSetInitiate(OperationContext* opCtx,
     invariant(_rsConfigState == kConfigInitiating);
     invariant(!_rsConfig.isInitialized());
     auto action = _setCurrentRSConfig(lk, opCtx, newConfig, myIndex);
+    _setImplicitDefaultWriteConcern(opCtx, lk);
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
 }
@@ -4782,20 +4838,20 @@ HostAndPort ReplicationCoordinatorImpl::chooseNewSyncSource(const OpTime& lastOp
     return newSyncSource;
 }
 
-void ReplicationCoordinatorImpl::_unblacklistSyncSource(
+void ReplicationCoordinatorImpl::_undenylistSyncSource(
     const executor::TaskExecutor::CallbackArgs& cbData, const HostAndPort& host) {
     if (cbData.status == ErrorCodes::CallbackCanceled)
         return;
 
     stdx::lock_guard<Latch> lock(_mutex);
-    _topCoord->unblacklistSyncSource(host, _replExecutor->now());
+    _topCoord->undenylistSyncSource(host, _replExecutor->now());
 }
 
-void ReplicationCoordinatorImpl::blacklistSyncSource(const HostAndPort& host, Date_t until) {
+void ReplicationCoordinatorImpl::denylistSyncSource(const HostAndPort& host, Date_t until) {
     stdx::lock_guard<Latch> lock(_mutex);
-    _topCoord->blacklistSyncSource(host, until);
+    _topCoord->denylistSyncSource(host, until);
     _scheduleWorkAt(until, [=](const executor::TaskExecutor::CallbackArgs& cbData) {
-        _unblacklistSyncSource(cbData, host);
+        _undenylistSyncSource(cbData, host);
     });
 }
 

@@ -173,7 +173,7 @@ Seconds ReplicationCoordinatorNoOp::getSecondaryDelaySecs() const {
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::clearSyncSourceBlacklist() {
+void ReplicationCoordinatorNoOp::clearSyncSourceDenylist() {
     MONGO_UNREACHABLE;
 }
 
@@ -338,6 +338,11 @@ Status ReplicationCoordinatorNoOp::doReplSetReconfig(OperationContext* opCtx,
     MONGO_UNREACHABLE;
 }
 
+Status ReplicationCoordinatorNoOp::doOptimizedReconfig(OperationContext* opCtx,
+                                                       GetNewConfigFn getNewConfig) {
+    MONGO_UNREACHABLE;
+}
+
 Status ReplicationCoordinatorNoOp::awaitConfigCommitment(OperationContext* opCtx,
                                                          bool waitForOplogCommitment) {
     MONGO_UNREACHABLE;
@@ -388,7 +393,7 @@ HostAndPort ReplicationCoordinatorNoOp::chooseNewSyncSource(const OpTime&) {
     MONGO_UNREACHABLE;
 }
 
-void ReplicationCoordinatorNoOp::blacklistSyncSource(const HostAndPort&, Date_t) {
+void ReplicationCoordinatorNoOp::denylistSyncSource(const HostAndPort&, Date_t) {
     MONGO_UNREACHABLE;
 }
 

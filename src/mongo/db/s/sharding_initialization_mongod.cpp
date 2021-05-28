@@ -37,6 +37,7 @@
 #include "mongo/client/global_conn_pool.h"
 #include "mongo/client/remote_command_targeter_factory_impl.h"
 #include "mongo/client/replica_set_monitor.h"
+#include "mongo/db/audit.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/client_metadata_propagation_egress_hook.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -174,7 +175,7 @@ private:
     void _updateShardIdentityConfigString(Status status,
                                           std::string setName,
                                           ConnectionString update) {
-        if (ErrorCodes::isCancelationError(status.code())) {
+        if (ErrorCodes::isCancellationError(status.code())) {
             LOGV2_DEBUG(22067,
                         2,
                         "Unable to schedule confirmed replica set update due to {error}",
@@ -436,6 +437,10 @@ void ShardingInitializationMongoD::initializeFromShardIdentity(
     }
 
     Grid::get(opCtx)->setShardingInitialized();
+
+    if (audit::initializeSynchronizeJob) {
+        audit::initializeSynchronizeJob(opCtx->getServiceContext());
+    }
 }
 
 void ShardingInitializationMongoD::updateShardIdentityConfigString(
@@ -450,10 +455,9 @@ void ShardingInitializationMongoD::updateShardIdentityConfigString(
         write_ops::UpdateModification::parseFromClassicUpdate(updateObj));
 
     try {
-        AutoGetOrCreateDb autoDb(
-            opCtx, NamespaceString::kServerConfigurationNamespace.db(), MODE_X);
+        AutoGetDb autoDb(opCtx, NamespaceString::kServerConfigurationNamespace.db(), MODE_X);
 
-        auto result = update(opCtx, autoDb.getDb(), updateReq);
+        auto result = update(opCtx, autoDb.ensureDbExists(), updateReq);
         if (result.numMatched == 0) {
             LOGV2_WARNING(22076,
                           "Failed to update config server connection string of shard identity "

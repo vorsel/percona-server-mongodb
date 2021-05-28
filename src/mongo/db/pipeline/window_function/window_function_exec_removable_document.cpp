@@ -38,7 +38,10 @@ WindowFunctionExecRemovableDocument::WindowFunctionExecRemovableDocument(
     boost::intrusive_ptr<Expression> input,
     std::unique_ptr<WindowFunctionState> function,
     WindowBounds::DocumentBased bounds)
-    : WindowFunctionExecRemovable(iter, std::move(input), std::move(function)) {
+    : WindowFunctionExecRemovable(iter,
+                                  PartitionAccessor::Policy::kDefaultSequential,
+                                  std::move(input),
+                                  std::move(function)) {
     stdx::visit(
         visit_helper::Overloaded{
             [](const WindowBounds::Unbounded&) {
@@ -53,12 +56,14 @@ WindowFunctionExecRemovableDocument::WindowFunctionExecRemovableDocument(
     stdx::visit(
         visit_helper::Overloaded{
             [](const WindowBounds::Unbounded&) {
-                // Pass. _upperBound defaults to boost::none which represents no upper bound.
+                // Pass. _upperBound defaults to boost::none which represents no upper
+                // bound.
             },
             [&](const WindowBounds::Current&) { _upperBound = 0; },
             [&](const int& upperIndex) { _upperBound = upperIndex; },
         },
         bounds.upper);
+    _memUsageBytes = sizeof(*this);
 }
 
 void WindowFunctionExecRemovableDocument::initialize() {
@@ -67,30 +72,44 @@ void WindowFunctionExecRemovableDocument::initialize() {
     // bound.
     for (int i = lowerBoundForInit; !_upperBound || i <= _upperBound.get(); ++i) {
         // If this is false, we're over the end of the partition.
-        if (auto doc = (*this->_iter)[i]) {
-            addValue(_input->evaluate(*doc, nullptr));
+        if (auto doc = (this->_iter)[i]) {
+            Value valToAdd = _sortBy
+                ? Value(std::vector<Value>{
+                      _sortBy->evaluate(*doc, &_sortBy->getExpressionContext()->variables),
+                      _input->evaluate(*doc, &_input->getExpressionContext()->variables)})
+                : _input->evaluate(*doc, &_input->getExpressionContext()->variables);
+            addValue(valToAdd);
         } else {
             break;
         }
     }
+    _initialized = true;
 }
 
-void WindowFunctionExecRemovableDocument::processDocumentsToUpperBound() {
+void WindowFunctionExecRemovableDocument::update() {
+    if (!_initialized) {
+        initialize();
+        return;
+    }
+
     // If there is no upper bound, the whole partition is loaded by initialize.
     if (_upperBound) {
         // If this is false, we're over the end of the partition.
-        if (auto doc = (*this->_iter)[_upperBound.get()]) {
-            addValue(_input->evaluate(*doc, nullptr));
+        if (auto doc = (this->_iter)[_upperBound.get()]) {
+            Value valToAdd = _sortBy
+                ? Value(std::vector<Value>{
+                      _sortBy->evaluate(*doc, &_sortBy->getExpressionContext()->variables),
+                      _input->evaluate(*doc, &_input->getExpressionContext()->variables)})
+                : _input->evaluate(*doc, &_input->getExpressionContext()->variables);
+            addValue(valToAdd);
         }
     }
-}
 
-void WindowFunctionExecRemovableDocument::removeDocumentsUnderLowerBound() {
     // For a positive lower bound the first pass loads the correct window, so subsequent passes
     // must always remove a document if there is a document left to remove.
     // For a negative lower bound we can start removing every time only after we have seen
     // documents to fill the left side of the window.
-    if (_lowerBound >= 0 || _iter->getCurrentOffset() > abs(_lowerBound)) {
+    if (_lowerBound >= 0 || _iter.getCurrentPartitionIndex() > abs(_lowerBound)) {
         removeFirstValueIfExists();
     }
 }

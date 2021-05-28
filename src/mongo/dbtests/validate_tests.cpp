@@ -68,10 +68,7 @@ public:
     explicit ValidateBase(bool full, bool background, bool clustered)
         : _full(full), _background(background), _nss(_ns), _autoDb(nullptr), _db(nullptr) {
 
-        WriteUnitOfWork wuow(&_opCtx);
-        AutoGetOrCreateDb autoDb(&_opCtx, _nss.db(), MODE_X);
-        auto db = autoDb.getDb();
-        ASSERT_TRUE(db);
+        _supportsBackgroundValidation = storageGlobalParams.engine != "ephemeralForTest";
 
         _supportsClusteredIdIndex =
             _opCtx.getServiceContext()->getStorageEngine()->supportsClusteredIdIndex();
@@ -82,11 +79,15 @@ public:
         }
 
         const bool createIdIndex = !clustered;
-        auto coll = db->createCollection(&_opCtx, _nss, options, createIdIndex);
-        ASSERT_TRUE(coll);
-        wuow.commit();
 
-        _supportsBackgroundValidation = storageGlobalParams.engine != "ephemeralForTest";
+        AutoGetCollection autoColl(&_opCtx, _nss, MODE_IX);
+        auto db = autoColl.ensureDbExists();
+        ASSERT_TRUE(db) << _nss;
+
+        WriteUnitOfWork wuow(&_opCtx);
+        auto coll = db->createCollection(&_opCtx, _nss, options, createIdIndex);
+        ASSERT_TRUE(coll) << _nss;
+        wuow.commit();
     }
 
     explicit ValidateBase(bool full, bool background)
@@ -960,7 +961,7 @@ public:
         // Insert additional multikey path metadata index keys.
         lockDb(MODE_X);
         const RecordId recordId(
-            RecordId::reservedIdFor<int64_t>(RecordId::Reservation::kWildcardMultikeyMetadataId));
+            RecordIdReservations::reservedIdFor(ReservationId::kWildcardMultikeyMetadataId));
         const IndexCatalog* indexCatalog = coll->getIndexCatalog();
         auto descriptor = indexCatalog->findIndexByName(&_opCtx, indexName);
         auto accessMethod =
@@ -1088,8 +1089,8 @@ public:
         lockDb(MODE_X);
         {
             WriteUnitOfWork wunit(&_opCtx);
-            RecordId recordId(RecordId::reservedIdFor<int64_t>(
-                RecordId::Reservation::kWildcardMultikeyMetadataId));
+            RecordId recordId(
+                RecordIdReservations::reservedIdFor(ReservationId::kWildcardMultikeyMetadataId));
             const KeyString::Value indexKey =
                 KeyString::HeapBuilder(sortedDataInterface->getKeyStringVersion(),
                                        BSON("" << 1 << ""

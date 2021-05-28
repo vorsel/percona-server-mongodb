@@ -117,8 +117,9 @@ PlanState SpoolEagerProducerStage::getNext() {
 
 void SpoolEagerProducerStage::close() {
     auto optTimer(getOptTimer(_opCtx));
+    trackClose();
 
-    _commonStats.closes++;
+    _buffer->clear();
 }
 
 std::unique_ptr<PlanStageStats> SpoolEagerProducerStage::getStats(bool includeDebugInfo) const {
@@ -195,7 +196,7 @@ void SpoolLazyProducerStage::prepare(CompileCtx& ctx) {
         uassert(4822811, str::stream() << "duplicate field: " << slot, inserted);
 
         _inAccessors.emplace_back(_children[0]->getAccessor(ctx, slot));
-        _outAccessors.emplace(slot, value::ViewOfValueAccessor{});
+        _outAccessors.emplace(slot, value::OwnedValueAccessor{});
     }
 
     _compiled = true;
@@ -227,6 +228,9 @@ void SpoolLazyProducerStage::open(bool reOpen) {
 PlanState SpoolLazyProducerStage::getNext() {
     auto optTimer(getOptTimer(_opCtx));
 
+    // We are about to call getNext() on our child so do not bother saving our internal state in
+    // case it yields as the state will be completely overwritten after the getNext() call.
+    disableSlotAccess();
     auto state = _children[0]->getNext();
 
     if (state == PlanState::ADVANCED) {
@@ -243,7 +247,7 @@ PlanState SpoolLazyProducerStage::getNext() {
 
             for (size_t idx = 0; idx < _inAccessors.size(); ++idx) {
                 auto [tag, val] = _inAccessors[idx]->getViewOfValue();
-                _outAccessors[_vals[idx]].reset(tag, val);
+                _outAccessors[_vals[idx]].reset(false, tag, val);
 
                 auto [copyTag, copyVal] = value::copyValue(tag, val);
                 vals.reset(idx, true, copyTag, copyVal);
@@ -254,7 +258,7 @@ PlanState SpoolLazyProducerStage::getNext() {
             // Otherwise, just pass through the input values.
             for (size_t idx = 0; idx < _inAccessors.size(); ++idx) {
                 auto [tag, val] = _inAccessors[idx]->getViewOfValue();
-                _outAccessors[_vals[idx]].reset(tag, val);
+                _outAccessors[_vals[idx]].reset(false, tag, val);
             }
         }
     }
@@ -262,10 +266,23 @@ PlanState SpoolLazyProducerStage::getNext() {
     return trackPlanState(state);
 }
 
+void SpoolLazyProducerStage::doSaveState() {
+    if (!slotsAccessible()) {
+        return;
+    }
+
+    for (auto& [slot, accessor] : _outAccessors) {
+        accessor.makeOwned();
+    }
+}
+
 void SpoolLazyProducerStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
+
+    _buffer->clear();
+    _children[0]->close();
 }
 
 std::unique_ptr<PlanStageStats> SpoolLazyProducerStage::getStats(bool includeDebugInfo) const {

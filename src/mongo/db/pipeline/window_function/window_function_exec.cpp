@@ -28,8 +28,11 @@
  */
 
 #include "mongo/db/pipeline/window_function/window_function_exec.h"
+#include "mongo/db/pipeline/window_function/window_function_exec_derivative.h"
 #include "mongo/db/pipeline/window_function/window_function_exec_non_removable.h"
+#include "mongo/db/pipeline/window_function/window_function_exec_non_removable_range.h"
 #include "mongo/db/pipeline/window_function/window_function_exec_removable_document.h"
+#include "mongo/db/pipeline/window_function/window_function_exec_removable_range.h"
 
 namespace mongo {
 
@@ -54,27 +57,74 @@ std::unique_ptr<WindowFunctionExec> translateDocumentWindow(
         bounds.lower);
 }
 
+std::unique_ptr<WindowFunctionExec> translateDerivative(
+    PartitionIterator* iter,
+    const window_function::ExpressionDerivative& deriv,
+    const boost::optional<SortPattern>& sortBy) {
+    auto expCtx = deriv.expCtx();
+
+    tassert(5490703,
+            "$derivative requires a 1-field ascending sortBy",
+            sortBy && sortBy->size() == 1 && !sortBy->begin()->expression &&
+                sortBy->begin()->isAscending);
+    auto sortExpr = ExpressionFieldPath::createPathFromString(
+        expCtx, sortBy->begin()->fieldPath->fullPath(), expCtx->variablesParseState);
+
+    return std::make_unique<WindowFunctionExecDerivative>(
+        iter, deriv.input(), sortExpr, deriv.bounds(), deriv.outputUnit());
+}
+
+
 }  // namespace
 
 std::unique_ptr<WindowFunctionExec> WindowFunctionExec::create(
-    PartitionIterator* iter, const WindowFunctionStatement& functionStmt) {
+    ExpressionContext* expCtx,
+    PartitionIterator* iter,
+    const WindowFunctionStatement& functionStmt,
+    const boost::optional<SortPattern>& sortBy) {
 
-    // Use a sentinel variable to avoid a compilation error when some cases of std::visit don't
-    // return a value.
-    std::unique_ptr<WindowFunctionExec> exec;
-    stdx::visit(
+    if (auto deriv =
+            dynamic_cast<window_function::ExpressionDerivative*>(functionStmt.expr.get())) {
+        return translateDerivative(iter, *deriv, sortBy);
+    }
+
+    WindowBounds bounds = functionStmt.expr->bounds();
+
+    return stdx::visit(
         visit_helper::Overloaded{
-            [&](const WindowBounds::DocumentBased& docBase) {
-                exec = translateDocumentWindow(iter, functionStmt.expr, docBase);
+            [&](const WindowBounds::DocumentBased& docBounds) {
+                return translateDocumentWindow(iter, functionStmt.expr, docBounds);
             },
-            [&](const WindowBounds::RangeBased& rangeBase) {
-                uasserted(5397901, "Ranged based windows not currently supported");
+            [&](const WindowBounds::RangeBased& rangeBounds)
+                -> std::unique_ptr<WindowFunctionExec> {
+                // These checks should be enforced already during parsing.
+                tassert(5429401,
+                        "Range-based window needs a non-compound sortBy",
+                        sortBy != boost::none && sortBy->size() == 1);
+                SortPattern::SortPatternPart part = *sortBy->begin();
+                tassert(5429410,
+                        "Range-based window doesn't work on expression-sortBy",
+                        part.fieldPath != boost::none && !part.expression);
+                auto sortByExpr = ExpressionFieldPath::createPathFromString(
+                    expCtx, part.fieldPath->fullPath(), expCtx->variablesParseState);
+                if (stdx::holds_alternative<WindowBounds::Unbounded>(rangeBounds.lower)) {
+                    return std::make_unique<WindowFunctionExecNonRemovableRange>(
+                        iter,
+                        functionStmt.expr->input(),
+                        std::move(sortByExpr),
+                        functionStmt.expr->buildAccumulatorOnly(),
+                        bounds);
+                } else {
+                    return std::make_unique<WindowFunctionExecRemovableRange>(
+                        iter,
+                        functionStmt.expr->input(),
+                        std::move(sortByExpr),
+                        functionStmt.expr->buildRemovable(),
+                        bounds);
+                }
             },
-            [&](const WindowBounds::TimeBased& timeBase) {
-                uasserted(5397902, "Time based windows are not currently supported");
-            }},
-        functionStmt.expr->bounds().bounds);
-    return exec;
+        },
+        bounds.bounds);
 }
 
 }  // namespace mongo

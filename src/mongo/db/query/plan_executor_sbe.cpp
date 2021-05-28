@@ -27,6 +27,8 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/query/plan_executor_sbe.h"
@@ -37,8 +39,13 @@
 #include "mongo/db/query/plan_explainer_factory.h"
 #include "mongo/db/query/plan_insert_listener.h"
 #include "mongo/db/query/sbe_stage_builder.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/resharding/resume_token_gen.h"
 
 namespace mongo {
+// This failpoint is defined by the classic executor but is also accessed here.
+extern FailPoint planExecutorHangBeforeShouldWaitForInserts;
+
 PlanExecutorSBE::PlanExecutorSBE(OperationContext* opCtx,
                                  std::unique_ptr<CanonicalQuery> cq,
                                  sbe::CandidatePlans candidates,
@@ -72,9 +79,8 @@ PlanExecutorSBE::PlanExecutorSBE(OperationContext* opCtx,
         uassert(4822866, "Query does not have recordId slot.", _resultRecordId);
     }
 
-    if (auto slot = _rootData.outputs.getIfExists(stage_builder::PlanStageSlots::kOplogTs); slot) {
-        _oplogTs = _root->getAccessor(_rootData.ctx, *slot);
-        uassert(4822867, "Query does not have oplogTs slot.", _oplogTs);
+    if (_rootData.shouldTrackLatestOplogTimestamp) {
+        _oplogTs = _rootData.env->getAccessor(_rootData.env->getSlot("oplogTs"_sd));
     }
 
     if (winner.data.shouldUseTailableScan) {
@@ -95,6 +101,8 @@ PlanExecutorSBE::PlanExecutorSBE(OperationContext* opCtx,
     }
 
     const auto isMultiPlan = candidates.plans.size() > 0;
+
+    uassert(5088500, "Query does not have a valid CanonicalQuery", _cq);
     if (!_cq->getExpCtx()->explain) {
         // If we're not in explain mode, there is no need to keep rejected candidate plans around.
         candidates.plans.clear();
@@ -110,6 +118,7 @@ PlanExecutorSBE::PlanExecutorSBE(OperationContext* opCtx,
 void PlanExecutorSBE::saveState() {
     _root->saveState();
     _yieldPolicy->setYieldable(nullptr);
+    _lastGetNext = {};
 }
 
 void PlanExecutorSBE::restoreState(const RestoreContext& context) {
@@ -208,17 +217,14 @@ PlanExecutor::ExecState PlanExecutorSBE::getNext(BSONObj* out, RecordId* dlOut) 
     for (;;) {
         if (_state == State::kClosed) {
             if (_resumeRecordIdSlot) {
-                invariant(_resultRecordId);
-
-                auto [tag, val] = _resultRecordId->getViewOfValue();
                 uassert(4946306,
                         "Collection scan was asked to track resume token, but found a result "
                         "without a valid RecordId",
-                        tag == sbe::value::TypeTags::RecordId ||
-                            tag == sbe::value::TypeTags::Nothing);
-                _rootData.env->resetSlot(*_resumeRecordIdSlot, tag, val, false);
+                        _tagLastRecordId == sbe::value::TypeTags::RecordId ||
+                            _tagLastRecordId == sbe::value::TypeTags::Nothing);
+                _rootData.env->resetSlot(
+                    *_resumeRecordIdSlot, _tagLastRecordId, _valLastRecordId, false);
             }
-
             _state = State::kOpened;
             _root->open(false);
         }
@@ -230,6 +236,21 @@ PlanExecutor::ExecState PlanExecutorSBE::getNext(BSONObj* out, RecordId* dlOut) 
         if (result == sbe::PlanState::IS_EOF) {
             _root->close();
             _state = State::kClosed;
+            _lastGetNext = {};
+
+            if (MONGO_unlikely(planExecutorHangBeforeShouldWaitForInserts.shouldFail(
+                    [this](const BSONObj& data) {
+                        if (data.hasField("namespace") &&
+                            _nss != NamespaceString(data.getStringField("namespace"))) {
+                            return false;
+                        }
+                        return true;
+                    }))) {
+                LOGV2(5567001,
+                      "PlanExecutor - planExecutorHangBeforeShouldWaitForInserts fail point "
+                      "enabled. Blocking until fail point is disabled");
+                planExecutorHangBeforeShouldWaitForInserts.pauseWhileSet();
+            }
 
             if (!insert_listener::shouldWaitForInserts(_opCtx, _cq.get(), _yieldPolicy.get())) {
                 return PlanExecutor::ExecState::IS_EOF;
@@ -238,16 +259,26 @@ PlanExecutor::ExecState PlanExecutorSBE::getNext(BSONObj* out, RecordId* dlOut) 
             insert_listener::waitForInserts(_opCtx, _yieldPolicy.get(), &cappedInsertNotifierData);
             // There may be more results, keep going.
             continue;
+        } else if (_resumeRecordIdSlot) {
+            invariant(_resultRecordId);
+
+            std::tie(_tagLastRecordId, _valLastRecordId) = _resultRecordId->getViewOfValue();
         }
 
         invariant(result == sbe::PlanState::ADVANCED);
+        if (_mustReturnOwnedBson) {
+            _lastGetNext = *out;
+        }
         return PlanExecutor::ExecState::ADVANCED;
     }
 }
 
 Timestamp PlanExecutorSBE::getLatestOplogTimestamp() const {
     if (_rootData.shouldTrackLatestOplogTimestamp) {
-        invariant(_oplogTs);
+        tassert(5567201,
+                "The '_oplogTs' accessor should be populated when "
+                "'shouldTrackLatestOplogTimestamp' is true",
+                _oplogTs);
 
         auto [tag, val] = _oplogTs->getViewOfValue();
         if (tag != sbe::value::TypeTags::Nothing) {
@@ -278,6 +309,11 @@ BSONObj PlanExecutorSBE::getPostBatchResumeToken() const {
             return BSON("$recordId" << sbe::value::bitcastTo<int64_t>(val));
         }
     }
+
+    if (_rootData.shouldTrackLatestOplogTimestamp) {
+        return ResumeTokenOplogTimestamp{getLatestOplogTimestamp()}.toBSON();
+    }
+
     return {};
 }
 
@@ -288,11 +324,15 @@ sbe::PlanState fetchNext(sbe::PlanStage* root,
                          RecordId* dlOut,
                          bool returnOwnedBson) {
     invariant(out);
-
     auto state = root->getNext();
+
     if (state == sbe::PlanState::IS_EOF) {
+        tassert(5609900,
+                "Root stage returned EOF but root stage's CommonStats 'isEOF' field is false",
+                root->getCommonStats()->isEOF);
         return state;
     }
+
     invariant(state == sbe::PlanState::ADVANCED);
 
     if (resultSlot) {

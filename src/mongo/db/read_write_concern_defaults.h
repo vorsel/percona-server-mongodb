@@ -152,6 +152,18 @@ public:
      */
     void setDefault(OperationContext* opCtx, RWConcernDefault&& rwc);
 
+    /**
+     * Sets implicit default write concern whether it should be majority or not.
+     * Should be called once on startup.
+     */
+    void setImplicitDefaultWriteConcernMajority(bool newImplicitDefaultWCMajority);
+
+    /**
+     * Gets a bool indicating whether the implicit default write concern is majority.
+     * This function should only be used for testing purposes.
+     */
+    boost::optional<bool> getImplicitDefaultWriteConcernMajority_forTest();
+
 private:
     enum class Type { kReadWriteConcernEntry };
 
@@ -179,6 +191,9 @@ private:
 
     // Thread pool on which to perform loading of the cached RWC defaults
     ThreadPool _threadPool;
+
+    // Indicate whether implicit default write concern should be majority or not.
+    boost::optional<bool> _implicitDefaultWriteConcernMajority;
 };
 
 }  // namespace mongo

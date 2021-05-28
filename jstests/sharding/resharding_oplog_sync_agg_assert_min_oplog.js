@@ -1,7 +1,9 @@
 /**
  * Tests that the resharding operation will fail if a recipient shard would have missed oplog
  * entries from a donor shard.
- * @tags: [requires_fcv_47]
+ * @tags: [
+ *   requires_fcv_47,
+ * ]
  */
 (function() {
 "use strict";
@@ -9,7 +11,7 @@
 const rst = new ReplSetTest({
     // Set the syncdelay to 1s to speed up checkpointing.
     nodeOptions: {syncdelay: 1},
-    nodes: [{}, {rsConfig: {priority: 0, votes: 0}}]
+    nodes: 1
 });
 // Set max oplog size to 1MB.
 rst.startSet({oplogSize: 1});

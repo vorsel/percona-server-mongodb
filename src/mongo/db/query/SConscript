@@ -151,7 +151,7 @@ env.Library(
     source=[
         'cursor_response.idl',
     ],
-    LIBDEPS=[
+    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/idl/basic_types',
         '$BUILD_DIR/mongo/idl/idl_parser',
@@ -181,9 +181,11 @@ env.Library(
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/rpc/command_status',
         '$BUILD_DIR/mongo/rpc/rpc',
-        'cursor_response_idl',
         'query_request',
-    ]
+    ],
+    LIBDEPS_PRIVATE=[
+        "cursor_response_idl",
+    ],
 )
 
 env.Library(
@@ -200,12 +202,15 @@ env.Library(
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/api_parameters",
+        '$BUILD_DIR/mongo/db/auth/authprivilege',
         "$BUILD_DIR/mongo/db/catalog/collection_catalog",
         "$BUILD_DIR/mongo/db/commands/test_commands_enabled",
         "$BUILD_DIR/mongo/db/pipeline/runtime_constants_idl",
         "$BUILD_DIR/mongo/db/repl/read_concern_args",
-        "cursor_response_idl",
         "hint_parser",
+    ],
+    LIBDEPS_PRIVATE=[
+        "cursor_response_idl",
     ],
 )
 
@@ -360,7 +365,6 @@ env.CppUnitTest(
         "$BUILD_DIR/mongo/db/exec/sbe/sbe_plan_stage_test",
         "$BUILD_DIR/mongo/db/pipeline/aggregation_request_helper",
         "$BUILD_DIR/mongo/db/query_exec",
-        "$BUILD_DIR/mongo/db/service_context_d",
         "$BUILD_DIR/mongo/db/service_context_d_test_fixture",
         "$BUILD_DIR/mongo/db/service_context_test_fixture",
         "$BUILD_DIR/mongo/dbtests/mocklib",

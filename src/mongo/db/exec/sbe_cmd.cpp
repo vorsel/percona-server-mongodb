@@ -39,6 +39,8 @@
 #include "mongo/db/query/cursor_response.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/yield_policy_callbacks_impl.h"
 
 namespace mongo {
 /**
@@ -69,16 +71,31 @@ public:
         uassertStatusOK(CursorRequest::parseCommandCursorOptions(
             cmdObj, query_request_helper::kDefaultBatchSize, &batchSize));
 
-        sbe::Parser parser;
-        auto root = parser.parse(opCtx, dbname, cmdObj["sbe"].String());
+        NamespaceString nss{dbname};
+
+        auto yieldPolicy = std::make_unique<PlanYieldPolicySBE>(
+            PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
+            opCtx->getServiceContext()->getFastClockSource(),
+            internalQueryExecYieldIterations.load(),
+            Milliseconds{internalQueryExecYieldPeriodMS.load()},
+            nullptr,
+            std::make_unique<YieldPolicyCallbacksImpl>(nss));
+
+        auto env = std::make_unique<sbe::RuntimeEnvironment>();
+        sbe::Parser parser(env.get());
+        auto root = parser.parse(opCtx, dbname, cmdObj["sbe"].String(), yieldPolicy.get());
         auto [resultSlot, recordIdSlot] = parser.getTopLevelSlots();
 
         std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec;
         BSONArrayBuilder firstBatch;
 
-        NamespaceString nss{dbname};
 
-        stage_builder::PlanStageData data{std::make_unique<sbe::RuntimeEnvironment>()};
+        // Create a trivial cannonical query for the 'sbe' command execution.
+        auto statusWithCQ =
+            CanonicalQuery::canonicalize(opCtx, std::make_unique<FindCommandRequest>(nss));
+        std::unique_ptr<CanonicalQuery> cq = std::move(statusWithCQ.getValue());
+
+        stage_builder::PlanStageData data{std::move(env)};
 
         if (resultSlot) {
             data.outputs.set(stage_builder::PlanStageSlots::kResult, *resultSlot);
@@ -87,14 +104,15 @@ public:
             data.outputs.set(stage_builder::PlanStageSlots::kRecordId, *recordIdSlot);
         }
 
+        root->attachToOperationContext(opCtx);
         exec = uassertStatusOK(plan_executor_factory::make(opCtx,
-                                                           nullptr,
+                                                           std::move(cq),
                                                            nullptr,
                                                            {std::move(root), std::move(data)},
                                                            &CollectionPtr::null,
                                                            false, /* returnOwnedBson */
                                                            nss,
-                                                           nullptr));
+                                                           std::move(yieldPolicy)));
         for (long long objCount = 0; objCount < batchSize; objCount++) {
             BSONObj next;
             PlanExecutor::ExecState state = exec->getNext(&next, nullptr);
@@ -134,6 +152,18 @@ public:
             pinnedCursor.getCursor()->cursorid(), nss.ns(), firstBatch.arr(), &result);
 
         return true;
+    }
+
+    // This is a test-only command so shouldn't be enabled in production, but we try to require
+    // auth on new test commands anyway, just in case someone enables them by mistake.
+    Status checkAuthForOperation(OperationContext* opCtx,
+                                 const std::string& dbname,
+                                 const BSONObj& cmdObj) const override {
+        auto authSession = AuthorizationSession::get(opCtx->getClient());
+        if (!authSession->isAuthorizedForAnyActionOnAnyResourceInDB(dbname)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        }
+        return Status::OK();
     }
 };
 

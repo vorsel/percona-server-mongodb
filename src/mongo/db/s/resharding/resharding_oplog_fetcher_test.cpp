@@ -209,7 +209,7 @@ public:
 
     void create(NamespaceString nss) {
         writeConflictRetry(_opCtx, "create", nss.ns(), [&] {
-            AutoGetOrCreateDb dbRaii(_opCtx, nss.db(), LockMode::MODE_X);
+            AutoGetDb autoDb(_opCtx, nss.db(), LockMode::MODE_X);
             WriteUnitOfWork wunit(_opCtx);
             if (_opCtx->recoveryUnit()->getCommitTimestamp().isNull()) {
                 ASSERT_OK(_opCtx->recoveryUnit()->setTimestamp(Timestamp(1, 1)));
@@ -217,7 +217,8 @@ public:
 
             OperationShardingState::ScopedAllowImplicitCollectionCreate_UNSAFE
                 unsafeCreateCollection(_opCtx);
-            ASSERT(dbRaii.getDb()->createCollection(_opCtx, nss));
+            auto db = autoDb.ensureDbExists();
+            ASSERT(db->createCollection(_opCtx, nss)) << nss;
             wunit.commit();
         });
     }
@@ -307,8 +308,22 @@ public:
 
     long long metricsFetchedCount() const {
         BSONObjBuilder bob;
-        _metrics->serialize(&bob, ReshardingMetrics::ReporterOptions::Role::kRecipient);
+        _metrics->serializeCurrentOpMetrics(&bob,
+                                            ReshardingMetrics::ReporterOptions::Role::kRecipient);
         return bob.obj()["oplogEntriesFetched"_sd].Long();
+    }
+
+    CancelableOperationContextFactory makeCancelableOpCtx() {
+        auto cancelableOpCtxExecutor = std::make_shared<ThreadPool>([] {
+            ThreadPool::Options options;
+            options.poolName = "TestReshardOplogFetcherCancelableOpCtxPool";
+            options.minThreads = 1;
+            options.maxThreads = 1;
+            return options;
+        }());
+
+        return CancelableOperationContextFactory(operationContext()->getCancellationToken(),
+                                                 cancelableOpCtxExecutor);
     }
 
 protected:
@@ -347,7 +362,8 @@ TEST_F(ReshardingOplogFetcherTest, TestBasic) {
         fetcher.useReadConcernForTest(false);
         fetcher.setInitialBatchSizeForTest(2);
 
-        fetcher.iterate(&cc());
+        auto factory = makeCancelableOpCtx();
+        fetcher.iterate(&cc(), factory);
     });
 
     requestPassthroughHandler(fetcherJob);
@@ -380,7 +396,8 @@ TEST_F(ReshardingOplogFetcherTest, TestTrackLastSeen) {
         fetcher.setInitialBatchSizeForTest(2);
         fetcher.setMaxBatchesForTest(maxBatches);
 
-        fetcher.iterate(&cc());
+        auto factory = makeCancelableOpCtx();
+        fetcher.iterate(&cc(), factory);
         return fetcher.getLastSeenTimestamp();
     });
 
@@ -417,7 +434,8 @@ TEST_F(ReshardingOplogFetcherTest, TestFallingOffOplog) {
         // Status has a private default constructor so we wrap it in a boost::optional to placate
         // the Windows compiler.
         try {
-            fetcher.iterate(&cc());
+            auto factory = makeCancelableOpCtx();
+            fetcher.iterate(&cc(), factory);
             // Test failure case.
             return boost::optional<Status>(Status::OK());
         } catch (...) {
@@ -466,7 +484,8 @@ TEST_F(ReshardingOplogFetcherTest, TestAwaitInsert) {
         ThreadClient tc("RunnerForFetcher", _svcCtx, nullptr);
         fetcher.useReadConcernForTest(false);
         fetcher.setInitialBatchSizeForTest(2);
-        return fetcher.iterate(&cc());
+        auto factory = makeCancelableOpCtx();
+        return fetcher.iterate(&cc(), factory);
     });
     ASSERT_TRUE(requestPassthroughHandler(fetcherJob));
     ASSERT_FALSE(hasSeenStartAtFuture.isReady());
@@ -492,7 +511,8 @@ TEST_F(ReshardingOplogFetcherTest, TestAwaitInsert) {
         ThreadClient tc("RunnerForFetcher", _svcCtx, nullptr);
         fetcher.useReadConcernForTest(false);
         fetcher.setInitialBatchSizeForTest(2);
-        return fetcher.iterate(&cc());
+        auto factory = makeCancelableOpCtx();
+        return fetcher.iterate(&cc(), factory);
     });
     ASSERT_TRUE(requestPassthroughHandler(fetcherJob));
     ASSERT_TRUE(hasSeenStartAtFuture.isReady());

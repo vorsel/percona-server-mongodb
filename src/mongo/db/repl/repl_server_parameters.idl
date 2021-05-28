@@ -218,6 +218,16 @@ server_parameters:
             gte: 1
             lte: 256
 
+    replWriterMinThreadCount:
+        description: The minimum number of threads in the thread pool used to apply the oplog
+        set_at: startup
+        cpp_vartype: int
+        cpp_varname: replWriterMinThreadCount
+        default: 0
+        validator:
+            gte: 0
+            lte: 256
+
     replBatchLimitOperations:
         description: The maximum number of operations to apply in a single batch
         set_at: [ startup, runtime ]
@@ -433,7 +443,12 @@ server_parameters:
         set_at: startup
         cpp_vartype: int
         cpp_varname: maxTenantMigrationDonorServiceThreadPoolSize
-        default: 8
+        # Currently, the donor service blocks a service thread when loading cluster time keys from
+        # the recipient. The number of keys to copy is small so the blocking should be short, but
+        # to guarantee 50 concurrent migrations are supported, we set the thread pool size to 50.
+        #
+        # TODO SERVER-54208: Lower this value when loading keys is asynchronous.
+        default: 50
         validator:
             gte: 1
 
@@ -467,6 +482,27 @@ server_parameters:
         validator:
             gte: 1
 
+    enableDefaultWriteConcernUpdatesForInitiate:
+        description: >-
+            When enabled, allow the default write concern to be updated in the replica set
+            initiate process. This parameter should only ever be enabled in our testing
+            infrastructure, as using it in production may lead to undefined behavior. 
+        set_at: [ startup, runtime ]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: enableDefaultWriteConcernUpdatesForInitiate
+        default: false
+
+    startupRecoveryForRestore:
+        description: >-
+            When set, do startup recovery in such a way that the history of the recovered
+            operations is not preserved.  At the end of startup recovery, snapshot reads before
+            the recovered top of oplog will not be possible.  Reduces cache pressure when
+            recovering many oplog entries, as when restoring from backup in some scenarios.
+        set_at: startup
+        cpp_vartype: bool
+        cpp_varname: startupRecoveryForRestore
+        default: false
+
 feature_flags:
     featureFlagTenantMigrations:
         description: >-
@@ -481,3 +517,10 @@ feature_flags:
         cpp_varname: feature_flags::gUseSecondaryDelaySecs
         default: true
         version: 4.9
+
+    featureFlagDefaultWriteConcernMajority:
+        description: >-
+            When enabled, default write concern might be set to majority following the default write
+            concern formula if there is no cluster wide write concern (CWWC).
+        cpp_varname: feature_flags::gDefaultWCMajority
+        default: false

@@ -57,18 +57,6 @@
 
 namespace mongo::stage_builder {
 namespace {
-std::pair<sbe::value::TypeTags, sbe::value::Value> convertFrom(Value val) {
-    // TODO: Either make this conversion unnecessary by changing the value representation in
-    // ExpressionConstant, or provide a nicer way to convert directly from Document/Value to
-    // sbe::Value.
-    BSONObjBuilder bob;
-    val.addToBsonObj(&bob, ""_sd);
-    auto obj = bob.done();
-    auto be = obj.objdata();
-    auto end = be + sbe::value::readFromMemory<uint32_t>(be);
-    return sbe::bson::convertFrom(false, be + 4, end, 0);
-}
-
 struct ExpressionVisitorContext {
     struct VarsFrame {
         std::deque<Variables::Id> variablesToBind;
@@ -271,6 +259,7 @@ void generateStringCaseConversionExpression(ExpressionVisitorContext* _context,
     uint32_t typeMask = (getBSONTypeMask(sbe::value::TypeTags::StringSmall) |
                          getBSONTypeMask(sbe::value::TypeTags::StringBig) |
                          getBSONTypeMask(sbe::value::TypeTags::bsonString) |
+                         getBSONTypeMask(sbe::value::TypeTags::bsonSymbol) |
                          getBSONTypeMask(sbe::value::TypeTags::NumberInt32) |
                          getBSONTypeMask(sbe::value::TypeTags::NumberInt64) |
                          getBSONTypeMask(sbe::value::TypeTags::NumberDouble) |
@@ -484,6 +473,7 @@ public:
     void visit(ExpressionToHashedIndexKey* expr) final {}
     void visit(ExpressionDateAdd* expr) final {}
     void visit(ExpressionDateSubtract* expr) final {}
+    void visit(ExpressionGetField* expr) final {}
 
 private:
     void visitMultiBranchLogicExpression(Expression* expr, sbe::EPrimBinary::Op logicOp) {
@@ -683,6 +673,7 @@ public:
     void visit(ExpressionToHashedIndexKey* expr) final {}
     void visit(ExpressionDateAdd* expr) final {}
     void visit(ExpressionDateSubtract* expr) final {}
+    void visit(ExpressionGetField* expr) final {}
 
 private:
     void visitMultiBranchLogicExpression(Expression* expr, sbe::EPrimBinary::Op logicOp) {
@@ -726,7 +717,7 @@ public:
     };
 
     void visit(ExpressionConstant* expr) final {
-        auto [tag, val] = convertFrom(expr->getValue());
+        auto [tag, val] = makeValue(expr->getValue());
         _context->pushExpr(sbe::makeE<sbe::EConstant>(tag, val));
     }
 
@@ -1172,7 +1163,7 @@ public:
             collatorSlot,
             _context->planNodeId);
 
-        // Create a branch stage to select between the branch that produces one null if any eleemnts
+        // Create a branch stage to select between the branch that produces one null if any elements
         // in the original input were null or missing, or otherwise select the branch that unwinds
         // and concatenates elements into the output array.
         auto [nullExpr, nullStage] = makeNullLimitCoscanTree();
@@ -1781,16 +1772,30 @@ public:
             sbe::makeE<sbe::ELocalBind>(frameId, std::move(binds), std::move(expExpr)));
     }
     void visit(ExpressionFieldPath* expr) final {
-        if (expr->getVariableId() == Variables::kRemoveId) {
-            // The case of $$REMOVE. Note that MQL allows a path in this situation (e.g.,
-            // "$$REMOVE.foo.bar") but ignores it.
-            _context->pushExpr(sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Nothing, 0));
-            return;
-        }
-
         sbe::value::SlotId slotId;
-        if (expr->isRootFieldPath()) {
-            slotId = _context->rootSlot;
+
+        if (!Variables::isUserDefinedVariable(expr->getVariableId())) {
+            if (expr->getVariableId() == Variables::kRootId) {
+                slotId = _context->rootSlot;
+            } else if (expr->getVariableId() == Variables::kRemoveId) {
+                // For the field paths that begin with "$$REMOVE", we always produce Nothing,
+                // so no traversal is necessary.
+                _context->pushExpr(sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Nothing, 0));
+                return;
+            } else {
+                auto it = Variables::kIdToBuiltinVarName.find(expr->getVariableId());
+                tassert(5611300,
+                        "Encountered unexpected system variable ID",
+                        it != Variables::kIdToBuiltinVarName.end());
+
+                auto variableSlot = _context->runtimeEnvironment->getSlotIfExists(it->second);
+                uassert(5611301,
+                        str::stream()
+                            << "Builtin variable '$$" << it->second << "' is not available",
+                        variableSlot.has_value());
+
+                slotId = *variableSlot;
+            }
         } else {
             auto it = _context->environment.find(expr->getVariableId());
             invariant(it != _context->environment.end());
@@ -2389,12 +2394,22 @@ public:
                                 _context->runtimeEnvironment);
         };
 
-        // Check that each argument exists, is not null, and is a string. Fails if the delimiter is
-        // an empty string. Returns [""] if the string input is an empty string, otherwise calls
-        // builtinSplit.
+        auto checkIsNullOrMissing = makeBinaryOp(sbe::EPrimBinary::logicOr,
+                                                 generateNullOrMissing(stringExpressionRef),
+                                                 generateNullOrMissing(delimiterRef));
+
+        // In order to maintain MQL semantics, first check both the string expression
+        // (first agument), and delimiter string (second argument) for null, undefined, or
+        // missing, and if either is nullish make the entire expression return null. Only
+        // then make further validity checks against the input. Fail if the delimiter is an empty
+        // string. Return [""] if the string expression is an empty string.
         auto totalSplitFunc = buildMultiBranchConditional(
-            CaseValuePair{generateNullOrMissing(delimiterRef),
+            CaseValuePair{std::move(checkIsNullOrMissing),
                           sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
+            CaseValuePair{generateNonStringCheck(stringExpressionRef),
+                          sbe::makeE<sbe::EFail>(
+                              ErrorCodes::Error{5155402},
+                              str::stream() << "$split string expression must be a string")},
             CaseValuePair{
                 generateNonStringCheck(delimiterRef),
                 sbe::makeE<sbe::EFail>(ErrorCodes::Error{5155400},
@@ -2403,12 +2418,6 @@ public:
                           sbe::makeE<sbe::EFail>(
                               ErrorCodes::Error{5155401},
                               str::stream() << "$split delimiter must not be an empty string")},
-            CaseValuePair{generateNullOrMissing(stringExpressionRef),
-                          sbe::makeE<sbe::EConstant>(sbe::value::TypeTags::Null, 0)},
-            CaseValuePair{generateNonStringCheck(stringExpressionRef),
-                          sbe::makeE<sbe::EFail>(
-                              ErrorCodes::Error{5155402},
-                              str::stream() << "$split string expression must be a string")},
             sbe::makeE<sbe::EIf>(
                 generateIsEmptyString(stringExpressionRef),
                 sbe::makeE<sbe::EConstant>(arrayWithEmptyStringTag, arrayWithEmptyStringVal),
@@ -2640,6 +2649,10 @@ public:
 
     void visit(ExpressionDateSubtract* expr) final {
         generateDateArithmeticsExpression(expr, "dateSubtract");
+    }
+
+    void visit(ExpressionGetField* expr) final {
+        unsupportedExpression("$getField");
     }
 
 private:

@@ -29,12 +29,13 @@
 
 #pragma once
 
+#include "mongo/base/status_with.h"
 #include "mongo/bson/bsonobj.h"
-#include "mongo/db/timeseries/timeseries_gen.h"
 
 namespace mongo {
 
 class OperationContext;
+class TimeseriesOptions;
 
 /**
  * Namespace for helper functions converting index spec schema between time-series collection and
@@ -43,27 +44,20 @@ class OperationContext;
 namespace timeseries {
 
 /**
- * Returns a copy of the time-series options for namespace 'nss', if 'nss' refers to a time-series
- * collection. Otherwise returns boost::none.
- */
-boost::optional<TimeseriesOptions> getTimeseriesOptions(OperationContext* opCtx,
-                                                        const NamespaceString& nss);
-
-/**
  * Maps the time-series collection index spec 'timeseriesIndexSpecBSON' to the index schema of the
  * underlying bucket collection using the information provided in 'timeseriesOptions'.
  *
  * Returns an error if the specified 'timeseriesKeyBSON' is invalid for the time-series collection.
  */
-StatusWith<BSONObj> convertTimeseriesIndexSpecToBucketsIndexSpec(
+StatusWith<BSONObj> createBucketsIndexSpecFromTimeseriesIndexSpec(
     const TimeseriesOptions& timeseriesOptions, const BSONObj& timeseriesIndexSpecBSON);
 
 /**
  * Maps the buckets collection index spec 'bucketsIndexSpecBSON' to the index schema of the
  * time-series collection using the information provided in 'timeseriesOptions'.
  *
- * If 'bucketsIndexSpecBSON' does not match a valid time-series index format, then an empty BSONObj
- * is returned.
+ * If 'bucketsIndexSpecBSON' does not match a valid time-series index format, then boost::none is
+ * returned.
  *
  * Conversion Example:
  * On a time-series collection with 'tm' time field and 'mm' metadata field,
@@ -79,8 +73,27 @@ StatusWith<BSONObj> convertTimeseriesIndexSpecToBucketsIndexSpec(
  *     'tm': 1
  * }
  */
-BSONObj convertBucketsIndexSpecToTimeseriesIndexSpec(const TimeseriesOptions& timeseriesOptions,
-                                                     const BSONObj& bucketsIndexSpecBSON);
+boost::optional<BSONObj> createTimeseriesIndexSpecFromBucketsIndexSpec(
+    const TimeseriesOptions& timeseriesOptions, const BSONObj& bucketsIndexSpecBSON);
+
+/**
+ * Returns a time-series collection index spec equivalent to the given 'bucketsIndex' using the
+ * time-series specifications provided in 'timeseriesOptions'. Returns boost::none if the
+ * buckets index is not supported on a time-series collection.
+ *
+ * Copies and modifies the 'key' field of the buckets index, but otherwises copies all of the fields
+ * over unaltered.
+ */
+boost::optional<BSONObj> createTimeseriesIndexFromBucketsIndex(
+    const TimeseriesOptions& timeseriesOptions, const BSONObj& bucketsIndex);
+
+/**
+ * Returns a list of time-series collection index specs equivalent to the given 'bucketsIndexSpecs'
+ * using the time-series specifications provided in 'timeseriesOptions'. If any of the buckets
+ * indexes is not supported on a time-series collection, it will be ommitted from the results.
+ */
+std::list<BSONObj> createTimeseriesIndexesFromBucketsIndexes(
+    const TimeseriesOptions& timeseriesOptions, const std::list<BSONObj>& bucketsIndexes);
 
 }  // namespace timeseries
 }  // namespace mongo

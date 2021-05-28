@@ -62,7 +62,7 @@
 #include "mongo/db/write_concern.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/logv2/log.h"
-#include "mongo/util/cancelation.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future_util.h"
 
 namespace mongo {
@@ -127,7 +127,7 @@ StatusWith<int> deleteNextBatch(OperationContext* opCtx,
                                 int numDocsToRemovePerBatch) {
     invariant(collection);
 
-    auto const& nss = collection->ns();
+    auto const nss = collection->ns();
 
     // The IndexChunk has a keyPattern that may apply to more than one index - we need to
     // select the index and get the full index keyPattern here.
@@ -188,7 +188,7 @@ StatusWith<int> deleteNextBatch(OperationContext* opCtx,
                                                      min,
                                                      max,
                                                      BoundInclusion::kIncludeStartKeyOnly,
-                                                     PlanYieldPolicy::YieldPolicy::YIELD_MANUAL,
+                                                     PlanYieldPolicy::YieldPolicy::YIELD_AUTO,
                                                      InternalPlanner::FORWARD);
 
     if (MONGO_unlikely(hangBeforeDoingDeletion.shouldFail())) {
@@ -356,7 +356,7 @@ ExecutorFuture<void> deleteRangeInBatches(const std::shared_ptr<executor::TaskEx
                 ErrorCodes::isNotPrimaryError(swNumDeleted.getStatus());
         })
         .withDelayBetweenIterations(delayBetweenBatches)
-        .on(executor, CancelationToken::uncancelable())
+        .on(executor, CancellationToken::uncancelable())
         .ignoreValue();
 }
 
@@ -406,7 +406,7 @@ ExecutorFuture<void> waitForDeletionsToMajorityReplicate(
 
         // Asynchronously wait for majority write concern.
         return WaitForMajorityService::get(opCtx->getServiceContext())
-            .waitUntilMajority(clientOpTime, CancelationToken::uncancelable())
+            .waitUntilMajority(clientOpTime, CancellationToken::uncancelable())
             .thenRunOn(executor);
     });
 }

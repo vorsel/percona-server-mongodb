@@ -131,6 +131,13 @@ public:
         return boost::none;
     }
 
+    std::pair<BSONObj, bool> extractComputedProjections(
+        const StringData& oldName,
+        const StringData& newName,
+        const std::set<StringData>& reservedNames) final {
+        return _root->extractComputedProjectionsInAddFields(oldName, newName, reservedNames);
+    }
+
 private:
     /**
      * Attempts to parse 'objSpec' as an expression like {$add: [...]}. Adds a computed field to

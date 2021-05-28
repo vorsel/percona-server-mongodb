@@ -29,6 +29,8 @@
 #ifndef CONFIGURATION_H
 #define CONFIGURATION_H
 
+#include <string>
+
 extern "C" {
 #include "test_util.h"
 }
@@ -81,7 +83,7 @@ class configuration {
     {
         WT_CONFIG_ITEM temp_value;
         testutil_check(_config_parser->get(_config_parser, key.c_str(), &temp_value));
-        if (temp_value.type != WT_CONFIG_ITEM::WT_CONFIG_ITEM_STRING ||
+        if (temp_value.type != WT_CONFIG_ITEM::WT_CONFIG_ITEM_STRING &&
           temp_value.type != WT_CONFIG_ITEM::WT_CONFIG_ITEM_ID)
             return (-1);
         value = std::string(temp_value.str, temp_value.len);
@@ -108,6 +110,14 @@ class configuration {
             return (-1);
         value = temp_value.val;
         return (0);
+    }
+
+    configuration *
+    get_subconfig(const std::string &key) const
+    {
+        WT_CONFIG_ITEM subconfig;
+        testutil_check(get(key, &subconfig));
+        return new configuration(subconfig);
     }
 
     /*

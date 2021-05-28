@@ -159,7 +159,7 @@ Seconds ReplicationCoordinatorMock::getSecondaryDelaySecs() const {
     return Seconds(0);
 }
 
-void ReplicationCoordinatorMock::clearSyncSourceBlacklist() {}
+void ReplicationCoordinatorMock::clearSyncSourceDenylist() {}
 
 ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorMock::awaitReplication(
     OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern) {
@@ -437,6 +437,11 @@ Status ReplicationCoordinatorMock::doReplSetReconfig(OperationContext* opCtx,
     return Status::OK();
 }
 
+Status ReplicationCoordinatorMock::doOptimizedReconfig(OperationContext* opCtx,
+                                                       GetNewConfigFn getNewConfig) {
+    return Status::OK();
+}
+
 Status ReplicationCoordinatorMock::awaitConfigCommitment(OperationContext* opCtx,
                                                          bool waitForOplogCommitment) {
     return Status::OK();
@@ -491,7 +496,7 @@ HostAndPort ReplicationCoordinatorMock::chooseNewSyncSource(const OpTime& lastOp
     return HostAndPort();
 }
 
-void ReplicationCoordinatorMock::blacklistSyncSource(const HostAndPort& host, Date_t until) {}
+void ReplicationCoordinatorMock::denylistSyncSource(const HostAndPort& host, Date_t until) {}
 
 void ReplicationCoordinatorMock::resetLastOpTimesFromOplog(OperationContext* opCtx) {
     stdx::lock_guard<Mutex> lk(_mutex);

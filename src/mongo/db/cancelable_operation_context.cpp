@@ -31,27 +31,33 @@
 
 #include "mongo/db/cancelable_operation_context.h"
 
-#include "mongo/db/client.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/stdx/mutex.h"
-#include "mongo/util/cancelation.h"
 
 namespace mongo {
 
 CancelableOperationContext::CancelableOperationContext(ServiceContext::UniqueOperationContext opCtx,
-                                                       const CancelationToken& cancelToken,
+                                                       const CancellationToken& cancelToken,
                                                        ExecutorPtr executor)
     : _sharedBlock{std::make_shared<SharedBlock>()},
       _opCtx{std::move(opCtx)},
-      _markKilledFinished{cancelToken.onCancel()
-                              .thenRunOn(std::move(executor))
-                              .then([sharedBlock = _sharedBlock, opCtx = _opCtx.get()] {
-                                  if (!sharedBlock->done.swap(true)) {
-                                      stdx::lock_guard<Client> lk(*opCtx->getClient());
-                                      opCtx->markKilled(ErrorCodes::CallbackCanceled);
-                                  }
-                              })
-                              .semi()} {}
+      _markKilledFinished{[&] {
+          if (cancelToken.isCanceled()) {
+              // This thread owns _opCtx so it isn't necessary to acquire the Client mutex.
+              _opCtx->markKilled(ErrorCodes::Interrupted);
+              return makeReadyFutureWith([] {}).semi();
+          }
+
+          return cancelToken.onCancel()
+              .thenRunOn(std::move(executor))
+              .then([sharedBlock = _sharedBlock, opCtx = _opCtx.get()] {
+                  if (!sharedBlock->done.swap(true)) {
+                      stdx::lock_guard<Client> lk(*opCtx->getClient());
+                      opCtx->markKilled(ErrorCodes::Interrupted);
+                  }
+              })
+              .semi();
+      }()} {}
 
 CancelableOperationContext::~CancelableOperationContext() {
     if (_sharedBlock->done.swap(true)) {

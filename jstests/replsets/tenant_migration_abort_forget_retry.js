@@ -4,7 +4,8 @@
  * and then issues a donorForgetMigration command. Finally, starts a second tenant migration with
  * the same tenantId as the aborted migration, and expects this second migration to go through.
  *
- * @tags: [requires_fcv_49, requires_majority_read_concern, incompatible_with_windows_tls]
+ * @tags: [requires_fcv_49, requires_majority_read_concern, incompatible_with_windows_tls,
+ * incompatible_with_eft, incompatible_with_macos, requires_persistence]
  */
 
 (function() {
@@ -89,7 +90,7 @@ if (!tenantMigrationTest.isFeatureFlagEnabled()) {
     assert.soon(() => {
         const res = assert.commandWorked(donorPrimary.adminCommand(
             {currentOp: true, desc: "tenant donor migration", tenantId: tenantId}));
-        return res.inprog[0].receivedCancelation;
+        return res.inprog[0].receivedCancellation;
     });
 
     fp.off();

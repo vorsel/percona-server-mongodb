@@ -45,7 +45,8 @@ value::MaterializedRow materializeCopyOfRow(std::vector<value::SlotAccessor*>& a
 
     size_t idx = 0;
     for (auto& accessor : accessors) {
-        auto [tag, val] = accessor->copyOrMoveValue();
+        auto [tag, val] = accessor->getViewOfValue();
+        std::tie(tag, val) = value::copyValue(tag, val);
         row.reset(idx++, true, tag, val);
     }
     return row;
@@ -240,7 +241,7 @@ PlanState MergeJoinStage::getNext() {
                     _currentInnerKey = materializeCopyOfRow(_innerKeyAccessors);
                     _currentInnerProject = materializeCopyOfRow(_innerProjectAccessors);
 
-                    return PlanState::ADVANCED;
+                    return trackPlanState(PlanState::ADVANCED);
                 } else {
                     // Since iterated over all of the elements in the buffer and are currently
                     // pointing to the end of the buffer, need to reset the buffer to the beginning
@@ -314,10 +315,20 @@ PlanState MergeJoinStage::getNext() {
 void MergeJoinStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
     _children[0]->close();
     _children[1]->close();
     _outerProjectsBuffer.clear();
+}
+
+void MergeJoinStage::doSaveState() {
+    if (!slotsAccessible()) {
+        return;
+    }
+
+    // We only have to save shallow non-owning materialized rows.
+    _currentOuterKey.makeOwned();
+    _currentInnerKey.makeOwned();
 }
 
 std::unique_ptr<PlanStageStats> MergeJoinStage::getStats(bool includeDebugInfo) const {

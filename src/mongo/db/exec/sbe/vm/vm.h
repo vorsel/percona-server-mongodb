@@ -75,10 +75,9 @@ std::pair<value::TypeTags, value::Value> genericCompare(
             default:
                 MONGO_UNREACHABLE;
         }
-    } else if (isString(lhsTag) && isString(rhsTag)) {
-        auto lhsStr = getStringView(lhsTag, lhsValue);
-        auto rhsStr = getStringView(rhsTag, rhsValue);
-
+    } else if (isStringOrSymbol(lhsTag) && isStringOrSymbol(rhsTag)) {
+        auto lhsStr = value::getStringOrSymbolView(lhsTag, lhsValue);
+        auto rhsStr = value::getStringOrSymbolView(rhsTag, rhsValue);
         auto result =
             op(comparator ? comparator->compare(lhsStr, rhsStr) : lhsStr.compare(rhsStr), 0);
 
@@ -123,13 +122,56 @@ std::pair<value::TypeTags, value::Value> genericCompare(
             ? value::getObjectIdView(rhsValue)->data()
             : value::bitcastTo<uint8_t*>(rhsValue);
         auto threeWayResult = memcmp(lhsObjId, rhsObjId, sizeof(value::ObjectIdType));
-        auto booleanResult = op(threeWayResult, 0);
-        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(booleanResult)};
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(op(threeWayResult, 0))};
     } else if (lhsTag == value::TypeTags::bsonRegex && rhsTag == value::TypeTags::bsonRegex) {
         auto lhsRegex = value::getBsonRegexView(lhsValue);
         auto rhsRegex = value::getBsonRegexView(rhsValue);
-        auto result = op(lhsRegex.dataView(), rhsRegex.dataView());
-        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
+
+        if (auto threeWayResult = lhsRegex.pattern.compare(rhsRegex.pattern); threeWayResult != 0) {
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(op(threeWayResult, 0))};
+        }
+
+        auto threeWayResult = lhsRegex.flags.compare(rhsRegex.flags);
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(op(threeWayResult, 0))};
+    } else if (lhsTag == value::TypeTags::bsonDBPointer &&
+               rhsTag == value::TypeTags::bsonDBPointer) {
+        auto lhsDBPtr = value::getBsonDBPointerView(lhsValue);
+        auto rhsDBPtr = value::getBsonDBPointerView(rhsValue);
+        if (lhsDBPtr.ns.size() != rhsDBPtr.ns.size()) {
+            return {value::TypeTags::Boolean,
+                    value::bitcastFrom<bool>(op(lhsDBPtr.ns.size(), rhsDBPtr.ns.size()))};
+        }
+
+        if (auto threeWayResult = lhsDBPtr.ns.compare(rhsDBPtr.ns); threeWayResult != 0) {
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(op(threeWayResult, 0))};
+        }
+
+        auto threeWayResult = memcmp(lhsDBPtr.id, rhsDBPtr.id, sizeof(value::ObjectIdType));
+        return {value::TypeTags::Boolean, value::bitcastFrom<bool>(op(threeWayResult, 0))};
+    } else if (lhsTag == value::TypeTags::bsonJavascript &&
+               rhsTag == value::TypeTags::bsonJavascript) {
+        auto lhsCode = value::getBsonJavascriptView(lhsValue);
+        auto rhsCode = value::getBsonJavascriptView(rhsValue);
+        return {value::TypeTags::Boolean,
+                value::bitcastFrom<bool>(op(lhsCode.compare(rhsCode), 0))};
+    } else if (lhsTag == value::TypeTags::bsonCodeWScope &&
+               rhsTag == value::TypeTags::bsonCodeWScope) {
+        auto lhsCws = value::getBsonCodeWScopeView(lhsValue);
+        auto rhsCws = value::getBsonCodeWScopeView(rhsValue);
+        if (auto threeWayResult = lhsCws.code.compare(rhsCws.code); threeWayResult != 0) {
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(op(threeWayResult, 0))};
+        }
+
+        // Special string comparison semantics do not apply to strings nested inside the
+        // CodeWScope scope object, so we do not pass through the string comparator.
+        auto [tag, val] = value::compareValue(value::TypeTags::bsonObject,
+                                              value::bitcastFrom<const char*>(lhsCws.scope),
+                                              value::TypeTags::bsonObject,
+                                              value::bitcastFrom<const char*>(rhsCws.scope));
+        if (tag == value::TypeTags::NumberInt32) {
+            auto result = op(value::bitcastTo<int32_t>(val), 0);
+            return {value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
+        }
     }
 
     return {value::TypeTags::Nothing, 0};
@@ -291,6 +333,7 @@ enum class Builtin : uint8_t {
     sinh,
     tan,
     tanh,
+    round,
     isMember,
     collIsMember,
     indexOfBytes,
@@ -309,6 +352,7 @@ enum class Builtin : uint8_t {
     regexFind,
     regexFindAll,
     shardFilter,
+    shardHash,
     extractSubArray,
     isArrayEmpty,
     reverseArray,
@@ -317,6 +361,7 @@ enum class Builtin : uint8_t {
     getRegexPattern,
     getRegexFlags,
     ftsMatch,
+    generateSortKey,
 };
 
 using SmallArityType = uint8_t;
@@ -533,8 +578,6 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> genericNumConvert(value::TypeTags lhsTag,
                                                                       value::Value lhsValue,
                                                                       value::TypeTags rhsTag);
-    std::pair<value::TypeTags, value::Value> genericNumConvertToPreciseInt64(value::TypeTags lhsTag,
-                                                                             value::Value lhsValue);
 
     std::pair<value::TypeTags, value::Value> compare3way(
         value::TypeTags lhsTag,
@@ -599,10 +642,6 @@ private:
                                                                value::TypeTags fieldTag,
                                                                value::Value fieldValue);
 
-    std::tuple<bool, value::TypeTags, value::Value> convertBitTestValue(value::TypeTags maskTag,
-                                                                        value::Value maskValue,
-                                                                        value::TypeTags valueTag,
-                                                                        value::Value value);
     std::tuple<bool, value::TypeTags, value::Value> genericAcos(value::TypeTags operandTag,
                                                                 value::Value operandValue);
     std::tuple<bool, value::TypeTags, value::Value> genericAcosh(value::TypeTags operandTag,
@@ -705,6 +744,7 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinSinh(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinTan(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinTanh(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinRound(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinConcat(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinIsMember(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinCollIsMember(ArityType arity);
@@ -724,6 +764,7 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinRegexFind(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinRegexFindAll(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinShardFilter(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinShardHash(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinExtractSubArray(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinIsArrayEmpty(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinReverseArray(ArityType arity);
@@ -732,6 +773,7 @@ private:
     std::tuple<bool, value::TypeTags, value::Value> builtinGetRegexPattern(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinGetRegexFlags(ArityType arity);
     std::tuple<bool, value::TypeTags, value::Value> builtinFtsMatch(ArityType arity);
+    std::tuple<bool, value::TypeTags, value::Value> builtinGenerateSortKey(ArityType arity);
 
     std::tuple<bool, value::TypeTags, value::Value> dispatchBuiltin(Builtin f, ArityType arity);
 

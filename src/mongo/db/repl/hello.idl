@@ -205,7 +205,8 @@ commands:
         access_check:
             none: true
         reply_type: HelloCommandReply
-        strict: true
+        # Most V1 commands should be strict: true but hello is special to allow for unknown fields.
+        strict: false
         fields:
             forShell:
                 type: safeBool
@@ -236,7 +237,8 @@ commands:
                 type: array<string>
                 optional: true
             saslSupportedMechs:
-                type: UserName
+                type: 
+                    variant: [string, object_owned]
                 optional: true
             speculativeAuthenticate:
                 type: object

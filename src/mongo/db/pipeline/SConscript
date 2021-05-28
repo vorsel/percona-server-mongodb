@@ -119,6 +119,7 @@ env.Library(
         'accumulator_add_to_set.cpp',
         'accumulator_avg.cpp',
         'accumulator_covariance.cpp',
+        'accumulator_exp_moving_avg.cpp',
         'accumulator_first.cpp',
         'accumulator_js_reduce.cpp',
         'accumulator_last.cpp',
@@ -129,8 +130,11 @@ env.Library(
         'accumulator_std_dev.cpp',
         'accumulator_sum.cpp',
         'window_function/window_bounds.cpp',
+        'window_function/window_function_covariance.cpp',
+        'window_function/window_function_count.cpp',
         'window_function/window_function_expression.cpp',
-        'window_function/window_function_sum.cpp'
+        'window_function/window_function_integral.cpp',
+        'window_function/window_function_sum.cpp',
         ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/exec/document_value/document_value',
@@ -203,6 +207,16 @@ env.Library(
     ],
 )
 
+env.Library(
+    target="change_stream_invalidation_info",
+    source=[
+        'change_stream_invalidation_info.cpp',
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+    ],
+)
+
 pipelineEnv = env.Clone()
 pipelineEnv.InjectThirdParty(libraries=['snappy'])
 pipelineEnv.Library(
@@ -216,6 +230,7 @@ pipelineEnv.Library(
         'document_source_change_stream.cpp',
         'document_source_change_stream_close_cursor.cpp',
         'document_source_change_stream_transform.cpp',
+        'document_source_change_stream_unwind_transactions.cpp',
         'document_source_check_invalidate.cpp',
         'document_source_check_resume_token.cpp',
         'document_source_coll_stats.cpp',
@@ -258,6 +273,7 @@ pipelineEnv.Library(
         'document_source_union_with.cpp',
         'document_source_unwind.cpp',
         'document_source_internal_unpack_bucket.cpp',
+        'document_source_internal_convert_bucket_index_stats.cpp',
         'pipeline.cpp',
         'semantic_analysis.cpp',
         'sequential_document_cache.cpp',
@@ -267,6 +283,7 @@ pipelineEnv.Library(
         'window_function/window_function_exec.cpp',
         'window_function/window_function_exec_derivative.cpp',
         'window_function/window_function_exec_removable_document.cpp',
+        'window_function/window_function_exec_removable_range.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/client/clientdriver_minimal',
@@ -274,6 +291,7 @@ pipelineEnv.Library(
         '$BUILD_DIR/mongo/db/bson/dotted_path_support',
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/curop_failpoint_helpers',
+        '$BUILD_DIR/mongo/db/exec/bucket_unpacker',
         '$BUILD_DIR/mongo/db/exec/document_value/document_value',
         '$BUILD_DIR/mongo/db/exec/projection_executor',
         '$BUILD_DIR/mongo/db/exec/scoped_timer',
@@ -283,6 +301,7 @@ pipelineEnv.Library(
         '$BUILD_DIR/mongo/db/logical_session_cache',
         '$BUILD_DIR/mongo/db/logical_session_id_helpers',
         '$BUILD_DIR/mongo/db/matcher/expressions',
+        '$BUILD_DIR/mongo/db/pipeline/change_stream_invalidation_info',
         '$BUILD_DIR/mongo/db/pipeline/lite_parsed_document_source',
         '$BUILD_DIR/mongo/db/query/collation/collator_factory_interface',
         '$BUILD_DIR/mongo/db/query/collation/collator_interface',
@@ -312,6 +331,8 @@ pipelineEnv.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/test_commands_enabled',
         '$BUILD_DIR/mongo/db/sorter/sorter_idl',
+        '$BUILD_DIR/mongo/db/timeseries/timeseries_idl',
+        '$BUILD_DIR/mongo/db/timeseries/timeseries_index_schema_conversion_functions',
         '$BUILD_DIR/mongo/rpc/command_status',
     ]
 )
@@ -398,11 +419,15 @@ env.CppUnitTest(
         'document_source_union_with_test.cpp',
         'document_source_internal_unpack_bucket_test/extract_or_build_project_to_internalize_test.cpp',
         'document_source_internal_unpack_bucket_test/create_predicates_on_bucket_level_field_test.cpp',
+        'document_source_internal_unpack_bucket_test/extract_project_for_pushdown_test.cpp',
         'document_source_internal_unpack_bucket_test/group_reorder_test.cpp',
         'document_source_internal_unpack_bucket_test/internalize_project_test.cpp',
+        'document_source_internal_unpack_bucket_test/optimize_pipeline_test.cpp',
+        'document_source_internal_unpack_bucket_test/pushdown_computed_meta_projections_test.cpp',
+        'document_source_internal_unpack_bucket_test/sample_reorder_test.cpp',
         'document_source_internal_unpack_bucket_test/sort_reorder_test.cpp',
-        'document_source_internal_unpack_bucket_test/unpack_bucket_exec_test.cpp',
         'document_source_internal_unpack_bucket_test/split_match_on_meta_and_rename_test.cpp',
+        'document_source_internal_unpack_bucket_test/unpack_bucket_exec_test.cpp',
         'document_source_unwind_test.cpp',
         'expression_and_test.cpp',
         'expression_compare_test.cpp',
@@ -436,9 +461,11 @@ env.CppUnitTest(
         'tee_buffer_test.cpp',
         'window_function/partition_iterator_test.cpp',
         'window_function/window_function_add_to_set_test.cpp',
+        'window_function/window_function_covariance_test.cpp',
         'window_function/window_function_exec_derivative_test.cpp',
         'window_function/window_function_exec_non_removable_test.cpp',
         'window_function/window_function_exec_removable_test.cpp',
+        'window_function/window_function_integral_test.cpp',
         'window_function/window_function_min_max_test.cpp',
         'window_function/window_function_push_test.cpp',
         'window_function/window_function_std_dev_test.cpp',
@@ -457,8 +484,8 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/db/query/query_test_service_context',
         '$BUILD_DIR/mongo/db/repl/oplog_entry',
         '$BUILD_DIR/mongo/db/repl/replmocks',
+        '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
         '$BUILD_DIR/mongo/db/service_context',
-        '$BUILD_DIR/mongo/db/service_context_d',
         '$BUILD_DIR/mongo/db/service_context_d_test_fixture',
         '$BUILD_DIR/mongo/db/service_context_test_fixture',
         '$BUILD_DIR/mongo/db/storage/devnull/storage_devnull_core',

@@ -85,8 +85,7 @@ public:
         return ThreadPool::Limits();
     }
 
-    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(
-        BSONObj initialState) const override {
+    std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override {
         return std::make_shared<TestService::Instance>(this, std::move(initialState));
     }
 
@@ -101,7 +100,7 @@ public:
               _service(service) {}
 
         SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                             const CancelationToken& token) noexcept override {
+                             const CancellationToken& token) noexcept override {
             if (MONGO_unlikely(TestServiceHangDuringInitialization.shouldFail())) {
                 TestServiceHangDuringInitialization.pauseWhileSet();
             }
@@ -163,7 +162,7 @@ public:
         }
 
         void interrupt(Status status) override {
-            // Currently unused. Functionality has been put into cancelation logic.
+            // Currently unused. Functionality has been put into cancellation logic.
         }
 
         // Whether or not an op is reported depends on the "reportOp" field of the state doc the
@@ -263,7 +262,7 @@ public:
 
 private:
     ExecutorFuture<void> _rebuildService(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                                         const CancelationToken& token) override {
+                                         const CancellationToken& token) override {
         auto nss = getStateDocumentsNS();
 
         AllowOpCtxWhenServiceRebuildingBlock allowOpCtxBlock(Client::getCurrent());
@@ -363,7 +362,7 @@ DEATH_TEST_F(PrimaryOnlyServiceTest,
     registry.registerService(std::move(service2));
 }
 
-TEST_F(PrimaryOnlyServiceTest, CancelationOnStepdown) {
+TEST_F(PrimaryOnlyServiceTest, CancellationOnStepdown) {
     // Used to ensure that _scheduleRun is run before we run the stepdown logic so that we fulfill
     // the _completionPromise.
     auto timesEntered = TestServiceHangDuringInitialization.setMode(FailPoint::alwaysOn);
@@ -380,7 +379,7 @@ TEST_F(PrimaryOnlyServiceTest, CancelationOnStepdown) {
     ASSERT_EQ(instance->getCompletionFuture().getNoThrow().code(), ErrorCodes::Interrupted);
 }
 
-TEST_F(PrimaryOnlyServiceTest, ResetCancelationSourceOnStepupAndCompleteSuccessfully) {
+TEST_F(PrimaryOnlyServiceTest, ResetCancellationSourceOnStepupAndCompleteSuccessfully) {
     {
         // Used to ensure that _scheduleRun is run before we run the stepdown logic so that we
         // fulfill the _completionPromise.
@@ -410,7 +409,7 @@ TEST_F(PrimaryOnlyServiceTest, ResetCancelationSourceOnStepupAndCompleteSuccessf
     }
 }
 
-TEST_F(PrimaryOnlyServiceTest, ResetCancelationSourceOnStepupAndStepDownAgain) {
+TEST_F(PrimaryOnlyServiceTest, ResetCancellationSourceOnStepupAndStepDownAgain) {
     {
         // Used to ensure that _scheduleRun is run before we run the stepdown logic so that we
         // fulfill the _completionPromise.

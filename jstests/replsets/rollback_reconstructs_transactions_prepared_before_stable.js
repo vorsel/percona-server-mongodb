@@ -2,7 +2,10 @@
  * Test that we can successfully reconstruct a prepared transaction that was prepared before the
  * stable timestamp at the end of rollback recovery.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
 (function() {

@@ -29,6 +29,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include <boost/container/small_vector.hpp>
 
 #include "mongo/db/exec/sbe/values/value.h"
@@ -184,6 +186,15 @@ public:
         _owned = owned;
     }
 
+    void makeOwned() {
+        if (_owned) {
+            return;
+        }
+
+        std::tie(_tag, _val) = copyValue(_tag, _val);
+        _owned = true;
+    }
+
 private:
     void release() {
         if (_owned) {
@@ -206,8 +217,10 @@ private:
  */
 class ArrayAccessor final : public SlotAccessor {
 public:
-    void reset(TypeTags tag, Value val) {
-        _enumerator.reset(tag, val);
+    void reset(SlotAccessor* input) {
+        _input = input;
+        _currentIndex = 0;
+        refresh();
     }
 
     // Return non-owning view of the value.
@@ -225,10 +238,18 @@ public:
     }
 
     bool advance() {
+        ++_currentIndex;
         return _enumerator.advance();
     }
 
+    void refresh() {
+        auto [tag, val] = _input->getViewOfValue();
+        _enumerator.reset(tag, val, _currentIndex);
+    }
+
 private:
+    size_t _currentIndex = 0;
+    SlotAccessor* _input{nullptr};
     ArrayEnumerator _enumerator;
 };
 
@@ -238,8 +259,7 @@ private:
  */
 class SwitchAccessor final : public SlotAccessor {
 public:
-    SwitchAccessor(std::vector<std::unique_ptr<SlotAccessor>> accessors)
-        : _accessors(std::move(accessors)) {
+    SwitchAccessor(std::vector<SlotAccessor*> accessors) : _accessors(std::move(accessors)) {
         invariant(!_accessors.empty());
     }
 
@@ -256,7 +276,7 @@ public:
     }
 
 private:
-    std::vector<std::unique_ptr<SlotAccessor>> _accessors;
+    std::vector<SlotAccessor*> _accessors;
     size_t _index{0};
 };
 
@@ -363,18 +383,18 @@ public:
         copy(other);
     }
 
-    MaterializedRow(MaterializedRow&& other) {
+    MaterializedRow(MaterializedRow&& other) noexcept {
         swap(*this, other);
     }
 
-    ~MaterializedRow() {
+    ~MaterializedRow() noexcept {
         if (_data) {
             release();
             delete[] _data;
         }
     }
 
-    MaterializedRow& operator=(MaterializedRow other) {
+    MaterializedRow& operator=(MaterializedRow other) noexcept {
         swap(*this, other);
         return *this;
     }
@@ -512,6 +532,10 @@ private:
     size_t _count{0};
 };
 
+// This check is needed to ensure that 'std::vector<MaterializedRow>' uses move constructor of
+// 'MaterializedRow' during reallocation. This way, values inside 'MaterializedRow' are not copied
+// during reallocation and references to them remain valid.
+static_assert(std::is_nothrow_move_constructible_v<MaterializedRow>);
 
 /**
  * Provides a view of a slot inside a single MaterializedRow.
@@ -623,7 +647,7 @@ void readKeyStringValueIntoAccessors(
     const KeyString::Value& keyString,
     const Ordering& ordering,
     BufBuilder* valueBufferBuilder,
-    std::vector<ViewOfValueAccessor>* accessors,
+    std::vector<OwnedValueAccessor>* accessors,
     boost::optional<IndexKeysInclusionSet> indexKeysToInclude = boost::none);
 
 
@@ -633,7 +657,8 @@ void readKeyStringValueIntoAccessors(
 template <typename T>
 using SlotMap = absl::flat_hash_map<SlotId, T>;
 using SlotAccessorMap = SlotMap<SlotAccessor*>;
-using FieldAccessorMap = StringMap<std::unique_ptr<ViewOfValueAccessor>>;
+using FieldAccessorMap = StringMap<std::unique_ptr<OwnedValueAccessor>>;
+using FieldViewAccessorMap = StringMap<std::unique_ptr<ViewOfValueAccessor>>;
 using SlotSet = absl::flat_hash_set<SlotId>;
 using SlotVector = std::vector<SlotId>;
 

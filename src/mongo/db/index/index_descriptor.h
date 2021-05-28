@@ -38,12 +38,10 @@
 #include "mongo/db/index/multikey_paths.h"
 #include "mongo/db/index_names.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/server_options.h"
 
 namespace mongo {
 
 class IndexCatalogEntry;
-class IndexCatalogEntryContainer;
 class OperationContext;
 
 /**
@@ -102,20 +100,6 @@ public:
     static bool isIndexVersionSupported(IndexVersion indexVersion);
 
     /**
-     * Returns a set of the currently supported index versions.
-     */
-    static std::set<IndexVersion> getSupportedIndexVersions();
-
-    /**
-     * Returns Status::OK() if indexes of version 'indexVersion' are allowed to be created, and
-     * returns ErrorCodes::CannotCreateIndex otherwise.
-     */
-    static Status isIndexVersionAllowedForCreation(
-        IndexVersion indexVersion,
-        const ServerGlobalParams::FeatureCompatibility& featureCompatibility,
-        const BSONObj& indexSpec);
-
-    /**
      * Returns the index version to use if it isn't specified in the index specification.
      */
     static IndexVersion getDefaultIndexVersion();
@@ -138,6 +122,14 @@ public:
      */
     const BSONObj& pathProjection() const {
         return _projection;
+    }
+
+    /**
+     * Returns the normalized path projection spec, if one exists. This is only applicable for '$**'
+     * indexes.
+     */
+    const BSONObj& normalizedPathProjection() const {
+        return _normalizedProjection;
     }
 
     // How many fields do we index / are in the key pattern?
@@ -218,13 +210,13 @@ public:
     }
 
     /**
-     * Compares the current IndexDescriptor against the given index entry. Returns kIdentical if all
-     * index options are logically identical, kEquivalent if all options which uniquely identify an
-     * index are logically identical, and kDifferent otherwise.
+     * Compares the current IndexDescriptor against the given existing index entry 'existingIndex'.
+     * Returns kIdentical if all index options are logically identical, kEquivalent if all options
+     * which uniquely identify an index are logically identical, and kDifferent otherwise.
      */
     Comparison compareIndexOptions(OperationContext* opCtx,
                                    const NamespaceString& ns,
-                                   const IndexCatalogEntry* other) const;
+                                   const IndexCatalogEntry* existingIndex) const;
 
     const BSONObj& collation() const {
         return _collation;
@@ -246,6 +238,12 @@ public:
     }
 
 private:
+    // This method should only ever be called by WildcardAccessMethod, to set the
+    // '_normalizedProjection' for descriptors associated with an existing IndexCatalogEntry.
+    void _setNormalizedPathProjection(BSONObj&& proj) {
+        _normalizedProjection = std::move(proj);
+    }
+
     // What access method should we use for this index?
     std::string _accessMethodName;
 
@@ -259,6 +257,7 @@ private:
     int64_t _numFields;  // How many fields are indexed?
     BSONObj _keyPattern;
     BSONObj _projection;
+    BSONObj _normalizedProjection;
     std::string _indexName;
     bool _isIdIndex;
     bool _sparse;
@@ -276,6 +275,7 @@ private:
     friend class IndexCatalog;
     friend class IndexCatalogEntryImpl;
     friend class IndexCatalogEntryContainer;
+    friend class WildcardAccessMethod;
 };
 
 }  // namespace mongo

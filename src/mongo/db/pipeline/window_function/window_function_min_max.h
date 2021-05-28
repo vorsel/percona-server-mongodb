@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/window_function/window_function.h"
 
 namespace mongo {
@@ -49,8 +50,8 @@ public:
     }
 
     void add(Value value) final {
-        _values.insert(std::move(value));
         _memUsageBytes += value.getApproximateSize();
+        _values.insert(std::move(value));
     }
 
     void remove(Value value) final {

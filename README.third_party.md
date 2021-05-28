@@ -24,9 +24,9 @@ a notice will be included in
 | [abseil-cpp]               | Apache-2.0        |                  | 070f6e47b3        |                      |                ✗                |
 | Aladdin MD5                | Zlib              |                  | Unknown           |          ✗           |                ✗                |
 | [ASIO]                     | BSL-1.0           | 1.16.1           | b0926b61b0        |                      |                ✗                |
-| [benchmark]                | Apache-2.0        | 1.5.1            | 1.5.0             |                      |                                 |
+| [benchmark]                | Apache-2.0        | 1.5.2            | 1.5.2             |                      |                                 |
 | [Boost]                    | BSL-1.0           | 1.73.0           | 1.70.0            |                      |                ✗                |
-| [fmt]                      | BSD-2-Clause      | 6.2.1            | 6.1.1             |                      |                ✗                |
+| [fmt]                      | BSD-2-Clause      | 7.1.3            | 7.1.3             |                      |                ✗                |
 | [GPerfTools]               | BSD-3-Clause      | 2.8              | 2.8               |                      |                ✗                |
 | [ICU4]                     | ICU               | 67.1             | 57.1              |          ✗           |                ✗                |
 | [Intel Decimal FP Library] | BSD-3-Clause      | 2.0 Update 2     | 2.0 Update 1      |                      |                ✗                |
@@ -41,14 +41,14 @@ a notice will be included in
 | [peglib]                   | MIT               | 0.1.12           | 0.1.12            |                      |                ✗                |
 | [Pcre]                     | BSD-3-Clause      | 8.44             | 8.42              |                      |                ✗                |
 | [S2]                       | Apache-2.0        |                  | Unknown           |          ✗           |                ✗                |
-| [SafeInt]                  | MIT               | 3.24             | 3.23              |                      |                                 |
+| [SafeInt]                  | MIT               | 3.0.26           | 3.0.26            |                      |                                 |
 | [schemastore.org]          | Apache-2.0        |                  | 6847cfc3a1        |                      |                                 |
 | [scons]                    | MIT               | 3.1.2            | 3.1.2             |                      |                                 |
 | [Snappy]                   | BSD-3-Clause      | 1.1.8            | 1.1.7             |          ✗           |                ✗                |
-| [timelib]                  | MIT               | 2018.03          | 2018.01           |                      |                ✗                |
+| [timelib]                  | MIT               | 2021.06          | 2021.06           |                      |                ✗                |
 | [TomCrypt]                 | Public Domain     | 1.18.2           | 1.18.2            |          ✗           |                ✗                |
 | [Unicode]                  | Unicode-DFS-2015  | 13.0.0           | 8.0.0             |          ✗           |                ✗                |
-| [Valgrind]                 | BSD-3-Clause<sup>\[<a href="#note_vg" id="ref_vg">1</a>]</sup> | 3.16.1 | 3.11.0 | |             ✗                |
+| [Valgrind]                 | BSD-3-Clause<sup>\[<a href="#note_vg" id="ref_vg">1</a>]</sup> | 3.17.0 | 3.17.0 | |             ✗                |
 | [variant]                  | BSL-1.0           | 1.4.0            | 1.4.0             |                      |                ✗                |
 | [wiredtiger]               |                   |                  | <sup>\[<a href="#note_wt" id="ref_wt">2</a>]</sup> | ✗ |  ✗                |
 | [yaml-cpp]                 | MIT               | 0.6.3            | 0.6.2             |                      |                ✗                |

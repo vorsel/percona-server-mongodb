@@ -33,25 +33,14 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/commands/feature_compatibility_version_document_gen.h"
+#include "mongo/db/commands/set_feature_compatibility_version_gen.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/server_options.h"
 
 namespace mongo {
 
-class BSONObj;
-class OperationContext;
-
 class FeatureCompatibilityVersion {
 public:
-    /**
-     * Should be taken in shared mode by any operations that should not run while
-     * setFeatureCompatibilityVersion is running.
-     *
-     * setFCV takes this lock in exclusive mode so that it both does not run with the shared mode
-     * operations and does not run with itself.
-     */
-    static Lock::ResourceMutex fcvLock;
-
     /**
      * Reads the featureCompatibilityVersion (FCV) document in admin.system.version and initializes
      * the FCV global state. Returns an error if the FCV document exists and is invalid. Does not
@@ -68,13 +57,19 @@ public:
     static void fassertInitializedAfterStartup(OperationContext* opCtx);
 
     /**
+     * Returns the on-disk feature compatibility version document if it exists.
+     */
+    static boost::optional<BSONObj> findFeatureCompatibilityVersionDocument(
+        OperationContext* opCtx);
+
+    /**
      * uassert that a transition from fromVersion to newVersion is permitted. Different rules apply
      * if the request is from a config server.
      */
     static void validateSetFeatureCompatibilityVersionRequest(
-        ServerGlobalParams::FeatureCompatibility::Version fromVersion,
-        ServerGlobalParams::FeatureCompatibility::Version newVersion,
-        bool isFromConfigServer);
+        OperationContext* opCtx,
+        const SetFeatureCompatibilityVersion& setFCVRequest,
+        ServerGlobalParams::FeatureCompatibility::Version fromVersion);
 
     /**
      * Updates the on-disk feature compatibility version document for the transition fromVersion ->
@@ -85,6 +80,7 @@ public:
         ServerGlobalParams::FeatureCompatibility::Version fromVersion,
         ServerGlobalParams::FeatureCompatibility::Version newVersion,
         bool isFromConfigServer,
+        boost::optional<Timestamp> timestamp,
         bool setTargetVersion);
 
     /**
@@ -106,6 +102,13 @@ public:
      * current featureCompatibilityVersion value.
      */
     static void updateMinWireVersion();
+
+    /**
+     * Returns a scoped object, which holds the 'fcvLock' in exclusive mode for the given scope. It
+     * must only be used by the setFeatureCompatibilityVersion command in order to serialise with
+     * concurrent 'FixedFCVRegions'.
+     */
+    static Lock::ExclusiveLock enterFCVChangeRegion(OperationContext* opCtx);
 };
 
 /**
@@ -113,19 +116,17 @@ public:
  */
 class FixedFCVRegion {
 public:
-    explicit FixedFCVRegion(OperationContext* opCtx) {
-        invariant(!opCtx->lockState()->isLocked());
-        _lk.emplace(opCtx->lockState(), FeatureCompatibilityVersion::fcvLock);
-    }
+    explicit FixedFCVRegion(OperationContext* opCtx);
+    ~FixedFCVRegion();
 
-    ~FixedFCVRegion() = default;
+    bool operator==(const ServerGlobalParams::FeatureCompatibility::Version& other) const;
+    bool operator!=(const ServerGlobalParams::FeatureCompatibility::Version& other) const;
 
-    void release() {
-        _lk.reset();
-    }
+    const ServerGlobalParams::FeatureCompatibility& operator*() const;
+    const ServerGlobalParams::FeatureCompatibility* operator->() const;
 
 private:
-    boost::optional<Lock::SharedLock> _lk;
+    Lock::SharedLock _lk;
 };
 
 }  // namespace mongo

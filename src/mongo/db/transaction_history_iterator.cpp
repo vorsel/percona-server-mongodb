@@ -55,7 +55,7 @@ BSONObj findOneOplogEntry(OperationContext* opCtx,
     BSONObj oplogBSON;
     invariant(!opTime.isNull());
 
-    auto findCommand = std::make_unique<FindCommand>(NamespaceString::kRsOplogNamespace);
+    auto findCommand = std::make_unique<FindCommandRequest>(NamespaceString::kRsOplogNamespace);
     findCommand->setFilter(opTime.asQuery());
 
     if (prevOpOnly) {
@@ -87,8 +87,12 @@ BSONObj findOneOplogEntry(OperationContext* opCtx,
         CollectionCatalog::get(opCtx)->getDatabaseProfileLevel(NamespaceString::kLocalDb),
         Date_t::max());
 
-    auto exec = uassertStatusOK(
-        getExecutorFind(opCtx, &oplogRead.getCollection(), std::move(cq), permitYield));
+    auto exec =
+        uassertStatusOK(getExecutorFind(opCtx,
+                                        &oplogRead.getCollection(),
+                                        std::move(cq),
+                                        permitYield,
+                                        QueryPlannerParams::OMIT_REPL_STATE_PERMITS_READS_CHECK));
 
     PlanExecutor::ExecState getNextResult;
     try {

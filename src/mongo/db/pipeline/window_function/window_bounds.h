@@ -75,26 +75,19 @@ struct WindowBounds {
         Bound<int> upper;
     };
     struct RangeBased {
-        // Range-based bounds can be any numeric type: int, double, Decimal, etc.
         Bound<Value> lower;
         Bound<Value> upper;
-    };
-    struct TimeBased {
-        // Although time-based bounds look similar to range-based, they are more restricted:
-        // the numbers must be integers, like $dateAdd / $dateDiff.
-        Bound<int> lower;
-        Bound<int> upper;
-        TimeUnit unit;
+        boost::optional<TimeUnit> unit;
     };
 
-    stdx::variant<DocumentBased, RangeBased, TimeBased> bounds;
+    stdx::variant<DocumentBased, RangeBased> bounds;
 
     static WindowBounds defaultBounds() {
         return WindowBounds{DocumentBased{Unbounded{}, Unbounded{}}};
     }
 
     /**
-     * Check if these bounds are unbounded on both ends.
+     * Checks whether these bounds are unbounded on both ends.
      * This case is special because it means you don't need a sortBy to interpret the bounds:
      * the bounds include every document (in the current partition).
      */

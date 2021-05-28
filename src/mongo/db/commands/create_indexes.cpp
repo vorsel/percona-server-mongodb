@@ -58,9 +58,9 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/storage/two_phase_index_build_knobs_gen.h"
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/timeseries/timeseries_lookup.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/idl/command_generic_argument.h"
 #include "mongo/logv2/log.h"
@@ -100,7 +100,6 @@ std::vector<BSONObj> parseAndValidateIndexSpecs(OperationContext* opCtx,
     constexpr auto k_id_ = "_id_"_sd;
     constexpr auto kStar = "*"_sd;
 
-    const auto& featureCompatability = serverGlobalParams.featureCompatibility;
     const auto ns = cmd.getNamespace();
     const bool ignoreUnknownIndexOptions = cmd.getIgnoreUnknownIndexOptions();
 
@@ -111,8 +110,7 @@ std::vector<BSONObj> parseAndValidateIndexSpecs(OperationContext* opCtx,
             parsedIndexSpec = index_key_validate::removeUnknownFields(parsedIndexSpec);
         }
 
-        auto indexSpecStatus =
-            index_key_validate::validateIndexSpec(opCtx, parsedIndexSpec, featureCompatability);
+        auto indexSpecStatus = index_key_validate::validateIndexSpec(opCtx, parsedIndexSpec);
         uassertStatusOK(indexSpecStatus.getStatus().withContext(
             str::stream() << "Error in specification " << parsedIndexSpec.toString()));
 
@@ -371,7 +369,7 @@ CreateIndexesReply runCreateIndexesOnNewCollection(
 CreateIndexesReply runCreateIndexesWithCoordinator(OperationContext* opCtx,
                                                    const CreateIndexesCommand& cmd) {
     const auto ns = cmd.getNamespace();
-    uassertStatusOK(userAllowedWriteNS(ns));
+    uassertStatusOK(userAllowedWriteNS(opCtx, ns));
 
     // Disallow users from creating new indexes on config.transactions since the sessions code
     // was optimized to not update indexes
@@ -638,8 +636,8 @@ std::unique_ptr<CreateIndexesCommand> makeTimeseriesCreateIndexesCommand(
         for (const auto& elem : origIndex) {
             if (elem.fieldNameStringData() == NewIndexSpec::kKeyFieldName) {
                 auto bucketsIndexSpecWithStatus =
-                    timeseries::convertTimeseriesIndexSpecToBucketsIndexSpec(*timeseriesOptions,
-                                                                             elem.Obj());
+                    timeseries::createBucketsIndexSpecFromTimeseriesIndexSpec(*timeseriesOptions,
+                                                                              elem.Obj());
                 uassert(ErrorCodes::CannotCreateIndex,
                         str::stream() << bucketsIndexSpecWithStatus.getStatus().toString()
                                       << " Command request: " << redact(origCmd.toBSON({})),

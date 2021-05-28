@@ -42,7 +42,7 @@ namespace mongo::sbe::value {
  * sbe::value::Value. During construction, these pairs are stored in the parallel '_tagList' and
  * '_valList' arrays, as a "structure of arrays."
  *
- * After constructing the array, use the 'readValues()' method to populate a ViewOfValueAccessor
+ * After constructing the array, use the 'readValues()' method to populate a OwnedValueAccessor
  * vector. Some "views" (values that are pointers into other memory) are constructed by appending
  * them to the 'valueBufferBuilder' provided to the constructor, and the internal buffer in that
  * 'valueBufferBuilder' must be kept alive for as long as the accessors are to remain valid.
@@ -109,27 +109,31 @@ public:
             appendValue(makeSmallString({in.rawData(), in.size()}));
         } else {
             appendValueBufferOffset(TypeTags::StringBig);
-
-            // Note: This _will_ write a NULL-terminated string, even if the input StringData does
-            // not have a NULL terminator.
             _valueBufferBuilder->appendNum(static_cast<int32_t>(in.size() + 1));
-            _valueBufferBuilder->appendStr(in);
+            _valueBufferBuilder->appendStr(in, true /* includeEndingNull */);
         }
     }
 
     void append(const BSONSymbol& in) {
-        unsupportedType("symbol");
+        appendValueBufferOffset(TypeTags::bsonSymbol);
+        _valueBufferBuilder->appendNum(static_cast<int32_t>(in.symbol.size() + 1));
+        _valueBufferBuilder->appendStr(in.symbol, true /* includeEndingNull */);
     }
 
     void append(const BSONCode& in) {
         appendValueBufferOffset(TypeTags::bsonJavascript);
         // Add one to account null byte at the end.
         _valueBufferBuilder->appendNum(static_cast<uint32_t>(in.code.size() + 1));
-        _valueBufferBuilder->appendStr(in.code);
+        _valueBufferBuilder->appendStr(in.code, true /* includeEndingNull */);
     }
 
     void append(const BSONCodeWScope& in) {
-        unsupportedType("javascriptWithScope");
+        appendValueBufferOffset(TypeTags::bsonCodeWScope);
+        _valueBufferBuilder->appendNum(
+            static_cast<int32_t>(4 + in.code.size() + 1 + in.scope.objsize()));
+        _valueBufferBuilder->appendNum(static_cast<int32_t>(in.code.size() + 1));
+        _valueBufferBuilder->appendStr(in.code, true /* includeEndingNull */);
+        _valueBufferBuilder->appendBuf(in.scope.objdata(), in.scope.objsize());
     }
 
     void append(const BSONBinData& in) {
@@ -141,12 +145,15 @@ public:
 
     void append(const BSONRegEx& in) {
         appendValueBufferOffset(TypeTags::bsonRegex);
-        _valueBufferBuilder->appendStr(in.pattern);
-        _valueBufferBuilder->appendStr(in.flags);
+        _valueBufferBuilder->appendStr(in.pattern, true /* includeEndingNull */);
+        _valueBufferBuilder->appendStr(in.flags, true /* includeEndingNull */);
     }
 
     void append(const BSONDBRef& in) {
-        unsupportedType("dbPointer");
+        appendValueBufferOffset(TypeTags::bsonDBPointer);
+        _valueBufferBuilder->appendNum(static_cast<int32_t>(in.ns.size() + 1));
+        _valueBufferBuilder->appendStr(in.ns, true /* includeEndingNull */);
+        _valueBufferBuilder->appendBuf(in.oid.view().view(), OID::kOIDSize);
     }
 
     void append(double in) {
@@ -196,7 +203,7 @@ public:
      * into the memory constructed by the '_valueBufferBuilder' object, which is a caller-owned
      * object that must remain valid for as long as these accessors are to remain valid.
      */
-    void readValues(std::vector<ViewOfValueAccessor>* accessors) {
+    void readValues(std::vector<OwnedValueAccessor>* accessors) {
         auto bufferLen = _valueBufferBuilder->len();
         for (size_t i = 0; i < _numValues; ++i) {
             auto tag = _tagList[i];
@@ -208,12 +215,15 @@ public:
                 // convert those offsets into pointers.
                 case TypeTags::ObjectId:
                 case TypeTags::StringBig:
+                case TypeTags::bsonSymbol:
                 case TypeTags::NumberDecimal:
                 case TypeTags::bsonObject:
                 case TypeTags::bsonArray:
                 case TypeTags::bsonBinData:
                 case TypeTags::bsonRegex:
-                case TypeTags::bsonJavascript: {
+                case TypeTags::bsonJavascript:
+                case TypeTags::bsonDBPointer:
+                case TypeTags::bsonCodeWScope: {
                     auto offset = bitcastTo<decltype(bufferLen)>(val);
                     invariant(offset < bufferLen);
                     val = bitcastFrom<const char*>(_valueBufferBuilder->buf() + offset);
@@ -225,7 +235,7 @@ public:
             }
 
             invariant(i < accessors->size());
-            (*accessors)[i].reset(tag, val);
+            (*accessors)[i].reset(false, tag, val);
         }
     }
 

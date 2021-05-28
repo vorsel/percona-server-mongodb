@@ -117,8 +117,13 @@ public:
     Timestamp getLatestOplogTimestamp() const override;
     BSONObj getPostBatchResumeToken() const override;
 
+    /**
+     * Even though the leaves of '_root' will acquire AutoGet objects, the caller must acquire a top
+     * level AutoGet object outside of this PlanExecutor in order to open a storage transaction and
+     * establish a consistent view of the catalog.
+     */
     LockPolicy lockPolicy() const override {
-        return LockPolicy::kLocksInternally;
+        return LockPolicy::kLockExternally;
     }
 
     const PlanExplainer& getPlanExplainer() const final {
@@ -143,10 +148,16 @@ private:
 
     sbe::value::SlotAccessor* _result{nullptr};
     sbe::value::SlotAccessor* _resultRecordId{nullptr};
-    sbe::value::SlotAccessor* _oplogTs{nullptr};
+    sbe::value::TypeTags _tagLastRecordId{sbe::value::TypeTags::Nothing};
+    sbe::value::Value _valLastRecordId{0};
+    sbe::RuntimeEnvironment::Accessor* _oplogTs{nullptr};
+
     boost::optional<sbe::value::SlotId> _resumeRecordIdSlot;
 
     std::queue<std::pair<BSONObj, boost::optional<RecordId>>> _stash;
+    // If we are returning owned result (i.e. value is moved out of the result accessor) then its
+    // lifetime must extend up to the next getNext (or saveState).
+    BSONObj _lastGetNext;
 
     // If _killStatus has a non-OK value, then we have been killed and the value represents the
     // reason for the kill.

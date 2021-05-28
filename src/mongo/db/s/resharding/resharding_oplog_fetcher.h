@@ -32,6 +32,7 @@
 
 #include "mongo/base/status_with.h"
 #include "mongo/client/dbclient_base.h"
+#include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/expression_context.h"
@@ -42,7 +43,7 @@
 #include "mongo/s/client/shard.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/util/background.h"
-#include "mongo/util/cancelation.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future.h"
 #include "mongo/util/time_support.h"
 #include "mongo/util/uuid.h"
@@ -96,7 +97,8 @@ public:
      * will be rescheduled in a way that resumes where it had left off from.
      */
     ExecutorFuture<void> schedule(std::shared_ptr<executor::TaskExecutor> executor,
-                                  const CancelationToken& cancelToken);
+                                  const CancellationToken& cancelToken,
+                                  CancelableOperationContextFactory factory);
 
     /**
      * Given a shard, fetches and copies oplog entries until
@@ -107,9 +109,9 @@ public:
      * Returns true if there are more oplog entries to be copied, and returns false if the sentinel
      * finish oplog entry has been copied.
      */
-    bool consume(Client* client, Shard* shard);
+    bool consume(Client* client, CancelableOperationContextFactory factory, Shard* shard);
 
-    bool iterate(Client* client);
+    bool iterate(Client* client, CancelableOperationContextFactory factory);
 
     int getNumOplogEntriesCopied() const {
         return _numOplogEntriesCopied;
@@ -135,10 +137,14 @@ private:
     /**
      * Returns true if there's more work to do and the task should be rescheduled.
      */
-    void _ensureCollection(Client* client, const NamespaceString nss);
-    AggregateCommand _makeAggregateCommand(Client* client);
+    void _ensureCollection(Client* client,
+                           CancelableOperationContextFactory factory,
+                           const NamespaceString nss);
+    AggregateCommandRequest _makeAggregateCommandRequest(Client* client,
+                                                         CancelableOperationContextFactory factory);
     ExecutorFuture<void> _reschedule(std::shared_ptr<executor::TaskExecutor> executor,
-                                     const CancelationToken& cancelToken);
+                                     const CancellationToken& cancelToken,
+                                     CancelableOperationContextFactory factory);
 
     ServiceContext* _service() const {
         return _env->service();

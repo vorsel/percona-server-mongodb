@@ -194,7 +194,7 @@ void SortStage::open(bool reOpen) {
             // higher level stages.
             _tracker = nullptr;
             _children[0]->close();
-            uasserted(ErrorCodes::QueryTrialRunCompleted, "Trial run early exit");
+            uasserted(ErrorCodes::QueryTrialRunCompleted, "Trial run early exit in sort");
         }
     }
 
@@ -225,7 +225,7 @@ PlanState SortStage::getNext() {
 void SortStage::close() {
     auto optTimer(getOptTimer(_opCtx));
 
-    _commonStats.closes++;
+    trackClose();
     _mergeIt.reset();
     _sorter.reset();
 }
@@ -269,6 +269,16 @@ std::vector<DebugPrinter::Block> SortStage::debugPrint() const {
         }
 
         DebugPrinter::addIdentifier(ret, _obs[idx]);
+    }
+    ret.emplace_back(DebugPrinter::Block("`]"));
+
+    ret.emplace_back(DebugPrinter::Block("[`"));
+    for (size_t idx = 0; idx < _dirs.size(); idx++) {
+        if (idx) {
+            ret.emplace_back(DebugPrinter::Block("`,"));
+        }
+        DebugPrinter::addIdentifier(ret,
+                                    _dirs[idx] == value::SortDirection::Ascending ? "asc" : "desc");
     }
     ret.emplace_back(DebugPrinter::Block("`]"));
 

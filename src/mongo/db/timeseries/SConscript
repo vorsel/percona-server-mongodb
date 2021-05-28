@@ -23,7 +23,9 @@ env.Library(
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/commands/server_status',
+        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
         '$BUILD_DIR/mongo/db/views/views',
+        '$BUILD_DIR/mongo/util/fail_point',
         'timeseries_idl',
     ],
 )
@@ -33,14 +35,22 @@ env.Library(
     source=[
         'timeseries_index_schema_conversion_functions.cpp',
     ],
+    LIBDEPS_PRIVATE=[
+        'timeseries_idl',
+    ],
+)
+
+env.Library(
+    target='timeseries_lookup',
+    source=[
+        'timeseries_lookup.cpp',
+    ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         'timeseries_idl',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/catalog/database_holder',
-        '$BUILD_DIR/mongo/db/pipeline/pipeline',
-        '$BUILD_DIR/mongo/db/views/views',
+        '$BUILD_DIR/mongo/db/catalog/collection_catalog',
     ],
 )
 

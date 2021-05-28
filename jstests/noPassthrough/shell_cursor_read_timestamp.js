@@ -39,7 +39,11 @@ assert.eq(cursor.getClusterTime(), insertTimestamp);
 
 // Test find with snapshot readConcern.
 cursor = collection.find().readConcern("snapshot");
-assert.eq(cursor.getClusterTime(), insertTimestamp);
+// During primary stepup, we will rebuild PrimaryOnlyService instances, which requires creating
+// indexes on certain collections. If a createCollection occurred after the insert of 10 documents,
+// it is possible that the committed snapshot advanced past 'insertTimestamp'. Therefore, this read
+// could be reading at a newer snapshot since we did not specify a specific 'atClusterTime'.
+assert.gte(cursor.getClusterTime(), insertTimestamp);
 
 // Test find with non-snapshot readConcern.
 cursor = collection.find();
@@ -50,9 +54,11 @@ cursor = collection.aggregate([{$sort: {_id: 1}}],
                               {readConcern: {level: "snapshot", atClusterTime: insertTimestamp}});
 assert.eq(cursor.getClusterTime(), insertTimestamp);
 
-// Test aggregate with snapshot readConcern.
+// Test aggregate with snapshot readConcern. Similarly to the find with snapshot readConcern and no
+// 'atClusterTime', it's possible that this aggregate can read at a newer snapshot than
+// 'insertTimestamp'.
 cursor = collection.aggregate([{$sort: {_id: 1}}], {readConcern: {level: "snapshot"}});
-assert.eq(cursor.getClusterTime(), insertTimestamp);
+assert.gte(cursor.getClusterTime(), insertTimestamp);
 
 // Test aggregate with non-snapshot readConcern.
 cursor = collection.aggregate([{$sort: {_id: 1}}]);

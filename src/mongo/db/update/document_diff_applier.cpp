@@ -74,37 +74,47 @@ struct DocumentDiffTables {
 
     // Order in which new fields should be added to the pre image.
     std::vector<BSONElement> fieldsToInsert;
+    std::size_t sizeOfFieldsToInsert = 0;
+    // Diff only inserts fields, no deletes or updates
+    bool insertOnly = false;
 };
 
 DocumentDiffTables buildObjDiffTables(DocumentDiffReader* reader) {
     DocumentDiffTables out;
+    out.insertOnly = true;
 
     boost::optional<StringData> optFieldName;
     while ((optFieldName = reader->nextDelete())) {
         out.safeInsert(*optFieldName, Delete{});
+        out.insertOnly = false;
     }
 
     boost::optional<BSONElement> nextUpdate;
     while ((nextUpdate = reader->nextUpdate())) {
         out.safeInsert(nextUpdate->fieldNameStringData(), Update{*nextUpdate});
         out.fieldsToInsert.push_back(*nextUpdate);
+        out.insertOnly = false;
     }
 
     boost::optional<BSONElement> nextInsert;
     while ((nextInsert = reader->nextInsert())) {
         out.safeInsert(nextInsert->fieldNameStringData(), Insert{*nextInsert});
         out.fieldsToInsert.push_back(*nextInsert);
+        out.sizeOfFieldsToInsert += out.fieldsToInsert.back().size();
     }
 
     for (auto next = reader->nextSubDiff(); next; next = reader->nextSubDiff()) {
         out.safeInsert(next->first, SubDiff{next->second});
+        out.insertOnly = false;
     }
     return out;
 }
 
 class DiffApplier {
 public:
-    DiffApplier(const UpdateIndexData* indexData) : _indexData(indexData) {}
+    DiffApplier(const UpdateIndexData* indexData, bool mustCheckExistenceForInsertOperations)
+        : _indexData(indexData),
+          _mustCheckExistenceForInsertOperations{mustCheckExistenceForInsertOperations} {}
 
     void applyDiffToObject(const BSONObj& preImage,
                            FieldRef* path,
@@ -113,6 +123,17 @@ public:
         // First build some tables so we can quickly apply the diff. We shouldn't need to examine
         // the diff again once this is done.
         const DocumentDiffTables tables = buildObjDiffTables(reader);
+
+        if (!_mustCheckExistenceForInsertOperations && tables.insertOnly) {
+            builder->bb().reserveBytes(preImage.objsize() + tables.sizeOfFieldsToInsert);
+            builder->appendElements(preImage);
+            for (auto&& elt : tables.fieldsToInsert) {
+                builder->append(elt);
+                FieldRef::FieldRefTempAppend tempAppend(*path, elt.fieldNameStringData());
+                updateIndexesAffected(path);
+            }
+            return;
+        }
 
         // Keep track of what fields we already appended, so that we can insert the rest at the end.
         StringDataSet fieldsToSkipInserting;
@@ -175,12 +196,36 @@ public:
                 it->second);
         }
 
+        // Whether we have already determined whether indexes are affected for the base path; that
+        // is, the path without any of the fields to insert below. This is useful for when multiple
+        // of the fields to insert are not canonical index field components.
+        bool alreadyDidUpdateIndexAffectedForBasePath = false;
+
         // Insert remaining fields to the end.
         for (auto&& elt : tables.fieldsToInsert) {
             if (!fieldsToSkipInserting.count(elt.fieldNameStringData())) {
                 builder->append(elt);
-                FieldRef::FieldRefTempAppend tempAppend(*path, elt.fieldNameStringData());
-                updateIndexesAffected(path);
+
+                bool isComponentPartOfCanonicalizedIndexPath =
+                    UpdateIndexData::isComponentPartOfCanonicalizedIndexPath(
+                        elt.fieldNameStringData());
+                // If the path is empty, then the field names are being appended at the top level.
+                // This means that they cannot represent indices of an array, so the 'canonical'
+                // path check does not apply.
+                if (isComponentPartOfCanonicalizedIndexPath ||
+                    !alreadyDidUpdateIndexAffectedForBasePath || path->empty()) {
+                    FieldRef::FieldRefTempAppend tempAppend(*path, elt.fieldNameStringData());
+                    updateIndexesAffected(path);
+
+                    // If we checked whether the update affects indexes for a path where the tail
+                    // element is not considered part of the 'canonicalized' path (as defined by
+                    // UpdateIndexData) then we've effectively checked whether updating the base
+                    // path affects indexes. This means we can skip future checks for paths that end
+                    // with a component that's not considered part of the canonicalized path.
+                    alreadyDidUpdateIndexAffectedForBasePath =
+                        alreadyDidUpdateIndexAffectedForBasePath ||
+                        !isComponentPartOfCanonicalizedIndexPath;
+                }
             }
         }
     }
@@ -292,14 +337,18 @@ private:
     }
 
     const UpdateIndexData* _indexData;
+    bool _mustCheckExistenceForInsertOperations = true;
     bool _indexesAffected = false;
 };
 }  // namespace
 
-ApplyDiffOutput applyDiff(const BSONObj& pre, const Diff& diff, const UpdateIndexData* indexData) {
+ApplyDiffOutput applyDiff(const BSONObj& pre,
+                          const Diff& diff,
+                          const UpdateIndexData* indexData,
+                          bool mustCheckExistenceForInsertOperations) {
     DocumentDiffReader reader(diff);
     BSONObjBuilder out;
-    DiffApplier applier(indexData);
+    DiffApplier applier(indexData, mustCheckExistenceForInsertOperations);
     FieldRef path;
     applier.applyDiffToObject(pre, &path, &reader, &out);
     return {out.obj(), applier.indexesAffected()};

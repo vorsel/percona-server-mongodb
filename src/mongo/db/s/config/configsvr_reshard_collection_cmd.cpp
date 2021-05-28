@@ -45,7 +45,6 @@
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/reshard_collection_gen.h"
 #include "mongo/s/resharding/resharding_feature_flag_gen.h"
-#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 
 namespace mongo {
 namespace {
@@ -140,9 +139,11 @@ public:
             coordinatorDoc.setCommonReshardingMetadata(std::move(commonMetadata));
             coordinatorDoc.setZones(request().getZones());
             coordinatorDoc.setPresetReshardedChunks(request().get_presetReshardedChunks());
+            coordinatorDoc.setNumInitialChunks(request().getNumInitialChunks());
 
             auto registry = repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext());
-            auto service = registry->lookupServiceByName(kReshardingCoordinatorServiceName);
+            auto service =
+                registry->lookupServiceByName(ReshardingCoordinatorService::kServiceName);
             auto instance = ReshardingCoordinatorService::ReshardingCoordinator::getOrCreate(
                 opCtx, service, coordinatorDoc.toBSON());
 

@@ -483,7 +483,7 @@ private:
 
         if (!response.getOk()) {
             numAttempts = 0;
-        } else if (batchedRequest.getWriteCommandBase().getOrdered() &&
+        } else if (batchedRequest.getWriteCommandRequestBase().getOrdered() &&
                    response.isErrDetailsSet()) {
             // Add one failed attempt
             numAttempts = response.getErrDetailsAt(0)->getIndex() + 1;
@@ -673,6 +673,10 @@ private:
     LogicalOp getLogicalOp() const override {
         return LogicalOp::opInsert;
     }
+
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::write_ops::InsertCommandRequest::kAuthorizationContract;
+    }
 } clusterInsertCmd;
 
 class ClusterUpdateCmd final : public ClusterWriteCmd {
@@ -714,6 +718,10 @@ private:
         return LogicalOp::opUpdate;
     }
 
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::write_ops::UpdateCommandRequest::kAuthorizationContract;
+    }
+
     // Update related command execution metrics.
     UpdateMetrics _updateMetrics;
 } clusterUpdateCmd;
@@ -751,6 +759,11 @@ private:
     LogicalOp getLogicalOp() const override {
         return LogicalOp::opDelete;
     }
+
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::write_ops::DeleteCommandRequest::kAuthorizationContract;
+    }
+
 } clusterDeleteCmd;
 
 }  // namespace

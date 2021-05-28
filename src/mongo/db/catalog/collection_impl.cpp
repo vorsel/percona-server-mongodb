@@ -63,6 +63,7 @@
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/internal_plans.h"
+#include "mongo/db/record_id_helpers.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
@@ -211,6 +212,29 @@ Status validatePreImageRecording(OperationContext* opCtx, const NamespaceString&
     return Status::OK();
 }
 
+class CappedDeleteSideTxn {
+public:
+    CappedDeleteSideTxn(OperationContext* opCtx) : _opCtx(opCtx) {
+        _originalRecoveryUnit = _opCtx->releaseRecoveryUnit().release();
+        invariant(_originalRecoveryUnit);
+        _originalRecoveryUnitState = _opCtx->setRecoveryUnit(
+            std::unique_ptr<RecoveryUnit>(
+                _opCtx->getServiceContext()->getStorageEngine()->newRecoveryUnit()),
+            WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
+    }
+
+    ~CappedDeleteSideTxn() {
+        _opCtx->releaseRecoveryUnit();
+        _opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(_originalRecoveryUnit),
+                                _originalRecoveryUnitState);
+    }
+
+private:
+    OperationContext* const _opCtx;
+    RecoveryUnit* _originalRecoveryUnit;
+    WriteUnitOfWork::RecoveryUnitState _originalRecoveryUnitState;
+};
+
 }  // namespace
 
 CollectionImpl::SharedState::SharedState(CollectionImpl* collection,
@@ -333,9 +357,14 @@ void CollectionImpl::init(OperationContext* opCtx) {
                               "validatorStatus"_attr = _validator.getStatus());
     }
 
+    _timeseriesOptions = collectionOptions.timeseries;
+
     if (collectionOptions.clusteredIndex) {
         _clustered = true;
         if (collectionOptions.clusteredIndex->getExpireAfterSeconds()) {
+            // TTL indexes are not compatible with capped collections.
+            invariant(!collectionOptions.capped);
+
             // If this collection has been newly created, we need to register with the TTL cache at
             // commit time, otherwise it is startup and we can register immediately.
             auto svcCtx = opCtx->getClient()->getServiceContext();
@@ -569,7 +598,7 @@ Status CollectionImpl::insertDocumentsForOplog(OperationContext* opCtx,
     if (!status.isOK())
         return status;
 
-    _cappedDeleteAsNeeded(opCtx);
+    _cappedDeleteAsNeeded(opCtx, records->begin()->id);
 
     opCtx->recoveryUnit()->onCommit(
         [this](boost::optional<Timestamp>) { _shared->notifyCappedWaitersIfNeeded(); });
@@ -607,14 +636,11 @@ Status CollectionImpl::insertDocuments(OperationContext* opCtx,
 
     const SnapshotId sid = opCtx->recoveryUnit()->getSnapshotId();
 
-    status = _insertDocuments(opCtx, begin, end, opDebug);
+    status = _insertDocuments(opCtx, begin, end, opDebug, fromMigrate);
     if (!status.isOK()) {
         return status;
     }
     invariant(sid == opCtx->recoveryUnit()->getSnapshotId());
-
-    getGlobalServiceContext()->getOpObserver()->onInserts(
-        opCtx, ns(), uuid(), begin, end, fromMigrate);
 
     opCtx->recoveryUnit()->onCommit(
         [this](boost::optional<Timestamp>) { _shared->notifyCappedWaitersIfNeeded(); });
@@ -673,14 +699,8 @@ Status CollectionImpl::insertDocumentForBulkLoader(
 
     RecordId recordId;
     if (isClustered()) {
-        // Collections clustered by _id require ObjectId values.
-        BSONElement oidElem;
-        bool foundId = doc.getObjectID(oidElem);
-        uassert(ErrorCodes::BadValue,
-                str::stream() << "Document " << redact(doc) << " is missing the '_id' field",
-                foundId);
         invariant(_shared->_recordStore->keyFormat() == KeyFormat::String);
-        recordId = RecordId(oidElem.OID().view().view(), OID::kOIDSize);
+        recordId = uassertStatusOK(record_id_helpers::keyForDoc(doc));
     }
 
     // Using timestamp 0 for these inserts, which are non-oplog so we don't have an appropriate
@@ -714,7 +734,7 @@ Status CollectionImpl::insertDocumentForBulkLoader(
     getGlobalServiceContext()->getOpObserver()->onInserts(
         opCtx, ns(), uuid(), inserts.begin(), inserts.end(), false);
 
-    _cappedDeleteAsNeeded(opCtx);
+    _cappedDeleteAsNeeded(opCtx, loc.getValue());
 
     opCtx->recoveryUnit()->onCommit(
         [this](boost::optional<Timestamp>) { _shared->notifyCappedWaitersIfNeeded(); });
@@ -725,7 +745,8 @@ Status CollectionImpl::insertDocumentForBulkLoader(
 Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
                                         const std::vector<InsertStatement>::const_iterator begin,
                                         const std::vector<InsertStatement>::const_iterator end,
-                                        OpDebug* opDebug) const {
+                                        OpDebug* opDebug,
+                                        bool fromMigrate) const {
     dassert(opCtx->lockState()->isCollectionLockedForMode(ns(), MODE_IX));
 
     const size_t count = std::distance(begin, end);
@@ -740,7 +761,8 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
 
     if (_shared->_needCappedLock) {
         // X-lock the metadata resource for this capped collection until the end of the WUOW. This
-        // prevents the primary from executing with more concurrency than secondaries.
+        // prevents the primary from executing with more concurrency than secondaries and protects
+        // '_cappedFirstRecord'.
         // See SERVER-21646.
         Lock::ResourceLock heldUntilEndOfWUOW{
             opCtx->lockState(), ResourceId(RESOURCE_METADATA, _ns.ns()), MODE_X};
@@ -756,16 +778,8 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
 
         RecordId recordId;
         if (isClustered()) {
-            // Collections clustered by _id require ObjectId values.
-            BSONElement oidElem;
-            if (!doc.getObjectID(oidElem)) {
-                return Status(ErrorCodes::BadValue,
-                              str::stream()
-                                  << "Document " << redact(doc) << " is missing the '_id' field");
-            }
-
             invariant(_shared->_recordStore->keyFormat() == KeyFormat::String);
-            recordId = RecordId(oidElem.OID().view().view(), OID::kOIDSize);
+            recordId = uassertStatusOK(record_id_helpers::keyForDoc(doc));
         }
 
         if (MONGO_unlikely(corruptDocumentOnInsert.shouldFail())) {
@@ -808,7 +822,11 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
         opDebug->additiveMetrics.incrementKeysInserted(keysInserted);
     }
 
-    _cappedDeleteAsNeeded(opCtx);
+    opCtx->getServiceContext()->getOpObserver()->onInserts(
+        opCtx, ns(), uuid(), begin, end, fromMigrate);
+
+    _cappedDeleteAsNeeded(opCtx, records.begin()->id);
+
     return Status::OK();
 }
 
@@ -817,7 +835,12 @@ bool CollectionImpl::_cappedAndNeedDelete(OperationContext* opCtx) const {
         return false;
     }
 
-    if (dataSize(opCtx) >= _shared->_cappedMaxSize) {
+    if (ns().isOplog() && _shared->_recordStore->selfManagedOplogTruncation()) {
+        // Storage engines can choose to manage oplog truncation internally.
+        return false;
+    }
+
+    if (dataSize(opCtx) > _shared->_cappedMaxSize) {
         return true;
     }
 
@@ -828,13 +851,18 @@ bool CollectionImpl::_cappedAndNeedDelete(OperationContext* opCtx) const {
     return false;
 }
 
-void CollectionImpl::_cappedDeleteAsNeeded(OperationContext* opCtx) const {
-    if (ns().isOplog() && _shared->_recordStore->selfManagedOplogTruncation()) {
-        // Storage engines can choose to manage oplog truncation internally.
+void CollectionImpl::_cappedDeleteAsNeeded(OperationContext* opCtx,
+                                           const RecordId& justInserted) const {
+    if (!_cappedAndNeedDelete(opCtx)) {
         return;
     }
 
-    if (!_cappedAndNeedDelete(opCtx)) {
+    bool useOldCappedDeleteBehaviour = serverGlobalParams.featureCompatibility.isLessThan(
+        ServerGlobalParams::FeatureCompatibility::Version::kVersion50);
+
+    if (!useOldCappedDeleteBehaviour && !opCtx->isEnforcingConstraints()) {
+        // With new capped delete behavior, secondaries only delete from capped collections via
+        // oplog application when there are explicit delete oplog entries.
         return;
     }
 
@@ -854,33 +882,41 @@ void CollectionImpl::_cappedDeleteAsNeeded(OperationContext* opCtx) const {
     // replication recovery. If we don't mark the collection for size adjustment then we will not
     // perform the capped deletions as expected. In that case, the collection is guaranteed to be
     // empty at the stable timestamp and thus guaranteed to be marked for size adjustment.
-    if (!sizeRecoveryState(opCtx->getServiceContext())
+    //
+    // This is only applicable for the old capped delete behaviour.
+    if (useOldCappedDeleteBehaviour &&
+        !sizeRecoveryState(opCtx->getServiceContext())
              .collectionNeedsSizeAdjustment(getSharedIdent()->getIdent())) {
         return;
     }
 
-    stdx::lock_guard<Latch> lk(_shared->_cappedDeleterMutex);
+    stdx::unique_lock<Latch> cappedFirstRecordMutex(_shared->_cappedFirstRecordMutex,
+                                                    stdx::defer_lock);
+    if (_shared->_needCappedLock) {
+        // As capped deletes can be part of a larger WriteUnitOfWork, we need a way to protect
+        // '_cappedFirstRecord' until the outermost WriteUnitOfWork commits or aborts. Locking the
+        // metadata resource exclusively on the collection gives us that guarantee as it uses
+        // two-phase locking semantics.
+        invariant(opCtx->lockState()->getLockMode(ResourceId(RESOURCE_METADATA, _ns.ns())) ==
+                  MODE_X);
+    } else {
+        // Capped deletes not performed under the capped lock need the '_cappedFirstRecordMutex'
+        // mutex.
+        cappedFirstRecordMutex.lock();
+    }
 
-    // TODO SERVER-16049: remove this side transaction.
-    RecoveryUnit* realRecoveryUnit = opCtx->releaseRecoveryUnit().release();
-    invariant(realRecoveryUnit);
-    WriteUnitOfWork::RecoveryUnitState const realRUstate = opCtx->setRecoveryUnit(
-        std::unique_ptr<RecoveryUnit>(
-            opCtx->getServiceContext()->getStorageEngine()->newRecoveryUnit()),
-        WriteUnitOfWork::RecoveryUnitState::kNotInUnitOfWork);
-
-    ON_BLOCK_EXIT([&]() {
-        opCtx->releaseRecoveryUnit();
-        opCtx->setRecoveryUnit(std::unique_ptr<RecoveryUnit>(realRecoveryUnit), realRUstate);
-    });
-
+    boost::optional<CappedDeleteSideTxn> cappedDeleteSideTxn;
+    if (useOldCappedDeleteBehaviour || !_shared->_needCappedLock) {
+        // In FCV < 5.0, all capped deletes are performed in a side transaction. Additionally, any
+        // capped deletes not performed under the capped lock need to commit the innermost
+        // WriteUnitOfWork while '_cappedFirstRecordMutex' is locked.
+        cappedDeleteSideTxn.emplace(opCtx);
+    }
     const long long currentDataSize = dataSize(opCtx);
     const long long currentNumRecords = numRecords(opCtx);
 
-    const long long cappedMaxSize = _shared->_cappedMaxSize;
-
     const long long sizeOverCap =
-        (currentDataSize > cappedMaxSize) ? currentDataSize - cappedMaxSize : 0;
+        (currentDataSize > _shared->_cappedMaxSize) ? currentDataSize - _shared->_cappedMaxSize : 0;
     const long long docsOverCap =
         (_shared->_cappedMaxDocs != 0 && currentNumRecords > _shared->_cappedMaxDocs)
         ? currentNumRecords - _shared->_cappedMaxDocs
@@ -891,14 +927,29 @@ void CollectionImpl::_cappedDeleteAsNeeded(OperationContext* opCtx) const {
 
     WriteUnitOfWork wuow(opCtx);
 
+    boost::optional<Record> record;
     auto cursor = getCursor(opCtx, /*forward=*/true);
-    while (sizeSaved < sizeOverCap || docsRemoved < docsOverCap) {
-        boost::optional<Record> record = cursor->next();
 
-        // Because we're in a side transaction, we're using another storage snapshot and therefore
-        // can't see the newly inserted documents in the capped collection. If there are no records
-        // found. there's nothing to delete.
+    // If the next RecordId to be deleted is known, navigate to it using seekNear(). Using a cursor
+    // and advancing it to the first element by calling next() will be slow for capped collections
+    // on particular storage engines, such as WiredTiger. In WiredTiger, there may be many
+    // tombstones (invisible deleted records) to traverse at the beginning of the table.
+    if (!_shared->_cappedFirstRecord.isNull()) {
+        // Use seekNear instead of seekExact. If this node steps down and a new primary starts
+        // deleting capped documents then this node's cached record will become stale. If this node
+        // steps up again afterwards, then the cached record will be an already deleted document.
+        record = cursor->seekNear(_shared->_cappedFirstRecord);
+    } else {
+        record = cursor->next();
+    }
+
+    while (sizeSaved < sizeOverCap || docsRemoved < docsOverCap) {
         if (!record) {
+            break;
+        }
+
+        if (record->id == justInserted) {
+            // We're prohibited from deleting what was just inserted.
             break;
         }
 
@@ -906,18 +957,58 @@ void CollectionImpl::_cappedDeleteAsNeeded(OperationContext* opCtx) const {
         sizeSaved += record->data.size();
 
         try {
+            BSONObj doc = record->data.toBson();
+            if (!useOldCappedDeleteBehaviour && ns().isReplicated()) {
+                // Only generate oplog entries on replicated collections in FCV >= 5.0.
+                OpObserver* opObserver = opCtx->getServiceContext()->getOpObserver();
+                opObserver->aboutToDelete(opCtx, ns(), doc);
+
+                // Reserves an optime for the deletion and sets the timestamp for future writes.
+                opObserver->onDelete(opCtx,
+                                     ns(),
+                                     uuid(),
+                                     kUninitializedStmtId,
+                                     /*fromMigrate=*/false,
+                                     /*deletedDoc=*/boost::none);
+            }
+
             int64_t unusedKeysDeleted = 0;
             _indexCatalog->unindexRecord(
-                opCtx, record->data.toBson(), record->id, /*logIfError=*/false, &unusedKeysDeleted);
-            _shared->_recordStore->deleteRecord(opCtx, record->id);
+                opCtx, doc, record->id, /*logIfError=*/false, &unusedKeysDeleted);
+
+            // We're about to delete the record our cursor is positioned on, so advance the cursor.
+            RecordId toDelete = record->id;
+            record = cursor->next();
+
+            _shared->_recordStore->deleteRecord(opCtx, toDelete);
         } catch (const WriteConflictException&) {
+            if (!useOldCappedDeleteBehaviour) {
+                throw;
+            }
+
+            invariant(cappedDeleteSideTxn);
             LOGV2(22398, "Got write conflict removing capped records, ignoring");
             return;
         }
     }
 
+    if (cappedDeleteSideTxn) {
+        // Save the RecordId of the next record to be deleted, if it exists.
+        if (!record) {
+            _shared->_cappedFirstRecord = RecordId();
+        } else {
+            _shared->_cappedFirstRecord = record->id;
+        }
+    } else {
+        // Update the next record to be deleted. The next record must exist as we're using the same
+        // snapshot the insert was performed on and we can't delete newly inserted records.
+        invariant(record);
+        opCtx->recoveryUnit()->onCommit([this, recordId = record->id](boost::optional<Timestamp>) {
+            _shared->_cappedFirstRecord = recordId;
+        });
+    }
+
     wuow.commit();
-    return;
 }
 
 void CollectionImpl::setMinimumVisibleSnapshot(Timestamp newMinimumVisibleSnapshot) {
@@ -974,13 +1065,11 @@ void CollectionImpl::deleteDocument(OperationContext* opCtx,
                                     bool fromMigrate,
                                     bool noWarn,
                                     Collection::StoreDeletedDoc storeDeletedDoc) const {
-    if (isCapped()) {
-        LOGV2(20291,
-              "failing remove on a capped ns {ns}",
-              "failing remove on a capped ns",
-              "namespace"_attr = _ns);
+    if (isCapped() && opCtx->isEnforcingConstraints()) {
+        // System operations such as tenant migration or secondary batch application can delete from
+        // capped collections.
+        LOGV2(20291, "failing remove on a capped ns", "namespace"_attr = _ns);
         uasserted(10089, "cannot remove from a capped collection");
-        return;
     }
 
     getGlobalServiceContext()->getOpObserver()->aboutToDelete(opCtx, ns(), doc.value());
@@ -1035,7 +1124,8 @@ RecordId CollectionImpl::updateDocument(OperationContext* opCtx,
 
     if (_shared->_needCappedLock) {
         // X-lock the metadata resource for this capped collection until the end of the WUOW. This
-        // prevents the primary from executing with more concurrency than secondaries.
+        // prevents the primary from executing with more concurrency than secondaries and protects
+        // '_cappedFirstRecord'.
         // See SERVER-21646.
         Lock::ResourceLock heldUntilEndOfWUOW{
             opCtx->lockState(), ResourceId(RESOURCE_METADATA, _ns.ns()), MODE_X};
@@ -1410,6 +1500,10 @@ Status CollectionImpl::updateValidator(OperationContext* opCtx,
     return Status::OK();
 }
 
+boost::optional<TimeseriesOptions> CollectionImpl::getTimeseriesOptions() const {
+    return _timeseriesOptions;
+}
+
 const CollatorInterface* CollectionImpl::getDefaultCollator() const {
     return _shared->_collator.get();
 }
@@ -1469,12 +1563,8 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> CollectionImpl::makePlanExe
     boost::optional<RecordId> resumeAfterRecordId) const {
     auto isForward = scanDirection == ScanDirection::kForward;
     auto direction = isForward ? InternalPlanner::FORWARD : InternalPlanner::BACKWARD;
-    return InternalPlanner::collectionScan(opCtx,
-                                           yieldableCollection->ns().ns(),
-                                           &yieldableCollection,
-                                           yieldPolicy,
-                                           direction,
-                                           resumeAfterRecordId);
+    return InternalPlanner::collectionScan(
+        opCtx, &yieldableCollection, yieldPolicy, direction, resumeAfterRecordId);
 }
 
 void CollectionImpl::setNs(NamespaceString nss) {

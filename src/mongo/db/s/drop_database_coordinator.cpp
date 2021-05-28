@@ -34,6 +34,7 @@
 #include "mongo/db/api_parameters.h"
 #include "mongo/db/persistent_task_store.h"
 #include "mongo/db/s/sharding_ddl_util.h"
+#include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/catalog/sharding_catalog_client.h"
@@ -154,21 +155,9 @@ void DropDatabaseCoordinator::_enterPhase(Phase newPhase) {
     _updateStateDocument(opCtx.get(), std::move(newDoc));
 }
 
-void DropDatabaseCoordinator::_removeStateDocument() {
-    auto opCtx = cc().makeOperationContext();
-    PersistentTaskStore<StateDoc> store(NamespaceString::kShardingDDLCoordinatorsNamespace);
-    LOGV2_DEBUG(
-        5549402, 2, "Removing state document for drop database coordinator", "db"_attr = _dbName);
-    store.remove(opCtx.get(),
-                 BSON(StateDoc::kIdFieldName << _doc.getId().toBSON()),
-                 WriteConcerns::kMajorityWriteConcern);
-
-    _doc = {};
-}
-
 ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
-    const CancelationToken& token) noexcept {
+    const CancellationToken& token) noexcept {
     return ExecutorFuture<void>(**executor)
         .then(_executePhase(
             Phase::kDrop,
@@ -185,6 +174,8 @@ ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
                                 "namespace"_attr = coll.getNss());
                     dropShardedCollection(opCtx, coll, executor);
                 }
+
+                ShardingLogging::get(opCtx)->logChange(opCtx, "dropDatabase.start", _dbName);
 
                 // Drop all collections under this DB
                 auto const catalogClient = Grid::get(opCtx)->catalogClient();
@@ -237,37 +228,19 @@ ExecutorFuture<void> DropDatabaseCoordinator::_runImpl(
                         allShardIds,
                         **executor);
                 }
-            }))
-        .onCompletion([this, anchor = shared_from_this()](const Status& status) {
-            if (!status.isOK() &&
-                (status.isA<ErrorCategory::NotPrimaryError>() ||
-                 status.isA<ErrorCategory::ShutdownError>())) {
-                LOGV2_DEBUG(5494506,
-                            1,
-                            "Drop database coordinator has been interrupted and "
-                            " will continue on the next elected replicaset primary",
-                            "db"_attr = _dbName,
-                            "error"_attr = status);
-                return;
-            }
 
-            if (status.isOK()) {
-                LOGV2_DEBUG(5494507, 1, "Database dropped", "db"_attr = _dbName);
-            } else {
-                LOGV2_ERROR(5494508,
+                ShardingLogging::get(opCtx)->logChange(opCtx, "dropDatabase", _dbName);
+                LOGV2(5494506, "Database dropped", "namespace"_attr = nss());
+            }))
+        .onError([this, anchor = shared_from_this()](const Status& status) {
+            if (!status.isA<ErrorCategory::NotPrimaryError>() &&
+                !status.isA<ErrorCategory::ShutdownError>()) {
+                LOGV2_ERROR(5494507,
                             "Error running drop database",
-                            "db"_attr = _dbName,
+                            "namespace"_attr = nss(),
                             "error"_attr = redact(status));
             }
-
-            try {
-                _removeStateDocument();
-            } catch (DBException& ex) {
-                ex.addContext("Failed to remove drop database coordinator state document");
-                throw;
-            }
-
-            uassertStatusOK(status);
+            return status;
         });
 }
 

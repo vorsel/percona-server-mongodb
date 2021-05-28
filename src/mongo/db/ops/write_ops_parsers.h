@@ -51,11 +51,17 @@ constexpr int kRetryableAndTxnBatchWriteBSONSizeOverhead =
 /**
  * Parses the 'limit' property of a delete entry, which has inverted meaning from the 'multi'
  * property of an update.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
  */
 bool readMultiDeleteProperty(const BSONElement& limitElement);
 
 /**
  * Writes the 'isMulti' value as a limit property.
+ *
+ * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+ * break because of it.
  */
 void writeMultiDeleteProperty(bool isMulti, StringData fieldName, BSONObjBuilder* builder);
 
@@ -78,30 +84,42 @@ public:
     /**
      * Used to indicate that a certain type of update is being passed to the constructor.
      */
-    struct DiffTag {};
+    struct DiffOptions {
+        bool mustCheckExistenceForInsertOperations = true;
+    };
     struct ClassicTag {};
 
     // Given the 'o' field of an update oplog entry, will return an UpdateModification that can be
-    // applied.
-    static UpdateModification parseFromOplogEntry(const BSONObj& oField);
+    // applied. The `options` parameter will be applied only in the case a Delta update is parsed.
+    static UpdateModification parseFromOplogEntry(const BSONObj& oField,
+                                                  const DiffOptions& options);
     static UpdateModification parseFromClassicUpdate(const BSONObj& modifiers) {
         return UpdateModification(modifiers, ClassicTag{});
     }
-    static UpdateModification parseFromV2Delta(const doc_diff::Diff& diff) {
-        return UpdateModification(diff, DiffTag{});
+    static UpdateModification parseFromV2Delta(const doc_diff::Diff& diff,
+                                               DiffOptions const& options) {
+        return UpdateModification(diff, options);
     }
 
     UpdateModification() = default;
     UpdateModification(BSONElement update);
     UpdateModification(std::vector<BSONObj> pipeline);
-    UpdateModification(doc_diff::Diff, DiffTag);
+    UpdateModification(doc_diff::Diff, DiffOptions);
     // This constructor exists only to provide a fast-path for constructing classic-style updates.
     UpdateModification(const BSONObj& update, ClassicTag);
 
     /**
      * These methods support IDL parsing of the "u" field from the update command and OP_UPDATE.
+     *
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
      */
     static UpdateModification parseFromBSON(BSONElement elem);
+
+    /**
+     * IMPORTANT: The method should not be modified, as API version input/output guarantees could
+     * break because of it.
+     */
     void serializeToBSON(StringData fieldName, BSONObjBuilder* bob) const;
 
     // When parsing from legacy OP_UPDATE messages, we receive the "u" field as an object. When an
@@ -129,7 +147,12 @@ public:
 
     doc_diff::Diff getDiff() const {
         invariant(type() == Type::kDelta);
-        return stdx::get<doc_diff::Diff>(_update);
+        return stdx::get<DeltaUpdate>(_update).diff;
+    }
+
+    bool mustCheckExistenceForInsertOperations() const {
+        invariant(type() == Type::kDelta);
+        return stdx::get<DeltaUpdate>(_update).options.mustCheckExistenceForInsertOperations;
     }
 
     std::string toString() const {
@@ -143,8 +166,9 @@ public:
                                                  sb << "{type: Pipeline, update: "
                                                     << Value(pipeline).toString() << "}";
                                              },
-                                             [&sb](const doc_diff::Diff& diff) {
-                                                 sb << "{type: Delta, update: " << diff << "}";
+                                             [&sb](const DeltaUpdate& delta) {
+                                                 sb << "{type: Delta, update: " << delta.diff
+                                                    << "}";
                                              }},
                     _update);
 
@@ -157,7 +181,11 @@ private:
         BSONObj bson;
     };
     using PipelineUpdate = std::vector<BSONObj>;
-    stdx::variant<ClassicUpdate, PipelineUpdate, doc_diff::Diff> _update;
+    struct DeltaUpdate {
+        doc_diff::Diff diff;
+        DiffOptions options;
+    };
+    stdx::variant<ClassicUpdate, PipelineUpdate, DeltaUpdate> _update;
 };
 
 }  // namespace write_ops

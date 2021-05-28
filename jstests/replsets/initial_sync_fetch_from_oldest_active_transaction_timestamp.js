@@ -10,7 +10,10 @@
  * won't be fetched during oplog application and trying to apply the commitTransaction oplog entry
  * will cause initial sync to fail.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
 (function() {
@@ -32,6 +35,10 @@ replTest.initiate(config);
 
 const primary = replTest.getPrimary();
 let secondary = replTest.getSecondary();
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 const dbName = "test";
 const collName = "initial_sync_fetch_from_oldest_active_transaction_timestamp";

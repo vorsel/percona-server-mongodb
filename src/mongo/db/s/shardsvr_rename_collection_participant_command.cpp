@@ -32,39 +32,15 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/s/range_deletion_util.h"
-#include "mongo/db/s/shard_metadata_util.h"
-#include "mongo/db/s/sharding_ddl_util.h"
+#include "mongo/db/s/rename_collection_participant_service.h"
+#include "mongo/db/s/sharded_rename_collection_gen.h"
 #include "mongo/db/s/sharding_state.h"
+#include "mongo/db/write_concern.h"
 #include "mongo/logv2/log.h"
-#include "mongo/s/grid.h"
-#include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
 namespace mongo {
 namespace {
-
-void dropCollectionLocally(OperationContext* opCtx, const NamespaceString& nss) {
-    bool knownNss = [&]() {
-        try {
-            sharding_ddl_util::dropCollectionLocally(opCtx, nss);
-            return true;
-        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-            return false;
-        }
-    }();
-
-    if (knownNss) {
-        uassertStatusOK(shardmetadatautil::dropChunksAndDeleteCollectionsEntry(opCtx, nss));
-    }
-
-    LOGV2_DEBUG(5448800,
-                1,
-                "Dropped target collection locally on renameCollection participant",
-                "namespace"_attr = nss,
-                "collectionExisted"_attr = knownNss);
-}
 
 class ShardsvrRenameCollectionParticipantCommand final
     : public TypedCommand<ShardsvrRenameCollectionParticipantCommand> {
@@ -96,36 +72,25 @@ public:
 
             auto const shardingState = ShardingState::get(opCtx);
             uassertStatusOK(shardingState->canAcceptShardedCommands());
+            auto const& req = request();
 
-            const auto& req = request();
-            const auto& fromNss = ns();
-            const auto& toNss = req.getTo();
-            const RenameCollectionOptions options{req.getDropTarget(), req.getStayTemp()};
+            const NamespaceString& fromNss = ns();
+            RenameCollectionParticipantDocument participantDoc(
+                fromNss, ForwardableOperationMetadata(opCtx), req.getSourceUUID());
+            participantDoc.setRenameCollectionRequest(req.getRenameCollectionRequest());
 
-            // Acquire source/target critical sections
-            sharding_ddl_util::acquireCriticalSection(opCtx, fromNss);
-            sharding_ddl_util::acquireCriticalSection(opCtx, toNss);
+            const auto service = RenameCollectionParticipantService::getService(opCtx);
+            const auto participantDocBSON = participantDoc.toBSON();
+            const auto renameCollectionParticipant =
+                RenameParticipantInstance::getOrCreate(opCtx, service, participantDocBSON);
+            bool hasSameOptions = renameCollectionParticipant->hasSameOptions(participantDocBSON);
+            invariant(hasSameOptions,
+                      str::stream() << "Another rename participant for namespace " << fromNss
+                                    << "is instantiated with different parameters: `"
+                                    << renameCollectionParticipant->doc() << "` vs `"
+                                    << participantDocBSON << "`");
 
-            dropCollectionLocally(opCtx, toNss);
-
-            try {
-                snapshotRangeDeletionsForRename(opCtx, fromNss, toNss);
-
-                // Rename the collection locally and clear the cache
-                validateAndRunRenameCollection(opCtx, fromNss, toNss, options);
-                uassertStatusOK(
-                    shardmetadatautil::dropChunksAndDeleteCollectionsEntry(opCtx, fromNss));
-
-                restoreRangeDeletionTasksForRename(opCtx, toNss);
-                deleteRangeDeletionTasksForRename(opCtx, fromNss, toNss);
-            } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
-                // It's ok for a participant shard to have no knowledge about a collection
-                LOGV2_DEBUG(
-                    5448801,
-                    1,
-                    "Source namespace not found while trying to rename collection on participant",
-                    "namespace"_attr = fromNss);
-            }
+            renameCollectionParticipant->getBlockCRUDAndRenameCompletionFuture().get(opCtx);
         }
 
     private:
@@ -180,15 +145,20 @@ public:
             auto const shardingState = ShardingState::get(opCtx);
             uassertStatusOK(shardingState->canAcceptShardedCommands());
 
-            const auto& fromNss = ns();
-            const auto& toNss = request().getTo();
+            const NamespaceString& fromNss = ns();
+            const auto& req = request();
 
-            // Release source/target critical sections
-            sharding_ddl_util::releaseCriticalSection(opCtx, fromNss);
-            sharding_ddl_util::releaseCriticalSection(opCtx, toNss);
+            RenameCollectionParticipantDocument participantDoc(
+                fromNss, ForwardableOperationMetadata(opCtx), req.getSourceUUID());
+            participantDoc.setRenameCollectionRequest(req.getRenameCollectionRequest());
 
-            auto catalog = Grid::get(opCtx)->catalogCache();
-            uassertStatusOK(catalog->getCollectionRoutingInfoWithRefresh(opCtx, toNss));
+            const auto service = RenameCollectionParticipantService::getService(opCtx);
+            const auto id = BSON("_id" << fromNss.ns());
+            const auto optRenameCollectionParticipant =
+                RenameParticipantInstance::lookup(opCtx, service, id);
+            if (optRenameCollectionParticipant) {
+                optRenameCollectionParticipant.get()->getUnblockCrudFuture().get(opCtx);
+            }
         }
 
     private:

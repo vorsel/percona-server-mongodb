@@ -1,6 +1,9 @@
 // Tests that change streams and their update lookups obey the read preference specified by the
 // user.
-// @tags: [uses_change_streams, requires_majority_read_concern]
+// @tags: [
+//   requires_majority_read_concern,
+//   uses_change_streams,
+// ]
 (function() {
 "use strict";
 

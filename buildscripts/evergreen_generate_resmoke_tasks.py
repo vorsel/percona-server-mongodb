@@ -23,10 +23,10 @@ import requests
 import structlog
 import yaml
 
-from evergreen.api import EvergreenApi, RetryingEvergreenApi
 from pydantic.main import BaseModel
 
 from shrub.v2 import Task, TaskDependency, BuildVariant, ExistingTask, ShrubProject
+from evergreen.api import EvergreenApi, RetryingEvergreenApi
 
 # Get relative imports to work when the package is not installed on the PYTHONPATH.
 if __name__ == "__main__" and __package__ is None:
@@ -52,6 +52,7 @@ MIN_TIMEOUT_SECONDS = int(timedelta(minutes=5).total_seconds())
 MAX_EXPECTED_TIMEOUT = int(timedelta(hours=48).total_seconds())
 LOOKBACK_DURATION_DAYS = 14
 GEN_SUFFIX = "_gen"
+GEN_PARENT_TASK = "generator_tasks"
 CLEAN_EVERY_N_HOOK = "CleanEveryN"
 ASAN_SIGNATURE = "detect_leaks=1"
 
@@ -832,8 +833,9 @@ class EvergreenConfigGenerator(object):
         tasks = self._generate_all_tasks()
         generating_task = {ExistingTask(task_name) for task_name in self.options.gen_task_set}
         distros = self._get_distro(build_variant.name)
+        build_variant.display_task(GEN_PARENT_TASK, execution_existing_tasks=generating_task)
         build_variant.display_task(self.options.display_task_name, execution_tasks=tasks,
-                                   execution_existing_tasks=generating_task, distros=distros)
+                                   distros=distros)
 
 
 class GenerateSubSuites(object):
@@ -1008,7 +1010,16 @@ class GenerateSubSuites(object):
 
     def list_tests(self) -> List[str]:
         """List the test files that are part of the suite being split."""
-        return suitesconfig.get_suite(self.config_options.suite).tests
+        suite_config = suitesconfig.get_suite(self.config_options.suite)
+        test_list = []
+        for tests in suite_config.tests:
+            # `tests` could return individual tests or lists of tests, we need to handle both.
+            if isinstance(tests, list):
+                test_list.extend(tests)
+            else:
+                test_list.append(tests)
+
+        return test_list
 
     def add_suites_to_build_variant(self, suites: List[Suite], build_variant: BuildVariant) -> None:
         """

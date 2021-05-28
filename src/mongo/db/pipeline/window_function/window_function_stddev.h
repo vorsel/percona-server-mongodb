@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/pipeline/accumulator.h"
 #include "mongo/db/pipeline/window_function/window_function.h"
 
 namespace mongo {
@@ -60,7 +61,7 @@ public:
 
     Value getValue() const final {
         if (_nonfiniteValueCount > 0)
-            return Value(std::numeric_limits<double>::quiet_NaN());
+            return Value(BSONNULL);
         const long long adjustedCount = _isSamp ? _count - 1 : _count;
         if (adjustedCount == 0)
             return getDefault();

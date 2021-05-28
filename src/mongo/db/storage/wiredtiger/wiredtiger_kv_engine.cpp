@@ -82,6 +82,7 @@
 #include "mongo/db/encryption/encryption_options.h"
 #include "mongo/db/global_settings.h"
 #include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/mongod_options_storage_gen.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
@@ -405,7 +406,7 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         }
     }
 
-    _previousCheckedDropsQueued = _clockSource->now();
+    _previousCheckedDropsQueued.store(_clockSource->now().toMillisSinceEpoch());
 
     if (encryptionGlobalParams.enableEncryption) {
         namespace fs = boost::filesystem;
@@ -2360,6 +2361,8 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::getRecordStore(OperationContext
     params.engineName = _canonicalName;
     params.isCapped = options.capped;
     params.keyFormat = (options.clusteredIndex) ? KeyFormat::String : KeyFormat::Long;
+    // Record stores clustered by _id need to guarantee uniqueness by preventing overwrites.
+    params.overwrite = options.clusteredIndex ? false : true;
     params.isEphemeral = _ephemeral;
     params.cappedCallback = nullptr;
     params.sizeStorer = _sizeStorer.get();
@@ -2472,7 +2475,7 @@ std::unique_ptr<SortedDataInterface> WiredTigerKVEngine::getSortedDataInterface(
 
 std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(OperationContext* opCtx,
                                                                           StringData ident) {
-    invariant(!_readOnly);
+    invariant(!_readOnly || !recoverToOplogTimestamp.empty());
 
     _ensureIdentPath(ident);
     WiredTigerSession wtSession(_conn);
@@ -2499,6 +2502,7 @@ std::unique_ptr<RecordStore> WiredTigerKVEngine::makeTemporaryRecordStore(Operat
     params.engineName = _canonicalName;
     params.isCapped = false;
     params.keyFormat = KeyFormat::Long;
+    params.overwrite = true;
     params.isEphemeral = _ephemeral;
     params.cappedCallback = nullptr;
     // Temporary collections do not need to persist size information to the size storer.
@@ -2625,7 +2629,7 @@ std::list<WiredTigerCachedCursor> WiredTigerKVEngine::filterCursorsWithQueuedDro
 
 bool WiredTigerKVEngine::haveDropsQueued() const {
     Date_t now = _clockSource->now();
-    Milliseconds delta = now - _previousCheckedDropsQueued;
+    Milliseconds delta = now - Date_t::fromMillisSinceEpoch(_previousCheckedDropsQueued.load());
 
     if (!_readOnly && _sizeStorerSyncTracker.intervalHasElapsed()) {
         _sizeStorerSyncTracker.resetLastTime();
@@ -2636,7 +2640,7 @@ bool WiredTigerKVEngine::haveDropsQueued() const {
     if (delta < Milliseconds(1000))
         return false;
 
-    _previousCheckedDropsQueued = now;
+    _previousCheckedDropsQueued.store(now.toMillisSinceEpoch());
 
     // Don't wait for the mutex: if we can't get it, report that no drops are queued.
     stdx::unique_lock<Latch> lk(_identToDropMutex, stdx::defer_lock);
@@ -2715,7 +2719,7 @@ void WiredTigerKVEngine::checkpoint() {
         // Three cases:
         //
         // First, initialDataTimestamp is Timestamp(0, 1) -> Take full checkpoint. This is when
-        // there is no consistent view of the data (i.e: during initial sync).
+        // there is no consistent view of the data (e.g: during initial sync).
         //
         // Second, stableTimestamp < initialDataTimestamp: Skip checkpoints. The data on disk is
         // prone to being rolled back. Hold off on checkpoints.  Hope that the stable timestamp
@@ -2727,6 +2731,10 @@ void WiredTigerKVEngine::checkpoint() {
             UniqueWiredTigerSession session = _sessionCache->getSession();
             WT_SESSION* s = session->getSession();
             invariantWTOK(s->checkpoint(s, "use_timestamp=false"));
+            LOGV2_FOR_RECOVERY(5576602,
+                               2,
+                               "Completed unstable checkpoint.",
+                               "initialDataTimestamp"_attr = initialDataTimestamp.toString());
         } else if (stableTimestamp < initialDataTimestamp) {
             LOGV2_FOR_RECOVERY(
                 23985,

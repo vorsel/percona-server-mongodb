@@ -15,17 +15,22 @@ load("jstests/replsets/libs/tenant_migration_util.js");
  * instead, with all nodes running the latest version.
  *
  * @param {string} [name] the name of the replica sets
+ * @param {boolean} [enableRecipientTesting] whether recipient would actually migrate tenant data
  * @param {Object} [donorRst] the ReplSetTest instance to adopt for the donor
  * @param {Object} [recipientRst] the ReplSetTest instance to adopt for the recipient
  * @param {Object} [sharedOptions] an object that can contain 'nodes' <number>, the number of nodes
  *     each RST will contain, and 'setParameter' <object>, an object with various server parameters.
+ * @param {boolean} [allowDonorReadAfterMigration] whether donor would allow reads after a committed
+ *     migration.
  */
 function TenantMigrationTest({
     name = "TenantMigrationTest",
     enableRecipientTesting = true,
     donorRst,
     recipientRst,
-    sharedOptions = {}
+    sharedOptions = {},
+    // Default this to true so it is easier for data consistency checks.
+    allowStaleReadsOnDonor = true,
 }) {
     const donorPassedIn = (donorRst !== undefined);
     const recipientPassedIn = (recipientRst !== undefined);
@@ -42,13 +47,13 @@ function TenantMigrationTest({
     donorRst.asCluster(donorRst.nodes, () => {
         donorRst.getPrimary();
         donorRst.awaitReplication();
-        createTenantMigrationRecipientRoleIfNotExist(donorRst);
+        TenantMigrationUtil.createTenantMigrationRecipientRoleIfNotExist(donorRst);
     });
 
     recipientRst.asCluster(recipientRst.nodes, () => {
         recipientRst.getPrimary();
         recipientRst.awaitReplication();
-        createTenantMigrationDonorRoleIfNotExist(recipientRst);
+        TenantMigrationUtil.createTenantMigrationDonorRoleIfNotExist(recipientRst);
     });
 
     /**
@@ -65,6 +70,11 @@ function TenantMigrationTest({
                 tojson({mode: 'alwaysOn'});
         }
 
+        if (allowStaleReadsOnDonor) {
+            setParameterOpts["failpoint.tenantMigrationDonorAllowsNonTimestampedReads"] =
+                tojson({mode: 'alwaysOn'});
+        }
+
         let nodeOptions = isDonor ? migrationX509Options.donor : migrationX509Options.recipient;
         nodeOptions["setParameter"] = setParameterOpts;
 
@@ -77,71 +87,13 @@ function TenantMigrationTest({
     }
 
     /**
-     * Returns true if the given database role already exists.
-     */
-    function roleExists(db, roleName) {
-        const roles = db.getRoles({rolesInfo: 1, showPrivileges: false, showBuiltinRoles: false});
-        const fullRoleName = `${db.getName()}.${roleName}`;
-        for (let role of roles) {
-            if (role._id == fullRoleName) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Creates a role for tenant migration donor if it doesn't exist.
-     */
-    function createTenantMigrationDonorRoleIfNotExist(rst) {
-        const adminDB = rst.getPrimary().getDB("admin");
-
-        if (roleExists(adminDB, "tenantMigrationDonorRole")) {
-            return;
-        }
-
-        assert.commandWorked(adminDB.runCommand({
-            createRole: "tenantMigrationDonorRole",
-            privileges: [
-                {resource: {cluster: true}, actions: ["runTenantMigration"]},
-                {resource: {db: "admin", collection: "system.keys"}, actions: ["find"]}
-            ],
-            roles: []
-        }));
-    }
-
-    /**
-     * Creates a role for tenant migration recipient if it doesn't exist.
-     */
-    function createTenantMigrationRecipientRoleIfNotExist(rst) {
-        const adminDB = rst.getPrimary().getDB("admin");
-
-        if (roleExists(adminDB, "tenantMigrationRecipientRole")) {
-            return;
-        }
-
-        assert.commandWorked(adminDB.runCommand({
-            createRole: "tenantMigrationRecipientRole",
-            privileges: [
-                {resource: {cluster: true}, actions: ["listDatabases", "useUUID"]},
-                {resource: {db: "", collection: ""}, actions: ["listCollections"]},
-                {
-                    resource: {anyResource: true},
-                    actions: ["dbStats", "collStats", "find", "listIndexes"]
-                }
-            ],
-            roles: []
-        }));
-    }
-
-    /**
      * Creates a role for running find command against config.external_validation_keys if it
      * doesn't exist.
      */
     function createFindExternalClusterTimeKeysRoleIfNotExist(rst) {
         const adminDB = rst.getPrimary().getDB("admin");
 
-        if (roleExists(adminDB, "findExternalClusterTimeKeysRole")) {
+        if (TenantMigrationUtil.roleExists(adminDB, "findExternalClusterTimeKeysRole")) {
             return;
         }
 
@@ -300,7 +252,8 @@ function TenantMigrationTest({
         // If the migration has been successfully committed, check the db hashes for the tenantId
         // between the donor and recipient.
         if (stateRes.state === TenantMigrationTest.State.kCommitted) {
-            this.checkTenantDBHashes(tenantId);
+            TenantMigrationUtil.checkTenantDBHashes(
+                this.getDonorRst(), this.getRecipientRst(), tenantId);
         }
 
         return stateRes;
@@ -436,7 +389,7 @@ function TenantMigrationTest({
      */
     this.isDonorNodeInExpectedState = function(node, migrationId, tenantId, expectedState) {
         const configDonorsColl =
-            this.getDonorPrimary().getCollection("config.tenantMigrationDonors");
+            this.getDonorPrimary().getCollection(TenantMigrationTest.kConfigDonorsNS);
         if (configDonorsColl.findOne({_id: migrationId}).state !== expectedState) {
             return false;
         }
@@ -446,7 +399,7 @@ function TenantMigrationTest({
             : TenantMigrationTest.DonorAccessState.kAborted;
         const mtabs =
             assert.commandWorked(node.adminCommand({serverStatus: 1})).tenantMigrationAccessBlocker;
-        return (mtabs[tenantId].state === expectedAccessState);
+        return (mtabs[tenantId].donor.state === expectedAccessState);
     };
 
     /**
@@ -487,7 +440,7 @@ function TenantMigrationTest({
 
         const mtabs =
             assert.commandWorked(node.adminCommand({serverStatus: 1})).tenantMigrationAccessBlocker;
-        return (mtabs[tenantId].state === expectedAccessState);
+        return (mtabs[tenantId].recipient.state === expectedAccessState);
     };
 
     function loadDummyData() {
@@ -515,7 +468,8 @@ function TenantMigrationTest({
      */
     this.verifyRecipientDB = function(
         tenantId, dbName, collName, migrationCommitted = true, data = loadDummyData()) {
-        const shouldMigrate = migrationCommitted && this.isNamespaceForTenant(tenantId, dbName);
+        const shouldMigrate =
+            migrationCommitted && TenantMigrationUtil.isNamespaceForTenant(tenantId, dbName);
 
         jsTestLog(`Verifying that data in collection ${collName} of DB ${dbName} was ${
             (shouldMigrate ? "" : "not")} migrated to the recipient`);
@@ -557,13 +511,6 @@ function TenantMigrationTest({
      */
     this.nonTenantDB = function(tenantId, dbName) {
         return `non_${tenantId}_${dbName}`;
-    };
-
-    /**
-     * Determines if a database name belongs to the given tenant.
-     */
-    this.isNamespaceForTenant = function(tenantId, dbName) {
-        return dbName.startsWith(`${tenantId}_`);
     };
 
     /**
@@ -653,62 +600,6 @@ function TenantMigrationTest({
      */
     this.getRecipientConnString = function() {
         return this.getRecipientRst().getURL();
-    };
-
-    /**
-     * Compares the hashes for DBs that belong to the specified tenant between the donor and
-     * recipient primaries.
-     */
-    this.checkTenantDBHashes = function(
-        tenantId, excludedDBs = [], msgPrefix = 'checkTenantDBHashes', ignoreUUIDs = false) {
-        // Always skip db hash checks for the local database.
-        excludedDBs = [...excludedDBs, "local"];
-
-        const donorPrimary = this.getDonorRst().getPrimary();
-        const recipientPrimary = this.getRecipientRst().getPrimary();
-
-        // Filter out all dbs that don't belong to the tenant.
-        let combinedDBNames = [...donorPrimary.getDBNames(), ...recipientPrimary.getDBNames()];
-        combinedDBNames =
-            combinedDBNames.filter(dbName => (this.isNamespaceForTenant(tenantId, dbName) &&
-                                              !excludedDBs.includes(dbName)));
-        combinedDBNames = new Set(combinedDBNames);
-
-        for (const dbName of combinedDBNames) {
-            // Pass in an empty array for the secondaries, since we only wish to compare the DB
-            // hashes between the donor and recipient primary in this test.
-            const donorDBHash =
-                assert.commandWorked(this.getDonorRst().getHashes(dbName, []).primary);
-            const recipientDBHash =
-                assert.commandWorked(this.getRecipientRst().getHashes(dbName, []).primary);
-
-            const donorCollections = Object.keys(donorDBHash.collections);
-            const donorCollInfos = new CollInfos(donorPrimary, 'donorPrimary', dbName);
-            donorCollInfos.filter(donorCollections);
-
-            const recipientCollections = Object.keys(recipientDBHash.collections);
-            const recipientCollInfos = new CollInfos(recipientPrimary, 'recipientPrimary', dbName);
-            recipientCollInfos.filter(recipientCollections);
-
-            print(`checking db hash between donor: ${donorPrimary} and recipient: ${
-                recipientPrimary}`);
-
-            const collectionPrinted = new Set();
-            const success = DataConsistencyChecker.checkDBHash(donorDBHash,
-                                                               donorCollInfos,
-                                                               recipientDBHash,
-                                                               recipientCollInfos,
-                                                               msgPrefix,
-                                                               ignoreUUIDs,
-                                                               true, /* syncingHasIndexes */
-                                                               collectionPrinted);
-            if (!success) {
-                print(`checkTenantDBHashes dumping donor and recipient primary oplogs`);
-                this.getDonorRst().dumpOplog(donorPrimary, {}, 100);
-                this.getRecipientRst().dumpOplog(recipientPrimary, {}, 100);
-            }
-            assert(success, 'dbhash mismatch between donor and recipient primaries');
-        }
     };
 
     /**

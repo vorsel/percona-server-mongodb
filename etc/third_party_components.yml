@@ -71,7 +71,6 @@ components:
     local_directory_path: src/third_party/benchmark
     is_test_only: true
     team_owner: "Service Architecture"
-    upgrade_suppression: TODO SERVER-49200
 
   "Boost C++ Libraries - boost":
     homepage_url: https://www.boost.org/
@@ -95,7 +94,6 @@ components:
     release_monitoring_id: -1
     local_directory_path: src/third_party/SafeInt
     team_owner: "Service Architecture"
-    upgrade_suppression: TODO SERVER-49213
 
   discover-python:
     homepage_url: https://pypi.org/project/discover/
@@ -105,13 +103,12 @@ components:
     is_test_only: true
     team_owner: "Wiredtiger"
 
-  fmt:
+  fmtlib/fmt:
     homepage_url: https://fmt.dev
     open_hub_url: https://www.openhub.net/p/fmtlib_fmt
     release_monitoring_id: 11526
     local_directory_path: src/third_party/fmt
     team_owner: "Security"
-    upgrade_suppression: TODO SERVER-45445
 
   google/s2geometry:
     homepage_url: https://github.com/google/s2geometry
@@ -154,6 +151,14 @@ components:
     local_directory_path: src/third_party/IntelRDFPMathLib20U1
     team_owner: "Execution"
     # Note: IntelRDFPMathLib exists in Black Duck, but not OpenHub
+
+  jbeder/yaml-cpp:
+    homepage_url: https://github.com/jbeder/yaml-cpp
+    open_hub_url: https://www.openhub.net/p/jbeder_yaml-cpp
+    release_monitoring_id: 5284
+    local_directory_path: src/third_party/yaml-cpp-0.6.2
+    team_owner: "Security"
+    upgrade_suppression: TODO SERVER-48258
 
   JSON-Schema-Test-Suite:
     homepage_url: https://github.com/json-schema-org/JSON-Schema-Test-Suite
@@ -295,7 +300,7 @@ components:
     homepage_url: https://github.com/derickr/timelib
     open_hub_url: N/A
     release_monitoring_id: -1
-    local_directory_path: src/third_party/timelib-2018.01
+    local_directory_path: src/third_party/timelib-2021.06
     team_owner: "Query"
     # Note: Not in Black Duck
 
@@ -310,9 +315,8 @@ components:
     homepage_url: https://valgrind.org/
     open_hub_url: https://www.openhub.net/p/valgrind
     release_monitoring_id: 13639
-    local_directory_path: src/third_party/valgrind-3.14.0
+    local_directory_path: src/third_party/valgrind
     team_owner: "Decision Automation Group"
-    upgrade_suppression: TODO SERVER-51479
 
   testtools:
     homepage_url: https://launchpad.net/testtools
@@ -321,14 +325,6 @@ components:
     local_directory_path: src/third_party/wiredtiger/test/3rdparty/testtools-0.9.34
     is_test_only: true
     team_owner: "Wiredtiger"
-
-  yaml-cpp:
-    homepage_url: https://github.com/jbeder/yaml-cpp
-    open_hub_url: https://www.openhub.net/p/jbeder_yaml-cpp
-    release_monitoring_id: 5284
-    local_directory_path: src/third_party/yaml-cpp-0.6.2
-    team_owner: "Security"
-    upgrade_suppression: TODO SERVER-48258
 
   yhirose/cpp-peglib:
     homepage_url: https://github.com/yhirose/cpp-peglib

@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include "mongo/platform/basic.h"
 
@@ -118,7 +118,7 @@ ReshardingOplogApplicationRules::ReshardingOplogApplicationRules(
       _sourceChunkMgr(std::move(sourceChunkMgr)) {}
 
 Status ReshardingOplogApplicationRules::applyOperation(OperationContext* opCtx,
-                                                       const repl::OplogEntry& op) {
+                                                       const repl::OplogEntry& op) const {
     LOGV2_DEBUG(49901, 3, "Applying op for resharding", "op"_attr = redact(op.toBSONForLogging()));
 
     invariant(!opCtx->lockState()->inAWriteUnitOfWork());
@@ -198,7 +198,7 @@ void ReshardingOplogApplicationRules::_applyInsert_inlock(OperationContext* opCt
                                                           Database* db,
                                                           const CollectionPtr& outputColl,
                                                           const CollectionPtr& stashColl,
-                                                          const repl::OplogEntry& op) {
+                                                          const repl::OplogEntry& op) const {
     /**
      * The rules to apply ordinary insert operations are as follows:
      *
@@ -291,7 +291,7 @@ void ReshardingOplogApplicationRules::_applyUpdate_inlock(OperationContext* opCt
                                                           Database* db,
                                                           const CollectionPtr& outputColl,
                                                           const CollectionPtr& stashColl,
-                                                          const repl::OplogEntry& op) {
+                                                          const repl::OplogEntry& op) const {
     /**
      * The rules to apply ordinary update operations are as follows:
      *
@@ -323,7 +323,8 @@ void ReshardingOplogApplicationRules::_applyUpdate_inlock(OperationContext* opCt
             !idField.eoo());
 
     BSONObj idQuery = idField.wrap();
-    auto updateMod = write_ops::UpdateModification::parseFromOplogEntry(oField);
+    auto updateMod = write_ops::UpdateModification::parseFromOplogEntry(
+        oField, write_ops::UpdateModification::DiffOptions{});
 
     // First, query the conflict stash collection using [op _id] as the query. If a doc exists,
     // apply rule #1 and update the doc from the stash collection.
@@ -375,7 +376,7 @@ void ReshardingOplogApplicationRules::_applyDelete_inlock(OperationContext* opCt
                                                           Database* db,
                                                           const CollectionPtr& outputColl,
                                                           const CollectionPtr& stashColl,
-                                                          const repl::OplogEntry& op) {
+                                                          const repl::OplogEntry& op) const {
     /**
      * The rules to apply ordinary delete operations are as follows:
      *
@@ -519,7 +520,7 @@ void ReshardingOplogApplicationRules::_applyDelete_inlock(OperationContext* opCt
 BSONObj ReshardingOplogApplicationRules::_queryStashCollById(OperationContext* opCtx,
                                                              Database* db,
                                                              const CollectionPtr& coll,
-                                                             const BSONObj& idQuery) {
+                                                             const BSONObj& idQuery) const {
     const IndexCatalog* indexCatalog = coll->getIndexCatalog();
     uassert(4990100,
             str::stream() << "Missing _id index for collection " << _myStashNss.ns(),

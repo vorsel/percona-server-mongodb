@@ -94,7 +94,7 @@ public:
     static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
     buildInnerQueryExecutor(const CollectionPtr& collection,
                             const NamespaceString& nss,
-                            const AggregateCommand* aggRequest,
+                            const AggregateCommandRequest* aggRequest,
                             Pipeline* pipeline);
 
     /**
@@ -116,10 +116,11 @@ public:
      * used when the executor attachment phase doesn't need to be deferred and the $cursor stage
      * can be created right after buiding the executor.
      */
-    static void buildAndAttachInnerQueryExecutorToPipeline(const CollectionPtr& collection,
-                                                           const NamespaceString& nss,
-                                                           const AggregateCommand* aggRequest,
-                                                           Pipeline* pipeline);
+    static void buildAndAttachInnerQueryExecutorToPipeline(
+        const CollectionPtr& collection,
+        const NamespaceString& nss,
+        const AggregateCommandRequest* aggRequest,
+        Pipeline* pipeline);
 
     static Timestamp getLatestOplogTimestamp(const Pipeline* pipeline);
 
@@ -133,17 +134,28 @@ public:
      * Resolves the collator to either the user-specified collation or, if none was specified, to
      * the collection-default collation.
      */
-    static std::unique_ptr<CollatorInterface> resolveCollator(OperationContext* opCtx,
-                                                              BSONObj userCollation,
-                                                              const CollectionPtr& collection) {
-        if (!userCollation.isEmpty()) {
-            return uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
-                                       ->makeFromBSON(userCollation));
+    static std::pair<std::unique_ptr<CollatorInterface>, ExpressionContext::CollationMatchesDefault>
+    resolveCollator(OperationContext* opCtx,
+                    BSONObj userCollation,
+                    const CollectionPtr& collection) {
+        if (!collection || !collection->getDefaultCollator()) {
+            return {userCollation.isEmpty()
+                        ? nullptr
+                        : uassertStatusOK(CollatorFactoryInterface::get(opCtx->getServiceContext())
+                                              ->makeFromBSON(userCollation)),
+                    ExpressionContext::CollationMatchesDefault::kNoDefault};
         }
-
-        return (collection && collection->getDefaultCollator()
-                    ? collection->getDefaultCollator()->clone()
-                    : nullptr);
+        if (userCollation.isEmpty()) {
+            return {collection->getDefaultCollator()->clone(),
+                    ExpressionContext::CollationMatchesDefault::kYes};
+        }
+        auto userCollator = uassertStatusOK(
+            CollatorFactoryInterface::get(opCtx->getServiceContext())->makeFromBSON(userCollation));
+        return {
+            std::move(userCollator),
+            CollatorInterface::collatorsMatch(collection->getDefaultCollator(), userCollator.get())
+                ? ExpressionContext::CollationMatchesDefault::kYes
+                : ExpressionContext::CollationMatchesDefault::kNo};
     }
 
 private:
@@ -156,7 +168,7 @@ private:
     static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
     buildInnerQueryExecutorGeneric(const CollectionPtr& collection,
                                    const NamespaceString& nss,
-                                   const AggregateCommand* aggRequest,
+                                   const AggregateCommandRequest* aggRequest,
                                    Pipeline* pipeline);
 
     /**
@@ -167,7 +179,7 @@ private:
     static std::pair<AttachExecutorCallback, std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>>
     buildInnerQueryExecutorGeoNear(const CollectionPtr& collection,
                                    const NamespaceString& nss,
-                                   const AggregateCommand* aggRequest,
+                                   const AggregateCommandRequest* aggRequest,
                                    Pipeline* pipeline);
 
     /**
@@ -205,7 +217,7 @@ private:
         QueryMetadataBitSet metadataAvailable,
         const BSONObj& queryObj,
         SkipThenLimit skipThenLimit,
-        const AggregateCommand* aggRequest,
+        const AggregateCommandRequest* aggRequest,
         const MatchExpressionParser::AllowedFeatureSet& matcherFeatures,
         bool* hasNoRequirements);
 };

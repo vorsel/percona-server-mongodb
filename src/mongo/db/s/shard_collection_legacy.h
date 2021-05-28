@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
 
@@ -42,6 +43,7 @@ namespace mongo {
 CreateCollectionResponse shardCollectionLegacy(OperationContext* opCtx,
                                                const NamespaceString& nss,
                                                const BSONObj& cmdObj,
-                                               bool requestFromCSRS);
+                                               bool requestFromCSRS,
+                                               const FixedFCVRegion& fcvRegion);
 
 }  // namespace mongo

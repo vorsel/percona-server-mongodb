@@ -82,8 +82,8 @@ public:
         CatalogTestFixture::setUp();
 
         WriteUnitOfWork wuow(operationContext());
-        AutoGetOrCreateDb autoDb(operationContext(), "db", MODE_X);
-        _db = autoDb.getDb();
+        AutoGetDb autoDb(operationContext(), "db", MODE_X);
+        _db = autoDb.ensureDbExists();
         invariant(_db);
 
         auto durableViewCatalogUnique = std::make_unique<DurableViewCatalogImpl>(_db);
@@ -95,8 +95,8 @@ public:
             NamespaceString("db", NamespaceString::kSystemDotViewsCollectionName)));
 
         // Create any additional databases used throughout the test.
-        ASSERT(AutoGetOrCreateDb(operationContext(), "db1", MODE_X).getDb());
-        ASSERT(AutoGetOrCreateDb(operationContext(), "db2", MODE_X).getDb());
+        ASSERT(AutoGetDb(operationContext(), "db1", MODE_X).ensureDbExists());
+        ASSERT(AutoGetDb(operationContext(), "db2", MODE_X).ensureDbExists());
         wuow.commit();
     }
 
@@ -121,8 +121,7 @@ public:
             MODE_X);
 
         WriteUnitOfWork wuow(opCtx);
-        Status s =
-            ViewCatalog::createView(opCtx, _db, viewName, viewOn, pipeline, collation, boost::none);
+        Status s = ViewCatalog::createView(opCtx, _db, viewName, viewOn, pipeline, collation);
         wuow.commit();
 
         return s;
@@ -531,13 +530,8 @@ TEST_F(ViewCatalogFixture, LookupRIDExistingViewRollback) {
             MODE_X);
 
         WriteUnitOfWork wunit(operationContext());
-        ASSERT_OK(ViewCatalog::createView(operationContext(),
-                                          db(),
-                                          viewName,
-                                          viewOn,
-                                          emptyPipeline,
-                                          emptyCollation,
-                                          boost::none));
+        ASSERT_OK(ViewCatalog::createView(
+            operationContext(), db(), viewName, viewOn, emptyPipeline, emptyCollation));
     }
     auto resourceID = ResourceId(RESOURCE_COLLECTION, "db.view"_sd);
     auto collectionCatalog = CollectionCatalog::get(operationContext());

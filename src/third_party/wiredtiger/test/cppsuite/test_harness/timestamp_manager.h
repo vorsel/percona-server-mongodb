@@ -29,11 +29,12 @@
 #ifndef TIMESTAMP_MANAGER_H
 #define TIMESTAMP_MANAGER_H
 
-#include "component.h"
 #include <atomic>
 #include <chrono>
 #include <sstream>
 #include <thread>
+
+#include "component.h"
 
 namespace test_harness {
 /*
@@ -58,7 +59,7 @@ class timestamp_manager : public component {
         testutil_assert(_oldest_lag >= 0);
         testutil_check(_config->get_int(STABLE_LAG, _stable_lag));
         testutil_assert(_stable_lag >= 0);
-        testutil_check(_config->get_bool(ENABLE_TIMESTAMP, _enabled));
+        testutil_check(_config->get_bool(ENABLED, _enabled));
         component::load();
     }
 
@@ -87,7 +88,7 @@ class timestamp_manager : public component {
              * Keep a time window between the stable and oldest ts less than the max defined in the
              * configuration.
              */
-            testutil_assert(_stable_ts > _oldest_ts);
+            testutil_assert(_stable_ts >= _oldest_ts);
             if ((_stable_ts - _oldest_ts) > _oldest_lag) {
                 _oldest_ts = _stable_ts - _oldest_lag;
                 if (!config.empty())

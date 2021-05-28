@@ -43,7 +43,7 @@
 #include "mongo/executor/scoped_task_executor.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/platform/mutex.h"
-#include "mongo/util/cancelation.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/concurrency/thread_pool.h"
 #include "mongo/util/concurrency/with_lock.h"
 #include "mongo/util/fail_point.h"
@@ -116,11 +116,11 @@ public:
          * lifetime by getting a shared_ptr via 'shared_from_this' or else the Instance may be
          * destroyed out from under them.
          *
-         * 2. On stepdown/shutdown of a PrimaryOnlyService, the input cancelation token will be
+         * 2. On stepdown/shutdown of a PrimaryOnlyService, the input cancellation token will be
          * marked canceled.
          */
         virtual SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                                     const CancelationToken& token) noexcept = 0;
+                                     const CancellationToken& token) noexcept = 0;
 
         /**
          * This is the function that is called when this running Instance needs to be interrupted.
@@ -299,7 +299,7 @@ protected:
     /**
      * Constructs a new Instance object with the given initial state.
      */
-    virtual std::shared_ptr<Instance> constructInstance(BSONObj initialState) const = 0;
+    virtual std::shared_ptr<Instance> constructInstance(BSONObj initialState) = 0;
 
     /**
      * Given an InstanceId returns the corresponding running Instance object, or boost::none if
@@ -338,7 +338,7 @@ private:
     class ActiveInstance {
     public:
         ActiveInstance(std::shared_ptr<Instance> instance,
-                       CancelationSource source,
+                       CancellationSource source,
                        SemiFuture<void> instanceComplete)
             : _instance(std::move(instance)),
               _instanceComplete(std::move(instanceComplete)),
@@ -374,13 +374,13 @@ private:
         // A future that will be resolved when the passed in Instance has finished running.
         const SemiFuture<void> _instanceComplete;
 
-        // Each instance of a PrimaryOnlyService will own a CancelationSource for memory management
-        // purposes. Any memory associated with an instance's CancelationSource will be cleaned up
+        // Each instance of a PrimaryOnlyService will own a CancellationSource for memory management
+        // purposes. Any memory associated with an instance's CancellationSource will be cleaned up
         // upon the destruction of an instance. It must be instantiated from a token from the
-        // CancelationSource of the PrimaryOnlyService class in order to attain a hierarchical
-        // ownership pattern that allows for cancelation token clean up if the PrimaryOnlyService is
-        // shutdown/stepdown.
-        CancelationSource _source;
+        // CancellationSource of the PrimaryOnlyService class in order to attain a hierarchical
+        // ownership pattern that allows for cancellation token clean up if the PrimaryOnlyService
+        // is shutdown/stepdown.
+        CancellationSource _source;
     };
 
     /*
@@ -399,9 +399,16 @@ private:
      * state machine collection.
      */
     virtual ExecutorFuture<void> _rebuildService(
-        std::shared_ptr<executor::ScopedTaskExecutor> executor, const CancelationToken& token) {
+        std::shared_ptr<executor::ScopedTaskExecutor> executor, const CancellationToken& token) {
         return ExecutorFuture<void>(**executor, Status::OK());
     };
+
+    /**
+     * Called at the end of the service stepdown procedure.
+     * In order to not block the stepdown procedure, no blocking work must be done in this
+     * function.
+     */
+    virtual void _afterStepDown() {}
 
     /**
      * Called as part of onStepUp.  Queries the state document collection for this
@@ -479,9 +486,9 @@ private:
     // A set of OpCtxs running on Client threads associated with this PrimaryOnlyService.
     stdx::unordered_set<OperationContext*> _opCtxs;  // (M)
 
-    // CancelationSource used on stepdown/shutdown to cancel work in all running instances of a
+    // CancellationSource used on stepdown/shutdown to cancel work in all running instances of a
     // PrimaryOnlyService.
-    CancelationSource _source;
+    CancellationSource _source;
 };
 
 /**

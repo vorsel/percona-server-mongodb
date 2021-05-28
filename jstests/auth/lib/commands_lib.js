@@ -195,6 +195,35 @@ var authCommandsLib = {
     /************* TEST CASES ****************/
 
     tests: [
+      {
+        testname: "abortReshardCollection",
+        command: {abortReshardCollection: "test.x"},
+        skipUnlessSharded: true,
+        testcases: [
+            {
+              runOnDb: adminDbName,
+              roles: Object.extend({enableSharding: 1}, roles_clusterManager),
+              privileges:
+              [{resource: {db: "test", collection: "x"}, actions: ["reshardCollection"]}],
+                expectFail: true
+            },
+        ]
+      },
+      {
+        testname: "_configsvrAbortReshardCollection",
+        command: {_configsvrAbortReshardCollection: "test.x"},
+        skipSharded: true,
+        testcases: [
+            {
+              runOnDb: adminDbName,
+              roles: {__system: 1},
+              privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+              expectFail: true
+            },
+            {runOnDb: firstDbName, roles: {}},
+            {runOnDb: secondDbName, roles: {}}
+        ]
+      },
         {
           testname: "abortTxn",
           command: {abortTransaction: 1},
@@ -2172,6 +2201,50 @@ var authCommandsLib = {
                 runOnDb: adminDbName,
                 roles: roles_clusterManager,
                 privileges: [{resource: {cluster: true}, actions: ["cleanupOrphaned"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "cleanupReshardCollection",
+          command: {cleanupReshardCollection: "test.x"},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: Object.extend({enableSharding: 1}, roles_clusterManager),
+                privileges:
+                [{resource: {db: "test", collection: "x"}, actions: ["reshardCollection"]}],
+                  expectFail: true
+              },
+          ]
+        },
+        {
+          testname: "_configsvrCleanupReshardCollection",
+          command: {_configsvrCleanupReshardCollection: "test.x"},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+              {runOnDb: firstDbName, roles: {}},
+              {runOnDb: secondDbName, roles: {}}
+          ]
+        },
+        {
+          testname: "_shardsvrCleanupReshardCollection",
+          command: {_shardsvrCleanupReshardCollection: "test.x", reshardingUUID: UUID()},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
                 expectFail: true
               },
               {runOnDb: firstDbName, roles: {}},
@@ -5053,6 +5126,7 @@ var authCommandsLib = {
         {
           testname: "renameCollection_twoDbs",
           command: {renameCollection: firstDbName + ".x", to: secondDbName + ".y"},
+          skipSharded: true,
           setup: function(db) {
             assert.writeOK(db.getSiblingDB(firstDbName).x.save({}));
             assert.writeOK(db.getSiblingDB(secondDbName).y.save({}));
@@ -6067,7 +6141,6 @@ var authCommandsLib = {
               collection: "test",
               apiParameters: {version: "1", strict: true}
           },
-          skipSharded: true,
           setup: function(db) {
               assert.commandWorked(db.getSiblingDB(firstDbName).createCollection("test"));
               assert.commandWorked(db.getSiblingDB(secondDbName).createCollection("test"));
@@ -6084,24 +6157,23 @@ var authCommandsLib = {
                   privileges: [{resource: {db: secondDbName, collection: ""}, actions: ["validate"]}]
               },
               {
-                  // Need to have permission on firstDBName to be able to the command on the db.
+                  // Need to only have permission on secondDbName to be able to the command against
+                  // the db.
                   runOnDb: firstDbName,
                   privileges: [{resource: {db: secondDbName, collection: ""}, actions: ["validate"]}],
-                  expectAuthzFailure: true
               },
               {
                   runOnDb: firstDbName,
                   privileges: [
-                      {resource: {db: firstDbName, collection: ""}, actions: ["validate"]},
-                      {resource: {db: secondDbName, collection: ""}, actions: ["validate"]}
-                  ]
+                      {resource: {db: firstDbName, collection: ""}, actions: ["validate"]}
+                  ],
+                  expectAuthzFailure: true
               },
           ]
       },
       {
           testname: "validate_db_metadata_command_all_dbs",
           command: {validateDBMetadata: 1, apiParameters: {version: "1", strict: true}},
-          skipSharded: true,
           setup: function(db) {
               assert.commandWorked(db.getSiblingDB(firstDbName).createCollection("test"));
               assert.commandWorked(db.getSiblingDB(secondDbName).createCollection("test"));
@@ -6115,10 +6187,11 @@ var authCommandsLib = {
                   // Since the command didn't specify a 'db', it validates all dbs and hence require
                   // permission to run on all dbs.
                   runOnDb: secondDbName,
-                  privileges: [{resource: {db: secondDbName, collection: ""}, actions: ["validate"]}],
-                  expectAuthzFailure: true
+                  privileges: [{resource: {db: "", collection: ""}, actions: ["validate"]}],
               },
               {
+                  // An exhaustive list on all databases is still not good enough for running to
+                  // command on all dbs.
                   runOnDb: secondDbName,
                   privileges: [
                       {resource: {db: "admin", collection: ""}, actions: ["validate"]},
@@ -6126,7 +6199,8 @@ var authCommandsLib = {
                       {resource: {db: "local", collection: ""}, actions: ["validate"]},
                       {resource: {db: firstDbName, collection: ""}, actions: ["validate"]},
                       {resource: {db: secondDbName, collection: ""}, actions: ["validate"]}
-                  ]
+                  ],
+                  expectAuthzFailure: true
               },
           ]
       },

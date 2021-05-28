@@ -1,6 +1,9 @@
 // Tests the behavior of looking up the post image for change streams on collections which are
 // sharded with a hashed shard key.
-// @tags: [uses_change_streams, requires_majority_read_concern]
+// @tags: [
+//   requires_majority_read_concern,
+//   uses_change_streams,
+// ]
 (function() {
 "use strict";
 

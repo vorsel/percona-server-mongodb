@@ -1140,6 +1140,14 @@ class _CppHeaderFileWriter(_CppFileWriterBase):
                 with self.gen_class_declaration_block(struct.cpp_name):
                     self.write_unindented_line('public:')
 
+                    if isinstance(struct, ast.Command):
+                        if struct.reply_type:
+                            # Alias the reply type as a named type for commands
+                            self.gen_type_alias_declaration("Reply",
+                                                            struct.reply_type.type.cpp_type)
+                        else:
+                            self._writer.write_line('using Reply = void;')
+
                     # Generate a sorted list of string constants
                     self.gen_string_constants_declarations(struct)
                     self.write_empty_line()
@@ -1580,13 +1588,12 @@ class _CppSourceFileWriter(_CppFileWriterBase):
         if default_init:
             for field in struct.fields:
                 needs_init = (field.type and field.type.cpp_type and not field.type.is_array
-                              and cpp_types.is_primitive_scalar_type(field.type.cpp_type))
-
-                if _is_required_serializer_field(field) and needs_init:
+                              and _is_required_serializer_field(field)
+                              and field.cpp_name != 'dbName')
+                if needs_init:
                     initializers.append(
-                        '%s(%s)' % (_get_field_member_name(field),
-                                    cpp_types.get_primitive_scalar_type_default_value(
-                                        field.type.cpp_type)))
+                        '%s(mongo::idl::preparsedValue<decltype(%s)>())' %
+                        (_get_field_member_name(field), _get_field_member_name(field)))
 
         # Serialize the _dbName field second
         initializes_db_name = False
@@ -1760,13 +1767,13 @@ class _CppSourceFileWriter(_CppFileWriterBase):
 
                     if struct.command_field.type.cpp_type and cpp_types.is_primitive_scalar_type(
                             struct.command_field.type.cpp_type):
-                        self._writer.write_line('%s localCmdType(%s);' %
-                                                (cpp_type_info.get_storage_type(),
-                                                 cpp_types.get_primitive_scalar_type_default_value(
-                                                     struct.command_field.type.cpp_type)))
+                        self._writer.write_line(
+                            'auto localCmdType = mongo::idl::preparsedValue<%s>();' %
+                            (cpp_type_info.get_storage_type()))
                     else:
                         self._writer.write_line(
-                            '%s localCmdType;' % (cpp_type_info.get_storage_type()))
+                            'auto localCmdType = mongo::idl::preparsedValue<%s>();' %
+                            (cpp_type_info.get_storage_type()))
                     self._writer.write_line(
                         '%s object(localCmdType);' % (common.title_case(struct.cpp_name)))
                 elif struct.namespace in (common.COMMAND_NAMESPACE_CONCATENATE_WITH_DB,
@@ -1777,7 +1784,8 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                 else:
                     assert False, "Missing case"
             else:
-                self._writer.write_line('%s object;' % common.title_case(struct.cpp_name))
+                self._writer.write_line('auto object = mongo::idl::preparsedValue<%s>();' %
+                                        common.title_case(struct.cpp_name))
 
             self._writer.write_line(method_info.get_call('object'))
             self._writer.write_line('return object;')
@@ -1980,7 +1988,11 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                 method_name = writer.get_method_name(field.type.serializer)
                 template_params['method_name'] = method_name
 
-                if field.type.is_array:
+                if field.chained:
+                    # Just directly call the serializer for chained structs without opening up a
+                    # nested document.
+                    self._writer.write_template('${access_member}.${method_name}(builder);')
+                elif field.type.is_array:
                     self._writer.write_template(
                         'BSONArrayBuilder arrayBuilder(builder->subarrayStart(${field_name}));')
                     with self._block('for (const auto& item : ${access_member}) {', '}'):
@@ -1988,7 +2000,8 @@ class _CppSourceFileWriter(_CppFileWriterBase):
                             'BSONObjBuilder subObjBuilder(arrayBuilder.subobjStart());')
                         self._writer.write_template('item.${method_name}(&subObjBuilder);')
                 else:
-                    self._writer.write_template('${access_member}.${method_name}(builder);')
+                    self._writer.write_template(
+                        '${access_member}.${method_name}(${field_name}, builder);')
 
     def _gen_serializer_method_struct(self, field):
         # type: (ast.Field) -> None

@@ -57,9 +57,11 @@
 #include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/tenant_migration_decoration.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/resharding_util.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/storage/durable_catalog.h"
+#include "mongo/db/timeseries/bucket_catalog.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/transaction_participant_gen.h"
 #include "mongo/db/views/durable_view_catalog.h"
@@ -117,7 +119,10 @@ void onWriteOpCompleted(OperationContext* opCtx,
         return;
 
     auto txnParticipant = TransactionParticipant::get(opCtx);
-    if (!txnParticipant)
+    if (!txnParticipant ||
+        (!stmtIdsWritten.empty() && stmtIdsWritten.front() == kUninitializedStmtId))
+        // If the first statement written in uninitialized, then all the statements are assumed to
+        // be uninitialized.
         return;
 
     // We add these here since they may not exist if we return early.
@@ -200,7 +205,7 @@ OpTimeBundle replLogUpdate(OperationContext* opCtx,
     oplogEntry.setOpType(repl::OpTypeEnum::kUpdate);
     oplogEntry.setObject(args.updateArgs.update);
     oplogEntry.setObject2(args.updateArgs.criteria);
-    oplogEntry.setFromMigrateIfTrue(args.updateArgs.fromMigrate);
+    oplogEntry.setFromMigrateIfTrue(args.updateArgs.source == OperationSource::kFromMigrate);
     // oplogLink could have been changed to include pre/postImageOpTime by the previous no-op write.
     repl::appendOplogEntryChainInfo(opCtx, &oplogEntry, &oplogLink, args.updateArgs.stmtIds);
     if (args.updateArgs.oplogSlot) {
@@ -452,6 +457,8 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
     std::vector<repl::OpTime> opTimeList;
     repl::OpTime lastOpTime;
 
+    auto* const css = CollectionShardingState::get(opCtx, nss);
+    auto collDesc = css->getCollectionDescription(opCtx);
     if (inMultiDocumentTransaction) {
         // Do not add writes to the profile collection to the list of transaction operations, since
         // these are done outside the transaction. There is no top-level WriteUnitOfWork when we are
@@ -463,10 +470,14 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
 
         for (auto iter = first; iter != last; iter++) {
             auto operation = MutableOplogEntry::makeInsertOperation(nss, uuid.get(), iter->doc);
-            shardAnnotateOplogEntry(opCtx, nss, iter->doc, operation);
+            shardAnnotateOplogEntry(opCtx, nss, iter->doc, operation, css, collDesc);
             txnParticipant.addTransactionOperation(opCtx, operation);
         }
     } else {
+        std::function<boost::optional<ShardId>(const BSONObj& doc)> getDestinedRecipientFn =
+            [&](const BSONObj& doc) {
+                return getDestinedRecipient(opCtx, nss, doc, css, collDesc);
+            };
         MutableOplogEntry oplogEntryTemplate;
         oplogEntryTemplate.setNss(nss);
         oplogEntryTemplate.setUuid(uuid);
@@ -474,7 +485,8 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
         lastWriteDate = getWallClockTimeForOpLog(opCtx);
         oplogEntryTemplate.setWallClockTime(lastWriteDate);
 
-        opTimeList = repl::logInsertOps(opCtx, &oplogEntryTemplate, first, last);
+        opTimeList =
+            repl::logInsertOps(opCtx, &oplogEntryTemplate, first, last, getDestinedRecipientFn);
         if (!opTimeList.empty())
             lastOpTime = opTimeList.back();
 
@@ -497,7 +509,8 @@ void OpObserverImpl::onInserts(OperationContext* opCtx,
     size_t index = 0;
     for (auto it = first; it != last; it++, index++) {
         auto opTime = opTimeList.empty() ? repl::OpTime() : opTimeList[index];
-        shardObserveInsertOp(opCtx, nss, it->doc, opTime, fromMigrate, inMultiDocumentTransaction);
+        shardObserveInsertOp(
+            opCtx, nss, it->doc, opTime, css, fromMigrate, inMultiDocumentTransaction);
     }
 
     if (nss.coll() == "system.js") {
@@ -552,12 +565,16 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
     const bool inMultiDocumentTransaction =
         txnParticipant && opCtx->writesAreReplicated() && txnParticipant.transactionIsOpen();
 
+    auto* const css = CollectionShardingState::get(opCtx, args.nss);
+    auto collDesc = css->getCollectionDescription(opCtx);
+
     OpTimeBundle opTime;
     if (inMultiDocumentTransaction) {
         auto operation = MutableOplogEntry::makeUpdateOperation(
             args.nss, args.uuid, args.updateArgs.update, args.updateArgs.criteria);
 
-        shardAnnotateOplogEntry(opCtx, args.nss, args.updateArgs.updatedDoc, operation);
+        shardAnnotateOplogEntry(
+            opCtx, args.nss, args.updateArgs.updatedDoc, operation, css, collDesc);
 
         if (args.updateArgs.preImageRecordingEnabledForCollection) {
             invariant(args.updateArgs.preImageDoc);
@@ -567,8 +584,12 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
         txnParticipant.addTransactionOperation(opCtx, operation);
     } else {
         MutableOplogEntry oplogEntry;
-        shardAnnotateOplogEntry(
-            opCtx, args.nss, args.updateArgs.updatedDoc, oplogEntry.getDurableReplOperation());
+        shardAnnotateOplogEntry(opCtx,
+                                args.nss,
+                                args.updateArgs.updatedDoc,
+                                oplogEntry.getDurableReplOperation(),
+                                css,
+                                collDesc);
         opTime = replLogUpdate(opCtx, args, std::move(oplogEntry));
 
         SessionTxnRecord sessionTxnRecord;
@@ -578,12 +599,13 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
     }
 
     if (args.nss != NamespaceString::kSessionTransactionsTableNamespace) {
-        if (!args.updateArgs.fromMigrate) {
+        if (args.updateArgs.source != OperationSource::kFromMigrate) {
             shardObserveUpdateOp(opCtx,
                                  args.nss,
                                  args.updateArgs.preImageDoc,
                                  args.updateArgs.updatedDoc,
                                  opTime.writeOpTime,
+                                 css,
                                  opTime.prePostImageOpTime,
                                  inMultiDocumentTransaction);
         }
@@ -600,6 +622,11 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
     } else if (args.nss == NamespaceString::kConfigSettingsNamespace) {
         ReadWriteConcernDefaults::get(opCtx).observeDirectWriteToConfigSettings(
             opCtx, args.updateArgs.updatedDoc["_id"], args.updateArgs.updatedDoc);
+    } else if (args.nss.isTimeseriesBucketsCollection()) {
+        if (args.updateArgs.source != OperationSource::kTimeseries) {
+            auto& bucketCatalog = BucketCatalog::get(opCtx);
+            bucketCatalog.clear(args.updateArgs.updatedDoc["_id"].OID());
+        }
     }
 }
 
@@ -608,11 +635,19 @@ void OpObserverImpl::aboutToDelete(OperationContext* opCtx,
                                    BSONObj const& doc) {
     documentKeyDecoration(opCtx).emplace(getDocumentKey(opCtx, nss, doc));
 
+    auto* const css = CollectionShardingState::get(opCtx, nss);
+    auto collDesc = css->getCollectionDescription(opCtx);
+
     repl::DurableReplOperation op;
-    shardAnnotateOplogEntry(opCtx, nss, doc, op);
+    shardAnnotateOplogEntry(opCtx, nss, doc, op, css, collDesc);
     destinedRecipientDecoration(opCtx) = op.getDestinedRecipient();
 
     shardObserveAboutToDelete(opCtx, nss, doc);
+
+    if (nss.isTimeseriesBucketsCollection()) {
+        auto& bucketCatalog = BucketCatalog::get(opCtx);
+        bucketCatalog.clear(doc["_id"].OID());
+    }
 }
 
 void OpObserverImpl::onDelete(OperationContext* opCtx,
@@ -650,10 +685,12 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
 
     if (nss != NamespaceString::kSessionTransactionsTableNamespace) {
         if (!fromMigrate) {
+            auto* const css = CollectionShardingState::get(opCtx, nss);
             shardObserveDeleteOp(opCtx,
                                  nss,
                                  documentKey.getShardKeyAndId(),
                                  opTime.writeOpTime,
+                                 css,
                                  opTime.prePostImageOpTime,
                                  inMultiDocumentTransaction);
         }
@@ -790,6 +827,8 @@ void OpObserverImpl::onDropDatabase(OperationContext* opCtx, const std::string& 
     if (dbName == NamespaceString::kSessionTransactionsTableNamespace.db()) {
         MongoDSessionCatalog::invalidateAllSessions(opCtx);
     }
+
+    BucketCatalog::get(opCtx).clear(dbName);
 }
 
 repl::OpTime OpObserverImpl::onDropCollection(OperationContext* opCtx,
@@ -834,6 +873,8 @@ repl::OpTime OpObserverImpl::onDropCollection(OperationContext* opCtx,
         MongoDSessionCatalog::invalidateAllSessions(opCtx);
     } else if (collectionName == NamespaceString::kConfigSettingsNamespace) {
         ReadWriteConcernDefaults::get(opCtx).invalidate();
+    } else if (collectionName.isTimeseriesBucketsCollection()) {
+        BucketCatalog::get(opCtx).clear(collectionName.getTimeseriesViewNamespace());
     }
 
     return {};

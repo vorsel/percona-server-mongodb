@@ -208,6 +208,22 @@ class SymbolTable(object):
                 return struct
         return None
 
+    def get_generic_argument_list(self, name):
+        # type: (str) -> GenericArgumentList
+        """Get a generic argument list from the SymbolTable based on the list name."""
+        for gen_arg_list in self.generic_argument_lists:
+            if gen_arg_list.name == name:
+                return gen_arg_list
+        return None
+
+    def get_generic_reply_field_list(self, name):
+        # type: (str) -> GenericReplyFieldList
+        """Get a generic reply field list from the SymbolTable based on the list name."""
+        for gen_reply_field_list in self.generic_reply_field_lists:
+            if gen_reply_field_list.name == name:
+                return gen_reply_field_list
+        return None
+
     def resolve_type_from_name(self, ctxt, location, field_name, field_type_name):
         # type: (errors.ParserContext, common.SourceLocation, str, str) -> Optional[Union[Enum, Struct, Type]]
         """Find the type or struct a field refers to or log an error."""
@@ -560,6 +576,7 @@ class AccessChecks(common.SourceLocation):
         # type: (str, int, int) -> None
         """Construct an AccessChecks."""
 
+        self.ignore = None  # type: bool
         self.none = None  # type: bool
         self.simple = None  # type: AccessCheck
         self.complex = None  # type: List[AccessCheck]
@@ -568,6 +585,8 @@ class AccessChecks(common.SourceLocation):
 
     def get_access_check_type(self) -> str:
         """Get type of AccessChecks."""
+        if self.ignore:
+            return "ignore"
         if self.none:
             return "none"
         if self.simple:

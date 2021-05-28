@@ -1,6 +1,9 @@
-//
-// Ensures spherical queries report invalid latitude values in points and center positions
-//
+/**
+ * Ensures spherical queries report invalid latitude values in points and center positions.
+ * @tags: [
+ *   requires_fcv_49
+ * ]
+ */
 (function() {
 "use strict";
 
@@ -27,7 +30,7 @@ assert.throws(function() {
 
 // In a spherical geometry, this point is out-of-bounds.
 assert.commandFailedWithCode(coll.runCommand("find", {filter: {loc: {$nearSphere: [179, -91]}}}),
-                             17444);
+                             2);
 assert.commandFailedWithCode(coll.runCommand("aggregate", {
     cursor: {},
     pipeline: [{
@@ -38,5 +41,5 @@ assert.commandFailedWithCode(coll.runCommand("aggregate", {
         }
     }]
 }),
-                             17444);
+                             2);
 }());

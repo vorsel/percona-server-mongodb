@@ -169,7 +169,6 @@ public:
             // We will remove 'n' documents, so start truncating from the (n + 1)th document to the
             // end.
             auto exec = InternalPlanner::collectionScan(opCtx,
-                                                        fullNs.ns(),
                                                         &collection.getCollection(),
                                                         PlanYieldPolicy::YieldPolicy::NO_YIELD,
                                                         InternalPlanner::BACKWARD);
@@ -259,16 +258,17 @@ public:
         const Timestamp requestedPinTs = cmdObj.firstElement().timestamp();
         const bool round = cmdObj["round"].booleanSafe();
 
-        AutoGetOrCreateDb db(opCtx, kDurableHistoryTestNss.db(), MODE_IX);
+        AutoGetDb autoDb(opCtx, kDurableHistoryTestNss.db(), MODE_IX);
         Lock::CollectionLock collLock(opCtx, kDurableHistoryTestNss, MODE_IX);
         if (!CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(
                 opCtx,
                 kDurableHistoryTestNss)) {  // someone else may have beat us to it.
-            uassertStatusOK(userAllowedCreateNS(kDurableHistoryTestNss));
+            uassertStatusOK(userAllowedCreateNS(opCtx, kDurableHistoryTestNss));
             WriteUnitOfWork wuow(opCtx);
             CollectionOptions defaultCollectionOptions;
+            auto db = autoDb.ensureDbExists();
             uassertStatusOK(
-                db.getDb()->userCreateNS(opCtx, kDurableHistoryTestNss, defaultCollectionOptions));
+                db->userCreateNS(opCtx, kDurableHistoryTestNss, defaultCollectionOptions));
             wuow.commit();
         }
 

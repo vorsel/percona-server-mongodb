@@ -5,7 +5,7 @@
  * Tenant migrations are not expected to be run on servers with ephemeralForTest.
  *
  * @tags: [requires_fcv_47, requires_majority_read_concern, requires_persistence,
- * incompatible_with_eft, incompatible_with_windows_tls]
+ * incompatible_with_eft, incompatible_with_windows_tls, incompatible_with_macos]
  */
 
 (function() {
@@ -73,24 +73,26 @@ if (recipientDoc) {
             if (recipientDoc.dataConsistentStopDonorOpTime) {
                 assert.soon(() => tenantMigrationTest
                                       .getTenantMigrationAccessBlocker(recipientPrimary, kTenantId)
-                                      .state == TenantMigrationTest.RecipientAccessState.kReject);
+                                      .recipient.state ==
+                                TenantMigrationTest.RecipientAccessState.kReject);
             }
             break;
         case TenantMigrationTest.RecipientState.kConsistent:
             if (recipientDoc.rejectReadsBeforeTimestamp) {
                 assert.soon(() => tenantMigrationTest
                                       .getTenantMigrationAccessBlocker(recipientPrimary, kTenantId)
-                                      .state ==
+                                      .recipient.state ==
                                 TenantMigrationTest.RecipientAccessState.kRejectBefore);
                 assert.soon(() => bsonWoCompare(tenantMigrationTest
                                                     .getTenantMigrationAccessBlocker(
                                                         recipientPrimary, kTenantId)
-                                                    .rejectBeforeTimestamp,
+                                                    .recipient.rejectBeforeTimestamp,
                                                 recipientDoc.rejectReadsBeforeTimestamp) == 0);
             } else {
                 assert.soon(() => tenantMigrationTest
                                       .getTenantMigrationAccessBlocker(recipientPrimary, kTenantId)
-                                      .state == TenantMigrationTest.RecipientAccessState.kReject);
+                                      .recipient.state ==
+                                TenantMigrationTest.RecipientAccessState.kReject);
             }
             break;
         default:

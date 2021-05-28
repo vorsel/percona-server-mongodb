@@ -36,13 +36,17 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/dist_lock_manager.h"
 #include "mongo/db/s/rename_collection_coordinator.h"
+#include "mongo/db/s/sharded_rename_collection_gen.h"
+#include "mongo/db/s/sharding_ddl_50_upgrade_downgrade.h"
+#include "mongo/db/s/sharding_ddl_coordinator_service.h"
+#include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
 #include "mongo/s/cluster_commands_helpers.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
-#include "mongo/s/sharded_collections_ddl_parameters_gen.h"
 
 namespace mongo {
 namespace {
@@ -53,20 +57,27 @@ bool isCollectionSharded(OperationContext* opCtx, const NamespaceString& nss) {
         CollectionShardingState::get(opCtx, nss)->getCollectionDescription(opCtx).isSharded();
 }
 
+bool renameIsAllowedOnNS(const NamespaceString& nss) {
+    if (nss.isSystem()) {
+        return nss.isLegalClientSystemNS(serverGlobalParams.featureCompatibility);
+    }
+
+    return !nss.isOnInternalDb();
+}
+
 RenameCollectionResponse renameCollectionLegacy(OperationContext* opCtx,
                                                 const ShardsvrRenameCollection& request,
                                                 const NamespaceString& fromNss) {
     const auto& toNss = request.getTo();
 
-    const auto fromDB = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, fromNss.db()));
+    auto fromDbDistLock = uassertStatusOK(DistLockManager::get(opCtx)->lock(
+        opCtx, fromNss.db(), "renameCollection", DistLockManager::kDefaultLockTimeout));
 
-    const auto toDB = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, toNss.db()));
+    auto fromCollDistLock = uassertStatusOK(DistLockManager::get(opCtx)->lock(
+        opCtx, fromNss.ns(), "renameCollection", DistLockManager::kDefaultLockTimeout));
 
-    uassert(13137,
-            "Source and destination collections must be on same shard",
-            fromDB.primaryId() == toDB.primaryId());
+    auto toCollDistLock = uassertStatusOK(DistLockManager::get(opCtx)->lock(
+        opCtx, toNss.ns(), "renameCollection", DistLockManager::kDefaultLockTimeout));
 
     // Make sure that source and target collection are not sharded
     uassert(ErrorCodes::IllegalOperation,
@@ -106,16 +117,19 @@ public:
         Response typedRun(OperationContext* opCtx) {
             const auto& req = request();
             const auto& fromNss = ns();
+            const auto& toNss = req.getTo();
 
             auto const shardingState = ShardingState::get(opCtx);
             uassertStatusOK(shardingState->canAcceptShardedCommands());
 
-            bool useNewPath = [&] {
-                return feature_flags::gShardingFullDDLSupport.isEnabled(
-                           serverGlobalParams.featureCompatibility) &&
-                    !feature_flags::gDisableIncompleteShardingDDLSupport.isEnabled(
-                        serverGlobalParams.featureCompatibility);
-            }();
+            FixedFCVRegion fixedFCVRegion(opCtx);
+
+            const bool useNewPath =
+                feature_flags::gShardingFullDDLSupport.isEnabled(*fixedFCVRegion);
+
+            if (fromNss.db() != toNss.db()) {
+                sharding_ddl_util::checkDbPrimariesOnTheSameShard(opCtx, fromNss, toNss);
+            }
 
             if (!useNewPath) {
                 return renameCollectionLegacy(opCtx, req, fromNss);
@@ -127,10 +141,26 @@ public:
                                   << opCtx->getWriteConcern().wMode,
                     opCtx->getWriteConcern().wMode == WriteConcernOptions::kMajority);
 
-            auto renameCollectionCoordinator = std::make_shared<RenameCollectionCoordinator>(
-                opCtx, ns(), req.getTo(), req.getDropTarget(), req.getStayTemp());
-            renameCollectionCoordinator->run(opCtx).get();
-            return renameCollectionCoordinator->getResponseFuture().get();
+            // TODO SERVER-56296 Uniform `fromNss == toNss` behavior between RS and sharded cluster
+            if (fromNss == toNss) {
+                // Simply return the current collection version
+                const auto catalog = Grid::get(opCtx)->catalogCache();
+                const auto cm =
+                    uassertStatusOK(catalog->getCollectionRoutingInfoWithRefresh(opCtx, fromNss));
+                return RenameCollectionResponse(cm.isSharded() ? cm.getVersion()
+                                                               : ChunkVersion::UNSHARDED());
+            }
+
+            validateNamespacesForRenameCollection(opCtx, fromNss, toNss);
+
+            auto coordinatorDoc = RenameCollectionCoordinatorDocument();
+            coordinatorDoc.setRenameCollectionRequest(req.getRenameCollectionRequest());
+            coordinatorDoc.setShardingDDLCoordinatorMetadata(
+                {{fromNss, DDLCoordinatorTypeEnum::kRenameCollection}});
+            auto service = ShardingDDLCoordinatorService::getService(opCtx);
+            auto renameCollectionCoordinator = checked_pointer_cast<RenameCollectionCoordinator>(
+                service->getOrCreateInstance(opCtx, coordinatorDoc.toBSON()));
+            return renameCollectionCoordinator->getResponse(opCtx);
         }
 
     private:

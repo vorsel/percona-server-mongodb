@@ -30,6 +30,7 @@
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/executor/task_executor.h"
 #include "mongo/s/catalog/type_collection.h"
 #include "mongo/s/request_types/sharded_ddl_commands_gen.h"
@@ -53,20 +54,29 @@ void removeTagsMetadataFromConfig(OperationContext* opCtx, const NamespaceString
 
 
 /**
- * Erase collection metadata from config server and invalidate the locally cached once.
+ * Erase collection metadata from config server and invalidate the locally cached one.
  * In particular remove chunks, tags and the description associated with the given namespace.
  */
 void removeCollMetadataFromConfig(OperationContext* opCtx, const CollectionType& coll);
 
 /**
+ * Erase collection metadata from config server and invalidate the locally cached one.
+ * In particular remove chunks, tags and the description associated with the given namespace.
+ *
+ * Returns true if the collection existed before being removed.
+ */
+bool removeCollMetadataFromConfig(OperationContext* opCtx, const NamespaceString& nss);
+
+/**
  * Rename sharded collection metadata as part of a renameCollection operation.
  *
- * Transaction:
- * - Update config.collections entry: update nss and epoch.
- * - Update config.chunks entries: change epoch/timestamp.
+ * - Update namespace associated with tags (FROM -> TO)
+ * - Update FROM collection entry to TO
+ *
+ * This function is idempotent.
  */
 void shardedRenameMetadata(OperationContext* opCtx,
-                           const NamespaceString& fromNss,
+                           CollectionType& fromCollType,
                            const NamespaceString& toNss);
 
 /**
@@ -77,6 +87,16 @@ void shardedRenameMetadata(OperationContext* opCtx,
 void checkShardedRenamePreconditions(OperationContext* opCtx,
                                      const NamespaceString& toNss,
                                      const bool dropTarget);
+
+/**
+ * Throws if the DB primary shards of the provided namespaces differs.
+ *
+ * Optimistically assume that no movePrimary is performed during the check: it's currently not
+ * possible to ensure primary shard stability for both databases.
+ */
+void checkDbPrimariesOnTheSameShard(OperationContext* opCtx,
+                                    const NamespaceString& fromNss,
+                                    const NamespaceString& toNss);
 
 /**
  * Throws an exception if the collection is already sharded with different options.
@@ -92,15 +112,54 @@ boost::optional<CreateCollectionResponse> checkIfCollectionAlreadySharded(
     bool unique);
 
 /**
- * Acquires the critical section for the specified namespace.
- * It works even if the namespace's current metadata are UNKNOWN.
+ * Acquires the collection critical section in the catch-up phase (i.e. blocking writes) for the
+ * specified namespace and reason. It works even if the namespace's current metadata are UNKNOWN.
+ *
+ * It adds a doc to config.collectionCriticalSections with with writeConcern write concern.
+ *
+ * Do nothing if the collection critical section is taken for that nss and reason, and will
+ * invariant otherwise since it is the responsibility of the caller to ensure that only one thread
+ * is taking the critical section.
  */
-void acquireCriticalSection(OperationContext* opCtx, const NamespaceString& nss);
+void acquireRecoverableCriticalSectionBlockWrites(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const BSONObj& reason,
+    const WriteConcernOptions& writeConcern,
+    const boost::optional<BSONObj>& additionalInfo = boost::none);
 
 /**
- * Releases the critical section for the specified namespace.
+ * Advances the recoverable critical section from the catch-up phase (i.e. blocking writes) to the
+ * commit phase (i.e. blocking reads) for the specified nss and reason. The recoverable critical
+ * section must have been acquired first through 'acquireRecoverableCriticalSectionBlockWrites'
+ * function.
+ *
+ * It updates a doc from config.collectionCriticalSections with writeConcern write concern.
+ *
+ * Do nothing if the collection critical section is already taken in commit phase.
  */
-void releaseCriticalSection(OperationContext* opCtx, const NamespaceString& nss);
+void acquireRecoverableCriticalSectionBlockReads(OperationContext* opCtx,
+                                                 const NamespaceString& nss,
+                                                 const BSONObj& reason,
+                                                 const WriteConcernOptions& writeConcern);
+
+/**
+ * Releases the recoverable critical section for the given nss and reason.
+ *
+ * It removes a doc from config.collectionCriticalSections with writeConcern write concern.
+ *
+ * Do nothing if the collection critical section is not taken for that nss and reason.
+ */
+void releaseRecoverableCriticalSection(OperationContext* opCtx,
+                                       const NamespaceString& nss,
+                                       const BSONObj& reason,
+                                       const WriteConcernOptions& writeConcern);
+
+/**
+ * Retakes the in-memory collection critical section for each recoverable critical section
+ * persisted on config.collectionCriticalSections. It also clears the filtering metadata.
+ */
+void retakeInMemoryRecoverableCriticalSections(OperationContext* opCtx);
 
 /**
  * Stops ongoing migrations and prevents future ones to start for the given nss.

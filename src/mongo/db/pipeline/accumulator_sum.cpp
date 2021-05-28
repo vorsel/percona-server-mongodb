@@ -37,6 +37,7 @@
 #include "mongo/db/exec/document_value/value.h"
 #include "mongo/db/pipeline/accumulation_statement.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/window_function/window_function_count.h"
 #include "mongo/db/pipeline/window_function/window_function_expression.h"
 #include "mongo/db/pipeline/window_function/window_function_sum.h"
 #include "mongo/util/summation.h"
@@ -48,7 +49,10 @@ using boost::intrusive_ptr;
 REGISTER_ACCUMULATOR(sum, genericParseSingleExpressionAccumulator<AccumulatorSum>);
 REGISTER_EXPRESSION(sum, ExpressionFromAccumulator<AccumulatorSum>::parse);
 REGISTER_REMOVABLE_WINDOW_FUNCTION(sum, AccumulatorSum, WindowFunctionSum);
-REGISTER_ACCUMULATOR(count, parseCountAccumulator);
+REGISTER_ACCUMULATOR_WITH_MIN_VERSION(
+    count, parseCountAccumulator, ServerGlobalParams::FeatureCompatibility::Version::kVersion50);
+
+REGISTER_WINDOW_FUNCTION(count, window_function::parseCountWindowFunction);
 
 const char* AccumulatorSum::getOpName() const {
     return "$sum";

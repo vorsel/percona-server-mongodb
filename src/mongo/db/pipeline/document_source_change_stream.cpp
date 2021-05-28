@@ -39,6 +39,7 @@
 #include "mongo/db/pipeline/document_path_support.h"
 #include "mongo/db/pipeline/document_source_change_stream_close_cursor.h"
 #include "mongo/db/pipeline/document_source_change_stream_transform.h"
+#include "mongo/db/pipeline/document_source_change_stream_unwind_transactions.h"
 #include "mongo/db/pipeline/document_source_check_invalidate.h"
 #include "mongo/db/pipeline/document_source_check_resume_token.h"
 #include "mongo/db/pipeline/document_source_limit.h"
@@ -48,6 +49,7 @@
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/resume_token.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/repl/oplog_entry.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
@@ -437,8 +439,9 @@ list<intrusive_ptr<DocumentSource>> buildPipeline(const intrusive_ptr<Expression
             ResumeToken::makeHighWaterMarkToken(*startFrom).toDocument().toBson();
     }
 
-    // Obtain the current FCV and use it to create the DocumentSourceChangeStreamTransform stage.
+    // Obtain the current FCV and use it to create the unwind-transaction and transform stages.
     const auto fcv = serverGlobalParams.featureCompatibility.getVersion();
+    stages.push_back(DocumentSourceChangeStreamUnwindTransaction::create(expCtx));
     stages.push_back(
         DocumentSourceChangeStreamTransform::create(expCtx, fcv, elem.embeddedObject()));
 
@@ -488,10 +491,21 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
 
     auto stages = buildPipeline(expCtx, spec, elem);
 
+    const bool csOptFeatureFlag =
+        feature_flags::gFeatureFlagChangeStreamsOptimization.isEnabledAndIgnoreFCV();
+
+    if (expCtx->inMongos && csOptFeatureFlag) {
+        // TODO SERVER-55491: replace with DocumentSourceUpdateOnAddShard.
+        stages.push_back(DocumentSourceChangeStreamPipelineSplitter::create(expCtx));
+    }
+
     if (!expCtx->needsMerge) {
-        // There should only be one close cursor stage. If we're on the shards and producing input
-        // to be merged, do not add a close cursor stage, since the mongos will already have one.
-        stages.push_back(DocumentSourceCloseCursor::create(expCtx));
+        if (!csOptFeatureFlag) {
+            // There should only be one close cursor stage. If we're on the shards and producing
+            // input to be merged, do not add a close cursor stage, since the mongos will already
+            // have one.
+            stages.push_back(DocumentSourceCloseCursor::create(expCtx));
+        }
 
         // We only create a pre-image lookup stage on a non-merging mongoD. We place this stage here
         // so that any $match stages which follow the $changeStream pipeline prefix may be able to
@@ -516,7 +530,7 @@ list<intrusive_ptr<DocumentSource>> DocumentSourceChangeStream::createFromBson(
 BSONObj DocumentSourceChangeStream::replaceResumeTokenInCommand(BSONObj originalCmdObj,
                                                                 Document resumeToken) {
     Document originalCmd(originalCmdObj);
-    auto pipeline = originalCmd[AggregateCommand::kPipelineFieldName].getArray();
+    auto pipeline = originalCmd[AggregateCommandRequest::kPipelineFieldName].getArray();
     // A $changeStream must be the first element of the pipeline in order to be able
     // to replace (or add) a resume token.
     invariant(!pipeline[0][DocumentSourceChangeStream::kStageName].missing());
@@ -531,7 +545,7 @@ BSONObj DocumentSourceChangeStream::replaceResumeTokenInCommand(BSONObj original
     pipeline[0] =
         Value(Document{{DocumentSourceChangeStream::kStageName, changeStreamStage.freeze()}});
     MutableDocument newCmd(std::move(originalCmd));
-    newCmd[AggregateCommand::kPipelineFieldName] = Value(pipeline);
+    newCmd[AggregateCommandRequest::kPipelineFieldName] = Value(pipeline);
     return newCmd.freeze().toBson();
 }
 

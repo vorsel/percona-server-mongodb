@@ -41,8 +41,11 @@
 #include "mongo/db/client.h"
 #include "mongo/db/exec/js_function.h"
 #include "mongo/db/exec/sbe/values/bson.h"
+#include "mongo/db/exec/sbe/values/sort_spec.h"
 #include "mongo/db/exec/sbe/values/value.h"
 #include "mongo/db/exec/sbe/vm/datetime.h"
+#include "mongo/db/hasher.h"
+#include "mongo/db/index/btree_key_generator.h"
 #include "mongo/db/query/collation/collation_index_key.h"
 #include "mongo/db/query/datetime/date_time_support.h"
 #include "mongo/db/storage/key_string.h"
@@ -134,6 +137,25 @@ int Instruction::stackOffset[Instruction::Tags::lastInstruction] = {
     -1,  // fail
 };
 
+namespace {
+template <typename T>
+T readFromMemory(const uint8_t* ptr) noexcept {
+    static_assert(!IsEndian<T>::value);
+
+    T val;
+    memcpy(&val, ptr, sizeof(T));
+    return val;
+}
+
+template <typename T>
+size_t writeToMemory(uint8_t* ptr, const T val) noexcept {
+    static_assert(!IsEndian<T>::value);
+
+    memcpy(ptr, &val, sizeof(T));
+    return sizeof(T);
+}
+}  // namespace
+
 void CodeFragment::adjustStackSimple(const Instruction& i) {
     _stackSize += Instruction::stackOffset[i.tag];
 }
@@ -141,8 +163,8 @@ void CodeFragment::adjustStackSimple(const Instruction& i) {
 void CodeFragment::fixup(int offset) {
     for (auto fixUp : _fixUps) {
         auto ptr = instrs().data() + fixUp.offset;
-        int newOffset = value::readFromMemory<int>(ptr) + offset;
-        value::writeToMemory(ptr, newOffset);
+        int newOffset = readFromMemory<int>(ptr) + offset;
+        writeToMemory(ptr, newOffset);
     }
 }
 
@@ -191,9 +213,9 @@ void CodeFragment::appendConstVal(value::TypeTags tag, value::Value val) {
 
     auto offset = allocateSpace(sizeof(Instruction) + sizeof(tag) + sizeof(val));
 
-    offset += value::writeToMemory(offset, i);
-    offset += value::writeToMemory(offset, tag);
-    offset += value::writeToMemory(offset, val);
+    offset += writeToMemory(offset, i);
+    offset += writeToMemory(offset, tag);
+    offset += writeToMemory(offset, val);
 }
 
 void CodeFragment::appendAccessVal(value::SlotAccessor* accessor) {
@@ -203,8 +225,8 @@ void CodeFragment::appendAccessVal(value::SlotAccessor* accessor) {
 
     auto offset = allocateSpace(sizeof(Instruction) + sizeof(accessor));
 
-    offset += value::writeToMemory(offset, i);
-    offset += value::writeToMemory(offset, accessor);
+    offset += writeToMemory(offset, i);
+    offset += writeToMemory(offset, accessor);
 }
 
 void CodeFragment::appendMoveVal(value::SlotAccessor* accessor) {
@@ -214,8 +236,8 @@ void CodeFragment::appendMoveVal(value::SlotAccessor* accessor) {
 
     auto offset = allocateSpace(sizeof(Instruction) + sizeof(accessor));
 
-    offset += value::writeToMemory(offset, i);
-    offset += value::writeToMemory(offset, accessor);
+    offset += writeToMemory(offset, i);
+    offset += writeToMemory(offset, accessor);
 }
 
 void CodeFragment::appendLocalVal(FrameId frameId, int stackOffset) {
@@ -228,8 +250,8 @@ void CodeFragment::appendLocalVal(FrameId frameId, int stackOffset) {
 
     auto offset = allocateSpace(sizeof(Instruction) + sizeof(stackOffset));
 
-    offset += value::writeToMemory(offset, i);
-    offset += value::writeToMemory(offset, stackOffset);
+    offset += writeToMemory(offset, i);
+    offset += writeToMemory(offset, stackOffset);
 }
 
 void CodeFragment::appendAdd() {
@@ -243,8 +265,8 @@ void CodeFragment::appendNumericConvert(value::TypeTags targetTag) {
 
     auto offset = allocateSpace(sizeof(Instruction) + sizeof(targetTag));
 
-    offset += value::writeToMemory(offset, i);
-    offset += value::writeToMemory(offset, targetTag);
+    offset += writeToMemory(offset, i);
+    offset += writeToMemory(offset, targetTag);
 }
 
 void CodeFragment::appendSub() {
@@ -282,7 +304,7 @@ void CodeFragment::appendSimpleInstruction(Instruction::Tags tag) {
 
     auto offset = allocateSpace(sizeof(Instruction));
 
-    offset += value::writeToMemory(offset, i);
+    offset += writeToMemory(offset, i);
 }
 
 void CodeFragment::appendGetField() {
@@ -372,8 +394,8 @@ void CodeFragment::appendTypeMatch(uint32_t typeMask) {
 
     auto offset = allocateSpace(sizeof(Instruction) + sizeof(typeMask));
 
-    offset += value::writeToMemory(offset, i);
-    offset += value::writeToMemory(offset, typeMask);
+    offset += writeToMemory(offset, i);
+    offset += writeToMemory(offset, typeMask);
 }
 
 void CodeFragment::appendFunction(Builtin f, ArityType arity) {
@@ -389,10 +411,10 @@ void CodeFragment::appendFunction(Builtin f, ArityType arity) {
     auto offset = allocateSpace(sizeof(Instruction) + sizeof(f) +
                                 (isSmallArity ? sizeof(SmallArityType) : sizeof(ArityType)));
 
-    offset += value::writeToMemory(offset, i);
-    offset += value::writeToMemory(offset, f);
-    offset += isSmallArity ? value::writeToMemory(offset, static_cast<SmallArityType>(arity))
-                           : value::writeToMemory(offset, arity);
+    offset += writeToMemory(offset, i);
+    offset += writeToMemory(offset, f);
+    offset += isSmallArity ? writeToMemory(offset, static_cast<SmallArityType>(arity))
+                           : writeToMemory(offset, arity);
 }
 
 void CodeFragment::appendJump(int jumpOffset) {
@@ -402,8 +424,8 @@ void CodeFragment::appendJump(int jumpOffset) {
 
     auto offset = allocateSpace(sizeof(Instruction) + sizeof(jumpOffset));
 
-    offset += value::writeToMemory(offset, i);
-    offset += value::writeToMemory(offset, jumpOffset);
+    offset += writeToMemory(offset, i);
+    offset += writeToMemory(offset, jumpOffset);
 }
 
 void CodeFragment::appendJumpTrue(int jumpOffset) {
@@ -413,8 +435,8 @@ void CodeFragment::appendJumpTrue(int jumpOffset) {
 
     auto offset = allocateSpace(sizeof(Instruction) + sizeof(jumpOffset));
 
-    offset += value::writeToMemory(offset, i);
-    offset += value::writeToMemory(offset, jumpOffset);
+    offset += writeToMemory(offset, i);
+    offset += writeToMemory(offset, jumpOffset);
 }
 
 void CodeFragment::appendJumpNothing(int jumpOffset) {
@@ -424,8 +446,8 @@ void CodeFragment::appendJumpNothing(int jumpOffset) {
 
     auto offset = allocateSpace(sizeof(Instruction) + sizeof(jumpOffset));
 
-    offset += value::writeToMemory(offset, i);
-    offset += value::writeToMemory(offset, jumpOffset);
+    offset += writeToMemory(offset, i);
+    offset += writeToMemory(offset, jumpOffset);
 }
 
 ByteCode::~ByteCode() {
@@ -1211,9 +1233,9 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDoubleDoubleSum
         for (ArityType idx = 0; idx < arity; ++idx) {
             auto [own, tag, val] = getFromStack(idx);
             if (tag == value::TypeTags::Date) {
-                sum.add(Decimal128(value::bitcastTo<int64_t>(val)));
+                sum = sum.add(Decimal128(value::bitcastTo<int64_t>(val)));
             } else {
-                sum.add(value::numericCast<Decimal128>(tag, val));
+                sum = sum.add(value::numericCast<Decimal128>(tag, val));
             }
         }
         if (haveDate) {
@@ -1273,7 +1295,7 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinDoubleDoubleSum
 }
 
 /**
- * A helper for the bultinDate method. The formal parameters yearOrWeekYear and monthOrWeek carry
+ * A helper for the builtinDate method. The formal parameters yearOrWeekYear and monthOrWeek carry
  * values depending on wether the date is a year-month-day or ISOWeekYear.
  */
 using DateFn = std::function<Date_t(
@@ -1620,54 +1642,35 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinBitTestPosition
                                      bitTestBehavior == BitTestBehavior::AllClear)};
 }
 
-
-// Converts the value to a NumberInt64 tag/value and checks if the mask tab/value pair is a number.
-// If the inputs aren't numbers or the value can't be converted to a 64-bit integer, or if it's
-// outside of the range where the `lhsTag` type can represent consecutive integers precisely Nothing
-// is returned.
-std::tuple<bool, value::TypeTags, value::Value> ByteCode::convertBitTestValue(
-    value::TypeTags maskTag, value::Value maskVal, value::TypeTags valueTag, value::Value value) {
-    if (!value::isNumber(maskTag) || !value::isNumber(valueTag)) {
-        return {false, value::TypeTags::Nothing, 0};
-    }
-
-    // Bail out if the input can't be converted to a 64-bit integer, or if it's outside of the range
-    // where the `lhsTag` type can represent consecutive integers precisely.
-    auto [numTag, numVal] = genericNumConvertToPreciseInt64(valueTag, value);
-    if (numTag != value::TypeTags::NumberInt64) {
-        return {false, value::TypeTags::Nothing, 0};
-    }
-    return {false, numTag, numVal};
-}
-
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinBitTestZero(ArityType arity) {
     invariant(arity == 2);
+    auto [maskOwned, maskTag, maskValue] = getFromStack(0);
+    auto [inputOwned, inputTag, inputValue] = getFromStack(1);
 
-    auto [ownedMask, maskTag, maskValue] = getFromStack(0);
-    auto [ownedInput, valueTag, value] = getFromStack(1);
-
-    auto [ownedNum, numTag, numVal] = convertBitTestValue(maskTag, maskValue, valueTag, value);
-    if (numTag == value::TypeTags::Nothing) {
+    if ((maskTag != value::TypeTags::NumberInt32 && maskTag != value::TypeTags::NumberInt64) ||
+        (inputTag != value::TypeTags::NumberInt32 && inputTag != value::TypeTags::NumberInt64)) {
         return {false, value::TypeTags::Nothing, 0};
     }
-    auto result =
-        (value::numericCast<int64_t>(maskTag, maskValue) & value::bitcastTo<int64_t>(numVal)) == 0;
+
+    auto maskNum = value::numericCast<int64_t>(maskTag, maskValue);
+    auto inputNum = value::numericCast<int64_t>(inputTag, inputValue);
+    auto result = (maskNum & inputNum) == 0;
     return {false, value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinBitTestMask(ArityType arity) {
     invariant(arity == 2);
+    auto [maskOwned, maskTag, maskValue] = getFromStack(0);
+    auto [inputOwned, inputTag, inputValue] = getFromStack(1);
 
-    auto [ownedMask, maskTag, maskValue] = getFromStack(0);
-    auto [ownedInput, valueTag, value] = getFromStack(1);
-
-    auto [ownedNum, numTag, numVal] = convertBitTestValue(maskTag, maskValue, valueTag, value);
-    if (numTag == value::TypeTags::Nothing) {
+    if ((maskTag != value::TypeTags::NumberInt32 && maskTag != value::TypeTags::NumberInt64) ||
+        (inputTag != value::TypeTags::NumberInt32 && inputTag != value::TypeTags::NumberInt64)) {
         return {false, value::TypeTags::Nothing, 0};
     }
 
-    auto numMask = value::numericCast<int64_t>(maskTag, maskValue);
-    auto result = (numMask & value::bitcastTo<int64_t>(numVal)) == numMask;
+    auto maskNum = value::numericCast<int64_t>(maskTag, maskValue);
+    auto inputNum = value::numericCast<int64_t>(inputTag, inputValue);
+    auto result = (maskNum & inputNum) == maskNum;
     return {false, value::TypeTags::Boolean, value::bitcastFrom<bool>(result)};
 }
 
@@ -1719,6 +1722,14 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinCoerceToString(
     if (value::isString(operandTag)) {
         topStack(false, value::TypeTags::Nothing, 0);
         return {operandOwn, operandTag, operandVal};
+    }
+
+    if (operandTag == value::TypeTags::bsonSymbol) {
+        // Values of type StringBig and Values of type bsonSymbol have identical representations,
+        // so we can simply take ownership of the argument, change the type tag to StringBig, and
+        // return it.
+        topStack(false, value::TypeTags::Nothing, 0);
+        return {operandOwn, value::TypeTags::StringBig, operandVal};
     }
 
     switch (operandTag) {
@@ -1838,6 +1849,45 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinTan(ArityType a
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinTanh(ArityType arity) {
     auto [_, operandTag, operandValue] = getFromStack(0);
     return genericTanh(operandTag, operandValue);
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinRound(ArityType arity) {
+    invariant(arity == 1);
+    auto [owned, tag, val] = getFromStack(0);
+
+    // Round 'val' to the closest integer, with ties rounding to the closest even integer.
+    // If 'val' is +Inf, -Inf, or NaN, this function will simply return 'val' as-is.
+    switch (tag) {
+        case value::TypeTags::NumberInt32:
+        case value::TypeTags::NumberInt64:
+            // The value is already an integer, so just return it as-is.
+            return {false, tag, val};
+        case value::TypeTags::NumberDouble: {
+            // std::nearbyint()'s behavior relies on a thread-local "rounding mode", so
+            // we use boost::numeric::RoundEven<double>::nearbyint() instead. We should
+            // switch over to roundeven() once it becomes available in the standard library.
+            // (See https://en.cppreference.com/w/c/experimental/fpext1 for details.)
+            auto operand = value::bitcastTo<double>(val);
+            auto rounded = boost::numeric::RoundEven<double>::nearbyint(operand);
+            return {false, tag, value::bitcastFrom<double>(rounded)};
+        }
+        case value::TypeTags::NumberDecimal: {
+            auto operand = value::bitcastTo<Decimal128>(val);
+            auto rounded = operand.round(Decimal128::RoundingMode::kRoundTiesToEven);
+            if (operand.isEqual(rounded)) {
+                // If the output of rounding is equal to the input, then we can just take
+                // ownership of 'operand' and return it. (This is more efficient than calling
+                // makeCopyDecimal(), which would allocate memory on the heap.)
+                topStack(false, value::TypeTags::Nothing, 0);
+                return {owned, tag, val};
+            }
+
+            auto [tag, val] = value::makeCopyDecimal(rounded);
+            return {true, tag, val};
+        }
+        default:
+            return {false, value::TypeTags::Nothing, 0};
+    }
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinConcat(ArityType arity) {
@@ -2475,11 +2525,11 @@ std::tuple<bool, value::TypeTags, value::Value> genericPcreRegexSingleMatch(
     value::TypeTags typeTagInputStr,
     value::Value valueInputStr,
     bool isMatch) {
-    if (!value::isString(typeTagInputStr) || !value::isPcreRegex(typeTagPcreRegex)) {
+    if (!value::isStringOrSymbol(typeTagInputStr) || !value::isPcreRegex(typeTagPcreRegex)) {
         return {false, value::TypeTags::Nothing, 0};
     }
 
-    auto inputString = value::getStringView(typeTagInputStr, valueInputStr);
+    auto inputString = value::getStringOrSymbolView(typeTagInputStr, valueInputStr);
     auto pcreRegex = value::getPcreRegexView(valuePcreRegex);
 
     return pcreFirstMatch(pcreRegex, inputString, isMatch);
@@ -2496,9 +2546,8 @@ std::pair<value::TypeTags, value::Value> collComparisonKey(value::TypeTags tag,
 
     // For strings, call CollatorInterface::getComparisonKey() to obtain the comparison key.
     if (value::isString(tag)) {
-        auto compKey = collator->getComparisonKey(value::getStringView(tag, val));
-        auto keyData = compKey.getKeyData();
-        return value::makeNewString(keyData);
+        return value::makeNewString(
+            collator->getComparisonKey(value::getStringView(tag, val)).getKeyData());
     }
 
     // For collatable types other than strings (such as arrays and objects), we take the slow
@@ -2647,6 +2696,21 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinShardFilter(Ari
             value::TypeTags::Boolean,
             value::bitcastFrom<bool>(
                 value::getShardFiltererView(filterValue)->keyBelongsToMe(keyAsUnownedBson))};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinShardHash(ArityType arity) {
+    invariant(arity == 1);
+
+    auto [ownedShardKey, shardKeyTag, shardKeyValue] = getFromStack(0);
+
+    // Compute the shard key hash value by round-tripping it through BSONObj as it is currently the
+    // only way to do it if we do not want to duplicate the hash computation code.
+    // TODO SERVER-55622
+    BSONObjBuilder input;
+    bson::appendValueToBsonObj<BSONObjBuilder>(input, ""_sd, shardKeyTag, shardKeyValue);
+    auto hashVal =
+        BSONElementHasher::hash64(input.obj().firstElement(), BSONElementHasher::DEFAULT_HASH_SEED);
+    return {false, value::TypeTags::NumberInt64, value::bitcastFrom<decltype(hashVal)>(hashVal)};
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinExtractSubArray(ArityType arity) {
@@ -2820,6 +2884,34 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinGetRegexFlags(A
     auto [strType, strValue] = value::makeNewString(regex.flags);
 
     return {true, strType, strValue};
+}
+
+std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinGenerateSortKey(ArityType arity) {
+    invariant(arity == 2);
+
+    auto [ssOwned, ssTag, ssVal] = getFromStack(0);
+    auto [objOwned, objTag, objVal] = getFromStack(1);
+    if (ssTag != value::TypeTags::sortSpec || !value::isObject(objTag)) {
+        return {false, value::TypeTags::Nothing, 0};
+    }
+
+    auto ss = value::getSortSpecView(ssVal);
+
+    auto obj = [objTag = objTag, objVal = objVal]() {
+        if (objTag == value::TypeTags::bsonObject) {
+            return BSONObj{value::bitcastTo<const char*>(objVal)};
+        } else if (objTag == value::TypeTags::Object) {
+            BSONObjBuilder objBuilder;
+            bson::convertToBsonObj(objBuilder, value::getObjectView(objVal));
+            return objBuilder.obj();
+        } else {
+            MONGO_UNREACHABLE_TASSERT(5037004);
+        }
+    }();
+
+    return {true,
+            value::TypeTags::ksValue,
+            value::bitcastFrom<KeyString::Value*>(new KeyString::Value(ss->generateSortKey(obj)))};
 }
 
 std::tuple<bool, value::TypeTags, value::Value> ByteCode::builtinReverseArray(ArityType arity) {
@@ -3051,6 +3143,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builti
             return builtinTan(arity);
         case Builtin::tanh:
             return builtinTanh(arity);
+        case Builtin::round:
+            return builtinRound(arity);
         case Builtin::concat:
             return builtinConcat(arity);
         case Builtin::isMember:
@@ -3089,6 +3183,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builti
             return builtinRegexFindAll(arity);
         case Builtin::shardFilter:
             return builtinShardFilter(arity);
+        case Builtin::shardHash:
+            return builtinShardHash(arity);
         case Builtin::extractSubArray:
             return builtinExtractSubArray(arity);
         case Builtin::isArrayEmpty:
@@ -3105,6 +3201,8 @@ std::tuple<bool, value::TypeTags, value::Value> ByteCode::dispatchBuiltin(Builti
             return builtinGetRegexFlags(arity);
         case Builtin::ftsMatch:
             return builtinFtsMatch(arity);
+        case Builtin::generateSortKey:
+            return builtinGenerateSortKey(arity);
     }
 
     MONGO_UNREACHABLE;
@@ -3118,13 +3216,13 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
         if (pcPointer == pcEnd) {
             break;
         } else {
-            Instruction i = value::readFromMemory<Instruction>(pcPointer);
+            Instruction i = readFromMemory<Instruction>(pcPointer);
             pcPointer += sizeof(i);
             switch (i.tag) {
                 case Instruction::pushConstVal: {
-                    auto tag = value::readFromMemory<value::TypeTags>(pcPointer);
+                    auto tag = readFromMemory<value::TypeTags>(pcPointer);
                     pcPointer += sizeof(tag);
-                    auto val = value::readFromMemory<value::Value>(pcPointer);
+                    auto val = readFromMemory<value::Value>(pcPointer);
                     pcPointer += sizeof(val);
 
                     pushStack(false, tag, val);
@@ -3132,7 +3230,7 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     break;
                 }
                 case Instruction::pushAccessVal: {
-                    auto accessor = value::readFromMemory<value::SlotAccessor*>(pcPointer);
+                    auto accessor = readFromMemory<value::SlotAccessor*>(pcPointer);
                     pcPointer += sizeof(accessor);
 
                     auto [tag, val] = accessor->getViewOfValue();
@@ -3141,7 +3239,7 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     break;
                 }
                 case Instruction::pushMoveVal: {
-                    auto accessor = value::readFromMemory<value::SlotAccessor*>(pcPointer);
+                    auto accessor = readFromMemory<value::SlotAccessor*>(pcPointer);
                     pcPointer += sizeof(accessor);
 
                     auto [tag, val] = accessor->copyOrMoveValue();
@@ -3150,7 +3248,7 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     break;
                 }
                 case Instruction::pushLocalVal: {
-                    auto stackOffset = value::readFromMemory<int>(pcPointer);
+                    auto stackOffset = readFromMemory<int>(pcPointer);
                     pcPointer += sizeof(stackOffset);
 
                     auto [owned, tag, val] = getFromStack(stackOffset);
@@ -3173,16 +3271,24 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     auto [rhsOwned, rhsTag, rhsVal] = getFromStack(0);
                     auto [lhsOwned, lhsTag, lhsVal] = getFromStack(1);
 
-                    // Swap values only if they are not physically same.
-                    // Note - this has huge consequences for the memory management, it allows to
-                    // return owned values from the let expressions.
+                    // Swap values only if they are not physically same. This is necessary for the
+                    // "swap and pop" idiom for returning a value from the top of the stack (used
+                    // by ELocalBind). For example, consider the case where a series of swap, pop,
+                    // swap, pop... instructions are executed and the value at stack[0] and
+                    // stack[1] are physically identical, but stack[1] is owned and stack[0] is
+                    // not. After swapping them, the 'pop' instruction would free the owned one and
+                    // leave the unowned value dangling. The only exception to this is shallow
+                    // values (values which fit directly inside a 64 bit Value and don't need
+                    // to be freed explicitly).
                     if (!(rhsTag == lhsTag && rhsVal == lhsVal)) {
                         setStack(0, lhsOwned, lhsTag, lhsVal);
                         setStack(1, rhsOwned, rhsTag, rhsVal);
                     } else {
-                        // The values are physically same then the top of the stack must never ever
-                        // be owned.
-                        invariant(!rhsOwned);
+                        // See explanation above.
+                        tassert(
+                            56123,
+                            "Attempting to swap two identical values when top of stack is owned",
+                            !rhsOwned || isShallowType(rhsTag));
                     }
 
                     break;
@@ -3304,7 +3410,7 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     break;
                 }
                 case Instruction::numConvert: {
-                    auto tag = value::readFromMemory<value::TypeTags>(pcPointer);
+                    auto tag = readFromMemory<value::TypeTags>(pcPointer);
                     pcPointer += sizeof(tag);
 
                     auto [owned, lhsTag, lhsVal] = getFromStack(0);
@@ -3997,7 +4103,7 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     break;
                 }
                 case Instruction::typeMatch: {
-                    auto typeMask = value::readFromMemory<uint32_t>(pcPointer);
+                    auto typeMask = readFromMemory<uint32_t>(pcPointer);
                     pcPointer += sizeof(typeMask);
 
                     auto [owned, tag, val] = getFromStack(0);
@@ -4015,14 +4121,14 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                 }
                 case Instruction::function:
                 case Instruction::functionSmall: {
-                    auto f = value::readFromMemory<Builtin>(pcPointer);
+                    auto f = readFromMemory<Builtin>(pcPointer);
                     pcPointer += sizeof(f);
                     ArityType arity{0};
                     if (i.tag == Instruction::function) {
-                        arity = value::readFromMemory<ArityType>(pcPointer);
+                        arity = readFromMemory<ArityType>(pcPointer);
                         pcPointer += sizeof(ArityType);
                     } else {
-                        arity = value::readFromMemory<SmallArityType>(pcPointer);
+                        arity = readFromMemory<SmallArityType>(pcPointer);
                         pcPointer += sizeof(SmallArityType);
                     }
 
@@ -4041,14 +4147,14 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     break;
                 }
                 case Instruction::jmp: {
-                    auto jumpOffset = value::readFromMemory<int>(pcPointer);
+                    auto jumpOffset = readFromMemory<int>(pcPointer);
                     pcPointer += sizeof(jumpOffset);
 
                     pcPointer += jumpOffset;
                     break;
                 }
                 case Instruction::jmpTrue: {
-                    auto jumpOffset = value::readFromMemory<int>(pcPointer);
+                    auto jumpOffset = readFromMemory<int>(pcPointer);
                     pcPointer += sizeof(jumpOffset);
 
                     auto [owned, tag, val] = getFromStack(0);
@@ -4064,7 +4170,7 @@ std::tuple<uint8_t, value::TypeTags, value::Value> ByteCode::run(const CodeFragm
                     break;
                 }
                 case Instruction::jmpNothing: {
-                    auto jumpOffset = value::readFromMemory<int>(pcPointer);
+                    auto jumpOffset = readFromMemory<int>(pcPointer);
                     pcPointer += sizeof(jumpOffset);
 
                     auto [owned, tag, val] = getFromStack(0);

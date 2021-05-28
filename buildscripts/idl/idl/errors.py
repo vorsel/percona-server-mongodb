@@ -25,6 +25,7 @@
 # exception statement from all source files in the program, then also delete
 # it in the license file.
 #
+# pylint: disable=too-many-lines
 """
 Common error handling code for IDL compiler.
 
@@ -114,7 +115,6 @@ ERROR_ID_FEATURE_FLAG_DEFAULT_FALSE_HAS_VERSION = "ID0071"
 ERROR_ID_INVALID_REPLY_TYPE = "ID0072"
 ERROR_ID_UNSTABLE_NO_API_VERSION = "ID0073"
 ERROR_ID_MISSING_REPLY_TYPE = "ID0074"
-ERROR_ID_API_VERSION_NO_STRICT = "ID0075"
 ERROR_ID_USELESS_VARIANT = "ID0076"
 ERROR_ID_ILLEGAL_FIELD_ALWAYS_SERIALIZE_NOT_OPTIONAL = "ID0077"
 ERROR_ID_VARIANT_COMPARISON = "ID0078"
@@ -129,6 +129,7 @@ ERROR_ID_DUPLICATE_ACTION_TYPE = "ID0086"
 ERROR_ID_DUPLICATE_ACCESS_CHECK = "ID0087"
 ERROR_ID_DUPLICATE_PRIVILEGE = "ID0088"
 ERROR_ID_EMPTY_ACCESS_CHECK = "ID0089"
+ERROR_ID_MISSING_ACCESS_CHECK = "ID0090"
 
 
 class IDLError(Exception):
@@ -908,14 +909,6 @@ class ParserContext(object):
             location, ERROR_ID_MISSING_REPLY_TYPE,
             ("Command '%s' has an 'api_version' but no 'reply_type'" % (command_name, )))
 
-    def add_api_version_no_strict(self, location, command_name):
-        # type: (common.SourceLocation, str) -> None
-        """Add an error about a command with 'api_version' but 'strict' isn't set to true."""
-        # pylint: disable=invalid-name
-        self._add_error(
-            location, ERROR_ID_API_VERSION_NO_STRICT,
-            ("Command '%s' specifies 'api_version' but 'strict' isn't true" % (command_name, )))
-
     def add_bad_field_always_serialize_not_optional(self, location, field_name):
         # type: (common.SourceLocation, str) -> None
         """Add an error about a field with 'always_serialize' but 'optional' isn't set to true."""
@@ -971,11 +964,19 @@ class ParserContext(object):
 
     def add_empty_access_check(self, location):
         # type: (common.SourceLocation) -> None
-        """Add an error about specifying one of none, simple or complex in an access check."""
+        """Add an error about specifying one of ignore, none, simple or complex in an access check."""
         # pylint: disable=invalid-name
         self._add_error(
             location, ERROR_ID_EMPTY_ACCESS_CHECK,
-            "Must one and only one of either a 'none', 'simple', or 'complex' in an access_check.")
+            "Must one and only one of either a 'ignore', 'none', 'simple', or 'complex' in an access_check."
+        )
+
+    def add_missing_access_check(self, location, name):
+        # type: (common.SourceLocation, str) -> None
+        """Add an error about a missing access_check when api_version != ""."""
+        # pylint: disable=invalid-name
+        self._add_error(location, ERROR_ID_MISSING_ACCESS_CHECK,
+                        'Command "%s" has api_version != "" but is missing access_check.' % (name))
 
 
 def _assert_unique_error_messages():

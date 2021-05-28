@@ -1,7 +1,8 @@
 /**
  * Tests that in tenant migration, the recipient set can resume collection cloning from the last
  * document cloned after a failover even if the collection has been renamed on the donor.
- * @tags: [requires_majority_read_concern, requires_fcv_49, incompatible_with_windows_tls]
+ * @tags: [requires_majority_read_concern, requires_fcv_49, incompatible_with_windows_tls,
+ * incompatible_with_eft, incompatible_with_macos, requires_persistence]
  */
 
 (function() {
@@ -103,7 +104,8 @@ assert.commandWorked(migrationThread.returnData());
 recipientColl = newRecipientPrimary.getDB(dbName).getCollection(collNameRenamed);
 assert.eq(4, recipientColl.find().itcount());
 assert.eq(recipientColl.find().sort({_id: 1}).toArray(), docs);
-tenantMigrationTest.checkTenantDBHashes(tenantId);
+TenantMigrationUtil.checkTenantDBHashes(
+    tenantMigrationTest.getDonorRst(), tenantMigrationTest.getRecipientRst(), tenantId);
 
 tenantMigrationTest.stop();
 recipientRst.stopSet();

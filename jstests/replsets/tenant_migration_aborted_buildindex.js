@@ -2,7 +2,7 @@
  * Tests that index building is properly completed when a migration aborts.
  *
  * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
- * incompatible_with_windows_tls]
+ * incompatible_with_windows_tls, incompatible_with_macos, requires_persistence]
  */
 
 (function() {
@@ -97,7 +97,8 @@ const blockingFp =
     configureFailPoint(donorPrimary, "pauseTenantMigrationBeforeLeavingBlockingState");
 dataSyncFp.off();
 assert.soon(
-    () => tenantMigrationTest.getTenantMigrationAccessBlocker(donorPrimary, kTenantId).state ===
+    () =>
+        tenantMigrationTest.getTenantMigrationAccessBlocker(donorPrimary, kTenantId).donor.state ===
         TenantMigrationTest.DonorAccessState.kBlockWritesAndReads);
 
 // Clear the log so we can wait for the new index builds to start.

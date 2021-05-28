@@ -99,7 +99,7 @@ public:
 
     virtual Seconds getSecondaryDelaySecs() const;
 
-    virtual void clearSyncSourceBlacklist();
+    virtual void clearSyncSourceDenylist();
 
     virtual ReplicationCoordinator::StatusAndDuration awaitReplication(
         OperationContext* opCtx, const OpTime& opTime, const WriteConcernOptions& writeConcern);
@@ -226,6 +226,8 @@ public:
                                      GetNewConfigFn getNewConfig,
                                      bool force);
 
+    virtual Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn getNewConfig);
+
     Status awaitConfigCommitment(OperationContext* opCtx, bool waitForOplogCommitment);
 
     virtual Status processReplSetInitiate(OperationContext* opCtx,
@@ -244,7 +246,7 @@ public:
 
     virtual HostAndPort chooseNewSyncSource(const OpTime& lastOpTimeFetched);
 
-    virtual void blacklistSyncSource(const HostAndPort& host, Date_t until);
+    virtual void denylistSyncSource(const HostAndPort& host, Date_t until);
 
     virtual void resetLastOpTimesFromOplog(OperationContext* opCtx);
 

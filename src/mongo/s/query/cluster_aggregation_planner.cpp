@@ -35,6 +35,7 @@
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/pipeline/change_stream_invalidation_info.h"
 #include "mongo/db/pipeline/document_source_limit.h"
 #include "mongo/db/pipeline/document_source_skip.h"
 #include "mongo/db/pipeline/sharded_agg_helpers.h"
@@ -124,9 +125,9 @@ BSONObj createCommandForMergingShard(Document serializedCommand,
     MutableDocument mergeCmd(serializedCommand);
 
     mergeCmd["pipeline"] = Value(pipelineForMerging->serialize());
-    mergeCmd[AggregateCommand::kFromMongosFieldName] = Value(true);
+    mergeCmd[AggregateCommandRequest::kFromMongosFieldName] = Value(true);
 
-    mergeCmd[AggregateCommand::kLetFieldName] =
+    mergeCmd[AggregateCommandRequest::kLetFieldName] =
         Value(mergeCtx->variablesParseState.serialize(mergeCtx->variables));
 
     // If the user didn't specify a collation already, make sure there's a collation attached to
@@ -288,6 +289,18 @@ BSONObj establishMergingMongosCursor(OperationContext* opCtx,
             // This exception is thrown when a $changeStream stage encounters an event
             // that invalidates the cursor. We should close the cursor and return without
             // error.
+            cursorState = ClusterCursorManager::CursorState::Exhausted;
+            break;
+        } catch (const ExceptionFor<ErrorCodes::ChangeStreamInvalidated>& ex) {
+            // This exception is thrown when a change-stream cursor is invalidated. Set the PBRT
+            // to the resume token of the invalidating event, and mark the cursor response as
+            // invalidated. We always expect to have ExtraInfo for this error code.
+            const auto extraInfo = ex.extraInfo<ChangeStreamInvalidationInfo>();
+            tassert(
+                5493706, "Missing ChangeStreamInvalidationInfo on exception", extraInfo != nullptr);
+
+            responseBuilder.setPostBatchResumeToken(extraInfo->getInvalidateResumeToken());
+            responseBuilder.setInvalidated();
             cursorState = ClusterCursorManager::CursorState::Exhausted;
             break;
         }

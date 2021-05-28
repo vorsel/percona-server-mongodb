@@ -8,7 +8,7 @@
  *   reads after the migration aborts.
  *
  * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
- * incompatible_with_windows_tls]
+ * incompatible_with_windows_tls, incompatible_with_macos, requires_persistence]
  */
 
 (function() {
@@ -40,7 +40,7 @@ function checkTenantMigrationAccessBlocker(node, tenantId, {
     numTenantMigrationCommittedErrors = 0,
     numTenantMigrationAbortedErrors = 0
 }) {
-    const mtab = TenantMigrationUtil.getTenantMigrationAccessBlocker(node, tenantId);
+    const mtab = TenantMigrationUtil.getTenantMigrationAccessBlocker(node, tenantId).donor;
     if (!mtab) {
         assert.eq(0, numBlockedReads);
         assert.eq(0, numTenantMigrationCommittedErrors);

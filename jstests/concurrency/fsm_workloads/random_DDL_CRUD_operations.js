@@ -16,13 +16,32 @@
  *   # TODO (SERVER-54905): ensure all DDL are resilient.
  *   does_not_support_stepdowns,
  *   # Can be removed once PM-1965-Milestone-1 is completed.
- *   does_not_support_transactions
+ *   does_not_support_transactions,
+ *   featureFlagShardingFullDDLSupport
  *  ]
  */
 
 var $config = (function() {
     function threadCollectionName(prefix, tid) {
         return prefix + tid;
+    }
+
+    function countDocuments(coll, query) {
+        var count;
+        assert.soon(() => {
+            try {
+                count = coll.countDocuments(query);
+                return true;
+            } catch (e) {
+                if (e.code === ErrorCodes.QueryPlanKilled) {
+                    // Retry. Can happen due to concurrent rename collection.
+                    return false;
+                }
+                throw e;
+            }
+        });
+
+        return count;
     }
 
     let data = {numChunks: 20, documentsPerChunk: 5, CRUDMutex: 'CRUDMutex'};
@@ -89,34 +108,43 @@ var $config = (function() {
                 tid = Random.randInt(this.threadCount);
             const srcCollName = threadCollectionName(collName, tid);
             const srcColl = db[srcCollName];
-            const numInitialDocs = srcColl.countDocuments({});
             // Rename collection
-            const destCollName = threadCollectionName(collName, new Date().getTime());
+            const destCollName = threadCollectionName(collName, tid + '_' + new Date().getTime());
             try {
                 jsTestLog('rename state tid:' + tid + ' currentTid:' + this.tid +
                           ' collection:' + srcCollName);
                 assertAlways.commandWorked(srcColl.renameCollection(destCollName));
             } catch (e) {
-                if (e.code && e.code === ErrorCodes.NamespaceNotFound) {
-                    // It is fine for a rename operation to throw NamespaceNotFound BEFORE starting
-                    // (e.g. if the collection was previously dropped). Checking the changelog to
-                    // assert that no such exception was thrown AFTER a rename started.
-                    const dbName = db.getName();
-                    let config = db.getSiblingDB('config');
-                    let countRenames = config.changelog
-                                           .find({
-                                               what: 'renameCollection.start',
-                                               details: {
-                                                   source: dbName + srcCollName,
-                                                   destination: dbName + destCollName
-                                               }
-                                           })
-                                           .itcount();
-                    assert.eq(0,
-                              countRenames,
-                              'NamespaceNotFound exception thrown during rename from ' +
-                                  srcCollName + ' to ' + destCollName);
-                    return;
+                const exceptionCode = e.code;
+                if (exceptionCode) {
+                    if (exceptionCode === ErrorCodes.NamespaceNotFound) {
+                        // It is fine for a rename operation to throw NamespaceNotFound BEFORE
+                        // starting (e.g. if the collection was previously dropped). Checking the
+                        // changelog to assert that no such exception was thrown AFTER a rename
+                        // started.
+                        const dbName = db.getName();
+                        let config = db.getSiblingDB('config');
+                        let countRenames = config.changelog
+                                               .find({
+                                                   what: 'renameCollection.start',
+                                                   details: {
+                                                       source: dbName + srcCollName,
+                                                       destination: dbName + destCollName
+                                                   }
+                                               })
+                                               .itcount();
+                        assert.eq(0,
+                                  countRenames,
+                                  'NamespaceNotFound exception thrown during rename from ' +
+                                      srcCollName + ' to ' + destCollName);
+                        return;
+                    }
+                    if (exceptionCode === ErrorCodes.ConflictingOperationInProgress) {
+                        // It is fine for a rename operation to throw ConflictingOperationInProgress
+                        // if a concurrent rename with the same source collection but different
+                        // options is ongoing.
+                        return;
+                    }
                 }
                 throw e;
             } finally {
@@ -145,40 +173,44 @@ var $config = (function() {
             }
 
             mutexLock(db, tid, targetThreadColl);
-            try {
-                jsTestLog('CRUD - Insert tid:' + tid + ' currentTid:' + this.tid +
-                          ' collection:' + targetThreadColl);
-                // Check if insert succeeded
-                assertAlways.commandWorked(insertBulkOp.execute());
-                let currentDocs = coll.countDocuments({generation: generation});
-                // Check guarantees IF NO CONCURRENT DROP is running.
-                // If a concurrent rename came in, then either the full operation succeded (meaning
-                // there will be 0 documents left) or the insert came in first.
-                assertAlways(currentDocs === numDocs || currentDocs === 0);
+            jsTestLog('CRUD - Insert tid:' + tid + ' currentTid:' + this.tid +
+                      ' collection:' + targetThreadColl);
+            // Check if insert succeeded
+            var res = insertBulkOp.execute();
+            assertAlways.commandWorked(res);
 
-                jsTestLog('CRUD - Update tid:' + tid + ' currentTid:' + this.tid +
-                          ' collection:' + targetThreadColl);
-                assertAlways.commandWorked(
-                    coll.update({generation: generation}, {$set: {updated: true}}, {multi: true}));
+            let currentDocs = countDocuments(coll, {generation: generation});
 
-                // Delete Data
-                jsTestLog('CRUD - Remove tid:' + tid + ' currentTid:' + this.tid +
-                          ' collection:' + targetThreadColl);
-                // Check if delete succeeded
-                coll.remove({generation: generation}, {multi: true});
-                // Check guarantees IF NO CONCURRENT DROP is running.
-                assertAlways.eq(coll.countDocuments({generation: generation}), 0);
-            } catch (e) {
-                if (e.writeError && e.writeError.code === ErrorCodes.QueryPlanKilled) {
-                    // It is fine for a CRUD operation to throw ErrorCodes::QueryPlanKilled if
-                    // performed concurrently with a rename (SERVER-31695).
+            // Check guarantees IF NO CONCURRENT DROP is running.
+            // If a concurrent rename came in, then either the full operation succeded (meaning
+            // there will be 0 documents left) or the insert came in first.
+            assertAlways(currentDocs === numDocs || currentDocs === 0);
+
+            jsTestLog('CRUD - Update tid:' + tid + ' currentTid:' + this.tid +
+                      ' collection:' + targetThreadColl);
+            var res = coll.update({generation: generation}, {$set: {updated: true}}, {multi: true});
+            if (res.hasWriteError()) {
+                var err = res.getWriteError();
+                if (err.code == ErrorCodes.QueryPlanKilled) {
+                    // Update is expected to throw ErrorCodes::QueryPlanKilled if performed
+                    // concurrently with a rename (SERVER-31695).
+                    mutexUnlock(db, tid, targetThreadColl);
+                    jsTestLog('CRUD state finished earlier because query plan was killed.');
                     return;
                 }
                 throw e;
-            } finally {
-                mutexUnlock(db, tid, targetThreadColl);
-                jsTestLog('CRUD state finished');
             }
+            assertAlways.commandWorked(res);
+
+            // Delete Data
+            jsTestLog('CRUD - Remove tid:' + tid + ' currentTid:' + this.tid +
+                      ' collection:' + targetThreadColl);
+            // Check if delete succeeded
+            coll.remove({generation: generation}, {multi: true});
+            // Check guarantees IF NO CONCURRENT DROP is running.
+            assertAlways.eq(countDocuments(coll, {generation: generation}), 0);
+            mutexUnlock(db, tid, targetThreadColl);
+            jsTestLog('CRUD state finished');
         }
     };
 
@@ -187,6 +219,8 @@ var $config = (function() {
             db[data.CRUDMutex].insert({tid: tid, mutex: 0});
         }
     };
+
+    let teardown = function(db, collName, cluster) {};
 
     let transitions = {
         init: {create: 1.0},
@@ -204,6 +238,7 @@ var $config = (function() {
         transitions: transitions,
         data: data,
         setup: setup,
+        teardown: teardown,
         passConnectionCache: true
     };
 })();

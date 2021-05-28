@@ -165,9 +165,14 @@ public:
                 uassert(
                     ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("size"), !cmd.getSize());
                 uassert(ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("max"), !cmd.getMax());
-                uassert(ErrorCodes::InvalidOptions,
-                        timeseriesNotAllowedWith("validator"),
-                        !cmd.getValidator());
+
+                // The 'timeseries' option may be passed with a 'validator' if a buckets collection
+                // is being restored. We assume the caller knows what they are doing.
+                if (!cmd.getNamespace().isTimeseriesBucketsCollection()) {
+                    uassert(ErrorCodes::InvalidOptions,
+                            timeseriesNotAllowedWith("validator"),
+                            !cmd.getValidator());
+                }
                 uassert(ErrorCodes::InvalidOptions,
                         timeseriesNotAllowedWith("validationLevel"),
                         !cmd.getValidationLevel());
@@ -220,8 +225,8 @@ public:
                         !cmd.getAutoIndexId());
 
                 // Perform index spec validation.
-                idIndexSpec = uassertStatusOK(index_key_validate::validateIndexSpec(
-                    opCtx, idIndexSpec, serverGlobalParams.featureCompatibility));
+                idIndexSpec =
+                    uassertStatusOK(index_key_validate::validateIndexSpec(opCtx, idIndexSpec));
                 uassertStatusOK(index_key_validate::validateIdIndexSpec(idIndexSpec));
 
                 // Validate or fill in _id index collation.

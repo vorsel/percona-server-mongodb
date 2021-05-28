@@ -210,7 +210,7 @@ MongoRunner.binVersionSubs = [
     new MongoRunner.VersionSub(extractMajorVersionFromVersionString(shellVersion()),
                                shellVersion()),
     // To-be-updated when we branch for the next release.
-    new MongoRunner.VersionSub("last-continuous", "4.8"),
+    new MongoRunner.VersionSub("last-continuous", "4.9"),
     // To be updated when we branch for the next LTS release.
     new MongoRunner.VersionSub("last-lts", "4.4")
 ];
@@ -691,6 +691,8 @@ MongoRunner.mongodOptions = function(opts = {}) {
     _removeSetParameterIfBeforeVersion(opts, "shutdownTimeoutMillisForSignaledShutdown", "4.5.0");
     _removeSetParameterIfBeforeVersion(
         opts, "failpoint.PrimaryOnlyServiceSkipRebuildingInstances", "4.8.0");
+    _removeSetParameterIfBeforeVersion(
+        opts, "enableDefaultWriteConcernUpdatesForInitiate", "5.0.0");
 
     if (!opts.logFile && opts.useLogFiles) {
         opts.logFile = opts.dbpath + "/mongod.log";
@@ -1209,7 +1211,9 @@ function appendSetParameterArgs(argArray) {
             }
 
             // Disable background cache refreshing to avoid races in tests
-            argArray.push(...['--setParameter', "disableLogicalSessionCacheRefresh=true"]);
+            if (!argArrayContainsSetParameterValue('disableLogicalSessionCacheRefresh=')) {
+                argArray.push(...['--setParameter', "disableLogicalSessionCacheRefresh=true"]);
+            }
         }
 
         // Since options may not be backward compatible, mongos options are not

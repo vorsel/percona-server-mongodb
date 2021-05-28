@@ -142,6 +142,7 @@
 #include "mongo/db/s/migration_util.h"
 #include "mongo/db/s/op_observer_sharding_impl.h"
 #include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
+#include "mongo/db/s/rename_collection_participant_service.h"
 #include "mongo/db/s/resharding/resharding_coordinator_service.h"
 #include "mongo/db/s/resharding/resharding_donor_service.h"
 #include "mongo/db/s/resharding/resharding_op_observer.h"
@@ -265,8 +266,8 @@ void logStartup(OperationContext* opCtx) {
     BSONObj o = toLog.obj();
 
     Lock::GlobalWrite lk(opCtx);
-    AutoGetOrCreateDb autoDb(opCtx, startupLogCollectionName.db(), mongo::MODE_X);
-    Database* db = autoDb.getDb();
+    AutoGetDb autoDb(opCtx, startupLogCollectionName.db(), mongo::MODE_X);
+    auto db = autoDb.ensureDbExists();
     CollectionPtr collection =
         CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, startupLogCollectionName);
     WriteUnitOfWork wunit(opCtx);
@@ -316,15 +317,18 @@ void registerPrimaryOnlyServices(ServiceContext* serviceContext) {
     auto registry = repl::PrimaryOnlyServiceRegistry::get(serviceContext);
 
     std::vector<std::unique_ptr<repl::PrimaryOnlyService>> services;
-    services.push_back(std::make_unique<TenantMigrationDonorService>(serviceContext));
-    services.push_back(std::make_unique<repl::TenantMigrationRecipientService>(serviceContext));
 
     if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
         services.push_back(std::make_unique<ReshardingCoordinatorService>(serviceContext));
     } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer) {
+        services.push_back(std::make_unique<RenameCollectionParticipantService>(serviceContext));
         services.push_back(std::make_unique<ShardingDDLCoordinatorService>(serviceContext));
         services.push_back(std::make_unique<ReshardingDonorService>(serviceContext));
         services.push_back(std::make_unique<ReshardingRecipientService>(serviceContext));
+    } else {
+        // Tenant migrations are not supported in sharded clusters.
+        services.push_back(std::make_unique<TenantMigrationDonorService>(serviceContext));
+        services.push_back(std::make_unique<repl::TenantMigrationRecipientService>(serviceContext));
     }
 
     for (auto& service : services) {
@@ -526,6 +530,10 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
     auto const globalAuthzManager = AuthorizationManager::get(serviceContext);
     uassertStatusOK(globalAuthzManager->initialize(startupOpCtx.get()));
 
+    if (audit::initializeManager) {
+        audit::initializeManager(startupOpCtx.get());
+    }
+
     // This is for security on certain platforms (nonce generation)
     srand((unsigned)(curTimeMicros64()) ^ (unsigned(uintptr_t(&startupOpCtx))));
 
@@ -634,6 +642,10 @@ ExitCode _initAndListen(ServiceContext* serviceContext, int listenPort) {
             str::stream()
                 << "Cannot take an unstable checkpoint on shutdown while using queryableBackupMode",
             !gTakeUnstableCheckpointOnShutdown);
+        uassert(5576603,
+                str::stream() << "Cannot specify both queryableBackupMode and "
+                              << "startupRecoveryForRestore at the same time",
+                !repl::startupRecoveryForRestore);
 
         auto replCoord = repl::ReplicationCoordinator::get(startupOpCtx.get());
         invariant(replCoord);
@@ -1038,15 +1050,21 @@ void setUpObservers(ServiceContext* serviceContext) {
         opObserverRegistry->addObserver(std::make_unique<ReshardingOpObserver>());
     } else {
         opObserverRegistry->addObserver(std::make_unique<OpObserverImpl>());
+        // Tenant migrations are not supported in sharded clusters.
+        opObserverRegistry->addObserver(std::make_unique<repl::TenantMigrationDonorOpObserver>());
+        opObserverRegistry->addObserver(
+            std::make_unique<repl::TenantMigrationRecipientOpObserver>());
     }
     opObserverRegistry->addObserver(std::make_unique<AuthOpObserver>());
     opObserverRegistry->addObserver(
         std::make_unique<repl::PrimaryOnlyServiceOpObserver>(serviceContext));
-    opObserverRegistry->addObserver(std::make_unique<repl::TenantMigrationDonorOpObserver>());
-    opObserverRegistry->addObserver(std::make_unique<repl::TenantMigrationRecipientOpObserver>());
     opObserverRegistry->addObserver(std::make_unique<FcvOpObserver>());
 
     setupFreeMonitoringOpObserver(opObserverRegistry.get());
+
+    if (audit::opObserverRegistrar) {
+        audit::opObserverRegistrar(opObserverRegistry.get());
+    }
 
     serviceContext->setOpObserver(std::move(opObserverRegistry));
 }

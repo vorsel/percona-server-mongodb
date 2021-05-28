@@ -45,6 +45,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/pipeline/change_stream_invalidation_info.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/find_common.h"
 #include "mongo/db/query/getmore_request.h"
@@ -84,11 +85,11 @@ static const int kPerDocumentOverheadBytesUpperBound = 10;
 const char kFindCmdName[] = "find";
 
 /**
- * Given the FindCommand 'findCommand' being executed by mongos, returns a copy of the query which
- * is suitable for forwarding to the targeted hosts.
+ * Given the FindCommandRequest 'findCommand' being executed by mongos, returns a copy of the query
+ * which is suitable for forwarding to the targeted hosts.
  */
-StatusWith<std::unique_ptr<FindCommand>> transformQueryForShards(
-    const FindCommand& findCommand, bool appendGeoNearDistanceProjection) {
+StatusWith<std::unique_ptr<FindCommandRequest>> transformQueryForShards(
+    const FindCommandRequest& findCommand, bool appendGeoNearDistanceProjection) {
     // If there is a limit, we forward the sum of the limit and the skip.
     boost::optional<int64_t> newLimit;
     if (findCommand.getLimit()) {
@@ -156,7 +157,7 @@ StatusWith<std::unique_ptr<FindCommand>> transformQueryForShards(
         newProjection = projectionBuilder.obj();
     }
 
-    auto newQR = std::make_unique<FindCommand>(findCommand);
+    auto newQR = std::make_unique<FindCommandRequest>(findCommand);
     newQR->setProjection(newProjection);
     newQR->setSkip(boost::none);
     newQR->setLimit(newLimit);
@@ -171,7 +172,7 @@ StatusWith<std::unique_ptr<FindCommand>> transformQueryForShards(
     if (newQR->getShowRecordId())
         newQR->setShowRecordId(false);
 
-    uassertStatusOK(query_request_helper::validateFindCommand(*newQR));
+    uassertStatusOK(query_request_helper::validateFindCommandRequest(*newQR));
     return std::move(newQR);
 }
 
@@ -186,14 +187,14 @@ std::vector<std::pair<ShardId, BSONObj>> constructRequestsForShards(
     const CanonicalQuery& query,
     bool appendGeoNearDistanceProjection) {
 
-    std::unique_ptr<FindCommand> findCommandToForward;
+    std::unique_ptr<FindCommandRequest> findCommandToForward;
     if (shardIds.size() > 1) {
-        findCommandToForward = uassertStatusOK(
-            transformQueryForShards(query.getFindCommand(), appendGeoNearDistanceProjection));
+        findCommandToForward = uassertStatusOK(transformQueryForShards(
+            query.getFindCommandRequest(), appendGeoNearDistanceProjection));
     } else {
-        // Forwards the FindCommand as is to a single shard so that limit and skip can
+        // Forwards the FindCommandRequest as is to a single shard so that limit and skip can
         // be applied on mongod.
-        findCommandToForward = std::make_unique<FindCommand>(query.getFindCommand());
+        findCommandToForward = std::make_unique<FindCommandRequest>(query.getFindCommandRequest());
     }
 
     auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
@@ -248,7 +249,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
                                  const ChunkManager& cm,
                                  std::vector<BSONObj>* results,
                                  bool* partialResultsReturned) {
-    auto findCommand = query.getFindCommand();
+    auto findCommand = query.getFindCommandRequest();
     // Get the set of shards on which we will run the query.
     auto shardIds = getTargetedShardsForQuery(
         query.getExpCtx(), cm, findCommand.getFilter(), findCommand.getCollation());
@@ -438,7 +439,7 @@ CursorId runQueryWithoutRetrying(OperationContext* opCtx,
  * and/or what's specified on the request.
  */
 Status setUpOperationContextStateForGetMore(OperationContext* opCtx,
-                                            const GetMoreCommand& cmd,
+                                            const GetMoreCommandRequest& cmd,
                                             const ClusterCursorManager::PinnedCursor& cursor) {
     if (auto readPref = cursor->getReadPreference()) {
         ReadPreferenceSetting::get(opCtx) = *readPref;
@@ -494,7 +495,7 @@ CursorId ClusterFind::runQuery(OperationContext* opCtx,
     // We must always have a BSONObj vector into which to output our results.
     invariant(results);
 
-    auto findCommand = query.getFindCommand();
+    auto findCommand = query.getFindCommandRequest();
     // Projection on the reserved sort key field is illegal in mongos.
     if (findCommand.getProjection().hasField(AsyncResultsMerger::kSortKeyField)) {
         uasserted(ErrorCodes::BadValue,
@@ -689,7 +690,7 @@ void validateOperationSessionInfo(OperationContext* opCtx,
 }
 
 StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
-                                                   const GetMoreCommand& cmd) {
+                                                   const GetMoreCommandRequest& cmd) {
     auto cursorManager = Grid::get(opCtx)->getCursorManager();
 
     auto authzSession = AuthorizationSession::get(opCtx->getClient());
@@ -788,6 +789,17 @@ StatusWith<CursorResponse> ClusterFind::runGetMore(OperationContext* opCtx,
             // This exception is thrown when a $changeStream stage encounters an event
             // that invalidates the cursor. We should close the cursor and return without
             // error.
+            cursorState = ClusterCursorManager::CursorState::Exhausted;
+            break;
+        } catch (const ExceptionFor<ErrorCodes::ChangeStreamInvalidated>& ex) {
+            // This exception is thrown when a change-stream cursor is invalidated. Set the PBRT
+            // to the resume token of the invalidating event, and mark the cursor response as
+            // invalidated. We always expect to have ExtraInfo for this error code.
+            const auto extraInfo = ex.extraInfo<ChangeStreamInvalidationInfo>();
+            tassert(
+                5493707, "Missing ChangeStreamInvalidationInfo on exception", extraInfo != nullptr);
+
+            postBatchResumeToken = extraInfo->getInvalidateResumeToken();
             cursorState = ClusterCursorManager::CursorState::Exhausted;
             break;
         }

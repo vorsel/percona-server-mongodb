@@ -4,10 +4,10 @@
 // This test triggers a compiler bug that causes a crash when compiling with optimizations on, see
 // SERVER-36321.
 // @tags: [
-//     blacklist_from_rhel_67_s390x,
-//     requires_persistence,
-//     uses_change_streams,
-//     requires_majority_read_concern
+//   denylist_from_rhel_67_s390x,
+//   requires_majority_read_concern,
+//   requires_persistence,
+//   uses_change_streams,
 // ]
 (function() {
 "use strict";

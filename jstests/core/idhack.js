@@ -1,5 +1,6 @@
 // @tags: [
 //   assumes_balancer_off,
+//   requires_multi_updates,
 //   requires_non_retryable_writes,
 // ]
 (function() {
@@ -11,11 +12,9 @@ t.drop();
 // Include helpers for analyzing explain output.
 load("jstests/libs/analyze_plan.js");
 load("jstests/libs/sbe_explain_helpers.js");
+load("jstests/libs/sbe_util.js");
 
-const isSBEEnabled = (() => {
-    const getParam = db.adminCommand({getParameter: 1, featureFlagSBE: 1});
-    return getParam.hasOwnProperty("featureFlagSBE") && getParam.featureFlagSBE.value;
-})();
+const isSBEEnabled = checkSBEEnabled(db);
 
 assert.commandWorked(t.insert({_id: {x: 1}, z: 1}));
 assert.commandWorked(t.insert({_id: {x: 2}, z: 2}));
@@ -62,7 +61,7 @@ assertNonIdHackPlan(db, getWinningPlan(explain.queryPlanner), isSBEEnabled);
 
 // Covered query returning _id field only can be handled by ID hack.
 explain = t.find(query, {_id: 1}).explain();
-assertIdHackPlan(db, getWinningPlan(explain.queryPlanner), "PROJECTION_COVERED", isSBEEnabled);
+assertIdHackPlan(db, getWinningPlan(explain.queryPlanner), "FETCH", isSBEEnabled);
 // Check doc from covered ID hack query.
 assert.eq({_id: {x: 2}}, t.findOne(query, {_id: 1}), explain);
 

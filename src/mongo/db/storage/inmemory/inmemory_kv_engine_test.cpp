@@ -63,6 +63,7 @@ public:
             svcCtx,
             std::unique_ptr<repl::ReplicationCoordinator>(
                 new repl::ReplicationCoordinatorMock(svcCtx, repl::ReplSettings())));
+        _engine->notifyStartupComplete();
     }
 
     virtual ~InMemoryKVHarnessHelper() {

@@ -39,6 +39,7 @@
 #include "mongo/db/s/sharding_runtime_d_params_gen.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/logv2/log.h"
+#include "mongo/s/type_collection_timeseries_fields_gen.h"
 #include "mongo/util/duration.h"
 
 namespace mongo {
@@ -87,6 +88,10 @@ CollectionShardingRuntime::CollectionShardingRuntime(
 CollectionShardingRuntime* CollectionShardingRuntime::get(OperationContext* opCtx,
                                                           const NamespaceString& nss) {
     auto* const css = CollectionShardingState::get(opCtx, nss);
+    return checked_cast<CollectionShardingRuntime*>(css);
+}
+
+CollectionShardingRuntime* CollectionShardingRuntime::get(CollectionShardingState* css) {
     return checked_cast<CollectionShardingRuntime*>(css);
 }
 
@@ -161,9 +166,7 @@ void CollectionShardingRuntime::enterCriticalSectionCommitPhase(const CSRLock&) 
     _critSec.enterCriticalSectionCommitPhase();
 }
 
-void CollectionShardingRuntime::exitCriticalSection(OperationContext* opCtx) {
-    invariant(opCtx->lockState()->isCollectionLockedForMode(_nss, MODE_IX));
-    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, this);
+void CollectionShardingRuntime::exitCriticalSection(const CSRLock&) {
     _critSec.exitCriticalSection();
 }
 
@@ -315,6 +318,11 @@ CollectionShardingRuntime::_getMetadataWithVersionCheckAt(
             optCurrentMetadata);
 
     const auto& currentMetadata = optCurrentMetadata->get();
+
+    uassert(ErrorCodes::NotImplemented,
+            "Operations on sharded time-series collections are not supported",
+            !currentMetadata.isSharded() || !currentMetadata.getTimeseriesFields());
+
     auto wantedShardVersion = currentMetadata.getShardVersion();
 
     {
@@ -417,7 +425,8 @@ CollectionCriticalSection::~CollectionCriticalSection() {
     UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
     AutoGetCollection autoColl(_opCtx, _nss, MODE_IX);
     auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
-    csr->exitCriticalSection(_opCtx);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
+    csr->exitCriticalSection(csrLock);
 }
 
 void CollectionCriticalSection::enterCommitPhase() {

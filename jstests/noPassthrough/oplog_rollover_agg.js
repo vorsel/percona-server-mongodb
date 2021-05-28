@@ -88,7 +88,7 @@ function oplogIsRolledOver() {
     // oplog's current oldest entry. Said another way, the oplog is rolled over when
     // everything in the oplog is newer than what used to be the newest entry.
     return bsonWoCompare(mostRecentOplogEntry.ts,
-                         getLeastRecentOp({server: primaryNode, readConcern: "majority"}).ts) < 0;
+                         getFirstOplogEntry(primaryNode, {readConcern: "majority"}).ts) < 0;
 }
 
 while (!oplogIsRolledOver()) {
@@ -113,21 +113,45 @@ assert.commandFailedWithCode(localDB.runCommand({
 }),
                              ErrorCodes.OplogQueryMinTsMissing);
 
-// However, the same aggregation succeeds if we do not specify $_requestReshardingResumeToken.
-assert.commandWorked(localDB.runCommand({
-    aggregate: oplogColl.getName(),
-    pipeline: [{$match: {ts: {$gte: Timestamp(1, 1)}, ns: testColl.getFullName()}}],
-    cursor: {},
-}));
+// However, the same aggregation succeeds if we do not specify $_requestReshardingResumeToken. Since
+// we have just rolled over the oplog, we may encounter a "CappedPositionLost" error, which can be
+// safely retried.
+assert.soon(() => {
+    let commandRes = localDB.runCommand({
+        aggregate: oplogColl.getName(),
+        pipeline: [{$match: {ts: {$gte: Timestamp(1, 1)}, ns: testColl.getFullName()}}],
+        cursor: {},
+    });
+
+    if (!commandRes.ok && commandRes.code == ErrorCodes.CappedPositionLost) {
+        jsTestLog("Encountered a CappedPositionLost error, retrying the command.");
+        return false;
+    }
+
+    assert.commandWorked(commandRes);
+    return true;
+});
 
 // Requesting resume tokens on a find command does not imply 'assertMinTsHasNotFallenOffOplog'.
-assert.commandWorked(localDB.runCommand({
-    find: oplogColl.getName(),
-    filter: {ts: {$gte: Timestamp(1, 1)}, ns: testColl.getFullName()},
-    tailable: true,
-    hint: {$natural: 1},
-    $_requestResumeToken: true
-}));
+// Since we have just rolled over the oplog, we may encounter a "CappedPositionLost" error, which
+// can be safely retried.
+assert.soon(() => {
+    let commandRes = localDB.runCommand({
+        find: oplogColl.getName(),
+        filter: {ts: {$gte: Timestamp(1, 1)}, ns: testColl.getFullName()},
+        tailable: true,
+        hint: {$natural: 1},
+        $_requestResumeToken: true
+    });
+
+    if (!commandRes.ok && commandRes.code == ErrorCodes.CappedPositionLost) {
+        jsTestLog("Encountered a CappedPositionLost error, retrying the command.");
+        return false;
+    }
+
+    assert.commandWorked(commandRes);
+    return true;
+});
 
 rst.stopSet();
 })();

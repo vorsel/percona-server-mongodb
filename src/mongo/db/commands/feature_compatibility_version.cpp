@@ -66,8 +66,6 @@ using FCV = FCVParams::Version;
 
 using namespace fmt::literals;
 
-Lock::ResourceMutex FeatureCompatibilityVersion::fcvLock("featureCompatibilityVersionLock");
-
 namespace {
 
 /**
@@ -190,22 +188,16 @@ private:
     stdx::unordered_map<std::tuple<FCV, FCV, bool>, FCV> _transitions;
 } fcvTransitions;
 
+/**
+ * Taken in shared mode by any operations that need to ensure that the FCV does not change during
+ * its execution.
+ *
+ * setFCV takes this lock in exclusive mode when changing the FCV value.
+ */
+Lock::ResourceMutex fcvLock("featureCompatibilityVersionLock");
+
 bool isWriteableStorageEngine() {
     return !storageGlobalParams.readOnly && (storageGlobalParams.engine != "devnull");
-}
-
-// Returns the featureCompatibilityVersion document if it exists.
-boost::optional<BSONObj> findFcvDocument(OperationContext* opCtx) {
-    // Ensure database is opened and exists.
-    AutoGetOrCreateDb autoDb(opCtx, NamespaceString::kServerConfigurationNamespace.db(), MODE_IX);
-
-    const auto query = BSON("_id" << FeatureCompatibilityVersionParser::kParameterName);
-    const auto swFcv = repl::StorageInterface::get(opCtx)->findById(
-        opCtx, NamespaceString::kServerConfigurationNamespace, query["_id"]);
-    if (!swFcv.isOK()) {
-        return boost::none;
-    }
-    return swFcv.getValue();
 }
 
 /**
@@ -244,15 +236,77 @@ void runUpdateCommand(OperationContext* opCtx, const FeatureCompatibilityVersion
     client.runCommand(nss.db().toString(), updateCmd.obj(), updateResult);
     uassertStatusOK(getStatusFromWriteCommandReply(updateResult));
 }
+
 }  // namespace
 
+boost::optional<BSONObj> FeatureCompatibilityVersion::findFeatureCompatibilityVersionDocument(
+    OperationContext* opCtx) {
+    AutoGetCollection autoColl(opCtx, NamespaceString::kServerConfigurationNamespace, MODE_IX);
+    invariant(autoColl.ensureDbExists(), NamespaceString::kServerConfigurationNamespace.ns());
+
+    const auto query = BSON("_id" << FeatureCompatibilityVersionParser::kParameterName);
+    const auto swFcv = repl::StorageInterface::get(opCtx)->findById(
+        opCtx, NamespaceString::kServerConfigurationNamespace, query["_id"]);
+    if (!swFcv.isOK()) {
+        return boost::none;
+    }
+    return swFcv.getValue();
+}
+
 void FeatureCompatibilityVersion::validateSetFeatureCompatibilityVersionRequest(
-    FCV fromVersion, FCV newVersion, bool isFromConfigServer) {
+    OperationContext* opCtx, const SetFeatureCompatibilityVersion& setFCVRequest, FCV fromVersion) {
+
+    auto newVersion = setFCVRequest.getCommandParameter();
+    auto isFromConfigServer = setFCVRequest.getFromConfigServer().value_or(false);
+
     uassert(
         5147403,
         "cannot set featureCompatibilityVersion to '{}' while featureCompatibilityVersion is '{}'"_format(
             FCVP::toString(newVersion), FCVP::toString(fromVersion)),
         fcvTransitions.permitsTransition(fromVersion, newVersion, isFromConfigServer));
+
+    auto setFCVPhase = setFCVRequest.getPhase();
+    if (!isFromConfigServer || !setFCVPhase) {
+        return;
+    }
+
+    auto changeTimestamp = setFCVRequest.getChangeTimestamp();
+    invariant(changeTimestamp);
+
+    auto fcvObj = findFeatureCompatibilityVersionDocument(opCtx);
+    auto fcvDoc = FeatureCompatibilityVersionDocument::parse(
+        IDLParserErrorContext("featureCompatibilityVersionDocument"), fcvObj.get());
+    auto previousTimestamp = fcvDoc.getChangeTimestamp();
+
+    if (setFCVPhase == SetFCVPhaseEnum::kStart) {
+        uassert(
+            5563501,
+            "Shard received a timestamp for phase 1 of the 'setFeatureCompatibilityVersion' "
+            "command which is too old, so the request is discarded. This may indicate that the "
+            "request is related to a previous invocation of the 'setFeatureCompatibilityVersion' "
+            "command which, for example, was temporarily stuck on network.",
+            !previousTimestamp || previousTimestamp <= changeTimestamp);
+    } else {
+        uassert(5563601,
+                "Cannot transition to fully upgraded or fully downgraded state if the shard is not "
+                "in kUpgrading or kDowngrading state",
+                serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading());
+
+        tassert(5563502,
+                "Shard received a request for phase 2 of the 'setFeatureCompatibilityVersion' "
+                "command that cannot be correlated with the previous one, so the request is "
+                "discarded. This may indicate that the request for step 1 was not received or "
+                "processed properly.",
+                previousTimestamp);
+
+        uassert(5563503,
+                "Shard received a timestamp for phase 2 of the 'setFeatureCompatibilityVersion' "
+                "command that does not match the one received for phase 1, so the request is "
+                "discarded. This could indicate, for example, that the request is related to a "
+                "previous invocation of the 'setFeatureCompatibilityVersion' command which, for "
+                "example, was temporarily stuck on network.",
+                previousTimestamp == changeTimestamp);
+    }
 }
 
 void FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
@@ -260,6 +314,7 @@ void FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
     ServerGlobalParams::FeatureCompatibility::Version fromVersion,
     ServerGlobalParams::FeatureCompatibility::Version newVersion,
     bool isFromConfigServer,
+    boost::optional<Timestamp> changeTimestamp,
     bool setTargetVersion) {
 
     // Only transition to fully upgraded or downgraded states when we
@@ -270,6 +325,17 @@ void FeatureCompatibilityVersion::updateFeatureCompatibilityVersionDocument(
         : fcvTransitions.getTransitionalVersion(fromVersion, newVersion, isFromConfigServer);
     FeatureCompatibilityVersionDocument fcvDoc =
         fcvTransitions.getFCVDocument(transitioningVersion);
+
+    // The timestamp must be removed when downgrading to version 4.9 or 4.4. This is necessary to
+    // avoid the presence of an unknown field that old binaries are unable to deserialize.
+    if (transitioningVersion == ServerGlobalParams::FeatureCompatibility::Version::kVersion49 ||
+        transitioningVersion ==
+            ServerGlobalParams::FeatureCompatibility::Version::kFullyDowngradedTo44) {
+        fcvDoc.setChangeTimestamp(boost::none);
+    } else {
+        fcvDoc.setChangeTimestamp(changeTimestamp);
+    }
+
     runUpdateCommand(opCtx, fcvDoc);
 }
 
@@ -353,7 +419,7 @@ void FeatureCompatibilityVersion::updateMinWireVersion() {
 void FeatureCompatibilityVersion::initializeForStartup(OperationContext* opCtx) {
     // Global write lock must be held.
     invariant(opCtx->lockState()->isW());
-    auto featureCompatibilityVersion = findFcvDocument(opCtx);
+    auto featureCompatibilityVersion = findFeatureCompatibilityVersionDocument(opCtx);
     if (!featureCompatibilityVersion) {
         return;
     }
@@ -407,7 +473,7 @@ void FeatureCompatibilityVersion::fassertInitializedAfterStartup(OperationContex
         return;
     }
 
-    auto fcvDocument = findFcvDocument(opCtx);
+    auto fcvDocument = findFeatureCompatibilityVersionDocument(opCtx);
 
     auto const storageEngine = opCtx->getServiceContext()->getStorageEngine();
     auto dbNames = storageEngine->listDatabases();
@@ -429,6 +495,11 @@ void FeatureCompatibilityVersion::fassertInitializedAfterStartup(OperationContex
     if (isWriteableStorageEngine() && (!replSettings.usingReplSets() || nonLocalDatabases)) {
         invariant(serverGlobalParams.featureCompatibility.isVersionInitialized());
     }
+}
+
+Lock::ExclusiveLock FeatureCompatibilityVersion::enterFCVChangeRegion(OperationContext* opCtx) {
+    invariant(!opCtx->lockState()->isLocked());
+    return Lock::ExclusiveLock(opCtx->lockState(), fcvLock);
 }
 
 /**
@@ -458,6 +529,32 @@ Status FeatureCompatibilityVersionParameter::setFromString(const std::string&) {
             str::stream() << name() << " cannot be set via setParameter. See "
                           << feature_compatibility_version_documentation::kCompatibilityLink
                           << "."};
+}
+
+FixedFCVRegion::FixedFCVRegion(OperationContext* opCtx)
+    : _lk([&] {
+          invariant(!opCtx->lockState()->isLocked());
+          return Lock::SharedLock(opCtx->lockState(), fcvLock);
+      }()) {}
+
+FixedFCVRegion::~FixedFCVRegion() = default;
+
+const ServerGlobalParams::FeatureCompatibility& FixedFCVRegion::operator*() const {
+    return serverGlobalParams.featureCompatibility;
+}
+
+const ServerGlobalParams::FeatureCompatibility* FixedFCVRegion::operator->() const {
+    return &serverGlobalParams.featureCompatibility;
+}
+
+bool FixedFCVRegion::operator==(
+    const ServerGlobalParams::FeatureCompatibility::Version& other) const {
+    return serverGlobalParams.featureCompatibility.getVersion() == other;
+}
+
+bool FixedFCVRegion::operator!=(
+    const ServerGlobalParams::FeatureCompatibility::Version& other) const {
+    return !(*this == other);
 }
 
 }  // namespace mongo

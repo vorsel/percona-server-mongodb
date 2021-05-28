@@ -165,6 +165,7 @@ env.Library(
         '$BUILD_DIR/mongo/base/secure_allocator',
         '$BUILD_DIR/mongo/bson/util/bson_extract',
         '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/db/global_settings',
         '$BUILD_DIR/mongo/db/ldap/ldapmanager',
         '$BUILD_DIR/mongo/db/ldap_options',
@@ -176,8 +177,6 @@ env.Library(
         '$BUILD_DIR/mongo/util/net/ssl_types',
         'address_restriction',
         'auth',
-        'auth_types',
-        'auth_umc',
         'authorization_manager_global',
         'authprivilege',
         'builtin_roles',
@@ -186,11 +185,14 @@ env.Library(
         'user_document_parser',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/api_parameters',
         '$BUILD_DIR/mongo/db/audit', # audit:logLogout in AuthZSession.
         '$BUILD_DIR/mongo/db/commands/create_command',
         '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/idl/server_parameter',
         '$BUILD_DIR/mongo/util/caching',
+        'auth_types',
+        'auth_umc',
     ],
 )
 
@@ -231,13 +233,11 @@ env.Library(
         'privilege_parser.cpp',
         'resource_pattern.cpp',
     ],
-    LIBDEPS=[
+    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
-        '$BUILD_DIR/mongo/idl/idl_parser',
-    ],
-    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/idl/idl_parser',
     ],
 )
 
@@ -260,17 +260,15 @@ env.Library(
         'impersonation_session.cpp',
         'user_management_commands_parser.cpp',
     ],
-    LIBDEPS=[
+    LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/bson/mutable/mutable_bson',
         '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/rpc/metadata_impersonated_user',
         'address_restriction',
         'auth',
         'authprivilege',
     ],
-    LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/rpc/metadata_impersonated_user',
-    ]
 )
 
 env.Library(
@@ -480,6 +478,17 @@ env.Library(
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/util/net/network',
         'authentication_restriction',
+    ],
+)
+
+env.Library(
+    target='user_cache_acquisition_stats',
+    source=[
+        'user_cache_acquisition_stats.cpp'
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        'auth',
     ],
 )
 

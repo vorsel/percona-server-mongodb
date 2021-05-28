@@ -101,7 +101,7 @@ public:
     static void set(ServiceContext* service,
                     std::unique_ptr<ReplicationCoordinator> replCoordinator);
 
-    struct StatusAndDuration {
+    struct MONGO_WARN_UNUSED_RESULT_CLASS StatusAndDuration {
     public:
         Status status;
         Milliseconds duration;
@@ -724,6 +724,18 @@ public:
     virtual Status doReplSetReconfig(OperationContext* opCtx,
                                      GetNewConfigFn getNewConfig,
                                      bool force) = 0;
+
+    /**
+     * Performs a reconfig that skips certain safety checks, including the following:
+     * 1) Wait for the current config to be majority committed
+     * 2) Wait for oplog commitment
+     * 3) Quorum check
+     * This function is only intended to be called for internal reconfigs that do not change the
+     * consensus group (eg. only bumping the config version or term). These scenarios are expected
+     * to be able to bypass certain safety checks because the caller guarantees the reconfig to be
+     * safe.
+     */
+    virtual Status doOptimizedReconfig(OperationContext* opCtx, GetNewConfigFn) = 0;
 
     /**
      * Waits until the following two conditions are satisfied:

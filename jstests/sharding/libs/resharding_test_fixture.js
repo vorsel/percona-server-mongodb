@@ -28,6 +28,8 @@ var ReshardingTest = class {
         numRecipients: numRecipients = 1,
         reshardInPlace: reshardInPlace = false,
         minimumOperationDurationMS: minimumOperationDurationMS = undefined,
+        criticalSectionTimeoutMS: criticalSectionTimeoutMS = 24 * 60 * 60 * 1000 /* 1 day */,
+        commitImplicitly: commitImplicitly = true,
     } = {}) {
         // The @private JSDoc comments cause VS Code to not display the corresponding properties and
         // methods in its autocomplete list. This makes it simpler for test authors to know what the
@@ -44,6 +46,10 @@ var ReshardingTest = class {
                                                : this._numDonors + this._numRecipients;
         /** @private */
         this._minimumOperationDurationMS = minimumOperationDurationMS;
+        /** @private */
+        this._criticalSectionTimeoutMS = criticalSectionTimeoutMS;
+        /** @private */
+        this._commitImplicitly = commitImplicitly;
 
         // Properties set by setup().
         /** @private */
@@ -58,6 +64,8 @@ var ReshardingTest = class {
         this._sourceCollectionUUID = undefined;
         /** @private */
         this._tempNs = undefined;
+        /** @private */
+        this._primaryShardName = undefined;
 
         // Properties set by startReshardingInBackground() and withReshardingInBackground().
         /** @private */
@@ -84,6 +92,11 @@ var ReshardingTest = class {
                 this._minimumOperationDurationMS;
         }
 
+        if (this._criticalSectionTimeoutMS !== -1) {
+            config.setParameter.reshardingCriticalSectionTimeoutMillis =
+                this._criticalSectionTimeoutMS;
+        }
+
         this._st = new ShardingTest({
             mongos: 1,
             mongosOptions: {setParameter: {featureFlagResharding: true}},
@@ -94,6 +107,13 @@ var ReshardingTest = class {
             rsOptions: {setParameter: {featureFlagResharding: true}},
             manualAddShard: true,
         });
+
+        if (this._commitImplicitly) {
+            // The failpoint is enabled unless the caller opts out.
+            // This is a temporary situation until reshard can complete on its own.
+            this._canEnterCriticalFailpoint = configureFailPoint(
+                this._st.configRS.getPrimary(), "reshardingCoordinatorCanEnterCriticalImplicitly");
+        }
 
         for (let i = 0; i < this._numShards; ++i) {
             const isDonor = i < this._numDonors;
@@ -149,7 +169,8 @@ var ReshardingTest = class {
      * {min: <shardKeyValue0>, max: <shardKeyValue1>, shard: <shardName>} objects. The chunks must
      * form a partition of the {shardKey: MinKey} --> {shardKey: MaxKey} space.
      */
-    createShardedCollection({ns, shardKeyPattern, chunks}) {
+    createShardedCollection(
+        {ns, shardKeyPattern, chunks, primaryShardName = this.donorShardNames[0]}) {
         this._ns = ns;
         this._currentShardKey = Object.assign({}, shardKeyPattern);
 
@@ -169,7 +190,8 @@ var ReshardingTest = class {
         // collection is unsharded. We configure one of the recipient shards to be the primary shard
         // for the database so mongos still ends up routing operations to a shard which owns the
         // temporary resharding collection.
-        this._st.ensurePrimaryShard(sourceDB.getName(), this.recipientShardNames[0]);
+        this._st.ensurePrimaryShard(sourceDB.getName(), primaryShardName);
+        this._primaryShardName = primaryShardName;
 
         return sourceCollection;
     }
@@ -250,16 +272,19 @@ var ReshardingTest = class {
      * @param expectedErrorCode - the expected response code for the reshardCollection command.
      *
      * @param postCheckConsistencyFn - a function for evaluating additional correctness
-     * assertions. This function is called in the critical section after a successful
-     * `reshardCollection` command has shuffled data, but before the response is returned to the
-     * client.
+     * assertions. This function is called in the critical section, after the `reshardCollection`
+     * command has shuffled data, but before the coordinator persists a decision.
+     *
+     * @param postDecisionPersistedFn - a function for evaluating addition assertions after
+     * the decision has been persisted, but before the resharding operation finishes and returns
+     * to the client.
      */
     withReshardingInBackground({newShardKeyPattern, newChunks},
                                duringReshardingFn = (tempNs) => {},
                                {
                                    expectedErrorCode = ErrorCodes.OK,
                                    postCheckConsistencyFn = (tempNs) => {},
-                                   postAbortDecisionPersistedFn = () => {}
+                                   postDecisionPersistedFn = () => {}
                                } = {}) {
         this._startReshardingInBackgroundAndAllowCommandFailure({newShardKeyPattern, newChunks},
                                                                 expectedErrorCode);
@@ -272,7 +297,7 @@ var ReshardingTest = class {
         this._callFunctionSafely(() => duringReshardingFn(this._tempNs));
         this._checkConsistencyAndPostState(expectedErrorCode,
                                            () => postCheckConsistencyFn(this._tempNs),
-                                           () => postAbortDecisionPersistedFn());
+                                           () => postDecisionPersistedFn());
     }
 
     /** @private */
@@ -376,7 +401,7 @@ var ReshardingTest = class {
     /** @private */
     _checkConsistencyAndPostState(expectedErrorCode,
                                   postCheckConsistencyFn = () => {},
-                                  postAbortDecisionPersistedFn = () => {}) {
+                                  postDecisionPersistedFn = () => {}) {
         let performCorrectnessChecks = true;
         if (expectedErrorCode === ErrorCodes.OK) {
             this._callFunctionSafely(() => {
@@ -410,13 +435,15 @@ var ReshardingTest = class {
                 }
 
                 this._pauseCoordinatorBeforeDecisionPersistedFailpoint.off();
+                postDecisionPersistedFn();
                 this._pauseCoordinatorBeforeCompletionFailpoint.off();
             });
         } else {
             this._callFunctionSafely(() => {
                 this._pauseCoordinatorInSteadyStateFailpoint.off();
+                postCheckConsistencyFn();
                 this._pauseCoordinatorBeforeDecisionPersistedFailpoint.off();
-                postAbortDecisionPersistedFn();
+                postDecisionPersistedFn();
                 this._pauseCoordinatorBeforeCompletionFailpoint.off();
             });
         }
@@ -434,9 +461,15 @@ var ReshardingTest = class {
             expectedErrorCode: expectedErrorCode
         });
 
-        // TODO SERVER-52838: Call _checkPostState() when donor and recipient shards clean up their
-        // local metadata on error.
+        // TODO SERVER-52838: Call _checkPostState() without calling cleanupReshardCollection once
+        // donor and recipient shards clean up their local metadata on error.
         if (expectedErrorCode === ErrorCodes.OK) {
+            this._checkPostState(expectedErrorCode);
+        } else {
+            const res = this._st.s.adminCommand({
+                cleanupReshardCollection: this._ns,
+            });
+            assert.commandWorked(res);
             this._checkPostState(expectedErrorCode);
         }
     }
@@ -627,12 +660,13 @@ var ReshardingTest = class {
     /** @private */
     _checkDonorPostState(donor, expectedErrorCode) {
         const collInfo = donor.getCollection(this._ns).exists();
-        const isAlsoRecipient = this._recipientShards().includes(donor);
+        const isAlsoRecipient =
+            this._recipientShards().includes(donor) || donor.shardName === this._primaryShardName;
         if (expectedErrorCode === ErrorCodes.OK && !isAlsoRecipient) {
-            assert.eq(
-                null,
-                collInfo,
-                `collection exists on ${donor.shardName} despite resharding having succeeded`);
+            // TODO SERVER-55781 Only allow collection to be null after fixing underlying bug.
+            assert(collInfo == null ||
+                       !bsonBinaryEqual(this._sourceCollectionUUID, collInfo.info.uuid),
+                   `collection exists on ${donor.shardName} despite resharding having succeeded`);
         } else if (expectedErrorCode !== ErrorCodes.OK) {
             assert.neq(
                 null,
@@ -661,5 +695,29 @@ var ReshardingTest = class {
         }
 
         this._st.stop();
+    }
+
+    /**
+     * @returns the timestamp chosen by the resharding operation for cloning.
+     *
+     * Should also be used in tandem with retryableWriteManager when calling this method in a
+     * jstestfuzzer code for backwards compatibility, like so:
+     *
+     * if (reshardingTest.awaitCloneTimestampChosen !== undefined) {
+     *     fetchTimestamp = reshardingTest.awaitCloneTimestampChosen();
+     * } else {
+     *     fetchTimestamp = retryableWriteManager.awaitFetchTimestampChosen();
+     * }
+     */
+    awaitCloneTimestampChosen() {
+        let cloneTimestamp;
+
+        assert.soon(() => {
+            const coordinatorDoc = this._st.config.reshardingOperations.findOne({ns: this._ns});
+            cloneTimestamp = coordinatorDoc !== null ? coordinatorDoc.cloneTimestamp : undefined;
+            return cloneTimestamp !== undefined;
+        });
+
+        return cloneTimestamp;
     }
 };

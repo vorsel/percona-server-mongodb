@@ -338,6 +338,11 @@ namespace {
 using ArityFn = bool (*)(size_t);
 
 /**
+ * The arity test function that trivially accepts any number of arguments.
+ */
+static constexpr ArityFn kAnyNumberOfArgs = [](size_t) { return true; };
+
+/**
  * The builtin function description.
  */
 struct BuiltinFn {
@@ -366,7 +371,7 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"regexMatch", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::regexMatch, false}},
     {"replaceOne", BuiltinFn{[](size_t n) { return n == 3; }, vm::Builtin::replaceOne, false}},
     {"dropFields", BuiltinFn{[](size_t n) { return n > 0; }, vm::Builtin::dropFields, false}},
-    {"newArray", BuiltinFn{[](size_t n) { return n >= 0; }, vm::Builtin::newArray, false}},
+    {"newArray", BuiltinFn{kAnyNumberOfArgs, vm::Builtin::newArray, false}},
     {"newObj", BuiltinFn{[](size_t n) { return n % 2 == 0; }, vm::Builtin::newObj, false}},
     {"ksToString", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::ksToString, false}},
     {"ks", BuiltinFn{[](size_t n) { return n > 2; }, vm::Builtin::newKs, false}},
@@ -409,6 +414,7 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"sinh", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::sinh, false}},
     {"tan", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::tan, false}},
     {"tanh", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::tanh, false}},
+    {"round", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::round, false}},
     {"concat", BuiltinFn{[](size_t n) { return n > 0; }, vm::Builtin::concat, false}},
     {"isMember", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::isMember, false}},
     {"collIsMember", BuiltinFn{[](size_t n) { return n == 3; }, vm::Builtin::collIsMember, false}},
@@ -419,9 +425,8 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"isDayOfWeek", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::isDayOfWeek, false}},
     {"isTimeUnit", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::isTimeUnit, false}},
     {"isTimezone", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::isTimezone, false}},
-    {"setUnion", BuiltinFn{[](size_t n) { return n >= 0; }, vm::Builtin::setUnion, false}},
-    {"setIntersection",
-     BuiltinFn{[](size_t n) { return n >= 0; }, vm::Builtin::setIntersection, false}},
+    {"setUnion", BuiltinFn{kAnyNumberOfArgs, vm::Builtin::setUnion, false}},
+    {"setIntersection", BuiltinFn{kAnyNumberOfArgs, vm::Builtin::setIntersection, false}},
     {"setDifference",
      BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::setDifference, false}},
     {"collSetUnion", BuiltinFn{[](size_t n) { return n >= 1; }, vm::Builtin::collSetUnion, false}},
@@ -439,6 +444,7 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"getRegexFlags",
      BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::getRegexFlags, false}},
     {"shardFilter", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::shardFilter, false}},
+    {"shardHash", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::shardHash, false}},
     {"extractSubArray",
      BuiltinFn{[](size_t n) { return n == 2 || n == 3; }, vm::Builtin::extractSubArray, false}},
     {"isArrayEmpty", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::isArrayEmpty, false}},
@@ -446,6 +452,8 @@ static stdx::unordered_map<std::string, BuiltinFn> kBuiltinFunctions = {
     {"dateAdd", BuiltinFn{[](size_t n) { return n == 5; }, vm::Builtin::dateAdd, false}},
     {"hasNullBytes", BuiltinFn{[](size_t n) { return n == 1; }, vm::Builtin::hasNullBytes, false}},
     {"ftsMatch", BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::ftsMatch, false}},
+    {"generateSortKey",
+     BuiltinFn{[](size_t n) { return n == 2; }, vm::Builtin::generateSortKey, false}},
 };
 
 /**
@@ -857,7 +865,7 @@ void RuntimeEnvironment::resetSlot(value::SlotId slot,
     uasserted(4946300, str::stream() << "undefined slot accessor:" << slot);
 }
 
-value::SlotAccessor* RuntimeEnvironment::getAccessor(value::SlotId slot) {
+RuntimeEnvironment::Accessor* RuntimeEnvironment::getAccessor(value::SlotId slot) {
     if (auto it = _accessors.find(slot); it != _accessors.end()) {
         return &it->second;
     }

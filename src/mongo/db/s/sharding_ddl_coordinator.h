@@ -54,7 +54,7 @@ public:
      *
      * This is used to decide if we can join a previously created coordinator.
      * In the case the given coordinator document has incompatible options with this,
-     * this function must throw a ConflictingOprationInProgress exception with an adequate message.
+     * this function must throw a ConflictingOperationInProgress exception with an adequate message.
      */
     virtual void checkIfOptionsConflict(const BSONObj& coorDoc) const = 0;
 
@@ -90,18 +90,28 @@ public:
     }
 
 protected:
+    virtual std::vector<DistLockManager::ScopedDistLock> _acquireAdditionalLocks(
+        OperationContext* opCtx) {
+        return {};
+    };
+
     ShardingDDLCoordinatorMetadata _coorMetadata;
+    bool _recoveredFromDisk;
 
 private:
     SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                         const CancelationToken& token) noexcept override final;
+                         const CancellationToken& token) noexcept override final;
 
     virtual ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                                          const CancelationToken& token) noexcept = 0;
+                                          const CancellationToken& token) noexcept = 0;
+
+    // TODO SERVER-56040: remove once we have critical section handling and replication on
+    // secondaries.
+    virtual void _interrupt(Status status) noexcept {}
 
     void interrupt(Status status) override final;
 
-    virtual void _interruptImpl(Status status) {}
+    void _removeDocument(OperationContext* opCtx);
 
     Mutex _mutex = MONGO_MAKE_LATCH("ShardingDDLCoordinator::_mutex");
     SharedPromise<void> _constructionCompletionPromise;

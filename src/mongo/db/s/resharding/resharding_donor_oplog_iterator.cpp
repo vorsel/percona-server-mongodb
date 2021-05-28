@@ -27,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kResharding
 
 #include "mongo/platform/basic.h"
 
@@ -50,6 +50,7 @@
 #include "mongo/logv2/log.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/future_util.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
 namespace mongo {
@@ -137,20 +138,6 @@ std::unique_ptr<Pipeline, PipelineDeleter> ReshardingDonorOplogIterator::makePip
     return Pipeline::create(std::move(stages), std::move(expCtx));
 }
 
-template <typename Callable>
-auto ReshardingDonorOplogIterator::_withTemporaryOperationContext(Callable&& callable) {
-    auto& client = cc();
-    {
-        stdx::lock_guard<Client> lk(client);
-        invariant(client.canKillSystemOperationInStepdown(lk));
-    }
-
-    auto opCtx = client.makeOperationContext();
-    opCtx->setAlwaysInterruptAtStepDownOrUp();
-
-    return callable(opCtx.get());
-}
-
 std::vector<repl::OplogEntry> ReshardingDonorOplogIterator::_fillBatch(Pipeline& pipeline) {
     std::vector<repl::OplogEntry> batch;
 
@@ -208,21 +195,29 @@ std::vector<repl::OplogEntry> ReshardingDonorOplogIterator::_fillBatch(Pipeline&
 }
 
 ExecutorFuture<std::vector<repl::OplogEntry>> ReshardingDonorOplogIterator::getNextBatch(
-    std::shared_ptr<executor::TaskExecutor> executor, CancelationToken cancelToken) {
+    std::shared_ptr<executor::TaskExecutor> executor,
+    CancellationToken cancelToken,
+    CancelableOperationContextFactory factory) {
     if (_hasSeenFinalOplogEntry) {
         invariant(!_pipeline);
         return ExecutorFuture(std::move(executor), std::vector<repl::OplogEntry>{});
     }
 
-    auto batch = _withTemporaryOperationContext([&](auto* opCtx) {
+    auto batch = [&] {
+        auto opCtx = factory.makeOperationContext(&cc());
         if (_pipeline) {
-            _pipeline->reattachToOperationContext(opCtx);
+            _pipeline->reattachToOperationContext(opCtx.get());
         } else {
-            auto pipeline = makePipeline(opCtx, MongoProcessInterface::create(opCtx));
+            auto pipeline = makePipeline(opCtx.get(), MongoProcessInterface::create(opCtx.get()));
             _pipeline = pipeline->getContext()
                             ->mongoProcessInterface->attachCursorSourceToPipelineForLocalRead(
                                 pipeline.release());
         }
+        ON_BLOCK_EXIT([this] {
+            if (_pipeline) {
+                _pipeline->detachFromOperationContext();
+            }
+        });
 
         auto batch = _fillBatch(*_pipeline);
 
@@ -237,22 +232,20 @@ ExecutorFuture<std::vector<repl::OplogEntry>> ReshardingDonorOplogIterator::getN
                 // Skip returning the final oplog entry because it is known to be a no-op.
                 batch.pop_back();
                 _pipeline.reset();
-            } else {
-                _pipeline->detachFromOperationContext();
             }
         }
 
         return batch;
-    });
+    }();
 
     if (batch.empty() && !_hasSeenFinalOplogEntry) {
         return ExecutorFuture(executor)
             .then([this, cancelToken] {
-                return future_util::withCancelation(_insertNotifier->awaitInsert(_resumeToken),
-                                                    cancelToken);
+                return future_util::withCancellation(_insertNotifier->awaitInsert(_resumeToken),
+                                                     cancelToken);
             })
-            .then([this, cancelToken, executor] {
-                return getNextBatch(std::move(executor), cancelToken);
+            .then([this, cancelToken, executor, factory] {
+                return getNextBatch(std::move(executor), cancelToken, factory);
             });
     }
 

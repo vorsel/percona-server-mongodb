@@ -3,7 +3,10 @@
  * a failpoint that causes initial sync to fail partway through its first attempt and makes sure it
  * does not hit a WiredTiger assertion on the second attempt.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
 (function() {
@@ -34,6 +37,11 @@ assert.commandWorked(testColl.insert({_id: 1}));
 const session = primary.startSession();
 const sessionDB = session.getDatabase(dbName);
 const sessionColl = sessionDB.getCollection(collName);
+
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 session.startTransaction();
 assert.commandWorked(sessionColl.insert({_id: 2}));
 

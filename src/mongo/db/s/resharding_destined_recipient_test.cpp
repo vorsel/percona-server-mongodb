@@ -50,6 +50,7 @@
 #include "mongo/s/catalog/type_shard.h"
 #include "mongo/s/catalog_cache_loader_mock.h"
 #include "mongo/s/database_version.h"
+#include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
 #include "mongo/s/shard_id.h"
 #include "mongo/unittest/unittest.h"
 
@@ -287,7 +288,11 @@ TEST_F(DestinedRecipientTest, TestGetDestinedRecipient) {
     AutoGetCollection coll(opCtx, kNss, MODE_IX);
     OperationShardingState::get(opCtx).initializeClientRoutingVersions(
         kNss, env.version, env.dbVersion);
-    auto destShardId = getDestinedRecipient(opCtx, kNss, BSON("x" << 2 << "y" << 10));
+    auto* const css = CollectionShardingState::get(opCtx, kNss);
+    auto collDesc = css->getCollectionDescription(opCtx);
+
+    auto destShardId =
+        getDestinedRecipient(opCtx, kNss, BSON("x" << 2 << "y" << 10), css, collDesc);
     ASSERT(destShardId);
     ASSERT_EQ(*destShardId, env.destShard);
 }
@@ -300,10 +305,18 @@ TEST_F(DestinedRecipientTest, TestGetDestinedRecipientThrowsOnBlockedRefresh) {
         AutoGetCollection coll(opCtx, kNss, MODE_IX);
         OperationShardingState::get(opCtx).initializeClientRoutingVersions(
             kNss, env.version, env.dbVersion);
+        auto* const css = CollectionShardingState::get(opCtx, kNss);
+        auto collDesc = css->getCollectionDescription(opCtx);
 
         FailPointEnableBlock failPoint("blockCollectionCacheLookup");
-        ASSERT_THROWS(getDestinedRecipient(opCtx, kNss, BSON("x" << 2 << "y" << 10)),
-                      ExceptionFor<ErrorCodes::ShardInvalidatedForTargeting>);
+        ASSERT_THROWS_WITH_CHECK(
+            getDestinedRecipient(opCtx, kNss, BSON("x" << 2 << "y" << 10), css, collDesc),
+            ShardCannotRefreshDueToLocksHeldException,
+            [&](const ShardCannotRefreshDueToLocksHeldException& ex) {
+                const auto refreshInfo = ex.extraInfo<ShardCannotRefreshDueToLocksHeldInfo>();
+                ASSERT(refreshInfo);
+                ASSERT_EQ(refreshInfo->getNss(), env.tempNss);
+            });
     }
 
     auto sw = catalogCache()->getCollectionRoutingInfoWithRefresh(opCtx, env.tempNss);

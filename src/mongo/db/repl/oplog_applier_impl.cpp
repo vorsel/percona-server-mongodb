@@ -410,7 +410,7 @@ void scheduleWritesToOplog(OperationContext* opCtx,
     // setup/teardown overhead across many writes.
     const size_t kMinOplogEntriesPerThread = 16;
     const bool enoughToMultiThread =
-        ops.size() >= kMinOplogEntriesPerThread * writerPool->getStats().numThreads;
+        ops.size() >= kMinOplogEntriesPerThread * writerPool->getStats().options.maxThreads;
 
     // Storage engines support parallel writes to the oplog because they are required to ensure that
     // oplog entries are ordered correctly, even if inserted out-of-order.
@@ -420,7 +420,7 @@ void scheduleWritesToOplog(OperationContext* opCtx,
     }
 
 
-    const size_t numOplogThreads = writerPool->getStats().numThreads;
+    const size_t numOplogThreads = writerPool->getStats().options.maxThreads;
     const size_t numOpsPerThread = ops.size() / numOplogThreads;
     for (size_t thread = 0; thread < numOplogThreads; thread++) {
         size_t begin = thread * numOpsPerThread;
@@ -453,7 +453,7 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
     // Increment the batch size stat.
     oplogApplicationBatchSize.increment(ops.size());
 
-    std::vector<WorkerMultikeyPathInfo> multikeyVector(_writerPool->getStats().numThreads);
+    std::vector<WorkerMultikeyPathInfo> multikeyVector(_writerPool->getStats().options.maxThreads);
     {
         // Each node records cumulative batch application stats for itself using this timer.
         TimerHolder timer(&applyBatchStats);
@@ -479,7 +479,7 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
         std::vector<std::vector<OplogEntry>> derivedOps;
 
         std::vector<std::vector<const OplogEntry*>> writerVectors(
-            _writerPool->getStats().numThreads);
+            _writerPool->getStats().options.maxThreads);
         fillWriterVectors(opCtx, &ops, &writerVectors, &derivedOps);
 
         // Wait for writes to finish before applying ops.
@@ -501,7 +501,8 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
         }
 
         {
-            std::vector<Status> statusVector(_writerPool->getStats().numThreads, Status::OK());
+            std::vector<Status> statusVector(_writerPool->getStats().options.maxThreads,
+                                             Status::OK());
 
             // Doles out all the work to the writer pool threads. writerVectors is not modified,
             // but  applyOplogBatchPerWorker will modify the vectors that it contains.
@@ -522,6 +523,7 @@ StatusWith<OpTime> OplogApplierImpl::_applyOplogBatch(OperationContext* opCtx,
                         // This code path is only executed on secondaries and initial syncing nodes,
                         // so it is safe to exclude any writes from Flow Control.
                         opCtx->setShouldParticipateInFlowControl(false);
+                        opCtx->setEnforceConstraints(false);
 
                         status = opCtx->runWithoutInterruptionExceptAtGlobalShutdown([&] {
                             return applyOplogBatchPerWorker(opCtx.get(), &writer, &multikeyVector);
@@ -615,6 +617,9 @@ void OplogApplierImpl::_deriveOpsAndFillWriterVectors(
 
     LogicalSessionIdMap<std::vector<OplogEntry*>> partialTxnOps;
     CachedCollectionProperties collPropertiesCache;
+
+    // Used to serialize writes to the tenant migrations donor and recipient namespaces.
+    boost::optional<uint32_t> tenantMigrationsWriterId;
     for (auto&& op : *ops) {
         // If the operation's optime is before or the same as the beginApplyingOpTime we don't want
         // to apply it, so don't include it in writerVectors.
@@ -696,6 +701,19 @@ void OplogApplierImpl::_deriveOpsAndFillWriterVectors(
             continue;
         }
 
+        // Writes to the tenant migration namespaces must be serialized to preserve the order of
+        // migration and access blocker states.
+        if (op.getNss() == NamespaceString::kTenantMigrationDonorsNamespace ||
+            op.getNss() == NamespaceString::kTenantMigrationRecipientsNamespace) {
+            auto writerId = OplogApplierUtils::addToWriterVector(
+                opCtx, &op, writerVectors, &collPropertiesCache, tenantMigrationsWriterId);
+            if (!tenantMigrationsWriterId) {
+                tenantMigrationsWriterId.emplace(writerId);
+            } else {
+                invariant(writerId == *tenantMigrationsWriterId);
+            }
+            continue;
+        }
         OplogApplierUtils::addToWriterVector(opCtx, &op, writerVectors, &collPropertiesCache);
     }
 }
@@ -715,6 +733,14 @@ void OplogApplierImpl::fillWriterVectors(
         _deriveOpsAndFillWriterVectors(
             opCtx, &derivedOps->back(), writerVectors, derivedOps, nullptr);
     }
+}
+
+void OplogApplierImpl::fillWriterVectors_forTest(
+    OperationContext* opCtx,
+    std::vector<OplogEntry>* ops,
+    std::vector<std::vector<const OplogEntry*>>* writerVectors,
+    std::vector<std::vector<OplogEntry>>* derivedOps) noexcept {
+    fillWriterVectors(opCtx, ops, writerVectors, derivedOps);
 }
 
 Status applyOplogEntryOrGroupedInserts(OperationContext* opCtx,

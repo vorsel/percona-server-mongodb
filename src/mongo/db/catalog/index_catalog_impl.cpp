@@ -135,7 +135,10 @@ Status IndexCatalogImpl::init(OperationContext* opCtx) {
                           "https://dochub.mongodb.org/core/4.4-deprecate-geoHaystack");
         }
         auto descriptor = std::make_unique<IndexDescriptor>(_getAccessMethodName(keyPattern), spec);
-        if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName)) {
+
+        // TTL indexes are not compatible with capped collections.
+        if (spec.hasField(IndexDescriptor::kExpireAfterSecondsFieldName) &&
+            !_collection->isCapped()) {
             TTLCollectionCache::get(opCtx->getServiceContext())
                 .registerTTLInfo(_collection->uuid(), indexName);
         }
@@ -754,6 +757,10 @@ Status IndexCatalogImpl::_isSpecOk(OperationContext* opCtx, const BSONObj& spec)
             "TTL indexes are not supported on collections clustered by _id",
             !_collection->isClustered() || !spec[IndexDescriptor::kExpireAfterSecondsFieldName]);
 
+    uassert(ErrorCodes::InvalidOptions,
+            "Text indexes are not supported on collections clustered by _id",
+            !_collection->isClustered() || pluginName != IndexNames::TEXT);
+
     if (IndexDescriptor::isIdIndexPattern(key)) {
         if (_collection->isClustered()) {
             return Status(ErrorCodes::CannotCreateIndex,
@@ -830,9 +837,12 @@ Status IndexCatalogImpl::_doesSpecConflictWithExisting(OperationContext* opCtx,
             // but not with the specified (duplicate) name. User must specify another index name.
             if (indexComparison == IndexDescriptor::Comparison::kDifferent) {
                 return Status(ErrorCodes::IndexKeySpecsConflict,
-                              str::stream() << "An existing index has the same name as the "
-                                               "requested index. Requested index: "
-                                            << spec << ", existing index: " << desc->infoObj());
+                              str::stream()
+                                  << "An existing index has the same name as the "
+                                     "requested index. When index names are not specified, they "
+                                     "are auto generated and can cause conflicts. Please refer to "
+                                     "our documentation. Requested index: "
+                                  << spec << ", existing index: " << desc->infoObj());
             }
 
             // The candidate's key and uniquely-identifying options are equivalent to an existing
@@ -1080,7 +1090,7 @@ Status IndexCatalogImpl::dropIndexEntry(OperationContext* opCtx, IndexCatalogEnt
     // Pulling indexName out as it is needed post descriptor release.
     string indexName = entry->descriptor()->indexName();
 
-    audit::logDropIndex(&cc(), indexName, _collection->ns());
+    audit::logDropIndex(opCtx->getClient(), indexName, _collection->ns());
 
     auto released = _readyIndexes.release(entry->descriptor());
     if (released) {

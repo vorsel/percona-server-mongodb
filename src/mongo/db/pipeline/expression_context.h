@@ -56,7 +56,7 @@
 
 namespace mongo {
 
-class AggregateCommand;
+class AggregateCommandRequest;
 
 class ExpressionContext : public RefCountable {
 public:
@@ -104,7 +104,7 @@ public:
      * 'resolvedNamespaces' maps collection names (not full namespaces) to ResolvedNamespaces.
      */
     ExpressionContext(OperationContext* opCtx,
-                      const AggregateCommand& request,
+                      const AggregateCommandRequest& request,
                       std::unique_ptr<CollatorInterface> collator,
                       std::shared_ptr<MongoProcessInterface> mongoProcessInterface,
                       StringMap<ExpressionContext::ResolvedNamespace> resolvedNamespaces,
@@ -113,7 +113,7 @@ public:
 
     /**
      * Constructs an ExpressionContext to be used for Pipeline parsing and evaluation. This version
-     * requires finer-grained parameters but does not require an AggregateCommand.
+     * requires finer-grained parameters but does not require an AggregateCommandRequest.
      * 'resolvedNamespaces' maps collection names (not full namespaces) to ResolvedNamespaces.
      */
     ExpressionContext(OperationContext* opCtx,
@@ -150,7 +150,11 @@ public:
      * Used by a pipeline to check for interrupts so that killOp() works. Throws a UserAssertion if
      * this aggregation pipeline has been interrupted.
      */
-    void checkForInterrupt();
+    void checkForInterrupt() {
+        if (--_interruptCounter == 0) {
+            checkForInterruptSlow();
+        }
+    }
 
     /**
      * Returns true if this is a collectionless aggregation on the specified database.
@@ -374,10 +378,19 @@ public:
     bool exprUnstableForApiV1 = false;
     bool exprDeprectedForApiV1 = false;
 
+    // Tracks whether the collator to use for the aggregation matches the default collation of the
+    // collection or view. For collectionless aggregates this is set to 'kNoDefaultCollation'.
+    enum class CollationMatchesDefault { kNoDefault, kYes, kNo };
+    CollationMatchesDefault collationMatchesDefault = CollationMatchesDefault::kNoDefault;
+
 protected:
     static const int kInterruptCheckPeriod = 128;
 
     friend class CollatorStash;
+
+    // Performs the heavy work of checking whether an interrupt has occurred. Should only be called
+    // when _interruptCounter has been decremented to zero.
+    void checkForInterruptSlow();
 
     // Collator used for comparisons.
     std::unique_ptr<CollatorInterface> _collator;

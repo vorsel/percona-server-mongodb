@@ -202,14 +202,20 @@ inline auto makeConstant(StringData str) {
     return sbe::makeE<sbe::EConstant>(tag, value);
 }
 
-std::unique_ptr<sbe::EExpression> makeVariable(sbe::value::SlotId slotId,
-                                               boost::optional<sbe::FrameId> frameId = {});
+std::unique_ptr<sbe::EExpression> makeVariable(sbe::value::SlotId slotId);
+
+std::unique_ptr<sbe::EExpression> makeVariable(sbe::FrameId frameId, sbe::value::SlotId slotId);
 
 /**
- * Check if expression returns Nothing and return null if so. Otherwise, return the
- * expression.
+ * Check if expression returns Nothing and return null if so. Otherwise, return the expression.
  */
 std::unique_ptr<sbe::EExpression> makeFillEmptyNull(std::unique_ptr<sbe::EExpression> e);
+
+/**
+ * Check if expression returns Nothing and return bsonUndefined if so. Otherwise, return the
+ * expression.
+ */
+std::unique_ptr<sbe::EExpression> makeFillEmptyUndefined(std::unique_ptr<sbe::EExpression> e);
 
 /**
  * Check if expression returns an array and return Nothing if so. Otherwise, return the expression.
@@ -320,6 +326,16 @@ EvalStage makeTraverse(EvalStage outer,
                        boost::optional<size_t> nestedArraysDepth,
                        const sbe::value::SlotVector& lexicalEnvironment = {});
 
+EvalStage makeLimitSkip(EvalStage input,
+                        PlanNodeId planNodeId,
+                        boost::optional<long long> limit,
+                        boost::optional<long long> skip = boost::none);
+
+EvalStage makeUnion(std::vector<EvalStage> inputStages,
+                    std::vector<sbe::value::SlotVector> inputVals,
+                    sbe::value::SlotVector outputVals,
+                    PlanNodeId planNodeId);
+
 using BranchFn = std::function<std::pair<sbe::value::SlotId, EvalStage>(
     EvalExpr expr,
     EvalStage stage,
@@ -364,10 +380,17 @@ std::pair<sbe::value::SlotVector, std::unique_ptr<sbe::PlanStage>> generateVirtu
     sbe::value::Value arrVal);
 
 /**
- * Converts a BSONArray to an SBE Array. Caller owns the SBE Array returned. This method does not
- * assume ownership of the BSONArray.
+ * Helper functions for converting from BSONObj/BSONArray to SBE Object/Array. Caller owns the SBE
+ * Object/Array returned. These helper functions do not assume ownership of the BSONObj/BSONArray.
  */
+std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONObj& bo);
 std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const BSONArray& ba);
+
+/**
+ * Helper function for converting mongo::Value to SBE Value. Caller owns the SBE Value returned.
+ * This helper function does not assume ownership of the mongo::Value.
+ */
+std::pair<sbe::value::TypeTags, sbe::value::Value> makeValue(const Value& val);
 
 /**
  * Returns a BSON type mask of all data types coercible to date.

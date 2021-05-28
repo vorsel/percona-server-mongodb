@@ -34,13 +34,18 @@
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
 
 #include "mongo/base/checked_cast.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/pipeline/document_source_count.h"
+#include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/s/sharding_ddl_coordinator.h"
 #include "mongo/logv2/log.h"
 
+#include "mongo/db/s/create_collection_coordinator.h"
 #include "mongo/db/s/drop_collection_coordinator.h"
 #include "mongo/db/s/drop_database_coordinator.h"
+#include "mongo/db/s/rename_collection_coordinator.h"
 
 namespace mongo {
 
@@ -50,19 +55,22 @@ ShardingDDLCoordinatorService* ShardingDDLCoordinatorService::getService(Operati
     return checked_cast<ShardingDDLCoordinatorService*>(std::move(service));
 }
 
-std::shared_ptr<ShardingDDLCoordinatorService::Instance>
-ShardingDDLCoordinatorService::constructInstance(BSONObj initialState) const {
+std::shared_ptr<ShardingDDLCoordinator> ShardingDDLCoordinatorService::_constructCoordinator(
+    BSONObj initialState) const {
     const auto op = extractShardingDDLCoordinatorMetadata(initialState);
-    LOGV2_DEBUG(5390510,
-                2,
-                "Constructing new sharding DDL coordinator",
-                "coordinatorDoc"_attr = op.toBSON());
+    LOGV2(
+        5390510, "Constructing new sharding DDL coordinator", "coordinatorDoc"_attr = op.toBSON());
     switch (op.getId().getOperationType()) {
         case DDLCoordinatorTypeEnum::kDropDatabase:
             return std::make_shared<DropDatabaseCoordinator>(std::move(initialState));
             break;
         case DDLCoordinatorTypeEnum::kDropCollection:
             return std::make_shared<DropCollectionCoordinator>(std::move(initialState));
+            break;
+        case DDLCoordinatorTypeEnum::kRenameCollection:
+            return std::make_shared<RenameCollectionCoordinator>(std::move(initialState));
+        case DDLCoordinatorTypeEnum::kCreateCollection:
+            return std::make_shared<CreateCollectionCoordinator>(std::move(initialState));
             break;
         default:
             uasserted(ErrorCodes::BadValue,
@@ -73,7 +81,123 @@ ShardingDDLCoordinatorService::constructInstance(BSONObj initialState) const {
 }
 
 std::shared_ptr<ShardingDDLCoordinatorService::Instance>
+ShardingDDLCoordinatorService::constructInstance(BSONObj initialState) {
+    auto coord = _constructCoordinator(std::move(initialState));
+
+    {
+        stdx::lock_guard lg(_completionMutex);
+        ++_numActiveCoordinators;
+    }
+
+    coord->getConstructionCompletionFuture()
+        .thenRunOn(getInstanceCleanupExecutor())
+        .getAsync([this](auto status) {
+            stdx::lock_guard lg(_mutex);
+            if (_state != State::kRecovering) {
+                return;
+            }
+            invariant(_numCoordinatorsToWait > 0);
+            if (--_numCoordinatorsToWait == 0) {
+                _state = State::kRecovered;
+                _recoveredCV.notify_all();
+            }
+        });
+
+    coord->getCompletionFuture()
+        .thenRunOn(getInstanceCleanupExecutor())
+        .getAsync([this](auto status) {
+            stdx::lock_guard lg(_completionMutex);
+            if (--_numActiveCoordinators == 0) {
+                _completedCV.notify_all();
+            }
+        });
+
+    return coord;
+}
+
+void ShardingDDLCoordinatorService::waitForAllCoordinatorsToComplete(
+    OperationContext* opCtx) const {
+    _waitForRecoveryCompletion(opCtx);
+    stdx::unique_lock lk(_completionMutex);
+    opCtx->waitForConditionOrInterrupt(
+        _completedCV, lk, [this]() { return _numActiveCoordinators == 0; });
+}
+
+
+void ShardingDDLCoordinatorService::_afterStepDown() {
+    stdx::lock_guard lg(_mutex);
+    _state = State::kPaused;
+    _numCoordinatorsToWait = 0;
+}
+
+size_t ShardingDDLCoordinatorService::_countCoordinatorDocs(OperationContext* opCtx) {
+    constexpr auto kNumCoordLabel = "numCoordinators"_sd;
+
+    auto aggRequest = [&]() -> AggregateCommandRequest {
+        auto expCtx = make_intrusive<ExpressionContext>(opCtx, nullptr, getStateDocumentsNS());
+        const auto countSpec = BSON("$count" << kNumCoordLabel);
+        auto stages = DocumentSourceCount::createFromBson(countSpec.firstElement(), expCtx);
+        auto pipeline = Pipeline::create(std::move(stages), expCtx);
+        return {getStateDocumentsNS(), pipeline->serializeToBson()};
+    }();
+
+    DBDirectClient client(opCtx);
+    auto cursor = uassertStatusOKWithContext(
+        DBClientCursor::fromAggregationRequest(
+            &client, std::move(aggRequest), false /* secondaryOk */, true /* useExhaust */),
+        "Failed to establish a cursor for aggregation");
+
+    if (!cursor->more()) {
+        return 0;
+    }
+
+    auto res = cursor->nextSafe();
+    auto numCoordField = res.getField(kNumCoordLabel);
+    invariant(numCoordField);
+    return numCoordField.numberLong();
+}
+
+void ShardingDDLCoordinatorService::_waitForRecoveryCompletion(OperationContext* opCtx) const {
+    stdx::unique_lock lk(_mutex);
+    opCtx->waitForConditionOrInterrupt(
+        _recoveredCV, lk, [this]() { return _state == State::kRecovered; });
+}
+
+ExecutorFuture<void> ShardingDDLCoordinatorService::_rebuildService(
+    std::shared_ptr<executor::ScopedTaskExecutor> executor, const CancellationToken& token) {
+    return ExecutorFuture<void>(**executor)
+        .then([this] {
+            AllowOpCtxWhenServiceRebuildingBlock allowOpCtxBlock(Client::getCurrent());
+            auto opCtx = cc().makeOperationContext();
+            const auto numCoordinators = _countCoordinatorDocs(opCtx.get());
+            if (numCoordinators > 0) {
+                LOGV2(5622500,
+                      "Found Sharding DDL Coordinators to rebuild",
+                      "numCoordinators"_attr = numCoordinators);
+            }
+            stdx::lock_guard lg(_mutex);
+            if (numCoordinators > 0) {
+                _state = State::kRecovering;
+                _numCoordinatorsToWait = numCoordinators;
+            } else {
+                _state = State::kRecovered;
+                _recoveredCV.notify_all();
+            }
+        })
+        .onError([this](const Status& status) {
+            LOGV2_ERROR(5469630,
+                        "Failed to rebuild Sharding DDL coordinator service",
+                        "error"_attr = status);
+            return status;
+        });
+}
+
+std::shared_ptr<ShardingDDLCoordinatorService::Instance>
 ShardingDDLCoordinatorService::getOrCreateInstance(OperationContext* opCtx, BSONObj coorDoc) {
+
+    // Wait for all coordinators to be recovered before to allow the creation of new ones.
+    _waitForRecoveryCompletion(opCtx);
+
     auto coorMetadata = extractShardingDDLCoordinatorMetadata(coorDoc);
     const auto& nss = coorMetadata.getId().getNss();
 

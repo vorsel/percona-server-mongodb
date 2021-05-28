@@ -99,6 +99,7 @@
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
 #include "mongo/transport/hello_metrics.h"
 #include "mongo/transport/service_executor.h"
 #include "mongo/transport/session.h"
@@ -217,8 +218,8 @@ struct HandleRequest {
 
     std::unique_ptr<OpRunner> makeOpRunner();
 
-    Future<void> startOperation();
-    Future<void> completeOperation();
+    void startOperation();
+    void completeOperation(DbResponse&);
 
     std::shared_ptr<ExecutionContext> executionContext;
 };
@@ -600,9 +601,11 @@ public:
                 // Ensure the lifetime of `_scopedMetrics` ends here.
                 _scopedMetrics = boost::none;
 
-                auto authzSession = AuthorizationSession::get(_execContext->client());
-                authzSession->verifyContract(
-                    _execContext->getCommand()->getAuthorizationContract());
+                if (!_execContext->client().isInDirectClient()) {
+                    auto authzSession = AuthorizationSession::get(_execContext->client());
+                    authzSession->verifyContract(
+                        _execContext->getCommand()->getAuthorizationContract());
+                }
 
                 if (status.isOK())
                     return;
@@ -686,6 +689,7 @@ private:
     std::unique_ptr<PolymorphicScoped> _scoped;
     bool _refreshedDatabase = false;
     bool _refreshedCollection = false;
+    bool _refreshedCatalogCache = false;
 };
 
 class RunCommandImpl {
@@ -812,9 +816,9 @@ Future<void> InvokeCommand::run() {
                auto execContext = _ecd->getExecutionContext();
                // TODO SERVER-53761: find out if we can do this more asynchronously. The client
                // Strand is locked to current thread in ServiceStateMachine::Impl::startNewLoop().
-               tenant_migration_access_blocker::checkIfCanReadOrBlock(
-                   execContext->getOpCtx(), execContext->getRequest().getDatabase())
-                   .get();
+               tenant_migration_access_blocker::checkIfCanReadOrBlock(execContext->getOpCtx(),
+                                                                      execContext->getRequest())
+                   .get(execContext->getOpCtx());
                return runCommandInvocation(_ecd->getExecutionContext(), _ecd->getInvocation());
            })
         .onError<ErrorCodes::TenantMigrationConflict>([this](Status status) {
@@ -830,9 +834,9 @@ Future<void> CheckoutSessionAndInvokeCommand::run() {
 
                auto execContext = _ecd->getExecutionContext();
                // TODO SERVER-53761: find out if we can do this more asynchronously.
-               tenant_migration_access_blocker::checkIfCanReadOrBlock(
-                   execContext->getOpCtx(), execContext->getRequest().getDatabase())
-                   .get();
+               tenant_migration_access_blocker::checkIfCanReadOrBlock(execContext->getOpCtx(),
+                                                                      execContext->getRequest())
+                   .get(execContext->getOpCtx());
                return runCommandInvocation(_ecd->getExecutionContext(), _ecd->getInvocation());
            })
         .onError<ErrorCodes::TenantMigrationConflict>([this](Status status) {
@@ -1661,6 +1665,31 @@ Future<void> ExecCommandDatabase::_commandExec() {
             }
 
             return s;
+        })
+        .onError<ErrorCodes::ShardCannotRefreshDueToLocksHeld>([this](Status s) -> Future<void> {
+            // This exception can never happen on the config server. Config servers can't receive
+            // SSV either, because they never have commands with shardVersion sent.
+            invariant(serverGlobalParams.clusterRole != ClusterRole::ConfigServer);
+
+            auto opCtx = _execContext->getOpCtx();
+            if (!opCtx->getClient()->isInDirectClient() && !_refreshedCatalogCache) {
+                invariant(!opCtx->lockState()->isLocked());
+
+                auto refreshInfo = s.extraInfo<ShardCannotRefreshDueToLocksHeldInfo>();
+                invariant(refreshInfo);
+
+                const auto refreshed =
+                    _execContext->behaviors->refreshCatalogCache(opCtx, *refreshInfo);
+
+                if (refreshed) {
+                    _refreshedCatalogCache = true;
+                    if (!opCtx->inMultiDocumentTransaction()) {
+                        return _commandExec();
+                    }
+                }
+            }
+
+            return s;
         });
 }
 
@@ -2271,7 +2300,7 @@ DbResponse FireAndForgetOpRunner::runSync() {
     return {};
 }
 
-Future<void> HandleRequest::startOperation() try {
+void HandleRequest::startOperation() {
     auto opCtx = executionContext->getOpCtx();
     auto& client = executionContext->client();
     auto& currentOp = executionContext->currentOp();
@@ -2295,23 +2324,19 @@ Future<void> HandleRequest::startOperation() try {
         currentOp.setNetworkOp_inlock(executionContext->op());
         currentOp.setLogicalOp_inlock(networkOpToLogicalOp(executionContext->op()));
     }
-    return {};
-} catch (const DBException& ex) {
-    return ex.toStatus();
 }
 
-Future<void> HandleRequest::completeOperation() try {
+void HandleRequest::completeOperation(DbResponse& response) {
     auto opCtx = executionContext->getOpCtx();
     auto& currentOp = executionContext->currentOp();
 
     // Mark the op as complete, and log it if appropriate. Returns a boolean indicating whether
     // this op should be written to the profiler.
-    const bool shouldProfile =
-        currentOp.completeAndLogOperation(opCtx,
-                                          MONGO_LOGV2_DEFAULT_COMPONENT,
-                                          executionContext->getResponse().response.size(),
-                                          executionContext->slowMsOverride,
-                                          executionContext->forceLog);
+    const bool shouldProfile = currentOp.completeAndLogOperation(opCtx,
+                                                                 MONGO_LOGV2_DEFAULT_COMPONENT,
+                                                                 response.response.size(),
+                                                                 executionContext->slowMsOverride,
+                                                                 executionContext->forceLog);
 
     Top::get(opCtx->getServiceContext())
         .incrementGlobalLatencyStats(
@@ -2338,9 +2363,6 @@ Future<void> HandleRequest::completeOperation() try {
     }
 
     recordCurOpMetrics(opCtx);
-    return {};
-} catch (const DBException& ex) {
-    return ex.toStatus();
 }
 
 }  // namespace
@@ -2354,48 +2376,42 @@ BSONObj ServiceEntryPointCommon::getRedactedCopyForLogging(const Command* comman
     return bob.obj();
 }
 
+void onHandleRequestException(const Status& status) {
+    LOGV2_ERROR(4879802, "Failed to handle request", "error"_attr = redact(status));
+}
+
 Future<DbResponse> ServiceEntryPointCommon::handleRequest(
     OperationContext* opCtx,
     const Message& m,
     std::unique_ptr<const Hooks> behaviors) noexcept try {
-    auto hr = std::make_shared<HandleRequest>(opCtx, m, std::move(behaviors));
+    HandleRequest hr(opCtx, m, std::move(behaviors));
+    hr.startOperation();
 
-    return hr->startOperation()
-        .then([hr]() -> Future<void> {
-            auto opRunner = hr->makeOpRunner();
-            invariant(opRunner);
-            return opRunner->run().then(
-                [execContext = hr->executionContext](DbResponse response) -> void {
-                    // Set the response upon successful execution
-                    execContext->setResponse(std::move(response));
+    auto opRunner = hr.makeOpRunner();
+    invariant(opRunner);
 
-                    auto opCtx = execContext->getOpCtx();
+    return opRunner->run()
+        .then([hr = std::move(hr)](DbResponse response) mutable {
+            hr.completeOperation(response);
 
-                    auto seCtx = transport::ServiceExecutorContext::get(opCtx->getClient());
-                    if (!seCtx) {
-                        // We were run by a background worker.
-                        return;
-                    }
-
-                    if (auto invocation = CommandInvocation::get(opCtx);
-                        invocation && !invocation->isSafeForBorrowedThreads()) {
-                        // If the last command wasn't safe for a borrowed thread, then let's move
-                        // off of it.
-                        seCtx->setThreadingModel(
-                            transport::ServiceExecutor::ThreadingModel::kDedicated);
-                    }
-                });
-        })
-        .then([hr] { return hr->completeOperation(); })
-        .onCompletion([hr](Status status) -> Future<DbResponse> {
-            if (!status.isOK()) {
-                LOGV2_ERROR(4879802, "Failed to handle request", "error"_attr = redact(status));
-                return status;
+            auto opCtx = hr.executionContext->getOpCtx();
+            if (auto seCtx = transport::ServiceExecutorContext::get(opCtx->getClient())) {
+                if (auto invocation = CommandInvocation::get(opCtx);
+                    invocation && !invocation->isSafeForBorrowedThreads()) {
+                    // If the last command wasn't safe for a borrowed thread, then let's move
+                    // off of it.
+                    seCtx->setThreadingModel(
+                        transport::ServiceExecutor::ThreadingModel::kDedicated);
+                }
             }
-            return hr->executionContext->getResponse();
-        });
+
+            return response;
+        })
+        .tapError([](Status status) { onHandleRequestException(status); });
 } catch (const DBException& ex) {
-    return ex.toStatus();
+    auto status = ex.toStatus();
+    onHandleRequestException(status);
+    return status;
 }
 
 ServiceEntryPointCommon::Hooks::~Hooks() = default;

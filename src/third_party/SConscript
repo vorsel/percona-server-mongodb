@@ -16,7 +16,7 @@ pcreSuffix = "-8.42"
 mozjsSuffix = '-60'
 yamlSuffix = '-0.6.2'
 icuSuffix = '-57.1'
-timelibSuffix = '-2018.01'
+timelibSuffix = '-2021.06'
 tomcryptSuffix = '-1.18.2'
 libarchiveSuffix = '-3.4.0'
 variantSuffix = '-1.4.0'
@@ -115,7 +115,7 @@ if not use_system_version_of_library('snappy'):
 # Valgrind is a header only include as valgrind.h includes everything we need
 if not use_system_version_of_library('valgrind'):
     thirdPartyEnvironmentModifications['valgrind'] = {
-        'CPPPATH' : ['#/src/third_party/valgrind-3.14.0/include'],
+        'CPPPATH' : ['#/src/third_party/valgrind/include'],
     }
 
 if not use_system_version_of_library('zlib'):

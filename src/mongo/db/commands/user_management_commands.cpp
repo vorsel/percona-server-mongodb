@@ -58,6 +58,7 @@
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/run_aggregate.h"
+#include "mongo/db/commands/test_commands.h"
 #include "mongo/db/commands/user_management_commands_common.h"
 #include "mongo/db/commands/user_management_commands_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -242,7 +243,7 @@ Status insertAuthzDocument(OperationContext* opCtx,
         BSONObj res;
         client.runCommand(collectionName.db().toString(),
                           [&] {
-                              write_ops::Insert insertOp(collectionName);
+                              write_ops::InsertCommandRequest insertOp(collectionName);
                               insertOp.setDocuments({document});
                               return insertOp.toBSON({});
                           }(),
@@ -278,7 +279,7 @@ Status updateAuthzDocuments(OperationContext* opCtx,
         BSONObj res;
         client.runCommand(collectionName.db().toString(),
                           [&] {
-                              write_ops::Update updateOp(collectionName);
+                              write_ops::UpdateCommandRequest updateOp(collectionName);
                               updateOp.setUpdates({[&] {
                                   write_ops::UpdateOpEntry entry;
                                   entry.setQ(query);
@@ -352,7 +353,7 @@ Status removeAuthzDocuments(OperationContext* opCtx,
         BSONObj res;
         client.runCommand(collectionName.db().toString(),
                           [&] {
-                              write_ops::Delete deleteOp(collectionName);
+                              write_ops::DeleteCommandRequest deleteOp(collectionName);
                               deleteOp.setDeletes({[&] {
                                   write_ops::DeleteOpEntry entry;
                                   entry.setQ(query);
@@ -789,7 +790,7 @@ public:
 
     StatusWith<std::uint32_t> insert(const NamespaceString& nss, const std::vector<BSONObj>& docs) {
         dassert(nss.db() == kAdminDB);
-        write_ops::Insert op(nss);
+        write_ops::InsertCommandRequest op(nss);
         op.setDocuments(docs);
         return doCrudOp(op.toBSON({}));
     }
@@ -800,7 +801,7 @@ public:
         entry.setQ(query);
         entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
         entry.setMulti(true);
-        write_ops::Update op(nss);
+        write_ops::UpdateCommandRequest op(nss);
         op.setUpdates({entry});
         return doCrudOp(op.toBSON({}));
     }
@@ -810,7 +811,7 @@ public:
         write_ops::DeleteOpEntry entry;
         entry.setQ(query);
         entry.setMulti(true);
-        write_ops::Delete op(nss);
+        write_ops::DeleteCommandRequest op(nss);
         op.setDeletes({entry});
         return doCrudOp(op.toBSON({}));
     }
@@ -936,12 +937,12 @@ struct UMCCacheParams {
     static constexpr auto allowedOnSecondary = BasicCommand::AllowedOnSecondary::kAlways;
 };
 
-template <typename RequestT, typename ReplyT, typename Params = UMCStdParams>
-class CmdUMCTyped : public TypedCommand<CmdUMCTyped<RequestT, ReplyT, Params>> {
+template <typename RequestT, typename Params = UMCStdParams>
+class CmdUMCTyped : public TypedCommand<CmdUMCTyped<RequestT, Params>> {
 public:
     using Request = RequestT;
-    using Reply = ReplyT;
-    using TC = TypedCommand<CmdUMCTyped<RequestT, ReplyT, Params>>;
+    using Reply = typename RequestT::Reply;
+    using TC = TypedCommand<CmdUMCTyped<RequestT, Params>>;
 
     class Invocation final : public TC::InvocationBase {
     public:
@@ -973,7 +974,7 @@ public:
     }
 };
 
-class CmdCreateUser : public CmdUMCTyped<CreateUserCommand, void> {
+class CmdCreateUser : public CmdUMCTyped<CreateUserCommand> {
 public:
     static constexpr StringData kPwdField = "pwd"_sd;
 
@@ -983,7 +984,7 @@ public:
 } cmdCreateUser;
 
 template <>
-void CmdUMCTyped<CreateUserCommand, void>::Invocation::typedRun(OperationContext* opCtx) {
+void CmdUMCTyped<CreateUserCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
 
@@ -1082,7 +1083,7 @@ void CmdUMCTyped<CreateUserCommand, void>::Invocation::typedRun(OperationContext
     uassertStatusOK(status);
 }
 
-class CmdUpdateUser : public CmdUMCTyped<UpdateUserCommand, void> {
+class CmdUpdateUser : public CmdUMCTyped<UpdateUserCommand> {
 public:
     static constexpr StringData kPwdField = "pwd"_sd;
 
@@ -1092,7 +1093,7 @@ public:
 } cmdUpdateUser;
 
 template <>
-void CmdUMCTyped<UpdateUserCommand, void>::Invocation::typedRun(OperationContext* opCtx) {
+void CmdUMCTyped<UpdateUserCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
     UserName userName(cmd.getCommandParameter(), dbname);
@@ -1188,9 +1189,9 @@ void CmdUMCTyped<UpdateUserCommand, void>::Invocation::typedRun(OperationContext
     uassertStatusOK(status);
 }
 
-CmdUMCTyped<DropUserCommand, void> cmdDropUser;
+CmdUMCTyped<DropUserCommand> cmdDropUser;
 template <>
-void CmdUMCTyped<DropUserCommand, void>::Invocation::typedRun(OperationContext* opCtx) {
+void CmdUMCTyped<DropUserCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
     UserName userName(cmd.getCommandParameter(), dbname);
@@ -1217,11 +1218,9 @@ void CmdUMCTyped<DropUserCommand, void>::Invocation::typedRun(OperationContext* 
             numMatched > 0);
 }
 
-CmdUMCTyped<DropAllUsersFromDatabaseCommand, DropAllUsersFromDatabaseReply>
-    cmdDropAllUsersFromDatabase;
+CmdUMCTyped<DropAllUsersFromDatabaseCommand> cmdDropAllUsersFromDatabase;
 template <>
-DropAllUsersFromDatabaseReply
-CmdUMCTyped<DropAllUsersFromDatabaseCommand, DropAllUsersFromDatabaseReply>::Invocation::typedRun(
+DropAllUsersFromDatabaseReply CmdUMCTyped<DropAllUsersFromDatabaseCommand>::Invocation::typedRun(
     OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
@@ -1246,9 +1245,9 @@ CmdUMCTyped<DropAllUsersFromDatabaseCommand, DropAllUsersFromDatabaseReply>::Inv
     return reply;
 }
 
-CmdUMCTyped<GrantRolesToUserCommand, void> cmdGrantRolesToUser;
+CmdUMCTyped<GrantRolesToUserCommand> cmdGrantRolesToUser;
 template <>
-void CmdUMCTyped<GrantRolesToUserCommand, void>::Invocation::typedRun(OperationContext* opCtx) {
+void CmdUMCTyped<GrantRolesToUserCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
     UserName userName(cmd.getCommandParameter(), dbname);
@@ -1281,9 +1280,9 @@ void CmdUMCTyped<GrantRolesToUserCommand, void>::Invocation::typedRun(OperationC
     uassertStatusOK(status);
 }
 
-CmdUMCTyped<RevokeRolesFromUserCommand, void> cmdRevokeRolesFromUser;
+CmdUMCTyped<RevokeRolesFromUserCommand> cmdRevokeRolesFromUser;
 template <>
-void CmdUMCTyped<RevokeRolesFromUserCommand, void>::Invocation::typedRun(OperationContext* opCtx) {
+void CmdUMCTyped<RevokeRolesFromUserCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
     UserName userName(cmd.getCommandParameter(), dbname);
@@ -1316,9 +1315,9 @@ void CmdUMCTyped<RevokeRolesFromUserCommand, void>::Invocation::typedRun(Operati
     uassertStatusOK(status);
 }
 
-CmdUMCTyped<UsersInfoCommand, UsersInfoReply, UMCInfoParams> cmdUsersInfo;
+CmdUMCTyped<UsersInfoCommand, UMCInfoParams> cmdUsersInfo;
 template <>
-UsersInfoReply CmdUMCTyped<UsersInfoCommand, UsersInfoReply, UMCInfoParams>::Invocation::typedRun(
+UsersInfoReply CmdUMCTyped<UsersInfoCommand, UMCInfoParams>::Invocation::typedRun(
     OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& arg = cmd.getCommandParameter();
@@ -1419,8 +1418,8 @@ UsersInfoReply CmdUMCTyped<UsersInfoCommand, UsersInfoReply, UMCInfoParams>::Inv
         DBDirectClient client(opCtx);
 
         rpc::OpMsgReplyBuilder replyBuilder;
-        AggregateCommand aggRequest(AuthorizationManager::usersCollectionNamespace,
-                                    std::move(pipeline));
+        AggregateCommandRequest aggRequest(AuthorizationManager::usersCollectionNamespace,
+                                           std::move(pipeline));
         // Impose no cursor privilege requirements, as cursor is drained internally
         uassertStatusOK(runAggregate(opCtx,
                                      AuthorizationManager::usersCollectionNamespace,
@@ -1445,9 +1444,9 @@ UsersInfoReply CmdUMCTyped<UsersInfoCommand, UsersInfoReply, UMCInfoParams>::Inv
     return reply;
 }
 
-CmdUMCTyped<CreateRoleCommand, void> cmdCreateRole;
+CmdUMCTyped<CreateRoleCommand> cmdCreateRole;
 template <>
-void CmdUMCTyped<CreateRoleCommand, void>::Invocation::typedRun(OperationContext* opCtx) {
+void CmdUMCTyped<CreateRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
 
@@ -1498,9 +1497,9 @@ void CmdUMCTyped<CreateRoleCommand, void>::Invocation::typedRun(OperationContext
     uassertStatusOK(insertRoleDocument(opCtx, roleObjBuilder.done()));
 }
 
-CmdUMCTyped<UpdateRoleCommand, void> cmdUpdateRole;
+CmdUMCTyped<UpdateRoleCommand> cmdUpdateRole;
 template <>
-void CmdUMCTyped<UpdateRoleCommand, void>::Invocation::typedRun(OperationContext* opCtx) {
+void CmdUMCTyped<UpdateRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
     RoleName roleName(cmd.getCommandParameter(), dbname);
@@ -1573,10 +1572,9 @@ void CmdUMCTyped<UpdateRoleCommand, void>::Invocation::typedRun(OperationContext
     uassertStatusOK(status);
 }
 
-CmdUMCTyped<GrantPrivilegesToRoleCommand, void> cmdGrantPrivilegesToRole;
+CmdUMCTyped<GrantPrivilegesToRoleCommand> cmdGrantPrivilegesToRole;
 template <>
-void CmdUMCTyped<GrantPrivilegesToRoleCommand, void>::Invocation::typedRun(
-    OperationContext* opCtx) {
+void CmdUMCTyped<GrantPrivilegesToRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
     RoleName roleName(cmd.getCommandParameter(), dbname);
@@ -1623,10 +1621,9 @@ void CmdUMCTyped<GrantPrivilegesToRoleCommand, void>::Invocation::typedRun(
     uassertStatusOK(status);
 }
 
-CmdUMCTyped<RevokePrivilegesFromRoleCommand, void> cmdRevokePrivilegesFromRole;
+CmdUMCTyped<RevokePrivilegesFromRoleCommand> cmdRevokePrivilegesFromRole;
 template <>
-void CmdUMCTyped<RevokePrivilegesFromRoleCommand, void>::Invocation::typedRun(
-    OperationContext* opCtx) {
+void CmdUMCTyped<RevokePrivilegesFromRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
     RoleName roleName(cmd.getCommandParameter(), dbname);
@@ -1678,9 +1675,9 @@ void CmdUMCTyped<RevokePrivilegesFromRoleCommand, void>::Invocation::typedRun(
     uassertStatusOK(status);
 }
 
-CmdUMCTyped<GrantRolesToRoleCommand, void> cmdGrantRolesToRole;
+CmdUMCTyped<GrantRolesToRoleCommand> cmdGrantRolesToRole;
 template <>
-void CmdUMCTyped<GrantRolesToRoleCommand, void>::Invocation::typedRun(OperationContext* opCtx) {
+void CmdUMCTyped<GrantRolesToRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
     RoleName roleName(cmd.getCommandParameter(), dbname);
@@ -1718,9 +1715,9 @@ void CmdUMCTyped<GrantRolesToRoleCommand, void>::Invocation::typedRun(OperationC
     uassertStatusOK(status);
 }
 
-CmdUMCTyped<RevokeRolesFromRoleCommand, void> cmdRevokeRolesFromRole;
+CmdUMCTyped<RevokeRolesFromRoleCommand> cmdRevokeRolesFromRole;
 template <>
-void CmdUMCTyped<RevokeRolesFromRoleCommand, void>::Invocation::typedRun(OperationContext* opCtx) {
+void CmdUMCTyped<RevokeRolesFromRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
     RoleName roleName(cmd.getCommandParameter(), dbname);
@@ -1777,7 +1774,10 @@ Status retryTransactionOps(OperationContext* opCtx,
     // since its populated with the return from ops(),
     // but guard against bit-rot by pre-populating a generic failure.
     Status status(ErrorCodes::OperationFailed, "Operation was never attempted");
-    constexpr int kMaxAttempts = 3;
+
+    // Be more patient with our test runner which is likely to be
+    // doing aggressive reelections and failovers and replication shenanigans.
+    const int kMaxAttempts = getTestCommandsEnabled() ? 10 : 3;
 
     for (int tries = kMaxAttempts; tries > 0; --tries) {
         if (tries < kMaxAttempts) {
@@ -1820,9 +1820,9 @@ Status retryTransactionOps(OperationContext* opCtx,
     return status;
 }
 
-CmdUMCTyped<DropRoleCommand, void> cmdDropRole;
+CmdUMCTyped<DropRoleCommand> cmdDropRole;
 template <>
-void CmdUMCTyped<DropRoleCommand, void>::Invocation::typedRun(OperationContext* opCtx) {
+void CmdUMCTyped<DropRoleCommand>::Invocation::typedRun(OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
     RoleName roleName(cmd.getCommandParameter(), dbname);
@@ -1886,11 +1886,9 @@ void CmdUMCTyped<DropRoleCommand, void>::Invocation::typedRun(OperationContext* 
     }
 }
 
-CmdUMCTyped<DropAllRolesFromDatabaseCommand, DropAllRolesFromDatabaseReply>
-    cmdDropAllRolesFromDatabase;
+CmdUMCTyped<DropAllRolesFromDatabaseCommand> cmdDropAllRolesFromDatabase;
 template <>
-DropAllRolesFromDatabaseReply
-CmdUMCTyped<DropAllRolesFromDatabaseCommand, DropAllRolesFromDatabaseReply>::Invocation::typedRun(
+DropAllRolesFromDatabaseReply CmdUMCTyped<DropAllRolesFromDatabaseCommand>::Invocation::typedRun(
     OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& dbname = cmd.getDbName();
@@ -1982,9 +1980,9 @@ CmdUMCTyped<DropAllRolesFromDatabaseCommand, DropAllRolesFromDatabaseReply>::Inv
  *                    these roles. This format may change over time with changes to the auth
  *                    schema.
  */
-CmdUMCTyped<RolesInfoCommand, RolesInfoReply, UMCInfoParams> cmdRolesInfo;
+CmdUMCTyped<RolesInfoCommand, UMCInfoParams> cmdRolesInfo;
 template <>
-RolesInfoReply CmdUMCTyped<RolesInfoCommand, RolesInfoReply, UMCInfoParams>::Invocation::typedRun(
+RolesInfoReply CmdUMCTyped<RolesInfoCommand, UMCInfoParams>::Invocation::typedRun(
     OperationContext* opCtx) {
     const auto& cmd = request();
     const auto& arg = cmd.getCommandParameter();
@@ -2032,21 +2030,20 @@ RolesInfoReply CmdUMCTyped<RolesInfoCommand, RolesInfoReply, UMCInfoParams>::Inv
     return reply;
 }
 
-CmdUMCTyped<InvalidateUserCacheCommand, void, UMCCacheParams> cmdInvalidateUserCache;
+CmdUMCTyped<InvalidateUserCacheCommand, UMCCacheParams> cmdInvalidateUserCache;
 template <>
-void CmdUMCTyped<InvalidateUserCacheCommand, void, UMCCacheParams>::Invocation::typedRun(
+void CmdUMCTyped<InvalidateUserCacheCommand, UMCCacheParams>::Invocation::typedRun(
     OperationContext* opCtx) {
     auto* authzManager = AuthorizationManager::get(opCtx->getServiceContext());
     auto lk = requireReadableAuthSchema26Upgrade(opCtx, authzManager);
     authzManager->invalidateUserCache(opCtx);
 }
 
-CmdUMCTyped<GetUserCacheGenerationCommand, GetUserCacheGenerationReply, UMCCacheParams>
-    cmdGetUserCacheGeneration;
+CmdUMCTyped<GetUserCacheGenerationCommand, UMCCacheParams> cmdGetUserCacheGeneration;
 template <>
 GetUserCacheGenerationReply
-CmdUMCTyped<GetUserCacheGenerationCommand, GetUserCacheGenerationReply, UMCCacheParams>::
-    Invocation::typedRun(OperationContext* opCtx) {
+CmdUMCTyped<GetUserCacheGenerationCommand, UMCCacheParams>::Invocation::typedRun(
+    OperationContext* opCtx) {
     uassert(ErrorCodes::IllegalOperation,
             "_getUserCacheGeneration can only be run on config servers",
             serverGlobalParams.clusterRole == ClusterRole::ConfigServer);

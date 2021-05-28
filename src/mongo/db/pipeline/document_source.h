@@ -66,7 +66,7 @@ class Document;
 /**
  * Registers a DocumentSource to have the name 'key'.
  *
- * 'liteParser' takes an AggregateCommand and a BSONElement and returns a
+ * 'liteParser' takes an AggregateCommandRequest and a BSONElement and returns a
  * LiteParsedDocumentSource. This is used for checks that need to happen before a full parse,
  * such as checks about which namespaces are referenced by this aggregation.
  *
@@ -497,6 +497,17 @@ public:
                           std::set<std::string>&& paths,
                           StringMap<std::string>&& renames)
             : type(type), paths(std::move(paths)), renames(std::move(renames)) {}
+
+        std::set<std::string> getNewNames() {
+            std::set<std::string> newNames;
+            for (auto&& name : paths) {
+                newNames.insert(name);
+            }
+            for (auto&& rename : renames) {
+                newNames.insert(rename.first);
+            }
+            return newNames;
+        }
 
         Type type;
         std::set<std::string> paths;

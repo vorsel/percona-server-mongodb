@@ -59,7 +59,7 @@ namespace mongo::map_reduce_agg {
 namespace {
 
 auto makeExpressionContext(OperationContext* opCtx,
-                           const MapReduce& parsedMr,
+                           const MapReduceCommandRequest& parsedMr,
                            boost::optional<ExplainOptions::Verbosity> verbosity) {
     // AutoGetCollectionForReadCommand will throw if the sharding version for this connection is
     // out of date.
@@ -69,7 +69,7 @@ auto makeExpressionContext(OperationContext* opCtx,
             "mapReduce on a view is not supported",
             !ctx.getView());
 
-    auto resolvedCollator = PipelineD::resolveCollator(
+    auto [resolvedCollator, _] = PipelineD::resolveCollator(
         opCtx, parsedMr.getCollation().get_value_or(BSONObj()), ctx.getCollection());
 
     // The UUID of the collection for the execution namespace of this aggregation.
@@ -123,7 +123,7 @@ bool runAggregationMapReduce(OperationContext* opCtx,
 
     Timer cmdTimer;
 
-    auto parsedMr = MapReduce::parse(IDLParserErrorContext("MapReduce"), cmd);
+    auto parsedMr = MapReduceCommandRequest::parse(IDLParserErrorContext("mapReduce"), cmd);
     auto expCtx = makeExpressionContext(opCtx, parsedMr, verbosity);
     auto runnablePipeline = [&]() {
         auto pipeline = map_reduce_common::translateFromMR(parsedMr, expCtx);

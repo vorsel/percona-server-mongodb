@@ -35,7 +35,12 @@
 
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/db_raii.h"
+#include "mongo/db/dbdirectclient.h"
+#include "mongo/db/persistent_task_store.h"
+#include "mongo/db/repl/repl_client_info.h"
+#include "mongo/db/s/collection_critical_section_document_gen.h"
 #include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_util.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/metadata/impersonated_user_metadata.h"
@@ -53,9 +58,10 @@ namespace sharding_ddl_util {
 
 namespace {
 
-void cloneTags(OperationContext* opCtx,
-               const NamespaceString& fromNss,
-               const NamespaceString& toNss) {
+void updateTags(OperationContext* opCtx,
+                const NamespaceString& fromNss,
+                const NamespaceString& toNss) {
+    // TODO very inefficient function, refactor using a cluster write with bulk update
     auto catalogClient = Grid::get(opCtx)->catalogClient();
     auto tags = uassertStatusOK(catalogClient->getTagsForCollection(opCtx, fromNss));
 
@@ -67,13 +73,21 @@ void cloneTags(OperationContext* opCtx,
     auto lastTag = tags.back();
     tags.pop_back();
     for (auto& tag : tags) {
-        tag.setNS(toNss);
-        uassertStatusOK(catalogClient->insertConfigDocument(
-            opCtx, TagsType::ConfigNS, tag.toBSON(), ShardingCatalogClient::kLocalWriteConcern));
+        uassertStatusOK(catalogClient->updateConfigDocument(
+            opCtx,
+            TagsType::ConfigNS,
+            BSON(TagsType::ns(fromNss.ns()) << TagsType::min(tag.getMinKey())),
+            BSON("$set" << BSON(TagsType::ns << toNss.ns())),
+            false /* upsert */,
+            ShardingCatalogClient::kLocalWriteConcern));
     }
-    lastTag.setNS(toNss);
-    uassertStatusOK(catalogClient->insertConfigDocument(
-        opCtx, TagsType::ConfigNS, lastTag.toBSON(), ShardingCatalogClient::kMajorityWriteConcern));
+    uassertStatusOK(catalogClient->updateConfigDocument(
+        opCtx,
+        TagsType::ConfigNS,
+        BSON(TagsType::ns(fromNss.ns()) << TagsType::min(lastTag.getMinKey())),
+        BSON("$set" << BSON(TagsType::ns << toNss.ns())),
+        false /* upsert */,
+        ShardingCatalogClient::kMajorityWriteConcern));
 }
 
 void deleteChunks(OperationContext* opCtx, const NamespaceStringOrUUID& nssOrUUID) {
@@ -169,38 +183,49 @@ bool removeCollMetadataFromConfig(OperationContext* opCtx, const NamespaceString
 }
 
 void shardedRenameMetadata(OperationContext* opCtx,
-                           const NamespaceString& fromNss,
+                           CollectionType& fromCollType,
                            const NamespaceString& toNss) {
     auto catalogClient = Grid::get(opCtx)->catalogClient();
+    auto fromNss = fromCollType.getNss();
 
     // Delete eventual TO chunk/collection entries referring a dropped collection
-    removeCollMetadataFromConfig(opCtx, toNss);
+    try {
+        auto coll = catalogClient->getCollection(opCtx, toNss);
 
-    // Clone FROM tags to TO
-    cloneTags(opCtx, fromNss, toNss);
+        if (coll.getUuid() == fromCollType.getUuid()) {
+            // Metadata rename already happened
+            return;
+        }
 
-    auto collType = catalogClient->getCollection(opCtx, fromNss);
-    collType.setNss(toNss);
+        // Delete TO chunk/collection entries referring a dropped collection
+        removeCollMetadataFromConfig(opCtx, toNss);
+    } catch (ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+        // The TO collection is not sharded or doesn't exist
+    }
+
+    // Delete FROM collection entry
+    deleteCollection(opCtx, fromNss);
+
+    // Update FROM tags to TO
+    updateTags(opCtx, fromNss, toNss);
+
     // Insert the TO collection entry
+    fromCollType.setNss(toNss);
     uassertStatusOK(
         catalogClient->insertConfigDocument(opCtx,
                                             CollectionType::ConfigNS,
-                                            collType.toBSON(),
+                                            fromCollType.toBSON(),
                                             ShardingCatalogClient::kMajorityWriteConcern));
-
-    // Delete FROM tag/collection entries
-    removeTagsMetadataFromConfig(opCtx, fromNss);
-    deleteCollection(opCtx, fromNss);
 }
 
 void checkShardedRenamePreconditions(OperationContext* opCtx,
                                      const NamespaceString& toNss,
                                      const bool dropTarget) {
+    auto catalogClient = Grid::get(opCtx)->catalogClient();
     if (!dropTarget) {
         // Check that the sharded target collection doesn't exist
-        auto catalogCache = Grid::get(opCtx)->catalogCache();
         try {
-            catalogCache->getShardedCollectionRoutingInfo(opCtx, toNss);
+            catalogClient->getCollection(opCtx, toNss);
             // If no exception is thrown, the collection exists and is sharded
             uasserted(ErrorCodes::CommandFailed,
                       str::stream() << "Sharded target collection " << toNss.ns()
@@ -222,12 +247,25 @@ void checkShardedRenamePreconditions(OperationContext* opCtx,
     }
 
     // Check that there are no tags associated to the target collection
-    auto catalogClient = Grid::get(opCtx)->catalogClient();
     auto tags = uassertStatusOK(catalogClient->getTagsForCollection(opCtx, toNss));
     uassert(ErrorCodes::CommandFailed,
             str::stream() << "Can't rename to target collection " << toNss.ns()
                           << " because it must not have associated tags",
             tags.empty());
+}
+
+void checkDbPrimariesOnTheSameShard(OperationContext* opCtx,
+                                    const NamespaceString& fromNss,
+                                    const NamespaceString& toNss) {
+    const auto fromDB =
+        uassertStatusOK(Grid::get(opCtx)->catalogCache()->getDatabase(opCtx, fromNss.db()));
+
+    const auto toDB = uassertStatusOK(
+        Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, toNss.db()));
+
+    uassert(ErrorCodes::CommandFailed,
+            "Source and destination collections must be on same shard",
+            fromDB.primaryId() == toDB.primaryId());
 }
 
 boost::optional<CreateCollectionResponse> checkIfCollectionAlreadySharded(
@@ -259,19 +297,261 @@ boost::optional<CreateCollectionResponse> checkIfCollectionAlreadySharded(
     return response;
 }
 
-void acquireCriticalSection(OperationContext* opCtx, const NamespaceString& nss) {
-    AutoGetCollection cCollLock(opCtx, nss, MODE_X);
-    auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
-    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr);
-    csr->enterCriticalSectionCatchUpPhase(csrLock);
-    csr->enterCriticalSectionCommitPhase(csrLock);
+void acquireRecoverableCriticalSectionBlockWrites(OperationContext* opCtx,
+                                                  const NamespaceString& nss,
+                                                  const BSONObj& reason,
+                                                  const WriteConcernOptions& writeConcern,
+                                                  const boost::optional<BSONObj>& additionalInfo) {
+    invariant(!opCtx->lockState()->isLocked());
+
+    {
+        Lock::GlobalLock lk(opCtx, MODE_IX);
+        AutoGetCollection cCollLock(opCtx, nss, MODE_S);
+
+        DBDirectClient dbClient(opCtx);
+        auto cursor = dbClient.query(
+            NamespaceString::kCollectionCriticalSectionsNamespace,
+            BSON(CollectionCriticalSectionDocument::kNssFieldName << nss.toString()));
+
+        // if there is a doc with the same nss -> in order to not fail it must have the same reason
+        if (cursor->more()) {
+            const auto bsonObj = cursor->next();
+            const auto collCSDoc = CollectionCriticalSectionDocument::parse(
+                IDLParserErrorContext("AcquireRecoverableCSBW"), bsonObj);
+
+            invariant(collCSDoc.getReason().woCompare(reason) == 0,
+                      str::stream()
+                          << "Trying to acquire a  critical section blocking writes for namespace "
+                          << nss << " and reason " << reason
+                          << " but it is already taken by another operation with different reason "
+                          << collCSDoc.getReason());
+
+            // Do nothing, the persisted document is already there!
+            return;
+        }
+
+        // The collection critical section is not taken, try to acquire it.
+
+        // The following code will try to add a doc to config.criticalCollectionSections:
+        // - If everything goes well, the shard server op observer will acquire the in-memory CS.
+        // - Otherwise this call will fail and the CS won't be taken (neither persisted nor in-mem)
+        CollectionCriticalSectionDocument newDoc(nss, reason, false /* blockReads */);
+        newDoc.setAdditionalInfo(additionalInfo);
+
+        const auto commandResponse = dbClient.runCommand([&] {
+            write_ops::InsertCommandRequest insertOp(
+                NamespaceString::kCollectionCriticalSectionsNamespace);
+            insertOp.setDocuments({newDoc.toBSON()});
+            return insertOp.serialize({});
+        }());
+
+        const auto commandReply = commandResponse->getCommandReply();
+        uassertStatusOK(getStatusFromWriteCommandReply(commandReply));
+
+        BatchedCommandResponse batchedResponse;
+        std::string unusedErrmsg;
+        batchedResponse.parseBSON(commandReply, &unusedErrmsg);
+        invariant(batchedResponse.getN() > 0,
+                  str::stream() << "Insert did not add any doc to collection "
+                                << NamespaceString::kCollectionCriticalSectionsNamespace
+                                << " for namespace " << nss << " and reason " << reason);
+    }
+
+    WriteConcernResult ignoreResult;
+    const auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    uassertStatusOK(waitForWriteConcern(opCtx, latestOpTime, writeConcern, &ignoreResult));
 }
 
-void releaseCriticalSection(OperationContext* opCtx, const NamespaceString& nss) {
-    AutoGetCollection collLock(opCtx, nss, MODE_X);
-    auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
-    csr->exitCriticalSection(opCtx);
-    csr->clearFilteringMetadata(opCtx);
+void acquireRecoverableCriticalSectionBlockReads(OperationContext* opCtx,
+                                                 const NamespaceString& nss,
+                                                 const BSONObj& reason,
+                                                 const WriteConcernOptions& writeConcern) {
+    invariant(!opCtx->lockState()->isLocked());
+
+    {
+        AutoGetCollection cCollLock(opCtx, nss, MODE_X);
+
+        DBDirectClient dbClient(opCtx);
+        auto cursor = dbClient.query(
+            NamespaceString::kCollectionCriticalSectionsNamespace,
+            BSON(CollectionCriticalSectionDocument::kNssFieldName << nss.toString()));
+
+        invariant(
+            cursor->more(),
+            str::stream() << "Trying to acquire a critical section blocking reads for namespace "
+                          << nss << " and reason " << reason
+                          << " but the critical section wasn't acquired first blocking writers.");
+        BSONObj bsonObj = cursor->next();
+        const auto collCSDoc = CollectionCriticalSectionDocument::parse(
+            IDLParserErrorContext("AcquireRecoverableCSBR"), bsonObj);
+
+        invariant(
+            collCSDoc.getReason().woCompare(reason) == 0,
+            str::stream() << "Trying to acquire a critical section blocking reads for namespace "
+                          << nss << " and reason " << reason
+                          << " but it is already taken by another operation with different reason "
+                          << collCSDoc.getReason());
+
+        // if there is a document with the same nss, reason and blocking reads -> do nothing, the CS
+        // is already taken!
+        if (collCSDoc.getBlockReads())
+            return;
+
+        // The CS is in the catch-up phase, try to advance it to the commit phase.
+
+        // The following code will try to update a doc from config.criticalCollectionSections:
+        // - If everything goes well, the shard server op observer will advance the in-memory CS to
+        // the
+        //   commit phase (blocking readers).
+        // - Otherwise this call will fail and the CS won't be advanced (neither persisted nor
+        // in-mem)
+        auto commandResponse = dbClient.runCommand([&] {
+            const auto query = BSON(
+                CollectionCriticalSectionDocument::kNssFieldName
+                << nss.toString() << CollectionCriticalSectionDocument::kReasonFieldName << reason);
+            const auto update = BSON(
+                "$set" << BSON(CollectionCriticalSectionDocument::kBlockReadsFieldName << true));
+
+            write_ops::UpdateCommandRequest updateOp(
+                NamespaceString::kCollectionCriticalSectionsNamespace);
+            auto updateModification = write_ops::UpdateModification::parseFromClassicUpdate(update);
+            write_ops::UpdateOpEntry updateEntry(query, updateModification);
+            updateOp.setUpdates({updateEntry});
+
+            return updateOp.serialize({});
+        }());
+
+        const auto commandReply = commandResponse->getCommandReply();
+        uassertStatusOK(getStatusFromWriteCommandReply(commandReply));
+
+        BatchedCommandResponse batchedResponse;
+        std::string unusedErrmsg;
+        batchedResponse.parseBSON(commandReply, &unusedErrmsg);
+        invariant(batchedResponse.getNModified() > 0,
+                  str::stream() << "Update did not modify any doc from collection "
+                                << NamespaceString::kCollectionCriticalSectionsNamespace
+                                << " for namespace " << nss << " and reason " << reason);
+    }
+
+    WriteConcernResult ignoreResult;
+    const auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    uassertStatusOK(waitForWriteConcern(opCtx, latestOpTime, writeConcern, &ignoreResult));
+}
+
+
+void releaseRecoverableCriticalSection(OperationContext* opCtx,
+                                       const NamespaceString& nss,
+                                       const BSONObj& reason,
+                                       const WriteConcernOptions& writeConcern) {
+    invariant(!opCtx->lockState()->isLocked());
+
+    {
+        AutoGetCollection collLock(opCtx, nss, MODE_X);
+
+        DBDirectClient dbClient(opCtx);
+
+        const auto queryNss =
+            BSON(CollectionCriticalSectionDocument::kNssFieldName << nss.toString());
+        auto cursor =
+            dbClient.query(NamespaceString::kCollectionCriticalSectionsNamespace, queryNss);
+
+        // if there is no document with the same nss -> do nothing!
+        if (!cursor->more())
+            return;
+
+        BSONObj bsonObj = cursor->next();
+        const auto collCSDoc = CollectionCriticalSectionDocument::parse(
+            IDLParserErrorContext("ReleaseRecoverableCS"), bsonObj);
+
+        invariant(
+            collCSDoc.getReason().woCompare(reason) == 0,
+            str::stream() << "Trying to release a critical for namespace " << nss << " and reason "
+                          << reason
+                          << " but it is already taken by another operation with different reason "
+                          << collCSDoc.getReason());
+
+
+        // The collection critical section is taken (in any phase), try to release it.
+
+        // The following code will try to remove a doc from config.criticalCollectionSections:
+        // - If everything goes well, the shard server op observer will release the in-memory CS
+        // - Otherwise this call will fail and the CS won't be released (neither persisted nor
+        // in-mem)
+
+        auto commandResponse = dbClient.runCommand([&] {
+            write_ops::DeleteCommandRequest deleteOp(
+                NamespaceString::kCollectionCriticalSectionsNamespace);
+
+            deleteOp.setDeletes({[&] {
+                write_ops::DeleteOpEntry entry;
+                entry.setQ(queryNss);
+                entry.setMulti(true);
+                return entry;
+            }()});
+
+            return deleteOp.serialize({});
+        }());
+
+        const auto commandReply = commandResponse->getCommandReply();
+        uassertStatusOK(getStatusFromWriteCommandReply(commandReply));
+
+        BatchedCommandResponse batchedResponse;
+        std::string unusedErrmsg;
+        batchedResponse.parseBSON(commandReply, &unusedErrmsg);
+        invariant(batchedResponse.getN() > 0,
+                  str::stream() << "Delete did not remove any doc from collection "
+                                << NamespaceString::kCollectionCriticalSectionsNamespace
+                                << " for namespace " << nss << " and reason " << reason);
+    }
+
+    WriteConcernResult ignoreResult;
+    const auto latestOpTime = repl::ReplClientInfo::forClient(opCtx->getClient()).getLastOp();
+    uassertStatusOK(waitForWriteConcern(opCtx, latestOpTime, writeConcern, &ignoreResult));
+}
+
+void retakeInMemoryRecoverableCriticalSections(OperationContext* opCtx) {
+
+    LOGV2_DEBUG(5549400, 2, "Starting re-acquisition of recoverable critical sections");
+
+    PersistentTaskStore<CollectionCriticalSectionDocument> store(
+        NamespaceString::kCollectionCriticalSectionsNamespace);
+    store.forEach(opCtx, Query{}, [&opCtx](const CollectionCriticalSectionDocument& doc) {
+        const auto& nss = doc.getNss();
+        {
+            // Entering into the catch-up phase: blocking writes
+            Lock::GlobalLock lk(opCtx, MODE_IX);
+            AutoGetCollection cCollLock(opCtx, nss, MODE_S);
+            auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
+            auto csrLock = CollectionShardingRuntime ::CSRLock::lockExclusive(opCtx, csr);
+
+            // It may happen that the ReplWriterWorker enters the critical section before drain mode
+            // upon committing a recoverable critical section oplog entry (SERVER-56104)
+            if (!csr->getCriticalSectionSignal(
+                    opCtx, ShardingMigrationCriticalSection::Operation::kWrite)) {
+                csr->enterCriticalSectionCatchUpPhase(csrLock);
+            }
+        }
+
+        if (doc.getBlockReads()) {
+            // Entering into the commit phase: blocking reads
+            AutoGetCollection cCollLock(opCtx, nss, MODE_X);
+            auto* const csr = CollectionShardingRuntime::get(opCtx, nss);
+            auto csrLock = CollectionShardingRuntime ::CSRLock::lockExclusive(opCtx, csr);
+
+            // It may happen that the ReplWriterWorker enters the critical section before drain mode
+            // upon committing a recoverable critical section oplog entry (SERVER-56104)
+            if (!csr->getCriticalSectionSignal(
+                    opCtx, ShardingMigrationCriticalSection::Operation::kRead)) {
+                csr->enterCriticalSectionCommitPhase(csrLock);
+            }
+
+            CollectionShardingRuntime::get(opCtx, nss)->clearFilteringMetadata(opCtx);
+        }
+
+        return true;
+    });
+
+    LOGV2_DEBUG(5549401, 2, "Finished re-acquisition of recoverable critical sections");
 }
 
 void stopMigrations(OperationContext* opCtx, const NamespaceString& nss) {

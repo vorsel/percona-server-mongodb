@@ -2,7 +2,7 @@
  * Tests that index building is properly blocked and/or aborted during migrations.
  *
  * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
- * incompatible_with_windows_tls]
+ * incompatible_with_windows_tls, incompatible_with_macos, requires_persistence]
  */
 
 (function() {
@@ -127,7 +127,7 @@ jsTestLog("Allowing migration to commit");
 dataSyncFp.off();
 assert.soon(() => {
     const state =
-        tenantMigrationTest.getTenantMigrationAccessBlocker(donorPrimary, kTenantId).state;
+        tenantMigrationTest.getTenantMigrationAccessBlocker(donorPrimary, kTenantId).donor.state;
     return state === TenantMigrationTest.DonorAccessState.kBlockWritesAndReads ||
         state === TenantMigrationTest.DonorAccessState.kReject;
 });

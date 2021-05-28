@@ -4,7 +4,6 @@
  * @tags: [
  *   requires_fcv_47,
  *   requires_journaling,
- *   sbe_incompatible,
  * ]
  */
 
@@ -50,12 +49,12 @@ const runTest = testDB => {
         "testRemoval is not in API V2");
 };
 
-const conn = MongoRunner.runMongod({setParameter: {acceptAPIVersion2: true}});
+const conn = MongoRunner.runMongod({setParameter: {acceptApiVersion2: true}});
 const db = conn.getDB(jsTestName());
 runTest(db);
 MongoRunner.stopMongod(conn);
 
-const st = new ShardingTest({mongosOptions: {setParameter: {acceptAPIVersion2: true}}});
+const st = new ShardingTest({mongosOptions: {setParameter: {acceptApiVersion2: true}}});
 runTest(st.s0.getDB(jsTestName()));
 st.stop();
 })();

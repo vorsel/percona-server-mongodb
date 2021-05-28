@@ -1,4 +1,4 @@
-/*
+/**
  * Tests that we don't hit 3 way deadlock between an index builder, prepared transaction, and step
  * down.
  *
@@ -12,10 +12,8 @@
  *    block stepDown.
  *
  * @tags: [
- *     # TODO SERVER-54889: Re-enable this test with SBE.
- *     sbe_incompatible,
- *     uses_prepare_transaction,
- *     uses_transactions,
+ *   uses_prepare_transaction,
+ *   uses_transactions,
  * ]
  */
 load('jstests/noPassthrough/libs/index_build.js');

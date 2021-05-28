@@ -5,7 +5,7 @@
  * Tenant migrations are not expected to be run on servers with ephemeralForTest.
  *
  * @tags: [requires_fcv_47, requires_majority_read_concern, requires_persistence,
- * incompatible_with_eft, incompatible_with_windows_tls]
+ * incompatible_with_eft, incompatible_with_windows_tls, incompatible_with_macos]
  */
 
 (function() {
@@ -13,6 +13,7 @@
 
 load("jstests/libs/fail_point_util.js");
 load("jstests/libs/uuid_util.js");
+load("jstests/libs/write_concern_util.js");
 load("jstests/replsets/libs/tenant_migration_test.js");
 
 const tenantMigrationTest = new TenantMigrationTest({name: jsTestName()});
@@ -51,6 +52,11 @@ const initialSyncNode = recipientRst.add({rsConfig: {priority: 0, votes: 0}});
 recipientRst.reInitiate();
 jsTestLog("Waiting for initial sync to finish.");
 recipientRst.awaitSecondaryNodes();
+recipientRst.awaitReplication();
+
+// Stop replication on the node so that the TenantMigrationAccessBlocker cannot transition its state
+// past what is reflected in the state doc read below.
+stopServerReplication(initialSyncNode);
 
 const configRecipientsColl = initialSyncNode.getCollection(TenantMigrationTest.kConfigRecipientsNS);
 const recipientDoc = configRecipientsColl.findOne({tenantId: kTenantId});
@@ -59,31 +65,35 @@ if (recipientDoc) {
         case TenantMigrationTest.RecipientState.kStarted:
             if (recipientDoc.dataConsistentStopDonorOpTime) {
                 assert.soon(() => tenantMigrationTest
-                                      .getTenantMigrationAccessBlocker(recipientPrimary, kTenantId)
-                                      .state == TenantMigrationTest.RecipientAccessState.kReject);
+                                      .getTenantMigrationAccessBlocker(initialSyncNode, kTenantId)
+                                      .recipient.state ==
+                                TenantMigrationTest.RecipientAccessState.kReject);
             }
             break;
         case TenantMigrationTest.RecipientState.kConsistent:
             if (recipientDoc.rejectReadsBeforeTimestamp) {
                 assert.soon(() => tenantMigrationTest
-                                      .getTenantMigrationAccessBlocker(recipientPrimary, kTenantId)
-                                      .state ==
+                                      .getTenantMigrationAccessBlocker(initialSyncNode, kTenantId)
+                                      .recipient.state ==
                                 TenantMigrationTest.RecipientAccessState.kRejectBefore);
                 assert.soon(() => bsonWoCompare(tenantMigrationTest
                                                     .getTenantMigrationAccessBlocker(
-                                                        recipientPrimary, kTenantId)
-                                                    .rejectBeforeTimestamp,
+                                                        initialSyncNode, kTenantId)
+                                                    .recipient.rejectBeforeTimestamp,
                                                 recipientDoc.rejectReadsBeforeTimestamp) == 0);
             } else {
                 assert.soon(() => tenantMigrationTest
-                                      .getTenantMigrationAccessBlocker(recipientPrimary, kTenantId)
-                                      .state == TenantMigrationTest.RecipientAccessState.kReject);
+                                      .getTenantMigrationAccessBlocker(initialSyncNode, kTenantId)
+                                      .recipient.state ==
+                                TenantMigrationTest.RecipientAccessState.kReject);
             }
             break;
         default:
             throw new Error(`Invalid state "${state}" from recipient doc.`);
     }
 }
+
+restartServerReplication(initialSyncNode);
 
 tenantMigrationTest.stop();
 })();

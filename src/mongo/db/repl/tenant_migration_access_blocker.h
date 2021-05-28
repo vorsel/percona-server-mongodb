@@ -39,11 +39,17 @@
 namespace mongo {
 
 /**
- * Tenant access blocking interface used by TenantMigrationDonorAccessBlocker.
+ * Tenant access blocking interface used by TenantMigrationDonorAccessBlocker and
+ * TenantMigrationRecipientAccessBlocker.
  */
 class TenantMigrationAccessBlocker {
 public:
-    TenantMigrationAccessBlocker() = default;
+    /**
+     * The blocker type determines the context in which the access blocker is used.
+     */
+    enum class BlockerType { kDonor, kRecipient };
+
+    TenantMigrationAccessBlocker(BlockerType type) : _type(type) {}
     virtual ~TenantMigrationAccessBlocker() = default;
 
     /**
@@ -60,7 +66,8 @@ public:
                                                OperationType operationType) = 0;
 
     virtual Status checkIfLinearizableReadWasAllowed(OperationContext* opCtx) = 0;
-    virtual SharedSemiFuture<void> getCanReadFuture(OperationContext* opCtx) = 0;
+    virtual SharedSemiFuture<void> getCanReadFuture(OperationContext* opCtx,
+                                                    StringData command) = 0;
 
     //
     // Called by index build user threads before acquiring an index build slot, and again right
@@ -97,6 +104,16 @@ public:
      * thrown based on the given status.
      */
     virtual void recordTenantMigrationError(Status status) = 0;
+
+    /**
+     * Returns the type of access blocker.
+     */
+    virtual BlockerType getType() {
+        return _type;
+    }
+
+private:
+    const BlockerType _type;
 };
 
 }  // namespace mongo

@@ -83,6 +83,8 @@ DEFAULTS = {
     "replay_file": None,
     "report_failure_status": "fail",
     "report_file": None,
+    "run_all_feature_flag_tests": False,
+    "additional_feature_flags": None,
     "seed": int(time.time() * 256),  # Taken from random.py code in Python 2.7.
     "service_executor": None,
     "shell_conn_string": None,
@@ -316,6 +318,9 @@ EVERGREEN_VARIANT_NAME = None
 # the commit hash.
 EVERGREEN_VERSION_ID = None
 
+# The url that retrieve the debug symbol from a patch build.
+DEBUG_SYMBOL_PATCH_URL = None
+
 # If set, then any jstests that have any of the specified tags will be excluded from the suite(s).
 EXCLUDE_WITH_ANY_TAGS = None
 
@@ -347,6 +352,9 @@ LOGGER_FILE = None
 
 # Where to find the MONGO*_EXECUTABLE binaries
 INSTALL_DIR = None
+
+# Whether to run tests for feature flags.
+RUN_ALL_FEATURE_FLAG_TESTS = None
 
 # The path to the mongo executable used by resmoke.py.
 MONGO_EXECUTABLE = None
@@ -509,6 +517,10 @@ ARCHIVE_FILE = "archive.json"
 
 # S3 Bucket to upload archive files.
 ARCHIVE_BUCKET = "mongodatafiles"
+
+# Force archive all files where appropriate. Eventually we want this to be the default option.
+# For now, only the mainline required builders have this option enabled.
+FORCE_ARCHIVE_ALL_DATA_FILES = False
 
 # Benchmark options set internally by resmoke.py
 BENCHMARK_OUT_FORMAT = "json"

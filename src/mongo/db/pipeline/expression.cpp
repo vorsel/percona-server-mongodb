@@ -47,6 +47,7 @@
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/pipeline/variable_validation.h"
 #include "mongo/db/query/datetime/date_time_support.h"
+#include "mongo/db/query/sort_pattern.h"
 #include "mongo/platform/bits.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/util/regex_util.h"
@@ -285,6 +286,38 @@ const char* ExpressionAbs::getOpName() const {
 }
 
 /* ------------------------- ExpressionAdd ----------------------------- */
+
+StatusWith<Value> ExpressionAdd::apply(Value lhs, Value rhs) {
+    BSONType diffType = Value::getWidestNumeric(rhs.getType(), lhs.getType());
+
+    if (diffType == NumberDecimal) {
+        Decimal128 left = lhs.coerceToDecimal();
+        Decimal128 right = rhs.coerceToDecimal();
+        return Value(left.add(right));
+    } else if (diffType == NumberDouble) {
+        double right = rhs.coerceToDouble();
+        double left = lhs.coerceToDouble();
+        return Value(left + right);
+    } else if (diffType == NumberLong) {
+        long long result;
+
+        // If there is an overflow, convert the values to doubles.
+        if (overflow::add(lhs.coerceToLong(), rhs.coerceToLong(), &result)) {
+            return Value(lhs.coerceToDouble() + rhs.coerceToDouble());
+        }
+        return Value(result);
+    } else if (diffType == NumberInt) {
+        long long right = rhs.coerceToLong();
+        long long left = lhs.coerceToLong();
+        return Value::createIntOrLong(left + right);
+    } else if (lhs.nullish() || rhs.nullish()) {
+        return Value(BSONNULL);
+    } else {
+        return Status(ErrorCodes::TypeMismatch,
+                      str::stream() << "cannot $add a" << typeName(rhs.getType()) << " from a "
+                                    << typeName(lhs.getType()));
+    }
+}
 
 Value ExpressionAdd::evaluate(const Document& root, Variables* variables) const {
     // We'll try to return the narrowest possible result value while avoiding overflow, loss
@@ -2888,7 +2921,7 @@ Value ExpressionMeta::evaluate(const Document& root, Variables* variables) const
             return metadata.hasGeoNearDistance() ? Value(metadata.getGeoNearDistance()) : Value();
         case MetaType::kGeoNearPoint:
             return metadata.hasGeoNearPoint() ? Value(metadata.getGeoNearPoint()) : Value();
-        case MetaType::kRecordId:
+        case MetaType::kRecordId: {
             // Be sure that a RecordId can be represented by a long long.
             static_assert(RecordId::kMinRepr >= std::numeric_limits<long long>::min());
             static_assert(RecordId::kMaxRepr <= std::numeric_limits<long long>::max());
@@ -2896,10 +2929,10 @@ Value ExpressionMeta::evaluate(const Document& root, Variables* variables) const
                 return Value();
             }
 
-            return metadata.getRecordId().withFormat(
-                [](RecordId::Null n) { return Value(); },
-                [](const int64_t rid) { return Value{static_cast<long long>(rid)}; },
-                [](const char* str, int len) { return Value(OID::from(str)); });
+            BSONObjBuilder builder;
+            metadata.getRecordId().serializeToken("", &builder);
+            return Value(builder.done().firstElement());
+        }
         case MetaType::kIndexKey:
             return metadata.hasIndexKey() ? Value(metadata.getIndexKey()) : Value();
         case MetaType::kSortKey:
@@ -4996,11 +5029,11 @@ StatusWith<Value> ExpressionSubtract::apply(Value lhs, Value rhs) {
         } else {
             return Status(ErrorCodes::TypeMismatch,
                           str::stream()
-                              << "cant $subtract a " << typeName(rhs.getType()) << " from a Date");
+                              << "can't $subtract " << typeName(rhs.getType()) << " from Date");
         }
     } else {
         return Status(ErrorCodes::TypeMismatch,
-                      str::stream() << "cant $subtract a" << typeName(rhs.getType()) << " from a "
+                      str::stream() << "can't $subtract " << typeName(rhs.getType()) << " from "
                                     << typeName(lhs.getType()));
     }
 }
@@ -7184,6 +7217,86 @@ void ExpressionDateTrunc::_doAddDependencies(DepsTracker* deps) const {
     if (_startOfWeek) {
         _startOfWeek->addDependencies(deps);
     }
+}
+
+/* -------------------------- ExpressionGetField ------------------------------ */
+REGISTER_FEATURE_FLAG_GUARDED_EXPRESSION(getField,
+                                         ExpressionGetField::parse,
+                                         feature_flags::gFeatureFlagDotsAndDollars);
+
+intrusive_ptr<Expression> ExpressionGetField::parse(ExpressionContext* const expCtx,
+                                                    BSONElement expr,
+                                                    const VariablesParseState& vps) {
+    boost::intrusive_ptr<Expression> fieldExpr;
+    boost::intrusive_ptr<Expression> fromExpr;
+
+    if (expr.type() == BSONType::Object) {
+        for (auto&& elem : expr.embeddedObject()) {
+            const auto fieldName = elem.fieldNameStringData();
+            if (!fieldExpr && !fromExpr && fieldName[0] == '$') {
+                // This may be an expression, so we should treat it as such.
+                fieldExpr = Expression::parseOperand(expCtx, expr, vps);
+                fromExpr = ExpressionFieldPath::parse(expCtx, "$$ROOT", vps);
+                break;
+            } else if (fieldName == "field"_sd) {
+                fieldExpr = Expression::parseOperand(expCtx, elem, vps);
+            } else if (fieldName == "from"_sd) {
+                fromExpr = Expression::parseOperand(expCtx, elem, vps);
+            } else {
+                uasserted(3041701,
+                          str::stream()
+                              << kExpressionName << " found an unknown argument: " << fieldName);
+            }
+        }
+    } else {
+        fieldExpr = Expression::parseOperand(expCtx, expr, vps);
+        fromExpr = ExpressionFieldPath::parse(expCtx, "$$ROOT", vps);
+    }
+
+    uassert(3041702,
+            str::stream() << kExpressionName << " requires 'field' to be specified",
+            fieldExpr);
+    uassert(
+        3041703, str::stream() << kExpressionName << " requires 'from' to be specified", fromExpr);
+
+    return make_intrusive<ExpressionGetField>(expCtx, fieldExpr, fromExpr);
+}
+
+Value ExpressionGetField::evaluate(const Document& root, Variables* variables) const {
+    auto fieldValue = _field->evaluate(root, variables);
+    if (fieldValue.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    auto fromValue = _from->evaluate(root, variables);
+    if (fromValue.nullish()) {
+        return Value(BSONNULL);
+    }
+
+    uassert(3041704,
+            str::stream() << kExpressionName << " requires 'field' to evaluate to type String",
+            fieldValue.getType() == BSONType::String);
+
+    uassert(3041705,
+            str::stream() << kExpressionName << " requires 'from' to evaluate to type Object",
+            fromValue.getType() == BSONType::Object);
+
+    return fromValue.getDocument().getField(fieldValue.getString());
+}
+
+intrusive_ptr<Expression> ExpressionGetField::optimize() {
+    return intrusive_ptr<Expression>(this);
+}
+
+void ExpressionGetField::_doAddDependencies(DepsTracker* deps) const {
+    _from->addDependencies(deps);
+    _field->addDependencies(deps);
+}
+
+Value ExpressionGetField::serialize(const bool explain) const {
+    return Value(Document{{"$getField"_sd,
+                           Document{{"field"_sd, _field->serialize(explain)},
+                                    {"from"_sd, _from->serialize(explain)}}}});
 }
 
 MONGO_INITIALIZER(expressionParserMap)(InitializerContext*) {

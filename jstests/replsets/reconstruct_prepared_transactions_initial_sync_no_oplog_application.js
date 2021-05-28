@@ -5,7 +5,10 @@
  * during secondary oplog application. During initial sync, there will be no oplog entries that
  * need to be applied other than the prepare transaction oplog entries.
  *
- * @tags: [uses_transactions, uses_prepare_transaction]
+ * @tags: [
+ *   uses_prepare_transaction,
+ *   uses_transactions,
+ * ]
  */
 
 (function() {

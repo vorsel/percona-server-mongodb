@@ -25,6 +25,10 @@ rst.awaitSecondaryNodes();
 var primary = rst.getPrimary();
 var primaryColl = primary.getDB("test").coll;
 
+// The default WC is majority and this test can't test catchup properly if it used majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
 // Set verbosity for replication on all nodes.
 var verbosity = {
     "setParameter": 1,
@@ -160,7 +164,7 @@ rst.awaitReplication();
 
 jsTest.log("Case 3: The primary needs to catch up, but has to change sync source to catch up.");
 // Reconfig the election timeout to be longer than 1 minute so that the third node will no
-// longer be blacklisted by the new primary if it happened to be at the beginning of the test.
+// longer be denylisted by the new primary if it happened to be at the beginning of the test.
 reconfigElectionAndCatchUpTimeout(3 * 60 * 1000, conf.settings.catchUpTimeoutMillis);
 
 stepUpResults = stopReplicationAndEnforceNewPrimaryToCatchUp(rst, rst.getSecondaries()[0]);

@@ -43,36 +43,17 @@ from pymongo import MongoClient
 sys.path.append(os.path.normpath(os.path.join(os.path.abspath(__file__), '../../..')))
 
 # pylint: disable=wrong-import-position,wrong-import-order
+from buildscripts.idl.lib import list_idls, parse_idl
 from buildscripts.resmokelib import configure_resmoke
 from buildscripts.resmokelib.logging import loggers
 from buildscripts.resmokelib.testing.fixtures import interface
+from buildscripts.resmokelib.testing.fixtures.fixturelib import FixtureLib
 from buildscripts.resmokelib.testing.fixtures.shardedcluster import ShardedClusterFixture
 from buildscripts.resmokelib.testing.fixtures.standalone import MongoDFixture
-from idl import parser, syntax
-from idl.compiler import CompilerImportResolver
+from idl import syntax
 
 LOGGER_NAME = 'check-idl-definitions'
 LOGGER = logging.getLogger(LOGGER_NAME)
-
-
-def list_idls(directory: str) -> Set[str]:
-    """Find all IDL files in the current directory."""
-    return {
-        os.path.join(dirpath, filename)
-        for dirpath, dirnames, filenames in os.walk(directory) for filename in filenames
-        if filename.endswith('.idl')
-    }
-
-
-def parse_idl(idl_path: str, import_directories: List[str]) -> syntax.IDLParsedSpec:
-    """Parse an IDL file or throw an error."""
-    parsed_doc = parser.parse(open(idl_path), idl_path, CompilerImportResolver(import_directories))
-
-    if parsed_doc.errors:
-        parsed_doc.errors.dump_errors()
-        raise ValueError(f"Cannot parse {idl_path}")
-
-    return parsed_doc
 
 
 def is_test_idl(idl_path: str) -> bool:
@@ -109,17 +90,18 @@ def list_commands_for_api(api_version: str, mongod_or_mongos: str, install_dir: 
     assert mongod_or_mongos in ("mongod", "mongos")
     logging.info("Calling listCommands on %s", mongod_or_mongos)
     dbpath = TemporaryDirectory()
+    fixturelib = FixtureLib()
     mongod_executable = os.path.join(install_dir, "mongod")
     mongos_executable = os.path.join(install_dir, "mongos")
     if mongod_or_mongos == "mongod":
         logger = loggers.new_fixture_logger("MongoDFixture", 0)
         logger.parent = LOGGER
-        fixture: interface.Fixture = MongoDFixture(logger, 0, dbpath_prefix=dbpath.name,
+        fixture: interface.Fixture = MongoDFixture(logger, 0, fixturelib, dbpath_prefix=dbpath.name,
                                                    mongod_executable=mongod_executable)
     else:
         logger = loggers.new_fixture_logger("ShardedClusterFixture", 0)
         logger.parent = LOGGER
-        fixture = ShardedClusterFixture(logger, 0, dbpath_prefix=dbpath.name,
+        fixture = ShardedClusterFixture(logger, 0, fixturelib, dbpath_prefix=dbpath.name,
                                         mongos_executable=mongos_executable,
                                         mongod_executable=mongod_executable, mongod_options={})
 

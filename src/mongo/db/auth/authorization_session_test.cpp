@@ -159,6 +159,8 @@ const ResourcePattern thirdProfileCollResource(
     ResourcePattern::forExactNamespace(NamespaceString("third.system.profile")));
 
 TEST_F(AuthorizationSessionTest, AddUserAndCheckAuthorization) {
+    authzSession->startContractTracking();
+
     // Check that disabling auth checks works
     ASSERT_FALSE(
         authzSession->isAuthorizedForActionsOnResource(testFooCollResource, ActionType::insert));
@@ -568,18 +570,18 @@ TEST_F(AuthorizationSessionTest, AcquireUserObtainsAndValidatesAuthenticationRes
 
 
     auto assertWorks = [this](StringData clientSource, StringData serverAddress) {
-        RestrictionEnvironment::set(
-            _session,
-            std::make_unique<RestrictionEnvironment>(SockAddr(clientSource, 5555, AF_UNSPEC),
-                                                     SockAddr(serverAddress, 27017, AF_UNSPEC)));
+        RestrictionEnvironment::set(_session,
+                                    std::make_unique<RestrictionEnvironment>(
+                                        SockAddr::create(clientSource, 5555, AF_UNSPEC),
+                                        SockAddr::create(serverAddress, 27017, AF_UNSPEC)));
         ASSERT_OK(authzSession->addAndAuthorizeUser(_opCtx.get(), UserName("spencer", "test")));
     };
 
     auto assertFails = [this](StringData clientSource, StringData serverAddress) {
-        RestrictionEnvironment::set(
-            _session,
-            std::make_unique<RestrictionEnvironment>(SockAddr(clientSource, 5555, AF_UNSPEC),
-                                                     SockAddr(serverAddress, 27017, AF_UNSPEC)));
+        RestrictionEnvironment::set(_session,
+                                    std::make_unique<RestrictionEnvironment>(
+                                        SockAddr::create(clientSource, 5555, AF_UNSPEC),
+                                        SockAddr::create(serverAddress, 27017, AF_UNSPEC)));
         ASSERT_NOT_OK(authzSession->addAndAuthorizeUser(_opCtx.get(), UserName("spencer", "test")));
     };
 
@@ -1344,6 +1346,8 @@ TEST_F(AuthorizationSessionTest, CanUseUUIDNamespacesWithPrivilege) {
                              << "string");
     BSONObj uuidObj = BSON("a" << UUID::gen());
     BSONObj invalidObj = BSON("a" << 12);
+
+    authzSession->startContractTracking();
 
     // Strings require no privileges
     ASSERT_TRUE(authzSession->isAuthorizedToParseNamespaceElement(stringObj.firstElement()));

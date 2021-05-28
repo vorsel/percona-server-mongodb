@@ -31,35 +31,36 @@
 
 #include <memory>
 
+#include "mongo/db/client.h"
 #include "mongo/db/service_context.h"
 #include "mongo/platform/atomic_word.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future.h"
 #include "mongo/util/out_of_line_executor.h"
 
 namespace mongo {
 
-class CancelationToken;
 class OperationContext;
 
 /**
- * Wrapper class around an OperationContext that calls markKilled(ErrorCodes::CallbackCanceled) when
- * the supplied CancelationToken is canceled.
+ * Wrapper class around an OperationContext that calls markKilled(ErrorCodes::Interrupted) when the
+ * supplied CancellationToken is canceled.
  *
- * This class is useful for having an OperationContext be interrupted when a CancelationToken is
- * canceled. Note that OperationContext::getCancelationToken() is instead useful for having a
- * CancelationToken be canceled when an OperationContext is interrupted. The combination of the two
- * enables bridging between OperationContext interruption and CancelationToken cancellation
+ * This class is useful for having an OperationContext be interrupted when a CancellationToken is
+ * canceled. Note that OperationContext::getCancellationToken() is instead useful for having a
+ * CancellationToken be canceled when an OperationContext is interrupted. The combination of the two
+ * enables bridging between OperationContext interruption and CancellationToken cancellation
  * arbitrarily.
  *
- * IMPORTANT: Executors are allowed to refuse work. markKilled(ErrorCodes::CallbackCanceled) won't
- * be called when the supplied CancelationToken is canceled if the task executor has already been
- * shut down, for example. Use a task executor bound to the process lifetime if you must guarantee
- * that the OperationContext is interrupted when the CancelationToken is canceled.
+ * IMPORTANT: Executors are allowed to refuse work. markKilled(ErrorCodes::Interrupted) won't be
+ * called when the supplied CancellationToken is canceled if the task executor has already been shut
+ * down, for example. Use a task executor bound to the process lifetime if you must guarantee that
+ * the OperationContext is interrupted when the CancellationToken is canceled.
  */
 class CancelableOperationContext {
 public:
     CancelableOperationContext(ServiceContext::UniqueOperationContext opCtx,
-                               const CancelationToken& cancelToken,
+                               const CancellationToken& cancelToken,
                                ExecutorPtr executor);
 
     CancelableOperationContext(const CancelableOperationContext&) = delete;
@@ -90,6 +91,24 @@ private:
     const std::shared_ptr<SharedBlock> _sharedBlock;
     const ServiceContext::UniqueOperationContext _opCtx;
     const SemiFuture<void> _markKilledFinished;
+};
+
+/**
+ * A factory to create CancelableOperationContext objects that use the same CancelationToken and
+ * executor.
+ */
+class CancelableOperationContextFactory {
+public:
+    CancelableOperationContextFactory(CancellationToken cancelToken, ExecutorPtr executor)
+        : _cancelToken{std::move(cancelToken)}, _executor{std::move(executor)} {}
+
+    CancelableOperationContext makeOperationContext(Client* client) const {
+        return CancelableOperationContext{client->makeOperationContext(), _cancelToken, _executor};
+    }
+
+private:
+    const CancellationToken _cancelToken;
+    const ExecutorPtr _executor;
 };
 
 }  // namespace mongo

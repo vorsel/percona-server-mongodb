@@ -30,6 +30,8 @@
 #include "mongo/db/repl/tenant_migration_util.h"
 
 #include "mongo/bson/json.h"
+#include "mongo/bson/mutable/algorithm.h"
+#include "mongo/bson/mutable/document.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
@@ -46,14 +48,22 @@
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/wait_for_majority_service.h"
-#include "mongo/util/cancelation.h"
+#include "mongo/util/cancellation.h"
 #include "mongo/util/future_util.h"
 
 namespace mongo {
 
 namespace tenant_migration_util {
 
+namespace {
+
+const std::set<std::string> kSensitiveFieldNames{"donorCertificateForRecipient",
+                                                 "recipientCertificateForDonor"};
+
 MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationBeforeMarkingExternalKeysGarbageCollectable);
+MONGO_FAIL_POINT_DEFINE(pauseTenantMigrationBeforeStoringExternalClusterTimeKeyDocs);
+
+}  // namespace
 
 const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
 
@@ -67,11 +77,12 @@ ExternalKeysCollectionDocument makeExternalClusterTimeKeyDoc(UUID migrationId, B
     return externalKeyDoc;
 }
 
-repl::OpTime storeExternalClusterTimeKeyDocs(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                                             std::vector<ExternalKeysCollectionDocument> keyDocs) {
+repl::OpTime storeExternalClusterTimeKeyDocs(std::vector<ExternalKeysCollectionDocument> keyDocs) {
     auto opCtxHolder = cc().makeOperationContext();
     auto opCtx = opCtxHolder.get();
     auto nss = NamespaceString::kExternalKeysCollectionNamespace;
+
+    pauseTenantMigrationBeforeStoringExternalClusterTimeKeyDocs.pauseWhileSet(opCtx);
 
     for (auto& keyDoc : keyDocs) {
         AutoGetCollection collection(opCtx, nss, MODE_IX);
@@ -238,31 +249,51 @@ createRetryableWritesOplogFetchingPipelineForTenantMigrations(
     // 5. Remove `lastOps` in favor of `lastOp`.
     stages.emplace_back(DocumentSourceProject::createUnset(FieldPath("lastOps"), expCtx));
 
-    // 6. Fetch preImage oplog entry for `findAndModify` from the oplog view. `preImageOps` is not
-    //    expected to contain exactly one element if the `preImageOpTime` field is not null.
-    stages.emplace_back(DocumentSourceLookUp::createFromBson(
-        Doc{{"$lookup",
-             Doc{{"from", Doc{{"db", "local"_sd}, {"coll", "system.tenantMigration.oplogView"_sd}}},
-                 {"localField", "lastOp.preImageOpTime.ts"_sd},
-                 {"foreignField", "ts"_sd},
-                 {"as", "preImageOps"_sd}}}}
-            .toBson()
-            .firstElement(),
-        expCtx));
+    // 6. Fetch preImage oplog entry for `findAndModify` from the oplog view. `preImageOps` is
+    //    expected to contain exactly one element if the `preImageOpTime` field is not null and is
+    //    earlier than `startFetchingTimestamp`.
+    stages.emplace_back(DocumentSourceLookUp::createFromBson(fromjson("{\
+                    $lookup: {\
+                        from: {db: 'local', coll: 'system.tenantMigration.oplogView'},\
+                        let: { preimage_ts: '$lastOp.preImageOpTime.ts'},\
+                        pipeline: [{\
+                            $match: {\
+                                $expr: {\
+                                    $and: [\
+                                        {$eq: ['$ts', '$$preimage_ts']},\
+                                        {$lt: ['$ts', " + startFetchingTimestamp.toString() +
+                                                                      "]}\
+                                    ]\
+                                }\
+                            }\
+                        }],\
+                        as: 'preImageOps'\
+                    }}")
+                                                                 .firstElement(),
+                                                             expCtx));
 
-
-    // 7. Fetch postImage oplog entry for `findAndModify` from the oplog view. `postImageOps` is not
-    //    expected to contain exactly one element if the `postImageOpTime` field is not null.
-    stages.emplace_back(DocumentSourceLookUp::createFromBson(
-        Doc{{"$lookup",
-             Doc{{"from", Doc{{"db", "local"_sd}, {"coll", "system.tenantMigration.oplogView"_sd}}},
-                 {"localField", "lastOp.postImageOpTime.ts"_sd},
-                 {"foreignField", "ts"_sd},
-                 {"as", "postImageOps"_sd}}}}
-            .toBson()
-            .firstElement(),
-        expCtx));
-
+    // 7. Fetch postImage oplog entry for `findAndModify` from the oplog view. `postImageOps` is
+    //    expected to contain exactly one element if the `postImageOpTime` field is not null and is
+    //    earlier than `startFetchingTimestamp`.
+    stages.emplace_back(DocumentSourceLookUp::createFromBson(fromjson("{\
+                    $lookup: {\
+                        from: {db: 'local', coll: 'system.tenantMigration.oplogView'},\
+                        let: { postimage_ts: '$lastOp.postImageOpTime.ts'},\
+                        pipeline: [{\
+                            $match: {\
+                                $expr: {\
+                                    $and: [\
+                                        {$eq: ['$ts', '$$postimage_ts']},\
+                                        {$lt: ['$ts', " + startFetchingTimestamp.toString() +
+                                                                      "]}\
+                                    ]\
+                                }\
+                            }\
+                        }],\
+                        as: 'postImageOps'\
+                    }}")
+                                                                 .firstElement(),
+                                                             expCtx));
 
     // 8. Fetch oplog entries in each chain from the oplog view.
     stages.emplace_back(DocumentSourceGraphLookUp::createFromBson(
@@ -277,7 +308,7 @@ createRetryableWritesOplogFetchingPipelineForTenantMigrations(
             .firstElement(),
         expCtx));
 
-    // 9. Filter out all oplog entries from the `history` arrary that occur after
+    // 9. Filter out all oplog entries from the `history` array that occur after
     //    `startFetchingTimestamp`. Since the oplog fetching and application stages will already
     //    capture entries after `startFetchingTimestamp`, we only need the earlier part of the oplog
     //    chain.
@@ -334,7 +365,7 @@ createRetryableWritesOplogFetchingPipelineForTenantMigrations(
     return Pipeline::create(std::move(stages), expCtx);
 }
 
-bool shouldStopUpdatingExternalKeys(Status status, const CancelationToken& token) {
+bool shouldStopUpdatingExternalKeys(Status status, const CancellationToken& token) {
     return status.isOK() || token.isCanceled();
 }
 
@@ -343,7 +374,7 @@ ExecutorFuture<void> markExternalKeysAsGarbageCollectable(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
     std::shared_ptr<executor::TaskExecutor> parentExecutor,
     UUID migrationId,
-    const CancelationToken& token) {
+    const CancellationToken& token) {
     auto ttlExpiresAt = serviceContext->getFastClockSource()->now() +
         Milliseconds{repl::tenantMigrationGarbageCollectionDelayMS.load()} +
         Seconds{repl::tenantMigrationExternalKeysRemovalBufferSecs.load()};
@@ -388,7 +419,20 @@ ExecutorFuture<void> markExternalKeysAsGarbageCollectable(
         // AsyncTry itself on an executor that won't shut down.
         //
         // TODO SERVER-54735: Stop using the parent executor here.
-        .on(parentExecutor, CancelationToken::uncancelable());
+        .on(parentExecutor, CancellationToken::uncancelable());
+}
+
+BSONObj redactStateDoc(BSONObj stateDoc) {
+    mutablebson::Document stateDocToLog(stateDoc, mutablebson::Document::kInPlaceDisabled);
+    for (auto& sensitiveField : kSensitiveFieldNames) {
+        for (mutablebson::Element element =
+                 mutablebson::findFirstChildNamed(stateDocToLog.root(), sensitiveField);
+             element.ok();
+             element = mutablebson::findElementNamed(element.rightSibling(), sensitiveField)) {
+            uassertStatusOK(element.setValueString("xxx"));
+        }
+    }
+    return stateDocToLog.getObject();
 }
 
 }  // namespace tenant_migration_util

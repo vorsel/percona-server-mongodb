@@ -6,7 +6,7 @@
  * entries are being written.
  *
  * @tags: [requires_fcv_47, requires_majority_read_concern, incompatible_with_eft,
- * incompatible_with_windows_tls]
+ * incompatible_with_windows_tls, incompatible_with_macos, requires_persistence]
  */
 
 (function() {
@@ -82,7 +82,8 @@ logApplyOpsForTxnFp.wait();
 // Allow the migration to move to the blocking state and commit.
 dataSyncFp.off();
 assert.soon(
-    () => tenantMigrationTest.getTenantMigrationAccessBlocker(donorPrimary, kTenantId).state ===
+    () =>
+        tenantMigrationTest.getTenantMigrationAccessBlocker(donorPrimary, kTenantId).donor.state ===
         TenantMigrationTest.DonorAccessState.kBlockWritesAndReads);
 logApplyOpsForTxnFp.off();
 assert.commandWorked(migrationThread.returnData());

@@ -50,7 +50,7 @@ public:
 
 private:
     ExecutorFuture<void> _runImpl(std::shared_ptr<executor::ScopedTaskExecutor> executor,
-                                  const CancelationToken& token) noexcept override;
+                                  const CancellationToken& token) noexcept override;
 
     template <typename Func>
     auto _executePhase(const Phase& newPhase, Func&& func) {
@@ -71,7 +71,6 @@ private:
 
     void _insertStateDocument(StateDoc&& doc);
     void _updateStateDocument(StateDoc&& newStateDoc);
-    void _removeStateDocument();
     void _enterPhase(Phase newPhase);
 
     DropCollectionCoordinatorDocument _doc;
