@@ -110,6 +110,8 @@ MONGO_FAIL_POINT_DEFINE(allowSettingMalformedCollectionValidators);
 // This fail point introduces corruption to documents during insert.
 MONGO_FAIL_POINT_DEFINE(corruptDocumentOnInsert);
 
+MONGO_FAIL_POINT_DEFINE(skipCappedDeletes);
+
 /**
  * Checks the 'failCollectionInserts' fail point at the beginning of an insert operation to see if
  * the insert should fail. Returns Status::OK if The function should proceed with the insertion.
@@ -831,6 +833,10 @@ Status CollectionImpl::_insertDocuments(OperationContext* opCtx,
 }
 
 bool CollectionImpl::_cappedAndNeedDelete(OperationContext* opCtx) const {
+    if (MONGO_unlikely(skipCappedDeletes.shouldFail())) {
+        return false;
+    }
+
     if (!isCapped()) {
         return false;
     }
@@ -963,13 +969,12 @@ void CollectionImpl::_cappedDeleteAsNeeded(OperationContext* opCtx,
                 OpObserver* opObserver = opCtx->getServiceContext()->getOpObserver();
                 opObserver->aboutToDelete(opCtx, ns(), doc);
 
+                OpObserver::OplogDeleteEntryArgs args;
+                // Explicitly setting values despite them being the defaults.
+                args.deletedDoc = nullptr;
+                args.fromMigrate = false;
                 // Reserves an optime for the deletion and sets the timestamp for future writes.
-                opObserver->onDelete(opCtx,
-                                     ns(),
-                                     uuid(),
-                                     kUninitializedStmtId,
-                                     /*fromMigrate=*/false,
-                                     /*deletedDoc=*/boost::none);
+                opObserver->onDelete(opCtx, ns(), uuid(), kUninitializedStmtId, args);
             }
 
             int64_t unusedKeysDeleted = 0;
@@ -1084,8 +1089,11 @@ void CollectionImpl::deleteDocument(OperationContext* opCtx,
     _indexCatalog->unindexRecord(opCtx, doc.value(), loc, noWarn, &keysDeleted);
     _shared->_recordStore->deleteRecord(opCtx, loc);
 
-    getGlobalServiceContext()->getOpObserver()->onDelete(
-        opCtx, ns(), uuid(), stmtId, fromMigrate, deletedDoc);
+    OpObserver::OplogDeleteEntryArgs deleteArgs{nullptr, fromMigrate, getRecordPreImages()};
+    if (deletedDoc) {
+        deleteArgs.deletedDoc = &(deletedDoc.get());
+    }
+    getGlobalServiceContext()->getOpObserver()->onDelete(opCtx, ns(), uuid(), stmtId, deleteArgs);
 
     if (opDebug) {
         opDebug->additiveMetrics.incrementKeysDeleted(keysDeleted);

@@ -347,6 +347,10 @@ class TestRunner(Subcommand):  # pylint: disable=too-many-instance-attributes
             curator_path, "jasper", "service", "run", "rpc", "--port",
             str(jasper_port)
         ]
+        if sys.platform == "win32" or sys.platform == "cygwin":
+            # If running on windows, we need to add the `--interactive` flag
+            # for jasper to run.
+            jasper_command.append("--interactive")
         self._jasper_server = process.Process(self._resmoke_logger, jasper_command)
         self._jasper_server.start()
         config.JASPER_CONNECTION_STR = jasper_conn_str
@@ -1118,6 +1122,13 @@ def to_local_args(input_args=None):  # pylint: disable=too-many-branches,too-man
     origin_suite = getattr(parsed_args, "origin_suite", None)
     if origin_suite is not None:
         setattr(parsed_args, "suite_files", origin_suite)
+
+    # Replace --runAllFeatureFlagTests with an explicit list of feature flags. The former relies on
+    # all_feature_flags.txt which may not exist in the local dev environment.
+    run_all_feature_flag_tests = getattr(parsed_args, "run_all_feature_flag_tests", None)
+    if run_all_feature_flag_tests is not None:
+        setattr(parsed_args, "additional_feature_flags", config.ENABLED_FEATURE_FLAGS)
+        del parsed_args.run_all_feature_flag_tests
 
     # The top-level parser has one subparser that contains all subcommand parsers.
     command_subparser = [

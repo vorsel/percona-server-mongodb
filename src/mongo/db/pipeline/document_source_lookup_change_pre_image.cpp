@@ -35,11 +35,18 @@
 #include "mongo/db/pipeline/document_source_lookup_change_pre_image.h"
 
 #include "mongo/bson/simple_bsonelement_comparator.h"
-#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/transaction_history_iterator.h"
 #include "mongo/util/intrusive_counter.h"
 
 namespace mongo {
+
+namespace {
+REGISTER_INTERNAL_DOCUMENT_SOURCE(
+    _internalChangeStreamLookupPreImage,
+    LiteParsedDocumentSourceChangeStreamInternal::parse,
+    DocumentSourceLookupChangePreImage::createFromBson,
+    feature_flags::gFeatureFlagChangeStreamsOptimization.isEnabledAndIgnoreFCV());
+}
 
 constexpr StringData DocumentSourceLookupChangePreImage::kStageName;
 constexpr StringData DocumentSourceLookupChangePreImage::kFullDocumentBeforeChangeFieldName;
@@ -50,6 +57,18 @@ boost::intrusive_ptr<DocumentSourceLookupChangePreImage> DocumentSourceLookupCha
     auto mode = spec.getFullDocumentBeforeChange();
 
     return make_intrusive<DocumentSourceLookupChangePreImage>(expCtx, mode);
+}
+
+boost::intrusive_ptr<DocumentSourceLookupChangePreImage>
+DocumentSourceLookupChangePreImage::createFromBson(
+    const BSONElement elem, const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    uassert(5467610,
+            str::stream() << "the '" << kStageName << "' stage spec must be an object",
+            elem.type() == BSONType::Object);
+    auto parsedSpec = DocumentSourceChangeStreamLookUpPreImageSpec::parse(
+        IDLParserErrorContext("DocumentSourceChangeStreamLookUpPreImageSpec"), elem.Obj());
+    return make_intrusive<DocumentSourceLookupChangePreImage>(
+        expCtx, parsedSpec.getFullDocumentBeforeChange());
 }
 
 DocumentSource::GetNextResult DocumentSourceLookupChangePreImage::doGetNext() {
@@ -132,6 +151,20 @@ boost::optional<Document> DocumentSourceLookupChangePreImage::lookupPreImage(
     invariant(!opLogEntry.getObject().isEmpty());
 
     return Document{opLogEntry.getObject().getOwned()};
+}
+
+Value DocumentSourceLookupChangePreImage::serializeLatest(
+    boost::optional<ExplainOptions::Verbosity> explain) const {
+    return explain
+        ? Value(Document{
+              {DocumentSourceChangeStream::kStageName,
+               Document{{"stage"_sd, "internalLookUpPreImage"_sd},
+                        {"fullDocumentBeforeChange"_sd,
+                         FullDocumentBeforeChangeMode_serializer(_fullDocumentBeforeChangeMode)}}}})
+        : Value(
+              Document{{kStageName,
+                        DocumentSourceChangeStreamLookUpPreImageSpec(_fullDocumentBeforeChangeMode)
+                            .toBSON()}});
 }
 
 }  // namespace mongo

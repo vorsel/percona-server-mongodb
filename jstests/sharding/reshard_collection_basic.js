@@ -13,13 +13,7 @@ load("jstests/sharding/libs/find_chunks_util.js");
 (function() {
 'use strict';
 
-const st = new ShardingTest({
-    mongos: 1,
-    mongosOptions: {setParameter: {featureFlagResharding: true}},
-    configOptions: {setParameter: {featureFlagResharding: true}},
-    shards: 2,
-    shardOptions: {setParameter: {featureFlagResharding: true}},
-});
+const st = new ShardingTest({mongos: 1, shards: 2});
 const kDbName = 'db';
 const collName = 'foo';
 const ns = kDbName + '.' + collName;
@@ -201,9 +195,6 @@ let assertReshardCollOk = (commandObj, expectedChunks) => {
 
 let presetReshardedChunks =
     [{recipientShardId: st.shard1.shardName, min: {newKey: MinKey}, max: {newKey: MaxKey}}];
-const existingZoneName = 'x1';
-
-configureFailPoint(st.configRS.getPrimary(), "reshardingCoordinatorCanEnterCriticalImplicitly");
 
 /**
  * Fail cases
@@ -245,8 +236,21 @@ assert.commandFailedWithCode(mongos.adminCommand({
 }),
                              ErrorCodes.BadValue);
 
+jsTest.log("Fail if the zone provided is not assigned to a shard.");
+const nonExistingZoneName = 'x0';
+assert.commandFailedWithCode(mongos.adminCommand({
+    reshardCollection: ns,
+    key: {newKey: 1},
+    unique: false,
+    collation: {locale: 'simple'},
+    zones: [{zone: nonExistingZoneName, min: {newKey: 5}, max: {newKey: 10}}],
+    numInitialChunks: 2,
+}),
+                             4952607);
+
 jsTest.log(
     "Fail if authoritative tags exist in config.tags collection and zones are not provided.");
+const existingZoneName = 'x1';
 assert.commandWorked(
     st.s.adminCommand({addShardToZone: st.shard1.shardName, zone: existingZoneName}));
 assert.commandWorked(st.s.adminCommand(
@@ -257,18 +261,6 @@ assert.commandFailedWithCode(mongos.adminCommand({
     key: {newKey: 1},
     unique: false,
     collation: {locale: 'simple'},
-    numInitialChunks: 2,
-}),
-                             ErrorCodes.BadValue);
-
-jsTest.log(
-    "Fail if authoritative tags exist in config.tags collection and zones are provided and use a name which does not exist in authoritative tags.");
-assert.commandFailedWithCode(mongos.adminCommand({
-    reshardCollection: ns,
-    key: {newKey: 1},
-    unique: false,
-    collation: {locale: 'simple'},
-    zones: [{tag: 'x', min: {newKey: 5}, max: {newKey: 10}, ns: ns}],
     numInitialChunks: 2,
 }),
                              ErrorCodes.BadValue);
@@ -312,19 +304,22 @@ assertReshardCollOk({
                     2);
 
 jsTest.log(
-    "Succeed if all optional fields and _presetReshardedChunks are provided with correct values and test commands are enabled (default).");
+    "Succeed if all optional fields and _presetReshardedChunks are provided with correct values" +
+    " and test commands are enabled (default).");
 assertReshardCollOkWithPreset(
     {reshardCollection: ns, key: {newKey: 1}, unique: false, collation: {locale: 'simple'}},
     presetReshardedChunks);
 
-jsTest.log(
-    "Succeed if authoritative tags exist in config.tags collection and zones are provided and use an existing zone's name.");
+jsTest.log("Succeed if the zone provided is assigned to a shard but not a range for the source" +
+           " collection.");
+const newZoneName = 'x2';
+assert.commandWorked(st.s.adminCommand({addShardToZone: st.shard1.shardName, zone: newZoneName}));
 assertReshardCollOk({
     reshardCollection: ns,
     key: {newKey: 1},
     unique: false,
     collation: {locale: 'simple'},
-    zones: [{tag: existingZoneName, min: {newKey: 5}, max: {newKey: 10}, ns: ns}]
+    zones: [{zone: newZoneName, min: {newKey: 5}, max: {newKey: 10}}]
 },
                     3);
 
@@ -335,7 +330,7 @@ assertReshardCollOk({
     unique: false,
     numInitialChunks: 1,
     collation: {locale: 'simple'},
-    zones: [{tag: existingZoneName, min: {newKey: MinKey}, max: {newKey: MaxKey}, ns: ns}]
+    zones: [{zone: newZoneName, min: {newKey: MinKey}, max: {newKey: MaxKey}}]
 },
                     1);
 

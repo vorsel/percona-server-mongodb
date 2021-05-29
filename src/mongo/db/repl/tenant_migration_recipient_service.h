@@ -75,6 +75,11 @@ public:
 
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialStateDoc) final;
 
+    /**
+     * Sends an abort to all tenant migration instances on this recipient.
+     */
+    void abortAllMigrations(OperationContext* opCtx);
+
     class Instance final : public PrimaryOnlyService::TypedInstance<Instance> {
     public:
         explicit Instance(ServiceContext* const serviceContext,
@@ -89,6 +94,11 @@ public:
          * 'status'.
          */
         void interrupt(Status status) override;
+
+        /*
+         * Cancels the running instance but permits waiting for forgetMigration.
+         */
+        void cancelMigration();
 
         /**
          * Interrupts the migration for garbage collection.
@@ -151,9 +161,6 @@ public:
          * document and waits for the write to be replicated to every node (i.e. wait for
          * 'rejectReadsBeforeTimestamp' to be set on the TenantMigrationRecipientAccessBlocker of
          * every node) to guarantee that no reads will be incorrectly accepted.
-         *
-         * Throws IllegalOperation if the state document already has 'rejectReadsBeforeTimestamp'
-         * that is not equal to 'returnAfterReachingTimestamp', and on other error.
          */
         OpTime waitUntilMigrationReachesReturnAfterReachingTimestamp(
             OperationContext* opCtx, const Timestamp& returnAfterReachingTimestamp);

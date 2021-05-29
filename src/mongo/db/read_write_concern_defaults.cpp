@@ -98,7 +98,7 @@ void ReadWriteConcernDefaults::checkSuitabilityAsDefault(const WriteConcern& wc)
             !wc.getProvenance().hasSource());
 }
 
-RWConcernDefault ReadWriteConcernDefaults::generateNewConcerns(
+RWConcernDefault ReadWriteConcernDefaults::generateNewCWRWCToBeSavedOnDisk(
     OperationContext* opCtx,
     const boost::optional<ReadConcern>& rc,
     const boost::optional<WriteConcern>& wc) {
@@ -110,6 +110,12 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewConcerns(
             rc || wc);
 
     RWConcernDefault rwc;
+    const bool isDefaultWCMajorityFeatureFlagEnabled =
+        repl::feature_flags::gDefaultWCMajority.isEnabled(serverGlobalParams.featureCompatibility);
+    if (isDefaultWCMajorityFeatureFlagEnabled) {
+        rwc.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kImplicit);
+    }
+
     if (rc && !rc->isEmpty()) {
         checkSuitabilityAsDefault(*rc);
         rwc.setDefaultReadConcern(rc);
@@ -117,6 +123,9 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewConcerns(
     if (wc && !wc->usedDefault) {
         checkSuitabilityAsDefault(*wc);
         rwc.setDefaultWriteConcern(wc);
+        if (isDefaultWCMajorityFeatureFlagEnabled) {
+            rwc.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kGlobal);
+        }
     }
 
     auto* const serviceContext = opCtx->getServiceContext();
@@ -124,12 +133,16 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewConcerns(
     rwc.setUpdateOpTime(currentTime.clusterTime().asTimestamp());
     rwc.setUpdateWallClockTime(serviceContext->getFastClockSource()->now());
 
-    auto current = _getDefault(opCtx);
+    auto current = _getDefaultCWRWCFromDisk(opCtx);
     if (!rc && current) {
         rwc.setDefaultReadConcern(current->getDefaultReadConcern());
     }
     if (!wc && current) {
         rwc.setDefaultWriteConcern(current->getDefaultWriteConcern());
+        if (isDefaultWCMajorityFeatureFlagEnabled && current->getDefaultWriteConcern() &&
+            !current->getDefaultWriteConcern().get().usedDefault) {
+            rwc.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kGlobal);
+        }
     }
     // If the setDefaultRWConcern command tries to unset the global default write concern when it
     // has already been set, throw an error.
@@ -197,7 +210,7 @@ void ReadWriteConcernDefaults::refreshIfNecessary(OperationContext* opCtx) {
 }
 
 boost::optional<ReadWriteConcernDefaults::RWConcernDefaultAndTime>
-ReadWriteConcernDefaults::_getDefault(OperationContext* opCtx) {
+ReadWriteConcernDefaults::_getDefaultCWRWCFromDisk(OperationContext* opCtx) {
     auto defaultsHandle = _defaults.acquire(opCtx, Type::kReadWriteConcernEntry);
     if (defaultsHandle) {
         // Since CWRWC is ok with continuing to use a value well after it has been invalidated
@@ -208,6 +221,39 @@ ReadWriteConcernDefaults::_getDefault(OperationContext* opCtx) {
         return RWConcernDefaultAndTime(*defaultsHandle, defaultsHandle.updateWallClockTime());
     }
     return boost::none;
+}
+
+ReadWriteConcernDefaults::RWConcernDefaultAndTime ReadWriteConcernDefaults::getDefault(
+    OperationContext* opCtx) {
+    auto cached = _getDefaultCWRWCFromDisk(opCtx).value_or(RWConcernDefaultAndTime());
+    const bool isDefaultWCMajorityFeatureFlagEnabled =
+        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        repl::feature_flags::gDefaultWCMajority.isEnabled(serverGlobalParams.featureCompatibility);
+    if (isDefaultWCMajorityFeatureFlagEnabled && !cached.getDefaultWriteConcernSource()) {
+        cached.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kImplicit);
+    }
+
+    // The implicit default write concern will be w:1 if the feature compatibility version is not
+    // yet initialized. Similarly, if the config hasn't yet been loaded on the node, the default
+    // will be w:1, since we have no way of calculating the implicit default. This means that after
+    // we have loaded our config, nodes could change their implicit write concern default. This is
+    // safe since we shouldn't be accepting writes that need a write concern before we have loaded
+    // our config.
+    if (!isDefaultWCMajorityFeatureFlagEnabled || !_implicitDefaultWriteConcernMajority) {
+        return cached;
+    }
+
+    if ((!cached.getDefaultWriteConcern() || cached.getDefaultWriteConcern().get().usedDefault) &&
+        _implicitDefaultWriteConcernMajority.get()) {
+        cached.setDefaultWriteConcern(WriteConcernOptions(WriteConcernOptions::kMajority,
+                                                          WriteConcernOptions::SyncMode::UNSET,
+                                                          WriteConcernOptions::kNoTimeout));
+        if (isDefaultWCMajorityFeatureFlagEnabled) {
+            cached.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kImplicit);
+        }
+    }
+
+    return cached;
 }
 
 void ReadWriteConcernDefaults::setImplicitDefaultWriteConcernMajority(

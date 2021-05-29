@@ -6,19 +6,18 @@
  *
  * @tags: [
  *   requires_sharding,
- *   # TODO (SERVER-54881): ensure the new DDL paths work with balancer, autosplit
- *   # and causal consistency.
  *   assumes_balancer_off,
  *   assumes_autosplit_off,
  *   does_not_support_causal_consistency,
- *   # TODO (SERVER-54881): ensure the new DDL paths work with add/remove shards
+ *   # TODO (SERVER-56879): Support add/remove shards in new DDL paths
  *   does_not_support_add_remove_shards,
- *   # TODO (SERVER-54905): ensure all DDL are resilient.
+ *   # The mutex mechanism used in CRUD and drop states does not support stepdown
  *   does_not_support_stepdowns,
  *   # Can be removed once PM-1965-Milestone-1 is completed.
  *   does_not_support_transactions,
+ *   featureFlagShardingFullDDLSupport,
  *   # Requires all nodes to be running the latest binary.
- *   multiversion_incompatible,
+ *   multiversion_incompatible
  *  ]
  */
 
@@ -75,12 +74,12 @@ var $config = extendWorkload($config, function($config, $super) {
     };
 
     $config.transitions = {
-        init: {create: 1.0},
-        create: {create: 0.01, CRUD: 0.31, drop: 0.31, rename: 0.31, setFCV: 0.06},
-        CRUD: {create: 0.31, CRUD: 0.01, drop: 0.31, rename: 0.31, setFCV: 0.06},
-        drop: {create: 0.31, CRUD: 0.31, drop: 0.01, rename: 0.31, setFCV: 0.06},
-        rename: {create: 0.31, CRUD: 0.31, drop: 0.31, rename: 0.01, setFCV: 0.06},
-        setFCV: {create: 0.25, CRUD: 0.25, drop: 0.25, rename: 0.24, setFCV: 0.01}
+        init: {create: 0.23, CRUD: 0.23, drop: 0.23, rename: 0.23, setFCV: 0.08},
+        create: {create: 0.23, CRUD: 0.23, drop: 0.23, rename: 0.23, setFCV: 0.08},
+        CRUD: {create: 0.23, CRUD: 0.23, drop: 0.23, rename: 0.23, setFCV: 0.08},
+        drop: {create: 0.23, CRUD: 0.23, drop: 0.23, rename: 0.23, setFCV: 0.08},
+        rename: {create: 0.23, CRUD: 0.23, drop: 0.23, rename: 0.23, setFCV: 0.08},
+        setFCV: {create: 0.23, CRUD: 0.23, drop: 0.23, rename: 0.23, setFCV: 0.08}
     };
 
     $config.teardown = function(db, collName, cluster) {

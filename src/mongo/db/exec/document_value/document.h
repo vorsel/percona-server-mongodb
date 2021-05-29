@@ -304,14 +304,20 @@ public:
     struct SorterDeserializeSettings {};  // unused
     void serializeForSorter(BufBuilder& buf) const;
     static Document deserializeForSorter(BufReader& buf, const SorterDeserializeSettings&);
-    int memUsageForSorter() const {
-        return getApproximateSize();
-    }
+
+    /**
+     * Returns the amount of memory used by this 'Document' instance when serialized, e.g. when
+     * serialized as BSON for returning to a client or when serialized for spilling to disk. This
+     * can differ substantially from 'getApproximateSize()' due to the fact that not all portions of
+     * the backing BSON may appear in the serialized version of the document.
+     */
+    size_t memUsageForSorter() const;
 
     /**
      * Returns a document that owns the underlying BSONObj.
      */
-    Document getOwned() const;
+    Document getOwned() const&;
+    Document getOwned() &&;
 
     /**
      * Returns true if the underlying BSONObj is owned.
@@ -353,6 +359,12 @@ private:
     getNestedFieldNonCachingHelper(const FieldPath& dottedField, size_t level) const;
 
     boost::intrusive_ptr<const DocumentStorage> _storage;
+
+    /**
+     * Returns the approximate size of this `Document` instance without considering the size of its
+     * backing BSON object.
+     */
+    size_t getApproximateSizeWithoutBackingBSON() const;
 };
 
 //
@@ -515,6 +527,10 @@ public:
         storage().appendField(fieldName, ValueElement::Kind::kInserted) = val;
     }
 
+    void addField(StringData fieldName, Value&& val) {
+        storage().appendField(fieldName, ValueElement::Kind::kInserted) = std::move(val);
+    }
+
     /** Update field by key. If there is no field with that key, add one.
      *
      *  If the new value is missing(), the field is logically removed.
@@ -524,6 +540,9 @@ public:
     }
     void setField(StringData key, const Value& val) {
         getField(key) = val;
+    }
+    void setField(StringData key, Value&& val) {
+        getField(key) = std::move(val);
     }
     MutableValue getField(StringData key) {
         return MutableValue(storage().getField(key, DocumentStorage::LookupPolicy::kCacheOnly));
@@ -538,6 +557,9 @@ public:
     }
     void setField(Position pos, const Value& val) {
         getField(pos) = val;
+    }
+    void setField(Position pos, Value&& val) {
+        getField(pos) = std::move(val);
     }
     MutableValue getField(Position pos) {
         return MutableValue(storage().getField(pos).val);
@@ -561,11 +583,17 @@ public:
     void setNestedField(const FieldPath& dottedField, const Value& val) {
         getNestedField(dottedField) = val;
     }
+    void setNestedField(const FieldPath& dottedField, Value&& val) {
+        getNestedField(dottedField) = std::move(val);
+    }
 
     /// Takes positions vector from Document::getNestedField. All fields in path must exist.
     MutableValue getNestedField(const std::vector<Position>& positions);
     void setNestedField(const std::vector<Position>& positions, const Value& val) {
         getNestedField(positions) = val;
+    }
+    void setNestedField(const std::vector<Position>& positions, Value&& val) {
+        getNestedField(positions) = std::move(val);
     }
 
     /**
@@ -656,7 +684,7 @@ public:
      *  complete list is in Document::allMetadataFieldNames).
      */
     DocumentStorage& newStorageWithBson(const BSONObj& bson, bool stripMetadata) {
-        reset(make_intrusive<DocumentStorage>(bson, stripMetadata, false));
+        reset(make_intrusive<DocumentStorage>(bson, stripMetadata, false, 0));
         return const_cast<DocumentStorage&>(*storagePtr());
     }
 

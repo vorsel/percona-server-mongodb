@@ -1,6 +1,12 @@
-// Cannot implicitly shard accessed collections because of collection existing when none
-// expected.  Also, the primary node cannot change because we use the local database in this test.
-// @tags: [assumes_no_implicit_collection_creation_after_drop, does_not_support_stepdowns]
+/**
+ * This test uses the local database to test non-standard index creation options on the _id field.
+ * It uses the 'local' database because the scenarios in this test are not meant in a replicated
+ * settings. This also means the test is not meant for sharding or retryable passthroughs.
+ *
+ * @tags: [
+ *     assumes_standalone_mongod,
+ * ]
+ */
 
 // Test creation of the _id index with various options:
 // - _id indexes must have key pattern {_id: 1}.
@@ -72,4 +78,10 @@ coll.drop();
 assert.commandWorked(coll.runCommand("create", {autoIndexId: false}));
 assert.commandFailed(coll.createIndex({_id: "hashed"}, {name: "_id_"}));
 assert.commandFailed(coll.createIndex({a: 1}, {name: "_id_"}));
+
+// Non-_id indexes can have direction values outside the range for the integer type.
+coll.drop();
+assert.commandWorked(coll.insert({_id: 0}));
+assert.commandWorked(coll.createIndex({_id: Number.MAX_VALUE}));
+assert.commandWorked(coll.createIndex({_id: -Number.MAX_VALUE}));
 })();

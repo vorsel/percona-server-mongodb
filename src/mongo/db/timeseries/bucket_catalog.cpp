@@ -39,6 +39,7 @@
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/views/view_catalog.h"
+#include "mongo/platform/compiler.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/util/fail_point.h"
 
@@ -103,6 +104,15 @@ void normalizeObject(BSONObjBuilder* builder, const BSONObj& obj) {
     }
 }
 
+void normalizeTopLevel(BSONObjBuilder* builder, const BSONElement& elem) {
+    if (elem.type() != BSONType::Object) {
+        builder->append(elem);
+    } else {
+        BSONObjBuilder subObject(builder->subobjStart(elem.fieldNameStringData()));
+        normalizeObject(&subObject, elem.Obj());
+    }
+}
+
 UUID getLsid(OperationContext* opCtx, BucketCatalog::CombineWithInsertsFromOtherClients combine) {
     static const UUID common{UUID::gen()};
     switch (combine) {
@@ -143,13 +153,12 @@ StatusWith<std::shared_ptr<BucketCatalog::WriteBatch>> BucketCatalog::insert(
     const BSONObj& doc,
     CombineWithInsertsFromOtherClients combine) {
 
-    BSONObjBuilder metadata;
-    if (auto metaField = options.getMetaField()) {
-        if (auto elem = doc[*metaField]) {
-            metadata.append(elem);
-        }
+    BSONElement metadata;
+    auto metaFieldName = options.getMetaField();
+    if (metaFieldName) {
+        metadata = doc[*metaFieldName];
     }
-    auto key = BucketKey{ns, BucketMetadata{metadata.obj(), comparator}};
+    auto key = BucketKey{ns, BucketMetadata{metadata, comparator}};
 
     auto stats = _getExecutionStats(ns);
     invariant(stats);
@@ -186,13 +195,13 @@ StatusWith<std::shared_ptr<BucketCatalog::WriteBatch>> BucketCatalog::insert(
             return true;
         }
         auto bucketTime = (*bucket).getTime();
-        if (time - bucketTime >= Seconds(options.getBucketMaxSpanSeconds())) {
+        if (time - bucketTime >= Seconds(*options.getBucketMaxSpanSeconds())) {
             stats->numBucketsClosedDueToTimeForward.fetchAndAddRelaxed(1);
             return true;
         }
         if (time < bucketTime) {
             if (!(*bucket)->_hasBeenCommitted() &&
-                (*bucket)->_latestTime - time < Seconds(options.getBucketMaxSpanSeconds())) {
+                (*bucket)->_latestTime - time < Seconds(*options.getBucketMaxSpanSeconds())) {
                 (*bucket).setTime();
             } else {
                 stats->numBucketsClosedDueToTimeBackward.fetchAndAddRelaxed(1);
@@ -249,7 +258,10 @@ bool BucketCatalog::prepareCommit(std::shared_ptr<WriteBatch> batch) {
     _waitToCommitBatch(batch);
 
     BucketAccess bucket(this, batch->bucket());
-    if (!bucket) {
+    if (batch->finished()) {
+        // Someone may have aborted it while we were waiting.
+        return false;
+    } else if (!bucket) {
         abort(batch);
         return false;
     }
@@ -356,13 +368,9 @@ void BucketCatalog::clear(const OID& oid) {
     }
 }
 
-void BucketCatalog::clear(const NamespaceString& ns) {
+void BucketCatalog::clear(const std::function<bool(const NamespaceString&)>& shouldClear) {
     auto lk = _lockExclusive();
     auto statsLk = _statsMutex.lockExclusive();
-
-    auto shouldClear = [&ns](const NamespaceString& bucketNs) {
-        return ns.coll().empty() ? ns.db() == bucketNs.db() : ns == bucketNs;
-    };
 
     for (auto it = _allBuckets.begin(); it != _allBuckets.end();) {
         auto nextIt = std::next(it);
@@ -378,8 +386,12 @@ void BucketCatalog::clear(const NamespaceString& ns) {
     }
 }
 
+void BucketCatalog::clear(const NamespaceString& ns) {
+    clear([&ns](const NamespaceString& bucketNs) { return bucketNs == ns; });
+}
+
 void BucketCatalog::clear(StringData dbName) {
-    clear(NamespaceString(dbName, ""));
+    clear([&dbName](const NamespaceString& bucketNs) { return bucketNs.db() == dbName; });
 }
 
 void BucketCatalog::appendExecutionStats(const NamespaceString& ns, BSONObjBuilder* builder) const {
@@ -463,7 +475,7 @@ bool BucketCatalog::_removeBucket(Bucket* bucket, bool expiringBuckets) {
     _memoryUsage.fetchAndSubtract(bucket->_memoryUsage);
     _markBucketNotIdle(bucket, expiringBuckets /* locked */);
     _removeNonNormalizedKeysForBucket(bucket);
-    _openBuckets.erase({bucket->_ns, std::move(bucket->_metadata)});
+    _openBuckets.erase({bucket->_ns, bucket->_metadata});
     {
         stdx::lock_guard statesLk{_statesMutex};
         _bucketStates.erase(bucket->_id);
@@ -476,7 +488,7 @@ bool BucketCatalog::_removeBucket(Bucket* bucket, bool expiringBuckets) {
 void BucketCatalog::_removeNonNormalizedKeysForBucket(Bucket* bucket) {
     auto comparator = bucket->_metadata.getComparator();
     for (auto&& metadata : bucket->_nonNormalizedKeyMetadatas) {
-        _openBuckets.erase({bucket->_ns, {std::move(metadata), comparator}});
+        _openBuckets.erase({bucket->_ns, {metadata.firstElement(), metadata, comparator}});
     }
 }
 
@@ -644,31 +656,54 @@ boost::optional<BucketCatalog::BucketState> BucketCatalog::_setBucketState(const
     return state;
 }
 
-BucketCatalog::BucketMetadata::BucketMetadata(BSONObj&& obj,
+BucketCatalog::BucketMetadata::BucketMetadata(BSONElement elem,
                                               const StringData::ComparatorInterface* comparator)
-    : _metadata(obj), _comparator(comparator) {}
+    : _metadataElement(elem), _comparator(comparator) {}
+
+BucketCatalog::BucketMetadata::BucketMetadata(BSONElement elem,
+                                              BSONObj obj,
+                                              const StringData::ComparatorInterface* comparator,
+                                              bool normalized,
+                                              bool copied)
+    : _metadataElement(elem),
+      _metadata(obj),
+      _comparator(comparator),
+      _normalized(normalized),
+      _copied(copied) {}
+
 
 void BucketCatalog::BucketMetadata::normalize() {
     if (!_normalized) {
-        BSONObjBuilder objBuilder;
-        // We will get an object of equal size, just with reordered fields.
-        objBuilder.bb().reserveBytes(_metadata.objsize());
-        normalizeObject(&objBuilder, _metadata);
-        _metadata = objBuilder.obj();
+        if (_metadataElement) {
+            BSONObjBuilder objBuilder;
+            // We will get an object of equal size, just with reordered fields.
+            objBuilder.bb().reserveBytes(_metadataElement.size());
+            normalizeTopLevel(&objBuilder, _metadataElement);
+            _metadata = objBuilder.obj();
+        }
+        // Updates the BSONElement to refer to the copied BSONObj.
+        _metadataElement = _metadata.firstElement();
         _normalized = true;
+        _copied = true;
     }
 }
 
 bool BucketCatalog::BucketMetadata::operator==(const BucketMetadata& other) const {
-    return _metadata.binaryEqual(other._metadata);
+    return _metadataElement.binaryEqualValues(other._metadataElement);
 }
 
 const BSONObj& BucketCatalog::BucketMetadata::toBSON() const {
+    // Should only be called after the metadata is owned.
+    invariant(_copied);
     return _metadata;
 }
 
+const BSONElement BucketCatalog::BucketMetadata::getMetaElement() const {
+    return _metadataElement;
+}
+
 StringData BucketCatalog::BucketMetadata::getMetaField() const {
-    return _metadata.firstElementFieldNameStringData();
+    return StringData(_metadataElement.fieldName());
 }
 
 const StringData::ComparatorInterface* BucketCatalog::BucketMetadata::getComparator() const {
@@ -753,14 +788,12 @@ BucketCatalog::BucketAccess::BucketAccess(BucketCatalog* catalog,
 
     // If not found, we normalize the metadata object and try to find it again.
     // Save a copy of the non-normalized metadata before normalizing so we can add this key if the
-    // bucket was found for the normalized metadata.
-    BSONObj nonNormalizedMetadata = key.metadata.toBSON();
+    // bucket was found for the normalized metadata. The BSON element is still refering to that of
+    // the document in current scope at this point. We will only make a copy of it when we decide to
+    // store it.
+    BSONElement nonNormalizedMetadata = key.metadata.getMetaElement();
     key.metadata.normalize();
     HashedBucketKey hashedNormalizedKey = BucketHasher{}.hashed_key(key);
-
-    // Re-construct the key as it were before normalization
-    auto originalBucketKey = key.withMetadata(nonNormalizedMetadata);
-    hashedKey.key = &originalBucketKey;
 
     if (bucketFound(_findOpenBucketThenLock(hashedNormalizedKey))) {
         // Bucket found, check if we have available slots to store the non-normalized key
@@ -772,16 +805,28 @@ BucketCatalog::BucketAccess::BucketAccess(BucketCatalog* catalog,
         // Release the bucket as we need to acquire the exclusive lock for the catalog.
         release();
 
+        // Re-construct the key as it were before normalization.
+        auto originalBucketKey = nonNormalizedMetadata
+            ? key.withCopiedMetadata(nonNormalizedMetadata.wrap())
+            : key.withCopiedMetadata(BSONObj());
+        hashedKey.key = &originalBucketKey;
+
         // Find the bucket under a catalog exclusive lock for the catalog. It may have been modified
         // since we released our locks. If found we store the key to avoid the need to normalize for
         // future lookups with this incoming field order.
+        BSONObj nonNormalizedMetadataObj =
+            nonNormalizedMetadata ? nonNormalizedMetadata.wrap() : BSONObj();
         if (bucketFound(_findOpenBucketThenLockAndStoreKey(
-                hashedNormalizedKey, hashedKey, std::move(nonNormalizedMetadata)))) {
+                hashedNormalizedKey, hashedKey, nonNormalizedMetadataObj))) {
             return;
         }
     }
 
-    // Bucket not found, grab exclusive lock and create bucket
+    // Bucket not found, grab exclusive lock and create bucket with the key before normalization.
+    auto originalBucketKey = nonNormalizedMetadata
+        ? key.withCopiedMetadata(nonNormalizedMetadata.wrap())
+        : key.withCopiedMetadata(BSONObj());
+    hashedKey.key = &originalBucketKey;
     auto lk = _catalog->_lockExclusive();
     _findOrCreateOpenBucketThenLock(hashedNormalizedKey, hashedKey);
 }
@@ -832,7 +877,9 @@ BucketCatalog::BucketState BucketCatalog::BucketAccess::_findOpenBucketThenLock(
 }
 
 BucketCatalog::BucketState BucketCatalog::BucketAccess::_findOpenBucketThenLockAndStoreKey(
-    const HashedBucketKey& normalizedKey, const HashedBucketKey& key, BSONObj&& metadata) {
+    const HashedBucketKey& normalizedKey,
+    const HashedBucketKey& nonNormalizedKey,
+    BSONObj nonNormalizedMetadata) {
     invariant(!isLocked());
     {
         auto lk = _catalog->_lockExclusive();
@@ -845,14 +892,16 @@ BucketCatalog::BucketState BucketCatalog::BucketAccess::_findOpenBucketThenLockA
         _bucket = it->second;
         _acquire();
 
-        // Store the key if we still have free slots
+        // Store the non-normalized key if we still have free slots
         if (_bucket->_nonNormalizedKeyMetadatas.size() <
             _bucket->_nonNormalizedKeyMetadatas.capacity()) {
-            auto [_, inserted] = _catalog->_openBuckets.insert(std::make_pair(key, _bucket));
+            auto [_, inserted] =
+                _catalog->_openBuckets.insert(std::make_pair(nonNormalizedKey, _bucket));
             if (inserted) {
-                _bucket->_nonNormalizedKeyMetadatas.push_back(metadata);
+                _bucket->_nonNormalizedKeyMetadatas.push_back(nonNormalizedMetadata);
                 // Increment the memory usage to store this key and value in _openBuckets
-                _bucket->_memoryUsage += key.key->ns.size() + metadata.objsize() + sizeof(_bucket);
+                _bucket->_memoryUsage += nonNormalizedKey.key->ns.size() +
+                    nonNormalizedMetadata.objsize() + sizeof(_bucket);
             }
         }
     }
@@ -875,11 +924,11 @@ BucketCatalog::BucketState BucketCatalog::BucketAccess::_confirmStateForAcquired
 }
 
 void BucketCatalog::BucketAccess::_findOrCreateOpenBucketThenLock(
-    const HashedBucketKey& normalizedKey, const HashedBucketKey& key) {
+    const HashedBucketKey& normalizedKey, const HashedBucketKey& nonNormalizedKey) {
     auto it = _catalog->_openBuckets.find(normalizedKey);
     if (it == _catalog->_openBuckets.end()) {
         // No open bucket for this metadata.
-        _create(normalizedKey, key);
+        _create(normalizedKey, nonNormalizedKey);
         return;
     }
 
@@ -898,7 +947,7 @@ void BucketCatalog::BucketAccess::_findOrCreateOpenBucketThenLock(
     }
 
     _catalog->_abort(_guard, _bucket, nullptr, boost::none);
-    _create(normalizedKey, key);
+    _create(normalizedKey, nonNormalizedKey);
 }
 
 void BucketCatalog::BucketAccess::_acquire() {
@@ -907,11 +956,11 @@ void BucketCatalog::BucketAccess::_acquire() {
 }
 
 void BucketCatalog::BucketAccess::_create(const HashedBucketKey& normalizedKey,
-                                          const HashedBucketKey& key,
+                                          const HashedBucketKey& nonNormalizedKey,
                                           bool openedDuetoMetadata) {
     _bucket = _catalog->_allocateBucket(normalizedKey, *_time, _stats, openedDuetoMetadata);
-    _catalog->_openBuckets[key] = _bucket;
-    _bucket->_nonNormalizedKeyMetadatas.push_back(key.key->metadata.toBSON());
+    _catalog->_openBuckets[nonNormalizedKey] = _bucket;
+    _bucket->_nonNormalizedKeyMetadatas.push_back(nonNormalizedKey.key->metadata.toBSON());
     _acquire();
 }
 
@@ -947,10 +996,11 @@ void BucketCatalog::BucketAccess::rollover(const std::function<bool(BucketAccess
     release();
 
     // Precompute the hash outside the lock, since it's expensive.
-    auto prevMetadata = _key->metadata.toBSON();
+    auto prevMetadata = _key->metadata.getMetaElement();
     _key->metadata.normalize();
     auto hashedNormalizedKey = BucketHasher{}.hashed_key(*_key);
-    auto prevBucketKey = _key->withMetadata(prevMetadata);
+    auto prevBucketKey = prevMetadata ? _key->withCopiedMetadata(prevMetadata.wrap())
+                                      : _key->withCopiedMetadata(BSONObj());
     auto hashedKey = BucketHasher{}.hashed_key(prevBucketKey);
 
     auto lk = _catalog->_lockExclusive();
@@ -992,315 +1042,6 @@ void BucketCatalog::BucketAccess::setTime() {
 
 Date_t BucketCatalog::BucketAccess::getTime() const {
     return _bucket->id().asDateT();
-}
-
-void BucketCatalog::MinMax::Data::setValue(const BSONElement& elem) {
-    auto requiredSize = elem.size() - elem.fieldNameSize() + 1;
-    if (_totalSize < requiredSize) {
-        _value = std::make_unique<char[]>(requiredSize);
-    }
-    // Store element as BSONElement buffer but strip out the field name
-    _value[0] = elem.type();
-    _value[1] = '\0';
-    memcpy(_value.get() + 2, elem.value(), elem.valuesize());
-    _totalSize = requiredSize;
-    _type = Type::kValue;
-    _updated = true;
-}
-
-void BucketCatalog::MinMax::Data::setObject() {
-    if (std::exchange(_type, Type::kObject) != Type::kObject) {
-        _updated = true;
-    }
-}
-
-void BucketCatalog::MinMax::Data::setRootObject() {
-    _type = Type::kObject;
-}
-
-void BucketCatalog::MinMax::Data::setArray() {
-    if (std::exchange(_type, Type::kArray) != Type::kArray) {
-        _updated = true;
-    }
-}
-
-BSONElement BucketCatalog::MinMax::Data::value() const {
-    return BSONElement(_value.get(), 1, _totalSize, BSONElement::CachedSizeTag{});
-}
-
-BSONType BucketCatalog::MinMax::Data::valueType() const {
-    return (BSONType)_value[0];
-}
-
-int BucketCatalog::MinMax::Data::valueSize() const {
-    return _totalSize;
-}
-
-void BucketCatalog::MinMax::update(const BSONObj& doc,
-                                   boost::optional<StringData> metaField,
-                                   const StringData::ComparatorInterface* stringComparator) {
-    invariant(_min.type() == Type::kObject || _min.type() == Type::kUnset);
-    invariant(_max.type() == Type::kObject || _max.type() == Type::kUnset);
-
-
-    _min.setRootObject();
-    _max.setRootObject();
-    for (auto&& elem : doc) {
-        if (metaField && elem.fieldNameStringData() == metaField) {
-            continue;
-        }
-        _updateWithMemoryUsage(&_object[elem.fieldNameStringData()], elem, stringComparator);
-    }
-}
-
-void BucketCatalog::MinMax::_update(BSONElement elem,
-                                    const StringData::ComparatorInterface* stringComparator) {
-    auto typeComp = [&](BSONType type) {
-        return elem.canonicalType() - canonicalizeBSONType(type);
-    };
-
-    if (elem.type() == Object) {
-        auto shouldUpdateObject = [&](Data& data, auto compare) {
-            return data.type() == Type::kObject || data.type() == Type::kUnset ||
-                (data.type() == Type::kArray && compare(typeComp(Array), 0)) ||
-                (data.type() == Type::kValue && compare(typeComp(data.valueType()), 0));
-        };
-        bool updateMin = shouldUpdateObject(_min, std::less<int>{});
-        if (updateMin) {
-            _min.setObject();
-        }
-        bool updateMax = shouldUpdateObject(_max, std::greater<int>{});
-        if (updateMax) {
-            _max.setObject();
-        }
-
-        // Compare objects element-wise if min or max need to be updated
-        if (updateMin || updateMax) {
-            for (auto&& subElem : elem.Obj()) {
-                _updateWithMemoryUsage(
-                    &_object[subElem.fieldNameStringData()], subElem, stringComparator);
-            }
-        }
-        return;
-    }
-
-    if (elem.type() == Array) {
-        auto shouldUpdateArray = [&](Data& data, auto compare) {
-            return data.type() == Type::kArray || data.type() == Type::kUnset ||
-                (data.type() == Type::kObject && compare(typeComp(Object), 0)) ||
-                (data.type() == Type::kValue && compare(typeComp(data.valueType()), 0));
-        };
-        bool updateMin = shouldUpdateArray(_min, std::less<int>{});
-        if (updateMin) {
-            _min.setArray();
-        }
-        bool updateMax = shouldUpdateArray(_max, std::greater<int>{});
-        if (updateMax) {
-            _max.setArray();
-        }
-        // Compare objects element-wise if min or max need to be updated
-        if (updateMin || updateMax) {
-            auto elemArray = elem.Array();
-            if (_array.size() < elemArray.size()) {
-                _array.resize(elemArray.size());
-            }
-            for (size_t i = 0; i < elemArray.size(); i++) {
-                _updateWithMemoryUsage(&_array[i], elemArray[i], stringComparator);
-            }
-        }
-        return;
-    }
-
-    auto maybeUpdateValue = [&](Data& data, auto compare) {
-        if (data.type() == Type::kUnset ||
-            (data.type() == Type::kObject && compare(typeComp(Object), 0)) ||
-            (data.type() == Type::kArray && compare(typeComp(Array), 0)) ||
-            (data.type() == Type::kValue &&
-             compare(elem.woCompare(data.value(), false, stringComparator), 0))) {
-            data.setValue(elem);
-        }
-    };
-    maybeUpdateValue(_min, std::less<int>{});
-    maybeUpdateValue(_max, std::greater<int>{});
-}
-
-void BucketCatalog::MinMax::_updateWithMemoryUsage(
-    MinMax* minMax, BSONElement elem, const StringData::ComparatorInterface* stringComparator) {
-    _memoryUsage -= minMax->getMemoryUsage();
-    minMax->_update(elem, stringComparator);
-    _memoryUsage += minMax->getMemoryUsage();
-}
-
-BSONObj BucketCatalog::MinMax::min() const {
-    invariant(_min.type() == Type::kObject);
-
-    BSONObjBuilder builder;
-    _append(&builder, GetMin());
-    return builder.obj();
-}
-
-BSONObj BucketCatalog::MinMax::max() const {
-    invariant(_max.type() == Type::kObject);
-
-    BSONObjBuilder builder;
-    _append(&builder, GetMax());
-    return builder.obj();
-}
-
-template <typename GetDataFn>
-void BucketCatalog::MinMax::_append(BSONObjBuilder* builder, GetDataFn getData) const {
-    invariant(getData(*this).type() == Type::kObject);
-
-    for (const auto& minMax : _object) {
-        const Data& data = getData(minMax.second);
-        invariant(data.type() != Type::kUnset);
-        if (data.type() == Type::kObject) {
-            BSONObjBuilder subObj(builder->subobjStart(minMax.first));
-            minMax.second._append(&subObj, getData);
-        } else if (data.type() == Type::kArray) {
-            BSONArrayBuilder subArr(builder->subarrayStart(minMax.first));
-            minMax.second._append(&subArr, getData);
-        } else {
-            builder->appendAs(data.value(), minMax.first);
-        }
-    }
-}
-
-template <typename GetDataFn>
-void BucketCatalog::MinMax::_append(BSONArrayBuilder* builder, GetDataFn getData) const {
-    invariant(getData(*this).type() == Type::kArray);
-
-    for (const auto& minMax : _array) {
-        const Data& data = getData(minMax);
-        invariant(data.type() != Type::kUnset);
-        if (data.type() == Type::kObject) {
-            BSONObjBuilder subObj(builder->subobjStart());
-            minMax._append(&subObj, getData);
-        } else if (data.type() == Type::kArray) {
-            BSONArrayBuilder subArr(builder->subarrayStart());
-            minMax._append(&subArr, getData);
-        } else {
-            builder->append(data.value());
-        }
-    }
-}
-
-BSONObj BucketCatalog::MinMax::minUpdates() {
-    invariant(_min.type() == Type::kObject);
-
-    BSONObjBuilder builder;
-    _appendUpdates(&builder, GetMin());
-    return builder.obj();
-}
-
-BSONObj BucketCatalog::MinMax::maxUpdates() {
-    invariant(_max.type() == Type::kObject);
-
-    BSONObjBuilder builder;
-    _appendUpdates(&builder, GetMax());
-    return builder.obj();
-}
-
-template <typename GetDataFn>
-bool BucketCatalog::MinMax::_appendUpdates(BSONObjBuilder* builder, GetDataFn getData) {
-    const auto& data = getData(*this);
-    invariant(data.type() == Type::kObject || data.type() == Type::kArray);
-
-    bool appended = false;
-    if (data.type() == Type::kObject) {
-        bool hasUpdateSection = false;
-        BSONObjBuilder updateSection;
-        StringMap<BSONObj> subDiffs;
-        for (auto& minMax : _object) {
-            const auto& subdata = getData(minMax.second);
-            invariant(subdata.type() != Type::kUnset);
-            if (subdata.updated()) {
-                if (subdata.type() == Type::kObject) {
-                    BSONObjBuilder subObj(updateSection.subobjStart(minMax.first));
-                    minMax.second._append(&subObj, getData);
-                } else if (subdata.type() == Type::kArray) {
-                    BSONArrayBuilder subArr(updateSection.subarrayStart(minMax.first));
-                    minMax.second._append(&subArr, getData);
-                } else {
-                    updateSection.appendAs(subdata.value(), minMax.first);
-                }
-                minMax.second._clearUpdated(getData);
-                appended = true;
-                hasUpdateSection = true;
-            } else if (subdata.type() != Type::kValue) {
-                BSONObjBuilder subDiff;
-                if (minMax.second._appendUpdates(&subDiff, getData)) {
-                    // An update occurred at a lower level, so append the sub diff.
-                    subDiffs[doc_diff::kSubDiffSectionFieldPrefix + minMax.first] = subDiff.obj();
-                    appended = true;
-                };
-            }
-        }
-        if (hasUpdateSection) {
-            builder->append(doc_diff::kUpdateSectionFieldName, updateSection.done());
-        }
-
-        // Sub diffs are required to come last.
-        for (auto& subDiff : subDiffs) {
-            builder->append(subDiff.first, std::move(subDiff.second));
-        }
-    } else {
-        builder->append(doc_diff::kArrayHeader, true);
-        DecimalCounter<size_t> count;
-        for (auto& minMax : _array) {
-            const auto& subdata = getData(minMax);
-            invariant(subdata.type() != Type::kUnset);
-            if (subdata.updated()) {
-                std::string updateFieldName = str::stream()
-                    << doc_diff::kUpdateSectionFieldName << StringData(count);
-                if (subdata.type() == Type::kObject) {
-                    BSONObjBuilder subObj(builder->subobjStart(updateFieldName));
-                    minMax._append(&subObj, getData);
-                } else if (subdata.type() == Type::kArray) {
-                    BSONArrayBuilder subArr(builder->subarrayStart(updateFieldName));
-                    minMax._append(&subArr, getData);
-                } else {
-                    builder->appendAs(subdata.value(), updateFieldName);
-                }
-                minMax._clearUpdated(getData);
-                appended = true;
-            } else if (subdata.type() != Type::kValue) {
-                BSONObjBuilder subDiff;
-                if (minMax._appendUpdates(&subDiff, getData)) {
-                    // An update occurred at a lower level, so append the sub diff.
-                    builder->append(str::stream() << doc_diff::kSubDiffSectionFieldPrefix
-                                                  << StringData(count),
-                                    subDiff.done());
-                    appended = true;
-                }
-            }
-            ++count;
-        }
-    }
-
-    return appended;
-}
-
-template <typename GetDataFn>
-void BucketCatalog::MinMax::_clearUpdated(GetDataFn getData) {
-    auto& data = getData(*this);
-    invariant(data.type() != Type::kUnset);
-
-    data.clearUpdated();
-    if (data.type() == Type::kObject) {
-        for (auto& minMax : _object) {
-            minMax.second._clearUpdated(getData);
-        }
-    } else if (_min.type() == Type::kArray) {
-        for (auto& minMax : _array) {
-            minMax._clearUpdated(getData);
-        }
-    }
-}
-
-uint64_t BucketCatalog::MinMax::getMemoryUsage() const {
-    return _memoryUsage + _min.valueSize() + _min.valueSize() +
-        (sizeof(MinMax) * (_object.size() + _array.size()));
 }
 
 BucketCatalog::WriteBatch::WriteBatch(Bucket* bucket,
@@ -1399,16 +1140,24 @@ void BucketCatalog::WriteBatch::_prepareCommit() {
         ++it;
     }
 
-    _bucket->_memoryUsage -= _bucket->_minmax.getMemoryUsage();
     for (const auto& doc : _measurements) {
         _bucket->_minmax.update(
             doc, _bucket->_metadata.getMetaField(), _bucket->_metadata.getComparator());
     }
-    _bucket->_memoryUsage += _bucket->_minmax.getMemoryUsage();
 
     const bool isUpdate = _numPreviouslyCommittedMeasurements > 0;
-    _min = isUpdate ? _bucket->_minmax.minUpdates() : _bucket->_minmax.min();
-    _max = isUpdate ? _bucket->_minmax.maxUpdates() : _bucket->_minmax.max();
+    if (isUpdate) {
+        _min = _bucket->_minmax.minUpdates();
+        _max = _bucket->_minmax.maxUpdates();
+    } else {
+        _min = _bucket->_minmax.min();
+        _max = _bucket->_minmax.max();
+
+        // Approximate minmax memory usage by taking sizes of initial commit. Subsequent updates may
+        // add fields but are most likely just to update values.
+        _bucket->_memoryUsage += _min.objsize();
+        _bucket->_memoryUsage += _max.objsize();
+    }
 }
 
 void BucketCatalog::WriteBatch::_finish(const CommitInfo& info) {
@@ -1420,6 +1169,10 @@ void BucketCatalog::WriteBatch::_finish(const CommitInfo& info) {
 
 void BucketCatalog::WriteBatch::_abort(const boost::optional<Status>& status,
                                        bool canAccessBucket) {
+    if (finished()) {
+        return;
+    }
+
     _active = false;
     std::string bucketIdentification;
     if (canAccessBucket) {

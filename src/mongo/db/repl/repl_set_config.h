@@ -529,6 +529,18 @@ public:
      */
     bool isImplicitDefaultWriteConcernMajority() const;
 
+    /**
+     * Returns true if the config consists of a Primary-Secondary-Arbiter (PSA) architecture.
+     */
+    bool isPSASet() const {
+        return getNumMembers() == 3 && getNumDataBearingMembers() == 2;
+    }
+
+    /**
+     * Returns true if the getLastErrorDefaults has been customized.
+     */
+    bool containsCustomizedGetLastErrorDefaults() const;
+
 private:
     /**
      * Sets replica set ID to 'defaultReplicaSetId' if 'cfg' does not contain an ID.

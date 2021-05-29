@@ -87,6 +87,16 @@ __hs_insert_record(WT_SESSION_IMPL *session, WT_CURSOR *cursor, WT_BTREE *btree,
     counter = 0;
 
     /*
+     * We might be entering this code from application thread's context. We should make sure that we
+     * are not using snapshot associated with application session to perform visibility checks on
+     * history store records. Note that the history store cursor performs visibility checks based on
+     * snapshot if none of WT_CURSTD_HS_READ_ALL or WT_CURSTD_HS_READ_COMMITTED flags are set.
+     */
+    WT_ASSERT(session,
+      F_ISSET(session, WT_SESSION_INTERNAL) ||
+        F_ISSET(cursor, WT_CURSTD_HS_READ_ALL | WT_CURSTD_HS_READ_COMMITTED));
+
+    /*
      * Keep track if the caller had set WT_CURSTD_HS_READ_ALL flag on the history store cursor. We
      * want to preserve the flags set by the caller when we exit from this function. Also, we want
      * to explicitly set the flag WT_CURSTD_HS_READ_ALL only for the search_near operations on the
@@ -264,6 +274,8 @@ __wt_hs_insert_updates(
     WT_DECL_ITEM(prev_full_value);
     WT_DECL_ITEM(tmp);
     WT_DECL_RET;
+/* Limit the number of consecutive reverse modifies. */
+#define WT_MAX_CONSECUTIVE_REVERSE_MODIFY 10
 /* If the limit is exceeded, we will insert a full update to the history store */
 #define MAX_REVERSE_MODIFY_NUM 16
     WT_MODIFY entries[MAX_REVERSE_MODIFY_NUM];
@@ -274,7 +286,7 @@ __wt_hs_insert_updates(
     WT_UPDATE *non_aborted_upd, *oldest_upd, *prev_upd, *tombstone, *upd;
     WT_TIME_WINDOW tw;
     wt_off_t hs_size;
-    uint64_t insert_cnt, max_hs_size;
+    uint64_t insert_cnt, max_hs_size, modify_cnt;
     uint32_t i;
     uint8_t *p;
     int nentries;
@@ -353,10 +365,12 @@ __wt_hs_insert_updates(
         }
 
         first_globally_visible_upd = min_ts_upd = out_of_order_ts_upd = NULL;
-        enable_reverse_modify = true;
 
-        __wt_update_vector_clear(&updates);
-        WT_ASSERT(session, out_of_order_ts_updates.size == 0);
+        /*
+         * Reverse deltas are only supported on 'S' and 'u' value formats.
+         */
+        enable_reverse_modify =
+          (WT_STREQ(btree->value_format, "S") || WT_STREQ(btree->value_format, "u"));
 
         /*
          * The algorithm assumes the oldest update on the update chain in memory is either a full
@@ -367,10 +381,11 @@ __wt_hs_insert_updates(
          * newer than a TOMBSTONE must be a full update.
          *
          * The algorithm walks from the oldest update, or the most recently inserted into history
-         * store update, to the newest update and build full updates along the way. It sets the stop
-         * time point of the update to the start time point of the next update, squashes the updates
-         * that are from the same transaction and of the same start timestamp, calculates reverse
-         * modification if prev_upd is a MODIFY, and inserts the update to the history store.
+         * store update, to the newest update and builds full updates along the way. It sets the
+         * stop time point of the update to the start time point of the next update, squashes the
+         * updates that are from the same transaction and of the same start timestamp, checks if the
+         * update can be written as reverse modification, and inserts the update to the history
+         * store either as a full update or a reverse modification.
          *
          * It deals with the following scenarios:
          * 1) We only have full updates on the chain and we only insert full updates to
@@ -479,6 +494,7 @@ __wt_hs_insert_updates(
          * time point, we can squash updates with the same start time point as the onpage update
          * away.
          */
+        modify_cnt = 0;
         for (; updates.size > 0 &&
              !(upd->txnid == list->onpage_upd->txnid &&
                upd->start_ts == list->onpage_upd->start_ts);
@@ -522,9 +538,19 @@ __wt_hs_insert_updates(
                  */
                 WT_ASSERT(session, prev_upd->start_ts <= prev_upd->durable_ts);
 
-                if (out_of_order_ts_upd != NULL && out_of_order_ts_upd->txnid == prev_upd->txnid &&
-                  out_of_order_ts_upd->start_ts == prev_upd->start_ts) {
+                /*
+                 * Pop from the out of order timestamp updates stack if the previous update or the
+                 * current update is at the head of the stack. We need to check both cases because
+                 * if there is a tombstone older than the out of order timestamp, we would not pop
+                 * it because we skip the tombstone. Pop it when we are inserting it instead.
+                 */
+                if (out_of_order_ts_upd != NULL &&
+                  ((out_of_order_ts_upd->txnid == prev_upd->txnid &&
+                     out_of_order_ts_upd->start_ts == prev_upd->start_ts) ||
+                    (out_of_order_ts_upd->txnid == upd->txnid &&
+                      out_of_order_ts_upd->start_ts == upd->start_ts))) {
                     __wt_update_vector_pop(&out_of_order_ts_updates, &out_of_order_ts_upd);
+                    out_of_order_ts_upd = NULL;
                 }
 
                 if (out_of_order_ts_upd != NULL &&
@@ -588,7 +614,9 @@ __wt_hs_insert_updates(
              * Calculate reverse modify and clear the history store records with timestamps when
              * inserting the first update. Always write on-disk data store updates to the history
              * store as a full update because the on-disk update will be the base update for all the
-             * updates that are older than the on-disk update.
+             * updates that are older than the on-disk update. Limit the number of consecutive
+             * reverse modifies for standard updates. We want to ensure we do not store a large
+             * chain of reverse modifies as to impact read performance.
              *
              * Due to concurrent operation of checkpoint and eviction, it is possible that history
              * store may have more recent versions of a key than the on-disk version. Without a
@@ -596,17 +624,20 @@ __wt_hs_insert_updates(
              * the RTS.
              */
             nentries = MAX_REVERSE_MODIFY_NUM;
-            if (!F_ISSET(upd, WT_UPDATE_DS) && upd->type == WT_UPDATE_MODIFY &&
-              enable_reverse_modify &&
+            if (!F_ISSET(upd, WT_UPDATE_DS) && !F_ISSET(prev_upd, WT_UPDATE_DS) &&
+              enable_reverse_modify && modify_cnt < WT_MAX_CONSECUTIVE_REVERSE_MODIFY &&
               __wt_calc_modify(session, prev_full_value, full_value, prev_full_value->size / 10,
                 entries, &nentries) == 0) {
                 WT_ERR(__wt_modify_pack(hs_cursor, entries, nentries, &modify_value));
                 WT_ERR(__hs_insert_record(
                   session, hs_cursor, btree, key, WT_UPDATE_MODIFY, modify_value, &tw));
                 __wt_scr_free(session, &modify_value);
-            } else
+                ++modify_cnt;
+            } else {
+                modify_cnt = 0;
                 WT_ERR(__hs_insert_record(
                   session, hs_cursor, btree, key, WT_UPDATE_STANDARD, full_value, &tw));
+            }
 
             /* Flag the update as now in the history store. */
             F_SET(upd, WT_UPDATE_HS);
@@ -620,8 +651,24 @@ __wt_hs_insert_updates(
             }
         }
 
+        /* If we squash the onpage value, there may be one or more updates left in the stack. */
         if (updates.size > 0)
             WT_STAT_CONN_DATA_INCR(session, cache_hs_write_squash);
+
+        __wt_update_vector_clear(&updates);
+        /*
+         * In the case that the onpage value is an out of order timestamp update and the update
+         * older than it is a tombstone, it remains in the stack. Clean it up.
+         */
+        WT_ASSERT(session, out_of_order_ts_updates.size <= 1);
+#ifdef HAVE_DIAGNOSTIC
+        if (out_of_order_ts_updates.size == 1) {
+            __wt_update_vector_peek(&out_of_order_ts_updates, &upd);
+            WT_ASSERT(session,
+              upd->txnid == list->onpage_upd->txnid && upd->start_ts == list->onpage_upd->start_ts);
+        }
+#endif
+        __wt_update_vector_clear(&out_of_order_ts_updates);
     }
 
     WT_ERR(__wt_block_manager_named_size(session, WT_HS_FILE, &hs_size));

@@ -114,6 +114,11 @@ add_option('ninja',
     help='Enable the build.ninja generator tool stable or canary version',
 )
 
+add_option('force-jobs',
+    help='Allow more jobs than available cpu\'s when icecream is not enabled.',
+    nargs=0
+)
+
 add_option('build-tools',
     choices=['stable', 'next'],
     default='stable',
@@ -1298,7 +1303,6 @@ def shim_library(env, name, needs_link=False, *args, **kwargs):
 
     for n in nodes:
         setattr(n.attributes, "needs_link", needs_link)
-        setattr(n.attributes, "is_shim", True)
 
     return nodes
 
@@ -1598,6 +1602,9 @@ if has_option("cache"):
 link_model = get_option('link-model')
 if link_model == "auto":
     link_model = "static"
+
+if link_model.startswith('dynamic') and get_option('install-action') == 'symlink':
+    env.FatalError(f"Options '--link-model={link_model}' not supported with '--install-action={get_option('install-action')}'.")
 
 # libunwind configuration.
 # In which the following globals are set and normalized to bool:
@@ -2058,7 +2065,7 @@ if link_model.startswith("dynamic"):
 if env['_LIBDEPS'] == '$_LIBDEPS_LIBS':
     # The following platforms probably aren't using the binutils
     # toolchain, or may be using it for the archiver but not the
-    # linker, and binutils currently is the olny thing that supports
+    # linker, and binutils currently is the only thing that supports
     # thin archives. Don't even try on those platforms.
     if not env.TargetOSIs('solaris', 'darwin', 'windows', 'openbsd'):
         env.Tool('thin_archive')
@@ -2197,6 +2204,8 @@ env['LIBDEPS_TAG_EXPANSIONS'].append(link_guard_libdeps_tag_expand)
 
 if has_option('audit'):
     env.Append( CPPDEFINES=[ 'PERCONA_AUDIT_ENABLED' ] )
+
+env.Tool('forceincludes')
 
 # ---- other build setup -----
 if debugBuild:
@@ -2690,7 +2699,7 @@ if get_option('ocsp-stapling') == 'on':
     env.SetConfigHeaderDefine("MONGO_CONFIG_OCSP_STAPLING_ENABLED")
 
 
-if not env.TargetOSIs('windows') and (env.ToolchainIs('GCC', 'clang')):
+if not env.TargetOSIs('windows', 'macOS') and (env.ToolchainIs('GCC', 'clang')):
 
     # By default, apply our current microarchitecture minima. If the
     # user has customized a flag of the same name in any of CCFLAGS,
@@ -3565,50 +3574,50 @@ def doConfigure(myenv):
                 myenv.ConfError('Failed to enable -fsanitize-coverage with flag: {0}', sanitize_coverage_option )
 
 
-        blackfiles_map = {
-            "address" : myenv.File("#etc/asan.blacklist"),
-            "thread" : myenv.File("#etc/tsan.blacklist"),
-            "undefined" : myenv.File("#etc/ubsan.blacklist"),
+        denyfiles_map = {
+            "address" : myenv.File("#etc/asan.denylist"),
+            "thread" : myenv.File("#etc/tsan.denylist"),
+            "undefined" : myenv.File("#etc/ubsan.denylist"),
         }
 
-        # Select those unique black files that are associated with the
+        # Select those unique deny files that are associated with the
         # currently enabled sanitizers, but filter out those that are
         # zero length.
-        blackfiles = {v for (k, v) in blackfiles_map.items() if k in sanitizer_list}
-        blackfiles = [f for f in blackfiles if os.stat(f.path).st_size != 0]
+        denyfiles = {v for (k, v) in denyfiles_map.items() if k in sanitizer_list}
+        denyfiles = [f for f in denyfiles if os.stat(f.path).st_size != 0]
 
-        # Filter out any blacklist options that the toolchain doesn't support.
-        supportedBlackfiles = []
-        blackfilesTestEnv = myenv.Clone()
-        for blackfile in blackfiles:
-            if AddToCCFLAGSIfSupported(blackfilesTestEnv, f"-fsanitize-blacklist={blackfile}"):
-                supportedBlackfiles.append(blackfile)
-        blackfilesTestEnv = None
-        supportedBlackfiles = sorted(supportedBlackfiles)
+        # Filter out any denylist options that the toolchain doesn't support.
+        supportedDenyfiles = []
+        denyfilesTestEnv = myenv.Clone()
+        for denyfile in denyfiles:
+            if AddToCCFLAGSIfSupported(denyfilesTestEnv, f"-fsanitize-blacklist={denyfile}"):
+                supportedDenyfiles.append(denyfile)
+        denyfilesTestEnv = None
+        supportedDenyfiles = sorted(supportedDenyfiles)
 
-        # If we ended up with any blackfiles after the above filters,
+        # If we ended up with any denyfiles after the above filters,
         # then expand them into compiler flag arguments, and use a
         # generator to return at command line expansion time so that
         # we can change the signature if the file contents change.
-        if supportedBlackfiles:
+        if supportedDenyfiles:
             # Unconditionally using the full path can affect SCons cached builds, so we only do
             # this in cases where we know it's going to matter.
             if 'ICECC' in env and env['ICECC']:
                 # Make these files available to remote icecream builds if requested.
                 # These paths *must* be absolute to match the paths in the remote
                 # toolchain archive.
-                blacklist_options=[
-                    f"-fsanitize-blacklist={blackfile.get_abspath()}"
-                    for blackfile in supportedBlackfiles
+                denylist_options=[
+                    f"-fsanitize-blacklist={denyfile.get_abspath()}"
+                    for denyfile in supportedDenyfiles
                 ]
-                # If a sanitizer is in use with a blacklist file, we have to ensure they get
+                # If a sanitizer is in use with a denylist file, we have to ensure they get
                 # added to the toolchain package that gets sent to the remote hosts so they
                 # can be found by the remote compiler.
-                env.Append(ICECC_CREATE_ENV_ADDFILES=supportedBlackfiles)
+                env.Append(ICECC_CREATE_ENV_ADDFILES=supportedDenyfiles)
             else:
-                blacklist_options=[
-                    f"-fsanitize-blacklist={blackfile.path}"
-                    for blackfile in supportedBlackfiles
+                denylist_options=[
+                    f"-fsanitize-blacklist={denyfile.path}"
+                    for denyfile in supportedDenyfiles
                 ]
 
             if 'CCACHE' in env and env['CCACHE']:
@@ -3616,22 +3625,22 @@ def doConfigure(myenv):
                 # -fsanitize-blacklist at all or only support one instance of it. This will
                 # work on any version of ccache because the point is only to ensure that the
                 # resulting hash for any compiled object is guaranteed to take into account
-                # the effect of any sanitizer blacklist files used as part of the build.
+                # the effect of any sanitizer denylist files used as part of the build.
                 # TODO: This will no longer be required when the following pull requests/
                 # issues have been merged and deployed.
                 # https://github.com/ccache/ccache/pull/258
                 # https://github.com/ccache/ccache/issues/318
-                env.Append(CCACHE_EXTRAFILES=supportedBlackfiles)
+                env.Append(CCACHE_EXTRAFILES=supportedDenyfiles)
 
-            def SanitizerBlacklistGenerator(source, target, env, for_signature):
+            def SanitizerDenylistGenerator(source, target, env, for_signature):
                 if for_signature:
-                    return [f.get_csig() for f in supportedBlackfiles]
-                return blacklist_options
+                    return [f.get_csig() for f in supportedDenyfiles]
+                return denylist_options
 
             myenv.AppendUnique(
-                SANITIZER_BLACKLIST_GENERATOR=SanitizerBlacklistGenerator,
-                CCFLAGS="${SANITIZER_BLACKLIST_GENERATOR}",
-                LINKFLAGS="${SANITIZER_BLACKLIST_GENERATOR}",
+                SANITIZER_DENYLIST_GENERATOR=SanitizerDenylistGenerator,
+                CCFLAGS="${SANITIZER_DENYLIST_GENERATOR}",
+                LINKFLAGS="${SANITIZER_DENYLIST_GENERATOR}",
             )
 
         symbolizer_option = ""
@@ -4606,13 +4615,13 @@ if 'ICECC' in env and env['ICECC']:
 initial_num_jobs = env.GetOption('num_jobs')
 altered_num_jobs = initial_num_jobs + 1
 env.SetOption('num_jobs', altered_num_jobs)
+cpu_count = psutil.cpu_count()
 if env.GetOption('num_jobs') == altered_num_jobs:
     # psutil.cpu_count returns None when it can't determine the
     # number. This always fails on BSD's for example. If the user
     # didn't specify, and we can't determine for a parallel build, it
     # is better to make the user restart and be explicit, rather than
     # give them a very slow build.
-    cpu_count = psutil.cpu_count()
     if cpu_count is None:
         if get_option("ninja") != "disabled":
             env.FatalError("Cannot auto-determine the appropriate size for the Ninja local_job pool. Please regenerate with an explicit -j argument to SCons")
@@ -4630,6 +4639,22 @@ if env.GetOption('num_jobs') == altered_num_jobs:
         # Ninja, in which case num_jobs controls the size of the local
         # pool. Scale that up to the number of local CPUs.
         env.SetOption('num_jobs', cpu_count)
+else:
+    if (not has_option('force-jobs')
+        and ('ICECC' not in env or not env['ICECC'])
+        and env.GetOption('num_jobs') > cpu_count):
+
+        env.FatalError("ERROR: Icecream not enabled while using -j higher than available cpu's. " +
+            "Use --force-jobs to override.")
+
+if (get_option('ninja') != "disabled"
+    and ('ICECC' not in env or not env['ICECC'])
+    and not has_option('force-jobs')):
+
+    print(f"WARNING: Icecream not enabled - Ninja concurrency will be capped at {cpu_count} jobs " +
+        "without regard to the -j value passed to it. " +
+        "Generate your ninja file with --force-jobs to disable this behavior.")
+    env['NINJA_MAX_JOBS'] = cpu_count
 
 if get_option('ninja') != 'disabled':
 

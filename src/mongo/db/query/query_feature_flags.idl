@@ -41,7 +41,8 @@ feature_flags:
         description: >-
           When set to true, SBE engine is used instead of the classic engine.
         cpp_varname: gSBE
-        default: false
+        default: true
+        version: 5.0
 
     featureFlagChangeStreamsOptimization:
       description: "Feature flag for enabling change streams optimization"
@@ -51,4 +52,5 @@ feature_flags:
     featureFlagDotsAndDollars:
       description: "Feature flag for allowing use of field names containing dots and dollars"
       cpp_varname: gFeatureFlagDotsAndDollars
-      default: false
+      default: true
+      version: 5.0

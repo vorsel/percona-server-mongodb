@@ -29,7 +29,8 @@ var ReshardingTest = class {
         reshardInPlace: reshardInPlace = false,
         minimumOperationDurationMS: minimumOperationDurationMS = undefined,
         criticalSectionTimeoutMS: criticalSectionTimeoutMS = 24 * 60 * 60 * 1000 /* 1 day */,
-        commitImplicitly: commitImplicitly = true,
+        periodicNoopIntervalSecs: periodicNoopIntervalSecs = undefined,
+        writePeriodicNoops: writePeriodicNoops = undefined,
     } = {}) {
         // The @private JSDoc comments cause VS Code to not display the corresponding properties and
         // methods in its autocomplete list. This makes it simpler for test authors to know what the
@@ -49,7 +50,9 @@ var ReshardingTest = class {
         /** @private */
         this._criticalSectionTimeoutMS = criticalSectionTimeoutMS;
         /** @private */
-        this._commitImplicitly = commitImplicitly;
+        this._periodicNoopIntervalSecs = periodicNoopIntervalSecs;
+        /** @private */
+        this._writePeriodicNoops = writePeriodicNoops;
 
         // Properties set by setup().
         /** @private */
@@ -85,35 +88,38 @@ var ReshardingTest = class {
     }
 
     setup() {
-        let config = {setParameter: {featureFlagResharding: true}};
+        const mongosOptions = {setParameter: {}};
+        const configOptions = {setParameter: {}};
+        const rsOptions = {setParameter: {}};
 
         if (this._minimumOperationDurationMS !== undefined) {
-            config.setParameter.reshardingMinimumOperationDurationMillis =
+            configOptions.setParameter.reshardingMinimumOperationDurationMillis =
                 this._minimumOperationDurationMS;
         }
 
         if (this._criticalSectionTimeoutMS !== -1) {
-            config.setParameter.reshardingCriticalSectionTimeoutMillis =
+            configOptions.setParameter.reshardingCriticalSectionTimeoutMillis =
                 this._criticalSectionTimeoutMS;
+        }
+
+        if (this._periodicNoopIntervalSecs !== undefined) {
+            rsOptions.setParameter.periodicNoopIntervalSecs = this._periodicNoopIntervalSecs;
+        }
+
+        if (this._writePeriodicNoops !== undefined) {
+            rsOptions.setParameter.writePeriodicNoops = this._writePeriodicNoops;
         }
 
         this._st = new ShardingTest({
             mongos: 1,
-            mongosOptions: {setParameter: {featureFlagResharding: true}},
+            mongosOptions,
             config: 1,
-            configOptions: config,
+            configOptions,
             shards: this._numShards,
             rs: {nodes: 2},
-            rsOptions: {setParameter: {featureFlagResharding: true}},
+            rsOptions,
             manualAddShard: true,
         });
-
-        if (this._commitImplicitly) {
-            // The failpoint is enabled unless the caller opts out.
-            // This is a temporary situation until reshard can complete on its own.
-            this._canEnterCriticalFailpoint = configureFailPoint(
-                this._st.configRS.getPrimary(), "reshardingCoordinatorCanEnterCriticalImplicitly");
-        }
 
         for (let i = 0; i < this._numShards; ++i) {
             const isDonor = i < this._numDonors;
@@ -461,17 +467,7 @@ var ReshardingTest = class {
             expectedErrorCode: expectedErrorCode
         });
 
-        // TODO SERVER-52838: Call _checkPostState() without calling cleanupReshardCollection once
-        // donor and recipient shards clean up their local metadata on error.
-        if (expectedErrorCode === ErrorCodes.OK) {
-            this._checkPostState(expectedErrorCode);
-        } else {
-            const res = this._st.s.adminCommand({
-                cleanupReshardCollection: this._ns,
-            });
-            assert.commandWorked(res);
-            this._checkPostState(expectedErrorCode);
-        }
+        this._checkPostState(expectedErrorCode);
     }
 
     /** @private */
@@ -562,6 +558,11 @@ var ReshardingTest = class {
         assert.eq([],
                   this._st.config.collections.find({_id: this._tempNs}).toArray(),
                   "expected there to not be a config.collections entry for the temporary" +
+                      " resharding collection");
+
+        assert.eq([],
+                  this._st.config.chunks.find({ns: this._tempNs}).toArray(),
+                  "expected there to not be any config.chunks entry for the temporary" +
                       " resharding collection");
 
         const collEntry = this._st.config.collections.findOne({_id: this._ns});

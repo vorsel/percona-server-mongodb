@@ -37,6 +37,7 @@
 
 #include "mongo/bson/bsonobj.h"
 #include "mongo/bson/json.h"
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/namespace_string.h"
@@ -197,43 +198,39 @@ Timestamp getHighestMinFetchTimestamp(const std::vector<DonorShardEntry>& donorS
     return maxMinFetchTimestamp;
 }
 
-void checkForOverlappingZones(std::vector<TagsType>& zones) {
-    std::sort(zones.begin(), zones.end(), [](const TagsType& a, const TagsType& b) {
-        return SimpleBSONObjComparator::kInstance.evaluate(a.getMinKey() < b.getMinKey());
-    });
+void checkForOverlappingZones(std::vector<ReshardingZoneType>& zones) {
+    std::sort(
+        zones.begin(), zones.end(), [](const ReshardingZoneType& a, const ReshardingZoneType& b) {
+            return SimpleBSONObjComparator::kInstance.evaluate(a.getMin() < b.getMin());
+        });
 
     boost::optional<BSONObj> prevMax = boost::none;
     for (auto zone : zones) {
         if (prevMax) {
             uassert(ErrorCodes::BadValue,
                     "Zone ranges must not overlap",
-                    SimpleBSONObjComparator::kInstance.evaluate(prevMax.get() <= zone.getMinKey()));
+                    SimpleBSONObjComparator::kInstance.evaluate(prevMax.get() <= zone.getMin()));
         }
-        prevMax = boost::optional<BSONObj>(zone.getMaxKey());
+        prevMax = boost::optional<BSONObj>(zone.getMax());
     }
 }
 
-void validateZones(const std::vector<mongo::BSONObj>& zones,
-                   const std::vector<TagsType>& authoritativeTags) {
-    std::vector<TagsType> validZones;
-
-    for (const BSONObj& obj : zones) {
-        auto zone = uassertStatusOK(TagsType::fromBSON(obj));
-        auto zoneName = zone.getTag();
-        auto it =
-            std::find_if(authoritativeTags.begin(),
-                         authoritativeTags.end(),
-                         [&zoneName](const TagsType& obj) { return obj.getTag() == zoneName; });
-        uassert(ErrorCodes::BadValue, "Zone must already exist", it != authoritativeTags.end());
-        validZones.push_back(zone);
+std::vector<BSONObj> buildTagsDocsFromZones(const NamespaceString& tempNss,
+                                            const std::vector<ReshardingZoneType>& zones) {
+    std::vector<BSONObj> tags;
+    tags.reserve(zones.size());
+    for (const auto& zone : zones) {
+        ChunkRange range(zone.getMin(), zone.getMax());
+        TagsType tag(tempNss, zone.getZone().toString(), range);
+        tags.push_back(tag.toBSON());
     }
 
-    checkForOverlappingZones(validZones);
+    return tags;
 }
 
 void createSlimOplogView(OperationContext* opCtx, Database* db) {
     writeConflictRetry(
-        opCtx, "createReshardingSlimOplog", "local.system.resharding.slimOplogForGraphLookup", [&] {
+        opCtx, "createReshardingSlimOplog", NamespaceString::kReshardingOplogView.ns(), [&] {
             {
                 // Create 'system.views' in a separate WUOW if it does not exist.
                 WriteUnitOfWork wuow(opCtx);
@@ -256,10 +253,11 @@ void createSlimOplogView(OperationContext* opCtx, Database* db) {
             options.viewOn = NamespaceString::kRsOplogNamespace.coll().toString();
             options.pipeline = BSON_ARRAY(getSlimOplogPipeline());
             WriteUnitOfWork wuow(opCtx);
-            uassertStatusOK(
-                db->createView(opCtx,
-                               NamespaceString("local.system.resharding.slimOplogForGraphLookup"),
-                               options));
+            auto status = db->createView(opCtx, NamespaceString::kReshardingOplogView, options);
+            if (status == ErrorCodes::NamespaceExists) {
+                return;
+            }
+            uassertStatusOK(status);
             wuow.commit();
         });
 }

@@ -337,32 +337,61 @@ void assertCappedOplog(OperationContext* opCtx, Database* db) {
     }
 }
 
+void clearTempFilesExceptForResumableBuilds(const std::vector<ResumeIndexInfo>& indexBuildsToResume,
+                                            const boost::filesystem::path& tempDir) {
+    StringSet resumableIndexFiles;
+    for (const auto& resumeInfo : indexBuildsToResume) {
+        const auto& indexes = resumeInfo.getIndexes();
+        for (const auto& index : indexes) {
+            boost::optional<StringData> indexFilename = index.getFileName();
+            if (indexFilename) {
+                resumableIndexFiles.insert(indexFilename->toString());
+            }
+        }
+    }
+
+    auto dirItr = boost::filesystem::directory_iterator(tempDir);
+    auto dirEnd = boost::filesystem::directory_iterator();
+    for (; dirItr != dirEnd; ++dirItr) {
+        auto curFilename = dirItr->path().filename().string();
+        if (!resumableIndexFiles.contains(curFilename)) {
+            boost::system::error_code ec;
+            boost::filesystem::remove(dirItr->path(), ec);
+            if (ec) {
+                LOGV2(5676601,
+                      "Failed to clear temp directory file",
+                      "filename"_attr = curFilename,
+                      "error"_attr = ec.message());
+            }
+        }
+    }
+}
+
 void reconcileCatalogAndRebuildUnfinishedIndexes(
     OperationContext* opCtx,
     StorageEngine* storageEngine,
-    LastStorageEngineShutdownState lastStorageEngineShutdownState) {
-
-    // When starting up after an unclean shutdown, we do not attempt to recover any state from the
-    // internal idents. Thus, we drop them in this case.
-    auto reconcilePolicy =
-        LastStorageEngineShutdownState::kUnclean == lastStorageEngineShutdownState
-        ? StorageEngine::InternalIdentReconcilePolicy::kDrop
-        : StorageEngine::InternalIdentReconcilePolicy::kRetain;
+    StorageEngine::LastShutdownState lastShutdownState) {
     auto reconcileResult =
-        fassert(40593, storageEngine->reconcileCatalogAndIdents(opCtx, reconcilePolicy));
+        fassert(40593, storageEngine->reconcileCatalogAndIdents(opCtx, lastShutdownState));
 
-    // If we did not find any index builds to resume or we are starting up after an unclean
-    // shutdown, nothing in the temp directory will be used. Thus, we can clear it.
+    auto tempDir = boost::filesystem::path(storageGlobalParams.dbpath).append("_tmp");
     if (reconcileResult.indexBuildsToResume.empty() ||
-        lastStorageEngineShutdownState == LastStorageEngineShutdownState::kUnclean) {
+        lastShutdownState == StorageEngine::LastShutdownState::kUnclean) {
+        // If we did not find any index builds to resume or we are starting up after an unclean
+        // shutdown, nothing in the temp directory will be used. Thus, we can clear it completely.
         LOGV2(5071100, "Clearing temp directory");
 
         boost::system::error_code ec;
-        boost::filesystem::remove_all(storageGlobalParams.dbpath + "/_tmp/", ec);
+        boost::filesystem::remove_all(tempDir, ec);
 
         if (ec) {
             LOGV2(5071101, "Failed to clear temp directory", "error"_attr = ec.message());
         }
+    } else if (boost::filesystem::exists(tempDir)) {
+        // Clears the contents of the temp directory except for files for resumable builds.
+        LOGV2(5676600, "Clearing temp directory except for files for resumable builds");
+
+        clearTempFilesExceptForResumableBuilds(reconcileResult.indexBuildsToResume, tempDir);
     }
 
     // Determine which indexes need to be rebuilt. rebuildIndexesOnCollection() requires that all
@@ -548,7 +577,7 @@ void startupRecoveryReadOnly(OperationContext* opCtx, StorageEngine* storageEngi
 // Perform routine startup recovery procedure.
 void startupRecovery(OperationContext* opCtx,
                      StorageEngine* storageEngine,
-                     LastStorageEngineShutdownState lastStorageEngineShutdownState) {
+                     StorageEngine::LastShutdownState lastShutdownState) {
     invariant(!storageGlobalParams.readOnly && !storageGlobalParams.repair);
 
     // Determine whether this is a replica set node running in standalone mode. This must be set
@@ -560,8 +589,7 @@ void startupRecovery(OperationContext* opCtx,
 
     // Drops abandoned idents. Rebuilds unfinished indexes and restarts incomplete two-phase
     // index builds.
-    reconcileCatalogAndRebuildUnfinishedIndexes(
-        opCtx, storageEngine, lastStorageEngineShutdownState);
+    reconcileCatalogAndRebuildUnfinishedIndexes(opCtx, storageEngine, lastShutdownState);
 
     const auto& replSettings = repl::ReplicationCoordinator::get(opCtx)->getSettings();
 
@@ -603,7 +631,7 @@ namespace startup_recovery {
  * if data files are incompatible with the current binary version.
  */
 void repairAndRecoverDatabases(OperationContext* opCtx,
-                               LastStorageEngineShutdownState lastStorageEngineShutdownState) {
+                               StorageEngine::LastShutdownState lastShutdownState) {
     auto const storageEngine = opCtx->getServiceContext()->getStorageEngine();
     Lock::GlobalWrite lk(opCtx);
 
@@ -619,7 +647,7 @@ void repairAndRecoverDatabases(OperationContext* opCtx,
     } else if (storageGlobalParams.readOnly) {
         startupRecoveryReadOnly(opCtx, storageEngine);
     } else {
-        startupRecovery(opCtx, storageEngine, lastStorageEngineShutdownState);
+        startupRecovery(opCtx, storageEngine, lastShutdownState);
     }
 
     assertFilesCompatible(opCtx, storageEngine);

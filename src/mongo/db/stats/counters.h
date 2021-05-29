@@ -288,4 +288,54 @@ public:
 };
 
 extern AggStageCounters aggStageCounters;
+
+class DotsAndDollarsFieldsCounters {
+public:
+    DotsAndDollarsFieldsCounters()
+        : insertMetric("dotsAndDollarsFields.inserts", &inserts),
+          updateMetric("dotsAndDollarsFields.updates", &updates) {}
+
+    void incrementForUpsert(bool didInsert) {
+        if (didInsert) {
+            inserts.increment();
+        } else {
+            updates.increment();
+        }
+    }
+
+    Counter64 inserts;
+    Counter64 updates;
+    ServerStatusMetricField<Counter64> insertMetric;
+    ServerStatusMetricField<Counter64> updateMetric;
+};
+
+extern DotsAndDollarsFieldsCounters dotsAndDollarsFieldsCounters;
+
+class OperatorCountersExpressions {
+private:
+    struct ExprCounter {
+        ExprCounter(StringData name) : metric("operatorCounters.expressions." + name, &counter) {}
+
+        Counter64 counter;
+        ServerStatusMetricField<Counter64> metric;
+    };
+
+public:
+    void addExpressionCounter(StringData name) {
+        operatorCountersExpressionMap[name] = std::make_unique<ExprCounter>(name);
+    }
+
+    void incrementExpressionCounter(StringData name) {
+        if (auto it = operatorCountersExpressionMap.find(name);
+            it != operatorCountersExpressionMap.end()) {
+            it->second->counter.increment(1);
+        }
+    }
+
+private:
+    // Map of aggregation expressions to the number of occurrences in aggregation pipelines.
+    StringMap<std::unique_ptr<ExprCounter>> operatorCountersExpressionMap = {};
+};
+
+extern OperatorCountersExpressions operatorCountersExpressions;
 }  // namespace mongo

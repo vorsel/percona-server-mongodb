@@ -244,9 +244,9 @@ void onShardVersionMismatch(OperationContext* opCtx,
                 const auto currentShardVersion = metadata->getShardVersion();
                 // Don't need to remotely reload if we're in the same epoch and the requested
                 // version is smaller than the known one. This means that the remote side is behind.
-                if (currentShardVersion.epoch() == shardVersionReceived->epoch() &&
-                    currentShardVersion.majorVersion() >= shardVersionReceived->majorVersion())
+                if (shardVersionReceived->isOlderThan(currentShardVersion)) {
                     return;
+                }
             }
         }
 
@@ -269,8 +269,9 @@ void onShardVersionMismatch(OperationContext* opCtx,
 }
 
 ScopedShardVersionCriticalSection::ScopedShardVersionCriticalSection(OperationContext* opCtx,
-                                                                     NamespaceString nss)
-    : _opCtx(opCtx), _nss(std::move(nss)) {
+                                                                     NamespaceString nss,
+                                                                     BSONObj reason)
+    : _opCtx(opCtx), _nss(std::move(nss)), _reason(std::move(reason)) {
 
     while (true) {
         uassert(ErrorCodes::InvalidNamespace,
@@ -312,23 +313,21 @@ ScopedShardVersionCriticalSection::ScopedShardVersionCriticalSection(OperationCo
 
         if (!joinShardVersionOperation(_opCtx, csr, &dbLock, &collLock, &csrLock)) {
             CollectionShardingRuntime::get(_opCtx, _nss)
-                ->enterCriticalSectionCatchUpPhase(*csrLock);
+                ->enterCriticalSectionCatchUpPhase(*csrLock, _reason);
             break;
         }
     }
 
-    forceShardFilteringMetadataRefresh(_opCtx, _nss);
+    try {
+        forceShardFilteringMetadataRefresh(_opCtx, _nss);
+    } catch (const DBException&) {
+        _cleanup();
+        throw;
+    }
 }
 
 ScopedShardVersionCriticalSection::~ScopedShardVersionCriticalSection() {
-    UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
-    // DBLock and CollectionLock are used here to avoid throwing further recursive stale config
-    // errors.
-    Lock::DBLock dbLock(_opCtx, _nss.db(), MODE_IX);
-    Lock::CollectionLock collLock(_opCtx, _nss, MODE_IX);
-    auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
-    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
-    csr->exitCriticalSection(csrLock);
+    _cleanup();
 }
 
 void ScopedShardVersionCriticalSection::enterCommitPhase() {
@@ -340,7 +339,18 @@ void ScopedShardVersionCriticalSection::enterCommitPhase() {
     Lock::CollectionLock collLock(_opCtx, _nss, MODE_IS, deadline);
     auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
     auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
-    csr->enterCriticalSectionCommitPhase(csrLock);
+    csr->enterCriticalSectionCommitPhase(csrLock, _reason);
+}
+
+void ScopedShardVersionCriticalSection::_cleanup() {
+    UninterruptibleLockGuard noInterrupt(_opCtx->lockState());
+    // DBLock and CollectionLock are used here to avoid throwing further recursive stale config
+    // errors.
+    Lock::DBLock dbLock(_opCtx, _nss.db(), MODE_IX);
+    Lock::CollectionLock collLock(_opCtx, _nss, MODE_IX);
+    auto* const csr = CollectionShardingRuntime::get(_opCtx, _nss);
+    auto csrLock = CollectionShardingRuntime::CSRLock::lockExclusive(_opCtx, csr);
+    csr->exitCriticalSection(csrLock, _reason);
 }
 
 Status onShardVersionMismatchNoExcept(OperationContext* opCtx,

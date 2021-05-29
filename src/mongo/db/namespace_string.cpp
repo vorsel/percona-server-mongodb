@@ -121,11 +121,17 @@ const NamespaceString NamespaceString::kReshardingApplierProgressNamespace(
 const NamespaceString NamespaceString::kReshardingTxnClonerProgressNamespace(
     NamespaceString::kConfigDb, "localReshardingOperations.recipient.progress_txn_cloner");
 
+const NamespaceString NamespaceString::kReshardingOplogView(
+    NamespaceString::kLocalDb, "system.resharding.slimOplogForGraphLookup");
+
 const NamespaceString NamespaceString::kCollectionCriticalSectionsNamespace(
     NamespaceString::kConfigDb, "collection_critical_sections");
 
 const NamespaceString NamespaceString::kForceOplogBatchBoundaryNamespace(
     NamespaceString::kConfigDb, "system.forceOplogBatchBoundary");
+
+const NamespaceString NamespaceString::kConfigImagesNamespace(NamespaceString::kConfigDb,
+                                                              "image_collection");
 
 bool NamespaceString::isListCollectionsCursorNS() const {
     return coll() == listCollectionsCursorCol;

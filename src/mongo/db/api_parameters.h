@@ -48,10 +48,6 @@ public:
     static const OperationContext::Decoration<APIParameters> get;
     static APIParameters fromClient(const APIParametersFromClient& apiParamsFromClient);
     static APIParameters fromBSON(const BSONObj& cmdObj);
-    /*
-     * Throw if bsonObject includes any API parameters.
-     */
-    static void uassertNoApiParameters(const BSONObj& bsonObject);
 
     // For use with unordered_map.
     struct Hash {
@@ -59,6 +55,8 @@ public:
     };
 
     void appendInfo(BSONObjBuilder* builder) const;
+
+    BSONObj toBSON() const;
 
     const boost::optional<std::string>& getAPIVersion() const {
         return _apiVersion;

@@ -49,10 +49,13 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/repl_set_config.h"
 #include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/tenant_migration_donor_service.h"
+#include "mongo/db/repl/tenant_migration_recipient_service.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/sharding_ddl_coordinator_service.h"
 #include "mongo/db/server_options.h"
@@ -160,11 +163,20 @@ void removeTimeseriesEntriesFromConfigTransactions(OperationContext* opCtx) {
     static constexpr StringData kLastWriteOpFieldName = "lastWriteOpTime"_sd;
     auto cursor = dbClient.query(NamespaceString::kSessionTransactionsTableNamespace, Query{});
     while (cursor->more()) {
-        auto entry = TransactionHistoryIterator{repl::OpTime::parse(
-                                                    cursor->next()[kLastWriteOpFieldName].Obj())}
-                         .next(opCtx);
-        if (entry.getNss().isTimeseriesBucketsCollection()) {
-            sessions.push_back(*entry.getSessionId());
+        try {
+            auto entry =
+                TransactionHistoryIterator{
+                    repl::OpTime::parse(cursor->next()[kLastWriteOpFieldName].Obj())}
+                    .next(opCtx);
+            if (entry.getNss().isTimeseriesBucketsCollection()) {
+                sessions.push_back(*entry.getSessionId());
+            }
+        } catch (const DBException& ex) {
+            // IncompleteTransactionHistory can be thrown if the oplog entry referenced by this
+            // config.transactions entry no longer exists.
+            if (ex.code() != ErrorCodes::IncompleteTransactionHistory) {
+                throw;
+            }
         }
     }
 
@@ -411,6 +423,8 @@ private:
                     opCtx, CommandHelpers::appendMajorityWriteConcern(requestPhase1.toBSON({}))));
         }
 
+        _cancelTenantMigrations(opCtx);
+
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         const bool isReplSet =
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
@@ -535,6 +549,8 @@ private:
                     opCtx, CommandHelpers::appendMajorityWriteConcern(requestPhase1.toBSON({}))));
         }
 
+        _cancelTenantMigrations(opCtx);
+
         auto replCoord = repl::ReplicationCoordinator::get(opCtx);
         const bool isReplSet =
             replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet;
@@ -640,6 +656,25 @@ private:
         LOGV2(4975602,
               "Downgrading on-disk format to reflect the last-continuous version.",
               "last_continuous_version"_attr = FCVP::kLastContinuous);
+    }
+
+    /**
+     * Kills all tenant migrations active on this node, for both donors and recipients.
+     * Called after reaching an upgrading or downgrading state.
+     */
+    void _cancelTenantMigrations(OperationContext* opCtx) {
+        invariant(serverGlobalParams.featureCompatibility.isUpgradingOrDowngrading());
+        if (serverGlobalParams.clusterRole == ClusterRole::None) {
+            auto donorService = checked_cast<TenantMigrationDonorService*>(
+                repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
+                    ->lookupServiceByName(TenantMigrationDonorService::kServiceName));
+            donorService->abortAllMigrations(opCtx);
+            auto recipientService = checked_cast<repl::TenantMigrationRecipientService*>(
+                repl::PrimaryOnlyServiceRegistry::get(opCtx->getServiceContext())
+                    ->lookupServiceByName(repl::TenantMigrationRecipientService::
+                                              kTenantMigrationRecipientServiceName));
+            recipientService->abortAllMigrations(opCtx);
+        }
     }
 
 } setFeatureCompatibilityVersionCommand;

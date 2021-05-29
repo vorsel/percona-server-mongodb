@@ -15,6 +15,11 @@
  *                 *when the the collection has been dropped and recreated as empty.*
  * - behavior: Must be "unshardedOnly", or "versioned". Determines what system profiler checks are
  * performed.
+ *
+ * @tags: [
+ *   # SERVER-56565
+ *   does_not_support_stepdowns
+ *  ]
  */
 (function() {
 "use strict";
@@ -107,6 +112,7 @@ let testCases = {
     cloneCollectionAsCapped: {skip: "primary only"},
     collMod: {skip: "primary only"},
     collStats: {skip: "does not return user data"},
+    commitReshardCollection: {skip: "primary only"},
     commitTransaction: {skip: "primary only"},
     compact: {skip: "does not return user data"},
     configureFailPoint: {skip: "does not return user data"},
@@ -520,6 +526,9 @@ let staleMongos = st.s1;
 
 let res = st.s.adminCommand({listCommands: 1});
 assert.commandWorked(res);
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(staleMongos.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 let commands = Object.keys(res.commands);
 for (let command of commands) {

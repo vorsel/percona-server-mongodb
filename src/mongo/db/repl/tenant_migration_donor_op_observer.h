@@ -92,8 +92,7 @@ public:
                   const NamespaceString& nss,
                   OptionalCollectionUUID uuid,
                   StmtId stmtId,
-                  bool fromMigrate,
-                  const boost::optional<BSONObj>& deletedDoc) final;
+                  const OplogDeleteEntryArgs& args) final;
 
     void onInternalOpMessage(OperationContext* opCtx,
                              const NamespaceString& nss,
@@ -120,14 +119,12 @@ public:
                    boost::optional<IndexCollModInfo> indexInfo) final {}
 
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) final {}
-
+    using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
                                   std::uint64_t numRecords,
-                                  CollectionDropType dropType) final {
-        return repl::OpTime();
-    }
+                                  CollectionDropType dropType) final;
 
     void onDropIndex(OperationContext* opCtx,
                      const NamespaceString& nss,
@@ -135,6 +132,7 @@ public:
                      const std::string& indexName,
                      const BSONObj& indexInfo) final {}
 
+    using OpObserver::onRenameCollection;
     void onRenameCollection(OperationContext* opCtx,
                             const NamespaceString& fromCollection,
                             const NamespaceString& toCollection,
@@ -152,6 +150,7 @@ public:
                             const BSONObj& storageMetadata,
                             bool isDryRun) final {}
 
+    using OpObserver::preRenameCollection;
     repl::OpTime preRenameCollection(OperationContext* opCtx,
                                      const NamespaceString& fromCollection,
                                      const NamespaceString& toCollection,

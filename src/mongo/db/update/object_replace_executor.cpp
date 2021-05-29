@@ -72,7 +72,10 @@ ObjectReplaceExecutor::ObjectReplaceExecutor(BSONObj replacement)
 }
 
 UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyReplacementUpdate(
-    ApplyParams applyParams, const BSONObj& replacementDoc, bool replacementDocContainsIdField) {
+    ApplyParams applyParams,
+    const BSONObj& replacementDoc,
+    bool replacementDocContainsIdField,
+    bool allowTopLevelDollarPrefixedFields) {
     auto originalDoc = applyParams.element.getDocument().getObject();
 
     // Check for noop.
@@ -100,10 +103,13 @@ UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyReplacementUpdate(
         invariant(applyParams.element.appendElement(elem));
     }
 
-    // Validate for storage.
-    if (applyParams.validateForStorage) {
-        storage_validation::storageValid(applyParams.element.getDocument());
-    }
+    ApplyResult ret;
+
+    // Validate for storage and check if the document contains any '.'/'$' field name.
+    storage_validation::storageValid(applyParams.element.getDocument(),
+                                     allowTopLevelDollarPrefixedFields,
+                                     applyParams.validateForStorage,
+                                     &ret.containsDotsAndDollarsField);
 
     // Check immutable paths.
     for (auto path = applyParams.immutablePaths.begin(); path != applyParams.immutablePaths.end();
@@ -142,7 +148,7 @@ UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyReplacementUpdate(
         }
     }
 
-    return ApplyResult{};
+    return ret;
 }
 
 UpdateExecutor::ApplyResult ObjectReplaceExecutor::applyUpdate(ApplyParams applyParams) const {

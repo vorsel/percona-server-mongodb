@@ -32,6 +32,8 @@ env.Library(
         ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/query/query_knobs',
+        '$BUILD_DIR/mongo/idl/feature_flag',
         ]
     )
 
@@ -86,6 +88,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/query/query_knobs',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/db/service_context',
+        '$BUILD_DIR/mongo/db/stats/counters',
         '$BUILD_DIR/mongo/scripting/scripting',
         '$BUILD_DIR/mongo/scripting/scripting_common',
         '$BUILD_DIR/mongo/util/intrusive_counter',
@@ -121,6 +124,7 @@ env.Library(
         'accumulator_covariance.cpp',
         'accumulator_exp_moving_avg.cpp',
         'accumulator_first.cpp',
+        'accumulator_integral.cpp',
         'accumulator_js_reduce.cpp',
         'accumulator_last.cpp',
         'accumulator_merge_objects.cpp',
@@ -134,6 +138,7 @@ env.Library(
         'window_function/window_function_count.cpp',
         'window_function/window_function_expression.cpp',
         'window_function/window_function_integral.cpp',
+        'window_function/window_function_shift.cpp',
         'window_function/window_function_sum.cpp',
         ],
     LIBDEPS=[
@@ -222,17 +227,10 @@ pipelineEnv.InjectThirdParty(libraries=['snappy'])
 pipelineEnv.Library(
     target='pipeline',
     source=[
-        'change_stream_document_diff_parser.cpp',
         'document_source.cpp',
         'document_source_add_fields.cpp',
         'document_source_bucket.cpp',
         'document_source_bucket_auto.cpp',
-        'document_source_change_stream.cpp',
-        'document_source_change_stream_close_cursor.cpp',
-        'document_source_change_stream_transform.cpp',
-        'document_source_change_stream_unwind_transactions.cpp',
-        'document_source_check_invalidate.cpp',
-        'document_source_check_resume_token.cpp',
         'document_source_coll_stats.cpp',
         'document_source_count.cpp',
         'document_source_current_op.cpp',
@@ -250,8 +248,6 @@ pipelineEnv.Library(
         'document_source_list_local_sessions.cpp',
         'document_source_list_sessions.cpp',
         'document_source_lookup.cpp',
-        'document_source_lookup_change_post_image.cpp',
-        'document_source_lookup_change_pre_image.cpp',
         'document_source_match.cpp',
         'document_source_merge.cpp',
         'document_source_operation_metrics.cpp',
@@ -280,6 +276,7 @@ pipelineEnv.Library(
         'skip_and_limit.cpp',
         'tee_buffer.cpp',
         'window_function/partition_iterator.cpp',
+        'window_function/spillable_cache.cpp',
         'window_function/window_function_exec.cpp',
         'window_function/window_function_exec_derivative.cpp',
         'window_function/window_function_exec_removable_document.cpp',
@@ -336,6 +333,31 @@ pipelineEnv.Library(
         '$BUILD_DIR/mongo/rpc/command_status',
     ]
 )
+
+env.Library(
+    target="change_stream_pipeline",
+    source=[
+        'change_stream_document_diff_parser.cpp',
+        'change_stream_helpers_legacy.cpp',
+        'document_source_change_stream.cpp',
+        'document_source_change_stream_close_cursor.cpp',
+        'document_source_change_stream_ensure_resume_token_present.cpp',
+        'document_source_change_stream_oplog_match.cpp',
+        'document_source_change_stream_transform.cpp',
+        'document_source_change_stream_unwind_transactions.cpp',
+        'document_source_check_invalidate.cpp',
+        'document_source_check_resume_token.cpp',
+        'document_source_lookup_change_post_image.cpp',
+        'document_source_lookup_change_pre_image.cpp',
+        'document_source_update_on_add_shard.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/pipeline/pipeline',
+        '$BUILD_DIR/mongo/db/pipeline/sharded_agg_helpers',
+        '$BUILD_DIR/mongo/s/query/router_exec_stage',
+    ],
+)
+
 
 env.Library(
     target='runtime_constants_idl',
@@ -460,6 +482,7 @@ env.CppUnitTest(
         'skip_and_limit_test.cpp',
         'tee_buffer_test.cpp',
         'window_function/partition_iterator_test.cpp',
+        'window_function/spillable_cache_test.cpp',
         'window_function/window_function_add_to_set_test.cpp',
         'window_function/window_function_covariance_test.cpp',
         'window_function/window_function_exec_derivative_test.cpp',
@@ -496,6 +519,7 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/util/clock_source_mock',
         'accumulator',
         'aggregation_request_helper',
+        'change_stream_pipeline',
         'document_source_mock',
         'document_sources_idl',
         'expression_context',

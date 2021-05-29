@@ -20,7 +20,6 @@ selector:
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_s2cursorlimitskip.js  # profiling.
   - jstests/core/geo_update_btree2.js  # notablescan.
-  - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/stages*.js  # stageDebug.
@@ -34,6 +33,7 @@ selector:
   - jstests/core/geo_s2sparse.js  # keysPerIndex in different spot in validate().
   - jstests/core/operation_latency_histogram.js  # Stats are counted differently on mongos, SERVER-24880.
   - jstests/core/killop_drop_collection.js # Uses fsyncLock.
+  - jstests/core/or_to_in.js # queryPlanner in different spot in explain()
   # The following tests fail because of divergent dropCollection behavior between standalones and
   # sharded clusters. These tests expect a second drop command to error, whereas in sharded clusters
   # we expect a second drop to return status OK.

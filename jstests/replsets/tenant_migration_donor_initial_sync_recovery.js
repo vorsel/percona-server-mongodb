@@ -127,7 +127,7 @@ if (donorDoc) {
                                         .donor.abortOpTime,
                                     donorDoc.commitOrAbortOpTime) == 0);
             assert.soon(
-                () => bsonWoCompare(tenantMigrationTest.donor
+                () => bsonWoCompare(tenantMigrationTest
                                         .getTenantMigrationAccessBlocker(initialSyncNode, kTenantId)
                                         .donor.blockTimestamp,
                                     donorDoc.blockTimestamp) == 0);
@@ -143,7 +143,7 @@ if (fp) {
 
 restartServerReplication(initialSyncNode);
 
-assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
+TenantMigrationTest.assertCommitted(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
 assert.commandWorked(tenantMigrationTest.forgetMigration(migrationOpts.migrationIdString));
 tenantMigrationTest.stop();
 })();

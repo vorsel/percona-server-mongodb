@@ -82,6 +82,12 @@ public:
     using DropIdentCallback = std::function<void()>;
 
     /**
+     * Information on last storage engine shutdown state that is relevant to the recovery process.
+     * Determined by initializeStorageEngine() during mongod.lock initialization.
+     */
+    enum class LastShutdownState { kClean, kUnclean };
+
+    /**
      * The interface for creating new instances of storage engines.
      *
      * A storage engine provides an instance of this class (along with an associated
@@ -229,7 +235,7 @@ public:
      * caller. For example, on starting from a previous unclean shutdown, we may try to recover
      * orphaned idents, which are known to the storage engine but not referenced in the catalog.
      */
-    virtual void loadCatalog(OperationContext* opCtx, bool loadingFromUncleanShutdown) = 0;
+    virtual void loadCatalog(OperationContext* opCtx, LastShutdownState lastShutdownState) = 0;
     virtual void closeCatalog(OperationContext* opCtx) = 0;
 
     /**
@@ -475,7 +481,6 @@ public:
      * - and no holders of 'ident' remain (the index/collection is no longer in active use)
      */
     virtual void addDropPendingIdent(const Timestamp& dropTimestamp,
-                                     const NamespaceString& nss,
                                      std::shared_ptr<Ident> ident,
                                      DropIdentCallback&& onDrop = nullptr) = 0;
 
@@ -610,9 +615,8 @@ public:
      * unknown internal idents. If we started from a clean shutdown, the internal idents may contain
      * information for resuming index builds.
      */
-    enum class InternalIdentReconcilePolicy { kDrop, kRetain };
     virtual StatusWith<ReconcileResult> reconcileCatalogAndIdents(
-        OperationContext* opCtx, InternalIdentReconcilePolicy internalIdentReconcilePolicy) = 0;
+        OperationContext* opCtx, LastShutdownState lastShutdownState) = 0;
 
     /**
      * Returns the all_durable timestamp. All transactions with timestamps earlier than the
@@ -690,6 +694,13 @@ public:
      * Unpins the request registered under `requestingServiceName`.
      */
     virtual void unpinOldestTimestamp(const std::string& requestingServiceName) = 0;
+
+    /**
+     * Prevents oplog history at 'pinnedTimestamp' and later from being truncated. Setting
+     * Timestamp::max() effectively nullifies the pin because no oplog truncation will be stopped by
+     * it.
+     */
+    virtual void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) = 0;
 };
 
 }  // namespace mongo

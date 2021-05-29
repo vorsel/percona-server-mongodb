@@ -186,7 +186,7 @@ executor::RemoteCommandResponse initWireVersion(
     ScopedForceOpQuery forceOpQuery{conn};
 
     BSONObjBuilder bob;
-    bob.append("isMaster", 1);
+    bob.append(conn->getApiParameters().getVersion() ? "hello" : "isMaster", 1);
 
     if (uri.isHelloOk()) {
         // Attach "helloOk: true" to the initial handshake to indicate that the client supports the
@@ -856,6 +856,10 @@ const SSLConfiguration* DBClientConnection::getSSLConfiguration() {
 
 bool DBClientConnection::isUsingTransientSSLParams() const {
     return _transientSSLParams.has_value();
+}
+
+bool DBClientConnection::isTLS() {
+    return SSLPeerInfo::forSession(_session).isTLS;
 }
 
 #endif

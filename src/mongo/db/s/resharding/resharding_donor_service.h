@@ -32,7 +32,6 @@
 #include "mongo/db/cancelable_operation_context.h"
 #include "mongo/db/repl/primary_only_service.h"
 #include "mongo/db/s/resharding/donor_document_gen.h"
-#include "mongo/db/s/resharding/resharding_critical_section.h"
 #include "mongo/db/s/resharding_util.h"
 #include "mongo/s/resharding/type_collection_fields_gen.h"
 
@@ -58,10 +57,7 @@ public:
         return NamespaceString::kDonorReshardingOperationsNamespace;
     }
 
-    ThreadPool::Limits getThreadPoolLimits() const override {
-        // TODO Limit the size of ReshardingDonorService thread pool.
-        return ThreadPool::Limits();
-    }
+    ThreadPool::Limits getThreadPoolLimits() const override;
 
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override;
 };
@@ -73,7 +69,8 @@ public:
 class ReshardingDonorService::DonorStateMachine final
     : public repl::PrimaryOnlyService::TypedInstance<DonorStateMachine> {
 public:
-    explicit DonorStateMachine(const ReshardingDonorDocument& donorDoc,
+    explicit DonorStateMachine(const ReshardingDonorService* donorService,
+                               const ReshardingDonorDocument& donorDoc,
                                std::unique_ptr<DonorStateMachineExternalState> externalState);
 
     ~DonorStateMachine();
@@ -129,6 +126,12 @@ private:
         const CancellationToken& stepdownToken,
         bool aborted) noexcept;
 
+    /**
+     * The work inside this function must be run regardless of any work on _scopedExecutor ever
+     * running.
+     */
+    void _runMandatoryCleanup(Status status);
+
     // The following functions correspond to the actions to take at a particular donor state.
     void _transitionToPreparingToDonate();
 
@@ -138,7 +141,7 @@ private:
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
         const CancellationToken& abortToken);
 
-    ExecutorFuture<void> _awaitAllRecipientsDoneApplyingThenTransitionToPreparingToBlockWrites(
+    ExecutorFuture<void> _awaitAllRecipientsDoneApplying(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
         const CancellationToken& abortToken);
 
@@ -182,6 +185,9 @@ private:
     // Initiates the cancellation of the resharding operation.
     void _onAbortEncountered(const Status& abortReason);
 
+    // The primary-only service instance corresponding to the donor instance. Not owned.
+    const ReshardingDonorService* const _donorService;
+
     // The in-memory representation of the immutable portion of the document in
     // config.localReshardingOperations.donor.
     const CommonReshardingMetadata _metadata;
@@ -207,11 +213,11 @@ private:
     // cancels the parent CancellationSource upon stepdown/failover.
     boost::optional<CancellationSource> _abortSource;
 
-    // Holds the unrecoverable error reported by the coordinator that caused the entire resharding
-    // operation to fail.
-    boost::optional<Status> _abortReason;
+    // The identifier associated to the recoverable critical section.
+    const BSONObj _critSecReason;
 
-    boost::optional<ReshardingCriticalSection> _critSec;
+    // It states whether the current node has also the recipient role.
+    const bool _isAlsoRecipient;
 
     // Each promise below corresponds to a state on the donor state machine. They are listed in
     // ascending order, such that the first promise below will be the first promise fulfilled -
@@ -225,6 +231,10 @@ private:
     SharedPromise<void> _coordinatorHasDecisionPersisted;
 
     SharedPromise<void> _completionPromise;
+
+    // Promises used to synchronize the acquisition/promotion of the recoverable critical section.
+    SharedPromise<void> _critSecWasAcquired;
+    SharedPromise<void> _critSecWasPromoted;
 };
 
 /**

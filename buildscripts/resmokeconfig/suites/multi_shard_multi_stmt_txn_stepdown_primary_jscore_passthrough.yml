@@ -22,7 +22,6 @@ selector:
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_s2cursorlimitskip.js  # profiling.
   - jstests/core/geo_update_btree2.js  # notablescan.
-  - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/stages*.js  # stageDebug.
@@ -212,7 +211,7 @@ selector:
   - jstests/core/json_schema/misc_validation.js
   - jstests/core/views/views_all_commands.js
 
-  # TODO SERVER-52465 dropDatabase is not resilient to stepdowns on sharded cluster
+  # dropDatabase is not resilient to stepdowns on sharded cluster
   - jstests/core/dropdb.js
 
   # Committing a transaction when the server is fsync locked fails.
@@ -342,7 +341,9 @@ selector:
   # Retrying a query can change whether a plan cache entry is active.
   - inspects_whether_plan_cache_entry_is_active
   - does_not_support_transactions
-
+  # Transaction-continuing commands must use the same API parameters as the first command, so tests
+  # that use API parameters cannot be run with transactions.
+  - uses_api_parameters
 executor:
   archive:
     hooks:
@@ -354,7 +355,7 @@ executor:
       # Note: fail_unclean_shutdown_incompatible_commands.js not included because it conflicts with
       # implicitly_shard_accessed_collections.js use of collstats (usage is safe with unclean
       # shutdown). Workaround by relying on the requires_fastcount/dbstats/collstats/datasize tags
-      # to blacklist tests that uses them unsafely.
+      # to denylist tests that uses them unsafely.
       eval: >-
         var testingReplication = true;
         load("jstests/libs/override_methods/mongos_manual_intervention_actions.js");

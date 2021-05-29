@@ -419,6 +419,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/multi_key_path_tracker',
+        '$BUILD_DIR/mongo/db/record_id_helpers',
         'throttle_cursor',
         'validate_state',
     ]
@@ -443,6 +444,21 @@ env.Library(
         '$BUILD_DIR/mongo/db/curop',
         '$BUILD_DIR/mongo/util/fail_point',
         'validate_idl',
+    ],
+)
+
+env.Library(
+    target='local_oplog_info',
+    source=[
+        'local_oplog_info.cpp',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/logical_time',
+        '$BUILD_DIR/mongo/db/repl/optime',
+        '$BUILD_DIR/mongo/db/repl/repl_coordinator_interface',
+        '$BUILD_DIR/mongo/db/storage/flow_control',
+        '$BUILD_DIR/mongo/db/vector_clock_mutable',
+        'collection',
     ],
 )
 
@@ -474,8 +490,8 @@ env.Library(
         'multi_index_block',
     ],
     LIBDEPS_PRIVATE=[
-        '$BUILD_DIR/mongo/db/repl/local_oplog_info',
         'database_holder',
+        'local_oplog_info',
     ],
 )
 

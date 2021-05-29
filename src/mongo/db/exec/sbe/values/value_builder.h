@@ -130,7 +130,7 @@ public:
     void append(const BSONCodeWScope& in) {
         appendValueBufferOffset(TypeTags::bsonCodeWScope);
         _valueBufferBuilder->appendNum(
-            static_cast<int32_t>(4 + in.code.size() + 1 + in.scope.objsize()));
+            static_cast<uint32_t>(4 + in.code.size() + 1 + in.scope.objsize()));
         _valueBufferBuilder->appendNum(static_cast<int32_t>(in.code.size() + 1));
         _valueBufferBuilder->appendStr(in.code, true /* includeEndingNull */);
         _valueBufferBuilder->appendBuf(in.scope.objdata(), in.scope.objsize());

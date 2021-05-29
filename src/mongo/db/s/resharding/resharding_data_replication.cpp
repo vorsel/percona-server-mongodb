@@ -268,7 +268,7 @@ SemiFuture<void> ReshardingDataReplication::runUntilStrictlyConsistent(
     std::shared_ptr<executor::TaskExecutor> cleanupExecutor,
     CancellationToken cancelToken,
     CancelableOperationContextFactory opCtxFactory,
-    Milliseconds minimumOperationDuration) {
+    const mongo::Date_t& startConfigTxnCloneTime) {
     CancellationSource errorSource(cancelToken);
 
     auto oplogFetcherFutures = _runOplogFetchers(executor, errorSource.token(), opCtxFactory);
@@ -277,7 +277,7 @@ SemiFuture<void> ReshardingDataReplication::runUntilStrictlyConsistent(
         _runCollectionCloner(executor, cleanupExecutor, errorSource.token(), opCtxFactory);
 
     auto txnClonerFutures = _runTxnCloners(
-        executor, cleanupExecutor, errorSource.token(), opCtxFactory, minimumOperationDuration);
+        executor, cleanupExecutor, errorSource.token(), opCtxFactory, startConfigTxnCloneTime);
 
     auto fulfillCloningDoneFuture =
         whenAllSucceed(collectionClonerFuture.thenRunOn(executor),
@@ -288,7 +288,8 @@ SemiFuture<void> ReshardingDataReplication::runUntilStrictlyConsistent(
 
     // Calling _runOplogAppliers() won't actually immediately start performing oplog application.
     // Only after the _startOplogApplication promise is fulfilled will oplog application begin.
-    auto oplogApplierFutures = _runOplogAppliers(executor, errorSource.token(), opCtxFactory);
+    auto oplogApplierFutures =
+        _runOplogAppliers(executor, cleanupExecutor, errorSource.token(), opCtxFactory);
 
     // We must additionally wait for fulfillCloningDoneFuture to become ready to ensure their
     // corresponding promises aren't being fulfilled while the .onCompletion() is running.
@@ -341,13 +342,13 @@ std::vector<SharedSemiFuture<void>> ReshardingDataReplication::_runTxnCloners(
     std::shared_ptr<executor::TaskExecutor> cleanupExecutor,
     CancellationToken cancelToken,
     CancelableOperationContextFactory opCtxFactory,
-    Milliseconds minimumOperationDuration) {
+    const mongo::Date_t& startConfigTxnCloneTime) {
     std::vector<SharedSemiFuture<void>> txnClonerFutures;
     txnClonerFutures.reserve(_txnCloners.size());
 
     for (const auto& txnCloner : _txnCloners) {
         txnClonerFutures.emplace_back(
-            executor->sleepFor(minimumOperationDuration, cancelToken)
+            executor->sleepUntil(startConfigTxnCloneTime, cancelToken)
                 .then([executor,
                        cleanupExecutor,
                        cancelToken,
@@ -380,6 +381,7 @@ std::vector<SharedSemiFuture<void>> ReshardingDataReplication::_runOplogFetchers
 
 std::vector<SharedSemiFuture<void>> ReshardingDataReplication::_runOplogAppliers(
     std::shared_ptr<executor::TaskExecutor> executor,
+    std::shared_ptr<executor::TaskExecutor> cleanupExecutor,
     CancellationToken cancelToken,
     CancelableOperationContextFactory opCtxFactory) {
     std::vector<SharedSemiFuture<void>> oplogApplierFutures;
@@ -391,8 +393,12 @@ std::vector<SharedSemiFuture<void>> ReshardingDataReplication::_runOplogAppliers
         oplogApplierFutures.emplace_back(
             future_util::withCancellation(_startOplogApplication.getFuture(), cancelToken)
                 .thenRunOn(executor)
-                .then([applier = applier.get(), executor, cancelToken, opCtxFactory] {
-                    return applier->run(executor, cancelToken, opCtxFactory);
+                .then([applier = applier.get(),
+                       executor,
+                       cleanupExecutor,
+                       cancelToken,
+                       opCtxFactory] {
+                    return applier->run(executor, cleanupExecutor, cancelToken, opCtxFactory);
                 })
                 .share());
     }

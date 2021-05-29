@@ -125,7 +125,11 @@ MigrationSourceManager::MigrationSourceManager(OperationContext* opCtx,
       _args(std::move(request)),
       _donorConnStr(std::move(donorConnStr)),
       _recipientHost(std::move(recipientHost)),
-      _stats(ShardingStatistics::get(_opCtx)) {
+      _stats(ShardingStatistics::get(_opCtx)),
+      _critSecReason(BSON("command"
+                          << "moveChunk"
+                          << "fromShard" << request.getFromShardId() << "toShard"
+                          << request.getToShardId())) {
     invariant(!_opCtx->lockState()->isLocked());
 
     LOGV2(22016,
@@ -333,7 +337,7 @@ Status MigrationSourceManager::enterCriticalSection() {
                         "Starting critical section",
                         "migrationId"_attr = _coordinator->getMigrationId());
 
-    _critSec.emplace(_opCtx, _args.getNss());
+    _critSec.emplace(_opCtx, _args.getNss(), _critSecReason);
 
     _state = kCriticalSection;
 
@@ -346,8 +350,7 @@ Status MigrationSourceManager::enterCriticalSection() {
     Status signalStatus = shardmetadatautil::updateShardCollectionsEntry(
         _opCtx,
         BSON(ShardCollectionType::kNssFieldName << getNss().ns()),
-        BSONObj(),
-        BSON(ShardCollectionType::kEnterCriticalSectionCounterFieldName << 1),
+        BSON("$inc" << BSON(ShardCollectionType::kEnterCriticalSectionCounterFieldName << 1)),
         false /*upsert*/);
     if (!signalStatus.isOK()) {
         return {

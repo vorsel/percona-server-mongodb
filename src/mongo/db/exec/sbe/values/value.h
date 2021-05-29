@@ -996,18 +996,17 @@ inline std::pair<TypeTags, Value> makeCopyBsonDBPointer(const BsonDBPointer& dbp
 struct BsonCodeWScope {
     explicit BsonCodeWScope(const char* rawValue) {
         auto dataView = ConstDataView(rawValue);
-        numBytes = dataView.read<LittleEndian<uint32_t>>();
 
+        numBytes = dataView.read<LittleEndian<uint32_t>>();
         uint32_t lenWithNull = dataView.read<LittleEndian<uint32_t>>(sizeof(uint32_t));
-        code = {rawValue + 2 * sizeof(uint32_t), lenWithNull - sizeof(char)};
-        scope = rawValue + 2 * sizeof(uint32_t) + lenWithNull;
+
+        auto ptr = rawValue + 2 * sizeof(uint32_t);
+        code = {ptr, lenWithNull - sizeof(char)};
+        scope = ptr + lenWithNull;
     }
 
     size_t byteSize() const {
-        auto scopeLen = ConstDataView(scope).read<LittleEndian<uint32_t>>();
-
-        // Add sizeof(char) to account for the NULL byte after 'code'.
-        return 2 * sizeof(uint32_t) + code.size() + sizeof(char) + scopeLen;
+        return numBytes;
     }
 
     uint32_t numBytes{0};

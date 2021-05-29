@@ -53,6 +53,7 @@ public:
     size_t checkpointSizeMB;
     size_t statisticsLogDelaySecs;
     std::string journalCompressor;
+    int zstdCompressorLevel;
     bool directoryForIndexes;
     double maxCacheOverflowFileSizeGBDeprecated;
     std::string engineConfig;

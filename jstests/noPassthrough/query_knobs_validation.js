@@ -192,5 +192,8 @@ assertSetParameterSucceeds("internalQuerySlotBasedExecutionMaxStaticIndexScanInt
 assertSetParameterFails("internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals", 0);
 assertSetParameterFails("internalQuerySlotBasedExecutionMaxStaticIndexScanIntervals", -1);
 
+assertSetParameterSucceeds("internalQueryForceClassicEngine", true);
+assertSetParameterSucceeds("internalQueryForceClassicEngine", false);
+
 MongoRunner.stopMongod(conn);
 })();

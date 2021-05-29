@@ -35,7 +35,10 @@
 
 #include <fmt/format.h>
 
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/persistent_task_store.h"
+#include "mongo/db/s/collection_sharding_runtime.h"
+#include "mongo/db/s/migration_source_manager.h"
 #include "mongo/db/s/shard_filtering_metadata_refresh.h"
 #include "mongo/db/s/sharding_state.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
@@ -198,8 +201,8 @@ void verifyValidReshardingFields(const ReshardingFields& reshardingFields) {
                             CoordinatorState_serializer(reshardingFields.getState()),
                             reshardingFields.toBSON().toString()),
                 !reshardingFields.getDonorFields() && !reshardingFields.getRecipientFields());
-    } else if (coordinatorState < CoordinatorStateEnum::kDecisionPersisted) {
-        // Prior to the state CoordinatorStateEnum::kDecisionPersisted, only the source
+    } else if (coordinatorState < CoordinatorStateEnum::kCommitting) {
+        // Prior to the state CoordinatorStateEnum::kCommitting, only the source
         // collection's config.collections entry should have donorFields, and only the
         // temporary resharding collection's entry should have recipientFields.
         uassert(5274201,
@@ -211,13 +214,13 @@ void verifyValidReshardingFields(const ReshardingFields& reshardingFields) {
                 bool(reshardingFields.getDonorFields()) !=
                     bool(reshardingFields.getRecipientFields()));
     } else {
-        // At and after state CoordinatorStateEnum::kDecisionPersisted, the temporary
+        // At and after state CoordinatorStateEnum::kCommitting, the temporary
         // resharding collection's config.collections entry has been removed, and so the
         // source collection's entry should have both donorFields and recipientFields.
         uassert(5274202,
                 fmt::format("reshardingFields must contain both donorFields and recipientFields "
                             "when the coordinator's state is greater than or equal to "
-                            "CoordinatorStateEnum::kDecisionPersisted. Got reshardingFields {}",
+                            "CoordinatorStateEnum::kCommitting. Got reshardingFields {}",
                             reshardingFields.toBSON().toString()),
                 reshardingFields.getDonorFields() && reshardingFields.getRecipientFields());
     }
@@ -280,7 +283,7 @@ void processReshardingFieldsForCollection(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           const CollectionMetadata& metadata,
                                           const ReshardingFields& reshardingFields) {
-    if (reshardingFields.getAbortReason()) {
+    if (reshardingFields.getState() == CoordinatorStateEnum::kAborting) {
         // The coordinator encountered an unrecoverable error, both donors and recipients should be
         // made aware.
         processReshardingFieldsForDonorCollection(opCtx, nss, metadata, reshardingFields);
@@ -331,7 +334,7 @@ void clearFilteringMetadata(OperationContext* opCtx, bool scheduleAsyncRefresh) 
                 }
 
                 auto opCtx = tc->makeOperationContext();
-                onShardVersionMismatch(opCtx.get(), nss, boost::none /* shardVersionReceived */);
+                refreshShardVersion(opCtx.get(), nss);
             })
             .onError([](const Status& status) {
                 LOGV2_WARNING(5498101,
@@ -339,6 +342,58 @@ void clearFilteringMetadata(OperationContext* opCtx, bool scheduleAsyncRefresh) 
                               "error"_attr = redact(status));
             })
             .getAsync([](auto) {});
+    }
+}
+
+void refreshShardVersion(OperationContext* opCtx, const NamespaceString& nss) {
+    invariant(!opCtx->lockState()->isLocked());
+    invariant(!opCtx->getClient()->isInDirectClient());
+    invariant(ShardingState::get(opCtx)->canAcceptShardedCommands());
+
+    if (nss.isNamespaceAlwaysUnsharded())
+        return;
+
+    {
+        boost::optional<Lock::DBLock> dbLock;
+        dbLock.emplace(opCtx, nss.db(), MODE_IS);
+
+        boost::optional<Lock::CollectionLock> collLock;
+        collLock.emplace(opCtx, nss, MODE_IS);
+
+        const auto csr = CollectionShardingRuntime::get(opCtx, nss);
+        auto critSec =
+            csr->getCriticalSectionSignal(opCtx, ShardingMigrationCriticalSection::kWrite);
+
+        if (critSec) {
+            auto inRecoverOrRefresh = [&] {
+                invariant(critSec);
+
+                boost::optional<CollectionShardingRuntime::CSRLock> csrLock =
+                    CollectionShardingRuntime::CSRLock::lockShared(opCtx, csr);
+
+                auto metadata = csr->getCurrentMetadataIfKnown();
+
+                csrLock.reset();
+                csrLock.emplace(CollectionShardingRuntime::CSRLock::lockExclusive(opCtx, csr));
+
+                // If the shard doesn't yet know its filtering metadata, recovery needs to be run
+                bool runRecover = metadata ? false : true;
+                csr->setShardVersionRecoverRefreshFuture(
+                    recoverRefreshShardVersion(opCtx->getServiceContext(), nss, runRecover),
+                    *csrLock);
+                return csr->getShardVersionRecoverRefreshFuture(opCtx);
+            }();
+
+            collLock.reset();
+            dbLock.reset();
+
+            inRecoverOrRefresh->get(opCtx);
+        } else {
+            collLock.reset();
+            dbLock.reset();
+
+            onShardVersionMismatch(opCtx, nss, boost::none);
+        }
     }
 }
 

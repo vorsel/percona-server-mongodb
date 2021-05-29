@@ -380,7 +380,7 @@ connect = function(url, user, pass, apiParameters) {
 
         if (dest) {
             print(`\n\n*** You have failed to connect to a ${dest}. Please ensure` +
-                  " that your IP whitelist allows connections from your network.\n\n");
+                  " that your IP allowlist allows connections from your network.\n\n");
         }
 
         throw e;
@@ -695,6 +695,16 @@ Mongo.prototype._extractChangeStreamOptions = function(options) {
     if (options.hasOwnProperty("allChangesForCluster")) {
         changeStreamOptions.allChangesForCluster = options.allChangesForCluster;
         delete options.allChangesForCluster;
+    }
+
+    if (options.hasOwnProperty("allowToRunOnConfigDB")) {
+        changeStreamOptions.allowToRunOnConfigDB = options.allowToRunOnConfigDB;
+        delete options.allowToRunOnConfigDB;
+    }
+
+    if (options.hasOwnProperty("allowToRunOnSystemNS")) {
+        changeStreamOptions.allowToRunOnSystemNS = options.allowToRunOnSystemNS;
+        delete options.allowToRunOnSystemNS;
     }
 
     return [{$changeStream: changeStreamOptions}, options];

@@ -197,6 +197,14 @@ DB.prototype.adminCommand = function(obj, extra) {
 
 DB.prototype._adminCommand = DB.prototype.adminCommand;  // alias old name
 
+DB.prototype._helloOrLegacyHello = function(args) {
+    let cmd = this.getMongo().getApiParameters().version ? {hello: 1} : {isMaster: 1};
+    if (args) {
+        Object.assign(cmd, args);
+    }
+    return this.runCommand(cmd);
+};
+
 DB.prototype._runCommandWithoutApiStrict = function(command) {
     let commandWithoutApiStrict = Object.assign({}, command);
     if (this.getMongo().getApiParameters().strict) {
@@ -814,7 +822,31 @@ var commandUnsupported = function(res) {
 };
 
 DB.prototype.currentOp = function(arg) {
-    var q = {};
+    // TODO CLOUDP-89361: The shell is connected to the Atlas Proxy, which currently does not
+    // support the $currentOp aggregation stage. Remove the legacy server command path once the
+    // proxy can support $currentOp.
+    if (this.serverStatus().hasOwnProperty("atlasVersion")) {
+        return this.currentOpLegacy(arg);
+    }
+
+    try {
+        const results = this.currentOpCursor(arg).toArray();
+        let res = {"inprog": results.length > 0 ? results : [], "ok": 1};
+        Object.defineProperty(res, "fsyncLock", {
+            get: function() {
+                throw Error(
+                    "fsyncLock is no longer included in the currentOp shell helper, run db.runCommand({currentOp: 1}) instead.");
+            }
+        });
+        return res;
+    } catch (e) {
+        return {"ok": 0, "code": e.code, "errmsg": "Error executing $currentOp: " + e.message};
+    }
+};
+DB.prototype.currentOP = DB.prototype.currentOp;
+
+DB.prototype.currentOpLegacy = function(arg) {
+    let q = {};
     if (arg) {
         if (typeof (arg) == "object")
             Object.extend(q, arg);
@@ -838,7 +870,51 @@ DB.prototype.currentOp = function(arg) {
     }
     return res;
 };
-DB.prototype.currentOP = DB.prototype.currentOp;
+
+DB.prototype.currentOpCursor = function(arg) {
+    let q = {};
+    if (arg) {
+        if (typeof (arg) == "object")
+            Object.extend(q, arg);
+        else if (arg)
+            q["$all"] = true;
+    }
+
+    // Convert the incoming currentOp command into an equivalent aggregate command
+    // of the form {aggregate:1, pipeline: [{$currentOp: {idleConnections: $all, allUsers:
+    // !$ownOps, truncateOps: false}}, {$match: {<user-defined filter>}}], cursor:{}}.
+    let pipeline = [];
+
+    let currOpArgs = {};
+    let currOpStage = {"$currentOp": currOpArgs};
+    currOpArgs["allUsers"] = !q["$ownOps"];
+    currOpArgs["idleConnections"] = !!q["$all"];
+    currOpArgs["truncateOps"] = false;
+
+    pipeline.push(currOpStage);
+
+    let matchArgs = {};
+    let matchStage = {"$match": matchArgs};
+    for (const fieldname of Object.keys(q)) {
+        if (fieldname !== "$all" && fieldname !== "$ownOps" && fieldname !== "$truncateOps") {
+            matchArgs[fieldname] = q[fieldname];
+        }
+    }
+
+    pipeline.push(matchStage);
+
+    // The legacy db.currentOp() shell helper ignored any explicitly set read preference and used
+    // the default, with the ability to also run on secondaries. To preserve this behavior we will
+    // temporarily set the session's read preference to "primaryPreferred".
+    const session = this.getSession();
+    const readPreference = session.getOptions().getReadPreference();
+    try {
+        session.getOptions().setReadPreference({mode: "primaryPreferred"});
+        return this.getSiblingDB("admin").aggregate(pipeline);
+    } finally {
+        session.getOptions().setReadPreference(readPreference);
+    }
+};
 
 DB.prototype.killOp = function(op) {
     if (!op)
@@ -935,11 +1011,19 @@ DB.prototype.getReplicationInfo = function() {
 DB.prototype.printReplicationInfo = function() {
     var result = this.getReplicationInfo();
     if (result.errmsg) {
-        var isMaster = this.isMaster();
-        if (isMaster.arbiterOnly) {
+        let reply, isPrimary;
+        if (this.getMongo().getApiParameters().apiVersion) {
+            reply = this.hello();
+            isPrimary = reply.isWritablePrimary;
+        } else {
+            reply = this.isMaster();
+            isPrimary = reply.ismaster;
+        }
+
+        if (reply.arbiterOnly) {
             print("cannot provide replication status from an arbiter.");
             return;
-        } else if (!isMaster.ismaster) {
+        } else if (!isPrimary) {
             print("this is a secondary, printing secondary replication info.");
             this.printSecondaryReplicationInfo();
             return;
@@ -1407,7 +1491,7 @@ DB.prototype._defaultAuthenticationMechanism = null;
 DB.prototype._getDefaultAuthenticationMechanism = function(username, database) {
     if (username !== undefined) {
         const userid = database + "." + username;
-        const result = this.runCommand({isMaster: 1, saslSupportedMechs: userid});
+        const result = this._helloOrLegacyHello({saslSupportedMechs: userid});
         if (result.ok && (result.saslSupportedMechs !== undefined)) {
             const mechs = result.saslSupportedMechs;
             if (!Array.isArray(mechs)) {
@@ -1476,8 +1560,8 @@ DB.prototype._authOrThrow = function() {
     params.db = this.getName();
     var good = this.getMongo().auth(params);
     if (good) {
-        // auth enabled, and should try to use isMaster and replSetGetStatus to build prompt
-        this.getMongo().authStatus = {authRequired: true, isMaster: true, replSetGetStatus: true};
+        // auth enabled, and should try to use hello and replSetGetStatus to build prompt
+        this.getMongo().authStatus = {authRequired: true, hello: true, replSetGetStatus: true};
     }
 
     return good;
@@ -1730,8 +1814,16 @@ DB.prototype.getFreeMonitoringStatus = function() {
 
 DB.prototype.enableFreeMonitoring = function() {
     'use strict';
-    const isMaster = this.isMaster();
-    if (isMaster.ismaster == false) {
+    let reply, isPrimary;
+    if (this.getMongo().getApiParameters().apiVersion) {
+        reply = this.hello();
+        isPrimary = reply.isWritablePrimary;
+    } else {
+        reply = this.isMaster();
+        isPrimary = reply.ismaster;
+    }
+
+    if (!isPrimary) {
         print("ERROR: db.enableFreeMonitoring() may only be run on a primary");
         return;
     }

@@ -54,7 +54,7 @@ public:
     bool isEphemeral() const final {
         return true;
     }
-    void loadCatalog(OperationContext* opCtx, bool loadingFromUncleanShutdown) final {}
+    void loadCatalog(OperationContext* opCtx, LastShutdownState lastShutdownState) final {}
     void closeCatalog(OperationContext* opCtx) final {}
     Status closeDatabase(OperationContext* opCtx, StringData db) final {
         return Status::OK();
@@ -154,7 +154,7 @@ public:
         OldestActiveTransactionTimestampCallback callback) final {}
 
     StatusWith<StorageEngine::ReconcileResult> reconcileCatalogAndIdents(
-        OperationContext* opCtx, InternalIdentReconcilePolicy internalIdentReconcilePolicy) final {
+        OperationContext* opCtx, LastShutdownState lastShutdownState) final {
         return ReconcileResult{};
     }
     Timestamp getAllDurableTimestamp() const final {
@@ -170,7 +170,6 @@ public:
         return {};
     }
     void addDropPendingIdent(const Timestamp& dropTimestamp,
-                             const NamespaceString& nss,
                              std::shared_ptr<Ident> ident,
                              DropIdentCallback&& onDrop) final {}
     void checkpoint() final {}
@@ -204,6 +203,8 @@ public:
     }
 
     void unpinOldestTimestamp(const std::string& requestingServiceName) final {}
+
+    void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) final {}
 };
 
 }  // namespace mongo

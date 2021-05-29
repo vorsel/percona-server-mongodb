@@ -99,6 +99,7 @@
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/reply_builder_interface.h"
+#include "mongo/rpc/warn_deprecated_wire_ops.h"
 #include "mongo/s/shard_cannot_refresh_due_to_locks_held_exception.h"
 #include "mongo/transport/hello_metrics.h"
 #include "mongo/transport/service_executor.h"
@@ -900,6 +901,16 @@ void CheckoutSessionAndInvokeCommand::_checkOutSession() {
     _sessionTxnState = std::make_unique<MongoDOperationContextSession>(opCtx);
     _txnParticipant.emplace(TransactionParticipant::get(opCtx));
 
+    auto apiParamsFromClient = APIParameters::get(opCtx);
+    auto apiParamsFromTxn = _txnParticipant->getAPIParameters(opCtx);
+    uassert(
+        ErrorCodes::APIMismatchError,
+        "API parameter mismatch: {} used params {}, the transaction's first command used {}"_format(
+            invocation->definition()->getName(),
+            apiParamsFromClient.toBSON().toString(),
+            apiParamsFromTxn.toBSON().toString()),
+        apiParamsFromTxn == apiParamsFromClient);
+
     if (!opCtx->getClient()->isInDirectClient()) {
         bool beganOrContinuedTxn{false};
         // This loop allows new transactions on a session to block behind a previous prepared
@@ -986,9 +997,6 @@ void CheckoutSessionAndInvokeCommand::_checkOutSession() {
             }
         }
     }
-
-    // Use the API parameters that were stored when the transaction was initiated.
-    APIParameters::get(opCtx) = _txnParticipant->getAPIParameters(opCtx);
 }
 
 void CheckoutSessionAndInvokeCommand::_tapError(Status status) {
@@ -1547,13 +1555,6 @@ void ExecCommandDatabase::_initiateCommand() {
         opCtx->lockState()->setShouldConflictWithSecondaryBatchApplication(false);
     }
 
-    if (opCtx->inMultiDocumentTransaction() && !startTransaction) {
-        uassert(4937700,
-                "API parameters are only allowed in the first command of a multi-document "
-                "transaction",
-                !APIParameters::get(opCtx).getParamsPassed());
-    }
-
     // Remember whether or not this operation is starting a transaction, in case something later in
     // the execution needs to adjust its behavior based on this.
     opCtx->setIsStartingMultiDocumentTransaction(startTransaction);
@@ -1952,6 +1953,7 @@ DbResponse receivedQuery(OperationContext* opCtx,
     DbResponse dbResponse;
 
     try {
+        warnDeprecation(c, networkOpToString(m.operation()));
         Client* client = opCtx->getClient();
         Status status = auth::checkAuthForFind(AuthorizationSession::get(client), nss, false);
         audit::logQueryAuthzCheck(client, nss, q.query, status.code());
@@ -2088,6 +2090,7 @@ DbResponse receivedGetMore(OperationContext* opCtx,
 
     DbResponse dbresponse;
     try {
+        warnDeprecation(*opCtx->getClient(), networkOpToString(m.operation()));
         const NamespaceString nsString(ns);
         uassert(ErrorCodes::InvalidNamespace,
                 str::stream() << "Invalid ns [" << ns << "]",
@@ -2274,6 +2277,7 @@ std::unique_ptr<HandleRequest::OpRunner> HandleRequest::makeOpRunner() {
 
 DbResponse FireAndForgetOpRunner::runSync() {
     try {
+        warnDeprecation(executionContext->client(), networkOpToString(executionContext->op()));
         runAndForget();
     } catch (const AssertionException& ue) {
         LastError::get(executionContext->client()).setLastError(ue.code(), ue.reason());

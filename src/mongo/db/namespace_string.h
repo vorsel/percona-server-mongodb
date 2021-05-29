@@ -172,11 +172,17 @@ public:
     // Namespace for storing config.transactions cloner progress for resharding.
     static const NamespaceString kReshardingTxnClonerProgressNamespace;
 
+    // Namespace for view on local.oplog.rs for resharding.
+    static const NamespaceString kReshardingOplogView;
+
     // Namespace for storing config.collectionCriticalSections documents
     static const NamespaceString kCollectionCriticalSectionsNamespace;
 
     // Dummy namespace used for forcing secondaries to handle an oplog entry on its own batch.
     static const NamespaceString kForceOplogBatchBoundaryNamespace;
+
+    // Namespace used for storing retryable findAndModify images.
+    static const NamespaceString kConfigImagesNamespace;
 
     /**
      * Constructs an empty NamespaceString.

@@ -80,8 +80,8 @@ std::pair<TypeTags, Value> makeCopyBsonJavascript(StringData code) {
 }
 
 std::pair<TypeTags, Value> makeNewBsonDBPointer(StringData ns, const uint8_t* id) {
-    auto const nsLen = ns.size();
-    auto const nsLenWithNull = nsLen + sizeof(char);
+    const auto nsLen = ns.size();
+    const auto nsLenWithNull = nsLen + sizeof(char);
     auto buffer = std::make_unique<char[]>(sizeof(uint32_t) + nsLenWithNull + sizeof(ObjectIdType));
     char* ptr = buffer.get();
 
@@ -101,10 +101,10 @@ std::pair<TypeTags, Value> makeNewBsonDBPointer(StringData ns, const uint8_t* id
 }
 
 std::pair<TypeTags, Value> makeNewBsonCodeWScope(StringData code, const char* scope) {
-    auto const codeLen = code.size();
-    auto const codeLenWithNull = codeLen + sizeof(char);
-    auto const scopeLen = ConstDataView(scope).read<LittleEndian<uint32_t>>();
-    auto const numBytes = 2 * sizeof(uint32_t) + codeLenWithNull + scopeLen;
+    const auto codeLen = code.size();
+    const auto codeLenWithNull = codeLen + sizeof(char);
+    const auto scopeLen = ConstDataView(scope).read<LittleEndian<uint32_t>>();
+    const auto numBytes = 2 * sizeof(uint32_t) + codeLenWithNull + scopeLen;
     auto buffer = std::make_unique<char[]>(numBytes);
     char* ptr = buffer.get();
 

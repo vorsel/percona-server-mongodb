@@ -30,6 +30,7 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/exec/add_fields_projection_executor.h"
+#include "mongo/db/matcher/expression_algo.h"
 #include "mongo/db/pipeline/document_source_add_fields.h"
 #include "mongo/db/pipeline/document_source_project.h"
 #include "mongo/db/pipeline/document_source_set_window_fields.h"
@@ -38,6 +39,7 @@
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/query/sort_pattern.h"
 #include "mongo/util/visit_helper.h"
 
 using boost::intrusive_ptr;
@@ -46,6 +48,31 @@ using std::list;
 using SortPatternPart = mongo::SortPattern::SortPatternPart;
 
 namespace mongo {
+
+namespace {
+
+/**
+ * Does a sort pattern contain a path that has been modified?
+ */
+bool modifiedSortPaths(const SortPattern& pat, const DocumentSource::GetModPathsReturn& paths) {
+    for (const auto& path : pat) {
+        if (!path.fieldPath.has_value()) {
+            return true;
+        }
+        auto sortFieldPath = path.fieldPath->fullPath();
+        auto it = std::find_if(
+            paths.paths.begin(), paths.paths.end(), [&sortFieldPath](const auto& modPath) {
+                return sortFieldPath == modPath ||
+                    expression::isPathPrefixOf(sortFieldPath, modPath) ||
+                    expression::isPathPrefixOf(modPath, sortFieldPath);
+            });
+        if (it != paths.paths.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+}  // namespace
 
 REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(
     setWindowFields,
@@ -262,6 +289,9 @@ Value DocumentSourceInternalSetWindowFields::serialize(
         }
 
         out["maxFunctionMemoryUsageBytes"] = Value(md.freezeToValue());
+        out["maxTotalMemoryUsageBytes"] =
+            Value(static_cast<long long>(_memoryTracker.maxMemoryBytes()));
+        out["usedDisk"] = Value(_iterator.usedDisk());
     }
 
     return Value(out.freezeToValue());
@@ -312,6 +342,91 @@ void DocumentSourceInternalSetWindowFields::initialize() {
     _init = true;
 }
 
+Pipeline::SourceContainer::iterator DocumentSourceInternalSetWindowFields::doOptimizeAt(
+    Pipeline::SourceContainer::iterator itr, Pipeline::SourceContainer* container) {
+    invariant(*itr == this);
+
+    if (itr == container->begin()) {
+        return std::next(itr);
+    }
+
+    if (std::next(itr) == container->end()) {
+        return container->end();
+    }
+
+    auto nextSort = dynamic_cast<DocumentSourceSort*>((*std::next(itr)).get());
+    auto prevSort = dynamic_cast<DocumentSourceSort*>((*std::prev(itr)).get());
+
+    if (!nextSort || !prevSort) {
+        return std::next(itr);
+    }
+
+    auto nextPattern = nextSort->getSortKeyPattern();
+    auto prevPattern = prevSort->getSortKeyPattern();
+
+    if (nextSort->getLimit() != boost::none || modifiedSortPaths(nextPattern, getModifiedPaths())) {
+        return std::next(itr);
+    }
+
+    // Sort is redundant if prefix of _internalSetWindowFields' sort pattern.
+    //
+    // Ex.
+    //
+    // {$sort: {a: 1, b: 1}},
+    // {$_internalSetWindowFields: _},
+    // {$sort: {a: 1}}
+    //
+    // is equivalent to
+    //
+    // {$sort: {a: 1, b: 1}},
+    // {$_internalSetWindowFields: _}
+    //
+    if (nextPattern.size() <= prevPattern.size()) {
+        for (size_t i = 0; i < nextPattern.size(); i++) {
+            if (nextPattern[i] != prevPattern[i]) {
+                return std::next(itr);
+            }
+        }
+        container->erase(std::next(itr));
+        return itr;
+    }
+
+    // Push down if sort pattern contains _internalSetWindowFields' sort pattern.
+    //
+    // Ex.
+    //
+    //  {$sort: {a: 1, b: 1}},
+    //  {$_internalSetWindowFields: _},
+    //  {$sort: {a: 1, b: 1, c: 1}}
+    //
+    // is equivalent to
+    //
+    //  {$sort: {a: 1, b: 1}},
+    //  {$sort: {a: 1, b: 1, c: 1}},
+    //  {$_internalSetWindowFields: _}
+    //
+    for (size_t i = 0; i < prevPattern.size(); i++) {
+        if (nextPattern[i] != prevPattern[i]) {
+            return std::next(itr);
+        }
+    }
+
+    // Swap the $_internalSetWindowFields with the following $sort.
+    std::swap(*itr, *std::next(itr));
+    // Now 'itr' is still valid but points to the $sort we pushed down.
+
+    // We want to give other optimizations a chance to take advantage of the change:
+    // 1. The previous sort can remove itself.
+    // 2. Other stages may interact with the newly pushed down sort.
+    // So we want to look at the stage *before* the previous sort, if any.
+    itr = std::prev(itr);
+    // Now 'itr' points to the previous sort.
+
+    if (itr == container->begin())
+        return itr;
+    return std::prev(itr);
+}
+
 DocumentSource::GetNextResult DocumentSourceInternalSetWindowFields::doGetNext() {
     if (!_init) {
         initialize();
@@ -321,6 +436,8 @@ DocumentSource::GetNextResult DocumentSourceInternalSetWindowFields::doGetNext()
         return DocumentSource::GetNextResult::makeEOF();
 
     auto curDoc = _iterator.current();
+    _memoryTracker.setInternal("PartitionIterator", _iterator.getApproximateSize());
+
     // The only way we hit this case is if there are no documents, since otherwise _eof will be set.
     if (!curDoc) {
         _eof = true;
@@ -330,18 +447,29 @@ DocumentSource::GetNextResult DocumentSourceInternalSetWindowFields::doGetNext()
     // Populate the output document with the result from each window function.
     MutableDocument addFieldsSpec;
     for (auto&& [fieldName, function] : _executableOutputs) {
-        auto oldIteratorMemUsage = _iterator.getApproximateSize();
-        addFieldsSpec.addField(fieldName, function->getNext());
+        try {
+            // If we hit a uassert while evaluating expressions on user data, delete the temporary
+            // table before aborting the operation.
+            addFieldsSpec.addField(fieldName, function->getNext());
+        } catch (const DBException&) {
+            _iterator.finalize();
+            throw;
+        }
 
         // Update the memory usage for this function after getNext().
         _memoryTracker.set(fieldName, function->getApproximateSize());
         // Account for the additional memory in the iterator cache.
-        _memoryTracker.set(_memoryTracker.currentMemoryBytes() +
-                           (_iterator.getApproximateSize() - oldIteratorMemUsage));
-
-        uassert(5414201,
-                "Exceeded memory limit in DocumentSourceSetWindowFields",
-                _memoryTracker.currentMemoryBytes() < _memoryTracker._maxAllowedMemoryUsageBytes);
+        _memoryTracker.setInternal("PartitionIterator", _iterator.getApproximateSize());
+        if (_memoryTracker.currentMemoryBytes() >= _memoryTracker._maxAllowedMemoryUsageBytes &&
+            _memoryTracker._allowDiskUse) {
+            // Attempt to spill where possible.
+            _iterator.spillToDisk();
+            _memoryTracker.setInternal("PartitionIterator", _iterator.getApproximateSize());
+        }
+        if (_memoryTracker.currentMemoryBytes() > _memoryTracker._maxAllowedMemoryUsageBytes) {
+            _iterator.finalize();
+            uasserted(5414201, "Exceeded memory limit in DocumentSourceSetWindowFields");
+        }
     }
 
     // Advance the iterator and handle partition/EOF edge cases.
@@ -351,13 +479,14 @@ DocumentSource::GetNextResult DocumentSourceInternalSetWindowFields::doGetNext()
         case PartitionIterator::AdvanceResult::kNewPartition:
             // We've advanced to a new partition, reset the state of every function as well as the
             // memory tracker.
-            _memoryTracker.reset();
+            _memoryTracker.resetCurrent();
             for (auto&& [fieldName, function] : _executableOutputs) {
                 function->reset();
             }
             break;
         case PartitionIterator::AdvanceResult::kEOF:
             _eof = true;
+            _iterator.finalize();
             break;
     }
     auto projExec = projection_executor::AddFieldsProjectionExecutor::create(

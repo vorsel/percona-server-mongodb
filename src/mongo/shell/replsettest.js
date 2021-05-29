@@ -74,7 +74,6 @@
 
 var ReplSetTest = function(opts) {
     'use strict';
-    load("jstests/multiVersion/libs/verify_versions.js");
 
     if (!(this instanceof ReplSetTest)) {
         return new ReplSetTest(opts);
@@ -127,8 +126,8 @@ var ReplSetTest = function(opts) {
     }
 
     /**
-     * Invokes the 'hello' command via it's alias 'ismaster' on each individual node and returns the
-     * current primary, or false if none is found. Populates the following cached values:
+     * Invokes the 'hello' command on each individual node and returns the current primary, or false
+     * if none is found. Populates the following cached values:
      * '_primary': the current primary
      * '_secondaries': all nodes other than '_primary' (note this includes arbiters)
      * '_liveNodes': all currently reachable nodes
@@ -144,7 +143,7 @@ var ReplSetTest = function(opts) {
         self.nodes.forEach(function(node) {
             try {
                 node.setSecondaryOk();
-                var n = node.getDB('admin').runCommand({ismaster: 1});
+                var n = node.getDB('admin')._helloOrLegacyHello();
                 self._liveNodes.push(node);
                 // We verify that the node has a valid config by checking if n.me exists. Then, we
                 // check to see if the node is in primary state.
@@ -153,13 +152,14 @@ var ReplSetTest = function(opts) {
                         twoPrimaries = true;
                     } else {
                         self._primary = node;
-                        canAcceptWrites = n.ismaster;
+                        canAcceptWrites = n.isWritablePrimary || n.ismaster;
                     }
                 } else {
                     self._secondaries.push(node);
                 }
             } catch (err) {
-                print("ReplSetTest Could not call ismaster on node " + node + ": " + tojson(err));
+                print("ReplSetTest Could not call hello/ismaster on node " + node + ": " +
+                      tojson(err));
                 self._secondaries.push(node);
             }
         });
@@ -198,7 +198,25 @@ var ReplSetTest = function(opts) {
             return !connIsAuthenticated;
         });
 
-        if (keyFileParam && unauthenticatedConns.length > 0) {
+        const connOptions = connArray[0].fullOptions || {};
+        const authMode = connOptions.clusterAuthMode || connArray[0].clusterAuthMode ||
+            jsTest.options().clusterAuthMode;
+
+        let needsAuth = (keyFileParam || authMode === "x509" || authMode === "sendX509" ||
+                         authMode === "sendKeyFile") &&
+            unauthenticatedConns.length > 0;
+
+        // There are few cases where we do not auth
+        // 1. When transitiong to auth
+        // 2. When cluster is running in x509 but shell was not started with TLS (i.e. sslSpecial
+        // suite)
+        if (needsAuth &&
+            (connOptions.transitionToAuth !== undefined ||
+             (authMode === "x509" && !connArray[0].isTLS()))) {
+            needsAuth = false;
+        }
+
+        if (needsAuth) {
             return authutil.asCluster(unauthenticatedConns, keyFileParam, fn);
         } else {
             return fn();
@@ -716,10 +734,7 @@ var ReplSetTest = function(opts) {
             var ready = true;
 
             for (var i = 0; i < len; i++) {
-                // Our testing framework must be backwards compatible
-                // for multiversion testing, so we are using the 'hello'
-                // command's alias 'ismaster'.
-                var hello = secondariesToCheck[i].adminCommand({ismaster: 1});
+                var hello = secondariesToCheck[i].getDB('admin')._helloOrLegacyHello();
                 var arbiter = (hello.arbiterOnly === undefined ? false : hello.arbiterOnly);
                 ready = ready && (hello.secondary || arbiter);
             }
@@ -933,10 +948,7 @@ var ReplSetTest = function(opts) {
             var primary;
 
             for (var i = 0; i < nodes.length; i++) {
-                // Our testing framework must be backwards compatible
-                // for multiversion testing, so we are using the 'hello'
-                // command's alias 'ismaster'.
-                var hello = assert.commandWorked(nodes[i].adminCommand({ismaster: 1}));
+                var hello = assert.commandWorked(nodes[i].getDB('admin')._helloOrLegacyHello());
                 var nodesPrimary = hello.primary;
                 // Node doesn't see a primary.
                 if (!nodesPrimary) {
@@ -1069,7 +1081,7 @@ var ReplSetTest = function(opts) {
     };
 
     function isNodeArbiter(node) {
-        return node.getDB('admin').isMaster('admin').arbiterOnly;
+        return node.getDB('admin')._helloOrLegacyHello().arbiterOnly;
     }
 
     this.getArbiters = function() {
@@ -1082,7 +1094,7 @@ var ReplSetTest = function(opts) {
             assert.retryNoExcept(() => {
                 isArbiter = isNodeArbiter(node);
                 return true;
-            }, `Could not call 'isMaster' on ${node}.`, 3, 1000);
+            }, `Could not call hello/isMaster on ${node}.`, 3, 1000);
 
             if (isArbiter) {
                 arbiters.push(node);
@@ -1525,9 +1537,14 @@ var ReplSetTest = function(opts) {
         }
 
         // Setup authentication if running test with authentication
-        if ((jsTestOptions().keyFile) && cmdKey == 'replSetInitiate') {
+        if ((jsTestOptions().keyFile || self.clusterAuthMode === "x509") &&
+            cmdKey === 'replSetInitiate') {
             primary = this.getPrimary();
-            jsTest.authenticateNodes(this.nodes);
+            // The sslSpecial suite sets up cluster with x509 but the shell was not started with TLS
+            // so we need to rely on the test to auth if needed.
+            if (!(self.clusterAuthMode === "x509" && !primary.isTLS())) {
+                jsTest.authenticateNodes(this.nodes);
+            }
         }
 
         // Wait for initial sync to complete on all nodes. Use a faster polling interval so we can
@@ -1589,15 +1606,35 @@ var ReplSetTest = function(opts) {
                 const authMode = options.clusterAuthMode;
                 const notX509 =
                     authMode != "sendX509" && authMode != "x509" && authMode != "sendKeyFile";
-                const currVersion = node.getBinVersion();
-                const binVersionLatest =
-                    MongoRunner.areBinVersionsTheSame(MongoRunner.getBinVersionFor(currVersion),
-                                                      MongoRunner.getBinVersionFor("latest"));
-                if (binVersionLatest && notX509) {
+
+                // We should only be checking the binary version if we are not using X509 auth,
+                // as any server command will fail if the 'authMode' is X509.
+                if (notX509) {
+                    const serverStatus =
+                        assert.commandWorked(node.getDB("admin").runCommand({serverStatus: 1}));
+                    const currVersion = serverStatus.version;
+                    const binVersionLatest =
+                        MongoRunner.areBinVersionsTheSame(MongoRunner.getBinVersionFor(currVersion),
+                                                          MongoRunner.getBinVersionFor("latest"));
+
+                    // Only set the following server parameters for nodes running on the latest
+                    // binary version.
+                    if (!binVersionLatest) {
+                        continue;
+                    }
+
                     assert.commandWorked(node.adminCommand({
                         setParameter: 1,
                         enableDefaultWriteConcernUpdatesForInitiate: false,
                     }));
+
+                    // Re-enable the reconfig check to ensure that committed writes cannot be rolled
+                    // back. We disabled this check during initialization to ensure that replica
+                    // sets will not fail to start up.
+                    if (jsTestOptions().enableTestCommands) {
+                        assert.commandWorked(node.adminCommand(
+                            {setParameter: 1, enableReconfigRollbackCommittedWritesCheck: true}));
+                    }
                 }
             }
         });
@@ -1762,10 +1799,10 @@ var ReplSetTest = function(opts) {
         timeout = timeout || this.kDefaultTimeoutMS;
 
         assert.soonNoExcept(function() {
-            var primaryVersion = self.getPrimary().adminCommand({ismaster: 1}).setVersion;
+            var primaryVersion = self.getPrimary().getDB('admin')._helloOrLegacyHello().setVersion;
 
             for (var i = 0; i < self.nodes.length; i++) {
-                var version = self.nodes[i].adminCommand({ismaster: 1}).setVersion;
+                var version = self.nodes[i].getDB('admin')._helloOrLegacyHello().setVersion;
                 assert.eq(version,
                           primaryVersion,
                           "waiting for secondary node " + self.nodes[i].host +
@@ -2171,7 +2208,6 @@ var ReplSetTest = function(opts) {
     };
 
     this.getHashesUsingSessions = function(sessions, dbName, {
-        filterCapped: filterCapped = true,
         readAtClusterTime,
     } = {}) {
         return sessions.map(session => {
@@ -2191,26 +2227,7 @@ var ReplSetTest = function(opts) {
                 }
             }
 
-            const res = assert.commandWorked(db.runCommand(commandObj));
-
-            // The "capped" field in the dbHash command response is new as of MongoDB 4.0.
-            const cappedCollections = new Set(filterCapped ? res.capped : []);
-
-            for (let collName of Object.keys(res.collections)) {
-                // Capped collections are not necessarily truncated at the same points across
-                // replica set members and may therefore not have the same md5sum. We remove them
-                // from the dbHash command response to avoid an already known case of a mismatch.
-                // See SERVER-16049 for more details.
-                if (cappedCollections.has(collName)) {
-                    delete res.collections[collName];
-                    // The "uuids" field in the dbHash command response is new as of MongoDB 4.0.
-                    if (res.hasOwnProperty("uuids")) {
-                        delete res.uuids[collName];
-                    }
-                }
-            }
-
-            return res;
+            return assert.commandWorked(db.runCommand(commandObj));
         });
     };
 
@@ -2226,15 +2243,11 @@ var ReplSetTest = function(opts) {
         const sessions = [
             self._primary,
             ...secondaries.filter(conn => {
-                return !conn.adminCommand({isMaster: 1}).arbiterOnly;
+                return !conn.getDB('admin')._helloOrLegacyHello().arbiterOnly;
             })
         ].map(conn => conn.getDB('test').getSession());
 
-        // getHashes() is sometimes called for versions of MongoDB earlier than 4.0 so we cannot use
-        // the dbHash command directly to filter out capped collections. checkReplicatedDataHashes()
-        // uses the listCollections command after awaiting replication to determine if a collection
-        // is capped.
-        const hashes = this.getHashesUsingSessions(sessions, dbName, {filterCapped: false});
+        const hashes = this.getHashesUsingSessions(sessions, dbName);
         return {primary: hashes[0], secondaries: hashes.slice(1)};
     };
 
@@ -2828,6 +2841,12 @@ var ReplSetTest = function(opts) {
         // We need to recalculate the DWC after each reconfig until the full set is included.
         options.setParameter.enableDefaultWriteConcernUpdatesForInitiate = true;
 
+        // Disable a check in reconfig that will prevent certain configs with arbiters from
+        // spinning up. We will re-enable this check after the replica set has finished initiating.
+        if (jsTestOptions().enableTestCommands) {
+            options.setParameter.enableReconfigRollbackCommittedWritesCheck = false;
+        }
+
         if (tojson(options) != tojson({}))
             printjson(options);
 
@@ -3207,6 +3226,12 @@ var ReplSetTest = function(opts) {
         self.oplogSize = opts.oplogSize || 40;
         self.useSeedList = opts.useSeedList || false;
         self.keyFile = opts.keyFile;
+
+        self.clusterAuthMode = undefined;
+        if (opts.clusterAuthMode) {
+            self.clusterAuthMode = opts.clusterAuthMode;
+        }
+
         self.protocolVersion = opts.protocolVersion;
         self.waitForKeys = opts.waitForKeys;
 
@@ -3251,6 +3276,13 @@ var ReplSetTest = function(opts) {
             }
 
             numNodes = opts.nodes;
+        }
+
+        for (let i = 0; i < numNodes; i++) {
+            if (self.nodeOptions["n" + i] !== undefined &&
+                self.nodeOptions["n" + i].clusterAuthMode == "x509") {
+                self.clusterAuthMode = "x509";
+            }
         }
 
         if (_useBridge) {

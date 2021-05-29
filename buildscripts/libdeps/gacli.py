@@ -103,7 +103,6 @@ class CustomFormatter(argparse.RawTextHelpFormatter, argparse.ArgumentDefaultsHe
                     {help_text[CountTypes.PUB_EDGE.name]}count edges that are public
                     {help_text[CountTypes.PRIV_EDGE.name]}count edges that are private
                     {help_text[CountTypes.IF_EDGE.name]}count edges that are interface
-                    {help_text[CountTypes.SHIM.name]}count shim nodes
                     {help_text[CountTypes.LIB.name]}count library nodes
                     {help_text[CountTypes.PROG.name]}count program nodes
                 """)
@@ -159,6 +158,11 @@ def setup_args_parser():
         "[from_node] [to_node]: Print edges between two nodes, which if removed would break the dependency between those "
         + "nodes,.")
 
+    parser.add_argument(
+        '--indegree-one', action='store_true', default=False, help=
+        "Find candidate nodes for merging by searching the graph for nodes with only one node which depends on them."
+    )
+
     args = parser.parse_args()
 
     for arg_list in args.graph_paths:
@@ -212,12 +216,15 @@ def main():
         analysis.append(
             libdeps_analyzer.CriticalEdges(libdeps_graph, analyzer_args[0], analyzer_args[1]))
 
+    if args.indegree_one:
+        analysis.append(libdeps_analyzer.InDegreeOne(libdeps_graph))
+
     analysis += libdeps_analyzer.linter_factory(libdeps_graph, args.lint)
 
     if args.build_data:
         analysis.append(libdeps_analyzer.BuildDataReport(libdeps_graph))
 
-    ga = libdeps_analyzer.LibdepsGraphAnalysis(libdeps_graph=libdeps_graph, analysis=analysis)
+    ga = libdeps_analyzer.LibdepsGraphAnalysis(analysis)
 
     if args.format == 'pretty':
         ga_printer = libdeps_analyzer.GaPrettyPrinter(ga)

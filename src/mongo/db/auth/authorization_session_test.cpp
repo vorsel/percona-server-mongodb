@@ -126,7 +126,6 @@ protected:
     AuthorizationManager* authzManager;
     std::unique_ptr<AuthorizationSessionForTest> authzSession;
     BSONObj credentials;
-    RAIIServerParameterControllerForTest controller{"featureFlagAuthorizationContract", 1};
 };
 
 const NamespaceString testFooNss("test.foo");
@@ -593,7 +592,7 @@ TEST_F(AuthorizationSessionTest, AcquireUserObtainsAndValidatesAuthenticationRes
     assertWorks("192.168.0.6", "192.168.0.2");
     assertWorks("192.168.0.12", "192.168.0.2");
 
-    // A client connecting from the explicitly whitelisted addresses can connect to a
+    // A client connecting from the explicitly allowlisted addresses can connect to a
     // server listening on 192.168.0.2
     assertWorks("192.168.2.10", "192.168.0.2");
 

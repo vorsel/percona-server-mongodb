@@ -670,116 +670,6 @@ __wt_conn_remove_extractor(WT_SESSION_IMPL *session)
 }
 
 /*
- * __tiered_confchk --
- *     Check for a valid tiered storage source.
- */
-static int
-__tiered_confchk(
-  WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cname, WT_NAMED_STORAGE_SOURCE **nstoragep)
-{
-    WT_CONNECTION_IMPL *conn;
-    WT_NAMED_STORAGE_SOURCE *nstorage;
-
-    *nstoragep = NULL;
-
-    if (cname->len == 0 || WT_STRING_MATCH("none", cname->str, cname->len))
-        return (0);
-
-    conn = S2C(session);
-    TAILQ_FOREACH (nstorage, &conn->storagesrcqh, q)
-        if (WT_STRING_MATCH(nstorage->name, cname->str, cname->len)) {
-            *nstoragep = nstorage;
-            return (0);
-        }
-    WT_RET_MSG(session, EINVAL, "unknown storage source '%.*s'", (int)cname->len, cname->str);
-}
-
-/*
- * __wt_tiered_bucket_config --
- *     Given a configuration, configure the bucket storage.
- */
-int
-__wt_tiered_bucket_config(WT_SESSION_IMPL *session, WT_CONFIG_ITEM *cval, WT_CONFIG_ITEM *bucket,
-  WT_BUCKET_STORAGE **bstoragep)
-{
-    WT_BUCKET_STORAGE *bstorage, *new;
-    WT_CONNECTION_IMPL *conn;
-    WT_DECL_RET;
-    WT_NAMED_STORAGE_SOURCE *nstorage;
-#if 0
-    WT_STORAGE_SOURCE *custom, *storage;
-#else
-    WT_STORAGE_SOURCE *storage;
-#endif
-    uint64_t hash_bucket, hash;
-
-    *bstoragep = NULL;
-
-    bstorage = new = NULL;
-    conn = S2C(session);
-
-    __wt_spin_lock(session, &conn->storage_lock);
-
-    WT_ERR(__tiered_confchk(session, cval, &nstorage));
-    if (nstorage == NULL) {
-        if (bucket->len != 0)
-            WT_ERR_MSG(
-              session, EINVAL, "tiered_storage.bucket requires tiered_storage.name to be set");
-        goto out;
-    }
-
-    /*
-     * Check if tiered storage is set on the connection. If someone wants tiered storage on a table,
-     * it needs to be configured on the database as well.
-     */
-    if (conn->bstorage == NULL && bstoragep != &conn->bstorage)
-        WT_ERR_MSG(
-          session, EINVAL, "table tiered storage requires connection tiered storage to be set");
-    hash = __wt_hash_city64(bucket->str, bucket->len);
-    hash_bucket = hash & (conn->hash_size - 1);
-    TAILQ_FOREACH (bstorage, &nstorage->buckethashqh[hash_bucket], q)
-        if (WT_STRING_MATCH(bstorage->bucket, bucket->str, bucket->len))
-            goto out;
-
-    WT_ERR(__wt_calloc_one(session, &new));
-    WT_ERR(__wt_strndup(session, bucket->str, bucket->len, &new->bucket));
-    storage = nstorage->storage_source;
-#if 0
-    if (storage->customize != NULL) {
-        custom = NULL;
-        WT_ERR(storage->customize(storage, &session->iface, cfg_arg, &custom));
-        if (custom != NULL) {
-            bstorage->owned = 1;
-            storage = custom;
-        }
-    }
-#endif
-    new->storage_source = storage;
-    if (bstorage != NULL) {
-        new->object_size = bstorage->object_size;
-        new->retain_secs = bstorage->retain_secs;
-        WT_ERR(__wt_strdup(session, bstorage->auth_token, &new->auth_token));
-    }
-    TAILQ_INSERT_HEAD(&nstorage->bucketqh, new, q);
-    TAILQ_INSERT_HEAD(&nstorage->buckethashqh[hash_bucket], new, hashq);
-    F_SET(new, WT_BUCKET_FREE);
-
-out:
-    __wt_spin_unlock(session, &conn->storage_lock);
-    *bstoragep = new;
-    return (0);
-
-err:
-    if (bstorage != NULL) {
-        __wt_free(session, new->auth_token);
-        __wt_free(session, new->bucket);
-        __wt_free(session, new);
-    }
-    __wt_spin_unlock(session, &conn->storage_lock);
-    return (ret);
-}
-
-/*
  * __conn_add_storage_source --
  *     WT_CONNECTION->add_storage_source method.
  */
@@ -870,10 +760,6 @@ __wt_conn_remove_storage_source(WT_SESSION_IMPL *session)
         while ((bstorage = TAILQ_FIRST(&nstorage->bucketqh)) != NULL) {
             /* Remove from the connection's list, free memory. */
             TAILQ_REMOVE(&nstorage->bucketqh, bstorage, q);
-            storage = bstorage->storage_source;
-            WT_ASSERT(session, storage != NULL);
-            if (bstorage->owned && storage->terminate != NULL)
-                WT_TRET(storage->terminate(storage, (WT_SESSION *)session));
             __wt_free(session, bstorage->auth_token);
             __wt_free(session, bstorage->bucket);
             __wt_free(session, bstorage);
@@ -1407,7 +1293,7 @@ __conn_query_timestamp(WT_CONNECTION *wt_conn, char *hex_timestamp, const char *
     conn = (WT_CONNECTION_IMPL *)wt_conn;
 
     CONNECTION_API_CALL(conn, session, query_timestamp, config, cfg);
-    WT_TRET(__wt_txn_query_timestamp(session, hex_timestamp, cfg, true));
+    ret = __wt_txn_query_timestamp(session, hex_timestamp, cfg, true);
 err:
     API_END_RET(session, ret);
 }
@@ -1426,7 +1312,7 @@ __conn_set_timestamp(WT_CONNECTION *wt_conn, const char *config)
     conn = (WT_CONNECTION_IMPL *)wt_conn;
 
     CONNECTION_API_CALL(conn, session, set_timestamp, config, cfg);
-    WT_TRET(__wt_txn_global_set_timestamp(session, cfg));
+    ret = __wt_txn_global_set_timestamp(session, cfg);
 err:
     API_END_RET(session, ret);
 }
@@ -1446,7 +1332,7 @@ __conn_rollback_to_stable(WT_CONNECTION *wt_conn, const char *config)
 
     CONNECTION_API_CALL(conn, session, rollback_to_stable, config, cfg);
     WT_STAT_CONN_INCR(session, txn_rts);
-    WT_TRET(__wt_rollback_to_stable(session, cfg, false));
+    ret = __wt_rollback_to_stable(session, cfg, false);
 err:
     API_END_RET(session, ret);
 }
@@ -2924,16 +2810,19 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
     WT_ERR(__conn_load_extensions(session, cfg, false));
 
     /*
-     * The metadata/log encryptor is configured after extensions, since
-     * extensions may load encryptors.  We have to do this before creating
-     * the metadata file.
+     * Do some early initialization for tiered storage, as this may affect our choice of file system
+     * for some operations.
+     */
+    WT_ERR(__wt_tiered_conn_config(session, cfg, false));
+
+    /*
+     * The metadata/log encryptor is configured after extensions, since extensions may load
+     * encryptors. We have to do this before creating the metadata file.
      *
-     * The encryption customize callback needs the fully realized set of
-     * encryption args, as simply grabbing "encryption" doesn't work.
-     * As an example, configuration for the current call may just be
-     * "encryption=(secretkey=xxx)", with encryption.name,
-     * encryption.keyid being 'inherited' from the stored base
-     * configuration.
+     * The encryption customize callback needs the fully realized set of encryption args, as simply
+     * grabbing "encryption" doesn't work. As an example, configuration for the current call may
+     * just be "encryption=(secretkey=xxx)", with encryption.name, encryption.keyid being
+     * 'inherited' from the stored base configuration.
      */
     WT_ERR(__wt_config_gets_none(session, cfg, "encryption.name", &cval));
     WT_ERR(__wt_config_gets_none(session, cfg, "encryption.keyid", &keyid));

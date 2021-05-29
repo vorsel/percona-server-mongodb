@@ -4,7 +4,7 @@
 
 load("jstests/aggregation/extras/merge_helpers.js");  // For withEachMergeMode.
 
-const st = new ShardingTest({shards: 2, rs: {nodes: 3}, config: 1});
+const st = new ShardingTest({shards: 2, rs: {nodes: 3}});
 
 const mongosDB = st.s0.getDB("merge_write_concern");
 const source = mongosDB["source"];
@@ -94,6 +94,15 @@ testWriteConcernError(shard0);
 assert.commandWorked(source.insert([{_id: 11}, {_id: 12}, {_id: 13}]));
 
 // Verify that either shard can produce a WriteConcernError since writes are going to both.
+testWriteConcernError(shard0);
+testWriteConcernError(shard1);
+
+// Verify that either shard can produce a WriteConcernError when the CatalogCache is empty.
+[shard0, shard1].forEach(function(shard) {
+    shard.nodes.forEach(function(node) {
+        assert.commandWorked(node.adminCommand({flushRouterConfig: target.getFullName()}));
+    });
+});
 testWriteConcernError(shard0);
 testWriteConcernError(shard1);
 

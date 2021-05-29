@@ -106,8 +106,7 @@ public:
                   const NamespaceString& nss,
                   OptionalCollectionUUID uuid,
                   StmtId stmtId,
-                  bool fromMigrate,
-                  const boost::optional<BSONObj>& deletedDoc) final;
+                  const OplogDeleteEntryArgs& args) final;
     void onInternalOpMessage(OperationContext* opCtx,
                              const NamespaceString& nss,
                              const boost::optional<UUID> uuid,
@@ -135,6 +134,12 @@ public:
                                   OptionalCollectionUUID uuid,
                                   std::uint64_t numRecords,
                                   CollectionDropType dropType) final;
+    repl::OpTime onDropCollection(OperationContext* opCtx,
+                                  const NamespaceString& collectionName,
+                                  OptionalCollectionUUID uuid,
+                                  std::uint64_t numRecords,
+                                  CollectionDropType dropType,
+                                  bool markFromMigrate) final;
     void onDropIndex(OperationContext* opCtx,
                      const NamespaceString& nss,
                      OptionalCollectionUUID uuid,
@@ -147,6 +152,14 @@ public:
                                      OptionalCollectionUUID dropTargetUUID,
                                      std::uint64_t numRecords,
                                      bool stayTemp) final;
+    repl::OpTime preRenameCollection(OperationContext* opCtx,
+                                     const NamespaceString& fromCollection,
+                                     const NamespaceString& toCollection,
+                                     OptionalCollectionUUID uuid,
+                                     OptionalCollectionUUID dropTargetUUID,
+                                     std::uint64_t numRecords,
+                                     bool stayTemp,
+                                     bool markFromMigrate) final;
     void postRenameCollection(OperationContext* opCtx,
                               const NamespaceString& fromCollection,
                               const NamespaceString& toCollection,
@@ -160,6 +173,14 @@ public:
                             OptionalCollectionUUID dropTargetUUID,
                             std::uint64_t numRecords,
                             bool stayTemp) final;
+    void onRenameCollection(OperationContext* opCtx,
+                            const NamespaceString& fromCollection,
+                            const NamespaceString& toCollection,
+                            OptionalCollectionUUID uuid,
+                            OptionalCollectionUUID dropTargetUUID,
+                            std::uint64_t numRecords,
+                            bool stayTemp,
+                            bool markFromMigrate) final;
     void onImportCollection(OperationContext* opCtx,
                             const UUID& importUUID,
                             const NamespaceString& nss,

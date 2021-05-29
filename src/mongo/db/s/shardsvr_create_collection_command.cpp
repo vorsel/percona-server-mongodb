@@ -27,12 +27,11 @@
  *    it in the license file.
  */
 
-#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/bson/util/bson_extract.h"
-#include "mongo/db/audit.h"
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/dbdirectclient.h"
@@ -106,7 +105,7 @@ CreateCollectionResponse createCollectionLegacy(OperationContext* opCtx,
             dbInfo.shardingEnabled());
 
     if (nss.db() == NamespaceString::kConfigDb) {
-        // Only whitelisted collections in config may be sharded (unless we are in test mode)
+        // Only allowlisted collections in config may be sharded (unless we are in test mode)
         uassert(ErrorCodes::IllegalOperation,
                 "only special collections in the config db may be sharded",
                 nss == NamespaceString::kLogicalSessionsNamespace);
@@ -182,9 +181,6 @@ CreateCollectionResponse createCollection(OperationContext* opCtx,
                                           const ShardsvrCreateCollection& request) {
     uassert(
         ErrorCodes::NotImplemented, "create collection not implemented yet", request.getShardKey());
-
-    audit::logShardCollection(
-        opCtx->getClient(), nss.ns(), *request.getShardKey(), request.getUnique().value_or(false));
 
     auto coordinatorDoc = CreateCollectionCoordinatorDocument();
     coordinatorDoc.setShardingDDLCoordinatorMetadata(

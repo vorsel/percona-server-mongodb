@@ -29,9 +29,10 @@
 
 #include "mongo/db/exec/upsert_stage.h"
 
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop_failpoint_helpers.h"
-#include "mongo/db/repl/local_oplog_info.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/update/storage_validation.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
@@ -154,7 +155,7 @@ void UpsertStage::_performInsert(BSONObj newDocument) {
         auto replCoord = repl::ReplicationCoordinator::get(opCtx());
         if (collection()->isCapped() &&
             !replCoord->isOplogDisabledFor(opCtx(), collection()->ns())) {
-            auto oplogInfo = repl::LocalOplogInfo::get(opCtx());
+            auto oplogInfo = LocalOplogInfo::get(opCtx());
             auto oplogSlots = oplogInfo->getNextOpTimes(opCtx(), /*batchSize=*/1);
             insertStmt.oplogSlot = oplogSlots.front();
         }
@@ -274,7 +275,14 @@ void UpsertStage::_assertDocumentToBeInsertedIsValid(const mb::Document& documen
         // Shard key values are permitted to be missing, and so the only required field is _id. We
         // should always have an _id here, since we generated one earlier if not already present.
         invariant(document.root().ok() && document.root()[idFieldName].ok());
-        storage_validation::storageValid(document);
+        bool containsDotsAndDollarsField = false;
+        storage_validation::storageValid(
+            document,
+            feature_flags::gFeatureFlagDotsAndDollars.isEnabledAndIgnoreFCV(),
+            true, /* Should validate for storage */
+            &containsDotsAndDollarsField);
+        if (containsDotsAndDollarsField)
+            _params.driver->setContainsDotsAndDollarsField(true);
 
         //  Neither _id nor the shard key fields may have arrays at any point along their paths.
         _assertPathsNotArray(document, {{&idFieldRef}});

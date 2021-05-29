@@ -40,6 +40,7 @@
 
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/catalog_raii.h"
 #include "mongo/db/commands/test_commands_enabled.h"
 #include "mongo/db/concurrency/d_concurrency.h"
@@ -54,7 +55,6 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/query/get_executor.h"
-#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/storage_interface.h"
 #include "mongo/db/retryable_writes_stats.h"
@@ -93,7 +93,7 @@ MONGO_FAIL_POINT_DEFINE(failTransactionNoopWrite);
 const auto getTransactionParticipant = Session::declareDecoration<TransactionParticipant>();
 
 // The command names that are allowed in a prepared transaction.
-const StringMap<int> preparedTxnCmdWhitelist = {
+const StringMap<int> preparedTxnCmdAllowlist = {
     {"abortTransaction", 1}, {"commitTransaction", 1}, {"prepareTransaction", 1}};
 
 void fassertOnRepeatedExecution(const LogicalSessionId& lsid,
@@ -683,7 +683,7 @@ TransactionParticipant::OplogSlotReserver::OplogSlotReserver(OperationContext* o
 
     // Begin a new WUOW and reserve a slot in the oplog.
     WriteUnitOfWork wuow(opCtx);
-    auto oplogInfo = repl::LocalOplogInfo::get(opCtx);
+    auto oplogInfo = LocalOplogInfo::get(opCtx);
     _oplogSlots = oplogInfo->getNextOpTimes(opCtx, numSlotsToReserve);
 
     // Release the WUOW state since this WUOW is no longer in use.
@@ -1524,6 +1524,14 @@ APIParameters TransactionParticipant::Participant::getAPIParameters(OperationCon
     return APIParameters::get(opCtx);
 }
 
+void TransactionParticipant::Participant::setLastWriteOpTime(OperationContext* opCtx,
+                                                             const repl::OpTime& lastWriteOpTime) {
+    stdx::lock_guard<Client> lg(*opCtx->getClient());
+    auto& curLastWriteOpTime = o(lg).lastWriteOpTime;
+    invariant(lastWriteOpTime.isNull() || lastWriteOpTime > curLastWriteOpTime);
+    curLastWriteOpTime = lastWriteOpTime;
+}
+
 bool TransactionParticipant::Observer::expiredAsOf(Date_t when) const {
     return o().txnState.isInProgress() && o().transactionExpireDate &&
         o().transactionExpireDate < when;
@@ -1731,7 +1739,7 @@ void TransactionParticipant::Participant::_checkIsCommandValidWithTxnState(
             str::stream() << "Cannot call any operation other than abort, prepare or commit on"
                           << " a prepared transaction",
             !o().txnState.isPrepared() ||
-                preparedTxnCmdWhitelist.find(cmdName) != preparedTxnCmdWhitelist.cend());
+                preparedTxnCmdAllowlist.find(cmdName) != preparedTxnCmdAllowlist.cend());
 }
 
 BSONObj TransactionParticipant::Observer::reportStashedState(OperationContext* opCtx) const {
@@ -2168,7 +2176,8 @@ void TransactionParticipant::Participant::_setNewTxnNumber(OperationContext* opC
         "{lsid}",
         "New transaction started",
         "txnNumber"_attr = txnNumber,
-        "lsid"_attr = _sessionId().getId());
+        "lsid"_attr = _sessionId().getId(),
+        "apiParameters"_attr = APIParameters::get(opCtx).toBSON());
 
     // Abort the existing transaction if it's not prepared, committed, or aborted.
     if (o().txnState.isInProgress()) {

@@ -719,7 +719,7 @@ TEST_F(TransactionRouterTestWithDefaultSession, AttachTxnValidatesReadConcernIfA
     }
 }
 
-TEST_F(TransactionRouterTestWithDefaultSession, CannotSpecifyAPIParametersAfterFirstStatement) {
+TEST_F(TransactionRouterTestWithDefaultSession, SameAPIParametersAfterFirstStatement) {
     APIParameters apiParameters = APIParameters();
     apiParameters.setAPIVersion("1");
     APIParameters::get(operationContext()) = apiParameters;
@@ -730,11 +730,52 @@ TEST_F(TransactionRouterTestWithDefaultSession, CannotSpecifyAPIParametersAfterF
         operationContext(), txnNum, TransactionRouter::TransactionActions::kStart);
     txnRouter.setDefaultAtClusterTime(operationContext());
 
+    // Continuing with the same API params succeeds. (Must reset readConcern from "snapshot".)
+    repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs();
+    txnRouter.beginOrContinueTxn(
+        operationContext(), txnNum, TransactionRouter::TransactionActions::kContinue);
+}
+
+TEST_F(TransactionRouterTestWithDefaultSession, DifferentAPIParametersAfterFirstStatement) {
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("1");
+    APIParameters::get(operationContext()) = apiParameters;
+    TxnNumber txnNum{3};
+
+    auto txnRouter = TransactionRouter::get(operationContext());
+    txnRouter.beginOrContinueTxn(
+        operationContext(), txnNum, TransactionRouter::TransactionActions::kStart);
+    txnRouter.setDefaultAtClusterTime(operationContext());
+
+    // Can't continue with different params. (Must reset readConcern from "snapshot".)
+    APIParameters::get(operationContext()).setAPIStrict(true);
+    repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs();
     ASSERT_THROWS_CODE(
         txnRouter.beginOrContinueTxn(
             operationContext(), txnNum, TransactionRouter::TransactionActions::kContinue),
         DBException,
-        4937701);
+        ErrorCodes::APIMismatchError);
+}
+
+TEST_F(TransactionRouterTestWithDefaultSession, NoAPIParametersAfterFirstStatement) {
+    APIParameters apiParameters = APIParameters();
+    apiParameters.setAPIVersion("1");
+    APIParameters::get(operationContext()) = apiParameters;
+    TxnNumber txnNum{3};
+
+    auto txnRouter = TransactionRouter::get(operationContext());
+    txnRouter.beginOrContinueTxn(
+        operationContext(), txnNum, TransactionRouter::TransactionActions::kStart);
+    txnRouter.setDefaultAtClusterTime(operationContext());
+
+    // Can't continue without params. (Must reset readConcern from "snapshot".)
+    APIParameters::get(operationContext()) = APIParameters();
+    repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs();
+    ASSERT_THROWS_CODE(
+        txnRouter.beginOrContinueTxn(
+            operationContext(), txnNum, TransactionRouter::TransactionActions::kContinue),
+        DBException,
+        ErrorCodes::APIMismatchError);
 }
 
 TEST_F(TransactionRouterTestWithDefaultSession, CannotSpecifyReadConcernAfterFirstStatement) {
@@ -2277,34 +2318,6 @@ TEST_F(TransactionRouterTestWithDefaultSession, ContinueOnlyOnStaleVersionOnFirs
     txnRouter.attachTxnFieldsIfNeeded(operationContext(), shard1, {});
 
     ASSERT_FALSE(txnRouter.canContinueOnStaleShardOrDbError("update", kStaleConfigStatus));
-}
-
-TEST_F(TransactionRouterTestWithDefaultSession,
-       ContinuingTransactionPlacesItsAPIParametersOnOpCtx) {
-    APIParameters apiParams = APIParameters();
-    apiParams.setAPIVersion("2");
-    apiParams.setAPIStrict(true);
-    apiParams.setAPIDeprecationErrors(true);
-
-    APIParameters::get(operationContext()) = apiParams;
-    repl::ReadConcernArgs::get(operationContext()) = repl::ReadConcernArgs();
-
-    TxnNumber txnNum{3};
-
-    auto txnRouter = TransactionRouter::get(operationContext());
-
-    txnRouter.beginOrContinueTxn(
-        operationContext(), txnNum, TransactionRouter::TransactionActions::kStart);
-    txnRouter.setDefaultAtClusterTime(operationContext());
-
-    APIParameters::get(operationContext()) = APIParameters();
-    txnRouter.beginOrContinueTxn(
-        operationContext(), txnNum, TransactionRouter::TransactionActions::kContinue);
-
-    auto storedAPIParams = APIParameters::get(operationContext());
-    ASSERT_EQ("2", *storedAPIParams.getAPIVersion());
-    ASSERT_TRUE(*storedAPIParams.getAPIStrict());
-    ASSERT_TRUE(*storedAPIParams.getAPIDeprecationErrors());
 }
 
 TEST_F(TransactionRouterTestWithDefaultSession, ContinuingTransactionPlacesItsReadConcernOnOpCtx) {

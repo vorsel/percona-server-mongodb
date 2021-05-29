@@ -432,12 +432,14 @@ int getApproximateSize(TypeTags tag, Value val) {
             break;
         }
         case TypeTags::bsonBinData:
+            // The 32-bit 'length' at the beginning of a BinData does _not_ account for the
+            // 'length' field itself or the 'subtype' field, so we account for that here.
             result += sizeof(uint32_t) + sizeof(char) +
                 ConstDataView(getRawPointerView(val)).read<LittleEndian<uint32_t>>();
             break;
         case TypeTags::ksValue: {
             auto ks = getKeyStringView(val);
-            result += ks->memUsageForSorter();
+            result += ks->getSize();
             break;
         }
         case TypeTags::bsonRegex: {
@@ -454,6 +456,8 @@ int getApproximateSize(TypeTags tag, Value val) {
             result += getBsonDBPointerView(val).byteSize();
             break;
         case TypeTags::bsonCodeWScope:
+            // CodeWScope's 'length' field accounts for the full length of the CodeWScope
+            // including the 'length' field itself.
             result += ConstDataView(getRawPointerView(val)).read<LittleEndian<uint32_t>>();
             break;
         default:

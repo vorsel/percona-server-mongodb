@@ -98,6 +98,7 @@ Future<PrepareVoteConsensus> sendPrepare(ServiceContext* service,
                                          txn::AsyncWorkScheduler& scheduler,
                                          const LogicalSessionId& lsid,
                                          TxnNumber txnNumber,
+                                         const APIParameters& apiParams,
                                          const txn::ParticipantsList& participants);
 
 /**
@@ -143,6 +144,7 @@ Future<void> sendCommit(ServiceContext* service,
                         txn::AsyncWorkScheduler& scheduler,
                         const LogicalSessionId& lsid,
                         TxnNumber txnNumber,
+                        const APIParameters& apiParams,
                         const txn::ParticipantsList& participants,
                         Timestamp commitTimestamp);
 
@@ -154,6 +156,7 @@ Future<void> sendAbort(ServiceContext* service,
                        txn::AsyncWorkScheduler& scheduler,
                        const LogicalSessionId& lsid,
                        TxnNumber txnNumber,
+                       const APIParameters& apiParams,
                        const txn::ParticipantsList& participants);
 
 /**

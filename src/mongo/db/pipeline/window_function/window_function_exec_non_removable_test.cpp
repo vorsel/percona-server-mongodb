@@ -31,6 +31,7 @@
 
 #include "mongo/db/exec/document_value/document_value_test_util.h"
 #include "mongo/db/pipeline/accumulator.h"
+#include "mongo/db/pipeline/accumulator_for_window_functions.h"
 #include "mongo/db/pipeline/aggregation_context_fixture.h"
 #include "mongo/db/pipeline/document_source.h"
 #include "mongo/db/pipeline/document_source_mock.h"
@@ -53,14 +54,30 @@ public:
     WindowFunctionExecNonRemovable<AccumulatorState> createForFieldPath(
         std::deque<DocumentSource::GetNextResult> docs,
         const std::string& inputPath,
-        WindowBounds::Bound<int> upper) {
+        WindowBounds::Bound<int> upper,
+        boost::optional<std::string> sortByPath = boost::none) {
         _docSource = DocumentSourceMock::createForTest(std::move(docs), getExpCtx());
-        _iter = std::make_unique<PartitionIterator>(
-            getExpCtx().get(), _docSource.get(), boost::none, boost::none);
+        _iter = std::make_unique<PartitionIterator>(getExpCtx().get(),
+                                                    _docSource.get(),
+                                                    boost::none,
+                                                    boost::none,
+                                                    100 * 1024 * 1024 /* default memory limit */);
         auto input = ExpressionFieldPath::parse(
             getExpCtx().get(), inputPath, getExpCtx()->variablesParseState);
-        return WindowFunctionExecNonRemovable<AccumulatorState>(
-            _iter.get(), std::move(input), AccumulatorType::create(getExpCtx().get()), upper);
+        if (sortByPath) {
+            auto sortBy = ExpressionFieldPath::parse(
+                getExpCtx().get(), *sortByPath, getExpCtx()->variablesParseState);
+            return WindowFunctionExecNonRemovable<AccumulatorState>(
+                _iter.get(),
+                ExpressionArray::create(
+                    getExpCtx().get(),
+                    std::vector<boost::intrusive_ptr<Expression>>{sortBy, input}),
+                AccumulatorType::create(getExpCtx().get()),
+                upper);
+        } else {
+            return WindowFunctionExecNonRemovable<AccumulatorState>(
+                _iter.get(), std::move(input), AccumulatorType::create(getExpCtx().get()), upper);
+        }
     }
 
     auto advanceIterator() {
@@ -126,7 +143,8 @@ TEST_F(WindowFunctionExecNonRemovableTest, AccumulateOnlyWithMultiplePartitions)
     auto iter = PartitionIterator(getExpCtx().get(),
                                   mock.get(),
                                   boost::optional<boost::intrusive_ptr<Expression>>(key),
-                                  boost::none);
+                                  boost::none,
+                                  100 * 1024 * 1024 /* default memory limit */);
     auto input =
         ExpressionFieldPath::parse(getExpCtx().get(), "$a", getExpCtx()->variablesParseState);
     auto mgr = WindowFunctionExecNonRemovable<AccumulatorState>(
@@ -157,8 +175,11 @@ TEST_F(WindowFunctionExecNonRemovableTest, InputExpressionAllowedToCreateVariabl
     const auto docs = std::deque<DocumentSource::GetNextResult>{
         Document{{"a", 1}}, Document{{"a", 2}}, Document{{"a", 3}}};
     auto docSource = DocumentSourceMock::createForTest(std::move(docs), getExpCtx());
-    auto iter = std::make_unique<PartitionIterator>(
-        getExpCtx().get(), docSource.get(), boost::none, boost::none);
+    auto iter = std::make_unique<PartitionIterator>(getExpCtx().get(),
+                                                    docSource.get(),
+                                                    boost::none,
+                                                    boost::none,
+                                                    100 * 1024 * 1024 /* default memory limit */);
     auto filterBSON =
         fromjson("{$filter: {input: [1, 2, 3], as: 'num', cond: {$gte: ['$$num', 2]}}}");
     auto input = ExpressionFilter::parse(
@@ -171,6 +192,21 @@ TEST_F(WindowFunctionExecNonRemovableTest, InputExpressionAllowedToCreateVariabl
     ASSERT_VALUE_EQ(Value(std::vector<Value>{Value(2), Value(3)}), exec.getNext());
     iter->advance();
     ASSERT_VALUE_EQ(Value(std::vector<Value>{Value(2), Value(3)}), exec.getNext());
+}
+
+TEST_F(WindowFunctionExecNonRemovableTest, CanReceiveSortByExpression) {
+    const auto docs = std::deque<DocumentSource::GetNextResult>{
+        Document{{"x", 1}, {"y", 0}}, Document{{"x", 3}, {"y", 2}}, Document{{"x", 5}, {"y", 4}}};
+    auto mgr = createForFieldPath<AccumulatorIntegral>(
+        docs, "$y" /* input */, 0, std::string("$x") /* sortBy */);
+    double expectedIntegral = 0;
+    ASSERT_VALUE_EQ(Value(expectedIntegral), mgr.getNext());
+    advanceIterator();
+    expectedIntegral += 2.0;  // (2 + 0) * (3 - 1) / 2.0 = 2.0
+    ASSERT_VALUE_EQ(Value(expectedIntegral), mgr.getNext());
+    advanceIterator();
+    expectedIntegral += 6.0;  // (4 + 2) * (5 - 3) / 2.0 = 6.0
+    ASSERT_VALUE_EQ(Value(expectedIntegral), mgr.getNext());
 }
 
 }  // namespace

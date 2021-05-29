@@ -186,10 +186,7 @@ public:
         return NamespaceString::kConfigReshardingOperationsNamespace;
     }
 
-    ThreadPool::Limits getThreadPoolLimits() const override {
-        // TODO Limit the size of ReshardingCoordinatorService thread pool.
-        return ThreadPool::Limits();
-    }
+    ThreadPool::Limits getThreadPoolLimits() const override;
 
     std::shared_ptr<PrimaryOnlyService::Instance> constructInstance(BSONObj initialState) override;
 
@@ -351,7 +348,7 @@ private:
      * 2. Updates config.chunks entries for the new sharded collection
      * 3. Updates config.tags for the new sharded collection
      *
-     * Transitions to 'kDecisionPersisted'.
+     * Transitions to 'kCommitting'.
      */
     Future<void> _persistDecision(const ReshardingCoordinatorDocument& updatedDoc);
 
@@ -381,8 +378,8 @@ private:
     /**
      * Sends '_flushReshardingStateChange' to all recipient shards.
      *
-     * When the coordinator is in a state before 'kDecisionPersisted', refreshes the temporary
-     * namespace. When the coordinator is in a state at or after 'kDecisionPersisted', refreshes the
+     * When the coordinator is in a state before 'kCommitting', refreshes the temporary
+     * namespace. When the coordinator is in a state at or after 'kCommitting', refreshes the
      * original namespace.
      */
     void _tellAllRecipientsToRefresh(const std::shared_ptr<executor::ScopedTaskExecutor>& executor);

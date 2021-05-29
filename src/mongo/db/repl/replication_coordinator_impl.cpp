@@ -50,6 +50,7 @@
 #include "mongo/db/audit.h"
 #include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/commit_quorum_options.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
@@ -70,7 +71,6 @@
 #include "mongo/db/repl/hello_response.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/last_vote.h"
-#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/read_concern_args.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
@@ -417,7 +417,7 @@ void ReplicationCoordinatorImpl::appendConnectionStats(executor::ConnectionPoolS
 }
 
 bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
-    OperationContext* opCtx, LastStorageEngineShutdownState lastStorageEngineShutdownState) {
+    OperationContext* opCtx, StorageEngine::LastShutdownState lastShutdownState) {
     LOGV2_DEBUG(4280500, 1, "Attempting to create internal replication collections");
     // Create necessary replication collections to guarantee that if a checkpoint sees data after
     // initial sync has completed, it also sees these collections.
@@ -462,7 +462,7 @@ bool ReplicationCoordinatorImpl::_startLoadLocalConfig(
                                 "Error loading local Rollback ID document at startup",
                                 "error"_attr = status);
         }
-    } else if (lastStorageEngineShutdownState == LastStorageEngineShutdownState::kUnclean) {
+    } else if (lastShutdownState == StorageEngine::LastShutdownState::kUnclean) {
         LOGV2(501401, "Incrementing the rollback ID after unclean shutdown");
         fassert(501402, _replicationProcess->incrementRollbackID(opCtx));
     }
@@ -605,8 +605,7 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     }
     LOGV2_DEBUG(4280509, 1, "Local configuration validated for startup");
 
-    if (serverGlobalParams.enableMajorityReadConcern && localConfig.getNumMembers() == 3 &&
-        localConfig.getNumDataBearingMembers() == 2) {
+    if (serverGlobalParams.enableMajorityReadConcern && localConfig.isPSASet()) {
         LOGV2_OPTIONS(21315, {logv2::LogTag::kStartupWarnings}, "");
         LOGV2_OPTIONS(
             21316,
@@ -703,7 +702,6 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
         stdx::lock_guard<Latch> lk(_mutex);
         // Step down is impossible, so we don't need to wait for the returned event.
         _updateTerm_inlock(term);
-        _setImplicitDefaultWriteConcern(opCtx.get(), lk);
     }
     LOGV2_DEBUG(21320, 1, "Current term is now {term}", "Updated term", "term"_attr = term);
     _performPostMemberStateUpdateAction(action);
@@ -831,8 +829,8 @@ void ReplicationCoordinatorImpl::_startDataReplication(OperationContext* opCtx,
     }
 }
 
-void ReplicationCoordinatorImpl::startup(
-    OperationContext* opCtx, LastStorageEngineShutdownState lastStorageEngineShutdownState) {
+void ReplicationCoordinatorImpl::startup(OperationContext* opCtx,
+                                         StorageEngine::LastShutdownState lastShutdownState) {
     if (!isReplEnabled()) {
         if (ReplSettings::shouldRecoverFromOplogAsStandalone()) {
             uassert(ErrorCodes::InvalidOptions,
@@ -893,7 +891,7 @@ void ReplicationCoordinatorImpl::startup(
 
     ReplicaSetAwareServiceRegistry::get(_service).onStartup(opCtx);
 
-    bool doneLoadingConfig = _startLoadLocalConfig(opCtx, lastStorageEngineShutdownState);
+    bool doneLoadingConfig = _startLoadLocalConfig(opCtx, lastShutdownState);
     if (doneLoadingConfig) {
         // If we're not done loading the config, then the config state will be set by
         // _finishLoadLocalConfig.
@@ -907,7 +905,6 @@ void ReplicationCoordinatorImpl::_setImplicitDefaultWriteConcern(OperationContex
                                                                  WithLock lk) {
     auto& rwcDefaults = ReadWriteConcernDefaults::get(opCtx);
     bool isImplicitDefaultWriteConcernMajority = _rsConfig.isImplicitDefaultWriteConcernMajority();
-    // TODO (SERVER-55689): Add validation for shard and config servers
     rwcDefaults.setImplicitDefaultWriteConcernMajority(isImplicitDefaultWriteConcernMajority);
 }
 
@@ -1961,6 +1958,7 @@ ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorImpl::awaitRepli
               "Replication failed for write concern: {writeConcern}, waiting for optime: {opTime}, "
               "opID: {opID}, all_durable: {allDurable}, progress: {progress}",
               "Replication failed for write concern",
+              "status"_attr = redact(status),
               "writeConcern"_attr = writeConcern.toBSON(),
               "opTime"_attr = opTime,
               "opID"_attr = opCtx->getOpID(),
@@ -3480,7 +3478,8 @@ Status ReplicationCoordinatorImpl::_doReplSetReconfig(OperationContext* opCtx,
                     "replSetReconfig got {error} while validating {newConfig}",
                     "replSetReconfig error while validating new config",
                     "error"_attr = validateStatus,
-                    "newConfig"_attr = newConfigObj);
+                    "newConfig"_attr = newConfigObj,
+                    "oldConfig"_attr = oldConfigObj);
         return Status(ErrorCodes::NewReplicaSetConfigurationIncompatible, validateStatus.reason());
     }
 
@@ -3693,15 +3692,6 @@ void ReplicationCoordinatorImpl::_finishReplSetReconfig(OperationContext* opCtx,
         _clearCommittedSnapshot_inlock();
     }
 
-    // If 'enableDefaultWriteConcernUpdatesForInitiate' is enabled, we allow the IDWC to be
-    // recalculated after a reconfig. However, this logic is only relevant for testing,
-    // and should not be executed outside of our test infrastructure. This is needed due to an
-    // optimization in our ReplSetTest jstest fixture that initiates replica sets with only the
-    // primary, and then reconfigs the full membership set in. As a result, we must calculate
-    // the final IDWC only after the last node has been added to the set.
-    if (repl::enableDefaultWriteConcernUpdatesForInitiate.load()) {
-        _setImplicitDefaultWriteConcern(opCtx, lk);
-    }
 
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
@@ -4007,7 +3997,6 @@ void ReplicationCoordinatorImpl::_finishReplSetInitiate(OperationContext* opCtx,
     invariant(_rsConfigState == kConfigInitiating);
     invariant(!_rsConfig.isInitialized());
     auto action = _setCurrentRSConfig(lk, opCtx, newConfig, myIndex);
-    _setImplicitDefaultWriteConcern(opCtx, lk);
     lk.unlock();
     _performPostMemberStateUpdateAction(action);
 }
@@ -4497,6 +4486,21 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
     _rsConfig = newConfig;
     _protVersion.store(_rsConfig.getProtocolVersion());
 
+    if (!oldConfig.isInitialized()) {
+        // We allow the IDWC to be set only once after initial configuration is loaded.
+        _setImplicitDefaultWriteConcern(opCtx, lk);
+    } else {
+        // If 'enableDefaultWriteConcernUpdatesForInitiate' is enabled, we allow the IDWC to be
+        // recalculated after a reconfig. However, this logic is only relevant for testing,
+        // and should not be executed outside of our test infrastructure. This is needed due to an
+        // optimization in our ReplSetTest jstest fixture that initiates replica sets with only the
+        // primary, and then reconfigs the full membership set in. As a result, we must calculate
+        // the final IDWC only after the last node has been added to the set.
+        if (repl::enableDefaultWriteConcernUpdatesForInitiate.load()) {
+            _setImplicitDefaultWriteConcern(opCtx, lk);
+        }
+    }
+
     // Warn if using the in-memory (ephemeral) storage engine or running running --nojournal with
     // writeConcernMajorityJournalDefault=true.
     StorageEngine* storageEngine = opCtx->getServiceContext()->getStorageEngine();
@@ -4560,17 +4564,17 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
         }
     }
 
-    // Since the ReplSetConfig always has a WriteConcernOptions, the only way to know if it has been
-    // customized is if it's different to the implicit defaults of { w: 1, wtimeout: 0 }.
-    if (const auto& wc = newConfig.getDefaultWriteConcern();
-        !(wc.wNumNodes == 1 && wc.wTimeout == 0)) {
+    // Check that getLastErrorDefaults has not been changed from the default settings of
+    // { w: 1, wtimeout: 0 }.
+    if (newConfig.containsCustomizedGetLastErrorDefaults()) {
         LOGV2_OPTIONS(21387, {logv2::LogTag::kStartupWarnings}, "");
         LOGV2_OPTIONS(21388,
                       {logv2::LogTag::kStartupWarnings},
                       "** WARNING: Replica set config contains customized getLastErrorDefaults,");
         LOGV2_OPTIONS(21389,
                       {logv2::LogTag::kStartupWarnings},
-                      "**          which are deprecated. Use setDefaultRWConcern instead to set a");
+                      "**          which have been deprecated and are now ignored. Use "
+                      "setDefaultRWConcern instead to set a");
         LOGV2_OPTIONS(21390,
                       {logv2::LogTag::kStartupWarnings},
                       "**          cluster-wide default writeConcern.");

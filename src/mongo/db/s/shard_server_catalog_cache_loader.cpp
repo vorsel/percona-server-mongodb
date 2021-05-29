@@ -112,7 +112,6 @@ Status persistCollectionAndChangedChunks(OperationContext* opCtx,
         updateShardCollectionsEntry(opCtx,
                                     BSON(ShardCollectionType::kNssFieldName << nss.ns()),
                                     update.toBSON(),
-                                    BSONObj(),
                                     true /*upsert*/);
     if (!status.isOK()) {
         return status;
@@ -911,8 +910,7 @@ StatusWith<CollectionAndChangedChunks> ShardServerCatalogCacheLoader::_getLoader
             }
             persisted.changedChunks.erase(persistedChangedChunksIt, persisted.changedChunks.end());
 
-            // Append 'enqueued's chunks to 'persisted', which no longer overlaps. Also add
-            // 'enqueued's reshardingFields and allowMigrations setting to 'persisted'.
+            // Append 'enqueued's chunks to 'persisted', which no longer overlaps
             persisted.changedChunks.insert(persisted.changedChunks.end(),
                                            enqueued.changedChunks.begin(),
                                            enqueued.changedChunks.end());

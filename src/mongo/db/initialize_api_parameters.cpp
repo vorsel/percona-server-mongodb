@@ -107,8 +107,7 @@ void enforceRequireAPIVersion(OperationContext* opCtx, Command* command) {
     auto isInternalClient =
         !client->session() || (client->session()->getTags() & transport::Session::kInternalClient);
 
-    if (gRequireApiVersion.load() && !opCtx->getClient()->isInDirectClient() && !isInternalClient &&
-        command->getName() != "getMore" && !opCtx->isContinuingMultiDocumentTransaction()) {
+    if (gRequireApiVersion.load() && !opCtx->getClient()->isInDirectClient() && !isInternalClient) {
         uassert(
             498870,
             "The apiVersion parameter is required, please configure your MongoClient's API version",

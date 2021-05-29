@@ -22,7 +22,6 @@ selector:
   - jstests/core/fsync.js  # uses fsync.
   - jstests/core/geo_s2cursorlimitskip.js  # profiling.
   - jstests/core/geo_update_btree2.js  # notablescan.
-  - jstests/core/index_id_options.js  # "local" database.
   - jstests/core/index9.js  # "local" database.
   - jstests/core/queryoptimizera.js  # "local" database.
   - jstests/core/stages*.js  # stageDebug.
@@ -274,8 +273,8 @@ selector:
   # it, since we won't know whether the cursor was advanced or not.
   - requires_getmore
   - does_not_support_transactions
-  # Transaction-continuing commands cannot specify API parameters, so tests that use API parameters
-  # cannot be run with transactions.
+  # Transaction-continuing commands must use the same API parameters as the first command, so tests
+  # that use API parameters cannot be run with transactions.
   - uses_api_parameters
 
 executor:

@@ -33,8 +33,14 @@ StorageSource = wiredtiger.StorageSource  # easy access to constants
 # test_tiered04.py
 #    Basic tiered storage API test.
 class test_tiered04(wttest.WiredTigerTestCase):
-    uri = "table:test_tiered04_sys"
-    uri1 = "table:test_tiered04"
+
+    # If the 'uri' changes all the other names must change with it.
+    fileuri = 'file:test_tiered04-0000000001.wtobj'
+    objuri = 'object:test_tiered04-0000000001.wtobj'
+    tiereduri = "tiered:test_tiered04"
+    uri = "table:test_tiered04"
+
+    uri1 = "table:test_other_tiered04"
     uri_none = "table:test_local04"
 
     auth_token = "test_token"
@@ -42,6 +48,7 @@ class test_tiered04(wttest.WiredTigerTestCase):
     bucket1 = "otherbucket"
     extension_name = "local_store"
     prefix = "this_pfx"
+    prefix1 = "other_pfx"
     object_sys = "9M"
     object_sys_val = 9 * 1024 * 1024
     object_uri = "15M"
@@ -49,6 +56,8 @@ class test_tiered04(wttest.WiredTigerTestCase):
     retention = 600
     retention1 = 350
     def conn_config(self):
+        os.mkdir(self.bucket)
+        os.mkdir(self.bucket1)
         return \
           'statistics=(all),' + \
           'tiered_storage=(auth_token=%s,' % self.auth_token + \
@@ -62,6 +71,13 @@ class test_tiered04(wttest.WiredTigerTestCase):
     def conn_extensions(self, extlist):
         extlist.skip_if_missing = True
         extlist.extension('storage_sources', self.extension_name)
+
+    # Check for a specific string as part of the uri's metadata.
+    def check_metadata(self, uri, val_str):
+        c = self.session.open_cursor('metadata:')
+        val = c[uri]
+        c.close()
+        self.assertTrue(val_str in val)
 
     def get_stat(self, stat, uri):
         if uri == None:
@@ -77,20 +93,22 @@ class test_tiered04(wttest.WiredTigerTestCase):
         # Create three tables. One using the system tiered storage, one
         # specifying its own bucket and object size and one using no
         # tiered storage. Use stats to verify correct setup.
-        base_create = 'key_format=S'
+        intl_page = 'internal_page_max=16K'
+        base_create = 'key_format=S,' + intl_page
         self.pr("create sys")
         self.session.create(self.uri, base_create)
         conf = \
           ',tiered_storage=(auth_token=%s,' % self.auth_token + \
           'bucket=%s,' % self.bucket1 + \
+          'bucket_prefix=%s,' % self.prefix1 + \
           'local_retention=%d,' % self.retention1 + \
           'name=%s,' % self.extension_name + \
           'object_target_size=%s)' % self.object_uri
-        #self.pr("create non-sys tiered")
-        #self.session.create(self.uri1, base_create + conf)
+        self.pr("create non-sys tiered")
+        self.session.create(self.uri1, base_create + conf)
         conf = ',tiered_storage=(name=none)'
-        #self.pr("create non tiered/local")
-        #self.session.create(self.uri_none, base_create + conf)
+        self.pr("create non tiered/local")
+        self.session.create(self.uri_none, base_create + conf)
 
         #self.pr("open cursor")
         #c = self.session.open_cursor(self.uri)
@@ -104,7 +122,11 @@ class test_tiered04(wttest.WiredTigerTestCase):
         obj = self.get_stat(stat.conn.tiered_object_size, None)
         self.assertEqual(obj, self.object_sys_val)
 
-        self.pr("verify stats")
+        self.check_metadata(self.tiereduri, intl_page)
+        self.check_metadata(self.fileuri, intl_page)
+        self.check_metadata(self.objuri, intl_page)
+
+        #self.pr("verify stats")
         # Verify the table settings.
         #obj = self.get_stat(stat.dsrc.tiered_object_size, self.uri)
         #self.assertEqual(obj, self.object_sys_val)

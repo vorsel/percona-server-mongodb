@@ -1,5 +1,6 @@
 """Test hook that runs tenant migrations continuously."""
 
+import copy
 import random
 import re
 import threading
@@ -37,7 +38,7 @@ class ContinuousTenantMigration(interface.Hook):  # pylint: disable=too-many-ins
         if not isinstance(fixture, tenant_migration.TenantMigrationFixture):
             raise ValueError("The ContinuousTenantMigration hook requires a TenantMigrationFixture")
         self._tenant_migration_fixture = fixture
-        self._shell_options = shell_options.copy()
+        self._shell_options = copy.deepcopy(shell_options)
 
         self._tenant_migration_thread = None
 
@@ -360,7 +361,7 @@ class _TenantMigrationThread(threading.Thread):  # pylint: disable=too-many-inst
         return abort_reason["code"] == self.FAIL_TO_PARSE_ERR_CODE and re.search(
             err_msg_regex, abort_reason["errmsg"])
 
-    def _is_blacklisted_abort_reason(self, abort_reason):
+    def _is_denylisted_abort_reason(self, abort_reason):
         is_recipient_err = abort_reason["errmsg"].startswith(
             "Tenant migration recipient command failed")
         if not is_recipient_err:
@@ -434,10 +435,10 @@ class _TenantMigrationThread(threading.Thread):  # pylint: disable=too-many-inst
                     "Tenant migration '%s' with donor replica set '%s' aborted due to failpoint: " +
                     "%s.", migration_opts.migration_id, migration_opts.get_donor_name(), str(res))
                 return False
-            if self._is_blacklisted_abort_reason(abort_reason):
+            if self._is_denylisted_abort_reason(abort_reason):
                 self.logger.info(
                     "Tenant migration '%s' with donor replica set '%s' aborted due to a " +
-                    "blacklisted error: %s.", migration_opts.migration_id,
+                    "denylisted error: %s.", migration_opts.migration_id,
                     migration_opts.get_donor_name(), str(res))
                 return False
             raise errors.ServerFailure("Tenant migration '" + str(migration_opts.migration_id) +
@@ -662,10 +663,14 @@ class _TenantMigrationThread(threading.Thread):  # pylint: disable=too-many-inst
                     if db_name.startswith(self._tenant_id + "_"):
                         primary_client.drop_database(db_name)
                 return
-            except (pymongo.errors.AutoReconnect, pymongo.errors.NotMasterError):
+            # We retry on all write concern errors because we assume the only reason waiting for
+            # write concern should fail is because of a failover.
+            except (pymongo.errors.AutoReconnect, pymongo.errors.NotMasterError,
+                    pymongo.errors.WriteConcernError) as err:
                 primary = get_primary(rs, self.logger)
-                self.logger.info("Retrying dropDatabase commands against primary on port %d.",
-                                 primary.port)
+                self.logger.info(
+                    "Retrying dropDatabase commands against primary on port %d after error %s.",
+                    primary.port, str(err))
                 continue
             except pymongo.errors.PyMongoError:
                 self.logger.exception(

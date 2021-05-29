@@ -312,6 +312,53 @@ Status validateOldAndNewConfigsCompatible(const ReplSetConfig& oldConfig,
             }
         }
     }
+
+    if (!enableReconfigRollbackCommittedWritesCheck.load()) {
+        // Skip the following check. This parameter can only be set to false in tests.
+        return Status::OK();
+    }
+
+    const int numVotersOldConfig =
+        std::count_if(oldConfig.membersBegin(),
+                      oldConfig.membersEnd(),
+                      // Use 'getBaseNumVotes()' since a node may be newly added at this point,
+                      // which would indicate that it temporarily has 'votes: 0'.
+                      [](const auto& x) { return x.getBaseNumVotes() > 0; });
+    const int numArbitersOldConfig = std::count_if(oldConfig.membersBegin(),
+                                                   oldConfig.membersEnd(),
+                                                   [](const auto& x) { return x.isArbiter(); });
+    const int majorityVoteCountOldConfig = numVotersOldConfig / 2 + 1;
+    const int writableVotingMembersCountOldConfig = numVotersOldConfig - numArbitersOldConfig;
+
+    // An overlap between an election and write quorum is guaranteed to exist if the number of
+    // writable voting members is greater than or equal to the majority of voters. This is because
+    // at least one writable voting member will be a part of the majority in any election. This
+    // overlap is important so that if a candidate node that has not replicated recently committed
+    // writes decides to run for election, the writable voting member participating in the election
+    // will not vote for the candidate. As a result, the candidate cannot successfully become the
+    // primary.
+    const auto overlapBetweenElectionAndWriteQuorumOldConfig =
+        majorityVoteCountOldConfig <= writableVotingMembersCountOldConfig;
+    const auto numElectableNodesNewConfig = std::count_if(
+        newConfig.membersBegin(),
+        newConfig.membersEnd(),
+        // Use 'getBasePriority()' since newly added nodes also temporarily have 'priority: 0'.
+        [](const MemberConfig& mem) { return mem.getBasePriority() > 0.0; });
+
+    // If the aforementioned overlap doesn't exist, and we have a PSA set where the secondary can
+    // run for election, there is a risk that the secondary will not have replicated recent majority
+    // committed writes, but will be elected primary with the help of the arbiter. To prevent this
+    // from happening,, we fail the reconfig and refer the user to the appropriate next steps.
+    if (!overlapBetweenElectionAndWriteQuorumOldConfig && newConfig.isPSASet() &&
+        numElectableNodesNewConfig > 1) {
+        return Status(
+            ErrorCodes::NewReplicaSetConfigurationIncompatible,
+            // TODO (SERVER-56801): Add placeholder link.
+            str::stream()
+                << "Rejecting reconfig where the new config has a PSA topology and the secondary "
+                   "is electable, but the old config contains only one writable node");
+    }
+
     return Status::OK();
 }
 }  // namespace
@@ -384,6 +431,15 @@ StatusWith<int> validateConfigForStartUp(ReplicationCoordinatorExternalState* ex
     if (!status.isOK()) {
         return StatusWith<int>(status);
     }
+    if (newConfig.containsCustomizedGetLastErrorDefaults()) {
+        fassertFailedWithStatusNoTrace(
+            5624100,
+            {ErrorCodes::IllegalOperation,
+             str::stream() << "Failed to start up: Replica set config contains customized "
+                              "getLastErrorDefaults, which "
+                              "has been deprecated and is now ignored. Use setDefaultRWConcern "
+                              "instead to set a cluster-wide default writeConcern."});
+    }
     return findSelfInConfig(externalState, newConfig, ctx);
 }
 
@@ -400,10 +456,14 @@ StatusWith<int> validateConfigForInitiate(ReplicationCoordinatorExternalState* e
         return StatusWith<int>(status);
     }
 
-    status = newConfig.checkIfWriteConcernCanBeSatisfied(newConfig.getDefaultWriteConcern());
-    if (!status.isOK()) {
-        return status.withContext(
-            "Found invalid default write concern in 'getLastErrorDefaults' field");
+    if (newConfig.containsCustomizedGetLastErrorDefaults()) {
+        fassertFailedWithStatusNoTrace(
+            5624101,
+            {ErrorCodes::IllegalOperation,
+             str::stream() << "Failed to initiate: Replica set config contains customized "
+                              "getLastErrorDefaults, which "
+                              "has been deprecated and is now ignored. Use setDefaultRWConcern "
+                              "instead to set a cluster-wide default writeConcern."});
     }
 
     status = validateArbiterPriorities(newConfig);
@@ -449,11 +509,12 @@ Status validateConfigForReconfig(const ReplSetConfig& oldConfig,
         }
     }
 
-    status = newConfig.checkIfWriteConcernCanBeSatisfied(newConfig.getDefaultWriteConcern());
-    if (!status.isOK()) {
-        return status.withContext(
-            "Found invalid default write concern in 'getLastErrorDefaults' field");
-    }
+    uassert(5624102,
+            "Failed to reconfig: Replica set config contains customized "
+            "getLastErrorDefaults, which has "
+            "been deprecated and is now ignored. Use setDefaultRWConcern instead to "
+            "set a cluster-wide default writeConcern.",
+            !newConfig.containsCustomizedGetLastErrorDefaults());
 
     status = validateOldAndNewConfigsCompatible(oldConfig, newConfig);
     if (!status.isOK()) {
@@ -486,6 +547,13 @@ StatusWith<int> validateConfigForHeartbeatReconfig(
     if (!status.isOK()) {
         return StatusWith<int>(status);
     }
+
+    tassert(5624103,
+            "Replica set config during heartbeat reconfig contains "
+            "customized getLastErrorDefaults, which has "
+            "been deprecated and is now ignored. Use setDefaultRWConcern instead to "
+            "set a cluster-wide default writeConcern.",
+            !newConfig.containsCustomizedGetLastErrorDefaults());
 
     return findSelfInConfig(externalState, newConfig, ctx);
 }

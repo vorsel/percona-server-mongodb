@@ -11,7 +11,7 @@ load('./jstests/libs/chunk_manipulation_util.js');
 load("jstests/libs/write_concern_util.js");
 
 // Set up a sharded cluster with two shards, two chunks, and one document in one of the chunks.
-const st = new ShardingTest({shards: 2, rs: {nodes: 2}, config: 1});
+const st = new ShardingTest({shards: 2, rs: {nodes: 2}});
 const testDB = st.s.getDB("test");
 
 assert.commandWorked(testDB.foo.insert({_id: 1}, {writeConcern: {w: "majority"}}));
@@ -20,6 +20,9 @@ st.ensurePrimaryShard("test", st.shard0.shardName);
 assert.commandWorked(st.s.adminCommand({enableSharding: "test"}));
 assert.commandWorked(st.s.adminCommand({shardCollection: "test.foo", key: {_id: 1}}));
 assert.commandWorked(st.s.adminCommand({split: "test.foo", middle: {_id: 0}}));
+// The default WC is majority and stopServerReplication will prevent satisfying any majority writes.
+assert.commandWorked(st.s.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
 
 // The document is in the majority committed snapshot.
 assert.eq(1, testDB.foo.find().readConcern("majority").itcount());

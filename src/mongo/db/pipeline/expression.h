@@ -80,20 +80,20 @@ class DocumentSource;
 
 /**
  * Registers a Parser so it can be called from parseExpression and friends (but only if
- * 'featureFlag' is enabled).
+ * 'featureFlag' is enabled) in a feature compatibility version >= X.
  *
  * As an example, if your expression looks like {"$foo": [1,2,3]} and should be flag-guarded by
- * feature_flags::gFoo, you would add this line:
- * REGISTER_FEATURE_FLAG_GUARDED_EXPRESSION(foo, ExpressionFoo::parse, feature_flags::gFoo);
- *
- * An expression registered this way can be used in any featureCompatibilityVersion.
+ * feature_flags::gFoo and version >= X, you would add this line:
+ * REGISTER_FEATURE_FLAG_GUARDED_EXPRESSION_WITH_MIN_VERSION(
+ *     foo, ExpressionFoo::parse, feature_flags::gFoo, X);
  */
-#define REGISTER_FEATURE_FLAG_GUARDED_EXPRESSION(key, parser, featureFlag)    \
+#define REGISTER_FEATURE_FLAG_GUARDED_EXPRESSION_WITH_MIN_VERSION(            \
+    key, parser, featureFlag, minVersion)                                     \
     MONGO_INITIALIZER_GENERAL(                                                \
         addToExpressionParserMap_##key, ("default"), ("expressionParserMap")) \
     (InitializerContext*) {                                                   \
         if (featureFlag.isEnabledAndIgnoreFCV()) {                            \
-            Expression::registerExpression("$" #key, (parser), boost::none);  \
+            Expression::registerExpression("$" #key, (parser), (minVersion)); \
         }                                                                     \
     }
 
@@ -3509,18 +3509,18 @@ public:
                                                   const VariablesParseState& vps);
 
     /**
-     * Constructs a $getField expression where 'field' is an expression resolving to a string Value
-     * (or null) and 'from' is an expression resolving to an object Value (or null).
+     * Constructs a $getField expression where 'field' is an expression resolving to a constant
+     * string Value and 'input' is an expression resolving to an object Value (or null).
      *
-     * If either 'field' or 'from' is nullish, $getField evaluates to null. Furthermore, if 'from'
-     * does not contain 'field', then $getField returns missing.
+     * If 'input' is nullish, $getField evaluates to null. Furthermore, if 'input' does not contain
+     * 'field', then $getField returns missing.
      */
     ExpressionGetField(ExpressionContext* const expCtx,
                        boost::intrusive_ptr<Expression> field,
-                       boost::intrusive_ptr<Expression> from)
-        : Expression(expCtx, {std::move(field), std::move(from)}),
+                       boost::intrusive_ptr<Expression> input)
+        : Expression(expCtx, {std::move(field), std::move(input)}),
           _field(_children[0]),
-          _from(_children[1]) {
+          _input(_children[1]) {
         expCtx->sbeCompatible = false;
     }
 
@@ -3541,6 +3541,49 @@ protected:
 
 private:
     boost::intrusive_ptr<Expression>& _field;
-    boost::intrusive_ptr<Expression>& _from;
+    boost::intrusive_ptr<Expression>& _input;
 };
+
+class ExpressionSetField final : public Expression {
+public:
+    static boost::intrusive_ptr<Expression> parse(ExpressionContext* const expCtx,
+                                                  BSONElement exprElement,
+                                                  const VariablesParseState& vps);
+
+    /**
+     * Constructs a $setField expression where 'field' is a constant string, 'input' is an
+     * expression resolving to an object Value (or null), and 'value' is any expression.
+     */
+    ExpressionSetField(ExpressionContext* const expCtx,
+                       boost::intrusive_ptr<Expression> field,
+                       boost::intrusive_ptr<Expression> input,
+                       boost::intrusive_ptr<Expression> value)
+        : Expression(expCtx, {std::move(field), std::move(input), std::move(value)}),
+          _field(_children[0]),
+          _input(_children[1]),
+          _value(_children[2]) {
+        expCtx->sbeCompatible = false;
+    }
+
+    Value serialize(const bool explain) const final;
+
+    Value evaluate(const Document& root, Variables* variables) const final;
+
+    boost::intrusive_ptr<Expression> optimize() final;
+
+    void acceptVisitor(ExpressionVisitor* visitor) final {
+        return visitor->visit(this);
+    }
+
+    static constexpr auto kExpressionName = "$setField"_sd;
+
+protected:
+    void _doAddDependencies(DepsTracker* deps) const final override;
+
+private:
+    boost::intrusive_ptr<Expression>& _field;
+    boost::intrusive_ptr<Expression>& _input;
+    boost::intrusive_ptr<Expression>& _value;
+};
+
 }  // namespace mongo

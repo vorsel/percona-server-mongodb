@@ -41,14 +41,27 @@ class Config:
 
     def __ge__(self, other):
         return self.name >= other.name
+#
+# A generic configuration used by some components to define their tick rate.
+#
+throttle_config = [
+    Config('op_count', 1, r'''
+        The number of operations to be performed within the defined interval, e.g.
+        20 op_count with an interval of a second is equal to 20 ops per second.''',
+        min=1, max=10000),
+    Config('interval', 's', r'''
+        The interval to considered, either second, minute or hour.
+        The default interval is seconds.''',
+        choices=['s', 'm', 'h'])
+]
 
 #
 # Record config specifies the format of the keys and values used in the database
 #
-record_config = [
-    Config('key_size', 0, r'''
+record_config = throttle_config + [
+    Config('key_size', 5, r'''
         The size of the keys created''', min=0, max=10000),
-    Config('value_size', 0, r'''
+    Config('value_size', 5, r'''
         The size of the values created''', min=0, max=1000000000),
 ]
 
@@ -63,36 +76,36 @@ populate_config = [
 ]
 
 #
-# A generic configuration used by some components to define their tick rate.
-#
-throttle_config = [
-    Config('rate_per_second',1,r'''
-        The number of times an operation should be performed per second''', min=1,max=1000),
-]
-
-#
 # A generic configuration used by various other configurations to define whether that component or
 # similar is enabled or not.
 #
-enable_config = [
+enabled_config_true = [
+    Config('enabled', 'true', r'''
+        Whether or not this is relevant to the workload''',
+        type='boolean'),
+]
+
+enabled_config_false = [
     Config('enabled', 'false', r'''
         Whether or not this is relevant to the workload''',
         type='boolean'),
 ]
 
-stat_config = enable_config
+stat_config = enabled_config_false
 
 limit_stat = stat_config + [
     Config('limit', 0, r'''
-    The limit value a statistic is allowed to reach''')
+    The limit value a statistic is allowed to reach''', min=0)
 ]
 
 range_config = [
     Config('min', 0, r'''
-        The minimum a value can be in a range'''),
+        The minimum a value can be in a range''', min=0),
     Config('max', 1, r'''
         The maximum a value can be in a range''')
 ]
+
+component_config = enabled_config_true + throttle_config
 
 transaction_config = [
     Config('ops_per_transaction', '', r'''
@@ -105,7 +118,7 @@ transaction_config = [
 # Configuration that applies to the runtime monitor component, this should be a list of statistics
 # that need to be checked by the component.
 #
-runtime_monitor = throttle_config + [
+runtime_monitor = component_config + [
     Config('stat_cache_size', '', '''
         The maximum cache percentage that can be hit while running.''',
         type='category', subconfig=limit_stat)
@@ -114,22 +127,22 @@ runtime_monitor = throttle_config + [
 #
 # Configuration that applies to the timestamp_manager component.
 #
-timestamp_manager = enable_config +  [
-    Config('oldest_lag', 0, r'''
+timestamp_manager = component_config +  [
+    Config('oldest_lag', 1, r'''
         The duration between the stable and oldest timestamps''', min=0, max=1000000),
-    Config('stable_lag', 0, r'''
+    Config('stable_lag', 1, r'''
         The duration between the latest and stable timestamps''', min=0, max=1000000),
 ]
 
 #
 # Configuration that applies to the workload tracking component.
 #
-workload_tracking = enable_config
+workload_tracking = component_config
 
 #
 # Configuration that applies to the workload_generator component.
 #
-workload_generator = transaction_config + record_config + populate_config + [
+workload_generator = component_config + transaction_config + record_config + populate_config + [
     Config('read_threads', 0, r'''
         The number of threads performing read operations''', min=0, max=100),
     Config('insert_threads', 0, r'''
@@ -166,7 +179,7 @@ test_config = [
         The cache size that wiredtiger will be configured to run with''', min=0, max=100000000000),
     Config('duration_seconds', 0, r'''
         The duration that the test run will last''', min=0, max=1000000),
-    Config('enable_logging', 'true', r'''
+    Config('enable_logging', 'false', r'''
         Enables write ahead logs''', type='boolean'),
 ]
 

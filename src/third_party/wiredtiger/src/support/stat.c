@@ -175,6 +175,7 @@ static const char *const __stats_dsrc_desc[] = {
   "cursor: Total number of entries skipped by cursor next calls",
   "cursor: Total number of entries skipped by cursor prev calls",
   "cursor: Total number of entries skipped to position the history store cursor",
+  "cursor: Total number of times a search near has exited due to prefix config",
   "cursor: cursor next calls that skip due to a globally visible history store tombstone",
   "cursor: cursor next calls that skip greater than or equal to 100 entries",
   "cursor: cursor next calls that skip less than 100 entries",
@@ -427,6 +428,7 @@ __wt_stat_dsrc_clear_single(WT_DSRC_STATS *stats)
     stats->cursor_next_skip_total = 0;
     stats->cursor_prev_skip_total = 0;
     stats->cursor_skip_hs_cur_position = 0;
+    stats->cursor_search_near_prefix_fast_paths = 0;
     stats->cursor_next_hs_tombstone = 0;
     stats->cursor_next_skip_ge_100 = 0;
     stats->cursor_next_skip_lt_100 = 0;
@@ -665,6 +667,7 @@ __wt_stat_dsrc_aggregate_single(WT_DSRC_STATS *from, WT_DSRC_STATS *to)
     to->cursor_next_skip_total += from->cursor_next_skip_total;
     to->cursor_prev_skip_total += from->cursor_prev_skip_total;
     to->cursor_skip_hs_cur_position += from->cursor_skip_hs_cur_position;
+    to->cursor_search_near_prefix_fast_paths += from->cursor_search_near_prefix_fast_paths;
     to->cursor_next_hs_tombstone += from->cursor_next_hs_tombstone;
     to->cursor_next_skip_ge_100 += from->cursor_next_skip_ge_100;
     to->cursor_next_skip_lt_100 += from->cursor_next_skip_lt_100;
@@ -905,6 +908,8 @@ __wt_stat_dsrc_aggregate(WT_DSRC_STATS **from, WT_DSRC_STATS *to)
     to->cursor_next_skip_total += WT_STAT_READ(from, cursor_next_skip_total);
     to->cursor_prev_skip_total += WT_STAT_READ(from, cursor_prev_skip_total);
     to->cursor_skip_hs_cur_position += WT_STAT_READ(from, cursor_skip_hs_cur_position);
+    to->cursor_search_near_prefix_fast_paths +=
+      WT_STAT_READ(from, cursor_search_near_prefix_fast_paths);
     to->cursor_next_hs_tombstone += WT_STAT_READ(from, cursor_next_hs_tombstone);
     to->cursor_next_skip_ge_100 += WT_STAT_READ(from, cursor_next_skip_ge_100);
     to->cursor_next_skip_lt_100 += WT_STAT_READ(from, cursor_next_skip_lt_100);
@@ -1275,6 +1280,9 @@ static const char *const __stats_connection_desc[] = {
   "thread-yield: page delete rollback time sleeping for state change (usecs)",
   "thread-yield: page reconciliation yielded due to child modification",
   "transaction: Number of prepared updates",
+  "transaction: Number of prepared updates committed",
+  "transaction: Number of prepared updates repeated on the same key",
+  "transaction: Number of prepared updates rolled back",
   "transaction: prepared transactions",
   "transaction: prepared transactions committed",
   "transaction: prepared transactions currently active",
@@ -1284,6 +1292,7 @@ static const char *const __stats_connection_desc[] = {
   "transaction: rollback to stable pages visited",
   "transaction: rollback to stable tree walk skipping pages",
   "transaction: rollback to stable updates aborted",
+  "transaction: sessions scanned in each walk of concurrent sessions",
   "transaction: set timestamp calls",
   "transaction: set timestamp durable calls",
   "transaction: set timestamp durable updates",
@@ -1395,6 +1404,7 @@ static const char *const __stats_connection_desc[] = {
   "cursor: Total number of entries skipped by cursor next calls",
   "cursor: Total number of entries skipped by cursor prev calls",
   "cursor: Total number of entries skipped to position the history store cursor",
+  "cursor: Total number of times a search near has exited due to prefix config",
   "cursor: cursor next calls that skip due to a globally visible history store tombstone",
   "cursor: cursor next calls that skip greater than or equal to 100 entries",
   "cursor: cursor next calls that skip less than 100 entries",
@@ -1791,7 +1801,10 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->page_sleep = 0;
     stats->page_del_rollback_blocked = 0;
     stats->child_modify_blocked_page = 0;
-    stats->txn_prepared_updates_count = 0;
+    stats->txn_prepared_updates = 0;
+    stats->txn_prepared_updates_committed = 0;
+    stats->txn_prepared_updates_key_repeated = 0;
+    stats->txn_prepared_updates_rolledback = 0;
     stats->txn_prepare = 0;
     stats->txn_prepare_commit = 0;
     stats->txn_prepare_active = 0;
@@ -1801,6 +1814,7 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->txn_rts_pages_visited = 0;
     stats->txn_rts_tree_walk_skip_pages = 0;
     stats->txn_rts_upd_aborted = 0;
+    stats->txn_sessions_walked = 0;
     stats->txn_set_ts = 0;
     stats->txn_set_ts_durable = 0;
     stats->txn_set_ts_durable_upd = 0;
@@ -1908,6 +1922,7 @@ __wt_stat_connection_clear_single(WT_CONNECTION_STATS *stats)
     stats->cursor_next_skip_total = 0;
     stats->cursor_prev_skip_total = 0;
     stats->cursor_skip_hs_cur_position = 0;
+    stats->cursor_search_near_prefix_fast_paths = 0;
     stats->cursor_next_hs_tombstone = 0;
     stats->cursor_next_skip_ge_100 = 0;
     stats->cursor_next_skip_lt_100 = 0;
@@ -2300,7 +2315,10 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->page_sleep += WT_STAT_READ(from, page_sleep);
     to->page_del_rollback_blocked += WT_STAT_READ(from, page_del_rollback_blocked);
     to->child_modify_blocked_page += WT_STAT_READ(from, child_modify_blocked_page);
-    to->txn_prepared_updates_count += WT_STAT_READ(from, txn_prepared_updates_count);
+    to->txn_prepared_updates += WT_STAT_READ(from, txn_prepared_updates);
+    to->txn_prepared_updates_committed += WT_STAT_READ(from, txn_prepared_updates_committed);
+    to->txn_prepared_updates_key_repeated += WT_STAT_READ(from, txn_prepared_updates_key_repeated);
+    to->txn_prepared_updates_rolledback += WT_STAT_READ(from, txn_prepared_updates_rolledback);
     to->txn_prepare += WT_STAT_READ(from, txn_prepare);
     to->txn_prepare_commit += WT_STAT_READ(from, txn_prepare_commit);
     to->txn_prepare_active += WT_STAT_READ(from, txn_prepare_active);
@@ -2310,6 +2328,7 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->txn_rts_pages_visited += WT_STAT_READ(from, txn_rts_pages_visited);
     to->txn_rts_tree_walk_skip_pages += WT_STAT_READ(from, txn_rts_tree_walk_skip_pages);
     to->txn_rts_upd_aborted += WT_STAT_READ(from, txn_rts_upd_aborted);
+    to->txn_sessions_walked += WT_STAT_READ(from, txn_sessions_walked);
     to->txn_set_ts += WT_STAT_READ(from, txn_set_ts);
     to->txn_set_ts_durable += WT_STAT_READ(from, txn_set_ts_durable);
     to->txn_set_ts_durable_upd += WT_STAT_READ(from, txn_set_ts_durable_upd);
@@ -2427,6 +2446,8 @@ __wt_stat_connection_aggregate(WT_CONNECTION_STATS **from, WT_CONNECTION_STATS *
     to->cursor_next_skip_total += WT_STAT_READ(from, cursor_next_skip_total);
     to->cursor_prev_skip_total += WT_STAT_READ(from, cursor_prev_skip_total);
     to->cursor_skip_hs_cur_position += WT_STAT_READ(from, cursor_skip_hs_cur_position);
+    to->cursor_search_near_prefix_fast_paths +=
+      WT_STAT_READ(from, cursor_search_near_prefix_fast_paths);
     to->cursor_next_hs_tombstone += WT_STAT_READ(from, cursor_next_hs_tombstone);
     to->cursor_next_skip_ge_100 += WT_STAT_READ(from, cursor_next_skip_ge_100);
     to->cursor_next_skip_lt_100 += WT_STAT_READ(from, cursor_next_skip_lt_100);

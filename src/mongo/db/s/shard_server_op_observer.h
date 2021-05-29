@@ -92,8 +92,7 @@ public:
                   const NamespaceString& nss,
                   OptionalCollectionUUID uuid,
                   StmtId stmtId,
-                  bool fromMigrate,
-                  const boost::optional<BSONObj>& deletedDoc) override;
+                  const OplogDeleteEntryArgs& args) override;
 
     void onInternalOpMessage(OperationContext* opCtx,
                              const NamespaceString& nss,
@@ -121,6 +120,7 @@ public:
 
     void onDropDatabase(OperationContext* opCtx, const std::string& dbName) override {}
 
+    using OpObserver::onDropCollection;
     repl::OpTime onDropCollection(OperationContext* opCtx,
                                   const NamespaceString& collectionName,
                                   OptionalCollectionUUID uuid,
@@ -133,6 +133,7 @@ public:
                      const std::string& indexName,
                      const BSONObj& indexInfo) override;
 
+    using OpObserver::onRenameCollection;
     void onRenameCollection(OperationContext* opCtx,
                             const NamespaceString& fromCollection,
                             const NamespaceString& toCollection,
@@ -150,6 +151,7 @@ public:
                                     const BSONObj& storageMetadata,
                                     bool isDryRun) override {}
 
+    using OpObserver::preRenameCollection;
     repl::OpTime preRenameCollection(OperationContext* opCtx,
                                      const NamespaceString& fromCollection,
                                      const NamespaceString& toCollection,
@@ -192,7 +194,8 @@ public:
     void onTransactionAbort(OperationContext* opCtx,
                             boost::optional<OplogSlot> abortOplogEntryOpTime) override {}
 
-    void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo) {}
+    void onReplicationRollback(OperationContext* opCtx, const RollbackObserverInfo& rbInfo);
+
     void onMajorityCommitPointUpdate(ServiceContext* service,
                                      const repl::OpTime& newCommitPoint) override {}
 };

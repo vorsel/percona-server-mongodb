@@ -116,8 +116,32 @@ private:
     ClockSourceMock* _clockSource;
 };
 
+// TODO Re-enable once underlying invariants are re-enabled
+/*
 DEATH_TEST_F(ReshardingMetricsTest, RunOnCompletionBeforeOnStart, "No operation is in progress") {
     getMetrics()->onCompletion(ReshardingOperationStatusEnum::kSuccess);
+}
+
+DEATH_TEST_F(ReshardingMetricsTest,
+             RunOnStepUpAfterOnStartInvariants,
+             "Another operation is in progress") {
+    getMetrics()->onStart();
+    getMetrics()->onStepUp();
+}
+
+DEATH_TEST_F(ReshardingMetricsTest,
+             RunOnCompletionAfterOnStepDownInvariants,
+             "No operation is in progress") {
+    getMetrics()->onStart();
+    getMetrics()->onStepDown();
+    getMetrics()->onCompletion(ReshardingOperationStatusEnum::kSuccess);
+}
+*/
+
+TEST_F(ReshardingMetricsTest, RunOnStepDownAfterOnCompletionIsSafe) {
+    getMetrics()->onStart();
+    getMetrics()->onCompletion(ReshardingOperationStatusEnum::kSuccess);
+    getMetrics()->onStepDown();
 }
 
 TEST_F(ReshardingMetricsTest, OperationStatus) {
@@ -173,7 +197,8 @@ TEST_F(ReshardingMetricsTest, TestDonorAndRecipientMetrics) {
 
     // Update metrics for donor
     const auto kWritesDuringCriticalSection = 7;
-    getMetrics()->setDonorState(DonorStateEnum::kPreparingToBlockWrites);
+    getMetrics()->setDonorState(DonorStateEnum::kDonatingOplogEntries);
+    getMetrics()->startInCriticalSection();
     getMetrics()->onWriteDuringCriticalSection(kWritesDuringCriticalSection);
     advanceTime(Seconds(elapsedTime));
 
@@ -236,6 +261,27 @@ TEST_F(ReshardingMetricsTest, CumulativeOpMetricsAreRetainedAfterCompletion) {
         kTag, kDocumentsToCopy, "Cumulative metrics are reset", OpReportType::CumulativeReport);
 }
 
+TEST_F(ReshardingMetricsTest, CumulativeOpMetricsAreRetainedAfterCancellation) {
+    auto constexpr kTag = "documentsCopied";
+    getMetrics()->onStart();
+    const auto kDocumentsToCopy = 2;
+    const auto kBytesToCopy = 200;
+    getMetrics()->setRecipientState(RecipientStateEnum::kCloning);
+    getMetrics()->onDocumentsCopied(kDocumentsToCopy, kBytesToCopy);
+    advanceTime();
+    getMetrics()->onCompletion(ReshardingOperationStatusEnum::kCanceled);
+    advanceTime();
+
+    checkMetrics(kTag,
+                 kDocumentsToCopy,
+                 "Cumulative metrics are not retained",
+                 OpReportType::CumulativeReport);
+
+    getMetrics()->onStart();
+    checkMetrics(
+        kTag, kDocumentsToCopy, "Cumulative metrics are reset", OpReportType::CumulativeReport);
+}
+
 TEST_F(ReshardingMetricsTest, CurrentOpMetricsAreResetAfterCompletion) {
     auto constexpr kTag = "documentsCopied";
     getMetrics()->onStart();
@@ -274,6 +320,24 @@ TEST_F(ReshardingMetricsTest, CurrentOpMetricsAreNotRetainedAfterCompletion) {
     ASSERT_FALSE(getReport(OpReportType::CurrentOpReportRecipientRole)[kTag].ok());
 }
 
+TEST_F(ReshardingMetricsTest, CurrentOpMetricsAreNotRetainedAfterStepDown) {
+    auto constexpr kTag = "documentsCopied";
+    getMetrics()->onStart();
+    const auto kDocumentsToCopy = 2;
+    const auto kBytesToCopy = 200;
+    getMetrics()->setRecipientState(RecipientStateEnum::kCloning);
+    getMetrics()->onDocumentsCopied(kDocumentsToCopy, kBytesToCopy);
+    checkMetrics(kTag,
+                 kDocumentsToCopy,
+                 "Current metrics are not set",
+                 OpReportType::CurrentOpReportRecipientRole);
+    advanceTime();
+    getMetrics()->onStepDown();
+    advanceTime();
+
+    ASSERT_FALSE(getReport(OpReportType::CurrentOpReportRecipientRole)[kTag].ok());
+}
+
 TEST_F(ReshardingMetricsTest, EstimatedRemainingOperationTime) {
     auto constexpr kTag = "remainingOperationTimeEstimated";
     const auto elapsedTime = 1;
@@ -305,10 +369,11 @@ TEST_F(ReshardingMetricsTest, EstimatedRemainingOperationTime) {
 }
 
 TEST_F(ReshardingMetricsTest, CurrentOpReportForDonor) {
-    const auto kDonorState = DonorStateEnum::kPreparingToBlockWrites;
+    const auto kDonorState = DonorStateEnum::kDonatingOplogEntries;
     getMetrics()->onStart();
     advanceTime(Seconds(2));
     getMetrics()->setDonorState(kDonorState);
+    getMetrics()->startInCriticalSection();
     advanceTime(Seconds(3));
 
     const ReshardingMetrics::ReporterOptions options(

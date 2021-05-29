@@ -8,13 +8,11 @@ Import("use_system_libunwind")
 Import("use_vendored_libunwind")
 Import("wiredtiger")
 
-boostSuffix = "-1.70.0"
 snappySuffix = '-1.1.7'
 zlibSuffix = '-1.2.11'
 zstdSuffix = '-1.4.4'
 pcreSuffix = "-8.42"
 mozjsSuffix = '-60'
-yamlSuffix = '-0.6.2'
 icuSuffix = '-57.1'
 timelibSuffix = '-2021.06'
 tomcryptSuffix = '-1.18.2'
@@ -54,20 +52,12 @@ def injectMozJS(thisEnv):
 
     if thisEnv.TargetOSIs('windows'):
         thisEnv.Append(
-            CCFLAGS=[
-                '/FI', 'js-config.h',
-                '/FI', 'js/RequiredDefines.h',
-            ],
             CPPDEFINES=[
                 '_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING',
             ]
         )
     else:
         thisEnv.Append(
-            CCFLAGS=[
-                '-include', 'js-config.h',
-                '-include', 'js/RequiredDefines.h',
-            ],
             CXXFLAGS=[
                 '-Wno-non-virtual-dtor',
                 '-Wno-invalid-offsetof',
@@ -98,8 +88,26 @@ if not use_system_version_of_library('pcre'):
     }
 
 if not use_system_version_of_library('boost'):
+
+
+    # On at least Apple clang, proto throws this error.
+    #
+    # See https://github.com/boostorg/proto/issues/30.
+    #
+    # We use a generator so we can filter out conf tests, where applying this
+    # flag could change their meaning.
+    def NoErrorForUnknownWarningOptionGenerator(target, source, env, for_signature):
+        if 'conftest' in str(target[0]):
+            return str()
+        return '-Wno-error=unknown-warning-option'
+
     thirdPartyEnvironmentModifications['boost'] = {
-        'CPPPATH' : ['#/src/third_party/boost' + boostSuffix],
+        'CPPPATH' : ['#/src/third_party/boost'],
+
+        # We could narror further to just clang on Darwin, but there is
+        # little harm in applying for all clang.
+        'NOERROR_FOR_UNKNOWN_WARNING_OPTION_GEN' : NoErrorForUnknownWarningOptionGenerator,
+        'CCFLAGS' : ['$NOERROR_FOR_UNKNOWN_WARNING_OPTION_GEN'] if env.ToolchainIs('clang') else []
     }
 
 if not use_system_version_of_library('abseil-cpp'):
@@ -144,6 +152,10 @@ if True:
             '#/src/third_party/mozjs' + mozjsSuffix + '/mongo_sources',
             '#/src/third_party/mozjs' + mozjsSuffix + '/platform/' + env["TARGET_ARCH"] + "/" + env["TARGET_OS"] + "/include",
         ],
+        'FORCEINCLUDES' : [
+            'js-config.h',
+            'js/RequiredDefines.h',
+        ],
     }
 
 if "tom" in env["MONGO_CRYPTO"]:
@@ -166,7 +178,7 @@ if wiredtiger and not use_system_version_of_library('wiredtiger'):
 
 if not use_system_version_of_library('yaml'):
     thirdPartyEnvironmentModifications['yaml'] = {
-        'CPPPATH' : ['#/src/third_party/yaml-cpp' + yamlSuffix + '/yaml-cpp/include'],
+        'CPPPATH' : ['#/src/third_party/yaml-cpp/yaml-cpp/include'],
         'CPPDEFINES' : ['_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING'] if env.ToolchainIs('msvc') else [],
     }
 
@@ -324,7 +336,7 @@ if use_system_version_of_library("boost"):
                 env['LIBDEPS_BOOST_LOG_SYSLIBDEP'],
             ])
 else:
-    boostDirectory = 'boost' + boostSuffix
+    boostDirectory = 'boost'
     boostEnv = boostEnv.Clone()
     boostEnv.InjectThirdParty(libraries=['boost'])
     boostEnv.SConscript(boostDirectory + '/SConscript', exports={ 'env' : boostEnv })
@@ -531,10 +543,10 @@ if use_system_version_of_library("yaml"):
 else:
     yamlEnv = yamlEnv.Clone()
     yamlEnv.InjectThirdParty(libraries=['yaml', 'boost'])
-    yamlEnv.SConscript('yaml-cpp' + yamlSuffix + '/SConscript', exports={ 'env' : yamlEnv })
+    yamlEnv.SConscript('yaml-cpp/SConscript', exports={ 'env' : yamlEnv })
     yamlEnv = yamlEnv.Clone(
         LIBDEPS_INTERFACE=[
-            'yaml-cpp' + yamlSuffix + '/yaml',
+            'yaml-cpp/yaml',
         ])
 
 yamlEnv.ShimLibrary(name="yaml")

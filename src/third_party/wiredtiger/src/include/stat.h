@@ -624,7 +624,10 @@ struct __wt_connection_stats {
     int64_t page_sleep;
     int64_t page_del_rollback_blocked;
     int64_t child_modify_blocked_page;
-    int64_t txn_prepared_updates_count;
+    int64_t txn_prepared_updates;
+    int64_t txn_prepared_updates_committed;
+    int64_t txn_prepared_updates_key_repeated;
+    int64_t txn_prepared_updates_rolledback;
     int64_t txn_prepare;
     int64_t txn_prepare_commit;
     int64_t txn_prepare_active;
@@ -634,6 +637,7 @@ struct __wt_connection_stats {
     int64_t txn_rts_pages_visited;
     int64_t txn_rts_tree_walk_skip_pages;
     int64_t txn_rts_upd_aborted;
+    int64_t txn_sessions_walked;
     int64_t txn_set_ts;
     int64_t txn_set_ts_durable;
     int64_t txn_set_ts_durable_upd;
@@ -741,6 +745,7 @@ struct __wt_connection_stats {
     int64_t cursor_next_skip_total;
     int64_t cursor_prev_skip_total;
     int64_t cursor_skip_hs_cur_position;
+    int64_t cursor_search_near_prefix_fast_paths;
     int64_t cursor_next_hs_tombstone;
     int64_t cursor_next_skip_ge_100;
     int64_t cursor_next_skip_lt_100;
@@ -959,6 +964,7 @@ struct __wt_dsrc_stats {
     int64_t cursor_next_skip_total;
     int64_t cursor_prev_skip_total;
     int64_t cursor_skip_hs_cur_position;
+    int64_t cursor_search_near_prefix_fast_paths;
     int64_t cursor_next_hs_tombstone;
     int64_t cursor_next_skip_ge_100;
     int64_t cursor_next_skip_lt_100;

@@ -323,7 +323,6 @@ public:
     }
 
     void addDropPendingIdent(const Timestamp& dropTimestamp,
-                             const NamespaceString& nss,
                              std::shared_ptr<Ident> ident,
                              DropIdentCallback&& onDrop) override;
 
@@ -338,15 +337,14 @@ public:
     }
 
     StatusWith<ReconcileResult> reconcileCatalogAndIdents(
-        OperationContext* opCtx,
-        InternalIdentReconcilePolicy internalIdentReconcilePolicy) override;
+        OperationContext* opCtx, LastShutdownState lastShutdownState) override;
 
     std::string getFilesystemPathForDb(const std::string& dbName) const override;
 
     /**
      * When loading after an unclean shutdown, this performs cleanup on the DurableCatalogImpl.
      */
-    void loadCatalog(OperationContext* opCtx, bool loadingFromUncleanShutdown) final;
+    void loadCatalog(OperationContext* opCtx, LastShutdownState lastShutdownState) final;
 
     void closeCatalog(OperationContext* opCtx) final;
 
@@ -375,6 +373,8 @@ public:
                                              bool roundUpIfTooOld) override;
 
     void unpinOldestTimestamp(const std::string& requestingServiceName) override;
+
+    void setPinnedOplogTimestamp(const Timestamp& pinnedTimestamp) override;
 
 private:
     using CollIter = std::list<std::string>::iterator;
@@ -416,7 +416,7 @@ private:
      */
     bool _handleInternalIdent(OperationContext* opCtx,
                               const std::string& ident,
-                              InternalIdentReconcilePolicy internalIdentReconcilePolicy,
+                              LastShutdownState lastShutdownState,
                               ReconcileResult* reconcileResult,
                               std::set<std::string>* internalIdentsToDrop,
                               std::set<std::string>* allInternalIdents);

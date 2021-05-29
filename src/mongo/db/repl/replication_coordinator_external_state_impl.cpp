@@ -44,6 +44,7 @@
 #include "mongo/db/catalog/coll_mod.h"
 #include "mongo/db/catalog/database.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/commands/server_status_metric.h"
@@ -63,7 +64,6 @@
 #include "mongo/db/repl/drop_pending_collection_reaper.h"
 #include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/last_vote.h"
-#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/member_state.h"
 #include "mongo/db/repl/noop_writer.h"
 #include "mongo/db/repl/oplog.h"
@@ -83,7 +83,6 @@
 #include "mongo/db/s/periodic_balancer_config_refresher.h"
 #include "mongo/db/s/periodic_sharded_index_consistency_checker.h"
 #include "mongo/db/s/resharding/resharding_donor_recipient_common.h"
-#include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_initialization_mongod.h"
 #include "mongo/db/s/sharding_state_recovery.h"
 #include "mongo/db/s/transaction_coordinator_service.h"
@@ -905,8 +904,6 @@ void ReplicationCoordinatorExternalStateImpl::_shardingOnTransitionToPrimaryHook
         // refreshes which should use the recovered configOpTime.
         migrationutil::resubmitRangeDeletionsOnStepUp(_service);
         migrationutil::resumeMigrationCoordinationsOnStepUp(opCtx);
-
-        sharding_ddl_util::retakeInMemoryRecoverableCriticalSections(opCtx);
 
         const bool scheduleAsyncRefresh = true;
         resharding::clearFilteringMetadata(opCtx, scheduleAsyncRefresh);

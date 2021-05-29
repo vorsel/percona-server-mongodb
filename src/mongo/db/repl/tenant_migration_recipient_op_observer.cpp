@@ -153,8 +153,7 @@ void TenantMigrationRecipientOpObserver::onDelete(OperationContext* opCtx,
                                                   const NamespaceString& nss,
                                                   OptionalCollectionUUID uuid,
                                                   StmtId stmtId,
-                                                  bool fromMigrate,
-                                                  const boost::optional<BSONObj>& deletedDoc) {
+                                                  const OplogDeleteEntryArgs& args) {
     if (nss == NamespaceString::kTenantMigrationRecipientsNamespace &&
         tenantIdToDeleteDecoration(opCtx) &&
         !tenant_migration_access_blocker::inRecoveryMode(opCtx)) {
@@ -164,6 +163,21 @@ void TenantMigrationRecipientOpObserver::onDelete(OperationContext* opCtx,
                         TenantMigrationAccessBlocker::BlockerType::kRecipient);
         });
     }
+}
+
+repl::OpTime TenantMigrationRecipientOpObserver::onDropCollection(
+    OperationContext* opCtx,
+    const NamespaceString& collectionName,
+    OptionalCollectionUUID uuid,
+    std::uint64_t numRecords,
+    const CollectionDropType dropType) {
+    if (collectionName == NamespaceString::kTenantMigrationRecipientsNamespace) {
+        opCtx->recoveryUnit()->onCommit([opCtx](boost::optional<Timestamp>) {
+            TenantMigrationAccessBlockerRegistry::get(opCtx->getServiceContext())
+                .removeAll(TenantMigrationAccessBlocker::BlockerType::kRecipient);
+        });
+    }
+    return {};
 }
 
 }  // namespace repl

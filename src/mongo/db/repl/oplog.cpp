@@ -55,6 +55,7 @@
 #include "mongo/db/catalog/drop_database.h"
 #include "mongo/db/catalog/drop_indexes.h"
 #include "mongo/db/catalog/import_collection_oplog_entry_gen.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/catalog/multi_index_block.h"
 #include "mongo/db/catalog/rename_collection.h"
 #include "mongo/db/client.h"
@@ -71,21 +72,20 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/delete.h"
+#include "mongo/db/ops/delete_request_gen.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/dbcheck.h"
-#include "mongo/db/repl/local_oplog_info.h"
+#include "mongo/db/repl/image_collection_entry_gen.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
 #include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/tenant_migration_access_blocker_util.h"
 #include "mongo/db/repl/tenant_migration_decoration.h"
-#include "mongo/db/repl/tenant_migration_util.h"
 #include "mongo/db/repl/timestamp_block.h"
 #include "mongo/db/repl/transaction_oplog_application.h"
-#include "mongo/db/s/resharding_util.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/server_write_concern_metrics.h"
@@ -236,6 +236,46 @@ void createIndexForApplyOps(OperationContext* opCtx,
     indexBuildsCoordinator->createIndex(opCtx, collUUID, indexSpec, constraints, fromMigrate);
 
     opCtx->recoveryUnit()->abandonSnapshot();
+}
+
+/**
+ * @param dataImage can be BSONObj::isEmpty to signal the node is in initial sync and must
+ *                  invalidate relevant image collection data.
+ */
+void writeToImageCollection(OperationContext* opCtx,
+                            const LogicalSessionId& sessionId,
+                            const TxnNumber txnNum,
+                            const Timestamp timestamp,
+                            repl::RetryImageEnum imageKind,
+                            const BSONObj& dataImage,
+                            bool* upsertConfigImage) {
+    AutoGetCollection autoColl(opCtx, NamespaceString::kConfigImagesNamespace, LockMode::MODE_IX);
+    repl::ImageEntry imageEntry;
+    imageEntry.set_id(sessionId);
+    imageEntry.setTxnNumber(txnNum);
+    imageEntry.setTs(timestamp);
+    imageEntry.setImageKind(imageKind);
+    imageEntry.setImage(dataImage);
+    if (dataImage.isEmpty()) {
+        imageEntry.setInvalidated(true);
+        imageEntry.setInvalidatedReason("initial sync"_sd);
+    }
+
+    UpdateRequest request;
+    request.setNamespaceString(NamespaceString::kConfigImagesNamespace);
+    request.setQuery(
+        BSON("_id" << imageEntry.get_id().toBSON() << "ts" << BSON("$lt" << imageEntry.getTs())));
+    request.setUpsert(*upsertConfigImage);
+    request.setUpdateModification(
+        write_ops::UpdateModification::parseFromClassicUpdate(imageEntry.toBSON()));
+    request.setFromOplogApplication(true);
+    try {
+        ::mongo::update(opCtx, autoColl.getDb(), request);
+    } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
+        // We can get a duplicate key when two upserts race on inserting a document.
+        *upsertConfigImage = false;
+        throw WriteConflictException();
+    }
 }
 
 /* we write to local.oplog.rs:
@@ -663,9 +703,6 @@ void createOplog(OperationContext* opCtx,
         }
         uow.commit();
     });
-
-    createSlimOplogView(opCtx, ctx.db());
-    tenant_migration_util::createOplogViewForTenantMigrations(opCtx, ctx.db());
 
     /* sync here so we don't get any surprising lag later when we try to sync */
     service->getStorageEngine()->flushAllFiles(opCtx, /*callerHoldsReadLock*/ false);
@@ -1391,6 +1428,13 @@ Status applyOperation_inlock(OperationContext* opCtx,
             request.setUpdateModification(std::move(updateMod));
             request.setUpsert(upsert);
             request.setFromOplogApplication(true);
+            if (mode != OplogApplication::Mode::kInitialSync) {
+                if (op.getNeedsRetryImage() == repl::RetryImageEnum::kPreImage) {
+                    request.setReturnDocs(UpdateRequest::ReturnDocOption::RETURN_OLD);
+                } else if (op.getNeedsRetryImage() == repl::RetryImageEnum::kPostImage) {
+                    request.setReturnDocs(UpdateRequest::ReturnDocOption::RETURN_NEW);
+                }
+            }
 
             Timestamp timestamp;
             if (assignOperationTimestamp) {
@@ -1398,6 +1442,36 @@ Status applyOperation_inlock(OperationContext* opCtx,
             }
 
             const StringData ns = op.getNss().ns();
+            // Operations that were part of a retryable findAndModify have two formats for
+            // replicating pre/post images. The classic format has primaries writing explicit noop
+            // oplog entries that contain the necessary details for reconstructed a response to a
+            // retried operation.
+            //
+            // In the new format, we "implicitly" replicate the necessary data. Oplog entries may
+            // contain an optional field, `needsRetryImage` with a value of `preImage` or
+            // `postImage`. When applying these oplog entries, we also retrieve the pre/post image
+            // retrieved by the query system and write that value into `config.image_collection` as
+            // part of the same oplog application transaction. The `config.image_collection`
+            // documents are keyed by the oplog entries logical session id, which is the same as the
+            // `config.transactions` table.
+            //
+            // Batches of oplog entries can contain multiple oplog entries from the same logical
+            // session. Thus updates to `config.image_collection` documents can be
+            // concurrent. Secondaries already coalesce (read: intentionally ignore) some writes to
+            // `config.transactions`, we may also omit some writes to `config.image_collection`, so
+            // long as the last write persists. To accomplish this we update
+            // `config.image_collection` entries with an upsert. The query predicate is `{_id:
+            // <lsid>, ts $lt <oplogEntry.ts>}`. This can result in a WriteConflictException when
+            // two writers are concurrently updating/inserting the same document.
+            //
+            // However, when an upsert turns into an insert, a writer can also observe a
+            // DuplicateKeyException as its `ts` clause can hide the document from being
+            // updated. Following up the failed update with an insert turns into a
+            // DuplicateKeyException. This is safe, but to break an infinite loop, we retry the
+            // operation with a regular update as opposed to an upsert. We're guaranteed to not need
+            // to insert a document. We only have to make sure we didn't race with an insert that
+            // won, but with an earlier `ts`.
+            bool upsertConfigImage = true;
             auto status = writeConflictRetry(opCtx, "applyOps_update", ns, [&] {
                 WriteUnitOfWork wuow(opCtx);
                 if (timestamp != Timestamp::min()) {
@@ -1472,6 +1546,19 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     invariant(!oplogApplicationEnforcesSteadyStateConstraints);
                 }
 
+                if (op.getNeedsRetryImage()) {
+                    writeToImageCollection(opCtx,
+                                           op.getSessionId().get(),
+                                           op.getTxnNumber().get(),
+                                           op.getTimestamp(),
+                                           op.getNeedsRetryImage().get(),
+                                           // If we did not request an image because we're in
+                                           // initial sync, the value passed in here is conveniently
+                                           // the empty BSONObj.
+                                           ur.requestedDocImage,
+                                           &upsertConfigImage);
+                }
+
                 wuow.commit();
                 return Status::OK();
             });
@@ -1509,28 +1596,79 @@ Status applyOperation_inlock(OperationContext* opCtx,
             }
 
             const StringData ns = op.getNss().ns();
+            bool upsertConfigImage = true;
             writeConflictRetry(opCtx, "applyOps_delete", ns, [&] {
                 WriteUnitOfWork wuow(opCtx);
                 if (timestamp != Timestamp::min()) {
                     uassertStatusOK(opCtx->recoveryUnit()->setTimestamp(timestamp));
                 }
-                auto nDeleted = deleteObjects(
-                    opCtx, collection, requestNss, deleteCriteria, true /* justOne */);
-                if (nDeleted == 0 && mode == OplogApplication::Mode::kSecondary) {
+
+                DeleteRequest request;
+                request.setNsString(requestNss);
+                request.setQuery(deleteCriteria);
+                if (mode != OplogApplication::Mode::kInitialSync &&
+                    op.getNeedsRetryImage() == repl::RetryImageEnum::kPreImage) {
+                    // When in initial sync, we'll pass an empty image into
+                    // `writeToImageCollection`.
+                    request.setReturnDeleted(true);
+                }
+
+                DeleteResult result = deleteObject(opCtx, collection, request);
+                if (op.getNeedsRetryImage()) {
+                    // Even if `result.nDeleted` is 0, we want to perform a write to the
+                    // imageCollection to advance the txnNumber/ts and invalidate the image. This
+                    // isn't strictly necessary for correctness -- the `config.transactions` table
+                    // is responsible for whether to retry. The motivation here is to simply reduce
+                    // the number of states related documents in the two collections can be in.
+                    BSONObj imageDoc;
+                    if (result.nDeleted > 0 && mode != OplogApplication::Mode::kInitialSync) {
+                        imageDoc = result.requestedPreImage.get();
+                    }
+
+                    writeToImageCollection(opCtx,
+                                           op.getSessionId().get(),
+                                           op.getTxnNumber().get(),
+                                           op.getTimestamp(),
+                                           repl::RetryImageEnum::kPreImage,
+                                           imageDoc,
+                                           &upsertConfigImage);
+                }
+
+                if (result.nDeleted == 0 && mode == OplogApplication::Mode::kSecondary) {
                     LOGV2_WARNING(2170002,
                                   "Applied a delete which did not delete anything in steady state "
                                   "replication",
                                   "op"_attr = redact(op.toBSONForLogging()));
-                    if (collection)
+
+                    // In FCV 4.4, each node is responsible for deleting the excess documents in
+                    // capped collections. This implies that capped deletes may not be synchronized
+                    // between nodes at times. When upgraded to FCV 5.0, the primary will generate
+                    // delete oplog entries for capped collections. However, if any secondary was
+                    // behind in deleting excess documents while in FCV 4.4, the primary would have
+                    // no way of knowing and it would delete the first document it sees locally.
+                    // Eventually, when secondaries step up and start deleting capped documents,
+                    // they will first delete previously missed documents that may already be
+                    // deleted on other nodes. For this reason we skip returning NoSuchKey for
+                    // capped collections when oplog application is enforcing steady state
+                    // constraints.
+                    bool isCapped = false;
+                    if (collection) {
+                        isCapped = collection->isCapped();
                         opCounters->gotDeleteWasEmpty();
-                    else
+                    } else {
                         opCounters->gotDeleteFromMissingNamespace();
-                    // This error is fatal when we are enforcing steady state constraints.
-                    uassert(collection ? ErrorCodes::NoSuchKey : ErrorCodes::NamespaceNotFound,
-                            str::stream() << "Applied a delete which did not delete anything in "
-                                             "steady state replication : "
-                                          << redact(op.toBSONForLogging()),
-                            !oplogApplicationEnforcesSteadyStateConstraints);
+                    }
+
+                    if (!isCapped) {
+                        // This error is fatal when we are enforcing steady state constraints for
+                        // non-capped collections.
+                        uassert(collection ? ErrorCodes::NoSuchKey : ErrorCodes::NamespaceNotFound,
+                                str::stream()
+                                    << "Applied a delete which did not delete anything in "
+                                       "steady state replication : "
+                                    << redact(op.toBSONForLogging()),
+                                !oplogApplicationEnforcesSteadyStateConstraints);
+                    }
                 }
                 wuow.commit();
             });
@@ -1588,12 +1726,12 @@ Status applyCommand_inlock(OperationContext* opCtx,
     }
 
     // The feature compatibility version in the server configuration collection cannot change during
-    // initial sync. We do not attempt to parse the whitelisted ops because they do not have a
+    // initial sync. We do not attempt to parse the allowlisted ops because they do not have a
     // collection namespace. If we drop the 'admin' database we will also log a 'drop' oplog entry
     // for each collection dropped. 'applyOps' and 'commitTransaction' will try to apply each
     // individual operation, and those will be caught then if they are a problem. 'abortTransaction'
     // won't ever change the server configuration collection.
-    std::vector<std::string> whitelistedOps{"dropDatabase",
+    std::vector<std::string> allowlistedOps{"dropDatabase",
                                             "applyOps",
                                             "dbCheck",
                                             "commitTransaction",
@@ -1602,8 +1740,8 @@ Status applyCommand_inlock(OperationContext* opCtx,
                                             "commitIndexBuild",
                                             "abortIndexBuild"};
     if ((mode == OplogApplication::Mode::kInitialSync) &&
-        (std::find(whitelistedOps.begin(), whitelistedOps.end(), o.firstElementFieldName()) ==
-         whitelistedOps.end()) &&
+        (std::find(allowlistedOps.begin(), allowlistedOps.end(), o.firstElementFieldName()) ==
+         allowlistedOps.end()) &&
         extractNs(nss.db(), o) == NamespaceString::kServerConfigurationNamespace) {
         return Status(ErrorCodes::OplogOperationUnsupported,
                       str::stream() << "Applying command to feature compatibility version "

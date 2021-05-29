@@ -86,9 +86,9 @@ struct StageConstraints {
     /**
      * A ChangeStreamRequirement determines whether a particular stage is itself a ChangeStream
      * stage, whether it is allowed to exist in a $changeStream pipeline, or whether it is
-     * blacklisted from $changeStream.
+     * denylisted from $changeStream.
      */
-    enum class ChangeStreamRequirement { kChangeStreamStage, kWhitelist, kBlacklist };
+    enum class ChangeStreamRequirement { kChangeStreamStage, kAllowlist, kDenylist };
 
     /**
      * A FacetRequirement indicates whether this stage may be used within a $facet pipeline.
@@ -149,7 +149,7 @@ struct StageConstraints {
         TransactionRequirement transactionRequirement,
         LookupRequirement lookupRequirement,
         UnionRequirement unionRequirement,
-        ChangeStreamRequirement changeStreamRequirement = ChangeStreamRequirement::kBlacklist)
+        ChangeStreamRequirement changeStreamRequirement = ChangeStreamRequirement::kDenylist)
         : requiredPosition(requiredPosition),
           hostRequirement(hostRequirement),
           diskRequirement(diskRequirement),
@@ -174,14 +174,14 @@ struct StageConstraints {
         // Only streaming stages are permitted in $changeStream pipelines.
         invariant(!(isAllowedInChangeStream() && streamType == StreamType::kBlocking));
 
-        // A stage which is whitelisted for $changeStream cannot have a requirement to run on a
+        // A stage which is allowlisted for $changeStream cannot have a requirement to run on a
         // shard, since it needs to be able to run on mongoS in a cluster.
-        invariant(!(changeStreamRequirement == ChangeStreamRequirement::kWhitelist &&
+        invariant(!(changeStreamRequirement == ChangeStreamRequirement::kAllowlist &&
                     (hostRequirement == HostTypeRequirement::kAnyShard ||
                      hostRequirement == HostTypeRequirement::kPrimaryShard)));
 
-        // A stage which is whitelisted for $changeStream cannot have a position requirement.
-        invariant(!(changeStreamRequirement == ChangeStreamRequirement::kWhitelist &&
+        // A stage which is allowlisted for $changeStream cannot have a position requirement.
+        invariant(!(changeStreamRequirement == ChangeStreamRequirement::kAllowlist &&
                     requiredPosition != PositionRequirement::kNone));
 
         // Change stream stages should not be permitted with readConcern level "snapshot" or
@@ -229,7 +229,7 @@ struct StageConstraints {
      * True if this stage is permitted to run in a pipeline which starts with $changeStream.
      */
     bool isAllowedInChangeStream() const {
-        return changeStreamRequirement != ChangeStreamRequirement::kBlacklist;
+        return changeStreamRequirement != ChangeStreamRequirement::kDenylist;
     }
 
     /**

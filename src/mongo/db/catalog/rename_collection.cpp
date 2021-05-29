@@ -40,6 +40,7 @@
 #include "mongo/db/catalog/drop_collection.h"
 #include "mongo/db/catalog/index_catalog.h"
 #include "mongo/db/catalog/list_indexes.h"
+#include "mongo/db/catalog/local_oplog_info.h"
 #include "mongo/db/client.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
@@ -51,7 +52,6 @@
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/query/query_knobs_gen.h"
-#include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/database_sharding_state.h"
 #include "mongo/db/s/operation_sharding_state.h"
@@ -198,7 +198,8 @@ Status renameCollectionDirectly(OperationContext* opCtx,
         // avoid unintentionally removing a collection on a secondary with the same name as
         // the target.
         auto opObserver = opCtx->getServiceContext()->getOpObserver();
-        opObserver->onRenameCollection(opCtx, source, target, uuid, {}, 0U, options.stayTemp);
+        opObserver->onRenameCollection(
+            opCtx, source, target, uuid, {}, 0U, options.stayTemp, options.markFromMigrate);
 
         wunit.commit();
         return Status::OK();
@@ -231,8 +232,15 @@ Status renameCollectionAndDropTarget(OperationContext* opCtx,
 
         auto numRecords = targetColl->numRecords(opCtx);
         auto opObserver = opCtx->getServiceContext()->getOpObserver();
-        auto renameOpTime = opObserver->preRenameCollection(
-            opCtx, source, target, uuid, targetColl->uuid(), numRecords, options.stayTemp);
+
+        auto renameOpTime = opObserver->preRenameCollection(opCtx,
+                                                            source,
+                                                            target,
+                                                            uuid,
+                                                            targetColl->uuid(),
+                                                            numRecords,
+                                                            options.stayTemp,
+                                                            options.markFromMigrate);
 
         if (!renameOpTimeFromApplyOps.isNull()) {
             // 'renameOpTime' must be null because a valid 'renameOpTimeFromApplyOps' implies
@@ -445,7 +453,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
             << "cannot rename within same database (use renameCollectionWithinDB instead): source: "
             << source << "; target: " << target);
 
-    // Refer to txnCmdWhitelist in commands.cpp.
+    // Refer to txnCmdAllowlist in commands.cpp.
     invariant(
         !opCtx->inMultiDocumentTransaction(),
         str::stream() << "renameBetweenDBs not supported in multi-document transaction: source: "
@@ -680,7 +688,7 @@ Status renameBetweenDBs(OperationContext* opCtx,
                 WriteUnitOfWork wunit(opCtx);
 
                 if (!isOplogDisabledForTmpColl) {
-                    auto oplogInfo = repl::LocalOplogInfo::get(opCtx);
+                    auto oplogInfo = LocalOplogInfo::get(opCtx);
                     auto slots = oplogInfo->getNextOpTimes(opCtx, stmts.size());
                     for (std::size_t i = 0; i < stmts.size(); ++i) {
                         stmts[i].oplogSlot = slots[i];

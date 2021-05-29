@@ -1,8 +1,8 @@
-# This file is intended to track tests that should be blacklisted from multiversion testing due to
+# This file is intended to track tests that should be denylisted from multiversion testing due to
 # changes that have not yet been backported to the last-lts development branch.
 #
 # Usage:
-# Add the server ticket number and the path to the test file for the test you intend to blacklist
+# Add the server ticket number and the path to the test file for the test you intend to denylist
 # under the appropriate suite. Any test in a (ticket, test_file) pair that appears in this file but
 # not in the last-lts branch version of this file indicates that a commit has not yet been
 # backported to the last-lts branch and will be excluded from the multiversion suite
@@ -13,7 +13,7 @@
 #   - ticket: SERVER-1000
 #     test_file: jstests/core/my_test_file.js
 #
-# The above example will blacklist jstests/core/my_test_file.js from the
+# The above example will denylist jstests/core/my_test_file.js from the
 # 'replica_sets_multiversion_gen' task until this file has been updated with the same
 # (ticket, test_file) pair on the last-lts branch.
 #
@@ -132,8 +132,18 @@ all:
     test_file: jstests/core/geo_near_point_query.js
   - ticket: SERVER-48179
     test_file: jstests/replsets/reconfig_removes_node_in_rollback.js
-  - ticket: SERVER-55725
+  - ticket: SERVER-56371
     test_file: jstests/sharding/time_zone_info_mongos.js
+  - ticket: SERVER-55305
+    test_file: jstests/replsets/rollback_with_coalesced_txn_table_updates_during_oplog_application.js
+  - ticket: SERVER-55305
+    test_file: jstests/replsets/rollback_with_coalesced_txn_table_updates_from_vectored_inserts.js
+  - ticket: SERVER-53760
+    test_file: jstests/core/sort_spill_estimate_data_size.js
+  - ticket: SERVER-56772
+    test_file: jstests/concurrency/fsm_workloads/collmod_writeconflict.js
+  - ticket: SERVER-55111
+    test_file: jstests/sharding/transactions_reject_writes_for_moved_chunks.js
 
 # Tests that should only be excluded from particular suites should be listed under that suite.
 suites:

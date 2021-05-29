@@ -68,25 +68,36 @@ ReshardingOplogApplier::ReshardingOplogApplier(
 SemiFuture<void> ReshardingOplogApplier::_applyBatch(
     std::shared_ptr<executor::TaskExecutor> executor,
     CancellationToken cancelToken,
-    CancelableOperationContextFactory factory,
-    bool isForSessionApplication) {
-    auto currentWriterVectors = [&] {
-        if (isForSessionApplication) {
-            return _batchPreparer.makeSessionOpWriterVectors(_currentBatchToApply);
-        } else {
-            return _batchPreparer.makeCrudOpWriterVectors(_currentBatchToApply, _currentDerivedOps);
-        }
-    }();
+    CancelableOperationContextFactory factory) {
+    auto crudWriterVectors =
+        _batchPreparer.makeCrudOpWriterVectors(_currentBatchToApply, _currentDerivedOps);
 
     CancellationSource errorSource(cancelToken);
 
     std::vector<SharedSemiFuture<void>> batchApplierFutures;
-    batchApplierFutures.reserve(currentWriterVectors.size());
+    // Use `2 * crudWriterVectors.size()` because sessionWriterVectors.size() is very likely equal
+    // to crudWriterVectors.size(). Calling ReshardingOplogBatchApplier::applyBatch<false>() first
+    // though allows CRUD application to be concurrent with preparing the writer vectors for session
+    // application in addition to being concurrent with session application itself.
+    batchApplierFutures.reserve(2 * crudWriterVectors.size());
 
-    for (auto&& writer : currentWriterVectors) {
+    for (auto&& writer : crudWriterVectors) {
         if (!writer.empty()) {
             batchApplierFutures.emplace_back(
-                _batchApplier.applyBatch(std::move(writer), executor, errorSource.token(), factory)
+                _batchApplier
+                    .applyBatch<false>(std::move(writer), executor, errorSource.token(), factory)
+                    .share());
+        }
+    }
+
+    auto sessionWriterVectors = _batchPreparer.makeSessionOpWriterVectors(_currentBatchToApply);
+    batchApplierFutures.reserve(crudWriterVectors.size() + sessionWriterVectors.size());
+
+    for (auto&& writer : sessionWriterVectors) {
+        if (!writer.empty()) {
+            batchApplierFutures.emplace_back(
+                _batchApplier
+                    .applyBatch<true>(std::move(writer), executor, errorSource.token(), factory)
                     .share());
         }
     }
@@ -100,25 +111,32 @@ SemiFuture<void> ReshardingOplogApplier::_applyBatch(
         .semi();
 }
 
-SemiFuture<void> ReshardingOplogApplier::run(std::shared_ptr<executor::TaskExecutor> executor,
-                                             CancellationToken cancelToken,
-                                             CancelableOperationContextFactory factory) {
-    return AsyncTry([this, executor, cancelToken, factory] {
-               return _oplogIter->getNextBatch(executor, cancelToken, factory)
+SemiFuture<void> ReshardingOplogApplier::run(
+    std::shared_ptr<executor::TaskExecutor> executor,
+    std::shared_ptr<executor::TaskExecutor> cleanupExecutor,
+    CancellationToken cancelToken,
+    CancelableOperationContextFactory factory) {
+    struct ChainContext {
+        std::unique_ptr<ReshardingDonorOplogIteratorInterface> oplogIter;
+    };
+
+    auto chainCtx = std::make_shared<ChainContext>();
+    chainCtx->oplogIter = std::move(_oplogIter);
+
+    return AsyncTry([this, chainCtx, executor, cancelToken, factory] {
+               return chainCtx->oplogIter->getNextBatch(executor, cancelToken, factory)
                    .thenRunOn(executor)
                    .then([this, executor, cancelToken, factory](OplogBatch batch) {
                        LOGV2_DEBUG(5391002, 3, "Starting batch", "batchSize"_attr = batch.size());
                        _currentBatchToApply = std::move(batch);
 
-                       return _applyBatch(
-                           executor, cancelToken, factory, false /* isForSessionApplication */);
-                   })
-                   .then([this, executor, cancelToken, factory] {
-                       return _applyBatch(
-                           executor, cancelToken, factory, true /* isForSessionApplication */);
+                       return _applyBatch(executor, cancelToken, factory);
                    })
                    .then([this, factory] {
                        if (_currentBatchToApply.empty()) {
+                           // Increment the number of entries applied by 1 in order to account for
+                           // the final oplog entry.
+                           _env->metrics()->onOplogEntriesApplied(1);
                            return false;
                        }
 
@@ -132,11 +150,26 @@ SemiFuture<void> ReshardingOplogApplier::run(std::shared_ptr<executor::TaskExecu
         })
         .on(executor, cancelToken)
         .ignoreValue()
-        // There isn't a guarantee that the reference count to `executor` has been decremented after
-        // .on() returns. We schedule a trivial task on the task executor to ensure the callback's
-        // destructor has run. Otherwise `executor` could end up outliving the ServiceContext and
-        // triggering an invariant due to the task executor's thread having a Client still.
-        .onCompletion([](auto x) { return x; })
+        .thenRunOn(std::move(cleanupExecutor))
+        // It is unsafe to capture `this` once the task is running on the cleanupExecutor because
+        // RecipientStateMachine, along with its ReshardingOplogApplier member, may have already
+        // been destructed.
+        .onCompletion([chainCtx](Status status) {
+            if (chainCtx->oplogIter) {
+                // Use a separate Client to make a better effort of calling dispose() even when the
+                // CancellationToken has been canceled.
+                auto client =
+                    cc().getServiceContext()->makeClient("ReshardingOplogApplierCleanupClient");
+
+                AlternativeClientRegion acr(client);
+                auto opCtx = cc().makeOperationContext();
+
+                chainCtx->oplogIter->dispose(opCtx.get());
+                chainCtx->oplogIter.reset();
+            }
+
+            return status;
+        })
         .semi();
 }
 

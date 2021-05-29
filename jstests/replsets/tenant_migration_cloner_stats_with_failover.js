@@ -103,8 +103,8 @@ assert.soon(() => {
         {currentOp: true, desc: "tenant recipient migration"});
     currOp = res.inprog[0];
 
-    // Wait until one batch of documents has been copied.
-    return currOp.approxTotalBytesCopied > db1Size;
+    // Wait until one batch of documents of the second database's second collection has been copied.
+    return currOp.approxTotalBytesCopied > db1Size + db2Collection1Size;
 }, res);
 
 assert.eq(currOp.approxTotalDataSize, db1Size + db2Size, res);
@@ -137,7 +137,7 @@ fpAfterCreatingCollectionOfSecondDB.off();
 
 // After the migration completes, the total bytes copied should be equal to the total data size.
 jsTestLog("Waiting for migration to complete.");
-assert.commandWorked(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
+TenantMigrationTest.assertCommitted(tenantMigrationTest.waitForMigrationToComplete(migrationOpts));
 res = newRecipientPrimary.adminCommand({currentOp: true, desc: "tenant recipient migration"});
 currOp = res.inprog[0];
 assert.eq(currOp.approxTotalDataSize, db1Size + db2Size, res);

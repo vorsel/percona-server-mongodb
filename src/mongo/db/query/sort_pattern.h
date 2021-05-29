@@ -55,6 +55,9 @@ public:
             return isAscending == other.isAscending && fieldPath == other.fieldPath &&
                 expression == other.expression;
         }
+        bool operator!=(const SortPatternPart& other) const {
+            return !(*this == other);
+        }
     };
 
     SortPattern(const BSONObj&, const boost::intrusive_ptr<ExpressionContext>&);
@@ -85,6 +88,8 @@ public:
     bool empty() const {
         return _sortPattern.empty();
     }
+
+    void addDependencies(DepsTracker* deps) const;
 
     /**
      * Singleton sort patterns are a special case. In memory, sort keys for singleton patterns get

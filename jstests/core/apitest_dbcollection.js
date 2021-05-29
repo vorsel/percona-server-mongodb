@@ -3,6 +3,8 @@
  * Tests for the db collection
  *
  * @tags: [
+ *   # TODO(SERVER-56780): fix Number.MAX_VALUE scale test case for 4.4.
+ *   multiversion_incompatible,
  *   requires_capped,
  *   requires_collstats,
  *   requires_fastcount,
@@ -175,6 +177,19 @@ assert.eq(10,
           collectionStats.maxSize,
           'db.collection.stats({scale: N}) - capped collection size scaled incorrectly: ' +
               tojson(collectionStats));
+
+// Ensure that collStats can handle large values for 'scale'.
+var collectionStats = assert.commandWorked(t.stats(Number.MAX_VALUE));
+assert.eq(0,
+          collectionStats.maxSize,
+          'db.collection.stats(Number.MAX_VALUE) - capped collection size scaled incorrectly: ' +
+              tojson(collectionStats));
+var collectionStats = assert.commandWorked(t.stats({scale: Number.MAX_VALUE}));
+assert.eq(
+    0,
+    collectionStats.maxSize,
+    'db.collection.stats({scale: Number.MAX_VALUE}) - capped collection size scaled incorrectly: ' +
+        tojson(collectionStats));
 
 // indexDetails - If true, includes 'indexDetails' field in results. Default: false.
 t.drop();
