@@ -27,27 +27,19 @@
  *    it in the license file.
  */
 
-#pragma once
+#include "mongo/platform/basic.h"
 
-#include "mongo/base/string_data.h"
+#include "mongo/db/catalog/uncommitted_multikey.h"
+#include "mongo/db/operation_context.h"
 
 namespace mongo {
-namespace timeseries {
+namespace {
 
-// These are hard-coded constants in the bucket schema.
-static constexpr StringData kBucketIdFieldName = "_id"_sd;
-static constexpr StringData kBucketDataFieldName = "data"_sd;
-static constexpr StringData kBucketMetaFieldName = "meta"_sd;
-static constexpr StringData kBucketControlFieldName = "control"_sd;
-static constexpr StringData kControlMaxFieldNamePrefix = "control.max."_sd;
-static constexpr StringData kControlMinFieldNamePrefix = "control.min."_sd;
+const auto getUncommittedMultikey = OperationContext::declareDecoration<UncommittedMultikey>();
+}  // namespace
 
-// These are hard-coded field names in create collection for time-series collections.
-static constexpr StringData kTimeFieldName = "timeField"_sd;
-static constexpr StringData kMetaFieldName = "metaField"_sd;
+UncommittedMultikey& UncommittedMultikey::get(OperationContext* opCtx) {
+    return getUncommittedMultikey(opCtx);
+}
 
-// These are hard-coded field names in index specs.
-static constexpr StringData kKeyFieldName = "key"_sd;
-
-}  // namespace timeseries
 }  // namespace mongo

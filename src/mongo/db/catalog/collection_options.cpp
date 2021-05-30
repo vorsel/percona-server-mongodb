@@ -194,16 +194,17 @@ StatusWith<CollectionOptions> CollectionOptions::parse(const BSONObj& options, P
 
             collectionOptions.collation = e.Obj().getOwned();
         } else if (fieldName == "clusteredIndex") {
-            if (e.type() != mongo::Object) {
-                return Status(ErrorCodes::BadValue, "'clusteredIndex' has to be a document.");
+            if (e.type() != mongo::Bool) {
+                return Status(ErrorCodes::BadValue, "'clusteredIndex' has to be a boolean.");
             }
 
-            try {
-                collectionOptions.clusteredIndex =
-                    ClusteredIndexOptions::parse({"CollectionOptions::parse"}, e.Obj());
-            } catch (const DBException& ex) {
-                return ex.toStatus();
+            collectionOptions.clusteredIndex = e.Bool();
+        } else if (fieldName == "expireAfterSeconds") {
+            if (e.type() != mongo::NumberLong) {
+                return {ErrorCodes::BadValue, "'expireAfterSeconds' must be a number."};
             }
+
+            collectionOptions.expireAfterSeconds = e.Long();
         } else if (fieldName == "viewOn") {
             if (e.type() != mongo::String) {
                 return Status(ErrorCodes::BadValue, "'viewOn' has to be a string.");
@@ -303,7 +304,10 @@ CollectionOptions CollectionOptions::fromCreateCommand(const CreateCommand& cmd)
         options.timeseries = std::move(*timeseries);
     }
     if (auto clusteredIndex = cmd.getClusteredIndex()) {
-        options.clusteredIndex = std::move(*clusteredIndex);
+        options.clusteredIndex = *clusteredIndex;
+    }
+    if (auto expireAfterSeconds = cmd.getExpireAfterSeconds()) {
+        options.expireAfterSeconds = expireAfterSeconds;
     }
     if (auto temp = cmd.getTemp()) {
         options.temp = *temp;
@@ -312,77 +316,90 @@ CollectionOptions CollectionOptions::fromCreateCommand(const CreateCommand& cmd)
     return options;
 }
 
-BSONObj CollectionOptions::toBSON() const {
+BSONObj CollectionOptions::toBSON(bool includeUUID, const StringDataSet& includeFields) const {
     BSONObjBuilder b;
-    appendBSON(&b);
+    appendBSON(&b, includeUUID, includeFields);
     return b.obj();
 }
 
-void CollectionOptions::appendBSON(BSONObjBuilder* builder) const {
-    if (uuid) {
+void CollectionOptions::appendBSON(BSONObjBuilder* builder,
+                                   bool includeUUID,
+                                   const StringDataSet& includeFields) const {
+    if (uuid && includeUUID) {
         builder->appendElements(uuid->toBSON());
     }
 
-    if (capped) {
-        builder->appendBool("capped", true);
-        builder->appendNumber("size", cappedSize);
+    auto shouldAppend = [&](StringData option) {
+        return includeFields.empty() || includeFields.contains(option);
+    };
+
+    if (capped && shouldAppend(CreateCommand::kCappedFieldName)) {
+        builder->appendBool(CreateCommand::kCappedFieldName, true);
+        builder->appendNumber(CreateCommand::kSizeFieldName, cappedSize);
 
         if (cappedMaxDocs)
-            builder->appendNumber("max", cappedMaxDocs);
+            builder->appendNumber(CreateCommand::kMaxFieldName, cappedMaxDocs);
     }
 
-    if (autoIndexId != DEFAULT)
-        builder->appendBool("autoIndexId", autoIndexId == YES);
+    if (autoIndexId != DEFAULT && shouldAppend(CreateCommand::kAutoIndexIdFieldName))
+        builder->appendBool(CreateCommand::kAutoIndexIdFieldName, autoIndexId == YES);
 
-    if (temp)
-        builder->appendBool("temp", true);
+    if (temp && shouldAppend(CreateCommand::kTempFieldName))
+        builder->appendBool(CreateCommand::kTempFieldName, true);
 
-    if (recordPreImages) {
-        builder->appendBool("recordPreImages", true);
+    if (recordPreImages && shouldAppend(CreateCommand::kRecordPreImagesFieldName)) {
+        builder->appendBool(CreateCommand::kRecordPreImagesFieldName, true);
     }
 
-    if (!storageEngine.isEmpty()) {
-        builder->append("storageEngine", storageEngine);
+    if (!storageEngine.isEmpty() && shouldAppend(CreateCommand::kStorageEngineFieldName)) {
+        builder->append(CreateCommand::kStorageEngineFieldName, storageEngine);
     }
 
-    if (indexOptionDefaults.getStorageEngine()) {
-        builder->append("indexOptionDefaults", indexOptionDefaults.toBSON());
+    if (indexOptionDefaults.getStorageEngine() &&
+        shouldAppend(CreateCommand::kIndexOptionDefaultsFieldName)) {
+        builder->append(CreateCommand::kIndexOptionDefaultsFieldName, indexOptionDefaults.toBSON());
     }
 
-    if (!validator.isEmpty()) {
-        builder->append("validator", validator);
+    if (!validator.isEmpty() && shouldAppend(CreateCommand::kValidatorFieldName)) {
+        builder->append(CreateCommand::kValidatorFieldName, validator);
     }
 
-    if (validationLevel) {
-        builder->append("validationLevel", ValidationLevel_serializer(*validationLevel));
+    if (validationLevel && shouldAppend(CreateCommand::kValidationLevelFieldName)) {
+        builder->append(CreateCommand::kValidationLevelFieldName,
+                        ValidationLevel_serializer(*validationLevel));
     }
 
-    if (validationAction) {
-        builder->append("validationAction", ValidationAction_serializer(*validationAction));
+    if (validationAction && shouldAppend(CreateCommand::kValidationActionFieldName)) {
+        builder->append(CreateCommand::kValidationActionFieldName,
+                        ValidationAction_serializer(*validationAction));
     }
 
-    if (!collation.isEmpty()) {
-        builder->append("collation", collation);
+    if (!collation.isEmpty() && shouldAppend(CreateCommand::kCollationFieldName)) {
+        builder->append(CreateCommand::kCollationFieldName, collation);
     }
 
-    if (clusteredIndex) {
-        builder->append("clusteredIndex", clusteredIndex->toBSON());
+    if (clusteredIndex && shouldAppend(CreateCommand::kClusteredIndexFieldName)) {
+        builder->append(CreateCommand::kClusteredIndexFieldName, true);
     }
 
-    if (!viewOn.empty()) {
-        builder->append("viewOn", viewOn);
+    if (expireAfterSeconds && shouldAppend(CreateCommand::kExpireAfterSecondsFieldName)) {
+        builder->append(CreateCommand::kExpireAfterSecondsFieldName, *expireAfterSeconds);
     }
 
-    if (!pipeline.isEmpty()) {
-        builder->appendArray("pipeline", pipeline);
+    if (!viewOn.empty() && shouldAppend(CreateCommand::kViewOnFieldName)) {
+        builder->append(CreateCommand::kViewOnFieldName, viewOn);
     }
 
-    if (!idIndex.isEmpty()) {
-        builder->append("idIndex", idIndex);
+    if (!pipeline.isEmpty() && shouldAppend(CreateCommand::kPipelineFieldName)) {
+        builder->appendArray(CreateCommand::kPipelineFieldName, pipeline);
     }
 
-    if (timeseries) {
-        builder->append("timeseries", timeseries->toBSON());
+    if (!idIndex.isEmpty() && shouldAppend(CreateCommand::kIdIndexFieldName)) {
+        builder->append(CreateCommand::kIdIndexFieldName, idIndex);
+    }
+
+    if (timeseries && shouldAppend(CreateCommand::kTimeseriesFieldName)) {
+        builder->append(CreateCommand::kTimeseriesFieldName, timeseries->toBSON());
     }
 }
 
@@ -458,9 +475,11 @@ bool CollectionOptions::matchesStorageOptions(const CollectionOptions& other,
         return false;
     }
 
-    if ((clusteredIndex && other.clusteredIndex &&
-         clusteredIndex->toBSON().woCompare(other.clusteredIndex->toBSON())) ||
-        (!clusteredIndex != !other.clusteredIndex)) {
+    if (clusteredIndex != other.clusteredIndex) {
+        return false;
+    }
+
+    if (expireAfterSeconds != other.expireAfterSeconds) {
         return false;
     }
 

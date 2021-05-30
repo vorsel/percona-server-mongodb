@@ -213,27 +213,6 @@ const runAbortWithFailpoint = (failpointName, failpointNodeType, abortLocation, 
             ],
         },
         () => {
-            // TODO (SERVER-54704): Remove this call once it's no longer necessary to wait for
-            // participant machines to be set up to abort the reshardCollection command.
-            assert.soon(() => {
-                for (let donor of reshardingTest.donorShardNames) {
-                    const donorConn = new Mongo(topology.shards[donor].primary);
-                    const donorDoc =
-                        donorConn.getCollection('config.localReshardingOperations.donor').findOne({
-                            ns: originalCollectionNs
-                        });
-                    return donorDoc != null;
-                }
-
-                for (let recipient of reshardingTest.recipientShardNames) {
-                    const recipientConn = new Mongo(topology.shards[recipient].primary);
-                    const recipientDoc =
-                        recipientConn.getCollection('config.localReshardingOperations.recipient')
-                            .findOne({ns: originalCollectionNs});
-                    return recipientDoc != null;
-                }
-            });
-
             if (executeAtStartOfReshardingFn) {
                 jsTestLog(`Executing the start-of-resharding fn`);
                 executeAtStartOfReshardingFn(
@@ -293,9 +272,8 @@ const runAbortWithFailpoint = (failpointName, failpointNodeType, abortLocation, 
         assert.eq(reshardingSuccessesInitialCount, reshardingSuccessesFinalCount);
     }
 
-    reshardingTest.teardown();
-
     abortThread.join();
+    reshardingTest.teardown();
 };
 
 runAbortWithFailpoint("reshardingPauseRecipientBeforeCloning",
@@ -333,8 +311,12 @@ runAbortWithFailpoint(
                     return false;
                 }
 
+                if (coordinatorDoc.recipientShards == null) {
+                    return false;
+                }
+
                 for (const shardEntry of coordinatorDoc.recipientShards) {
-                    if (shardEntry.mutableState.state !== "steady-state") {
+                    if (shardEntry.mutableState.state !== "applying") {
                         return false;
                     }
                 }

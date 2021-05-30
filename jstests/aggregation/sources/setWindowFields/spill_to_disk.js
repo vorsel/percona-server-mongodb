@@ -42,6 +42,35 @@ seedWithTickerData(coll, 10);
 // Run $sum test with memory limits that cause spilling to disk.
 testAccumAgainstGroup(coll, "$sum", 0);
 
+function checkProfilerForDiskWrite(dbToCheck) {
+    if (!FixtureHelpers.isMongos) {
+        const profileObj = getLatestProfilerEntry(dbToCheck, {
+            $or: [
+                {originatingCommand: {pipeline: {$setWindowFields: {$exists: true}}}},
+                {command: {pipeline: {$setWindowFields: {$exists: true}}}}
+            ]
+        });
+        assert(profileObj.usedDisk, tojson(profileObj));
+    }
+}
+
+FixtureHelpers.runCommandOnEachPrimary({db: db, cmdObj: {profile: 2}});
+// Test that a query that spills to disk succeeds across getMore requests.
+const wfResults =
+    coll.aggregate(
+            [
+                {
+                    $setWindowFields: {
+                        sortBy: {_id: 1},
+                        output: {res: {$sum: "$price", window: {documents: ["unbounded", 5]}}}
+                    },
+                },
+            ],
+            {allowDiskUse: true, cursor: {batchSize: 1}})
+        .toArray();
+assert.eq(wfResults.length, 20);
+checkProfilerForDiskWrite(db);
+
 // Test a small, in memory, partition and a larger partition that requires spilling to disk.
 coll.drop();
 // Create small partition.
@@ -53,19 +82,6 @@ for (let i = 0; i < largePartitionSize; i++) {
     assert.commandWorked(coll.insert({_id: i + smallPartitionSize, val: i, partition: 2}));
 }
 
-function checkProfilerForDiskWrite(dbToCheck) {
-    if (!FixtureHelpers.isMongos) {
-        let profileObj = getLatestProfilerEntry(dbToCheck, {
-            $or: [
-                {originatingCommand: {pipeline: {$setWindowFields: {$exists: true}}}},
-                {command: {pipeline: {$setWindowFields: {$exists: true}}}}
-            ]
-        });
-        assert(profileObj.usedDisk, tojson(profileObj));
-    }
-}
-
-FixtureHelpers.runCommandOnEachPrimary({db: db, cmdObj: {profile: 2}});
 // Run an aggregation that will keep all documents in the cache for all documents.
 let results =
     coll.aggregate(
@@ -94,42 +110,40 @@ for (let i = 0; i < results.length; i++) {
     }
 }
 checkProfilerForDiskWrite(db);
-// Test that an explain that executes the query reports usedDisk correctly.
-let explainPipeline = [
-    {
-        $setWindowFields: {
-            partitionBy: "$partition",
-            sortBy: {partition: 1},
-            output: {arr: {$sum: "$val", window: {documents: [-21, 21]}}}
-        }
-    },
-    {$sort: {_id: 1}}
-];
 
 // We don't execute setWindowFields in a sharded explain.
 if (!FixtureHelpers.isMongos(db)) {
+    // Test that an explain that executes the query reports usedDisk correctly.
+    let explainPipeline = [
+        {
+            $setWindowFields: {
+                partitionBy: "$partition",
+                sortBy: {partition: 1},
+                output: {arr: {$sum: "$val", window: {documents: [-21, 21]}}}
+            }
+        },
+        {$sort: {_id: 1}}
+    ];
+
     let stages = getAggPlanStages(
         coll.explain("allPlansExecution").aggregate(explainPipeline, {allowDiskUse: true}),
         "$_internalSetWindowFields");
     assert(stages[0]["usedDisk"], stages);
-}
-setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(db.getMongo()),
-                       "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
-                       avgDocSize * largePartitionSize * 2);
-explainPipeline = [
-    {
-        $setWindowFields: {
-            partitionBy: "$partition",
-            sortBy: {partition: 1},
-            output: {arr: {$sum: "$val", window: {documents: [0, 0]}}}
-        }
-    },
-    {$sort: {_id: 1}}
-];
+    setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(db.getMongo()),
+                           "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+                           avgDocSize * largePartitionSize * 2);
+    explainPipeline = [
+        {
+            $setWindowFields: {
+                partitionBy: "$partition",
+                sortBy: {partition: 1},
+                output: {arr: {$sum: "$val", window: {documents: [0, 0]}}}
+            }
+        },
+        {$sort: {_id: 1}}
+    ];
 
-// We don't execute setWindowFields in a sharded explain.
-if (!FixtureHelpers.isMongos(db)) {
-    let stages = getAggPlanStages(
+    stages = getAggPlanStages(
         coll.explain("allPlansExecution").aggregate(explainPipeline, {allowDiskUse: true}),
         "$_internalSetWindowFields");
     assert(!stages[0]["usedDisk"], stages);
@@ -169,7 +183,7 @@ for (let i = 0; i < results.length; i++) {
 // $push uses about ~950 to store all the values in the second partition.
 setParameterOnAllHosts(DiscoverTopology.findNonConfigNodes(db.getMongo()),
                        "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
-                       750);
+                       avgDocSize * 2);
 assert.commandFailedWithCode(db.runCommand({
     aggregate: coll.getName(),
     pipeline: [

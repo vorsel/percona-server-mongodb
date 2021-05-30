@@ -2,6 +2,7 @@ curatorbin == 1.2.1
 PyKMIP == 0.4.0 # It's now 0.8.0. We're far enough back to have API conflicts.
 evergreen.py == 2.1.0
 jinja2
+MarkupSafe == 1.1.0  # See SERVER-57036, this is a transitive dependency of jinja2
 mock
 shrub.py == 1.1.0
 ocspresponder == 0.5.0
@@ -13,3 +14,4 @@ googleapis-common-protos == 1.53.0
 blackduck == 1.0.1
 PyGithub == 1.53
 urllib3 >= 1.26.0
+distro == 1.5.0

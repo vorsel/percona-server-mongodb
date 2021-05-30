@@ -39,6 +39,7 @@
 #include "mongo/db/query/collation/collator_factory_interface.h"
 #include "mongo/db/s/operation_sharding_state.h"
 #include "mongo/db/storage/storage_parameters_gen.h"
+#include "mongo/db/timeseries/timeseries_constants.h"
 #include "mongo/logv2/log.h"
 
 namespace mongo {
@@ -148,43 +149,33 @@ public:
                         feature_flags::gTimeseriesCollection.isEnabled(
                             serverGlobalParams.featureCompatibility));
 
-                const auto timeseriesNotAllowedWith = [&cmd](StringData option) -> std::string {
-                    return str::stream() << cmd.getNamespace()
-                                         << ": 'timeseries' is not allowed with '" << option << "'";
-                };
+                for (auto&& option : cmd.toBSON({})) {
+                    auto fieldName = option.fieldNameStringData();
 
-                uassert(ErrorCodes::InvalidOptions,
-                        timeseriesNotAllowedWith("capped"),
-                        !cmd.getCapped());
-                uassert(ErrorCodes::InvalidOptions,
-                        timeseriesNotAllowedWith("autoIndexId"),
-                        !cmd.getAutoIndexId());
-                uassert(ErrorCodes::InvalidOptions,
-                        timeseriesNotAllowedWith("idIndex"),
-                        !cmd.getIdIndex());
-                uassert(
-                    ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("size"), !cmd.getSize());
-                uassert(ErrorCodes::InvalidOptions, timeseriesNotAllowedWith("max"), !cmd.getMax());
+                    if (fieldName == CreateCommand::kCommandName) {
+                        continue;
+                    }
 
-                // The 'timeseries' option may be passed with a 'validator' if a buckets collection
-                // is being restored. We assume the caller knows what they are doing.
-                if (!cmd.getNamespace().isTimeseriesBucketsCollection()) {
+                    // The 'capped' option defaults to false. We accept it unless it is set to true.
+                    if (fieldName == CreateCommand::kCappedFieldName && !option.Bool()) {
+                        continue;
+                    }
+
+                    // The 'timeseries' option may be passed with a 'validator' or 'clusteredIndex'
+                    // if a buckets collection is being restored. We assume the caller knows what
+                    // they are doing.
+                    if ((fieldName == CreateCommand::kValidatorFieldName ||
+                         fieldName == CreateCommand::kClusteredIndexFieldName) &&
+                        cmd.getNamespace().isTimeseriesBucketsCollection()) {
+                        continue;
+                    }
+
                     uassert(ErrorCodes::InvalidOptions,
-                            timeseriesNotAllowedWith("validator"),
-                            !cmd.getValidator());
+                            str::stream()
+                                << cmd.getNamespace() << ": 'timeseries' is not allowed with '"
+                                << fieldName << "'",
+                            timeseries::kAllowedCollectionCreationOptions.contains(fieldName));
                 }
-                uassert(ErrorCodes::InvalidOptions,
-                        timeseriesNotAllowedWith("validationLevel"),
-                        !cmd.getValidationLevel());
-                uassert(ErrorCodes::InvalidOptions,
-                        timeseriesNotAllowedWith("validationAction"),
-                        !cmd.getValidationAction());
-                uassert(ErrorCodes::InvalidOptions,
-                        timeseriesNotAllowedWith("viewOn"),
-                        !cmd.getViewOn());
-                uassert(ErrorCodes::InvalidOptions,
-                        timeseriesNotAllowedWith("pipeline"),
-                        !cmd.getPipeline());
 
                 auto hasDot = [](StringData field) -> bool {
                     return field.find('.') != std::string::npos;
@@ -209,6 +200,14 @@ public:
                             mustBeTopLevel("metaField"),
                             !hasDot(*metaField));
                 }
+            }
+
+            if (cmd.getExpireAfterSeconds()) {
+                uassert(ErrorCodes::InvalidOptions,
+                        "'expireAfterSeconds' is only supported on time-series collections",
+                        cmd.getTimeseries() ||
+                            (cmd.getClusteredIndex() &&
+                             cmd.getNamespace().isTimeseriesBucketsCollection()));
             }
 
             // Validate _id index spec and fill in missing fields.

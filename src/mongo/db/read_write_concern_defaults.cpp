@@ -110,11 +110,6 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewCWRWCToBeSavedOnDisk(
             rc || wc);
 
     RWConcernDefault rwc;
-    const bool isDefaultWCMajorityFeatureFlagEnabled =
-        repl::feature_flags::gDefaultWCMajority.isEnabled(serverGlobalParams.featureCompatibility);
-    if (isDefaultWCMajorityFeatureFlagEnabled) {
-        rwc.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kImplicit);
-    }
 
     if (rc && !rc->isEmpty()) {
         checkSuitabilityAsDefault(*rc);
@@ -123,9 +118,6 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewCWRWCToBeSavedOnDisk(
     if (wc && !wc->usedDefault) {
         checkSuitabilityAsDefault(*wc);
         rwc.setDefaultWriteConcern(wc);
-        if (isDefaultWCMajorityFeatureFlagEnabled) {
-            rwc.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kGlobal);
-        }
     }
 
     auto* const serviceContext = opCtx->getServiceContext();
@@ -139,10 +131,6 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewCWRWCToBeSavedOnDisk(
     }
     if (!wc && current) {
         rwc.setDefaultWriteConcern(current->getDefaultWriteConcern());
-        if (isDefaultWCMajorityFeatureFlagEnabled && current->getDefaultWriteConcern() &&
-            !current->getDefaultWriteConcern().get().usedDefault) {
-            rwc.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kGlobal);
-        }
     }
     // If the setDefaultRWConcern command tries to unset the global default write concern when it
     // has already been set, throw an error.
@@ -159,6 +147,14 @@ RWConcernDefault ReadWriteConcernDefaults::generateNewCWRWCToBeSavedOnDisk(
     }
 
     return rwc;
+}
+
+bool ReadWriteConcernDefaults::isCWWCSet(OperationContext* opCtx) {
+    // This function is only valid if the gDefaultWCMajority feature flag is enabled. It only
+    // returns true if the gDefaultWCMajority feature flag is enabled, and the cluster-wide write
+    // concern has been set. It will return false otherwise.
+    auto rwcd = getDefault(opCtx);
+    return rwcd.getDefaultWriteConcernSource() == DefaultWriteConcernSourceEnum::kGlobal;
 }
 
 void ReadWriteConcernDefaults::observeDirectWriteToConfigSettings(OperationContext* opCtx,
@@ -209,6 +205,16 @@ void ReadWriteConcernDefaults::refreshIfNecessary(OperationContext* opCtx) {
     }
 }
 
+repl::ReadConcernArgs ReadWriteConcernDefaults::getImplicitDefaultReadConcern() {
+    const bool isDefaultRCLocalFeatureFlagEnabled =
+        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        repl::feature_flags::gDefaultRCLocal.isEnabled(serverGlobalParams.featureCompatibility);
+    if (!isDefaultRCLocalFeatureFlagEnabled) {
+        return repl::ReadConcernArgs();
+    }
+    return repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
+}
+
 boost::optional<ReadWriteConcernDefaults::RWConcernDefaultAndTime>
 ReadWriteConcernDefaults::_getDefaultCWRWCFromDisk(OperationContext* opCtx) {
     auto defaultsHandle = _defaults.acquire(opCtx, Type::kReadWriteConcernEntry);
@@ -226,11 +232,20 @@ ReadWriteConcernDefaults::_getDefaultCWRWCFromDisk(OperationContext* opCtx) {
 ReadWriteConcernDefaults::RWConcernDefaultAndTime ReadWriteConcernDefaults::getDefault(
     OperationContext* opCtx) {
     auto cached = _getDefaultCWRWCFromDisk(opCtx).value_or(RWConcernDefaultAndTime());
-    const bool isDefaultWCMajorityFeatureFlagEnabled =
+
+    const bool isDefaultRCLocalFeatureFlagEnabled =
         serverGlobalParams.featureCompatibility.isVersionInitialized() &&
-        repl::feature_flags::gDefaultWCMajority.isEnabled(serverGlobalParams.featureCompatibility);
-    if (isDefaultWCMajorityFeatureFlagEnabled && !cached.getDefaultWriteConcernSource()) {
-        cached.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kImplicit);
+        repl::feature_flags::gDefaultRCLocal.isEnabled(serverGlobalParams.featureCompatibility);
+
+    // Only overwrite the default read concern and its source if it has already been set on mongos.
+    if (isDefaultRCLocalFeatureFlagEnabled && !cached.getDefaultReadConcernSource()) {
+        if (!cached.getDefaultReadConcern() || cached.getDefaultReadConcern().get().isEmpty()) {
+            auto rcDefault = getImplicitDefaultReadConcern();
+            cached.setDefaultReadConcern(rcDefault);
+            cached.setDefaultReadConcernSource(DefaultReadConcernSourceEnum::kImplicit);
+        } else {
+            cached.setDefaultReadConcernSource(DefaultReadConcernSourceEnum::kGlobal);
+        }
     }
 
     // The implicit default write concern will be w:1 if the feature compatibility version is not
@@ -239,17 +254,26 @@ ReadWriteConcernDefaults::RWConcernDefaultAndTime ReadWriteConcernDefaults::getD
     // we have loaded our config, nodes could change their implicit write concern default. This is
     // safe since we shouldn't be accepting writes that need a write concern before we have loaded
     // our config.
-    if (!isDefaultWCMajorityFeatureFlagEnabled || !_implicitDefaultWriteConcernMajority) {
-        return cached;
-    }
+    const bool isDefaultWCMajorityFeatureFlagEnabled =
+        serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+        repl::feature_flags::gDefaultWCMajority.isEnabled(serverGlobalParams.featureCompatibility);
 
-    if ((!cached.getDefaultWriteConcern() || cached.getDefaultWriteConcern().get().usedDefault) &&
-        _implicitDefaultWriteConcernMajority.get()) {
-        cached.setDefaultWriteConcern(WriteConcernOptions(WriteConcernOptions::kMajority,
-                                                          WriteConcernOptions::SyncMode::UNSET,
-                                                          WriteConcernOptions::kNoTimeout));
-        if (isDefaultWCMajorityFeatureFlagEnabled) {
+    // This prevents overriding the default write concern and its source on mongos if it has
+    // already been set through the config server.
+    if (isDefaultWCMajorityFeatureFlagEnabled && !cached.getDefaultWriteConcernSource()) {
+        const bool isCWWCSet =
+            cached.getDefaultWriteConcern() && !cached.getDefaultWriteConcern().get().usedDefault;
+        if (isCWWCSet) {
+            cached.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kGlobal);
+        } else {
             cached.setDefaultWriteConcernSource(DefaultWriteConcernSourceEnum::kImplicit);
+            if (_implicitDefaultWriteConcernMajority &&
+                _implicitDefaultWriteConcernMajority.get()) {
+                cached.setDefaultWriteConcern(
+                    WriteConcernOptions(WriteConcernOptions::kMajority,
+                                        WriteConcernOptions::SyncMode::UNSET,
+                                        WriteConcernOptions::kNoTimeout));
+            }
         }
     }
 

@@ -76,6 +76,11 @@ public:
     boost::optional<ReadConcern> getDefaultReadConcern(OperationContext* opCtx);
     boost::optional<WriteConcern> getDefaultWriteConcern(OperationContext* opCtx);
 
+    /**
+     * Returns the implicit default read concern.
+     */
+    repl::ReadConcernArgs getImplicitDefaultReadConcern();
+
     class RWConcernDefaultAndTime : public RWConcernDefault {
     public:
         RWConcernDefaultAndTime() = default;
@@ -128,6 +133,12 @@ public:
     RWConcernDefault generateNewCWRWCToBeSavedOnDisk(OperationContext* opCtx,
                                                      const boost::optional<ReadConcern>& rc,
                                                      const boost::optional<WriteConcern>& wc);
+
+    /**
+     * Returns true if cluster-wide write concern is set and the gDefaultWCMajority feature flag
+     * is enabled, and false otherwise.
+     */
+    bool isCWWCSet(OperationContext* opCtx);
 
     /**
      * Invalidates the cached RWC defaults, causing them to be refreshed.

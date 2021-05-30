@@ -263,7 +263,6 @@ env.Library(
         'create_command_validation.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/db/catalog/clustered_index_options_idl',
         '$BUILD_DIR/mongo/db/timeseries/timeseries_idl',
     ],
     LIBDEPS_PRIVATE=[
@@ -505,6 +504,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/rw_concern_d',
         '$BUILD_DIR/mongo/db/s/sharding_catalog_manager',
         '$BUILD_DIR/mongo/db/s/sharding_commands_d',
+        '$BUILD_DIR/mongo/db/s/sharding_runtime_d',
         '$BUILD_DIR/mongo/db/s/transaction_coordinator',
         '$BUILD_DIR/mongo/db/server_options_core',
         '$BUILD_DIR/mongo/idl/idl_parser',

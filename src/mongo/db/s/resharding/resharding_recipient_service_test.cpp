@@ -262,12 +262,6 @@ public:
             opCtx, recipient, recipientDoc, CoordinatorStateEnum::kCommitting);
     }
 
-    void notifyReshardingAborting(OperationContext* opCtx,
-                                  RecipientStateMachine& recipient,
-                                  const ReshardingRecipientDocument& recipientDoc) {
-        _onReshardingFieldsChanges(opCtx, recipient, recipientDoc, CoordinatorStateEnum::kAborting);
-    }
-
     void checkStateDocumentRemoved(OperationContext* opCtx) {
         AutoGetCollection recipientColl(
             opCtx, NamespaceString::kRecipientReshardingOperationsNamespace, MODE_IS);
@@ -336,9 +330,7 @@ TEST_F(ReshardingRecipientServiceTest, StepDownStepUpEachTransition) {
     const std::vector<RecipientStateEnum> recipientStates{RecipientStateEnum::kCreatingCollection,
                                                           RecipientStateEnum::kCloning,
                                                           RecipientStateEnum::kApplying,
-                                                          RecipientStateEnum::kSteadyState,
                                                           RecipientStateEnum::kStrictConsistency,
-                                                          RecipientStateEnum::kRenaming,
                                                           RecipientStateEnum::kDone};
     for (bool isAlsoDonor : {false, true}) {
         LOGV2(5551106,
@@ -391,7 +383,6 @@ TEST_F(ReshardingRecipientServiceTest, StepDownStepUpEachTransition) {
                     notifyToStartCloning(opCtx.get(), *recipient, doc);
                     break;
                 }
-                case RecipientStateEnum::kRenaming:
                 case RecipientStateEnum::kDone: {
                     notifyReshardingCommitting(opCtx.get(), *recipient, doc);
                     break;
@@ -452,7 +443,7 @@ TEST_F(ReshardingRecipientServiceTest, DropsTemporaryReshardingCollectionOnAbort
         auto recipient = RecipientStateMachine::getOrCreate(opCtx.get(), _service, doc.toBSON());
 
         notifyToStartCloning(opCtx.get(), *recipient, doc);
-        notifyReshardingAborting(opCtx.get(), *recipient, doc);
+        recipient->abort();
 
         doneTransitionGuard->wait(RecipientStateEnum::kDone);
         stepDown();
@@ -468,7 +459,7 @@ TEST_F(ReshardingRecipientServiceTest, DropsTemporaryReshardingCollectionOnAbort
         recipient = *maybeRecipient;
 
         doneTransitionGuard.reset();
-        notifyReshardingAborting(opCtx.get(), *recipient, doc);
+        recipient->abort();
 
         ASSERT_OK(recipient->getCompletionFuture().getNoThrow());
         checkStateDocumentRemoved(opCtx.get());

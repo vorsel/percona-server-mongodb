@@ -63,7 +63,6 @@
 #include "mongo/db/retryable_writes_stats.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/storage/duplicate_key_error_info.h"
-#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/timeseries/bucket_catalog.h"
 #include "mongo/db/transaction_participant.h"
 #include "mongo/db/views/view_catalog.h"
@@ -319,8 +318,7 @@ boost::optional<BSONObj> generateError(OperationContext* opCtx,
 
             auto mtab = migrationConflictInfo->getTenantMigrationAccessBlocker();
 
-            auto migrationStatus =
-                mtab->waitUntilCommittedOrAborted(opCtx, migrationConflictInfo->getOperationType());
+            auto migrationStatus = mtab->waitUntilCommittedOrAborted(opCtx);
             mtab->recordTenantMigrationError(migrationStatus);
             error.append("code", static_cast<int>(migrationStatus.code()));
 

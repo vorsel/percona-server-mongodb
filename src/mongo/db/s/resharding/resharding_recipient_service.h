@@ -145,6 +145,9 @@ public:
     static void insertStateDocument(OperationContext* opCtx,
                                     const ReshardingRecipientDocument& recipientDoc);
 
+    // Initiates the cancellation of the resharding operation.
+    void abort();
+
 private:
     // The following functions correspond to the actions to take at a particular recipient state.
     ExecutorFuture<void> _awaitAllDonorsPreparedToDonateThenTransitionToCreatingCollection(
@@ -176,11 +179,16 @@ private:
                           boost::optional<CloneDetails>&& cloneDetails,
                           boost::optional<mongo::Date_t> configStartTime);
 
-    // Transitions the on-disk and in-memory state to RecipientStateEnum::kCreatingCollection.
+    // The following functions transition the on-disk and in-memory state to the named state.
     void _transitionToCreatingCollection(CloneDetails cloneDetails,
                                          boost::optional<mongo::Date_t> startConfigTxnCloneTime);
 
-    // Transitions the on-disk and in-memory state to RecipientStateEnum::kError.
+    void _transitionToCloning();
+
+    void _transitionToApplying();
+
+    void _transitionToStrictConsistency();
+
     void _transitionToError(Status abortReason);
 
     BSONObj _makeQueryForCoordinatorUpdate(const ShardId& shardId, RecipientStateEnum newState);
@@ -211,9 +219,6 @@ private:
     //
     // Should only be called once per lifetime.
     CancellationToken _initAbortSource(const CancellationToken& stepdownToken);
-
-    // Initiates the cancellation of the resharding operation.
-    void _onAbortEncountered(OperationContext* opCtx, const Status& abortReason);
 
     const ReshardingRecipientService* const _recipientService;
 

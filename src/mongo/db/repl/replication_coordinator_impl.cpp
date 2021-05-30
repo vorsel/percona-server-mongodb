@@ -605,23 +605,6 @@ void ReplicationCoordinatorImpl::_finishLoadLocalConfig(
     }
     LOGV2_DEBUG(4280509, 1, "Local configuration validated for startup");
 
-    if (serverGlobalParams.enableMajorityReadConcern && localConfig.isPSASet()) {
-        LOGV2_OPTIONS(21315, {logv2::LogTag::kStartupWarnings}, "");
-        LOGV2_OPTIONS(
-            21316,
-            {logv2::LogTag::kStartupWarnings},
-            "** WARNING: This replica set has a Primary-Secondary-Arbiter architecture, but "
-            "readConcern:majority is enabled ");
-        LOGV2_OPTIONS(
-            21317,
-            {logv2::LogTag::kStartupWarnings},
-            "**          for this node. This is not a recommended configuration. Please see ");
-        LOGV2_OPTIONS(21318,
-                      {logv2::LogTag::kStartupWarnings},
-                      "**          https://dochub.mongodb.org/core/psa-disable-rc-majority");
-        LOGV2_OPTIONS(21319, {logv2::LogTag::kStartupWarnings}, "");
-    }
-
     // Do not check optime, if this node is an arbiter.
     bool isArbiter =
         myIndex.getValue() != -1 && localConfig.getMemberAt(myIndex.getValue()).isArbiter();
@@ -3450,6 +3433,29 @@ Status ReplicationCoordinatorImpl::_doReplSetReconfig(OperationContext* opCtx,
     if (!status.isOK())
         return status;
     ReplSetConfig newConfig = newConfigStatus.getValue();
+
+    // If the new config changes the replica set's implicit default write concern, we fail the
+    // reconfig command. This includes force reconfigs, but excludes reconfigs that bump the config
+    // term during step-up. The user should set a cluster-wide write concern and attempt the
+    // reconfig command again. We also need to exclude shard servers from this validation, as shard
+    // servers don't store the cluster-wide write concern.
+    if (!skipSafetyChecks /* skipping step-up reconfig */ &&
+        repl::feature_flags::gDefaultWCMajority.isEnabled(
+            serverGlobalParams.featureCompatibility) &&
+        serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
+        !repl::enableDefaultWriteConcernUpdatesForInitiate.load()) {
+        bool currIDWC = oldConfig.isImplicitDefaultWriteConcernMajority();
+        bool newIDWC = newConfig.isImplicitDefaultWriteConcernMajority();
+        bool isCWWCSet = ReadWriteConcernDefaults::get(opCtx).isCWWCSet(opCtx);
+        if (!isCWWCSet && currIDWC != newIDWC) {
+            return Status(
+                ErrorCodes::NewReplicaSetConfigurationIncompatible,
+                str::stream()
+                    << "Reconfig attempted to install a config that would change the "
+                       "implicit default write concern. Use the setDefaultRWConcern command to "
+                       "set a cluster-wide write concern and try the reconfig again.");
+        }
+    }
 
     BSONObj oldConfigObj = oldConfig.toBSON();
     BSONObj newConfigObj = newConfig.toBSON();

@@ -60,6 +60,7 @@
 #include "mongo/db/query/getmore_command_gen.h"
 #include "mongo/db/query/query_request_helper.h"
 #include "mongo/db/read_write_concern_defaults.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/stats/api_version_metrics.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/transaction_validation.h"
@@ -719,31 +720,55 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
     bool clientSuppliedReadConcern = readConcernArgs.isSpecified();
     bool customDefaultReadConcernWasApplied = false;
 
-    auto readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel());
-    if (readConcernSupport.defaultReadConcernPermit.isOK() &&
-        (startTransaction || !TransactionRouter::get(opCtx))) {
+    auto readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel(),
+                                                              readConcernArgs.isImplicitDefault());
+
+    auto applyDefaultReadConcern = [&](const repl::ReadConcernArgs rcDefault) -> void {
+        // We must obtain the client lock to set ReadConcernArgs, because it's an
+        // in-place reference to the object on the operation context, which may be
+        // concurrently used elsewhere (eg. read by currentOp).
+        stdx::lock_guard<Client> lk(*opCtx->getClient());
+        LOGV2_DEBUG(22767,
+                    2,
+                    "Applying default readConcern on {command} of {readConcern}",
+                    "Applying default readConcern on command",
+                    "command"_attr = invocation->definition()->getName(),
+                    "readConcern"_attr = rcDefault);
+        readConcernArgs = std::move(rcDefault);
+        // Update the readConcernSupport, since the default RC was applied.
+        readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel(),
+                                                             !customDefaultReadConcernWasApplied);
+    };
+
+    auto shouldApplyDefaults = startTransaction || !TransactionRouter::get(opCtx);
+    if (readConcernSupport.defaultReadConcernPermit.isOK() && shouldApplyDefaults) {
         if (readConcernArgs.isEmpty()) {
-            const auto rcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
-                                       .getDefaultReadConcern(opCtx);
+            const auto rwcDefaults =
+                ReadWriteConcernDefaults::get(opCtx->getServiceContext()).getDefault(opCtx);
+            const auto rcDefault = rwcDefaults.getDefaultReadConcern();
             if (rcDefault) {
-                {
-                    // We must obtain the client lock to set ReadConcernArgs, because it's an
-                    // in-place reference to the object on the operation context, which may be
-                    // concurrently used elsewhere (eg. read by currentOp).
-                    stdx::lock_guard<Client> lk(*opCtx->getClient());
-                    readConcernArgs = std::move(*rcDefault);
-                }
-                customDefaultReadConcernWasApplied = true;
-                LOGV2_DEBUG(22767,
-                            2,
-                            "Applying default readConcern on {command} of {readConcern}",
-                            "Applying default readConcern on command",
-                            "command"_attr = invocation->definition()->getName(),
-                            "readConcern"_attr = *rcDefault);
-                // Update the readConcernSupport, since the default RC was applied.
-                readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel());
+                const bool isDefaultRCLocalFeatureFlagEnabled =
+                    serverGlobalParams.featureCompatibility.isVersionInitialized() &&
+                    repl::feature_flags::gDefaultRCLocal.isEnabled(
+                        serverGlobalParams.featureCompatibility);
+                const auto readConcernSource = rwcDefaults.getDefaultReadConcernSource();
+                customDefaultReadConcernWasApplied = !isDefaultRCLocalFeatureFlagEnabled ||
+                    (readConcernSource &&
+                     readConcernSource.get() == DefaultReadConcernSourceEnum::kGlobal);
+
+                applyDefaultReadConcern(*rcDefault);
             }
         }
+    }
+
+    // Apply the implicit default read concern even if the command does not support a cluster wide
+    // read concern.
+    if (!readConcernSupport.defaultReadConcernPermit.isOK() &&
+        readConcernSupport.implicitDefaultReadConcernPermit.isOK() && shouldApplyDefaults &&
+        readConcernArgs.isEmpty()) {
+        const auto rcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
+                                   .getImplicitDefaultReadConcern();
+        applyDefaultReadConcern(rcDefault);
     }
 
     auto& provenance = readConcernArgs.getProvenance();
@@ -1084,6 +1109,7 @@ Future<void> ParseAndRunCommand::run() {
 
 DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm) {
     globalOpCounters.gotQuery();
+    globalOpCounters.gotQueryDeprecated();
 
     ON_BLOCK_EXIT([opCtx] {
         Grid::get(opCtx)->catalogCache()->checkAndRecordOperationBlockedByRefresh(
@@ -1351,6 +1377,7 @@ DbResponse Strategy::getMore(OperationContext* opCtx, const NamespaceString& nss
     const long long cursorId = dbm->pullInt64();
 
     globalOpCounters.gotGetMore();
+    globalOpCounters.gotGetMoreDeprecated();
 
     // TODO: Handle stale config exceptions here from coll being dropped or sharded during op for
     // now has same semantics as legacy request.
@@ -1405,7 +1432,7 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
                           << ".",
             numCursors >= 1 && numCursors < 30000);
 
-    globalOpCounters.gotOp(dbKillCursors, false);
+    globalOpCounters.gotKillCursorsDeprecated();
 
     ConstDataCursor cursors(dbm->getArray(numCursors));
 
@@ -1467,12 +1494,16 @@ void Strategy::writeOp(std::shared_ptr<RequestExecutionContext> rec) {
     rec->setRequest([msg = rec->getMessage()]() {
         switch (msg.operation()) {
             case dbInsert: {
-                return InsertOp::parseLegacy(msg).serialize({});
+                auto op = InsertOp::parseLegacy(msg);
+                globalOpCounters.gotInsertsDeprecated(op.getDocuments().size());
+                return op.serialize({});
             }
             case dbUpdate: {
+                globalOpCounters.gotUpdateDeprecated();
                 return UpdateOp::parseLegacy(msg).serialize({});
             }
             case dbDelete: {
+                globalOpCounters.gotDeleteDeprecated();
                 return DeleteOp::parseLegacy(msg).serialize({});
             }
             default:
