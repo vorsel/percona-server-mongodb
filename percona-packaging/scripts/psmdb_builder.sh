@@ -172,6 +172,8 @@ get_sources(){
     git clone https://github.com/mongodb/mongo-tools.git
     cd mongo-tools
     git checkout $MONGO_TOOLS_TAG
+    sed -i 's|VersionStr="$(go run release/release.go get-version)"|VersionStr="$PSMDB_TOOLS_REVISION"|' set_goenv.sh
+    sed -i 's|GitCommit="$(git rev-parse HEAD)"|GitCommit="$PSMDB_TOOLS_COMMIT_HASH"|' set_goenv.sh
     echo "export PSMDB_TOOLS_COMMIT_HASH=\"$(git rev-parse HEAD)\"" > set_tools_revision.sh
     echo "export PSMDB_TOOLS_REVISION=\"${PSM_VER}-${PSM_RELEASE}\"" >> set_tools_revision.sh
     chmod +x set_tools_revision.sh
@@ -201,15 +203,18 @@ get_sources(){
 
 get_system(){
     if [ -f /etc/redhat-release ]; then
+        GLIBC_VER_TMP="$(rpm glibc -qa --qf %{VERSION})"
         RHEL=$(rpm --eval %rhel)
         ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
         OS_NAME="el$RHEL"
         OS="rpm"
     else
+        GLIBC_VER_TMP="$(dpkg-query -W -f='${Version}' libc6 | awk -F'-' '{print $1}')"
         ARCH=$(uname -m)
         OS_NAME="$(lsb_release -sc)"
         OS="deb"
     fi
+    export GLIBC_VER=".glibc${GLIBC_VER_TMP}"
     return
 }
 
@@ -332,7 +337,10 @@ install_deps() {
       add_percona_yum_repo
       wget http://jenkins.percona.com/yum-repo/percona-dev.repo
       mv -f percona-dev.repo /etc/yum.repos.d/
+      yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm
+      percona-release enable tools testing
       yum clean all
+      yum install -y patchelf
       RHEL=$(rpm --eval %rhel)
       if [ x"$RHEL" = x6 ]; then
         yum -y update
@@ -351,12 +359,16 @@ install_deps() {
         yum -y install epel-release
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint
-        yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel
+        yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel which
         yum -y install openldap-devel krb5-devel xz-devel
+        pip install --upgrade pip
+        pip2.7 install --user setuptools --upgrade
+        pip3.6 install --user typing pyyaml regex Cheetah3
+        pip2.7 install --user typing pyyaml regex Cheetah Cheetah3
       else
         yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
         yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
-        yum -y install python2-scons python2-pip python36-devel
+        yum -y install python2-scons python2-pip python36-devel which
         yum -y install redhat-rpm-config python2-devel e2fsprogs-devel expat-devel lz4-devel
         yum -y install openldap-devel krb5-devel xz-devel
       fi
@@ -364,13 +376,13 @@ install_deps() {
         /usr/bin/pip3.6 install --user typing pyyaml regex Cheetah3
         /usr/bin/pip2.7 install --user typing pyyaml regex Cheetah
       fi
-        wget https://curl.se/download/curl-7.66.0.tar.gz
-        tar -xvzf curl-7.66.0.tar.gz
-        cd curl-7.66.0
-          ./configure
-          make
-          make install
-        cd ../
+      wget https://curl.se/download/curl-7.66.0.tar.gz
+      tar -xvzf curl-7.66.0.tar.gz
+      cd curl-7.66.0
+        ./configure
+        make
+        make install
+      cd ../
 #
       install_golang
       install_gcc_8_centos
@@ -381,10 +393,25 @@ install_deps() {
       pip install --upgrade pip
 
     else
+      apt-get -y update
+      DEBIAN_FRONTEND=noninteractive apt-get -y install curl lsb-release wget apt-transport-https software-properties-common
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
-      INSTALL_LIST="python3 python3-dev python3-pip valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl"
-      INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev libldap2-dev libkrb5-dev liblzma-dev"
+      wget https://repo.percona.com/apt/percona-release_latest.$(lsb_release -sc)_all.deb && dpkg -i percona-release_latest.$(lsb_release -sc)_all.deb
+      if [ x"${DEBIAN}" = "xxenial" -o x"${DEBIAN}" = "xbionic" -o x"${DEBIAN}" = "xfocal" ]; then
+        add-apt-repository -y ppa:deadsnakes/ppa
+      elif [ x"${DEBIAN}" = "xstretch" -o x"${DEBIAN}" = "xbuster" ]; then
+        wget https://people.debian.org/~paravoid/python-all/unofficial-python-all.asc
+        mv unofficial-python-all.asc /etc/apt/trusted.gpg.d/
+        echo "deb http://people.debian.org/~paravoid/python-all ${DEBIAN} main" | tee /etc/apt/sources.list.d/python-all.list
+      fi
+      percona-release enable tools testing
+      apt-get update
+      INSTALL_LIST="git python3.7 python3.7-dev valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl"
+      INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev libldap2-dev libkrb5-dev liblzma-dev patchelf"
+      if [ x"${DEBIAN}" != "xstretch" ]; then
+        INSTALL_LIST="${INSTALL_LIST} python3.7-distutils"
+      fi
       until apt-get -y install dirmngr; do
         sleep 1
         echo "waiting"
@@ -402,9 +429,11 @@ install_deps() {
       install_golang
       install_gcc_8_deb
       wget https://bootstrap.pypa.io/get-pip.py
-      update-alternatives --install /usr/bin/python python /usr/bin/python3 1
+      update-alternatives --install /usr/bin/python python /usr/bin/python3.7 1
+      ln -sf /usr/bin/python3.7 /usr/bin/python3
       python get-pip.py
       easy_install pip
+      pip install setuptools
     fi
     if [ x"${DEBIAN}" = "xstretch" ]; then
       LIBCURL_DEPS="libidn2-0-dev libldap2-dev libnghttp2-dev libnss3-dev libpsl-dev librtmp-dev libssh2-1-dev libssl1.0-dev"
@@ -640,8 +669,8 @@ build_source_deb(){
     mv ${TARFILE} ${PRODUCT}_${VERSION}.orig.tar.gz
     cd ${BUILDDIR}
     pip install --upgrade pip
-    pip install --user -r etc/pip/dev-requirements.txt
-    pip install --user -r etc/pip/evgtest-requirements.txt
+    pip install -r etc/pip/dev-requirements.txt
+    pip install -r etc/pip/evgtest-requirements.txt
 
     set_compiler
     fix_rules
@@ -692,16 +721,17 @@ build_deb(){
     #
     cd ${PRODUCT}-${VERSION}
     pip install --upgrade pip
-    pip install --user -r etc/pip/dev-requirements.txt
-    pip install --user -r etc/pip/evgtest-requirements.txt
+    pip install -r etc/pip/dev-requirements.txt
+    pip install -r etc/pip/evgtest-requirements.txt
     #
     cp -av percona-packaging/debian/rules debian/
     set_compiler
     fix_rules
-    sed -i 's|VersionStr="$(git describe)"|VersionStr="$PSMDB_TOOLS_REVISION"|' mongo-tools/set_goenv.sh
-    sed -i 's|Gitspec="$(git rev-parse HEAD)"|Gitspec="$PSMDB_TOOLS_COMMIT_HASH"|' mongo-tools/set_goenv.sh
+    sed -i 's|VersionStr="$(go run release/release.go get-version)"|VersionStr="$PSMDB_TOOLS_REVISION"|' mongo-tools/set_goenv.sh
+    sed -i 's|GitCommit="$(git rev-parse HEAD)"|GitCommit="$PSMDB_TOOLS_COMMIT_HASH"|' mongo-tools/set_goenv.sh
     sed -i 's|go build|go build -a -x|' mongo-tools/build.sh
     sed -i 's|exit $ec||' mongo-tools/build.sh
+    . ./mongo-tools/set_tools_revision.sh
     dch -m -D "${DEBIAN}" --force-distribution -v "${VERSION}-${RELEASE}.${DEBIAN}" 'Update distribution'
     export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     if [ x"${DEBIAN}" = "xstretch" ]; then
@@ -737,18 +767,30 @@ build_tarball(){
     #
     #
     PSM_TARGETS="mongod mongos mongo mongobridge perconadecrypt $SPECIAL_TAR"
+    PSM_REAL_TARGETS=() # transformed targets with 'install-' prefix
+    for pp in $PSM_TARGETS
+    do
+        # using regex to find - and = characters in string
+        # also don't change parameter if it contains slash to preserve targets specifying full path to unittests or object files
+        if [[ $pp =~ -|=|/ ]]; then
+            # if - or = is found parameter is unchanged
+            PSM_REAL_TARGETS+=( $pp )
+        else
+            # otherwise add 'install-' prefix required by hygienic build
+            PSM_REAL_TARGETS+=( install-$pp )
+        fi
+    done
+
     TARBALL_SUFFIX=""
     if [ ${DEBUG} = 1 ]; then
     TARBALL_SUFFIX=".dbg"
     fi
     if [ -f /etc/debian_version ]; then
-        export OS_RELEASE="$(lsb_release -sc)"
         set_compiler
     fi
     #
     if [ -f /etc/redhat-release ]; then
     #export OS_RELEASE="centos$(lsb_release -sr | awk -F'.' '{print $1}')"
-        export OS_RELEASE="centos$(rpm --eval %rhel)"
         RHEL=$(rpm --eval %rhel)
         if [ -f /opt/rh/devtoolset-8/enable ]; then
             source /opt/rh/devtoolset-8/enable
@@ -839,10 +881,10 @@ build_tarball(){
       export LINKFLAGS="${LINKFLAGS} ${CURL_LINKFLAGS}"
     fi
     if [ ${DEBUG} = 0 ]; then
-        buildscripts/scons.py CC=${CC} CXX=${CXX} --install-mode=legacy --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" LINKFLAGS="${LINKFLAGS}" ${PSM_TARGETS} || exit $?
+        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --release --ssl --opt=on -j$NJOBS --use-sasl-client --wiredtiger --audit --inmemory --hotbackup CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" LINKFLAGS="${LINKFLAGS}" ${PSM_REAL_TARGETS[@]} || exit $?
     else
-        buildscripts/scons.py CC=${CC} CXX=${CXX} --install-mode=legacy --disable-warnings-as-errors --audit --ssl --dbg=on -j$NJOBS --use-sasl-client \
-        CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" LINKFLAGS="${LINKFLAGS}" --wiredtiger --inmemory --hotbackup ${PSM_TARGETS} || exit $?
+        buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --ssl --dbg=on -j$NJOBS --use-sasl-client \
+        CPPPATH="${INSTALLDIR}/include ${AWS_LIBS}/include" LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" LINKFLAGS="${LINKFLAGS}" --wiredtiger --inmemory --hotbackup ${PSM_REAL_TARGETS[@]} || exit $?
     fi
     #
     # scons install doesn't work - it installs the binaries not linked with fractal tree
@@ -850,7 +892,7 @@ build_tarball(){
     #
     mkdir -p ${PSMDIR}/bin
     for target in ${PSM_TARGETS[@]}; do
-        cp -f $target ${PSMDIR}/bin
+        cp -f build/install/bin/$target ${PSMDIR}/bin
         if [ ${DEBUG} = 0 ]; then
             strip --strip-debug ${PSMDIR}/bin/${target}
         fi
@@ -870,7 +912,7 @@ build_tarball(){
     cd mongo-tools
     . ./set_tools_revision.sh
     sed -i '12d' buildscript/build.go
-    sed -i '169,178d' buildscript/build.go
+    sed -i '167,176d' buildscript/build.go
     sed -i "s:versionStr,:\"$PSMDB_TOOLS_REVISION\",:" buildscript/build.go
     sed -i "s:gitCommit):\"$PSMDB_TOOLS_COMMIT_HASH\"):" buildscript/build.go
     ./make build
@@ -880,16 +922,158 @@ build_tarball(){
     sed -i "s:TARBALL=0:TARBALL=1:" ${PSMDIR_ABS}/percona-packaging/conf/percona-server-mongodb-enable-auth.sh
     cp ${PSMDIR_ABS}/percona-packaging/conf/percona-server-mongodb-enable-auth.sh ${PSMDIR_ABS}/${PSMDIR}/bin
 
+    # Patch needed libraries
+    cd "${PSMDIR_ABS}/${PSMDIR}"
+    if [ ! -d lib/private ]; then
+        mkdir -p lib/private
+    fi
+    LIBLIST="libcrypto.so libssl.so libsasl2.so librtmp.so libssl3.so libsmime3.so libnss3.so libnssutil3.so libplds4.so libplc4.so libnspr4.so libssl3.so liblzma.so libidn.so"
+    DIRLIST="bin lib/private"
+
+    LIBPATH=""
+
+    function gather_libs {
+        local elf_path=$1
+        for lib in ${LIBLIST}; do
+            for elf in $(find ${elf_path} -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
+                IFS=$'\n'
+                for libfromelf in $(ldd ${elf} | grep ${lib} | awk '{print $3}'); do
+                    lib_realpath="$(readlink -f ${libfromelf})"
+                    lib_realpath_basename="$(basename $(readlink -f ${libfromelf}))"
+                    lib_without_version_suffix=$(echo ${lib_realpath_basename} | awk -F"." 'BEGIN { OFS = "." }{ print $1, $2}')
+
+                    if [ ! -f "lib/private/${lib_realpath_basename}" ] && [ ! -L "lib/private/${lib_without_version_suffix}" ]; then
+                    
+                        echo "Copying lib ${lib_realpath_basename}"
+                        cp ${lib_realpath} lib/private
+
+                        if [ ${lib_realpath_basename} != ${lib_without_version_suffix} ]; then
+                            echo "Symlinking lib from ${lib_realpath_basename} to ${lib_without_version_suffix}"
+                            cd lib/private
+                            ln -s ${lib_realpath_basename} ${lib_without_version_suffix}
+                            cd -
+                        fi
+
+                        patchelf --set-soname ${lib_without_version_suffix} lib/private/${lib_realpath_basename}
+
+                        LIBPATH+=" $(echo ${libfromelf} | grep -v $(pwd))"
+                    fi
+                done
+                unset IFS
+            done
+        done
+    }
+
+    function set_runpath {
+        # Set proper runpath for bins but check before doing anything
+        local elf_path=$1
+        local r_path=$2
+        for elf in $(find ${elf_path} -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
+            echo "Checking LD_RUNPATH for ${elf}"
+            if [ -z $(patchelf --print-rpath ${elf}) ]; then
+                echo "Changing RUNPATH for ${elf}"
+                patchelf --set-rpath ${r_path} ${elf}
+            fi
+        done
+    }
+
+    function replace_libs {
+        local elf_path=$1
+        for libpath_sorted in ${LIBPATH}; do
+            for elf in $(find ${elf_path} -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
+                LDD=$(ldd ${elf} | grep ${libpath_sorted}|head -n1|awk '{print $1}')
+                lib_realpath_basename="$(basename $(readlink -f ${libpath_sorted}))"
+                lib_without_version_suffix="$(echo ${lib_realpath_basename} | awk -F"." 'BEGIN { OFS = "." }{ print $1, $2}')"
+                if [[ ! -z $LDD  ]]; then
+                    echo "Replacing lib ${lib_realpath_basename} to ${lib_without_version_suffix} for ${elf}"
+                    patchelf --replace-needed ${LDD} ${lib_without_version_suffix} ${elf}
+                fi
+            done
+        done
+    }
+
+    function create_sparse {
+        local elf_path=$1
+        for elf in $(find ${elf_path} -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
+            if [[ ! -f "${elf}.sparse" ]]; then
+                echo "Creating sparse file of $(basename ${elf})"
+                cp --sparse=always ${elf} ${elf}.sparse
+            fi
+        done
+    }
+
+    function replace_binaries {
+        local elf_path=$1
+        for elf in $(find ${elf_path} -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
+            if [[ -f "${elf}.sparse" ]]; then
+                echo "Replacing binary with sparse file"
+                mv ${elf}.sparse ${elf}
+            fi
+        done
+    }
+
+    function check_libs {
+        local elf_path=$1
+        for elf in $(find ${elf_path} -maxdepth 1 -exec file {} \; | grep 'ELF ' | cut -d':' -f1); do
+            if ! ldd ${elf}; then
+                exit 1
+            fi
+        done
+    }
+
+    function link {
+        # Gather libs
+        for DIR in ${DIRLIST}; do
+            gather_libs ${DIR}
+        done
+
+        # Set proper runpath
+        set_runpath bin '$ORIGIN/../lib/private/'
+        set_runpath lib/private '$ORIGIN/'
+
+        # Replace libs
+        for DIR in ${DIRLIST}; do
+            replace_libs ${DIR}
+        done
+
+        # Create and replace by sparse file to reduce size
+        create_sparse bin
+        replace_binaries bin
+
+        # Make final check in order to determine any error after linkage
+        for DIR in ${DIRLIST}; do
+            check_libs ${DIR}
+        done
+    }
+
     cd ${PSMDIR_ABS}
-    tar --owner=0 --group=0 -czf ${WORKDIR}/${PSMDIR}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${PSMDIR}
+    mv ${PSMDIR} ${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}
+
+    if [[ ${DEBUG} = 0 ]]; then
+        cp -r ${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX} ${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}-minimal
+        cd ${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}-minimal
+        find . -type f -exec file '{}' \; | grep ': ELF ' | cut -d':' -f1 | xargs strip --strip-unneeded
+        link
+        cd ${PSMDIR_ABS}
+        tar --owner=0 --group=0 -czf ${WORKDIR}/${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}-minimal.tar.gz ${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}-minimal
+    fi
+
+    cd ${PSMDIR_ABS}/${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}
+    link
+    cd ${PSMDIR_ABS}
+    tar --owner=0 --group=0 -czf ${WORKDIR}/${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}.tar.gz ${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}
     DIRNAME="tarball"
     if [ "${DEBUG}" = 1 ]; then
     DIRNAME="debug"
     fi
     mkdir -p ${WORKDIR}/${DIRNAME}
     mkdir -p ${CURDIR}/${DIRNAME}
-    cp ${WORKDIR}/${PSMDIR}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${WORKDIR}/${DIRNAME}
-    cp ${WORKDIR}/${PSMDIR}-${OS_RELEASE}-${ARCH}${TARBALL_SUFFIX}.tar.gz ${CURDIR}/${DIRNAME}
+    cp ${WORKDIR}/${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}.tar.gz ${WORKDIR}/${DIRNAME}
+    cp ${WORKDIR}/${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}.tar.gz ${CURDIR}/${DIRNAME}
+    if [[ ${DEBUG} = 0 ]]; then
+    cp ${WORKDIR}/${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}-minimal.tar.gz ${WORKDIR}/${DIRNAME}
+    cp ${WORKDIR}/${PSMDIR}-${ARCH}${GLIBC_VER}${TARBALL_SUFFIX}-minimal.tar.gz ${CURDIR}/${DIRNAME}
+    fi
 }
 
 #main

@@ -23,7 +23,7 @@ override_dh_auto_clean:
 	#rm -fr $(INSTALLDIR)
 	buildscripts/scons.py CC=$(CC) CXX=$(CXX) -C $(PSMSRC) -c --disable-warnings-as-errors --audit --release --ssl --opt -j$(NJOBS) --use-sasl-client CPPPATH=$(INSTALLDIR)/include \
 	LIBPATH=$(INSTALLDIR)/lib LINKFLAGS="$(LINKFLAGS)" --wiredtiger --inmemory --hotbackup $(PSM_TARGETS) || exit $?
-	rm -fr build
+	rm -fr build resmoke.ini
 	find $(PSMSRC) -name '*.pyc' -delete
 
 # Finally PSfMDB
@@ -42,7 +42,7 @@ compile-mongo-tools:
         export GOBINPATH="/usr/local/go/bin"
 	cd $(PSMSRC)/../src/github.com/mongodb/mongo-tools; \
         sed -i '12d' buildscript/build.go; \
-        sed -i '169,178d' buildscript/build.go; \
+        sed -i '167,176d' buildscript/build.go; \
         sed -i "s:versionStr,:\"$(PSMDB_TOOLS_REVISION)\",:" buildscript/build.go; \
         sed -i "s:gitCommit):\"$(PSMDB_TOOLS_COMMIT_HASH)\"):" buildscript/build.go; \
         ./make build;
