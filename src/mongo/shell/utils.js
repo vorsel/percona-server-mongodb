@@ -301,7 +301,6 @@ jsTestOptions = function() {
             enableEncryption: TestData.enableEncryption,
             encryptionCipherMode: TestData.encryptionCipherMode,
             encryptionKeyFile: TestData.encryptionKeyFile,
-            encryptionCipherMode: TestData.encryptionCipherMode,
             auditDestination: TestData.auditDestination,
             minPort: TestData.minPort,
             maxPort: TestData.maxPort,
