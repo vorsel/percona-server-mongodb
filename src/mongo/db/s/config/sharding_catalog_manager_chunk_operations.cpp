@@ -51,6 +51,7 @@
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/shard_key_pattern.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
@@ -370,12 +371,11 @@ Status ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
     std::vector<ChunkType> newChunks;
 
     ChunkVersion currentMaxVersion = collVersion;
-    // Increment the major version only if the shard that owns the chunk being split has version ==
-    // collection version. See SERVER-41480 for details.
+    // Increment the major version only if the shard that owns the chunk being split has
+    // shardVersion == collection version. See SERVER-41480 for details.
     if (incrementChunkMajorVersionOnChunkSplits.load() && shardVersion == collVersion) {
         currentMaxVersion.incMajor();
     }
-
 
     auto startKey = range.getMin();
     auto newChunkBounds(splitPoints);
@@ -583,8 +583,7 @@ Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
             1));                             // Limit 1.
 
     if (!swCollVersion.isOK()) {
-        return swCollVersion.getStatus().withContext(str::stream()
-                                                     << "mergeChunk cannot merge chunks.");
+        return swCollVersion.getStatus().withContext("mergeChunk cannot merge chunks.");
     }
 
     auto collVersion = swCollVersion.getValue();
@@ -595,6 +594,25 @@ Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
                 "epoch of chunk does not match epoch of request. This most likely means "
                 "that the collection was dropped and re-created."};
     }
+
+    // Get the shard version (max chunk version) for the shard requesting the merge.
+    auto swShardVersion = getMaxChunkVersionFromQueryResponse(
+        nss,
+        Grid::get(opCtx)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
+            opCtx,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            repl::ReadConcernLevel::kLocalReadConcern,
+            ChunkType::ConfigNS,
+            BSON("ns" << nss.ns() << "shard"
+                      << shardName),         // Query all chunks for this namespace and shard.
+            BSON(ChunkType::lastmod << -1),  // Sort by version.
+            1));                             // Limit 1.
+
+    if (!swShardVersion.isOK()) {
+        return swShardVersion.getStatus().withContext("mergeChunk cannot merge chunks.");
+    }
+
+    auto shardVersion = swShardVersion.getValue();
 
     // Build chunks to be merged
     std::vector<ChunkType> chunksToMerge;
@@ -636,7 +654,13 @@ Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
     }
 
     ChunkVersion mergeVersion = collVersion;
-    mergeVersion.incMinor();
+    // Increment the major version only if the shard that owns the chunks being merged has
+    // shardVersion == collection version. See SERVER-41480 for details.
+    if (incrementChunkMajorVersionOnChunkSplits.load() && shardVersion == collVersion) {
+        mergeVersion.incMajor();
+    } else {
+        mergeVersion.incMinor();
+    }
 
     auto updates = buildMergeChunksTransactionUpdates(chunksToMerge, mergeVersion, validAfter);
     auto preCond = buildMergeChunksTransactionPrecond(chunksToMerge, collVersion);
@@ -668,7 +692,7 @@ Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
     Grid::get(opCtx)
         ->catalogClient()
         ->logChange(opCtx, "merge", nss.ns(), logDetail.obj(), WriteConcernOptions())
-        .transitional_ignore();
+        .ignore();
 
     return applyOpsStatus;
 }
@@ -940,6 +964,7 @@ Status ShardingCatalogManager::upgradeChunksHistory(OperationContext* opCtx,
                                              0,
                                              currentCollectionVersion.getValue().epoch());
 
+    stdx::unordered_set<ShardId, ShardId::Hasher> bumpedShards;
     for (const auto& chunk : chunksVector) {
         auto swChunk = ChunkType::fromConfigBSON(chunk);
         if (!swChunk.isOK()) {
@@ -948,10 +973,14 @@ Status ShardingCatalogManager::upgradeChunksHistory(OperationContext* opCtx,
         auto& upgradeChunk = swChunk.getValue();
 
         if (upgradeChunk.getHistory().empty()) {
-
-            // Bump the version.
-            upgradeChunk.setVersion(newCollectionVersion);
-            newCollectionVersion.incMajor();
+            // Bump the version for only one chunk per shard to satisfy the requirement imposed by
+            // SERVER-33356
+            const auto& shardId = upgradeChunk.getShard();
+            if (!bumpedShards.count(shardId)) {
+                upgradeChunk.setVersion(newCollectionVersion);
+                newCollectionVersion.incMajor();
+                bumpedShards.emplace(shardId);
+            }
 
             // Construct the fresh history.
             upgradeChunk.setHistory({ChunkHistory{validAfter, upgradeChunk.getShard()}});
@@ -1004,26 +1033,12 @@ Status ShardingCatalogManager::downgradeChunksHistory(OperationContext* opCtx,
                               << ", but found no chunks"};
     }
 
-    const auto currentCollectionVersion = _findCollectionVersion(opCtx, nss, collectionEpoch);
-    if (!currentCollectionVersion.isOK()) {
-        return currentCollectionVersion.getStatus();
-    }
-
-    // Bump the version.
-    auto newCollectionVersion = ChunkVersion(currentCollectionVersion.getValue().majorVersion() + 1,
-                                             0,
-                                             currentCollectionVersion.getValue().epoch());
-
     for (const auto& chunk : chunksVector) {
         auto swChunk = ChunkType::fromConfigBSON(chunk);
         if (!swChunk.isOK()) {
             return swChunk.getStatus();
         }
         auto& downgradeChunk = swChunk.getValue();
-
-        // Bump the version.
-        downgradeChunk.setVersion(newCollectionVersion);
-        newCollectionVersion.incMajor();
 
         // Clear the history.
         downgradeChunk.setHistory({});

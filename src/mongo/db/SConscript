@@ -688,6 +688,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         'commands/server_status',
+        'op_observer',
         'update/update_driver',
     ]
 )
@@ -785,6 +786,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        'server_parameters',
     ],
 )
 
@@ -806,6 +808,7 @@ env.Library(
     ],
     LIBDEPS_PRIVATE=[
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
+        '$BUILD_DIR/mongo/db/repl/image_collection_entry',
     ],
 )
 
@@ -1839,6 +1842,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/repl/image_collection_entry',
         'catalog_raii',
         'catalog/collection_info_cache',
         'concurrency/lock_manager',

@@ -38,9 +38,9 @@
 
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/dbdirectclient.h"
 #include "mongo/db/kill_sessions_common.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/op_observer.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/service_context.h"
@@ -206,6 +206,23 @@ void SessionCatalog::onStepUp(OperationContext* opCtx) {
     const bool maxSize = 0;
 
     BSONObj result;
+
+    if (serverGlobalParams.featureCompatibility.getVersion() >=
+        ServerGlobalParams::FeatureCompatibility::Version::kUpgradingTo40) {
+        BSONObj imageResult;
+        client.createCollection(NamespaceString::kConfigImagesNamespace.ns(),
+                                initialExtentSize,
+                                capped,
+                                maxSize,
+                                &imageResult);
+        const auto status = getStatusFromCommandResult(imageResult);
+        if (status != ErrorCodes::NamespaceExists) {
+            uassertStatusOKWithContext(status,
+                                       str::stream() << "Failed to create the "
+                                                     << NamespaceString::kConfigImagesNamespace.ns()
+                                                     << " collection");
+        }
+    }
 
     if (client.createCollection(NamespaceString::kSessionTransactionsTableNamespace.ns(),
                                 initialExtentSize,

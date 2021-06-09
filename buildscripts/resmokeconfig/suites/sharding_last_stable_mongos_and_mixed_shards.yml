@@ -39,6 +39,7 @@ selector:
   - jstests/sharding/mongos_validate_writes.js
   - jstests/sharding/resume_change_stream_on_subset_of_shards.js
   - jstests/sharding/drop_sharded_db_tags_cleanup.js
+  - jstests/sharding/num_hosts_targeted_metrics.js
   # Can be un-blacklisted once the version of 3.6 used for 'last-stable' includes SERVER-34338's
   # backport.
   - jstests/sharding/explainFind_stale_mongos.js
@@ -129,6 +130,8 @@ selector:
   - jstests/sharding/ismaster.js
   # Requires behavior that does not and will never exist in 3.6.
   - jstests/sharding/safe_secondary_reads_causal_consistency.js
+  # Enable the following once SERVER-55725 is backported to 4.0 (and prev. versions checked here).
+  - jstests/sharding/time_zone_info_mongos.js
 executor:
   config:
     shell_options:
