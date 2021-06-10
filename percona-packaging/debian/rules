@@ -3,7 +3,7 @@
 export DH_VERBOSE=1
 export DEB_BUILD_HARDENING=1
 export NJOBS=$(shell grep -c processor /proc/cpuinfo)
-export PSM_TARGETS=mongod mongos mongo perconadecrypt mongobridge
+export PSM_TARGETS=install-mongod install-mongos install-mongo install-perconadecrypt install-mongobridge
 export PSMSRC=$(CURDIR)
 export MONGOTOOLS=bsondump mongostat mongofiles mongoexport mongoimport mongorestore mongodump mongotop
 export INSTALLDIR=/usr/local
@@ -53,11 +53,11 @@ build: percona-server-mongodb compile-mongo-tools
 
 override_dh_auto_install:
 	dh_auto_install
-	cp -av mongos debian/percona-server-mongodb-mongos/usr/bin
-	cp -av mongo debian/percona-server-mongodb-shell/usr/bin
-	cp -av mongod debian/percona-server-mongodb-server/usr/bin
-	cp -av perconadecrypt debian/percona-server-mongodb-server/usr/bin
-	cp -av mongobridge debian/percona-server-mongodb-server/usr/bin
+	cp -av build/install/bin/mongos debian/percona-server-mongodb-mongos/usr/bin/mongos
+	cp -av build/install/bin/mongo debian/percona-server-mongodb-shell/usr/bin/mongo
+	cp -av build/install/bin/mongod debian/percona-server-mongodb-server/usr/bin/mongod
+	cp -av build/install/bin/perconadecrypt debian/percona-server-mongodb-server/usr/bin
+	cp -av build/install/bin/mongobridge debian/percona-server-mongodb-server/usr/bin/mongobridge
 	cp -av debian/percona-server-mongodb-helper.sh debian/percona-server-mongodb-server/usr/bin
 	cp -av debian/percona-server-mongodb-enable-auth.sh debian/percona-server-mongodb-server/usr/bin
 	cp -av debian/mongod.conf debian/percona-server-mongodb-server/etc/mongod.conf

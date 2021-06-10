@@ -96,18 +96,6 @@ add_percona_yum_repo(){
     return
 }
 
-add_percona_apt_repo(){
-  if [ ! -f /etc/apt/sources.list.d/percona-dev.list ]; then
-    cat >/etc/apt/sources.list.d/percona-dev.list <<EOL
-deb http://jenkins.percona.com/apt-repo/ @@DIST@@ main
-deb-src http://jenkins.percona.com/apt-repo/ @@DIST@@ main
-EOL
-    sed -i "s:@@DIST@@:$OS_NAME:g" /etc/apt/sources.list.d/percona-dev.list
-  fi
-  wget -qO - http://jenkins.percona.com/apt-repo/8507EFA5.pub | apt-key add -
-  return
-}
-
 get_sources(){
     cd "${WORKDIR}"
     if [ "${SOURCE}" = 0 ]
@@ -116,11 +104,11 @@ get_sources(){
         return 0
     fi
     PRODUCT=percona-server-mongodb
-    echo "PRODUCT=${PRODUCT}" > percona-server-mongodb-44.properties
-    echo "PSM_BRANCH=${PSM_BRANCH}" >> percona-server-mongodb-44.properties
-    echo "JEMALLOC_TAG=${JEMALLOC_TAG}" >> percona-server-mongodb-44.properties
-    echo "BUILD_NUMBER=${BUILD_NUMBER}" >> percona-server-mongodb-44.properties
-    echo "BUILD_ID=${BUILD_ID}" >> percona-server-mongodb-44.properties
+    echo "PRODUCT=${PRODUCT}" > percona-server-mongodb-50.properties
+    echo "PSM_BRANCH=${PSM_BRANCH}" >> percona-server-mongodb-50.properties
+    echo "JEMALLOC_TAG=${JEMALLOC_TAG}" >> percona-server-mongodb-50.properties
+    echo "BUILD_NUMBER=${BUILD_NUMBER}" >> percona-server-mongodb-50.properties
+    echo "BUILD_ID=${BUILD_ID}" >> percona-server-mongodb-50.properties
     git clone "$REPO"
     retval=$?
     if [ $retval != 0 ]
@@ -155,12 +143,12 @@ get_sources(){
     #
 
     PRODUCT_FULL=${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
-    echo "PRODUCT_FULL=${PRODUCT_FULL}" >> ${WORKDIR}/percona-server-mongodb-44.properties
-    echo "VERSION=${PSM_VER}" >> ${WORKDIR}/percona-server-mongodb-44.properties
-    echo "RELEASE=${PSM_RELEASE}" >> ${WORKDIR}/percona-server-mongodb-44.properties
-    echo "MONGO_TOOLS_TAG=${MONGO_TOOLS_TAG}" >> ${WORKDIR}/percona-server-mongodb-44.properties
+    echo "PRODUCT_FULL=${PRODUCT_FULL}" >> ${WORKDIR}/percona-server-mongodb-50.properties
+    echo "VERSION=${PSM_VER}" >> ${WORKDIR}/percona-server-mongodb-50.properties
+    echo "RELEASE=${PSM_RELEASE}" >> ${WORKDIR}/percona-server-mongodb-50.properties
+    echo "MONGO_TOOLS_TAG=${MONGO_TOOLS_TAG}" >> ${WORKDIR}/percona-server-mongodb-50.properties
 
-    echo "REVISION=${REVISION}" >> ${WORKDIR}/percona-server-mongodb-44.properties
+    echo "REVISION=${REVISION}" >> ${WORKDIR}/percona-server-mongodb-50.properties
     rm -fr debian rpm
     cp -a percona-packaging/manpages .
     cp -a percona-packaging/docs/* .
@@ -178,7 +166,7 @@ get_sources(){
     echo "export PSMDB_TOOLS_REVISION=\"${PSM_VER}-${PSM_RELEASE}\"" >> set_tools_revision.sh
     chmod +x set_tools_revision.sh
     cd ${WORKDIR}
-    source percona-server-mongodb-44.properties
+    source percona-server-mongodb-50.properties
     #
 
     mv percona-server-mongodb ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
@@ -191,7 +179,7 @@ get_sources(){
                 mkdir build
     cd ../../
     tar --owner=0 --group=0 --exclude=.* -czf ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
-    echo "UPLOAD=UPLOAD/experimental/BUILDS/${PRODUCT}-4.4/${PRODUCT}-${PSM_VER}-${PSM_RELEASE}/${PSM_BRANCH}/${REVISION}/${BUILD_ID}" >> percona-server-mongodb-44.properties
+    echo "UPLOAD=UPLOAD/experimental/BUILDS/${PRODUCT}-5.0/${PRODUCT}-${PSM_VER}-${PSM_RELEASE}/${PSM_BRANCH}/${REVISION}/${BUILD_ID}" >> percona-server-mongodb-50.properties
     mkdir $WORKDIR/source_tarball
     mkdir $CURDIR/source_tarball
     cp ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz $WORKDIR/source_tarball
@@ -251,7 +239,7 @@ install_gcc_8_deb(){
         mv gcc-8.3.0 /usr/local/
         cd $CUR_DIR
     fi
-    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco -o x"${DEBIAN}" = xbuster ]; then
+    if [ x"${DEBIAN}" = xfocal -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco -o x"${DEBIAN}" = xbuster ]; then
         apt-get -y install gcc-8 g++-8
     fi
     if [ x"${DEBIAN}" = xstretch ]; then
@@ -264,7 +252,7 @@ install_gcc_8_deb(){
 
 set_compiler(){
     if [ "x$OS" = "xdeb" ]; then
-        if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco -o x"${DEBIAN}" = xbuster ]; then
+        if [ x"${DEBIAN}" = xfocal -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco -o x"${DEBIAN}" = xbuster ]; then
             export CC=/usr/bin/gcc-8
             export CXX=/usr/bin/g++-8
         else
@@ -283,7 +271,7 @@ set_compiler(){
 }
 
 fix_rules(){
-    if [ x"${DEBIAN}" = xcosmic -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco -o x"${DEBIAN}" = xbuster ]; then
+    if [ x"${DEBIAN}" = xfocal -o x"${DEBIAN}" = xbionic -o x"${DEBIAN}" = xdisco -o x"${DEBIAN}" = xbuster ]; then
         sed -i 's|CC = gcc-5|CC = /usr/bin/gcc-8|' debian/rules
         sed -i 's|CXX = g++-5|CXX = /usr/bin/g++-8|' debian/rules
     else
@@ -333,6 +321,7 @@ install_deps() {
     fi
     CURPLACE=$(pwd)
     if [ "x$OS" = "xrpm" ]; then
+      yum -y update
       yum -y install wget
       add_percona_yum_repo
       wget http://jenkins.percona.com/yum-repo/percona-dev.repo
@@ -343,7 +332,6 @@ install_deps() {
       yum install -y patchelf
       RHEL=$(rpm --eval %rhel)
       if [ x"$RHEL" = x6 ]; then
-        yum -y update
         yum -y install epel-release
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel git
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel libpcap-devel
@@ -413,11 +401,6 @@ install_deps() {
         INSTALL_LIST="${INSTALL_LIST} python3.7-distutils"
       fi
       until apt-get -y install dirmngr; do
-        sleep 1
-        echo "waiting"
-      done
-      add_percona_apt_repo
-      until apt-get update; do
         sleep 1
         echo "waiting"
       done
@@ -608,8 +591,8 @@ build_rpm(){
         export CXX=/opt/rh/devtoolset-8/root/usr/bin/g++
     fi
     #
-    echo "RHEL=${RHEL}" >> percona-server-mongodb-44.properties
-    echo "ARCH=${ARCH}" >> percona-server-mongodb-44.properties
+    echo "RHEL=${RHEL}" >> percona-server-mongodb-50.properties
+    echo "ARCH=${ARCH}" >> percona-server-mongodb-50.properties
     #
     file /usr/bin/scons
     #
@@ -711,8 +694,8 @@ build_deb(){
     export DEBIAN=$(lsb_release -sc)
     export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
     #
-    echo "DEBIAN=${DEBIAN}" >> percona-server-mongodb-44.properties
-    echo "ARCH=${ARCH}" >> percona-server-mongodb-44.properties
+    echo "DEBIAN=${DEBIAN}" >> percona-server-mongodb-50.properties
+    echo "ARCH=${ARCH}" >> percona-server-mongodb-50.properties
 
     #
     DSC=$(basename $(find . -name '*.dsc' | sort | tail -n1))
@@ -742,7 +725,6 @@ build_deb(){
     export GOPATH=$PWD/../
     export PATH="/usr/local/go/bin:$PATH:$GOPATH"
     export GOBINPATH="/usr/local/go/bin"
-    . ./mongo-tools/set_tools_revision.sh
     dpkg-buildpackage -rfakeroot -us -uc -b
     mkdir -p $CURDIR/deb
     mkdir -p $WORKDIR/deb
@@ -918,6 +900,7 @@ build_tarball(){
     ./make build
     # move mongo tools to PSM installation dir
     mv bin/* ${PSMDIR_ABS}/${PSMDIR}/bin
+    # end build tools
     #
     sed -i "s:TARBALL=0:TARBALL=1:" ${PSMDIR_ABS}/percona-packaging/conf/percona-server-mongodb-enable-auth.sh
     cp ${PSMDIR_ABS}/percona-packaging/conf/percona-server-mongodb-enable-auth.sh ${PSMDIR_ABS}/${PSMDIR}/bin
@@ -943,7 +926,6 @@ build_tarball(){
                     lib_without_version_suffix=$(echo ${lib_realpath_basename} | awk -F"." 'BEGIN { OFS = "." }{ print $1, $2}')
 
                     if [ ! -f "lib/private/${lib_realpath_basename}" ] && [ ! -L "lib/private/${lib_without_version_suffix}" ]; then
-                    
                         echo "Copying lib ${lib_realpath_basename}"
                         cp ${lib_realpath} lib/private
 
@@ -1097,7 +1079,7 @@ DEB_RELEASE=1
 REVISION=0
 BRANCH="master"
 REPO="https://github.com/percona/percona-server-mongodb.git"
-PSM_VER="4.4.0"
+PSM_VER="5.0.0"
 PSM_RELEASE="1"
 MONGO_TOOLS_TAG="master"
 PRODUCT=percona-server-mongodb
