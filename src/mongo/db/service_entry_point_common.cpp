@@ -577,8 +577,8 @@ void appendErrorLabelsAndTopologyVersion(OperationContext* opCtx,
                                          boost::optional<ErrorCodes::Error> code,
                                          boost::optional<ErrorCodes::Error> wcCode,
                                          bool isInternalClient) {
-    auto errorLabels =
-        getErrorLabels(opCtx, sessionOptions, commandName, code, wcCode, isInternalClient);
+    auto errorLabels = getErrorLabels(
+        opCtx, sessionOptions, commandName, code, wcCode, isInternalClient, false /* isMongos */);
     commandBodyFieldsBob->appendElements(errorLabels);
 
     const auto isNotPrimaryError =
@@ -1669,7 +1669,9 @@ Future<void> ExecCommandDatabase::_commandExec() {
                 const auto refreshed = _execContext->behaviors->refreshDatabase(opCtx, *sce);
                 if (refreshed) {
                     _refreshedDatabase = true;
-                    return _commandExec();
+                    if (!opCtx->isContinuingMultiDocumentTransaction()) {
+                        return _commandExec();
+                    }
                 }
             }
 
@@ -1687,7 +1689,9 @@ Future<void> ExecCommandDatabase::_commandExec() {
                     const auto refreshed = _execContext->behaviors->refreshCollection(opCtx, *sce);
                     if (refreshed) {
                         _refreshedCollection = true;
-                        return _commandExec();
+                        if (!opCtx->isContinuingMultiDocumentTransaction()) {
+                            return _commandExec();
+                        }
                     }
                 }
             }
@@ -1711,7 +1715,7 @@ Future<void> ExecCommandDatabase::_commandExec() {
 
                 if (refreshed) {
                     _refreshedCatalogCache = true;
-                    if (!opCtx->inMultiDocumentTransaction()) {
+                    if (!opCtx->isContinuingMultiDocumentTransaction()) {
                         return _commandExec();
                     }
                 }

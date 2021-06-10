@@ -210,7 +210,7 @@ public:
         const ReshardingCoordinatorService* coordinatorService,
         const BSONObj& state,
         std::shared_ptr<ReshardingCoordinatorExternalState> externalState);
-    ~ReshardingCoordinator();
+    ~ReshardingCoordinator() = default;
 
     SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                          const CancellationToken& token) noexcept override;
@@ -414,7 +414,8 @@ private:
     /**
      * Sends '_shardsvrAbortReshardCollection' to all participant shards.
      */
-    void _tellAllParticipantsToAbort(const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
+    void _tellAllParticipantsToAbort(const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+                                     bool isUserAborted);
 
     // The unique key for a given resharding operation. InstanceID is an alias for BSONObj. The
     // value of this is the UUID that will be used as the collection UUID for the new sharded

@@ -642,6 +642,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/query/explain_options',
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/rpc/command_status',
+        '$BUILD_DIR/mongo/rpc/rewrite_state_change_errors',
         '$BUILD_DIR/mongo/rpc/rpc',
         'audit',
         'auth/auth',
@@ -1111,6 +1112,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         "$BUILD_DIR/mongo/db/storage/storage_control",
         "commands/server_status_core",
+        'repl/repl_server_parameters',
         "s/sharding_api_d",
         "shared_request_handling",
     ],

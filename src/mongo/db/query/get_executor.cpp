@@ -1174,6 +1174,7 @@ inline bool isQuerySbeCompatible(OperationContext* opCtx,
     const auto& sortPattern = cq->getSortPattern();
     const bool allExpressionsSupported = expCtx && expCtx->sbeCompatible;
     const bool isNotCount = !(plannerOptions & QueryPlannerParams::IS_COUNT);
+    const bool isNotOplog = !cq->nss().isOplog();
     const bool doesNotContainMetadataRequirements = cq->metadataDeps().none();
     const bool doesNotSortOnMetaOrPathWithNumericComponents =
         !sortPattern || std::all_of(sortPattern->begin(), sortPattern->end(), [](auto&& part) {
@@ -1191,7 +1192,7 @@ inline bool isQuerySbeCompatible(OperationContext* opCtx,
     const bool isQueryNotAgainstTimeseriesCollection = !(cq->nss().isTimeseriesBucketsCollection());
     return allExpressionsSupported && isNotCount && doesNotContainMetadataRequirements &&
         isNotLegacy && doesNotNeedEnsureSorted && isQueryNotAgainstTimeseriesCollection &&
-        doesNotSortOnMetaOrPathWithNumericComponents;
+        doesNotSortOnMetaOrPathWithNumericComponents && isNotOplog;
 }
 }  // namespace
 
@@ -1202,7 +1203,6 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutor(
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions) {
     return !canonicalQuery->getForceClassicEngine() &&
-            feature_flags::gSBE.isEnabledAndIgnoreFCV() &&
             isQuerySbeCompatible(opCtx, canonicalQuery.get(), plannerOptions)
         ? getSlotBasedExecutor(
               opCtx, collection, std::move(canonicalQuery), yieldPolicy, plannerOptions)

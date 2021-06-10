@@ -155,7 +155,8 @@ public:
         _cm = createChunkManagerForOriginalColl();
 
         _metrics = std::make_unique<ReshardingMetrics>(getServiceContext());
-        _metrics->onStart(getServiceContext()->getFastClockSource()->now());
+        _metrics->onStart(ReshardingMetrics::Role::kRecipient,
+                          getServiceContext()->getFastClockSource()->now());
         _metrics->setRecipientState(RecipientStateEnum::kApplying);
     }
 
@@ -231,7 +232,8 @@ public:
                                         boost::none /* preImage */,
                                         boost::none /* postImage */,
                                         kMyShardId,
-                                        Value(id.toBSON()))};
+                                        Value(id.toBSON()),
+                                        boost::none /* needsRetryImage) */)};
     }
 
     const NamespaceString& appliedToNs() {
@@ -256,8 +258,7 @@ public:
 
     long long metricsAppliedCount() const {
         BSONObjBuilder bob;
-        _metrics->serializeCurrentOpMetrics(&bob,
-                                            ReshardingMetrics::ReporterOptions::Role::kRecipient);
+        _metrics->serializeCurrentOpMetrics(&bob, ReshardingMetrics::Role::kRecipient);
         return bob.obj()["oplogEntriesApplied"_sd].Long();
     }
 

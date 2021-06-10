@@ -45,6 +45,9 @@
 #include "mongo/util/future_util.h"
 
 namespace mongo {
+
+MONGO_FAIL_POINT_DEFINE(hangBeforeRunningCoordinatorInstance);
+
 namespace {
 
 const Backoff kExponentialBackoff(Seconds(1), Milliseconds::max());
@@ -153,10 +156,14 @@ SemiFuture<void> ShardingDDLCoordinator::run(std::shared_ptr<executor::ScopedTas
                 _scopedLocks.emplace(lock.moveToAnotherThread());
             }
 
-            stdx::lock_guard<Latch> lg(_mutex);
-            if (!_constructionCompletionPromise.getFuture().isReady()) {
-                _constructionCompletionPromise.emplaceValue();
+            {
+                stdx::lock_guard<Latch> lg(_mutex);
+                if (!_constructionCompletionPromise.getFuture().isReady()) {
+                    _constructionCompletionPromise.emplaceValue();
+                }
             }
+
+            hangBeforeRunningCoordinatorInstance.pauseWhileSet();
         })
         .onError([this, anchor = shared_from_this()](const Status& status) {
             static constexpr auto& errorMsg =
@@ -178,16 +185,17 @@ SemiFuture<void> ShardingDDLCoordinator::run(std::shared_ptr<executor::ScopedTas
                 .until([this, token](Status status) {
                     // Retry until either:
                     //  - The coordinator succeed
-                    //  - The coordiantor failed with non-retryable error
-                    //  - The node is stepping/shutting down
+                    //  - The coordinator failed with non-retryable error determined by the
+                    //  coordinator, or an already known retryable error
                     //
                     //  If the token is not cancelled we retry because it could have been generated
                     //  by a remote node.
-                    if (!status.isOK() &&
+                    if (!status.isOK() && !_completeOnError &&
                         (status.isA<ErrorCategory::CursorInvalidatedError>() ||
                          status.isA<ErrorCategory::ShutdownError>() ||
                          status.isA<ErrorCategory::RetriableError>() ||
                          status.isA<ErrorCategory::CancellationError>() ||
+                         status.isA<ErrorCategory::ExceededTimeLimitError>() ||
                          status == ErrorCodes::Interrupted) &&
                         !token.isCanceled()) {
                         LOGV2_DEBUG(5656000,

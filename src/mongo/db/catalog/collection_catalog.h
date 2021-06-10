@@ -183,9 +183,28 @@ public:
     std::shared_ptr<Collection> deregisterCollection(OperationContext* opCtx, CollectionUUID uuid);
 
     /**
-     * Deregister all the collection objects.
+     * Deregister all the collection objects and view namespaces.
      */
-    void deregisterAllCollections();
+    void deregisterAllCollectionsAndViews();
+
+    /**
+     * Register the namespace to be used as a view.
+     *
+     * Throws WriteConflictException if namespace is used by a Collection
+     */
+    void registerView(const NamespaceString& ns);
+
+    /**
+     * Deregister the namespace from being used as a view.
+     */
+    void deregisterView(const NamespaceString& ns);
+
+    /**
+     * Sets all namespaces used by views for a database. Does not validate if they are used by
+     * Collections. When creating new view its namespace should be registered with registerView()
+     * above.
+     */
+    void replaceViewsForDatabase(StringData dbName, absl::flat_hash_set<NamespaceString> views);
 
     /**
      * This function gets the Collection pointer that corresponds to the CollectionUUID.
@@ -309,6 +328,30 @@ public:
     void clearDatabaseProfileSettings(StringData dbName);
 
     /**
+     * Statistics for the types of collections in the catalog.
+     * Total collections = 'internal' + 'userCollections'
+     */
+    struct Stats {
+        // Non-system collections on non-internal databases
+        int userCollections = 0;
+        // Non-system capped collections on non-internal databases
+        int userCapped = 0;
+        // System collections or collections on internal databases
+        int internal = 0;
+    };
+
+    /**
+     * Returns statistics for the collection catalog.
+     */
+    Stats getStats() const;
+
+    /**
+     * Returns a set of databases, by name, that have view catalogs.
+     */
+    using ViewCatalogSet = StringSet;
+    ViewCatalogSet getViewCatalogDbNames() const;
+
+    /**
      * Puts the catalog in closed state. In this state, the lookupNSSByUUID method will fall back
      * to the pre-close state to resolve queries for currently unknown UUIDs. This allows processes,
      * like authorization and replication, which need to do lookups outside of database locks, to
@@ -382,6 +425,9 @@ private:
     OrderedCollectionMap _orderedCollections;  // Ordered by <dbName, collUUID> pair
     NamespaceCollectionMap _collections;
 
+    // Map of database names to a set of their views. Only databases with views are present.
+    StringMap<absl::flat_hash_set<NamespaceString>> _views;
+
     // Incremented whenever the CollectionCatalog gets closed and reopened (onCloseCatalog and
     // onOpenCatalog).
     //
@@ -403,6 +449,9 @@ private:
      * reside. Simple database name to struct ProfileSettings map.
      */
     DatabaseProfileSettingsMap _databaseProfileSettings;
+
+    // Tracks usage of collection usage features (e.g. capped).
+    Stats _stats;
 };
 
 /**

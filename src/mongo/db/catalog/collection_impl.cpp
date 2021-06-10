@@ -379,8 +379,6 @@ void CollectionImpl::init(OperationContext* opCtx) {
                               "validatorStatus"_attr = _validator.getStatus());
     }
 
-    _timeseriesOptions = collectionOptions.timeseries;
-
     if (collectionOptions.clusteredIndex) {
         _clustered = true;
         if (collectionOptions.expireAfterSeconds) {
@@ -1509,7 +1507,9 @@ Status CollectionImpl::setValidationLevel(OperationContext* opCtx, ValidationLev
     }
 
     _writeMetadata(opCtx, [&](BSONCollectionCatalogEntry::MetaData& md) {
+        md.options.validator = _validator.validatorDoc;
         md.options.validationLevel = storedValidationLevel;
+        md.options.validationAction = validationActionOrDefault(md.options.validationAction);
     });
 
     return Status::OK();
@@ -1533,6 +1533,8 @@ Status CollectionImpl::setValidationAction(OperationContext* opCtx,
     }
 
     _writeMetadata(opCtx, [&](BSONCollectionCatalogEntry::MetaData& md) {
+        md.options.validator = _validator.validatorDoc;
+        md.options.validationLevel = validationLevelOrDefault(md.options.validationLevel);
         md.options.validationAction = storedValidationAction;
     });
 
@@ -1562,7 +1564,14 @@ Status CollectionImpl::updateValidator(OperationContext* opCtx,
 }
 
 boost::optional<TimeseriesOptions> CollectionImpl::getTimeseriesOptions() const {
-    return _timeseriesOptions;
+    return _metadata->options.timeseries;
+}
+
+void CollectionImpl::setTimeseriesOptions(OperationContext* opCtx,
+                                          const TimeseriesOptions& tsOptions) {
+    _writeMetadata(opCtx, [&](BSONCollectionCatalogEntry::MetaData& md) {
+        md.options.timeseries = tsOptions;
+    });
 }
 
 const CollatorInterface* CollectionImpl::getDefaultCollator() const {

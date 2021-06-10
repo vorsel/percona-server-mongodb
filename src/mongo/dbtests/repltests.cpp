@@ -83,7 +83,8 @@ repl::OplogEntry makeOplogEntry(repl::OpTime opTime,
                                 boost::none,    // pre-image optime
                                 boost::none,    // post-image optime
                                 boost::none,    // ShardId of resharding recipient
-                                boost::none)};  // _id
+                                boost::none,    // _id
+                                boost::none)};  // needsRetryImage
 }
 
 BSONObj f(const char* s) {
@@ -247,8 +248,9 @@ protected:
                 }
                 repl::UnreplicatedWritesBlock uwb(&_opCtx);
                 auto entry = uassertStatusOK(OplogEntry::parse(*i));
+                const bool dataIsConsistent = true;
                 uassertStatusOK(applyOperation_inlock(
-                    &_opCtx, ctx.db(), &entry, false, getOplogApplicationMode()));
+                    &_opCtx, ctx.db(), &entry, false, getOplogApplicationMode(), dataIsConsistent));
             }
         }
     }

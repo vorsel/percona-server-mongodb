@@ -95,7 +95,7 @@ public:
                         request().getZones());
             }
 
-            if (request().get_presetReshardedChunks()) {
+            if (const auto& presetChunks = request().get_presetReshardedChunks()) {
                 uassert(ErrorCodes::BadValue,
                         "Test commands must be enabled when a value is provided for field: "
                         "_presetReshardedChunks",
@@ -105,9 +105,8 @@ public:
                         "Must specify only one of _presetReshardedChunks or numInitialChunks",
                         !(bool(request().getNumInitialChunks())));
 
-                validateReshardedChunks(request().get_presetReshardedChunks().get(),
-                                        opCtx,
-                                        ShardKeyPattern(request().getKey()).getKeyPattern());
+                validateReshardedChunks(
+                    *presetChunks, opCtx, ShardKeyPattern(request().getKey()).getKeyPattern());
             }
 
             auto instance = ([&] {
@@ -126,16 +125,8 @@ public:
                     nss.db(), getCollectionUUIDFromChunkManger(nss, cm));
 
 
-                boost::optional<std::vector<ReshardingZoneType>> zones;
-                if (request().getZones()) {
-                    zones.emplace();
-                    zones->reserve(request().getZones()->size());
-                    for (const BSONObj& obj : request().getZones().get()) {
-                        zones->push_back(ReshardingZoneType::parse(
-                            IDLParserErrorContext("ReshardingZoneType"), obj));
-                    }
-
-                    checkForOverlappingZones(zones.get());
+                if (auto zones = request().getZones()) {
+                    checkForOverlappingZones(*zones);
                 }
 
                 auto coordinatorDoc =
@@ -152,7 +143,7 @@ public:
                                                                std::move(tempReshardingNss),
                                                                request().getKey());
                 coordinatorDoc.setCommonReshardingMetadata(std::move(commonMetadata));
-                coordinatorDoc.setZones(std::move(zones));
+                coordinatorDoc.setZones(request().getZones());
                 coordinatorDoc.setPresetReshardedChunks(request().get_presetReshardedChunks());
                 coordinatorDoc.setNumInitialChunks(request().getNumInitialChunks());
 

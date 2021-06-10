@@ -950,6 +950,7 @@ bool ShardingCatalogClientImpl::runUserManagementReadCommand(OperationContext* o
 Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCtx,
                                                           const BSONArray& updateOps,
                                                           const BSONArray& preCondition,
+                                                          const NamespaceStringOrUUID& nsOrUUID,
                                                           const NamespaceString& nss,
                                                           const ChunkVersion& lastChunkVersion,
                                                           const WriteConcernOptions& writeConcern,
@@ -1003,7 +1004,11 @@ Status ShardingCatalogClientImpl::applyChunkOpsDeprecated(OperationContext* opCt
         // mod made it to the config server, then transaction was successful.
         BSONObjBuilder query;
         lastChunkVersion.appendLegacyWithField(&query, ChunkType::lastmod());
-        query.append(ChunkType::ns(), nss.ns());
+        if (nsOrUUID.uuid()) {
+            query.append(ChunkType::collectionUUID(), nsOrUUID.uuid()->toBSON());
+        } else {
+            query.append(ChunkType::ns(), nsOrUUID.nss()->ns());
+        }
         auto chunkWithStatus = getChunks(opCtx, query.obj(), BSONObj(), 1, nullptr, readConcern);
 
         if (!chunkWithStatus.isOK()) {
@@ -1200,7 +1205,8 @@ StatusWith<bool> ShardingCatalogClientImpl::_updateConfigDocument(
 Status ShardingCatalogClientImpl::removeConfigDocuments(OperationContext* opCtx,
                                                         const NamespaceString& nss,
                                                         const BSONObj& query,
-                                                        const WriteConcernOptions& writeConcern) {
+                                                        const WriteConcernOptions& writeConcern,
+                                                        boost::optional<BSONObj> hint) {
     invariant(nss.db() == NamespaceString::kConfigDb);
 
     BatchedCommandRequest request([&] {
@@ -1208,6 +1214,9 @@ Status ShardingCatalogClientImpl::removeConfigDocuments(OperationContext* opCtx,
         deleteOp.setDeletes({[&] {
             write_ops::DeleteOpEntry entry;
             entry.setQ(query);
+            if (hint) {
+                entry.setHint(*hint);
+            }
             entry.setMulti(true);
             return entry;
         }()});

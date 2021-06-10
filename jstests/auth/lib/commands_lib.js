@@ -226,7 +226,7 @@ var authCommandsLib = {
         },
         {
           testname: "_shardsvrAbortReshardCollection",
-          command: {_shardsvrAbortReshardCollection: UUID()},
+          command: {_shardsvrAbortReshardCollection: UUID(), userCanceled: true},
           skipSharded: true,
           testcases: [
               {
@@ -2949,6 +2949,20 @@ var authCommandsLib = {
         {
           testname: "_configsvrCommitChunkMigration",
           command: {_configsvrCommitChunkMigration: "x.y"},
+          skipSharded: true,
+          expectFail: true,
+          testcases: [
+              {
+                runOnDb: adminDbName,
+                roles: {__system: 1},
+                privileges: [{resource: {cluster: true}, actions: ["internal"]}],
+                expectFail: true
+              },
+          ]
+        },
+        {
+          testname: "_configsvrCommitChunksMerge",
+          command: {_configsvrCommitChunksMerge: "x.y"},
           skipSharded: true,
           expectFail: true,
           testcases: [

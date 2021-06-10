@@ -139,6 +139,21 @@ public:
     StatusWith<ResolvedView> resolveView(OperationContext* opCtx, const NamespaceString& nss) const;
 
     /**
+     * Usage statistics about this view catalog.
+     * Total views = internal + userViews + userTimeseries.
+     */
+    struct Stats {
+        int userViews = 0;
+        int userTimeseries = 0;
+        int internal = 0;
+    };
+
+    /**
+     * Returns statistics for this view catalog.
+     */
+    Stats getStats() const;
+
+    /**
      * Returns Status::OK with the set of involved namespaces if the given pipeline is eligible to
      * act as a view definition. Otherwise, returns ErrorCodes::OptionNotSupportedOnView.
      */
@@ -197,7 +212,9 @@ private:
                                             StringData ns,
                                             ViewCatalogLookupBehavior lookupBehavior);
 
-    Status _reload(OperationContext* opCtx, ViewCatalogLookupBehavior lookupBehavior);
+    Status _reload(OperationContext* opCtx,
+                   ViewCatalogLookupBehavior lookupBehavior,
+                   bool reloadForCollectionCatalog);
 
     /**
      * uasserts with the InvalidViewDefinition error if the current in-memory state of the view
@@ -207,10 +224,10 @@ private:
     void _requireValidCatalog() const;
 
     ViewMap _viewMap;
-    ViewMap _viewMapBackup;
     std::shared_ptr<DurableViewCatalog> _durable;
     bool _valid;
     ViewGraph _viewGraph;
     bool _viewGraphNeedsRefresh;
+    Stats _stats;
 };
 }  // namespace mongo

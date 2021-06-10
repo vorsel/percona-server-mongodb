@@ -44,7 +44,7 @@
 #include "mongo/db/s/sharding_ddl_util.h"
 #include "mongo/db/s/sharding_logging.h"
 #include "mongo/db/s/sharding_state.h"
-#include "mongo/db/timeseries/timeseries_lookup.h"
+#include "mongo/db/timeseries/timeseries_options.h"
 #include "mongo/logv2/log.h"
 #include "mongo/rpc/get_status_from_command_result.h"
 #include "mongo/s/cluster_commands_helpers.h"
@@ -362,21 +362,19 @@ ExecutorFuture<void> CreateCollectionCoordinator::_runImpl(
     std::shared_ptr<executor::ScopedTaskExecutor> executor,
     const CancellationToken& token) noexcept {
     return ExecutorFuture<void>(**executor)
-        .then(_executePhase(Phase::kCheck,
-                            [this, anchor = shared_from_this()] {
-                                _shardKeyPattern = ShardKeyPattern(*_doc.getShardKey());
-                                auto opCtxHolder = cc().makeOperationContext();
-                                auto* opCtx = opCtxHolder.get();
-                                getForwardableOpMetadata().setOn(opCtx);
+        .then([this, anchor = shared_from_this()] {
+            _shardKeyPattern = ShardKeyPattern(*_doc.getShardKey());
+            if (_doc.getPhase() < Phase::kCommit) {
+                auto opCtxHolder = cc().makeOperationContext();
+                auto* opCtx = opCtxHolder.get();
+                getForwardableOpMetadata().setOn(opCtx);
 
-                                _checkCommandArguments(opCtx);
-                            }))
+                _checkCommandArguments(opCtx);
+            }
+        })
         .then(_executePhase(
             Phase::kCommit,
             [this, executor = executor, token, anchor = shared_from_this()] {
-                if (!_shardKeyPattern) {
-                    _shardKeyPattern = ShardKeyPattern(*_doc.getShardKey());
-                }
                 auto opCtxHolder = cc().makeOperationContext();
                 auto* opCtx = opCtxHolder.get();
                 getForwardableOpMetadata().setOn(opCtx);
@@ -420,27 +418,6 @@ ExecutorFuture<void> CreateCollectionCoordinator::_runImpl(
                 RecoverableCriticalSectionService::get(opCtx)
                     ->acquireRecoverableCriticalSectionBlockWrites(
                         opCtx, nss(), _critSecReason, ShardingCatalogClient::kMajorityWriteConcern);
-
-                // Check if the collection was already created, this time under the critical
-                // section.
-                if (auto createCollectionResponseOpt =
-                        sharding_ddl_util::checkIfCollectionAlreadySharded(
-                            opCtx,
-                            nss(),
-                            _shardKeyPattern->getKeyPattern().toBSON(),
-                            getCollation(opCtx, nss(), _doc.getCollation()),
-                            _doc.getUnique().value_or(false))) {
-                    _result = createCollectionResponseOpt;
-                    // The collection was already created and commited but there was a
-                    // stepdown after the commit.
-                    RecoverableCriticalSectionService::get(opCtx)
-                        ->releaseRecoverableCriticalSection(
-                            opCtx,
-                            nss(),
-                            _critSecReason,
-                            ShardingCatalogClient::kMajorityWriteConcern);
-                    return;
-                }
 
                 if (_recoveredFromDisk) {
                     auto uuid = sharding_ddl_util::getCollectionUUID(opCtx, nss());
@@ -520,12 +497,25 @@ ExecutorFuture<void> CreateCollectionCoordinator::_runImpl(
 void CreateCollectionCoordinator::_checkCommandArguments(OperationContext* opCtx) {
     LOGV2_DEBUG(5277902, 2, "Create collection _checkCommandArguments", "namespace"_attr = nss());
 
-    const auto dbInfo = uassertStatusOK(
-        Grid::get(opCtx)->catalogCache()->getDatabaseWithRefresh(opCtx, nss().db()));
+    const auto dbEnabledForSharding = [&, this] {
+        // The modification of the 'sharded' flag for the db does not imply a database version
+        // change so we can't use the DatabaseShardingState to look it up. Instead we will do a
+        // first attempt through the catalog cache and if it is unset we will attempt another time
+        // after a forced catalog cache refresh.
+        auto catalogCache = Grid::get(opCtx)->catalogCache();
+
+        auto dbInfo = uassertStatusOK(catalogCache->getDatabase(opCtx, nss().db()));
+        if (dbInfo.shardingEnabled()) {
+            return true;
+        }
+
+        dbInfo = uassertStatusOK(catalogCache->getDatabaseWithRefresh(opCtx, nss().db()));
+        return dbInfo.shardingEnabled();
+    }();
 
     uassert(ErrorCodes::IllegalOperation,
             str::stream() << "sharding not enabled for db " << nss().db(),
-            dbInfo.shardingEnabled());
+            dbEnabledForSharding);
 
     if (nss().db() == NamespaceString::kConfigDb) {
         // Only allowlisted collections in config may be sharded (unless we are in test mode)
@@ -735,7 +725,7 @@ void CreateCollectionCoordinator::_commit(OperationContext* opCtx) {
     updateCatalogEntry(opCtx, nss(), coll);
 }
 
-void CreateCollectionCoordinator::_finalize(OperationContext* opCtx) noexcept {
+void CreateCollectionCoordinator::_finalize(OperationContext* opCtx) {
     LOGV2_DEBUG(5277907, 2, "Create collection _finalize", "namespace"_attr = nss());
 
     try {
@@ -748,8 +738,8 @@ void CreateCollectionCoordinator::_finalize(OperationContext* opCtx) noexcept {
         CollectionShardingRuntime::get(opCtx, nss())->clearFilteringMetadata(opCtx);
     }
 
-    // Is it really necessary to refresh all shards? or can I assume that the shard version will be
-    // unknown and refreshed eventually?
+    // Best effort refresh to warm up cache of all involved shards so we can have a cluster ready to
+    // receive operations.
     auto shardRegistry = Grid::get(opCtx)->shardRegistry();
     auto dbPrimaryShardId = ShardingState::get(opCtx)->shardId();
 
@@ -762,22 +752,11 @@ void CreateCollectionCoordinator::_finalize(OperationContext* opCtx) noexcept {
         }
 
         auto shard = uassertStatusOK(shardRegistry->getShard(opCtx, chunkShardId));
-        try {
-            auto refreshCmdResponse = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
-                opCtx,
-                ReadPreferenceSetting{ReadPreference::PrimaryOnly},
-                "admin",
-                BSON("_flushRoutingTableCacheUpdates" << nss().ns()),
-                Seconds{30},
-                Shard::RetryPolicy::kIdempotent));
+        shard->runFireAndForgetCommand(opCtx,
+                                       ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                       NamespaceString::kAdminDb.toString(),
+                                       BSON("_flushRoutingTableCacheUpdates" << nss().ns()));
 
-            uassertStatusOK(refreshCmdResponse.commandStatus);
-        } catch (const DBException& ex) {
-            LOGV2_WARNING(5277909,
-                          "Could not refresh shard",
-                          "shardId"_attr = shard->getId(),
-                          "error"_attr = redact(ex.reason()));
-        }
         shardsRefreshed.emplace(chunkShardId);
     }
 

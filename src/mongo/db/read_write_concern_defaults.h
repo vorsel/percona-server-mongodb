@@ -135,8 +135,12 @@ public:
                                                      const boost::optional<WriteConcern>& wc);
 
     /**
-     * Returns true if cluster-wide write concern is set and the gDefaultWCMajority feature flag
-     * is enabled, and false otherwise.
+     * Returns true if the cluster-wide read concern is set.
+     */
+    bool isCWRCSet(OperationContext* opCtx);
+
+    /**
+     * Returns true if the cluster-wide write concern is set.
      */
     bool isCWWCSet(OperationContext* opCtx);
 

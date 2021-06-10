@@ -48,5 +48,15 @@ namespace timeseries {
 boost::optional<TimeseriesOptions> getTimeseriesOptions(OperationContext* opCtx,
                                                         const NamespaceString& nss);
 
+/**
+ * Returns the default bucket timespan associated with the given granularity.
+ */
+int getMaxSpanSecondsFromGranularity(BucketGranularityEnum granularity);
+
+/**
+ * Returns the number of seconds used to round down the bucket ID and control.min timestamp.
+ */
+int getBucketRoundingSecondsFromGranularity(BucketGranularityEnum granularity);
+
 }  // namespace timeseries
 }  // namespace mongo

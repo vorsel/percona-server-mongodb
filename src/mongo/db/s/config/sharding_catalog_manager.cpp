@@ -297,6 +297,28 @@ void removeIncompleteChunks(OperationContext* opCtx, bool isOnUpgrade) {
         opCtx, ChunkType::ConfigNS, query, ShardingCatalogClient::kLocalWriteConcern));
 }
 
+// When building indexes for existing collections during FCV upgrade, use the createIndexes command
+// instead of Shard::createIndexesOnConfig, in order to leverage hybrid builds that do not require
+// to hold the collection lock in X_MODE for the duration of the build.
+// TODO SERVER-53283: Remove once 5.0 has been released.
+void createIndexesForFCVUpgradeDowngrade(OperationContext* opCtx,
+                                         const std::vector<BSONObj>& keysVector) {
+    DBDirectClient client(opCtx);
+    const auto indexSpecs = [&keysVector]() -> std::vector<BSONObj> {
+        std::vector<BSONObj> indexSpecs;
+        for (const auto& keys : keysVector) {
+            IndexSpec spec;
+            spec.addKeys(keys);
+            spec.unique(true);
+
+            indexSpecs.emplace_back(spec.toBSON());
+        }
+        return indexSpecs;
+    }();
+
+    client.createIndexes(ChunkType::ConfigNS.ns(), indexSpecs);
+}
+
 }  // namespace
 
 void ShardingCatalogManager::create(ServiceContext* serviceContext,
@@ -370,7 +392,12 @@ Status ShardingCatalogManager::initializeConfigDatabaseIfNeeded(OperationContext
         }
     }
 
-    Status status = _initConfigIndexes(opCtx);
+    Status status = _initConfigCollections(opCtx);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    status = _initConfigIndexes(opCtx);
     if (!status.isOK()) {
         return status;
     }
@@ -513,6 +540,27 @@ Status ShardingCatalogManager::_initConfigIndexes(OperationContext* opCtx) {
         return result.withContext("couldn't create ns_1_tag_1 index on config db");
     }
 
+    return Status::OK();
+}
+
+/**
+ * Ensure that config.collections exists upon configsvr startup
+ */
+Status ShardingCatalogManager::_initConfigCollections(OperationContext* opCtx) {
+    // Ensure that config.collections exist so that snapshot reads on it don't fail with
+    // SnapshotUnavailable error when it is implicitly created (when sharding a
+    // collection for the first time) but not in yet in the committed snapshot).
+    DBDirectClient client(opCtx);
+
+    BSONObj cmd = BSON("create" << CollectionType::ConfigNS.coll());
+    BSONObj result;
+    const bool ok = client.runCommand(CollectionType::ConfigNS.db().toString(), cmd, result);
+    if (!ok) {  // create returns error NamespaceExists if collection already exists
+        Status status = getStatusFromCommandResult(result);
+        if (status != ErrorCodes::NamespaceExists) {
+            return status.withContext("Could not create config.collections");
+        }
+    }
     return Status::OK();
 }
 
@@ -820,7 +868,11 @@ void ShardingCatalogManager::_upgradeCollectionsAndChunksEntriesTo50Phase1(
     removeIncompleteChunks(opCtx, true /* isOnUpgrade */);
 
     // Create uuid_* indexes for config.chunks
-    uassertStatusOK(createUuidIndexesForConfigChunks(opCtx));
+    createIndexesForFCVUpgradeDowngrade(
+        opCtx,
+        {BSON(ChunkType::collectionUUID << 1 << ChunkType::min() << 1),
+         BSON(ChunkType::collectionUUID << 1 << ChunkType::shard() << 1 << ChunkType::min() << 1),
+         BSON(ChunkType::collectionUUID << 1 << ChunkType::lastmod() << 1)});
 
     // Set timestamp for all collections in config.collections
     for (const auto& doc : collectionDocs) {
@@ -965,7 +1017,11 @@ void ShardingCatalogManager::_downgradeCollectionsAndChunksEntriesToPre50Phase1(
     removeIncompleteChunks(opCtx, false /* isOnUpgrade */);
 
     // Create ns_* indexes for config.chunks
-    uassertStatusOK(createNsIndexesForConfigChunks(opCtx));
+    createIndexesForFCVUpgradeDowngrade(
+        opCtx,
+        {BSON(ChunkType::ns << 1 << ChunkType::min() << 1),
+         BSON(ChunkType::ns << 1 << ChunkType::shard() << 1 << ChunkType::min() << 1),
+         BSON(ChunkType::ns << 1 << ChunkType::lastmod() << 1)});
 
     // Unset the timestamp field on all collections
     {

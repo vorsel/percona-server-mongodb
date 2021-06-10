@@ -411,16 +411,20 @@ public:
                 auto fcvDoc = FeatureCompatibilityVersionDocument::parse(
                     IDLParserErrorContext("featureCompatibilityVersionDocument"), fcvObj.get());
                 changeTimestamp = fcvDoc.getChangeTimestamp();
-                invariant(changeTimestamp);
+                uassert(5722800,
+                        "The 'changeTimestamp' field is missing in the FCV document persisted by "
+                        "the Config Server. This may indicate that this document has been "
+                        "explicitly amended causing an internal data inconsistency.",
+                        changeTimestamp);
             }
         } else if (serverGlobalParams.clusterRole == ClusterRole::ShardServer &&
                    request.getPhase()) {
             // Shards receive the timestamp from the Config Server's request.
             changeTimestamp = request.getChangeTimestamp();
             uassert(5563500,
-                    "The 'timestamp' field is missing even though the node is running as a shard. "
-                    "This may indicate that the 'setFeatureCompatibilityVersion' command was "
-                    "invoked directly against the shard or that the config server has not been "
+                    "The 'changeTimestamp' field is missing even though the node is running as a "
+                    "shard. This may indicate that the 'setFeatureCompatibilityVersion' command "
+                    "was invoked directly against the shard or that the config server has not been "
                     "upgraded to at least version 5.0.",
                     changeTimestamp);
         }
@@ -475,6 +479,46 @@ public:
             _runUpgrade(opCtx, request, changeTimestamp);
         } else {
             _runDowngrade(opCtx, request, changeTimestamp);
+        }
+
+        // We do not log this warning for shard servers since they don't set a cluster-wide write
+        // concern.
+        if (serverGlobalParams.clusterRole != ClusterRole::ShardServer &&
+            !ReadWriteConcernDefaults::get(opCtx).isCWWCSet(opCtx)) {
+            if (requestedVersion == FeatureCompatibility::kLatest &&
+                actualVersion < requestedVersion) {
+                LOGV2_WARNING(5569200,
+                              "The default write concern has been changed by upgrading the "
+                              "featureCompatibilityVersion to 5.0."
+                              "To keep the default write concern the same as before, use "
+                              "setDefaultRWConcern to set a cluster-wide write concern.");
+            } else if (actualVersion == FeatureCompatibility::kLatest &&
+                       actualVersion > requestedVersion) {
+                LOGV2_WARNING(5569201,
+                              "The default write concern has been changed by downgrading the "
+                              "featureCompatibilityVersion from 5.0. "
+                              "To keep the default write concern the same as before, use "
+                              "setDefaultRWConcern to set a cluster-wide write concern.");
+            }
+        }
+
+        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
+            !ReadWriteConcernDefaults::get(opCtx).isCWRCSet(opCtx)) {
+            if (requestedVersion == FeatureCompatibility::kLatest &&
+                actualVersion < requestedVersion) {
+                LOGV2_WARNING(5686200,
+                              "The default read concern has been changed by upgrading the "
+                              "featureCompatibilityVersion to 5.0."
+                              "To keep the default read concern the same as before, use "
+                              "setDefaultRWConcern to set a cluster-wide read concern.");
+            } else if (actualVersion == FeatureCompatibility::kLatest &&
+                       actualVersion > requestedVersion) {
+                LOGV2_WARNING(5686201,
+                              "The default read concern has been changed by downgrading the "
+                              "featureCompatibilityVersion from 5.0. "
+                              "To keep the default read concern the same as before, use "
+                              "setDefaultRWConcern to set a cluster-wide read concern.");
+            }
         }
 
         {

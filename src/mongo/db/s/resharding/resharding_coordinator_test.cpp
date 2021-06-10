@@ -673,7 +673,7 @@ protected:
         auto expectedCoordinatorDoc = coordinatorDoc;
         expectedCoordinatorDoc.setState(CoordinatorStateEnum::kAborting);
         auto abortReason = Status{errorCode, "reason to abort"};
-        emplaceAbortReasonIfExists(expectedCoordinatorDoc, abortReason);
+        emplaceTruncatedAbortReasonIfExists(expectedCoordinatorDoc, abortReason);
 
         writeStateTransitionUpdateExpectSuccess(operationContext(), expectedCoordinatorDoc);
     }
@@ -741,10 +741,9 @@ TEST_F(ReshardingCoordinatorPersistenceTest, WriteInitialInfoSucceeds) {
         reshardingZoneTypes.push_back(zoneType);
     }
 
-    std::vector<BSONObj> presetBSONChunks;
+    std::vector<ReshardedChunk> presetBSONChunks;
     for (const auto& chunk : initialChunks) {
-        ReshardedChunk reshardChunk(chunk.getShard(), chunk.getMin(), chunk.getMax());
-        presetBSONChunks.push_back(reshardChunk.toBSON());
+        presetBSONChunks.emplace_back(chunk.getShard(), chunk.getMin(), chunk.getMax());
     }
 
     // Persist the updates on disk

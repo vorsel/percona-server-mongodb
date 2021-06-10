@@ -37,7 +37,6 @@
 #include "mongo/db/pipeline/document_source_set_window_fields_gen.h"
 #include "mongo/db/pipeline/document_source_sort.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
-#include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/query/sort_pattern.h"
 #include "mongo/util/visit_helper.h"
@@ -74,23 +73,19 @@ bool modifiedSortPaths(const SortPattern& pat, const DocumentSource::GetModPaths
 }
 }  // namespace
 
-REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(
+REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(
     setWindowFields,
     LiteParsedDocumentSourceDefault::parse,
     document_source_set_window_fields::createFromBson,
     LiteParsedDocumentSource::AllowedWithApiStrict::kNeverInVersion1,
-    LiteParsedDocumentSource::AllowedWithClientType::kAny,
-    ServerGlobalParams::FeatureCompatibility::Version::kVersion50,
-    ::mongo::feature_flags::gFeatureFlagWindowFunctions.isEnabledAndIgnoreFCV());
+    ServerGlobalParams::FeatureCompatibility::Version::kVersion50);
 
-REGISTER_DOCUMENT_SOURCE_CONDITIONALLY(
+REGISTER_DOCUMENT_SOURCE_WITH_MIN_VERSION(
     _internalSetWindowFields,
     LiteParsedDocumentSourceDefault::parse,
     DocumentSourceInternalSetWindowFields::createFromBson,
     LiteParsedDocumentSource::AllowedWithApiStrict::kNeverInVersion1,
-    LiteParsedDocumentSource::AllowedWithClientType::kAny,
-    ServerGlobalParams::FeatureCompatibility::Version::kVersion50,
-    ::mongo::feature_flags::gFeatureFlagWindowFunctions.isEnabledAndIgnoreFCV());
+    ServerGlobalParams::FeatureCompatibility::Version::kVersion50);
 
 list<intrusive_ptr<DocumentSource>> document_source_set_window_fields::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {
@@ -215,20 +210,29 @@ list<intrusive_ptr<DocumentSource>> document_source_set_window_fields::create(
     }
 
     // $sort
-    if (simplePartitionBy || sortBy) {
-        // Generate a combined SortPattern for the partition key and sortBy.
-        std::vector<SortPatternPart> combined;
+    // Generate a combined SortPattern for the partition key and sortBy.
+    std::vector<SortPatternPart> combined;
 
-        if (simplePartitionBy) {
-            SortPatternPart part;
-            part.fieldPath = simplePartitionBy->fullPath();
-            combined.emplace_back(std::move(part));
+    if (simplePartitionBy) {
+        SortPatternPart part;
+        part.fieldPath = simplePartitionBy->fullPath();
+        combined.emplace_back(std::move(part));
+    }
+    if (sortBy) {
+        for (auto part : *sortBy) {
+            combined.push_back(part);
         }
-        if (sortBy) {
-            for (auto part : *sortBy) {
-                combined.push_back(part);
-            }
-        }
+    }
+
+    // This is for our testing framework. If this knob is set we append an _id to the translated
+    // sortBy in order to ensure deterministic output.
+    if (internalQueryAppendIdToSetWindowFieldsSort.load()) {
+        SortPatternPart part;
+        part.fieldPath = "_id"_sd;
+        combined.push_back(part);
+    }
+
+    if (!combined.empty()) {
         result.push_back(DocumentSourceSort::create(expCtx, SortPattern{combined}));
     }
 

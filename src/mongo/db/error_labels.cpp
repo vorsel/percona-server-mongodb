@@ -32,8 +32,15 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/lite_parsed_pipeline.h"
+#include "mongo/util/exit.h"
 
 namespace mongo {
+
+namespace {
+
+MONGO_FAIL_POINT_DEFINE(errorLabelBuilderMockShutdown);
+
+}
 
 bool ErrorLabelBuilder::isTransientTransactionError() const {
     // Note that we only apply the TransientTransactionError label if the "autocommit" field is
@@ -63,10 +70,20 @@ bool ErrorLabelBuilder::isRetryableWriteError() const {
     // Return with RetryableWriteError label on retryable error codes for retryable writes or
     // transactions commit/abort.
     if (isRetryableWrite() || isTransactionCommitOrAbort()) {
-        if ((_code && ErrorCodes::isRetriableError(_code.get())) ||
-            (_wcCode && ErrorCodes::isRetriableError(_wcCode.get()))) {
+        bool isShutDownCode = _code &&
+            (ErrorCodes::isShutdownError(_code.get()) ||
+             _code.get() == ErrorCodes::CallbackCanceled);
+        if (isShutDownCode &&
+            (globalInShutdownDeprecated() ||
+             MONGO_unlikely(errorLabelBuilderMockShutdown.shouldFail()))) {
             return true;
         }
+
+        // mongos should not attach RetryableWriteError label to retryable errors thrown by the
+        // config server or targeted shards.
+        return !_isMongos &&
+            ((_code && ErrorCodes::isRetriableError(_code.get())) ||
+             (_wcCode && ErrorCodes::isRetriableError(_wcCode.get())));
     }
     return false;
 }
@@ -120,13 +137,14 @@ void ErrorLabelBuilder::build(BSONArrayBuilder& labels) const {
     if (isTransientTransactionError()) {
         labels << ErrorLabel::kTransientTransaction;
         hasTransientTransactionOrRetryableWriteError = true;
-    }
-    if (isRetryableWriteError()) {
-        // RetryableWriteError and TransientTransactionError are mutually exclusive.
-        invariant(!hasTransientTransactionOrRetryableWriteError);
+    } else if (isRetryableWriteError()) {
+        // In the rare case where RetryableWriteError and TransientTransactionError are not mutually
+        // exclusive, only append the TransientTransactionError label so users know to retry the
+        // entire transaction.
         labels << ErrorLabel::kRetryableWrite;
         hasTransientTransactionOrRetryableWriteError = true;
     }
+
     // Change streams cannot run in a transaction, and cannot be a retryable write. Since these
     // labels are only added in the event that we are executing the associated operation, we do
     // not add a ResumableChangeStreamError label if either of them is set.
@@ -147,7 +165,8 @@ BSONObj getErrorLabels(OperationContext* opCtx,
                        const std::string& commandName,
                        boost::optional<ErrorCodes::Error> code,
                        boost::optional<ErrorCodes::Error> wcCode,
-                       bool isInternalClient) {
+                       bool isInternalClient,
+                       bool isMongos) {
     if (MONGO_unlikely(errorLabelsOverride(opCtx))) {
         // This command was failed by a failCommand failpoint. Thus, we return the errorLabels
         // specified in the failpoint to supress any other error labels that would otherwise be
@@ -161,7 +180,7 @@ BSONObj getErrorLabels(OperationContext* opCtx,
 
     BSONArrayBuilder labelArray;
     ErrorLabelBuilder labelBuilder(
-        opCtx, sessionOptions, commandName, code, wcCode, isInternalClient);
+        opCtx, sessionOptions, commandName, code, wcCode, isInternalClient, isMongos);
     labelBuilder.build(labelArray);
 
     return (labelArray.arrSize() > 0) ? BSON(kErrorLabelsFieldName << labelArray.arr()) : BSONObj();

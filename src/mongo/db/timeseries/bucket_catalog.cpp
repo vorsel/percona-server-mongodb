@@ -38,6 +38,7 @@
 #include "mongo/db/commands/server_status.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/timeseries/timeseries_options.h"
 #include "mongo/db/views/view_catalog.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/stdx/thread.h"
@@ -123,6 +124,19 @@ UUID getLsid(OperationContext* opCtx, BucketCatalog::CombineWithInsertsFromOther
     }
     MONGO_UNREACHABLE;
 }
+
+long long roundTimestampDown(const Date_t& time, const TimeseriesOptions& options) {
+    int roundingSeconds =
+        timeseries::getBucketRoundingSecondsFromGranularity(options.getGranularity());
+    long long seconds = durationCount<Seconds>(time.toDurationSinceEpoch());
+    return (seconds - (seconds % roundingSeconds));
+}
+
+BSONObj buildControlMinTimestampDoc(StringData timeField, long long roundedSeconds) {
+    BSONObjBuilder builder;
+    builder.append(timeField, Date_t::fromMillisSinceEpoch(1000 * roundedSeconds));
+    return builder.obj();
+}
 }  // namespace
 
 const std::shared_ptr<BucketCatalog::ExecutionStats> BucketCatalog::kEmptyStats{
@@ -172,7 +186,7 @@ StatusWith<std::shared_ptr<BucketCatalog::WriteBatch>> BucketCatalog::insert(
 
     auto time = timeElem.Date();
 
-    BucketAccess bucket{this, key, stats.get(), time};
+    BucketAccess bucket{this, key, options, stats.get(), time};
     invariant(bucket);
 
     NewFieldNames newFieldNamesToBeInserted;
@@ -200,13 +214,8 @@ StatusWith<std::shared_ptr<BucketCatalog::WriteBatch>> BucketCatalog::insert(
             return true;
         }
         if (time < bucketTime) {
-            if (!(*bucket)->_hasBeenCommitted() &&
-                (*bucket)->_latestTime - time < Seconds(*options.getBucketMaxSpanSeconds())) {
-                (*bucket).setTime();
-            } else {
-                stats->numBucketsClosedDueToTimeBackward.fetchAndAddRelaxed(1);
-                return true;
-            }
+            stats->numBucketsClosedDueToTimeBackward.fetchAndAddRelaxed(1);
+            return true;
         }
         return false;
     };
@@ -310,6 +319,7 @@ void BucketCatalog::finish(std::shared_ptr<WriteBatch> batch, const CommitInfo& 
         auto lk = _lockExclusive();
         if (_allBuckets.contains(ptr)) {
             stdx::unique_lock blk{ptr->_mutex};
+            ptr->_preparedBatch.reset();
             _abort(blk, ptr, nullptr, boost::none);
         }
     } else if (bucket->allCommitted()) {
@@ -504,15 +514,23 @@ void BucketCatalog::_abort(stdx::unique_lock<Mutex>& lk,
     }
     bucket->_batches.clear();
 
+    bool doRemove = true;  // We shouldn't remove the bucket if there's a prepared batch outstanding
+                           // and it's not the on we manage. In that case, we don't know what the
+                           // user is doing with it, but we need to keep the bucket around until
+                           // that batch is finished.
     if (auto& prepared = bucket->_preparedBatch) {
         if (prepared == batch) {
             prepared->_abort(status, true);
+            prepared.reset();
+        } else {
+            doRemove = false;
         }
-        prepared.reset();
     }
 
     lk.unlock();
-    [[maybe_unused]] bool removed = _removeBucket(bucket, false /* expiringBuckets */);
+    if (doRemove) {
+        [[maybe_unused]] bool removed = _removeBucket(bucket, false /* expiringBuckets */);
+    }
 }
 
 void BucketCatalog::_markBucketIdle(Bucket* bucket) {
@@ -564,14 +582,14 @@ std::size_t BucketCatalog::_numberOfIdleBuckets() const {
 
 BucketCatalog::Bucket* BucketCatalog::_allocateBucket(const BucketKey& key,
                                                       const Date_t& time,
+                                                      const TimeseriesOptions& options,
                                                       ExecutionStats* stats,
                                                       bool openedDuetoMetadata) {
     _expireIdleBuckets(stats);
 
     auto [it, inserted] = _allBuckets.insert(std::make_unique<Bucket>());
     Bucket* bucket = it->get();
-    _setIdTimestamp(bucket, time);
-    _bucketStates.emplace(bucket->_id, BucketState::kNormal);
+    _setIdTimestamp(bucket, time, options);
     _openBuckets[key] = bucket;
 
     if (openedDuetoMetadata) {
@@ -607,11 +625,18 @@ const std::shared_ptr<BucketCatalog::ExecutionStats> BucketCatalog::_getExecutio
     return kEmptyStats;
 }
 
-void BucketCatalog::_setIdTimestamp(Bucket* bucket, const Date_t& time) {
-    auto oldId = bucket->_id;
-    bucket->_id.setTimestamp(durationCount<Seconds>(time.toDurationSinceEpoch()));
+void BucketCatalog::_setIdTimestamp(Bucket* bucket,
+                                    const Date_t& time,
+                                    const TimeseriesOptions& options) {
+    auto const roundedSeconds = roundTimestampDown(time, options);
+    bucket->_id.setTimestamp(roundedSeconds);
+
+    // Make sure we set the control.min time field to match the rounded _id timestamp.
+    auto controlDoc = buildControlMinTimestampDoc(options.getTimeField(), roundedSeconds);
+    bucket->_minmax.update(
+        controlDoc, bucket->_metadata.getMetaField(), bucket->_metadata.getComparator());
+
     stdx::lock_guard statesLk{_statesMutex};
-    _bucketStates.erase(oldId);
     _bucketStates.emplace(bucket->_id, BucketState::kNormal);
 }
 
@@ -771,9 +796,10 @@ std::shared_ptr<BucketCatalog::WriteBatch> BucketCatalog::Bucket::_activeBatch(
 
 BucketCatalog::BucketAccess::BucketAccess(BucketCatalog* catalog,
                                           BucketKey& key,
+                                          const TimeseriesOptions& options,
                                           ExecutionStats* stats,
                                           const Date_t& time)
-    : _catalog(catalog), _key(&key), _stats(stats), _time(&time) {
+    : _catalog(catalog), _key(&key), _options(&options), _stats(stats), _time(&time) {
 
     auto bucketFound = [](BucketState bucketState) {
         return bucketState == BucketState::kNormal || bucketState == BucketState::kPrepared;
@@ -848,7 +874,7 @@ BucketCatalog::BucketAccess::BucketAccess(BucketCatalog* catalog, Bucket* bucket
     auto statesIt = _catalog->_bucketStates.find(_bucket->_id);
     invariant(statesIt != _catalog->_bucketStates.end());
     auto& [_, state] = *statesIt;
-    if (state == BucketState::kCleared) {
+    if (state == BucketState::kCleared || state == BucketState::kPreparedAndCleared) {
         release();
     }
 }
@@ -958,7 +984,9 @@ void BucketCatalog::BucketAccess::_acquire() {
 void BucketCatalog::BucketAccess::_create(const HashedBucketKey& normalizedKey,
                                           const HashedBucketKey& nonNormalizedKey,
                                           bool openedDuetoMetadata) {
-    _bucket = _catalog->_allocateBucket(normalizedKey, *_time, _stats, openedDuetoMetadata);
+    invariant(_options);
+    _bucket =
+        _catalog->_allocateBucket(normalizedKey, *_time, *_options, _stats, openedDuetoMetadata);
     _catalog->_openBuckets[nonNormalizedKey] = _bucket;
     _bucket->_nonNormalizedKeyMetadatas.push_back(nonNormalizedKey.key->metadata.toBSON());
     _acquire();
@@ -1029,15 +1057,6 @@ void BucketCatalog::BucketAccess::rollover(const std::function<bool(BucketAccess
 
         _create(hashedNormalizedKey, hashedKey, false /* openedDueToMetadata */);
     }
-}
-
-void BucketCatalog::BucketAccess::setTime() {
-    invariant(isLocked());
-    invariant(_key);
-    invariant(_stats);
-    invariant(_time);
-
-    _catalog->_setIdTimestamp(_bucket, *_time);
 }
 
 Date_t BucketCatalog::BucketAccess::getTime() const {

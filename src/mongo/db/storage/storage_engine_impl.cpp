@@ -357,7 +357,7 @@ void StorageEngineImpl::closeCatalog(OperationContext* opCtx) {
     }
 
     CollectionCatalog::write(
-        opCtx, [&](CollectionCatalog& catalog) { catalog.deregisterAllCollections(); });
+        opCtx, [&](CollectionCatalog& catalog) { catalog.deregisterAllCollectionsAndViews(); });
 
     _catalog.reset();
     _catalogRecordStore.reset();
@@ -730,7 +730,7 @@ void StorageEngineImpl::cleanShutdown() {
     }
 
     CollectionCatalog::write(getGlobalServiceContext(), [](CollectionCatalog& catalog) {
-        catalog.deregisterAllCollections();
+        catalog.deregisterAllCollectionsAndViews();
     });
 
     _catalog.reset();
@@ -828,7 +828,7 @@ Status StorageEngineImpl::_dropCollectionsNoTimestamp(OperationContext* opCtx,
     auto collectionCatalog = CollectionCatalog::get(opCtx);
     for (auto& uuid : toDrop) {
         auto coll = collectionCatalog->lookupCollectionByUUIDForMetadataWrite(
-            opCtx, CollectionCatalog::LifetimeMode::kInplace, uuid);
+            opCtx, CollectionCatalog::LifetimeMode::kManagedInWriteUnitOfWork, uuid);
 
         // No need to remove the indexes from the IndexCatalog because eliminating the Collection
         // will have the same effect.
@@ -1271,13 +1271,9 @@ int64_t StorageEngineImpl::sizeOnDiskForDb(OperationContext* opCtx, StringData d
     catalog::forEachCollectionFromDb(opCtx, dbName, MODE_IS, [&](const CollectionPtr& collection) {
         size += collection->getRecordStore()->storageSize(opCtx);
 
-        std::vector<std::string> indexNames;
-        collection->getAllIndexes(&indexNames);
-
-        for (size_t i = 0; i < indexNames.size(); i++) {
-            std::string ident =
-                _catalog->getIndexIdent(opCtx, collection->getCatalogId(), indexNames[i]);
-            size += _engine->getIdentSize(opCtx, ident);
+        auto it = collection->getIndexCatalog()->getIndexIterator(opCtx, true);
+        while (it->more()) {
+            size += _engine->getIdentSize(opCtx, it->next()->getIdent());
         }
 
         return true;

@@ -120,6 +120,7 @@ public:
     Status applyChunkOpsDeprecated(OperationContext* opCtx,
                                    const BSONArray& updateOps,
                                    const BSONArray& preCondition,
+                                   const NamespaceStringOrUUID& nsOrUUID,
                                    const NamespaceString& nss,
                                    const ChunkVersion& lastChunkVersion,
                                    const WriteConcernOptions& writeConcern,
@@ -150,7 +151,8 @@ public:
     Status removeConfigDocuments(OperationContext* opCtx,
                                  const NamespaceString& nss,
                                  const BSONObj& query,
-                                 const WriteConcernOptions& writeConcern) override;
+                                 const WriteConcernOptions& writeConcern,
+                                 boost::optional<BSONObj> hint = boost::none) override;
 
     StatusWith<std::vector<KeysCollectionDocument>> getNewKeys(
         OperationContext* opCtx,

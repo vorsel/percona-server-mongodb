@@ -1,4 +1,4 @@
-# Copyright (C) 2020-present MongoDB, Inc.
+# Copyright (C) 2021-present MongoDB, Inc.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the Server Side Public License, version 1,
@@ -26,26 +26,15 @@
 # it in the license file.
 #
 
-# ReshardedChunk IDL File
-
 global:
-    cpp_namespace: "mongo"
+    cpp_namespace: "mongo::rpc"
 
-imports:
-    - "mongo/idl/basic_types.idl"
-    - "mongo/s/sharding_types.idl"
-
-structs:
-    ReshardedChunk:
-        description: "ReshardedChunk"
-        fields:
-            recipientShardId:
-                type: shard_id
-                description: "The id of the recipient shard."
-            min:
-                type: object_owned
-                description: "The min key of the chunk range."
-            max:
-                type: object_owned
-                description: "The max key of the chunk range."
-
+server_parameters:
+    # Kill switch just in case this behavior is slow or breaks something.
+    rewriteStateChangeErrors:
+        description: >-
+            A failsafe to disable mongos state change error rewriting.
+        set_at: startup
+        cpp_vartype: bool
+        cpp_varname: rewriteStateChangeErrors
+        default: true

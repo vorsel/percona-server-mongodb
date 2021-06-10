@@ -74,6 +74,7 @@
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/op_msg.h"
 #include "mongo/rpc/op_msg_rpc_impls.h"
+#include "mongo/rpc/rewrite_state_change_errors.h"
 #include "mongo/s/catalog_cache.h"
 #include "mongo/s/client/shard_registry.h"
 #include "mongo/s/cluster_commands_helpers.h"
@@ -665,10 +666,19 @@ Status ParseAndRunCommand::RunInvocation::_setup() {
         } else {
             // This command is not from a DBDirectClient or internal client, and supports WC, but
             // wasn't given one - so apply the default, if there is one.
-            if (const auto wcDefault = ReadWriteConcernDefaults::get(opCtx->getServiceContext())
-                                           .getDefaultWriteConcern(opCtx)) {
+            const auto rwcDefaults =
+                ReadWriteConcernDefaults::get(opCtx->getServiceContext()).getDefault(opCtx);
+            if (const auto wcDefault = rwcDefaults.getDefaultWriteConcern()) {
                 _parc->_wc = *wcDefault;
-                customDefaultWriteConcernWasApplied = true;
+                if (repl::feature_flags::gDefaultWCMajority.isEnabled(
+                        serverGlobalParams.featureCompatibility)) {
+                    const auto defaultWriteConcernSource =
+                        rwcDefaults.getDefaultWriteConcernSource();
+                    customDefaultWriteConcernWasApplied = defaultWriteConcernSource &&
+                        defaultWriteConcernSource == DefaultWriteConcernSourceEnum::kGlobal;
+                } else {
+                    customDefaultWriteConcernWasApplied = true;
+                }
                 LOGV2_DEBUG(22766,
                             2,
                             "Applying default writeConcern on {command} of {writeConcern}",
@@ -1042,15 +1052,13 @@ void ParseAndRunCommand::RunInvocation::_tapOnError(const Status& status) {
     //    delegated to the shards. Mongos simply propagates the shard's response up to the client.
     // 2. For other commands in a transaction, they shouldn't get a writeConcern error so this
     //    setting doesn't apply.
-    //
-    // isInternalClient is set to true to suppress mongos from returning the RetryableWriteError
-    // label.
     auto errorLabels = getErrorLabels(opCtx,
                                       *_parc->_osi,
                                       command->getName(),
                                       status.code(),
                                       boost::none,
-                                      true /* isInternalClient */);
+                                      false /* isInternalClient */,
+                                      true /* isMongos */);
     _parc->_errorBuilder->appendElements(errorLabels);
 }
 
@@ -1349,6 +1357,11 @@ DbResponse ClientCommand::_produceResponse() {
             dbResponse.shouldRunAgainForExhaust = reply->shouldRunAgainForExhaust();
             dbResponse.nextInvocation = reply->getNextInvocation();
         }
+    }
+    if (auto doc = rpc::RewriteStateChangeErrors::rewrite(reply->getBodyBuilder().asTempObj(),
+                                                          _rec->getOpCtx())) {
+        reply->reset();
+        reply->getBodyBuilder().appendElements(*doc);
     }
     dbResponse.response = reply->done();
 

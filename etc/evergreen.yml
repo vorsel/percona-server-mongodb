@@ -19,6 +19,32 @@
 # - 'build_variant' (references the executing task's buildvariant).
 # - 'config_root' (references the root directory for the executor's configuration artifacts).
 
+
+#####################################################
+#          Setup environment in a new task          #
+#####################################################
+
+# There are several ways to setup the environment in your task.
+#
+# 1. If your task depends on 'archive_dist_test'/'archive_dist_test_debug' task you can call the function "do setup"
+# - func: "do setup"
+# Or alternatively call the functions in the sequence below, if you don't need everything else from "do setup"
+# - func: "fetch artifacts" (includes python, shell scripts, jstests etc. from the mongo and enterprise repos)
+# - func: "f_expansions_write"
+# - func: "kill processes"
+# - func: "cleanup environment"
+# - func: "set up venv"
+#
+# 2. If your task does not depend on 'archive_dist_test'/'archive_dist_test_debug' task use the following functions
+# call sequence
+# - command: manifest.load
+# - func: "git get project" (clone the entire mongo and enterprise repos)
+# - func: "f_expansions_write"
+# - func: "kill processes"
+# - func: "cleanup environment"
+# - func: "set up venv"
+
+
 stepback: true
 command_type: system
 pre_error_fails_task: true
@@ -171,12 +197,12 @@ variables:
         ${archive_file|src/archive.json}
   setup_group_can_fail_task: true
   setup_group:
-  - func: "f_expansions_write"
   - command: manifest.load
   - func: "git get project"
+  - func: "set task expansion macros"
+  - func: "f_expansions_write"
   - func: "kill processes"
   - func: "cleanup environment"
-  - func: "set task expansion macros"
   # The python virtual environment is installed in ${workdir}, which is created in
   # "set up venv".
   - func: "set up venv"
@@ -250,15 +276,17 @@ variables:
   setup_task:
     - func: "apply compile expansions"
     - func: "set task expansion macros"
+    - func: "f_expansions_write"
   teardown_task:
   - func: "attach scons logs"
   setup_group_can_fail_task: true
   setup_group:
     - command: manifest.load
     - func: "git get project"
+    - func: "set task expansion macros"
+    - func: "f_expansions_write"
     - func: "kill processes"
     - func: "cleanup environment"
-    - func: "set task expansion macros"
     - func: "set up venv"
     - func: "upload pip requirements"
     - func: "get buildnumber"
@@ -382,8 +410,6 @@ functions:
         binary: bash
         args:
           - "src/evergreen/functions/files_remove.sh"
-        env:
-          workdir: ${workdir}
 
   "configure evergreen api credentials": &configure_evergreen_api_credentials
     command: subprocess.exec
@@ -392,8 +418,6 @@ functions:
       binary: bash
       args:
         - "src/evergreen/functions/evergreen_api_credentials_configure.sh"
-      env:
-        workdir: ${workdir}
 
   "configure selected tests credentials": &configure_selected_tests_credentials
     command: subprocess.exec
@@ -407,11 +431,11 @@ functions:
         workdir: ${workdir}
 
   "git get project": &git_get_project
-    - command: git.get_project
-      params:
-        directory: ${git_project_directory|src}
-        revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
-          enterprise: ${enterprise_rev}
+    command: git.get_project
+    params:
+      directory: ${git_project_directory|src}
+      revisions: # for each module include revision as <module_name> : ${<module_name>_rev}
+        enterprise: ${enterprise_rev}
 
   "fetch artifacts": &fetch_artifacts
     command: s3.get
@@ -465,8 +489,6 @@ functions:
       binary: bash
       args:
         - "src/evergreen/functions/binaries_extract.sh"
-      env:
-        workdir: ${workdir}
 
   "check binary version": &check_binary_version
     command: subprocess.exec
@@ -474,8 +496,6 @@ functions:
       binary: bash
       args:
         - "src/evergreen/functions/binary_version_check.sh"
-      env:
-        workdir: ${workdir}
 
   "fetch benchmarks": &fetch_benchmarks
     command: s3.get
@@ -564,8 +584,6 @@ functions:
       binary: bash
       args:
         - "./src/evergreen/functions/system_resource_info_collect.sh"
-      env:
-        workdir: ${workdir}
 
   # Run a monitor process as a background, system task to periodically
   # display how many threads interesting processes are using.
@@ -577,8 +595,6 @@ functions:
       binary: bash
       args:
         - "./src/evergreen/functions/process_threads_monitor.sh"
-      env:
-        workdir: ${workdir}
 
   "set up credentials": &set_up_credentials
     command: subprocess.exec
@@ -587,8 +603,6 @@ functions:
       silent: true
       args:
         - "./src/evergreen/functions/credentials_setup.sh"
-      env:
-        workdir: ${workdir}
 
   "set up win mount script":
     - *f_expansions_write
@@ -598,8 +612,6 @@ functions:
         silent: true
         args:
           - "./src/evergreen/functions/win_mount_script_setup.sh"
-        env:
-          workdir: ${workdir}
 
   "set up notary client credentials":
     - *f_expansions_write
@@ -609,8 +621,6 @@ functions:
         silent: true
         args:
           - "./src/evergreen/functions/notary_client_credentials_setup.sh"
-        env:
-          workdir: ${workdir}
 
   "f_remote_credentials_setup_exec": &set_up_remote_credentials
     command: subprocess.exec
@@ -619,7 +629,6 @@ functions:
       args:
         - "./src/evergreen/functions/remote_credentials_setup.sh"
       env:
-        workdir: ${workdir}
         private_key_remote_bash_var: ${private_key_remote}
 
   "set up remote credentials":
@@ -634,8 +643,6 @@ functions:
         silent: true
         args:
           - "./src/evergreen/functions/bf_suggestion_service_call.sh"
-        env:
-          workdir: ${workdir}
 
   "upload debugsymbols": &upload_debugsymbols
     command: s3.put
@@ -664,8 +671,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/functions/wiredtiger_develop_use.sh"
-        env:
-          workdir: ${workdir}
 
   "shared scons cache pruning":
     - *f_expansions_write
@@ -675,8 +680,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/functions/shared_scons_cache_pruning.sh"
-        env:
-          workdir: ${workdir}
 
   "umount shared scons directory":
     - *f_expansions_write
@@ -685,8 +688,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/functions/shared_scons_directory_umount.sh"
-        env:
-          workdir: ${workdir}
 
   "get all modified patch files":
     - *f_expansions_write
@@ -695,8 +696,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/functions/modified_patch_files_get_all.sh"
-        env:
-          workdir: ${workdir}
 
   # This function should only be called from patch-build-only tasks.
   "get added and modified patch files":
@@ -706,8 +705,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/functions/added_and_modified_patch_files_get.sh"
-        env:
-          workdir: ${workdir}
 
   "determine resmoke jobs": &determine_resmoke_jobs
     command: subprocess.exec
@@ -715,8 +712,6 @@ functions:
       binary: bash
       args:
         - "./src/evergreen/functions/resmoke_jobs_determine.sh"
-      env:
-        workdir: ${workdir}
 
   "update resmoke jobs expansions": &update_resmoke_jobs_expansions
     command: expansions.update
@@ -730,8 +725,6 @@ functions:
       binary: bash
       args:
         - "./src/evergreen/functions/task_timeout_determine.sh"
-      env:
-        workdir: ${workdir}
 
   "update task timeout expansions": &update_task_timeout_expansions
     command: expansions.update
@@ -745,7 +738,6 @@ functions:
       exec_timeout_secs: ${exec_timeout_secs}
 
   ### Set expansion macros used in each task.
-  ### Note that this function will override task expansions set in update_bypass_expansions
   "set task expansion macros": &set_task_expansion_macros
     command: expansions.update
     params:
@@ -780,8 +772,8 @@ functions:
       args:
         - "src/evergreen/functions/venv_setup.sh"
       env:
-        workdir: ${workdir}
         pip_dir: ${pip_dir}
+        workdir: ${workdir}
 
   "upload pip requirements": &upload_pip_requirements
     command: s3.put
@@ -801,15 +793,30 @@ functions:
       name: perf
       file: src/perf.json
 
+  "cleanup environment": &cleanup_environment
+    command: subprocess.exec
+    params:
+      binary: bash
+      args:
+        - "./src/evergreen/cleanup_environment.sh"
+
+  "kill processes": &kill_processes
+    command: subprocess.exec
+    params:
+      silent: true
+      binary: bash
+      args:
+        - "./src/evergreen/kill_processes.sh"
+
   "do setup":
   - *f_expansions_write
-  - *set_up_venv
-  - *upload_pip_requirements
-  - *set_task_expansion_macros
-  - *f_expansions_write
   - *fetch_artifacts
+  - *kill_processes
+  - *cleanup_environment
   - *fetch_binaries
   - *fetch_debugsymbols_archive
+  - *set_up_venv
+  - *upload_pip_requirements
   - *extract_binaries
   - *check_binary_version
   - *get_buildnumber
@@ -820,9 +827,11 @@ functions:
   - *collect_system_resource_info
 
   "do non-compile setup":
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
-  - *set_task_expansion_macros
-  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
   - *set_up_venv
   - *upload_pip_requirements
   - *get_buildnumber
@@ -830,9 +839,11 @@ functions:
   - *set_up_credentials
 
   "do benchmark setup":
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
-  - *set_task_expansion_macros
-  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
   - *set_up_venv
   - *upload_pip_requirements
   - *get_buildnumber
@@ -846,8 +857,6 @@ functions:
       binary: bash
       args:
         - "./src/evergreen/multiversion_setup.sh"
-      env:
-        workdir: ${workdir}
 
   "do multiversion setup":
     - *f_expansions_write
@@ -860,11 +869,13 @@ functions:
       binary: bash
       args:
         - "./src/evergreen/compiled_binaries_get.sh"
-      env:
-        workdir: ${workdir}
 
   "generate powercycle tasks":
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - *set_up_venv
     - *upload_pip_requirements
 
@@ -873,8 +884,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/powercycle_tasks_generate.sh"
-        env:
-          workdir: ${workdir}
 
     - command: archive.targz_pack
       params:
@@ -900,7 +909,11 @@ functions:
           - powercycle_tasks.json
 
   "run powercycle sentinel":
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - *set_up_venv
     - *upload_pip_requirements
     - *configure_evergreen_api_credentials
@@ -911,8 +924,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/powercycle_sentinel_run.sh"
-        env:
-          workdir: ${workdir}
 
   "execute resmoke tests": &execute_resmoke_tests
     command: subprocess.exec
@@ -921,8 +932,6 @@ functions:
       binary: bash
       args:
         - "./src/evergreen/resmoke_tests_execute.sh"
-      env:
-        workdir: ${workdir}
 
   "retrieve generated test configuration": &retrieve_generated_test_configuration
     command: s3.get
@@ -943,9 +952,6 @@ functions:
 
   "generate selected tests":
     - *f_expansions_write
-    - command: expansions.write
-      params:
-        file: expansions.yml
     - *configure_evergreen_api_credentials
     - *configure_selected_tests_credentials
     - command: subprocess.exec
@@ -954,8 +960,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/selected_tests_generate.sh"
-        env:
-          workdir: ${workdir}
     - command: archive.targz_pack
       params:
         target: generate_tasks_config.tgz
@@ -988,8 +992,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/burn_in_tests_generate.sh"
-        env:
-          workdir: ${workdir}
     - command: archive.targz_pack
       params:
         target: burn_in_tags_gen.tgz
@@ -1012,9 +1014,11 @@ functions:
           - src/generated_burn_in_tags_config/burn_in_tags_gen.json
 
   "generate randomized multiversion tasks":
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
-    - *set_task_expansion_macros
-    - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - *set_up_venv
     - *upload_pip_requirements
     - *configure_evergreen_api_credentials
@@ -1026,8 +1030,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/randomized_multiversion_tasks_generate.sh"
-        env:
-          workdir: ${workdir}
 
     - *do_multiversion_setup
     - command: subprocess.exec
@@ -1035,8 +1037,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/randomized_multiversion_tasks_generate_exclude_tags.sh"
-        env:
-          workdir: ${workdir}
     - command: archive.targz_pack
       params:
         target: generate_tasks_config.tgz
@@ -1071,9 +1071,11 @@ functions:
           - src/generated_resmoke_config/*.json
 
   "generate resmoke tasks":
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
-    - *set_task_expansion_macros
-    - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - *set_up_venv
     - *upload_pip_requirements
     - *f_expansions_write
@@ -1085,8 +1087,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/resmoke_tasks_generate.sh"
-        env:
-          workdir: ${workdir}
 
     - command: archive.targz_pack
       params:
@@ -1196,8 +1196,6 @@ functions:
         binary: bash
         args:
           - "src/evergreen/scons_lint.sh"
-        env:
-          workdir: ${workdir}
 
   "scons compile":
     - *f_expansions_write
@@ -1207,9 +1205,6 @@ functions:
         binary: bash
         args:
           - "src/evergreen/scons_compile.sh"
-        env:
-          workdir: ${workdir}
-          patch_compile_flags: ${patch_compile_flags}
 
   "generate compile expansions":
     - *f_expansions_write
@@ -1218,8 +1213,6 @@ functions:
         binary: bash
         args:
           - "src/evergreen/functions/compile_expansions_generate.sh"
-        env:
-          workdir: ${workdir}
 
   "apply compile expansions":
     - command: expansions.update
@@ -1244,8 +1237,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/do_jepsen_setup/nodes.sh"
-        env:
-          workdir: ${workdir}
     - command: subprocess.exec
       params:
         binary: bash
@@ -1261,15 +1252,11 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/jepsen_test_run.sh"
-        env:
-          workdir: ${workdir}
     - command: subprocess.exec
       params:
         binary: bash
         args:
           - "./src/evergreen/jepsen_test_fail.sh"
-        env:
-          workdir: ${workdir}
 
   "load aws test credentials":
     - *f_expansions_write
@@ -1279,18 +1266,15 @@ functions:
         silent: true
         args:
           - "./src/evergreen/functions/aws_test_credentials_load.sh"
-        env:
-          workdir: ${workdir}
 
 
   "generate explicit multiversion tasks":
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
-    - *set_task_expansion_macros
-    - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - *set_up_venv
-    - command: expansions.write
-      params:
-        file: expansions.yml
     - *upload_pip_requirements
     - *f_expansions_write
     - *configure_evergreen_api_credentials
@@ -1302,8 +1286,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/explicit_multiversion_tasks_generate.sh"
-        env:
-          workdir: ${workdir}
 
     - command: archive.targz_pack
       params:
@@ -1338,15 +1320,12 @@ functions:
           - src/generated_resmoke_config/*.json
 
   "generate implicit multiversion tasks":
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
-    - *set_task_expansion_macros
-    - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - *set_up_venv
-    - *f_expansions_write
-    - *configure_evergreen_api_credentials
-    - command: expansions.write
-      params:
-        file: expansions.yml
     - *configure_evergreen_api_credentials
     - *f_expansions_write
     - *do_multiversion_setup
@@ -1357,8 +1336,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/implicit_multiversions_tasks_generate.sh"
-        env:
-          workdir: ${workdir}
 
     - command: archive.targz_pack
       params:
@@ -1395,13 +1372,12 @@ functions:
           - src/generated_resmoke_config/*.json
 
   "generate fuzzer tasks":
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
-    - *set_task_expansion_macros
-    - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - *set_up_venv
-    - command: expansions.write
-      params:
-        file: expansions.yml
     - *upload_pip_requirements
 
     - *f_expansions_write
@@ -1410,8 +1386,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/fuzzer_tasks_generate.sh"
-        env:
-          workdir: ${workdir}
 
     - command: archive.targz_pack
       params:
@@ -1449,8 +1423,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/jstestfuzz_setup.sh"
-        env:
-          workdir: ${workdir}
 
   "lint fuzzer sanity patch":
     - *f_expansions_write
@@ -1460,8 +1432,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/lint_fuzzer_sanity_patch.sh"
-        env:
-          workdir: ${workdir}
 
   "lint fuzzer sanity all":
     - *f_expansions_write
@@ -1471,8 +1441,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/lint_fuzzer_sanity_all.sh"
-        env:
-          workdir: ${workdir}
 
   # Used by generator
   "run jstestfuzz":
@@ -1489,16 +1457,12 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/jstestfuzz_run.sh"
-        env:
-          workdir: ${workdir}
     # TODO SERVER-57161 remove this touch command
     - command: subprocess.exec
       params:
         binary: touch
         args:
           - "./src/jstestfuzz/out/placeholder.js"
-        env:
-          workdir: ${workdir}
     - command: archive.targz_pack
       params:
         target: "jstests.tgz"
@@ -1525,8 +1489,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/idl_tests_run.sh"
-        env:
-          workdir: ${workdir}
 
   "run powercycle test":
     - *f_expansions_write
@@ -1536,19 +1498,11 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/powercycle_run_test.sh"
-        env:
-          workdir: ${workdir}
 
     - command: expansions.update
       params:
         ignore_missing_file: true
         file: src/powercycle_exit.yml
-    - *f_expansions_write
-
-    - command: expansions.write
-      params:
-        file: expansions.yml
-
     - *f_expansions_write
     - command: subprocess.exec
       type: setup
@@ -1556,16 +1510,12 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/powercycle_ssh_failure_exit.sh"
-        env:
-          workdir: ${workdir}
     - command: subprocess.exec
       type: test
       params:
         binary: bash
         args:
           - "./src/evergreen/powercycle_exit.sh"
-        env:
-          workdir: ${workdir}
 
   "run packager.py":
     - *f_expansions_write
@@ -1574,8 +1524,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/packager.py_run.sh"
-        env:
-          workdir: ${workdir}
 
   "do snmp setup":
     command: subprocess.exec
@@ -1591,21 +1539,6 @@ functions:
       args:
         - "./src/evergreen/do_watchdog_setup.sh"
 
-  "cleanup environment":
-    command: subprocess.exec
-    params:
-      binary: bash
-      args:
-        - "./src/evergreen/cleanup_environment.sh"
-
-  "kill processes":
-    command: subprocess.exec
-    params:
-      silent: true
-      binary: bash
-      args:
-        - "./src/evergreen/kill_processes.sh"
-
   "run kitchen":
     - *f_expansions_write
     - command: subprocess.exec
@@ -1614,8 +1547,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/kitchen_run.sh"
-        env:
-          workdir: ${workdir}
 
   "set up EC2 instance": &set_up_ec2_instance
 
@@ -1640,8 +1571,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/powercycle_check_host.sh"
-        env:
-          workdir: ${workdir}
 
     - command: expansions.update
       params:
@@ -1653,8 +1582,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/powercycle_setup_host.sh"
-        env:
-          workdir: ${workdir}
 
   ### Process & archive remote EC2 artifacts ###
   "save powercycle artifacts": &save_powercycle_artifacts
@@ -1663,8 +1590,6 @@ functions:
       binary: bash
       args:
         - "./src/evergreen/powercycle_save_artifacts.sh"
-      env:
-        workdir: ${workdir}
 
   "archive remote EC2 artifacts": &archive_remote_ec2_artifacts
     command: s3.put
@@ -1705,8 +1630,6 @@ functions:
       binary: bash
       args:
         - "./src/evergreen/local_client_logs_tar.sh"
-      env:
-        workdir: ${workdir}
 
   "archive local client logs": &archive_local_client_logs
     command: s3.put
@@ -1860,8 +1783,6 @@ functions:
       binary: bash
       args:
         - "./src/evergreen/failed_unittests_gather.sh"
-      env:
-        workdir: ${workdir}
 
   "tar failed unittests": &tar_failed_unittests
     command: archive.targz_pack
@@ -1927,8 +1848,6 @@ functions:
       binary: bash
       args:
         - "./src/evergreen/hang_analyzer.sh"
-      env:
-        workdir: ${workdir}
 
   "wait for resmoke to shutdown":
     command: subprocess.exec
@@ -2078,8 +1997,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/scons_splunk.sh"
-        env:
-          workdir: ${workdir}
 
   "attach report":
     command: attach.results
@@ -2101,8 +2018,6 @@ functions:
         binary: bash
         args:
           - "./src/evergreen/wiki_page.sh"
-        env:
-          workdir: ${workdir}
     - command: attach.artifacts
       params:
         files:
@@ -2111,12 +2026,6 @@ functions:
 
 # Pre task steps
 pre:
-  - func: "f_expansions_write"
-  - command: manifest.load
-  - func: "git get project"
-  - func: "kill processes"
-  - func: "cleanup environment"
-  - func: "set up venv"
   - func: "set task expansion macros"
   - func: "f_expansions_write"
 
@@ -2200,8 +2109,6 @@ tasks:
         binary: bash
         args:
           - "src/evergreen/gen_feature_flags.sh"
-        env:
-          workdir: ${workdir}
 
     - command: archive.targz_pack
       params:
@@ -2210,6 +2117,7 @@ tasks:
         include:
           - "./build/**.gcno"
           - "./etc/*san.suppressions"
+          - "./etc/expansions.default.yml"
           - "./etc/pip/**"
           - "./etc/repo_config.yaml"
           - "./etc/scons/**"
@@ -2220,7 +2128,7 @@ tasks:
           - "jstests/**"
           - "library_dependency_graph.json"
           - "patch_files.txt"
-          - "pytests/**"
+          - "evergreen/**"
           - "src/mongo/client/sdam/json_tests/sdam_tests/**"
           - "src/mongo/client/sdam/json_tests/server_selection_tests/**"
           - "src/mongo/db/modules/enterprise/docs/**"
@@ -2286,8 +2194,6 @@ tasks:
         binary: bash
         args:
           - "./src/evergreen/ninja_compile.sh"
-        env:
-          workdir: ${workdir}
 
 - name: compile_ninja_next
   commands:
@@ -2307,8 +2213,6 @@ tasks:
         binary: bash
         args:
           - "./src/evergreen/ninja_compile.sh"
-        env:
-          workdir: ${workdir}
 
 - name: compile_build_tools_next
   commands:
@@ -2327,8 +2231,6 @@ tasks:
         binary: bash
         args:
           - "src/evergreen/libdeps_setup.sh"
-        env:
-          workdir: ${workdir}
 
     - func: "scons compile"
       vars:
@@ -2343,8 +2245,6 @@ tasks:
         binary: bash
         args:
           - "src/evergreen/libdeps_run.sh"
-        env:
-          workdir: ${workdir}
 
     - command: s3.put
       params:
@@ -2545,8 +2445,6 @@ tasks:
         binary: bash
         args:
           - "src/evergreen/embedded_sdk_build_cdriver.sh"
-        env:
-          workdir: ${workdir}
 
 - name: embedded_sdk_install_dev
   depends_on:
@@ -2580,8 +2478,6 @@ tasks:
         binary: bash
         args:
           - "src/evergreen/embedded_sdk_s3_tar.sh"
-        env:
-          workdir: ${workdir}
 
     # Upload it so we can download from EVG.
     - command: s3.put
@@ -2624,8 +2520,6 @@ tasks:
         binary: bash
         args:
           - "src/evergreen/embedded_sdk_tests_s3_tar.sh"
-        env:
-          workdir: ${workdir}
 
     # Upload it so we can download from EVG.
     - command: s3.put
@@ -2651,15 +2545,11 @@ tasks:
         binary: bash
         args:
           - "src/evergreen/embedded_sdk_run_tests.sh"
-        env:
-          workdir: ${workdir}
     - command: subprocess.exec
       params:
         binary: bash
         args:
           - "src/evergreen/embedded_sdk_run_tests_post.sh"
-        env:
-          workdir: ${workdir}
 
 - name: embedded_sdk_s3_put_latest
   depends_on:
@@ -2718,8 +2608,6 @@ tasks:
         binary: bash
         args:
           - "src/evergreen/stitch_support_create_lib_tar.sh"
-        env:
-          workdir: ${workdir}
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -2759,15 +2647,15 @@ tasks:
         binary: bash
         args:
           - "src/evergreen/stitch_support_run_tests.sh"
-        env:
-          workdir: ${workdir}
 
 - name: compile_benchmarks
   depends_on: []
   commands:
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
-    - func: "set task expansion macros"
-    - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - func: "set up venv"
     - func: "upload pip requirements"
     - func: "get buildnumber"
@@ -2807,14 +2695,16 @@ tasks:
 ## lint ##
 - name: lint_pylinters
   commands:
-    - *f_expansions_write
     - command: timeout.update
       params:
         # 40 minutes
         exec_timeout_secs: 2400
     - *f_expansions_write
-    - func: "set task expansion macros"
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - func: "set up venv"
     - func: "upload pip requirements"
     - func: "scons lint"
@@ -2823,14 +2713,16 @@ tasks:
 
 - name: lint_clang_format
   commands:
-    - *f_expansions_write
     - command: timeout.update
       params:
         # 40 minutes
         exec_timeout_secs: 2400
     - *f_expansions_write
-    - func: "set task expansion macros"
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - func: "set up venv"
     - func: "upload pip requirements"
     - func: "scons lint"
@@ -2839,14 +2731,16 @@ tasks:
 
 - name: lint_eslint
   commands:
-    - *f_expansions_write
     - command: timeout.update
       params:
         # 40 minutes
         exec_timeout_secs: 2400
     - *f_expansions_write
-    - func: "set task expansion macros"
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - func: "set up venv"
     - func: "upload pip requirements"
     - func: "scons lint"
@@ -2855,14 +2749,16 @@ tasks:
 
 - name: lint_cpplint
   commands:
-    - *f_expansions_write
     - command: timeout.update
       params:
         # 40 minutes
         exec_timeout_secs: 2400
     - *f_expansions_write
-    - func: "set task expansion macros"
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - func: "set up venv"
     - func: "upload pip requirements"
     - func: "scons lint"
@@ -2872,9 +2768,11 @@ tasks:
 - name: lint_yaml
   depends_on: []
   commands:
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
-  - func: "set task expansion macros"
-  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
   - func: "set up venv"
   - func: "upload pip requirements"
   - func: "f_expansions_write"
@@ -2884,12 +2782,14 @@ tasks:
       binary: bash
       args:
         - "src/evergreen/lint_yaml.sh"
-      env:
-        workdir: ${workdir}
 
 - name: lint_shellscripts
   commands:
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
   - command: subprocess.exec
     type: test
     params:
@@ -2899,9 +2799,11 @@ tasks:
 
 - name: lint_errorcodes
   commands:
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
-    - func: "set task expansion macros"
-    - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - func: "set up venv"
     - func: "upload pip requirements"
     - func: "scons lint"
@@ -2912,9 +2814,11 @@ tasks:
   depends_on:
     - name: archive_dist_test_debug
   commands:
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
-    - func: "set task expansion macros"
-    - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
     - func: "set up venv"
     - func: "upload pip requirements"
     - func: "do setup"
@@ -2925,14 +2829,14 @@ tasks:
         binary: bash
         args:
           - "src/evergreen/check_idl_compat.sh"
-        env:
-          workdir: ${workdir}
 
 - name: burn_in_tests_gen
   commands:
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
-  - func: "set task expansion macros"
-  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
   - func: "set up venv"
   - func: "upload pip requirements"
   - func: "configure evergreen api credentials"
@@ -2943,8 +2847,6 @@ tasks:
       binary: bash
       args:
         - "src/evergreen/burn_in_tests.sh"
-      env:
-        workdir: ${workdir}
   - command: archive.targz_pack
     params:
       target: src/burn_in_tests_gen.tgz
@@ -2969,9 +2871,11 @@ tasks:
 
 - name: burn_in_tests_multiversion_gen
   commands:
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
-  - func: "set task expansion macros"
-  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
   - func: "set up venv"
   - func: "upload pip requirements"
   - func: "f_expansions_write"
@@ -2983,8 +2887,6 @@ tasks:
       binary: bash
       args:
         - "src/evergreen/burn_in_tests_multiversion.sh"
-      env:
-        workdir: ${workdir}
 
   - command: archive.targz_pack
     params:
@@ -3870,6 +3772,22 @@ tasks:
       resmoke_args: --storageEngine=wiredTiger
       name: resharding_fuzzer_shuffle
 
+- <<: *jstestfuzz_template
+  name: resharding_fuzzer_idempotency_gen
+  tags: ["resharding_fuzzer"]
+  commands:
+  - func: "generate fuzzer tasks"
+    vars:
+      <<: *jstestfuzz_config_vars
+      num_files: 10
+      num_tasks: 5
+      npm_command: resharding-fuzzer
+      jstestfuzz_vars: --numDonors 3 --numRecipients 3 --inPlace no
+      suite: resharding_fuzzer_idempotency
+      resmoke_args: >-
+        --storageEngine=wiredTiger
+      name: resharding_fuzzer_idempotency
+
 ## Tests that the multiversion test generation logic is not broken.
 - name: multiversion_sanity_check_gen
   commands:
@@ -3894,9 +3812,12 @@ tasks:
 - name: lint_fuzzer_sanity_patch
   patch_only: true
   commands:
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
-  - func: "set task expansion macros"
-  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
+  - *set_up_venv
   - func: "get added and modified patch files"
   - func: "setup jstestfuzz"
   - func: "lint fuzzer sanity patch"
@@ -3904,9 +3825,12 @@ tasks:
 # Check that the mutational fuzzer can parse all JS filess.
 - name: lint_fuzzer_sanity_all
   commands:
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
-  - func: "set task expansion macros"
-  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
+  - *set_up_venv
   - func: "setup jstestfuzz"
   - func: "lint fuzzer sanity all"
 
@@ -4065,9 +3989,11 @@ tasks:
   depends_on:
     - name: archive_dist_test_debug
   commands:
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
-  - func: "set task expansion macros"
-  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
   - func: "set up venv"
   - func: "upload pip requirements"
   - func: "configure evergreen api credentials"
@@ -4081,9 +4007,11 @@ tasks:
 
 - name: selected_tests_gen
   commands:
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
-  - func: "set task expansion macros"
-  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
   - func: "set up venv"
   - func: "upload pip requirements"
   - func: "generate selected tests"
@@ -4379,6 +4307,8 @@ tasks:
   name: integration_tests_standalone
   tags: ["integration", "standalone"]
   commands:
+  - command: manifest.load
+  - *git_get_project
   - func: "do setup"
   - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
@@ -4396,6 +4326,8 @@ tasks:
   name: integration_tests_standalone_audit
   tags: ["integration", "audit"]
   commands:
+  - command: manifest.load
+  - *git_get_project
   - func: "do setup"
   - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
@@ -4413,6 +4345,8 @@ tasks:
   name: integration_tests_replset
   tags: ["integration"]
   commands:
+  - command: manifest.load
+  - *git_get_project
   - func: "do setup"
   - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
@@ -4430,6 +4364,8 @@ tasks:
   name: integration_tests_replset_ssl_auth
   tags: ["integration"]
   commands:
+  - command: manifest.load
+  - *git_get_project
   - func: "do setup"
   - func: "set up win mount script"
   - func: "generate compile expansions"  # Generate compile expansions needs to be run to mount the shared scons cache.
@@ -4447,6 +4383,8 @@ tasks:
   name: integration_tests_sharded
   tags: ["integration", "sharded"]
   commands:
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
   - func: "do setup"
   - func: "set up win mount script"
@@ -4472,8 +4410,6 @@ tasks:
       binary: bash
       args:
         - "src/evergreen/external_auth_pip.sh"
-      env:
-        workdir: ${workdir}
   - func: "run tests"
     vars:
       resmoke_args: --suites=external_auth --excludeWithAnyTags=requires_domain_controller --storageEngine=wiredTiger
@@ -4490,15 +4426,11 @@ tasks:
       silent: true
       args:
         - "src/evergreen/external_auth_aws_setup.sh"
-      env:
-        workdir: ${workdir}
   - command: subprocess.exec
     params:
       binary: bash
       args:
         - "src/evergreen/external_auth_aws_pip.sh"
-      env:
-        workdir: ${workdir}
   - func: "run tests"
     vars:
       resmoke_args: --suites=external_auth_aws --storageEngine=wiredTiger
@@ -5152,6 +5084,26 @@ tasks:
       fallback_num_sub_suites: 10
 
 - name: tenant_migration_stepdown_jscore_passthrough_gen
+  tags: ["tenant_migration"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      depends_on: jsCore
+      use_large_distro: "true"
+      resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 10
+
+- name: tenant_migration_terminate_primary_jscore_passthrough_gen
+  tags: ["tenant_migration"]
+  commands:
+  - func: "generate resmoke tasks"
+    vars:
+      depends_on: jsCore
+      use_large_distro: "true"
+      resmoke_args: --storageEngine=wiredTiger
+      fallback_num_sub_suites: 10
+
+- name: tenant_migration_kill_primary_jscore_passthrough_gen
   tags: ["tenant_migration"]
   commands:
   - func: "generate resmoke tasks"
@@ -6232,9 +6184,11 @@ tasks:
   depends_on:
   - name: archive_dist_test_debug
   commands:
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
-  - func: "set task expansion macros"
-  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
   - func: "set up venv"
   - func: "upload pip requirements"
   - func: "run idl tests"
@@ -6251,16 +6205,12 @@ tasks:
       silent: true
       args:
         - "src/evergreen/blackduck_setup.sh"
-      env:
-        workdir: ${workdir}
   - command: subprocess.exec
     type: test
     params:
       binary: bash
       args:
         - "src/evergreen/blackduck_hub.sh"
-      env:
-        workdir: ${workdir}
 
 - name: tla_plus
   commands:
@@ -6303,6 +6253,12 @@ tasks:
   depends_on:
   - name: package
   commands:
+    - command: manifest.load
+    - *git_get_project
+    - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
+    - *set_up_venv
     - func: "fetch packages"
     - func: "set up remote credentials"
       vars:
@@ -6316,7 +6272,12 @@ tasks:
   depends_on:
     - name: compile_dist_test
   commands:
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
+    - *kill_processes
+    - *cleanup_environment
+    - *set_up_venv
     - func: "scons compile"
       vars:
         targets: >-
@@ -6335,8 +6296,6 @@ tasks:
         binary: bash
         args:
           - "src/evergreen/package.sh"
-        env:
-          workdir: ${workdir}
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -6473,6 +6432,10 @@ tasks:
   - name: replica_sets_jscore_passthrough
   commands:
     - func: "fetch artifacts"
+    - func: "f_expansions_write"
+    - func: "kill processes"
+    - func: "cleanup environment"
+    - func: "set up venv"
     - func: "fetch packages"
     - func: "apply compile expansions"
     - func: "set up remote credentials"
@@ -6486,8 +6449,6 @@ tasks:
         binary: bash
         args:
           - "./src/evergreen/packages_publish.sh"
-        env:
-          workdir: ${workdir}
 
 - name: push
   tags: ["publish"]
@@ -6500,6 +6461,10 @@ tasks:
   stepback: false
   commands:
     - func: "fetch artifacts"
+    - func: "f_expansions_write"
+    - func: "kill processes"
+    - func: "cleanup environment"
+    - func: "set up venv"
     - func: "fetch packages"
     - func: "fetch dist tarball"
     # Fetch the shell
@@ -6551,8 +6516,6 @@ tasks:
         binary: bash
         args:
           - "./src/evergreen/notary_client_run.sh"
-        env:
-          workdir: ${workdir}
 
     # Put the binaries tarball/zipfile
     - command: s3.put
@@ -7078,48 +7041,59 @@ tasks:
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on: []
   commands:
+  - command: manifest.load
+  - *git_get_project
+  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
+  - *set_up_venv
   - func: "shared scons cache pruning"
 
 - name: win_shared_scons_cache_pruning
   exec_timeout_secs: 7200 # 2 hour timeout for the task overall
   depends_on: []
   commands:
+  - command: manifest.load
+  - *git_get_project
+  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
+  - *set_up_venv
   - func: "set up win mount script"
   - func: "shared scons cache pruning"
 
 - name: validate_commit_message
   exec_timeout_secs: 600 # 10 minute timeout
   commands:
+  - command: manifest.load
+  - *git_get_project
   - *f_expansions_write
-  - func: "set task expansion macros"
-  - *f_expansions_write
+  - *kill_processes
+  - *cleanup_environment
   - func: "set up venv"
-  - *f_expansions_write
   - command: subprocess.exec
     type: test
     params:
       binary: bash
       args:
         - "./src/evergreen/commit_message_validate.sh"
-      env:
-        workdir: ${workdir}
 
 - name: check_for_todos
   exec_timeout_secs: 600 # 10 minute timeout
   commands:
+    - command: manifest.load
+    - *git_get_project
     - *f_expansions_write
-    - func: "set task expansion macros"
-    - *f_expansions_write
-    - func: "configure evergreen api credentials"
+    - *kill_processes
+    - *cleanup_environment
     - func: "set up venv"
+    - func: "configure evergreen api credentials"
     - command: subprocess.exec
       type: test
       params:
         binary: bash
         args:
           - "./src/evergreen/todos_check.sh"
-        env:
-          workdir: ${workdir}
 
 - <<: *task_template
   name: mqlrun
@@ -7254,12 +7228,12 @@ task_groups:
   setup_group:
     - command: manifest.load
     - func: "git get project"
+    - func: "set task expansion macros"
+    - func: "f_expansions_write"
     - func: "kill processes"
     - func: "cleanup environment"
     - func: "set up venv"
     - func: "upload pip requirements"
-    - func: "set task expansion macros"
-    - func: "f_expansions_write"
     - func: "configure evergreen api credentials"
     - func: "get buildnumber"
     - func: "f_expansions_write"
@@ -7272,6 +7246,7 @@ task_groups:
   setup_task:
     - func: "apply compile expansions"
     - func: "set task expansion macros"
+    - func: "f_expansions_write"
   teardown_task:
   tasks:
   - clang_tidy
@@ -7282,11 +7257,11 @@ task_groups:
   setup_group:
     - command: manifest.load
     - func: "git get project"
+    - func: "set task expansion macros"
+    - func: "f_expansions_write"
     - func: "get buildnumber"
     - func: "set up venv"
     - func: "upload pip requirements"
-    - func: "set task expansion macros"
-    - func: "f_expansions_write"
     - func: "set up credentials"
     - func: "set up win mount script"
     - func: "generate compile expansions"
@@ -7295,6 +7270,7 @@ task_groups:
   setup_task:
     - func: "set task expansion macros"
     - func: "apply compile expansions"
+    - func: "f_expansions_write"
   teardown_task:
       - func: "attach scons logs"
   tasks:
@@ -7306,11 +7282,11 @@ task_groups:
   setup_group:
     - command: manifest.load
     - func: "git get project"
+    - func: "set task expansion macros"
+    - func: "f_expansions_write"
     - func: "get buildnumber"
     - func: "set up venv"
     - func: "upload pip requirements"
-    - func: "set task expansion macros"
-    - func: "f_expansions_write"
     - func: "set up credentials"
     - func: "set up win mount script"
     - func: "generate compile expansions"
@@ -7319,6 +7295,7 @@ task_groups:
   setup_task:
     - func: "set task expansion macros"
     - func: "apply compile expansions"
+    - func: "f_expansions_write"
   teardown_task:
       - func: "attach scons logs"
   tasks:
@@ -8255,7 +8232,8 @@ buildvariants:
   expansions:
     exe: ".exe"
     content_type: application/zip
-    compile_flags: --dbg=on --opt=on --win-version-min=win10 -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) MONGO_DISTMOD=windows
+    compile_flags: --dbg=on --opt=on --win-version-min=win10 -j$(bc <<< "$(grep -c '^processor' /proc/cpuinfo) / 1.5") MONGO_DISTMOD=windows
+    num_scons_link_jobs_available: 0.25
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
     scons_cache_scope: shared
@@ -8326,8 +8304,8 @@ buildvariants:
     exe: ".exe"
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug msi archive-mh archive-mh-debug
     content_type: application/zip
-    compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=win10
-    num_scons_link_jobs_available: 0.5
+    compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(bc <<< "$(grep -c '^processor' /proc/cpuinfo) / 1.5") --win-version-min=win10
+    num_scons_link_jobs_available: 0.25
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
     scons_cache_scope: shared
@@ -8371,8 +8349,8 @@ buildvariants:
     exe: ".exe"
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug msi archive-mh archive-mh-debug
     content_type: application/zip
-    compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=win10
-    num_scons_link_jobs_available: 0.5
+    compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(bc <<< "$(grep -c '^processor' /proc/cpuinfo) / 1.5") --win-version-min=win10
+    num_scons_link_jobs_available: 0.25
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
     scons_cache_scope: shared
@@ -8443,8 +8421,8 @@ buildvariants:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug msi
     exe: ".exe"
     content_type: application/zip
-    compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=win10
-    num_scons_link_jobs_available: 0.5
+    compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(bc <<< "$(grep -c '^processor' /proc/cpuinfo) / 1.5") --win-version-min=win10
+    num_scons_link_jobs_available: 0.25
     python: '/cygdrive/c/python/python37/python.exe'
     test_flags: --storageEngine=inMemory --excludeWithAnyTags=requires_persistence,requires_journaling,incompatible_with_windows_tls
     ext: zip
@@ -8495,8 +8473,8 @@ buildvariants:
     multiversion_platform_44_or_later: windows
     multiversion_edition: base
     content_type: application/zip
-    compile_flags: --ssl MONGO_DISTMOD=windows -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=win10
-    num_scons_link_jobs_available: 0.5
+    compile_flags: --ssl MONGO_DISTMOD=windows -j$(bc <<< "$(grep -c '^processor' /proc/cpuinfo) / 1.5") --win-version-min=win10
+    num_scons_link_jobs_available: 0.25
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
     scons_cache_scope: shared
@@ -8549,8 +8527,8 @@ buildvariants:
     exe: ".exe"
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug msi archive-mh archive-mh-debug
     content_type: application/zip
-    compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=win10
-    num_scons_link_jobs_available: 0.5
+    compile_flags: --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(bc <<< "$(grep -c '^processor' /proc/cpuinfo) / 1.5") --win-version-min=win10
+    num_scons_link_jobs_available: 0.25
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
     scons_cache_scope: shared
@@ -8613,8 +8591,8 @@ buildvariants:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
     exe: ".exe"
     content_type: application/zip
-    compile_flags: --dbg=on --opt=off --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(( $(grep -c ^processor /proc/cpuinfo) / 2 )) --win-version-min=win10
-    num_scons_link_jobs_available: 0.5
+    compile_flags: --dbg=on --opt=off --ssl MONGO_DISTMOD=windows CPPPATH="c:/sasl/include c:/snmp/include" LIBPATH="c:/sasl/lib c:/snmp/lib" -j$(bc <<< "$(grep -c '^processor' /proc/cpuinfo) / 1.5") --win-version-min=win10
+    num_scons_link_jobs_available: 0.25
     python: '/cygdrive/c/python/python37/python.exe'
     ext: zip
     scons_cache_scope: shared
@@ -9062,7 +9040,7 @@ buildvariants:
     large_distro_name: rhel80-medium
     num_scons_link_jobs_available: 0.99
     test_flags: >-
-      --mongodSetParameters="{internalQueryForceClassicEngine: true, featureFlagSBE: false}"
+      --mongodSetParameters="{internalQueryForceClassicEngine: true}"
       --additionalFeatureFlags=featureFlagTimeseriesCollection
   tasks:
   - name: compile_test_and_package_parallel_core_stream_TG
@@ -9075,12 +9053,13 @@ buildvariants:
 #  - name: compile_test_and_package_parallel_dbtest_stream_TG
 #    distros:
 #    - rhel80-medium
+  - name: .aggfuzzer
   - name: .aggregation !.no_async !.secondary_reads !.sharded !.unwind !aggregation_disabled_optimization
-  - name: .aggfuzzer !.multiversion
   - name: .change_streams
   - name: .concurrency !.large !.ubsan !.debug_only
   - name: .jscore !.sharding !.decimal !.compat !cst_jscore_passthrough
   - name: .jstestfuzz !.flow_control
+  - name: .query_fuzzer
   - name: .read_write_concern
   - name: .replica_sets
   - name: .rollbackfuzzer
@@ -9350,6 +9329,7 @@ buildvariants:
   stepback: false
   expansions:
     additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
+    test_flags: --excludeWithAnyTags=resource_intensive
     compile_flags: --dbg=on --gcov --ssl MONGO_DISTMOD=rhel80 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     multiversion_platform: rhel80
     multiversion_edition: enterprise
@@ -10735,6 +10715,78 @@ buildvariants:
   - name: server_discovery_and_monitoring_json_test_TG
   - name: server_selection_json_test_TG
 
+- <<: *ubuntu1804-debug-asan-template
+  name: ubuntu1804-debug-asan-classic-engine
+  display_name: ~ ASAN Enterprise Ubuntu 18.04 DEBUG (Classic Execution Engine)
+  modules:
+  - enterprise
+  run_on:
+  - ubuntu1804-build
+  stepback: false
+  expansions:
+    additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
+    lang_environment: LANG=C
+    # If you add anything to san_options, make sure the appropriate changes are
+    # also made to SConstruct.
+    san_options: LSAN_OPTIONS="suppressions=etc/lsan.suppressions:report_objects=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer" ASAN_OPTIONS="detect_leaks=1:check_initialization_order=true:strict_init_order=true:abort_on_error=1:disable_coredump=0:handle_abort=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer"
+    compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --allocator=system --sanitize=address --ssl --ocsp-stapling=off --enable-free-mon=on -j$(grep -c ^processor /proc/cpuinfo)
+    test_flags: >-
+      --mongodSetParameters="{internalQueryForceClassicEngine: true}"
+      --excludeWithAnyTags=requires_fast_memory,requires_ocsp_stapling
+    multiversion_platform: ubuntu1804
+    multiversion_edition: enterprise
+    resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under ASAN build.
+    hang_analyzer_dump_core: false
+    scons_cache_scope: shared
+    exec_timeout_secs: 14400 # 3 hour timeout
+  tasks:
+  - name: compile_test_and_package_serial_TG
+  - name: compile_benchmarks
+  - name: .aggregation
+  - name: .auth
+  - name: audit
+  - name: .benchmarks
+  - name: .causally_consistent !.wo_snapshot
+  - name: .change_streams
+  - name: .misc_js
+  - name: .concurrency !.ubsan !.no_txns !.kill_terminate
+  - name: .encrypt
+  - name: free_monitoring
+  - name: external_auth
+  - name: external_auth_aws
+  - name: initial_sync_fuzzer_gen
+  - name: .integration !.standalone !.audit
+  - name: .jscore .common
+  - name: jsCore_minimum_batch_size
+  - name: jsCore_op_query
+  - name: jsCore_txns_large_txns_format
+  - name: jsonSchema
+  - name: .logical_session_cache
+  - name: .multi_shard .common
+  - name: .query_fuzzer
+  - name: .read_write_concern
+  - name: replica_sets_large_txns_format_gen
+  - name: replica_sets_large_txns_format_jscore_passthrough
+  - name: .replica_sets !.multi_oplog
+  - name: .resharding_fuzzer
+  - name: .retry
+  - name: .read_only
+  - name: .rollbackfuzzer
+  - name: .updatefuzzer
+  - name: sasl
+  - name: secondary_reads_passthrough_gen
+  - name: session_jscore_passthrough
+  - name: .sharding .jscore !.wo_snapshot
+  - name: .sharding .common !.csrs
+  - name: snmp
+  - name: .watchdog
+  - name: .stitch
+  - name: .tenant_migration
+  - name: unittest_shell_hang_analyzer_gen
+  - name: .updatefuzzer
+  - name: server_discovery_and_monitoring_json_test_TG
+  - name: server_selection_json_test_TG
+
 - name: ubuntu1804-asan
   display_name: ~ ASAN Ubuntu 18.04
   run_on:
@@ -10803,6 +10855,72 @@ buildvariants:
   - name: .multiversion_fuzzer
   - name: .multiversion_passthrough
   - name: .random_multiversion_ds
+  - name: .read_write_concern
+  - name: replica_sets_large_txns_format_gen
+  - name: replica_sets_large_txns_format_jscore_passthrough
+  - name: .replica_sets !.multi_oplog
+  - name: .resharding_fuzzer
+  - name: .retry
+  - name: .rollbackfuzzer
+  - name: .read_only
+  - name: sasl
+  - name: secondary_reads_passthrough_gen
+  - name: session_jscore_passthrough
+  - name: .sharding .jscore !.wo_snapshot
+  - name: .sharding .common !.csrs
+  - name: snmp
+  - name: .stitch
+  - name: .updatefuzzer
+  - name: .tenant_migration
+  - name: watchdog_wiredtiger
+  - name: server_discovery_and_monitoring_json_test_TG
+  - name: server_selection_json_test_TG
+
+- <<: *ubuntu1804-debug-ubsan-template
+  name: ubuntu1804-debug-ubsan-classic-engine
+  display_name: ~ UBSAN Enterprise Ubuntu 18.04 DEBUG (Classic Execution Engine)
+  modules:
+  - enterprise
+  run_on:
+  - ubuntu1804-build
+  stepback: false
+  expansions:
+    additional_package_targets: archive-mongocryptd archive-mongocryptd-debug
+    lang_environment: LANG=C
+    # If you add anything to san_options, make sure the appropriate changes are
+    # also made to SConstruct.
+    san_options: UBSAN_OPTIONS="print_stacktrace=1:external_symbolizer_path=/opt/mongodbtoolchain/v3/bin/llvm-symbolizer"
+    compile_flags: --variables-files=etc/scons/mongodbtoolchain_v3_clang.vars --dbg=on --opt=on --sanitize=undefined --ssl --ocsp-stapling=off --enable-free-mon=on -j$(grep -c ^processor /proc/cpuinfo)
+    test_flags: >-
+      --mongodSetParameters="{internalQueryForceClassicEngine: true}"
+      --excludeWithAnyTags=requires_ocsp_stapling
+    multiversion_platform: ubuntu1804
+    multiversion_edition: enterprise
+    resmoke_jobs_factor: 0.3  # Avoid starting too many mongod's under UBSAN build.
+    scons_cache_scope: shared
+  tasks:
+  - name: compile_test_and_package_serial_TG
+  - name: compile_benchmarks
+  - name: .aggregation
+  - name: .auth
+  - name: audit
+  - name: .benchmarks
+  - name: .causally_consistent !.wo_snapshot
+  - name: .change_streams
+  - name: .misc_js
+  - name: .concurrency !.no_txns !.repl !.kill_terminate
+  - name: disk_wiredtiger
+  - name: .encrypt
+  - name: free_monitoring
+  - name: initial_sync_fuzzer_gen
+  - name: .integration !.audit
+  - name: .jscore .common
+  - name: jsCore_minimum_batch_size
+  - name: jsCore_op_query
+  - name: jsCore_txns_large_txns_format
+  - name: jsonSchema
+  - name: .logical_session_cache .one_sec
+  - name: .multi_shard .common
   - name: .read_write_concern
   - name: replica_sets_large_txns_format_gen
   - name: replica_sets_large_txns_format_jscore_passthrough

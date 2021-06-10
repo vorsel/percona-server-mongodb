@@ -28,6 +28,7 @@ env.Library(
         '$BUILD_DIR/mongo/db/views/views',
         '$BUILD_DIR/mongo/util/fail_point',
         'timeseries_idl',
+        'timeseries_options',
     ],
 )
 
@@ -42,9 +43,9 @@ env.Library(
 )
 
 env.Library(
-    target='timeseries_lookup',
+    target='timeseries_options',
     source=[
-        'timeseries_lookup.cpp',
+        'timeseries_options.cpp',
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',

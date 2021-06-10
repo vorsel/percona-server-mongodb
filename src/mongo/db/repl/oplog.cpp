@@ -164,6 +164,16 @@ void applyImportCollectionDefault(OperationContext* opCtx,
                         "isDryRun"_attr = isDryRun);
 }
 
+StringData getInvalidatingReason(const OplogApplication::Mode mode, const bool isDataConsistent) {
+    if (mode == OplogApplication::Mode::kInitialSync) {
+        return "initial sync"_sd;
+    } else if (!isDataConsistent) {
+        return "minvalid suggests inconsistent snapshot"_sd;
+    }
+
+    return ""_sd;
+}
+
 }  // namespace
 
 ApplyImportCollectionFn applyImportCollection = applyImportCollectionDefault;
@@ -248,6 +258,7 @@ void writeToImageCollection(OperationContext* opCtx,
                             const Timestamp timestamp,
                             repl::RetryImageEnum imageKind,
                             const BSONObj& dataImage,
+                            const StringData& invalidatedReason,
                             bool* upsertConfigImage) {
     AutoGetCollection autoColl(opCtx, NamespaceString::kConfigImagesNamespace, LockMode::MODE_IX);
     repl::ImageEntry imageEntry;
@@ -258,7 +269,7 @@ void writeToImageCollection(OperationContext* opCtx,
     imageEntry.setImage(dataImage);
     if (dataImage.isEmpty()) {
         imageEntry.setInvalidated(true);
-        imageEntry.setInvalidatedReason("initial sync"_sd);
+        imageEntry.setInvalidatedReason(invalidatedReason);
     }
 
     UpdateRequest request;
@@ -270,6 +281,8 @@ void writeToImageCollection(OperationContext* opCtx,
         write_ops::UpdateModification::parseFromClassicUpdate(imageEntry.toBSON()));
     request.setFromOplogApplication(true);
     try {
+        // This code path can also be hit by things such as `applyOps` and tenant migrations.
+        repl::UnreplicatedWritesBlock dontReplicate(opCtx);
         ::mongo::update(opCtx, autoColl.getDb(), request);
     } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
         // We can get a duplicate key when two upserts race on inserting a document.
@@ -332,7 +345,7 @@ void _logOpsInner(OperationContext* opCtx,
     // index build on the donor after the blockTimestamp, plus if an index build fails to commit due
     // to TenantMigrationConflict, we need to be able to abort the index build and clean up.
     if (repl::feature_flags::gTenantMigrations.isEnabledAndIgnoreFCV() && !isAbortIndexBuild) {
-        tenant_migration_access_blocker::checkIfCanWriteOrThrow(opCtx, nss.db());
+        tenant_migration_access_blocker::checkIfCanWriteOrThrow(opCtx, nss.db(), timestamps.back());
     }
 
     Status result = oplogCollection->insertDocumentsForOplog(opCtx, records, timestamps);
@@ -1082,6 +1095,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                              const OplogEntryOrGroupedInserts& opOrGroupedInserts,
                              bool alwaysUpsert,
                              OplogApplication::Mode mode,
+                             const bool isDataConsistent,
                              IncrementOpsAppliedStatsFn incrementOpsAppliedStats) {
     // Get the single oplog entry to be applied or the first oplog entry of grouped inserts.
     auto op = opOrGroupedInserts.getOp();
@@ -1416,7 +1430,10 @@ Status applyOperation_inlock(OperationContext* opCtx,
             if (updateMod.type() == write_ops::UpdateModification::Type::kDelta) {
                 // If we are validating features as primary, only allow $v:2 delta entries if we are
                 // at FCV 4.7 or newer to prevent them from being written to the oplog.
-                if (serverGlobalParams.validateFeaturesAsPrimary.load()) {
+                //
+                // TODO SERVER-57176: Remove the check on 'kRecovering'.
+                if (serverGlobalParams.validateFeaturesAsPrimary.load() &&
+                    mode != OplogApplication::Mode::kRecovering) {
                     uassert(4773100,
                             "Delta oplog entries may not be used in FCV below 4.7",
                             serverGlobalParams.featureCompatibility.isGreaterThanOrEqualTo(
@@ -1427,7 +1444,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
             request.setUpdateModification(std::move(updateMod));
             request.setUpsert(upsert);
             request.setFromOplogApplication(true);
-            if (mode != OplogApplication::Mode::kInitialSync) {
+            if (mode != OplogApplication::Mode::kInitialSync && isDataConsistent) {
                 if (op.getNeedsRetryImage() == repl::RetryImageEnum::kPreImage) {
                     request.setReturnDocs(UpdateRequest::ReturnDocOption::RETURN_OLD);
                 } else if (op.getNeedsRetryImage() == repl::RetryImageEnum::kPostImage) {
@@ -1555,6 +1572,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                                            // initial sync, the value passed in here is conveniently
                                            // the empty BSONObj.
                                            ur.requestedDocImage,
+                                           getInvalidatingReason(mode, isDataConsistent),
                                            &upsertConfigImage);
                 }
 
@@ -1606,7 +1624,8 @@ Status applyOperation_inlock(OperationContext* opCtx,
                 request.setNsString(requestNss);
                 request.setQuery(deleteCriteria);
                 if (mode != OplogApplication::Mode::kInitialSync &&
-                    op.getNeedsRetryImage() == repl::RetryImageEnum::kPreImage) {
+                    op.getNeedsRetryImage() == repl::RetryImageEnum::kPreImage &&
+                    isDataConsistent) {
                     // When in initial sync, we'll pass an empty image into
                     // `writeToImageCollection`.
                     request.setReturnDeleted(true);
@@ -1619,17 +1638,13 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     // isn't strictly necessary for correctness -- the `config.transactions` table
                     // is responsible for whether to retry. The motivation here is to simply reduce
                     // the number of states related documents in the two collections can be in.
-                    BSONObj imageDoc;
-                    if (result.nDeleted > 0 && mode != OplogApplication::Mode::kInitialSync) {
-                        imageDoc = result.requestedPreImage.get();
-                    }
-
                     writeToImageCollection(opCtx,
                                            op.getSessionId().get(),
                                            op.getTxnNumber().get(),
                                            op.getTimestamp(),
                                            repl::RetryImageEnum::kPreImage,
-                                           imageDoc,
+                                           result.requestedPreImage.value_or(BSONObj()),
+                                           getInvalidatingReason(mode, isDataConsistent),
                                            &upsertConfigImage);
                 }
 

@@ -255,7 +255,7 @@ public:
     }
 
     bool isCapped() const {
-        std::abort();
+        return false;
     }
 
     long long getCappedMaxDocs() const {
@@ -310,6 +310,10 @@ public:
     }
 
     boost::optional<TimeseriesOptions> getTimeseriesOptions() const {
+        std::abort();
+    }
+
+    void setTimeseriesOptions(OperationContext* opCtx, const TimeseriesOptions& tsOptions) {
         std::abort();
     }
 

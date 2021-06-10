@@ -4,14 +4,6 @@
 (function() {
 "use strict";
 
-const getParam = db.adminCommand({getParameter: 1, featureFlagWindowFunctions: 1});
-jsTestLog(getParam);
-const featureEnabled = assert.commandWorked(getParam).featureFlagWindowFunctions.value;
-if (!featureEnabled) {
-    jsTestLog("Skipping test because the window function feature flag is disabled");
-    return;
-}
-
 const coll = db.setWindowFields_derivative;
 
 // The default window is usually [unbounded, unbounded], but this would be surprising for
@@ -125,6 +117,23 @@ assert.docEq(result, [
     // time: 4 and time: 7.
     {time: 7, y: 118, dy: +3 / 3},
 ]);
+// Because the derivative is the same irrespective of sort order (as long as we reexpress the
+// bounds) we can compare this result with the result of the previous aggregation.
+const resultDesc =
+    coll.aggregate([
+            {
+                $setWindowFields: {
+                    sortBy: {time: -1},
+                    output: {
+                        dy: {$derivative: {input: "$y"}, window: {documents: [-1, +3]}},
+                    }
+                }
+            },
+            {$unset: "_id"},
+            {$sort: {time: 1}},
+        ])
+        .toArray();
+assert.docEq(result, resultDesc);
 
 // Example with range-based bounds.
 coll.drop();
