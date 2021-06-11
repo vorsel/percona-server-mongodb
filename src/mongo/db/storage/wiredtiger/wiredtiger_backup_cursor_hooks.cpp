@@ -97,12 +97,11 @@ BackupCursorState WiredTigerBackupCursorHooks::openBackupCursor(
         AutoGetCollectionForRead coll(opCtx, NamespaceString::kRsOplogNamespace);
         if (coll.getCollection()) {
             BSONObj lastEntry;
-            uassert(50914,
-                    str::stream() << "No oplog records were found.",
-                    Helpers::getLast(
-                        opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), lastEntry));
-            auto oplogEntry = fassertNoTrace(50913, repl::OplogEntry::parse(lastEntry));
-            oplogEnd = oplogEntry.getOpTime();
+            if (Helpers::getLast(
+                    opCtx, NamespaceString::kRsOplogNamespace.ns().c_str(), lastEntry)) {
+                auto oplogEntry = fassertNoTrace(50913, repl::OplogEntry::parse(lastEntry));
+                oplogEnd = oplogEntry.getOpTime();
+            }
         }
     }
 

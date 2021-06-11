@@ -45,12 +45,19 @@ constexpr StringData kTimestamp = "timestamp"_sd;
 
 // We only link this file into mongod so this stage doesn't exist in mongos
 REGISTER_DOCUMENT_SOURCE(backupCursorExtend,
-                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceBackupCursorExtend::LiteParsed::parse,
                          DocumentSourceBackupCursorExtend::createFromBson,
                          AllowedWithApiStrict::kAlways);
 }  // namespace
 
 using boost::intrusive_ptr;
+
+std::unique_ptr<DocumentSourceBackupCursorExtend::LiteParsed>
+DocumentSourceBackupCursorExtend::LiteParsed::parse(const NamespaceString& nss,
+                                                    const BSONElement& spec) {
+
+    return std::make_unique<DocumentSourceBackupCursorExtend::LiteParsed>(spec.fieldName());
+}
 
 const char* DocumentSourceBackupCursorExtend::getSourceName() const {
     return kStageName.rawData();
