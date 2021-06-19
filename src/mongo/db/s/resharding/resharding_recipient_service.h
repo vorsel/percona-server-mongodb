@@ -162,7 +162,8 @@ private:
      * The work inside this function must be run regardless of any work on _scopedExecutor ever
      * running.
      */
-    ExecutorFuture<void> _runMandatoryCleanup(Status status);
+    ExecutorFuture<void> _runMandatoryCleanup(Status status,
+                                              const CancellationToken& stepdownToken);
 
     // The following functions correspond to the actions to take at a particular recipient state.
     ExecutorFuture<void> _awaitAllDonorsPreparedToDonateThenTransitionToCreatingCollection(
@@ -172,10 +173,6 @@ private:
     void _createTemporaryReshardingCollectionThenTransitionToCloning();
 
     ExecutorFuture<void> _cloneThenTransitionToApplying(
-        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
-        const CancellationToken& abortToken);
-
-    ExecutorFuture<void> _applyThenTransitionToSteadyState(
         const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
         const CancellationToken& abortToken);
 
@@ -229,6 +226,11 @@ private:
         const CancellationToken& abortToken);
 
     ReshardingMetrics* _metrics() const;
+
+    void _startMetrics();
+
+    // Restore metrics using the persisted metrics after stepping up.
+    void _restoreMetrics();
 
     // Initializes the _abortSource and generates a token from it to return back the caller.
     //

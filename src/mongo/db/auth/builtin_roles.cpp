@@ -325,6 +325,8 @@ void addReadOnlyAnyDbPrivileges(PrivilegeVector* privileges) {
         privileges, Privilege(ResourcePattern::forClusterResource(), ActionType::listDatabases));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forCollectionName("system.js"), readRoleActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forAnySystemBuckets(), readRoleActions));
 }
 
 void addReadWriteAnyDbPrivileges(PrivilegeVector* privileges) {
@@ -334,6 +336,8 @@ void addReadWriteAnyDbPrivileges(PrivilegeVector* privileges) {
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,
         Privilege(ResourcePattern::forCollectionName("system.js"), readWriteRoleActions));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forAnySystemBuckets(), readWriteRoleActions));
 }
 
 void addUserAdminAnyDbPrivileges(PrivilegeVector* privileges) {
@@ -399,6 +403,8 @@ void addDbAdminAnyDbPrivileges(PrivilegeVector* privileges) {
         Privilege(ResourcePattern::forCollectionName("system.profile"), profileActions));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forClusterResource(), ActionType::applyOps));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forAnySystemBuckets(), dbAdminRoleActions));
 }
 
 void addClusterMonitorPrivileges(PrivilegeVector* privileges) {
@@ -501,6 +507,8 @@ void addQueryableBackupPrivileges(PrivilegeVector* privileges) {
         privileges, Privilege(ResourcePattern::forAnyResource(), ActionType::listIndexes));
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forAnyNormalResource(), ActionType::startBackup));
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forAnySystemBuckets(), ActionType::find));
 
     ActionSet clusterActions;
     clusterActions << ActionType::getParameter  // To check authSchemaVersion
@@ -592,6 +600,9 @@ void addRestorePrivileges(PrivilegeVector* privileges) {
 
     Privilege::addPrivilegeToPrivilegeVector(
         privileges, Privilege(ResourcePattern::forDatabaseName("config"), actions));
+
+    Privilege::addPrivilegeToPrivilegeVector(
+        privileges, Privilege(ResourcePattern::forAnySystemBuckets(), actions));
 
     Privilege::addPrivilegeToPrivilegeVector(
         privileges,

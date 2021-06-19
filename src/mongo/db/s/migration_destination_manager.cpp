@@ -360,7 +360,6 @@ void MigrationDestinationManager::report(BSONObjBuilder& b,
     b.append("min", _min);
     b.append("max", _max);
     b.append("shardKeyPattern", _shardKeyPattern);
-    b.append(StartChunkCloneRequest::kSupportsCriticalSectionDuringCatchUp, true);
 
     b.append("state", stateToString(_state));
 
@@ -548,24 +547,6 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
 
     stdx::unique_lock<Latch> lock(_mutex);
 
-    const auto convergenceTimeout =
-        Shard::kDefaultConfigCommandTimeout + Shard::kDefaultConfigCommandTimeout / 4;
-
-    // The donor may have started the commit while the recipient is still busy processing
-    // the last batch of mods sent in the catch up phase. Allow some time for synching up.
-    auto deadline = Date_t::now() + convergenceTimeout;
-
-    while (_state == CATCHUP) {
-        if (stdx::cv_status::timeout ==
-            _stateChangedCV.wait_until(lock, deadline.toSystemTimePoint())) {
-            return {ErrorCodes::CommandFailed,
-                    str::stream() << "startCommit timed out waiting for the catch up completion. "
-                                  << "Sender's session is " << sessionId.toString()
-                                  << ". Current session is "
-                                  << (_sessionId ? _sessionId->toString() : "none.")};
-        }
-    }
-
     if (_state != STEADY) {
         return {ErrorCodes::CommandFailed,
                 str::stream() << "Migration startCommit attempted when not in STEADY state."
@@ -593,7 +574,8 @@ Status MigrationDestinationManager::startCommit(const MigrationSessionId& sessio
 
     // Assigning a timeout slightly higher than the one used for network requests to the config
     // server. Enough time to retry at least once in case of network failures (SERVER-51397).
-    deadline = Date_t::now() + convergenceTimeout;
+    auto const deadline = Date_t::now() + Shard::kDefaultConfigCommandTimeout +
+        Shard::kDefaultConfigCommandTimeout / 4;
     while (_sessionId) {
         if (stdx::cv_status::timeout ==
             _isActiveCV.wait_until(lock, deadline.toSystemTimePoint())) {
@@ -964,6 +946,33 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
     auto fromShard =
         uassertStatusOK(Grid::get(outerOpCtx)->shardRegistry()->getShard(outerOpCtx, _fromShard));
 
+    // The conventional usage of retryable writes is to assign statement id's to all of
+    // the writes done as part of the data copying so that _recvChunkStart is
+    // conceptually a retryable write batch. However, we are using an alternate approach to do those
+    // writes under an AlternativeClientRegion because 1) threading the
+    // statement id's through to all the places where they are needed would make this code more
+    // complex, and 2) some of the operations, like creating the collection or building indexes, are
+    // not currently supported in retryable writes.
+    {
+        auto newClient = outerOpCtx->getServiceContext()->makeClient("MigrationCoordinator");
+        {
+            stdx::lock_guard<Client> lk(*newClient.get());
+            newClient->setSystemOperationKillableByStepdown(lk);
+        }
+
+        AlternativeClientRegion acr(newClient);
+        auto executor =
+            Grid::get(outerOpCtx->getServiceContext())->getExecutorPool()->getFixedExecutor();
+        auto altOpCtx = CancelableOperationContext(
+            cc().makeOperationContext(), outerOpCtx->getCancellationToken(), executor);
+
+        _dropLocalIndexesIfNecessary(altOpCtx.get(), _nss, donorCollectionOptionsAndIndexes);
+        cloneCollectionIndexesAndOptions(altOpCtx.get(), _nss, donorCollectionOptionsAndIndexes);
+
+        timing.done(1);
+        migrateThreadHangAtStep1.pauseWhileSet();
+    }
+
     {
         const ChunkRange range(_min, _max);
 
@@ -1020,38 +1029,21 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
                 outerOpCtx, latestOpTime, WriteConcerns::kMajorityWriteConcern, &ignoreResult));
         });
 
-        timing.done(1);
-        migrateThreadHangAtStep1.pauseWhileSet();
+        timing.done(2);
+        migrateThreadHangAtStep2.pauseWhileSet();
     }
 
-    // The conventional usage of retryable writes is to assign statement id's to all of
-    // the writes done as part of the data copying so that _recvChunkStart is
-    // conceptually a retryable write batch. However, we are using an alternate approach to do those
-    // writes under an AlternativeClientRegion because 1) threading the
-    // statement id's through to all the places where they are needed would make this code more
-    // complex, and 2) some of the operations, like creating the collection or building indexes, are
-    // not currently supported in retryable writes.
     auto newClient = outerOpCtx->getServiceContext()->makeClient("MigrationCoordinator");
     {
         stdx::lock_guard<Client> lk(*newClient.get());
         newClient->setSystemOperationKillableByStepdown(lk);
     }
-
     AlternativeClientRegion acr(newClient);
     auto executor =
         Grid::get(outerOpCtx->getServiceContext())->getExecutorPool()->getFixedExecutor();
     auto newOpCtxPtr = CancelableOperationContext(
         cc().makeOperationContext(), outerOpCtx->getCancellationToken(), executor);
     auto opCtx = newOpCtxPtr.get();
-
-    {
-        _dropLocalIndexesIfNecessary(opCtx, _nss, donorCollectionOptionsAndIndexes);
-        cloneCollectionIndexesAndOptions(opCtx, _nss, donorCollectionOptionsAndIndexes);
-
-        timing.done(2);
-        migrateThreadHangAtStep2.pauseWhileSet();
-    }
-
     repl::OpTime lastOpApplied;
     {
         // 3. Initial bulk clone
@@ -1182,7 +1174,6 @@ void MigrationDestinationManager::_migrateDriver(OperationContext* outerOpCtx) {
             const auto& mods = res.response;
 
             if (mods["size"].number() == 0) {
-                // There are no more pending modifications to be applied. End the catchup phase
                 break;
             }
 

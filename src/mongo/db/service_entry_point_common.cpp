@@ -357,7 +357,9 @@ StatusWith<repl::ReadConcernArgs> _extractReadConcern(OperationContext* opCtx,
         return readConcernParseStatus;
     }
 
-    bool clientSuppliedReadConcern = readConcernArgs.isSpecified();
+    // Represents whether the client explicitly defines read concern within the cmdObj or not.
+    // It will be set to false also if the client specifies empty read concern {readConcern: {}}.
+    bool clientSuppliedReadConcern = !readConcernArgs.isEmpty();
     bool customDefaultWasApplied = false;
     auto readConcernSupport = invocation->supportsReadConcern(readConcernArgs.getLevel(),
                                                               readConcernArgs.isImplicitDefault());
@@ -1302,7 +1304,8 @@ Future<void> RunCommandAndWaitForWriteConcern::_runCommandWithFailPoint() {
 Future<void> RunCommandAndWaitForWriteConcern::_handleError(Status status) {
     auto opCtx = _execContext->getOpCtx();
     // Do no-op write before returning NoSuchTransaction if command has writeConcern.
-    if (status.code() == ErrorCodes::NoSuchTransaction && !opCtx->getWriteConcern().usedDefault) {
+    if (status.code() == ErrorCodes::NoSuchTransaction &&
+        !opCtx->getWriteConcern().usedDefaultConstructedWC) {
         TransactionParticipant::performNoopWrite(opCtx, "NoSuchTransaction error");
     }
     _waitForWriteConcern(*_ecd->getExtraFieldsBuilder());

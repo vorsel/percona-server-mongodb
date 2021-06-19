@@ -1227,11 +1227,6 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
             4784909, {LogComponent::kReplication}, "Shutting down the ReplicationCoordinator");
         repl::ReplicationCoordinator::get(serviceContext)->shutdown(opCtx);
 
-        LOGV2_OPTIONS(5093807,
-                      {LogComponent::kTenantMigration},
-                      "Shutting down all TenantMigrationAccessBlockers on global shutdown");
-        TenantMigrationAccessBlockerRegistry::get(serviceContext).shutDown();
-
         // Terminate the index consistency check.
         if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer) {
             LOGV2_OPTIONS(4784904,
@@ -1260,6 +1255,14 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
         LOGV2_OPTIONS(4784912, {LogComponent::kDefault}, "Killing all operations for shutdown");
         const std::set<std::string> excludedClients = {std::string(kFTDCThreadName)};
         serviceContext->setKillAllOperations(excludedClients);
+
+        // Clear tenant migration access blockers after killing all operation contexts to ensure
+        // that no operation context cancellation token continuation holds the last reference to the
+        // TenantMigrationAccessBlockerExecutor.
+        LOGV2_OPTIONS(5093807,
+                      {LogComponent::kTenantMigration},
+                      "Shutting down all TenantMigrationAccessBlockers on global shutdown");
+        TenantMigrationAccessBlockerRegistry::get(serviceContext).shutDown();
 
         if (MONGO_unlikely(pauseWhileKillingOperationsAtShutdown.shouldFail())) {
             LOGV2_OPTIONS(4701700,
@@ -1323,7 +1326,7 @@ void shutdownTask(const ShutdownTaskArgs& shutdownArgs) {
     // The migrationutil executor must be shut down before shutting down the CatalogCacheLoader.
     // Otherwise, it may try to schedule work on the CatalogCacheLoader and fail.
     LOGV2_OPTIONS(4784921, {LogComponent::kSharding}, "Shutting down the MigrationUtilExecutor");
-    auto migrationUtilExecutor = migrationutil::getMigrationUtilExecutor();
+    auto migrationUtilExecutor = migrationutil::getMigrationUtilExecutor(serviceContext);
     migrationUtilExecutor->shutdown();
     migrationUtilExecutor->join();
 
