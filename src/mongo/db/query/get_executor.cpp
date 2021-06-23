@@ -567,7 +567,7 @@ public:
                         "namespace"_attr = _cq->ns(),
                         "canonicalQuery"_attr = redact(_cq->toStringShort()));
 
-            auto solution = std::make_unique<QuerySolution>(_plannerOptions);
+            auto solution = std::make_unique<QuerySolution>();
             solution->setRoot(std::make_unique<EofNode>());
 
             auto root = buildExecutableTree(*solution);
@@ -974,7 +974,7 @@ protected:
             }
         }
 
-        auto soln = std::make_unique<QuerySolution>(plannerParams->options);
+        auto soln = std::make_unique<QuerySolution>();
         soln->setRoot(std::move(root));
 
         auto execTree = buildExecutableTree(*soln);
@@ -1202,7 +1202,7 @@ StatusWith<std::unique_ptr<PlanExecutor, PlanExecutor::Deleter>> getExecutor(
     std::unique_ptr<CanonicalQuery> canonicalQuery,
     PlanYieldPolicy::YieldPolicy yieldPolicy,
     size_t plannerOptions) {
-    return !canonicalQuery->getForceClassicEngine() &&
+    return canonicalQuery->getEnableSlotBasedExecutionEngine() &&
             isQuerySbeCompatible(opCtx, canonicalQuery.get(), plannerOptions)
         ? getSlotBasedExecutor(
               opCtx, collection, std::move(canonicalQuery), yieldPolicy, plannerOptions)

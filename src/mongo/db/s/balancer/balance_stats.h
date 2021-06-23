@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2018-present MongoDB, Inc.
+ *    Copyright (C) 2021-present MongoDB, Inc.
  *
  *    This program is free software: you can redistribute it and/or modify
  *    it under the terms of the Server Side Public License, version 1,
@@ -29,13 +29,22 @@
 
 #pragma once
 
+#include <cstddef>
+#include <vector>
+
+#include "mongo/s/catalog/type_shard.h"
+
 namespace mongo {
 
-class ServiceContext;
+class ChunkManager;
+class ZoneInfo;
 
 /**
- * Perform security initialization activity for mongod and mongos.
+ * Returns the maximum chunk imbalance (most chunks in shard minus least chunks in shard) among each
+ * zone. The default unlabeled zone is considered as its own zone.
  */
-bool initializeServerSecurityGlobalState(ServiceContext* service);
+int64_t getMaxChunkImbalanceCount(const ChunkManager& routingInfo,
+                                  const std::vector<ShardType>& allShards,
+                                  const ZoneInfo& zoneInfo);
 
 }  // namespace mongo

@@ -85,17 +85,9 @@ void RenameCollectionCoordinator::checkIfOptionsConflict(const BSONObj& doc) con
             SimpleBSONObjComparator::kInstance.evaluate(selfReq == otherReq));
 }
 
-std::vector<DistLockManager::ScopedDistLock> RenameCollectionCoordinator::_acquireAdditionalLocks(
+std::vector<StringData> RenameCollectionCoordinator::_acquireAdditionalLocks(
     OperationContext* opCtx) {
-    const auto coorName = DDLCoordinatorType_serializer(_coorMetadata.getId().getOperationType());
-
-    auto distLockManager = DistLockManager::get(opCtx);
-    auto targetCollDistLock = uassertStatusOK(distLockManager->lock(
-        opCtx, _doc.getTo().ns(), coorName, DistLockManager::kDefaultLockTimeout));
-
-    std::vector<DistLockManager::ScopedDistLock> vec;
-    vec.push_back(targetCollDistLock.moveToAnotherThread());
-    return vec;
+    return {_doc.getTo().ns()};
 }
 
 boost::optional<BSONObj> RenameCollectionCoordinator::reportForCurrentOp(
@@ -288,23 +280,24 @@ ExecutorFuture<void> RenameCollectionCoordinator::_runImpl(
                                     participants,
                                     **executor);
                             }))
-        .then(_executePhase(
-            Phase::kRenameMetadata,
-            [this, anchor = shared_from_this()] {
-                auto opCtxHolder = cc().makeOperationContext();
-                auto* opCtx = opCtxHolder.get();
-                getForwardableOpMetadata().setOn(opCtx);
+        .then(_executePhase(Phase::kRenameMetadata,
+                            [this, anchor = shared_from_this()] {
+                                auto opCtxHolder = cc().makeOperationContext();
+                                auto* opCtx = opCtxHolder.get();
+                                getForwardableOpMetadata().setOn(opCtx);
 
-                const auto& optFromCollType = _doc.getOptShardedCollInfo();
-                if (optFromCollType) {
-                    // Rename CSRS metadata
-                    auto collType = *optFromCollType;
-                    sharding_ddl_util::shardedRenameMetadata(opCtx, collType, _doc.getTo());
-                } else if (_doc.getTargetIsSharded()) {
-                    // Remove stale target CSRS metadata
-                    sharding_ddl_util::removeCollMetadataFromConfig(opCtx, _doc.getTo());
-                }
-            }))
+                                ConfigsvrRenameCollectionMetadata req(nss(), _doc.getTo());
+                                req.setOptFromCollection(_doc.getOptShardedCollInfo());
+
+                                const auto& configShard =
+                                    Grid::get(opCtx)->shardRegistry()->getConfigShard();
+                                uassertStatusOK(configShard->runCommand(
+                                    opCtx,
+                                    ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                    "admin",
+                                    CommandHelpers::appendMajorityWriteConcern(req.toBSON({})),
+                                    Shard::RetryPolicy::kIdempotent));
+                            }))
         .then(_executePhase(
             Phase::kUnblockCRUD,
             [this, executor = executor, anchor = shared_from_this()] {

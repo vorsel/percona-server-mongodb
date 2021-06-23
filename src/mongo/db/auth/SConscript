@@ -42,6 +42,8 @@ env.Library(
         '$BUILD_DIR/mongo/db/service_context',
     ],
     LIBDEPS_PRIVATE=[
+        'auth_options',
+        'cluster_auth_mode',
         'sasl_options',
     ],
 )
@@ -136,6 +138,16 @@ env.Library(
     LIBDEPS_PRIVATE=[
         'address_restriction',
         'authprivilege',
+    ],
+)
+
+env.Library(
+    target='cluster_auth_mode',
+    source=[
+        'cluster_auth_mode.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
@@ -277,7 +289,12 @@ env.Library(
         'authorization_manager_global_parameters.idl',
     ],
     LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/client/authentication",
         '$BUILD_DIR/mongo/idl/server_parameter',
+        "$BUILD_DIR/mongo/util/net/ssl_manager",
+        "$BUILD_DIR/mongo/util/net/ssl_parameters_auth",
+        'cluster_auth_mode',
+        'security_key'
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/db/ldap/ldapmanager',
@@ -303,6 +320,7 @@ env.Library(
         '$BUILD_DIR/mongo/util/icu',
         '$BUILD_DIR/mongo/util/md5',
         'auth',
+        'cluster_auth_mode',
         'sasl_options',
         'security_file',
         'user',
@@ -411,6 +429,9 @@ env.Library(
         'authprivilege',
         'sasl_options',
         'user',
+    ],
+    LIBDEPS_PRIVATE=[
+        'cluster_auth_mode',
     ],
 )
 

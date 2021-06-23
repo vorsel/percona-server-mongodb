@@ -38,6 +38,8 @@
 #include "mongo/db/logical_session_cache.h"
 #include "mongo/db/ops/write_ops.h"
 #include "mongo/db/repl/primary_only_service.h"
+#include "mongo/db/s/balancer/balance_stats.h"
+#include "mongo/db/s/balancer/balancer_policy.h"
 #include "mongo/db/s/config/initial_split_policy.h"
 #include "mongo/db/s/config/sharding_catalog_manager.h"
 #include "mongo/db/s/resharding/resharding_coordinator_commit_monitor.h"
@@ -542,35 +544,23 @@ void updateChunkAndTagsDocsForTempNss(OperationContext* opCtx,
                                       OID newCollectionEpoch,
                                       boost::optional<Timestamp> newCollectionTimestamp,
                                       TxnNumber txnNumber) {
-    // Update all chunk documents that currently have 'ns' as the temporary collection namespace
-    // such that 'ns' is now the original collection namespace and 'lastmodEpoch' is
-    // newCollectionEpoch.
-    const auto chunksQuery = [&]() {
-        if (newCollectionTimestamp) {
-            return BSON(ChunkType::collectionUUID() << coordinatorDoc.getReshardingUUID());
-        } else {
-            return BSON(ChunkType::ns(coordinatorDoc.getTempReshardingNss().ns()));
-        }
-    }();
-    const auto chunksUpdate = [&]() {
-        if (newCollectionTimestamp) {
-            return BSON("$set" << BSON(ChunkType::epoch << newCollectionEpoch
-                                                        << ChunkType::timestamp
-                                                        << *newCollectionTimestamp));
-        } else {
-            return BSON("$set" << BSON(ChunkType::ns << coordinatorDoc.getSourceNss().ns()
-                                                     << ChunkType::epoch << newCollectionEpoch));
-        }
-    }();
-    auto chunksRequest = BatchedCommandRequest::buildUpdateOp(ChunkType::ConfigNS,
-                                                              chunksQuery,   // query
-                                                              chunksUpdate,  // update
-                                                              false,         // upsert
-                                                              true           // multi
-    );
+    // If the collection entry has a timestamp, this means the metadata has been upgraded to the 5.0
+    // format in which case chunks are indexed by UUID and do not contain Epochs. Therefore, only
+    // the update to config.collections is sufficient.
+    if (!newCollectionTimestamp) {
+        auto chunksRequest = BatchedCommandRequest::buildUpdateOp(
+            ChunkType::ConfigNS,
+            BSON(ChunkType::ns(coordinatorDoc.getTempReshardingNss().ns())),  // query
+            BSON("$set" << BSON(ChunkType::ns << coordinatorDoc.getSourceNss().ns()
+                                              << ChunkType::epoch
+                                              << newCollectionEpoch)),  // update
+            false,                                                      // upsert
+            true                                                        // multi
+        );
 
-    auto chunksRes = ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
-        opCtx, ChunkType::ConfigNS, chunksRequest, txnNumber);
+        auto chunksRes = ShardingCatalogManager::get(opCtx)->writeToConfigDocumentInTxn(
+            opCtx, ChunkType::ConfigNS, chunksRequest, txnNumber);
+    }
 
     auto tagsRequest = BatchedCommandRequest::buildUpdateOp(
         TagsType::ConfigNS,
@@ -609,12 +599,12 @@ CollectionType createTempReshardingCollectionType(
     const BSONObj& collation) {
     CollectionType collType(coordinatorDoc.getTempReshardingNss(),
                             chunkVersion.epoch(),
+                            chunkVersion.getTimestamp(),
                             opCtx->getServiceContext()->getPreciseClockSource()->now(),
                             coordinatorDoc.getReshardingUUID());
     collType.setKeyPattern(coordinatorDoc.getReshardingKey());
     collType.setDefaultCollation(collation);
     collType.setUnique(false);
-    collType.setTimestamp(chunkVersion.getTimestamp());
 
     TypeCollectionReshardingFields tempEntryReshardingFields(coordinatorDoc.getReshardingUUID());
     tempEntryReshardingFields.setState(coordinatorDoc.getState());
@@ -1146,6 +1136,7 @@ ReshardingCoordinatorService::ReshardingCoordinator::_persistDecisionAndFinishRe
         .then([this, self = shared_from_this(), executor] {
             _tellAllParticipantsToRefresh(_coordinatorDoc.getSourceNss(), executor);
         })
+        .then([this] { _updateChunkImbalanceMetrics(_coordinatorDoc.getSourceNss()); })
         .then([this, self = shared_from_this(), executor] {
             // The shared_ptr maintaining the ReshardingCoordinatorService Instance object gets
             // deleted from the PrimaryOnlyService's map. Thus, shared_from_this() is necessary to
@@ -1670,6 +1661,46 @@ void ReshardingCoordinatorService::ReshardingCoordinator::_tellAllParticipantsTo
                                                             << WriteConcernOptions::Majority)),
                                        {participantShardIds.begin(), participantShardIds.end()},
                                        **executor);
+}
+
+void ReshardingCoordinatorService::ReshardingCoordinator::_updateChunkImbalanceMetrics(
+    const NamespaceString& nss) {
+    auto cancellableOpCtx = _cancelableOpCtxFactory->makeOperationContext(&cc());
+    auto opCtx = cancellableOpCtx.get();
+
+    try {
+        auto routingInfo = uassertStatusOK(
+            Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
+                                                                                         nss));
+
+        const auto collectionZones =
+            uassertStatusOK(Grid::get(opCtx)->catalogClient()->getTagsForCollection(opCtx, nss));
+
+        const auto& keyPattern = routingInfo.getShardKeyPattern().getKeyPattern();
+
+        ZoneInfo zoneInfo;
+        for (const auto& tag : collectionZones) {
+            uassertStatusOK(zoneInfo.addRangeToZone(
+                ZoneRange(keyPattern.extendRangeBound(tag.getMinKey(), false),
+                          keyPattern.extendRangeBound(tag.getMaxKey(), false),
+                          tag.getTag())));
+        }
+
+        const auto allShardsWithOpTime =
+            uassertStatusOK(Grid::get(opCtx)->catalogClient()->getAllShards(
+                opCtx, repl::ReadConcernLevel::kLocalReadConcern));
+
+        auto imbalanceCount =
+            getMaxChunkImbalanceCount(routingInfo, allShardsWithOpTime.value, zoneInfo);
+
+        ReshardingMetrics::get(opCtx->getServiceContext())
+            ->setLastReshardChunkImbalanceCount(imbalanceCount);
+    } catch (const DBException& ex) {
+        LOGV2_WARNING(5543000,
+                      "Encountered error while trying to update resharding chunk imbalance metrics",
+                      "namespace"_attr = nss,
+                      "error"_attr = redact(ex.toStatus()));
+    }
 }
 
 }  // namespace mongo

@@ -341,6 +341,7 @@ env.Library(
         '$BUILD_DIR/mongo/base',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/auth/cluster_auth_mode',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
         'server_options_core',
     ],
@@ -360,26 +361,8 @@ env.Clone().InjectModule("enterprise").Library(
         'server_options',
         'server_options_base',
     ],
-)
-
-# This library is linked into mongos and mongod only, not into the shell or any tools.
-env.Library(
-    target="initialize_server_security_state",
-    source=[
-        "initialize_server_security_state.cpp",
-    ],
-    LIBDEPS=[
-        "serverinit",
-    ],
     LIBDEPS_PRIVATE=[
-        "$BUILD_DIR/mongo/client/authentication",
-        "$BUILD_DIR/mongo/db/auth/auth",
-        "$BUILD_DIR/mongo/db/auth/security_key",
-        "$BUILD_DIR/mongo/rpc/metadata",
-        "$BUILD_DIR/mongo/rpc/rpc",
-        "$BUILD_DIR/mongo/util/net/ssl_manager",
-        "$BUILD_DIR/mongo/util/net/ssl_parameters_auth",
-        "auth/authorization_manager_global",
+        '$BUILD_DIR/mongo/db/auth/cluster_auth_mode',
     ],
 )
 
@@ -424,6 +407,7 @@ env.Library(
         'ratelimit_parameter.idl',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/auth/cluster_auth_mode',
         '$BUILD_DIR/mongo/db/ldap_options',
         '$BUILD_DIR/mongo/db/repl/repl_settings',
         '$BUILD_DIR/mongo/db/repl/replica_set_messages',
@@ -1125,6 +1109,7 @@ env.Library(
         'read_concern_mongod.idl',
     ],
     LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/db/repl/tenant_migration_access_blocker",
         "$BUILD_DIR/mongo/idl/server_parameter",
         "$BUILD_DIR/mongo/s/grid",
         "catalog_raii",
@@ -2138,7 +2123,6 @@ env.Library(
         'index/index_access_methods',
         'index/index_descriptor',
         'index_builds_coordinator_mongod',
-        'initialize_server_security_state',
         'initialize_snmp',
         'introspect',
         'keys_collection_client_direct',
@@ -2242,7 +2226,6 @@ env.Library(
         'index/index_access_method_factory',
         'index/index_access_methods',
         'index_builds_coordinator_mongod',
-        'initialize_server_security_state',
         'initialize_snmp',
         'keys_collection_client_direct',
         'kill_sessions',
