@@ -368,6 +368,102 @@ static void copy_keydb_files(const boost::filesystem::path& from,
         emptyDirs.push_back(from);
 }
 
+namespace {
+
+StatusWith<std::vector<StorageEngine::BackupBlock>> getBackupBlocksFromBackupCursor(
+    WT_SESSION* session,
+    WT_CURSOR* cursor,
+    bool incrementalBackup,
+    bool fullBackup,
+    std::string dbPath,
+    const char* statusPrefix) {
+    int wtRet;
+    std::vector<StorageEngine::BackupBlock> backupBlocks;
+    const char* filename;
+    const auto directoryPath = boost::filesystem::path(dbPath);
+    const auto wiredTigerLogFilePrefix = "WiredTigerLog";
+    while ((wtRet = cursor->next(cursor)) == 0) {
+        invariantWTOK(cursor->get_key(cursor, &filename));
+
+        std::string name(filename);
+
+        boost::filesystem::path filePath = directoryPath;
+        if (name.find(wiredTigerLogFilePrefix) == 0) {
+            // TODO SERVER-13455:replace `journal/` with the configurable journal path.
+            filePath /= boost::filesystem::path("journal");
+        }
+        filePath /= name;
+
+        boost::system::error_code errorCode;
+        const std::uint64_t fileSize = boost::filesystem::file_size(filePath, errorCode);
+        uassert(31403,
+                "Failed to get a file's size. Filename: {} Error: {}"_format(filePath.string(),
+                                                                             errorCode.message()),
+                !errorCode);
+
+        if (incrementalBackup && !fullBackup) {
+            // For a subsequent incremental backup, each BackupBlock corresponds to changes
+            // made to data files since the initial incremental backup. Each BackupBlock has a
+            // maximum size of options.blockSizeMB.
+            // For each file listed, open a duplicate backup cursor and get the blocks to copy.
+            std::stringstream ss;
+            ss << "incremental=(file=" << filename << ")";
+            const std::string config = ss.str();
+            WT_CURSOR* dupCursor;
+            wtRet = session->open_cursor(session, nullptr, cursor, config.c_str(), &dupCursor);
+            if (wtRet != 0) {
+                return wtRCToStatus(wtRet);
+            }
+
+            bool fileUnchangedFlag = true;
+            while ((wtRet = dupCursor->next(dupCursor)) == 0) {
+                fileUnchangedFlag = false;
+                uint64_t offset, size, type;
+                invariantWTOK(dupCursor->get_key(dupCursor, &offset, &size, &type));
+                LOGV2_DEBUG(22311,
+                            2,
+                            "Block to copy for incremental backup: filename: {filePath_string}, "
+                            "offset: {offset}, size: {size}, type: {type}",
+                            "filePath_string"_attr = filePath.string(),
+                            "offset"_attr = offset,
+                            "size"_attr = size,
+                            "type"_attr = type);
+                backupBlocks.push_back({filePath.string(), offset, size, fileSize});
+            }
+
+            // If the file is unchanged, push a BackupBlock with offset=0 and length=0. This allows
+            // us to distinguish between an unchanged file and a deleted file in an incremental
+            // backup.
+            if (fileUnchangedFlag) {
+                backupBlocks.push_back(
+                    {filePath.string(), 0 /* offset */, 0 /* length */, fileSize});
+            }
+
+            if (wtRet != WT_NOTFOUND) {
+                return wtRCToStatus(wtRet);
+            }
+
+            wtRet = dupCursor->close(dupCursor);
+            if (wtRet != 0) {
+                return wtRCToStatus(wtRet);
+            }
+        } else {
+            // For a full backup or the initial incremental backup, each BackupBlock corresponds
+            // to an entire file. Full backups cannot open an incremental cursor, even if they
+            // are the initial incremental backup.
+            const std::uint64_t length = incrementalBackup ? fileSize : 0;
+            backupBlocks.push_back({filePath.string(), 0 /* offset */, length, fileSize});
+        }
+    }
+
+    if (wtRet != WT_NOTFOUND) {
+        return wtRCToStatus(wtRet, statusPrefix);
+    }
+    return backupBlocks;
+}
+
+}  // namespace
+
 StringData WiredTigerKVEngine::kTableUriPrefix = "table:"_sd;
 
 WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
