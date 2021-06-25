@@ -605,9 +605,13 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
         // setup encryption hooks
         // WiredTigerEncryptionHooks instance should be created after EncryptionKeyDB (depends on it)
         if (encryptionGlobalParams.encryptionCipherMode == "AES256-CBC")
-            EncryptionHooks::set(getGlobalServiceContext(), std::make_unique<WiredTigerEncryptionHooksCBC>());
+            EncryptionHooks::set(
+                getGlobalServiceContext(),
+                std::make_unique<WiredTigerEncryptionHooksCBC>(_encryptionKeyDB.get()));
         else // AES256-GCM
-            EncryptionHooks::set(getGlobalServiceContext(), std::make_unique<WiredTigerEncryptionHooksGCM>());
+            EncryptionHooks::set(
+                getGlobalServiceContext(),
+                std::make_unique<WiredTigerEncryptionHooksGCM>(_encryptionKeyDB.get()));
     }
 
     std::stringstream ss;
@@ -1577,6 +1581,56 @@ StatusWith<std::vector<std::string>> WiredTigerKVEngine::extendBackupCursor(
     // established point-in-time for backup, they will need to create a full copy of the additional
     // journal files returned by this method to ensure a consistent backup of the data is taken.
     return getUniqueFiles(filePaths, _wtBackup.logFilePathsSeenByGetNextBatch);
+}
+
+StatusWith<std::vector<StorageEngine::BackupBlock>> EncryptionKeyDB::beginNonBlockingBackup(
+    const StorageEngine::BackupOptions& options) {
+    std::stringstream ss;
+    if (options.incrementalBackup) {
+        invariant(options.thisBackupName);
+        ss << "incremental=(enabled=true,force_stop=false,";
+        ss << "granularity=" << options.blockSizeMB << "MB,";
+        ss << "this_id=" << std::quoted(str::escape(*options.thisBackupName)) << ",";
+
+        if (options.srcBackupName) {
+            ss << "src_id=" << std::quoted(str::escape(*options.srcBackupName)) << ",";
+        }
+
+        ss << ")";
+    }
+
+    // This cursor will be freed by the backupSession being closed as the session is uncached
+    auto sessionRaii = std::make_unique<WiredTigerSession>(_conn);
+    WT_CURSOR* cursor = nullptr;
+    WT_SESSION* session = sessionRaii->getSession();
+    const std::string config = ss.str();
+    int wtRet = session->open_cursor(session, "backup:", nullptr, config.c_str(), &cursor);
+    if (wtRet != 0) {
+        return wtRCToStatus(wtRet);
+    }
+
+    const bool fullBackup = !options.srcBackupName;
+    auto swBackupBlocks = getBackupBlocksFromBackupCursor(session,
+                                                          cursor,
+                                                          options.incrementalBackup,
+                                                          fullBackup,
+                                                          _path,
+                                                          "Error opening backup cursor.");
+
+    if (!swBackupBlocks.isOK()) {
+        return swBackupBlocks;
+    }
+
+    _backupSession = std::move(sessionRaii);
+    _backupCursor = cursor;
+
+    return swBackupBlocks;
+}
+
+Status EncryptionKeyDB::endNonBlockingBackup() {
+    _backupSession.reset();
+    _backupCursor = nullptr;
+    return Status::OK();
 }
 
 // Can throw standard exceptions

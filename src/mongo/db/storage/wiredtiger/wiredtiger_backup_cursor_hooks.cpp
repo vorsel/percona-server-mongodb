@@ -162,11 +162,10 @@ BackupCursorState WiredTigerBackupCursorHooks::openBackupCursor(
                 oplogStart < oplogEnd);
     }
 
-    auto encHooks = EncryptionHooks::get(opCtx->getServiceContext());
+    std::vector<StorageEngine::BackupBlock> eseBackupBlocks;
+    auto* encHooks = EncryptionHooks::get(opCtx->getServiceContext());
     if (encHooks->enabled()) {
-        auto eseFiles = uassertStatusOK(encHooks->beginNonBlockingBackup());
-        // TODO: fix this for encryption DB
-        // filesToBackup.insert(filesToBackup.end(), eseFiles.begin(), eseFiles.end());
+        eseBackupBlocks = uassertStatusOK(encHooks->beginNonBlockingBackup(options));
     }
 
     BSONObjBuilder builder;
@@ -185,7 +184,10 @@ BackupCursorState WiredTigerBackupCursorHooks::openBackupCursor(
     Document preamble{{"metadata"_sd, builder.obj()}};
 
     closeCursorGuard.dismiss();
-    return {_openCursor.get(), preamble, filesToBackup};
+    return {_openCursor.get(),
+            std::move(preamble),
+            std::move(filesToBackup),
+            std::move(eseBackupBlocks)};
 }
 
 void WiredTigerBackupCursorHooks::closeBackupCursor(OperationContext* opCtx, const UUID& backupId) {
@@ -202,7 +204,7 @@ void WiredTigerBackupCursorHooks::_closeBackupCursor(OperationContext* opCtx,
                           << " Running: " << _openCursor.get(),
             backupId == _openCursor.get());
     _storageEngine->endNonBlockingBackup(opCtx);
-    auto encHooks = EncryptionHooks::get(opCtx->getServiceContext());
+    auto* encHooks = EncryptionHooks::get(opCtx->getServiceContext());
     if (encHooks->enabled()) {
         fassert(50934, encHooks->endNonBlockingBackup());
     }

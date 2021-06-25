@@ -95,7 +95,8 @@ namespace {
 }
 
 
-WiredTigerEncryptionHooks::WiredTigerEncryptionHooks() = default;
+WiredTigerEncryptionHooks::WiredTigerEncryptionHooks(EncryptionKeyDB* encryptionKeyDB)
+    : _encryptionKeyDB(encryptionKeyDB) {}
 
 WiredTigerEncryptionHooks::~WiredTigerEncryptionHooks() = default;
 
@@ -105,6 +106,15 @@ bool WiredTigerEncryptionHooks::enabled() const {
 
 bool WiredTigerEncryptionHooks::restartRequired() {
     return false;
+}
+
+StatusWith<std::vector<StorageEngine::BackupBlock>>
+WiredTigerEncryptionHooks::beginNonBlockingBackup(const StorageEngine::BackupOptions& options) {
+    return _encryptionKeyDB->beginNonBlockingBackup(options);
+}
+
+Status WiredTigerEncryptionHooks::endNonBlockingBackup() {
+    return _encryptionKeyDB->endNonBlockingBackup();
 }
 
 const unsigned char* WiredTigerEncryptionHooks::dbKey(boost::optional<std::string> dbName,
@@ -125,7 +135,8 @@ const unsigned char* WiredTigerEncryptionHooks::dbKey(boost::optional<std::strin
 }
 
 
-WiredTigerEncryptionHooksCBC::WiredTigerEncryptionHooksCBC() {
+WiredTigerEncryptionHooksCBC::WiredTigerEncryptionHooksCBC(EncryptionKeyDB* encryptionKeyDB)
+    : WiredTigerEncryptionHooks(encryptionKeyDB) {
     _cipher = EVP_aes_256_cbc();
     _iv_len = EVP_CIPHER_iv_length(_cipher);
     // get wiredTiger's crc32c function
@@ -227,7 +238,8 @@ boost::filesystem::path WiredTigerEncryptionHooksCBC::getProtectedPathSuffix() {
 }
 
 
-WiredTigerEncryptionHooksGCM::WiredTigerEncryptionHooksGCM() {
+WiredTigerEncryptionHooksGCM::WiredTigerEncryptionHooksGCM(EncryptionKeyDB* encryptionKeyDB)
+    : WiredTigerEncryptionHooks(encryptionKeyDB) {
     _cipher = EVP_aes_256_gcm();
     _iv_len = EVP_CIPHER_iv_length(_cipher);
 }

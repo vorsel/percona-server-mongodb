@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "mongo/db/jsobj.h"
+#include "mongo/db/storage/storage_engine.h"
 
 namespace boost {
 namespace filesystem {
@@ -114,7 +115,8 @@ public:
      * Inform the encryption storage system to prepare its data such that its files can be copied
      * along with MongoDB data files for a backup.
      */
-    virtual StatusWith<std::vector<std::string>> beginNonBlockingBackup();
+    virtual StatusWith<std::vector<StorageEngine::BackupBlock>> beginNonBlockingBackup(
+        const StorageEngine::BackupOptions& options);
 
     /**
      * Inform the encryption storage system that it can release resources associated with a

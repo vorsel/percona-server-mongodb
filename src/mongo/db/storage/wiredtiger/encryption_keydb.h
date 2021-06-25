@@ -36,6 +36,8 @@ Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
 #include <boost/multiprecision/cpp_int.hpp>
 #include <wiredtiger.h>
 
+#include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_session_cache.h"
 #include "mongo/platform/mutex.h"
 #include "mongo/platform/random.h"
 
@@ -87,6 +89,11 @@ public:
     // _srng use protected by _lock_key
     void generate_secure_key(unsigned char* key);
 
+    StatusWith<std::vector<StorageEngine::BackupBlock>> beginNonBlockingBackup(
+        const StorageEngine::BackupOptions& options);
+
+    Status endNonBlockingBackup();
+
 private:
     typedef boost::multiprecision::uint128_t _gcm_iv_type;
 
@@ -121,6 +128,9 @@ private:
     // get_key_by_id creates entry
     // delete_key_by_it lets encryptor know that DB was deleted and deletes entry
     std::map<std::string, void*> _encryptors;
+
+    std::unique_ptr<WiredTigerSession> _backupSession;
+    WT_CURSOR* _backupCursor;
 };
 
 }  // namespace mongo
