@@ -108,6 +108,7 @@ wtEnv.Library(
 wtEnv.Library(
     target='storage_wiredtiger',
     source=[
+        'wiredtiger_backup_cursor_hooks.cpp',
         'wiredtiger_init.cpp',
         'wiredtiger_options_init.cpp',
         'wiredtiger_server_status.cpp',
@@ -125,6 +126,7 @@ wtEnv.Library(
         '$BUILD_DIR/mongo/db/catalog/database_holder',
         '$BUILD_DIR/mongo/db/commands/server_status',
         '$BUILD_DIR/mongo/db/concurrency/lock_manager',
+        '$BUILD_DIR/mongo/db/storage/backup_cursor_hooks',
         '$BUILD_DIR/mongo/db/storage/storage_engine_common',
         '$BUILD_DIR/mongo/util/options_parser/options_parser',
     ],

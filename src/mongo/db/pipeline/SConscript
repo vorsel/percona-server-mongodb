@@ -223,6 +223,16 @@ env.Library(
     ],
 )
 
+# pipeline stages which exist in mongod only
+env.Library(
+    target='pipeline_mongod',
+    source=[
+        'document_source_backup_cursor.cpp',
+        'document_source_backup_cursor_extend.cpp',
+    ],
+    LIBDEPS=[],
+)
+
 pipelineEnv = env.Clone()
 pipelineEnv.InjectThirdParty(libraries=['snappy'])
 pipelineEnv.Library(

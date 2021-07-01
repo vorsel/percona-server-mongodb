@@ -389,7 +389,7 @@ BackupCursorState CommonMongodProcessInterface::openBackupCursor(
     if (backupCursorHooks->enabled()) {
         return backupCursorHooks->openBackupCursor(opCtx, options);
     } else {
-        uasserted(50956, "Backup cursors are an enterprise only feature.");
+        uasserted(50956, "The current storage engine doesn't support backup cursors");
     }
 }
 
@@ -399,7 +399,7 @@ void CommonMongodProcessInterface::closeBackupCursor(OperationContext* opCtx,
     if (backupCursorHooks->enabled()) {
         backupCursorHooks->closeBackupCursor(opCtx, backupId);
     } else {
-        uasserted(50955, "Backup cursors are an enterprise only feature.");
+        uasserted(50955, "The current storage engine doesn't support backup cursors");
     }
 }
 
@@ -409,7 +409,7 @@ BackupCursorExtendState CommonMongodProcessInterface::extendBackupCursor(
     if (backupCursorHooks->enabled()) {
         return backupCursorHooks->extendBackupCursor(opCtx, backupId, extendTo);
     } else {
-        uasserted(51010, "Backup cursors are an enterprise only feature.");
+        uasserted(51010, "The current storage engine doesn't support backup cursors");
     }
 }
 
