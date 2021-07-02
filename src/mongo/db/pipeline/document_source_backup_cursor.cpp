@@ -48,12 +48,18 @@ constexpr StringData kSrcBackupName = "srcBackupName"_sd;
 
 // We only link this file into mongod so this stage doesn't exist in mongos
 REGISTER_DOCUMENT_SOURCE(backupCursor,
-                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceBackupCursor::LiteParsed::parse,
                          DocumentSourceBackupCursor::createFromBson,
                          AllowedWithApiStrict::kAlways);
 }  // namespace
 
 using boost::intrusive_ptr;
+
+std::unique_ptr<DocumentSourceBackupCursor::LiteParsed>
+DocumentSourceBackupCursor::LiteParsed::parse(const NamespaceString& nss, const BSONElement& spec) {
+
+    return std::make_unique<DocumentSourceBackupCursor::LiteParsed>(spec.fieldName());
+}
 
 const char* DocumentSourceBackupCursor::getSourceName() const {
     return kStageName.rawData();
