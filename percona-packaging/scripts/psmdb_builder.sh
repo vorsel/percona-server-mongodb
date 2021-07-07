@@ -752,9 +752,10 @@ build_tarball(){
     PSM_REAL_TARGETS=() # transformed targets with 'install-' prefix
     for pp in $PSM_TARGETS
     do
-        # using regex to find - and = characters in string
+        # using regex to find '=' characters in string
+        # don't touch if it starts from '-' character or 'install-' string
         # also don't change parameter if it contains slash to preserve targets specifying full path to unittests or object files
-        if [[ $pp =~ -|=|/ ]]; then
+        if [[ $pp =~ '^install-|^-|=|/' ]]; then
             # if - or = is found parameter is unchanged
             PSM_REAL_TARGETS+=( $pp )
         else
