@@ -142,7 +142,8 @@ OpTime logOp(OperationContext* opCtx,
              const OperationSessionInfo& sessionInfo,
              boost::optional<StmtId> stmtId,
              const OplogLink& oplogLink,
-             const OplogSlot& oplogSlot);
+             const OplogSlot& oplogSlot,
+             boost::optional<repl::RetryImageEnum> needsRetryImage);
 
 // Flush out the cached pointer to the oplog.
 void clearLocalOplogPtr();
@@ -207,6 +208,7 @@ inline std::ostream& operator<<(std::ostream& s, OplogApplication::Mode mode) {
  * Used for applying from an oplog
  * @param alwaysUpsert convert some updates to upserts for idempotency reasons
  * @param mode specifies what oplog application mode we are in
+ * @param isDataConsistent applying a batch that doesn't have a consistent snapshot of data
  * @param incrementOpsAppliedStats is called whenever an op is applied.
  * Returns failure status if the op was an update that could not be applied.
  */
@@ -215,6 +217,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                              const BSONObj& op,
                              bool alwaysUpsert,
                              OplogApplication::Mode mode,
+                             const bool isDataConsistent,
                              IncrementOpsAppliedStatsFn incrementOpsAppliedStats = {});
 
 /**

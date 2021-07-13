@@ -324,7 +324,7 @@ variables:
   - enterprise-rhel-62-64-bit-majority-read-concern-off
   - enterprise-rhel-62-64-bit-multi-txn-oplog-entries
   - enterprise-rhel-62-64-bit-required-inmem
-  - enterprise-rhel-67-s390x
+  - enterprise-rhel-62-64-bit-store_fam_images_in_side_coll
   - enterprise-rhel-70-64-bit
   - enterprise-rhel-70-64-bit-kitchen-sink
   - enterprise-rhel-71-ppc64le
@@ -335,7 +335,6 @@ variables:
   - enterprise-rhel-81-ppc64le
   - enterprise-suse12-64
   - enterprise-suse15-64
-  - enterprise-suse12-s390x
   - enterprise-ubuntu-dynamic-1604-64-bit
   - enterprise-ubuntu-dynamic-1604-clang
   - enterprise-ubuntu1604-64
@@ -343,7 +342,6 @@ variables:
   - enterprise-ubuntu1804-64
   - enterprise-ubuntu1804-arm64
   - enterprise-ubuntu1804-ppc64le
-  - enterprise-ubuntu1804-s390x
   - enterprise-windows-64-2k8
   - enterprise-windows-64-2k8-async
   - enterprise-windows-64-2k8-compile-all
@@ -2395,7 +2393,7 @@ functions:
              variant=ubuntu1604
           fi
           # Download stable version of curator
-          curator_hash=117d1a65256ff78b6d15ab79a1c7088443b936d0
+          curator_hash=b0c3c0fc68bce26d9572796d6bed3af4a298e30e
           curator_url="https://s3.amazonaws.com/boxes.10gen.com/build/curator/curator-dist-$variant-$curator_hash.tar.gz"
           cmds="curl -s $curator_url | tar -xzv"
           if [ "Windows_NT" = "$OS" ]; then
@@ -7864,64 +7862,6 @@ buildvariants:
     distros:
     - ubuntu1804-test
 
-- name: enterprise-ubuntu1804-s390x
-  display_name: Enterprise Ubuntu 18.04 s390x
-  modules:
-  - enterprise
-  run_on:
-  - ubuntu1804-zseries-test
-  batchtime: 10080 # 7 days
-  stepback: false
-  expansions:
-    push_path: linux
-    push_bucket: downloads.10gen.com
-    push_name: linux
-    push_arch: s390x-enterprise-ubuntu1804
-    compile_flags: --ssl MONGO_DISTMOD=ubuntu1804 --release --jlink=3 -j$(grep -c ^processor /proc/cpuinfo) CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-    resmoke_jobs_max: 2
-    has_packages: true
-    packager_script: packager_enterprise.py
-    packager_arch: s390x
-    packager_distro: ubuntu1804
-    repo_edition: enterprise
-    tooltags: "ssl sasl gssapi"
-    build_mongoreplay: true
-    multiversion_platform: ubuntu1804
-    multiversion_architecture: s390x
-    multiversion_edition: enterprise
-  tasks:
-  - name: compile_all_run_unittests_TG
-    distros:
-    - ubuntu1804-zseries-build
-  - name: aggregation
-  - name: aggregation_read_concern_majority_passthrough
-  - name: aggregation_sharded_collections_passthrough
-  - name: audit
-  - name: .auth !.multiversion !.jscore
-  - name: causally_consistent_jscore_txns_passthrough
-  - name: .misc_js
-  - name: .concurrency .common
-  - name: concurrency_replication_causal_consistency_gen
-  - name: .encrypt
-  - name: .integration !.audit
-    distros:
-    - ubuntu1804-zseries-build
-  - name: .jscore .common !.auth
-  - name: jsCore_op_query
-  - name: .jstestfuzz .common
-  - name: .logical_session_cache .one_sec
-  - name: .read_write_concern
-  - name: replica_sets
-  - name: .replica_sets .common
-  - name: sasl
-  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
-  - name: .sharding .common !.mixed_version
-  - name: .sharding .txns
-  - name: snmp
-  - name: .publish
-    distros:
-    - ubuntu1804-test
-
 - name: enterprise-linux-64-amazon-ami
   display_name: "Enterprise Amazon Linux"
   modules:
@@ -8909,6 +8849,119 @@ buildvariants:
     distros:
     - rhel62-small
 
+- name: enterprise-rhel-62-64-bit-store_fam_images_in_side_coll
+  display_name: "Enterprise RHEL 6.2 (storeFindAndModifyImagesInSideCollection=True)"
+  modules:
+  - enterprise
+  run_on:
+  - rhel62-small
+  expansions:
+    test_flags: >-
+      --mongodSetParameters="{storeFindAndModifyImagesInSideCollection: true}"
+      --excludeWithAnyTags=requires_mmapv1,requires_storing_fam_images_in_oplog
+    push_path: linux
+    push_bucket: downloads.10gen.com
+    push_name: linux
+    push_arch: x86_64-enterprise-rhel62
+    mh_target: dist-mh
+    compile_flags: --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --release --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
+    multiversion_platform: rhel62
+    multiversion_edition: enterprise
+    has_packages: true
+    packager_script: packager_enterprise.py
+    packager_arch: x86_64
+    packager_distro: rhel62
+    repo_edition: enterprise
+    scons_cache_scope: shared
+    tooltags: "ssl sasl gssapi"
+    build_mongoreplay: true
+    jstestfuzz_num_generated_files: 40
+    jstestfuzz_concurrent_num_files: 10
+    target_resmoke_time: 10
+    large_distro_name: rhel62-large
+    burn_in_tag_buildvariants: enterprise-rhel-62-64-bit-majority-read-concern-off enterprise-rhel-62-64-bit-inmem linux-64-duroff
+  tasks:
+  - name: compile_all_run_unittests_TG
+    distros:
+    - rhel62-large
+  - name: compile_benchmarks
+    distros:
+    - rhel62-large
+  - name: lint
+  - name: lint_fuzzer_sanity_patch
+  - name: lint_yaml
+  - name: burn_in_tests_gen
+    distros:
+    - rhel62-large
+  - name: burn_in_tags_gen
+  - name: .aggfuzzer
+  - name: .aggregation
+  - name: audit
+  - name: .auth
+  - name: .benchmarks
+    distros:
+    - centos6-perf
+  - name: buildscripts_test
+  - name: .causally_consistent !.sharding
+  - name: .change_streams
+  - name: .misc_js
+  - name: .concurrency !.large !.ubsan !.no_txns
+  - name: .concurrency .large !.ubsan !.no_txns
+    distros:
+    - rhel62-large
+  - name: disk_wiredtiger
+  - name: .encrypt
+  - name: idl_tests
+  - name: initial_sync_fuzzer_gen
+  - name: .integration
+    distros:
+    - rhel62-large
+  - name: .jscore .common
+  - name: jsCore_minimum_batch_size
+  - name: jsCore_op_query
+  - name: jsCore_txns_large_txns_format
+  - name: jsonSchema
+  - name: .jstestfuzz
+  - name: .logical_session_cache
+  - name: .multi_shard
+  - name: multi_stmt_txn_jscore_passthrough_with_migration_gen
+  - name: multiversion
+  - name: .read_write_concern .large
+    distros:
+    - rhel62-large
+  - name: .read_write_concern !.large
+  - name: .replica_sets !.encrypt !.auth
+    distros:
+    - rhel62-large
+  - name: retryable_writes_jscore_passthrough_gen
+  - name: retryable_writes_jscore_stepdown_passthrough
+    distros:
+    - rhel62-large
+  - name: .read_only
+  - name: .rollbackfuzzer
+  - name: sasl
+  - name: search_beta
+  - name: search_beta_auth
+  - name: search_beta_ssl
+  - name: session_jscore_passthrough
+  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
+  - name: .sharding .txns
+  - name: .sharding .common
+  - name: sharded_multi_stmt_txn_jscore_passthrough
+    distros:
+    - rhel62-large
+  - name: sharding_opportunistic_secondary_targeting_gen
+  - name: snmp
+  - name: .stitch
+  - name: .updatefuzzer
+  - name: secondary_reads_passthrough_gen
+  - name: package
+    distros:
+    - ubuntu1604-packer
+  - name: .publish
+    distros:
+    - rhel62-small
+
 - name: enterprise-rhel-62-64-bit-large-txns-format
   display_name: "Enterprise RHEL 6.2 (large transactions format)"
   modules:
@@ -9179,6 +9232,7 @@ buildvariants:
   batchtime: 10080 # 7 days
   stepback: false
   expansions:
+    test_flags: --excludeWithAnyTags=resource_intensive
     compile_flags: --dbg=on --gcov --ssl MONGO_DISTMOD=rhel62 -j$(grep -c ^processor /proc/cpuinfo) --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
     multiversion_platform: rhel62
     multiversion_edition: enterprise
@@ -9760,59 +9814,6 @@ buildvariants:
     distros:
     - rhel70-small
 
-- name: enterprise-rhel-67-s390x
-  display_name: Enterprise RHEL 6.7 s390x
-  modules:
-  - enterprise
-  run_on:
-  - rhel67-zseries-test
-  batchtime: 1440 # 1 day
-  stepback: false
-  expansions:
-    compile_flags: --ssl MONGO_DISTMOD=rhel67 --release -j3 CCFLAGS="-march=z9-109 -mtune=z10" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars --use-hardware-crc32=off
-    has_packages: true
-    packager_script: packager_enterprise.py
-    packager_arch: s390x
-    packager_distro: rhel67
-    push_path: linux
-    push_bucket: downloads.10gen.com
-    push_name: linux
-    push_arch: s390x-enterprise-rhel67
-    repo_edition: enterprise
-    tooltags: "ssl sasl gssapi"
-    build_mongoreplay: true
-  tasks:
-  - name: compile_all_run_unittests_TG
-    distros:
-    - rhel67-zseries-build
-  - name: .aggregation .common
-  - name: audit
-  - name: .auth !.multiversion
-  - name: causally_consistent_jscore_txns_passthrough
-  - name: .misc_js
-  - name: .concurrency .common
-  - name: concurrency_replication_causal_consistency_gen
-  - name: .encrypt
-  - name: .integration !.audit !.sharded
-    distros:
-    - rhel67-zseries-build
-  - name: .jscore .common
-  - name: jsCore_minimum_batch_size
-  - name: jsCore_op_query
-  - name: .logical_session_cache .one_sec
-  - name: .read_write_concern
-  - name: replica_sets
-  - name: .replica_sets .common
-  - name: sasl
-  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
-  - name: .sharding .common !.mixed_version
-  - name: snmp
-  - name: .stitch
-  - name: secondary_reads_passthrough_gen
-  - name: .publish
-    distros:
-    - rhel62-small
-
 ###########################################
 #          Ubuntu buildvariants           #
 ###########################################
@@ -9957,62 +9958,6 @@ buildvariants:
   - name: .publish
     distros:
     - suse12-small
-
-- name: enterprise-suse12-s390x
-  display_name: Enterprise SLES 12 s390x
-  modules:
-  - enterprise
-  run_on:
-  - suse12-zseries-test
-  batchtime: 10080 # 7 days
-  stepback: false
-  expansions:
-    push_path: linux
-    push_bucket: downloads.10gen.com
-    push_name: linux
-    push_arch: s390x-enterprise-suse12
-    compile_flags: --ssl MONGO_DISTMOD=suse12 --release -j3 CCFLAGS="-march=z196 -mtune=zEC12" --variables-files=etc/scons/mongodbtoolchain_v3_gcc.vars
-    has_packages: true
-    packager_script: packager_enterprise.py
-    packager_arch: s390x
-    packager_distro: suse12
-    repo_edition: enterprise
-    tooltags: "ssl sasl gssapi"
-    build_mongoreplay: true
-    multiversion_platform: suse12
-    multiversion_architecture: s390x
-    multiversion_edition: enterprise
-  tasks:
-  - name: compile_all_run_unittests_TG
-    distros:
-    - suse12-zseries-build
-  - name: .aggregation .common
-  - name: audit
-  - name: .auth !.multiversion !.jscore
-  - name: causally_consistent_jscore_txns_passthrough
-  - name: .misc_js
-  - name: .concurrency .common
-  - name: concurrency_replication_causal_consistency_gen
-  - name: .encrypt
-  - name: .integration !.audit
-    distros:
-    - suse12-zseries-build
-  - name: .jscore .common !.auth
-  - name: jsCore_op_query
-  - name: .jstestfuzz .common
-  - name: .logical_session_cache .one_sec
-  - name: .read_write_concern
-  - name: replica_sets
-  - name: .replica_sets .common
-  - name: sasl
-  - name: .sharding .jscore !.wo_snapshot !.multi_stmt
-  - name: .sharding .common !.mixed_version
-  - name: snmp
-  - name: .stitch
-  - name: secondary_reads_passthrough_gen
-  - name: .publish
-    distros:
-    - suse12-test
 
 - name: suse12
   display_name: SSL SUSE 12

@@ -62,6 +62,7 @@
 #include "mongo/db/views/resolved_view.h"
 #include "mongo/rpc/factory.h"
 #include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/rpc/metadata/logical_time_metadata.h"
 #include "mongo/rpc/metadata/tracking_metadata.h"
 #include "mongo/rpc/op_msg.h"
@@ -354,6 +355,8 @@ void runCommand(OperationContext* opCtx,
         return;
     }
 
+    const auto isHello = command->getName() == "hello"_sd || command->getName() == "isMaster"_sd;
+
     CommandHelpers::uassertShouldAttemptParse(opCtx, command, request);
 
     // Parse the 'maxTimeMS' command option, and use it to set a deadline for the operation on
@@ -418,6 +421,13 @@ void runCommand(OperationContext* opCtx,
 
     boost::optional<RouterOperationContextSession> routerSession;
     try {
+        if (isHello) {
+            // Preload generic ClientMetadata ahead of our first hello request. After the first
+            // request, metaElement should always be empty.
+            auto metaElem = request.body[kMetadataDocumentName];
+            ClientMetadata::setFromMetadata(opCtx->getClient(), metaElem);
+        }
+
         CommandHelpers::evaluateFailCommandFailPoint(opCtx, invocation.get());
         if (osi.getAutocommit()) {
             routerSession.emplace(opCtx);
@@ -631,6 +641,7 @@ void runCommand(OperationContext* opCtx,
 
 DbResponse Strategy::queryOp(OperationContext* opCtx, const NamespaceString& nss, DbMessage* dbm) {
     globalOpCounters.gotQuery();
+    globalOpCounters.gotQueryDeprecated();
 
     ON_BLOCK_EXIT([opCtx] {
         Grid::get(opCtx)->catalogCache()->checkAndRecordOperationBlockedByRefresh(
@@ -835,6 +846,7 @@ DbResponse Strategy::getMore(OperationContext* opCtx, const NamespaceString& nss
     const long long cursorId = dbm->pullInt64();
 
     globalOpCounters.gotGetMore();
+    globalOpCounters.gotGetMoreDeprecated();
 
     // TODO: Handle stale config exceptions here from coll being dropped or sharded during op for
     // now has same semantics as legacy request.
@@ -890,7 +902,7 @@ void Strategy::killCursors(OperationContext* opCtx, DbMessage* dbm) {
                           << ".",
             numCursors >= 1 && numCursors < 30000);
 
-    globalOpCounters.gotOp(dbKillCursors, false);
+    globalOpCounters.gotKillCursorsDeprecated();
 
     ConstDataCursor cursors(dbm->getArray(numCursors));
 
@@ -937,12 +949,16 @@ void Strategy::writeOp(OperationContext* opCtx, DbMessage* dbm) {
                [&]() {
                    switch (msg.operation()) {
                        case dbInsert: {
-                           return InsertOp::parseLegacy(msg).serialize({});
+                           auto op = InsertOp::parseLegacy(msg);
+                           globalOpCounters.gotInsertsDeprecated(op.getDocuments().size());
+                           return op.serialize({});
                        }
                        case dbUpdate: {
+                           globalOpCounters.gotUpdateDeprecated();
                            return UpdateOp::parseLegacy(msg).serialize({});
                        }
                        case dbDelete: {
+                           globalOpCounters.gotDeleteDeprecated();
                            return DeleteOp::parseLegacy(msg).serialize({});
                        }
                        default:

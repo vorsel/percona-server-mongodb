@@ -4,8 +4,7 @@
 (function() {
 'use strict';
 
-// Test with default value of incrementChunkMajorVersionOnChunkSplits, which is
-// false>
+// Test with default value of incrementChunkMajorVersionOnChunkSplits, which is false
 (() => {
     var st = new ShardingTest({shards: 1, mongos: 2});
 
@@ -50,6 +49,11 @@
 
     assert.eq(Timestamp(1, 0),
               staleMongos.getDB("admin").runCommand({getShardVersion: coll + ""}).version);
+
+    // Merge the just-split chunks and ensure the major version didn't go up
+    assert.commandWorked(
+        admin.runCommand({mergeChunks: coll + "", bounds: [{_id: MinKey}, {_id: MaxKey}]}));
+    assert.eq(Timestamp(1, 3), admin.runCommand({getShardVersion: coll + ""}).version);
 
     st.stop();
 })();
@@ -96,18 +100,6 @@
 
     printjson(staleMongos.getDB("admin").runCommand({getShardVersion: coll + ""}));
 
-    assert.eq(Timestamp(1, 0),
-              staleMongos.getDB("admin").runCommand({getShardVersion: coll + ""}).version);
-
-    // See if our stale mongos is required to catch up to run a findOne on a new connection
-    staleMongos = new Mongo(staleMongos.host);
-    staleMongos.getCollection(coll + "").findOne();
-
-    printjson(staleMongos.getDB("admin").runCommand({getShardVersion: coll + ""}));
-
-    assert.eq(Timestamp(1, 0),
-              staleMongos.getDB("admin").runCommand({getShardVersion: coll + ""}).version);
-
     // Run another split on the original chunk, which does not exist anymore (but the stale mongos
     // thinks it exists). This should fail and cause a refresh on the shard, updating its shard
     // version.
@@ -123,6 +115,11 @@
     // The previously stale mongos should now be up-to-date.
     assert.eq(Timestamp(2, 2),
               staleMongos.getDB("admin").runCommand({getShardVersion: coll + ""}).version);
+
+    // Merge the just-split chunks and ensure the major version went up
+    assert.commandWorked(
+        admin.runCommand({mergeChunks: coll + "", bounds: [{_id: MinKey}, {_id: MaxKey}]}));
+    assert.eq(Timestamp(3, 0), admin.runCommand({getShardVersion: coll + ""}).version);
 
     st.stop();
 })();

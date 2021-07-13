@@ -68,10 +68,12 @@
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer.h"
 #include "mongo/db/ops/delete.h"
+#include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/repl/apply_ops.h"
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/dbcheck.h"
+#include "mongo/db/repl/image_collection_entry_gen.h"
 #include "mongo/db/repl/local_oplog_info.h"
 #include "mongo/db/repl/optime.h"
 #include "mongo/db/repl/repl_client_info.h"
@@ -188,6 +190,15 @@ bool shouldBuildInForeground(OperationContext* opCtx,
     return false;
 }
 
+StringData getInvalidatingReason(const OplogApplication::Mode mode, const bool isDataConsistent) {
+    if (mode == OplogApplication::Mode::kInitialSync) {
+        return "initial sync"_sd;
+    } else if (!isDataConsistent) {
+        return "minvalid suggests inconsistent snapshot"_sd;
+    }
+
+    return ""_sd;
+}
 
 }  // namespace
 
@@ -329,6 +340,48 @@ void createIndexForApplyOps(OperationContext* opCtx,
     }
 }
 
+/**
+ * @param dataImage can be BSONObj::isEmpty to signal the node is in initial sync and must
+ *                  invalidate relevant image collection data.
+ */
+void writeToImageCollection(OperationContext* opCtx,
+                            const BSONObj& op,
+                            const BSONObj& image,
+                            repl::RetryImageEnum imageKind,
+                            const StringData& invalidatedReason,
+                            bool* upsertConfigImage) {
+    AutoGetCollection autoColl(opCtx, NamespaceString::kConfigImagesNamespace, LockMode::MODE_IX);
+    repl::ImageEntry imageEntry;
+    LogicalSessionId sessionId =
+        LogicalSessionId::parse(IDLParserErrorContext("ParseSessionIdWhenWritingToImageCollection"),
+                                op.getField(OplogEntryBase::kSessionIdFieldName).Obj());
+    imageEntry.set_id(sessionId);
+    imageEntry.setTxnNumber(op.getField(OplogEntryBase::kTxnNumberFieldName).numberLong());
+    imageEntry.setTs(op["ts"].timestamp());
+    imageEntry.setImageKind(imageKind);
+    imageEntry.setImage(image);
+    if (image.isEmpty()) {
+        imageEntry.setInvalidated(true);
+        imageEntry.setInvalidatedReason(invalidatedReason);
+    }
+
+    UpdateRequest request(NamespaceString::kConfigImagesNamespace);
+    request.setQuery(
+        BSON("_id" << imageEntry.get_id().toBSON() << "ts" << BSON("$lt" << imageEntry.getTs())));
+    request.setUpsert(*upsertConfigImage);
+    request.setUpdateModification(imageEntry.toBSON());
+    request.setFromOplogApplication(true);
+    try {
+        // This code path can also be hit by `applyOps`.
+        repl::UnreplicatedWritesBlock dontReplicate(opCtx);
+        ::mongo::update(opCtx, autoColl.getDb(), request);
+    } catch (const ExceptionFor<ErrorCodes::DuplicateKey>&) {
+        // We can get a duplicate key when two upserts race on inserting a document.
+        *upsertConfigImage = false;
+        throw WriteConflictException();
+    }
+}
+
 namespace {
 
 /**
@@ -380,7 +433,8 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
                             Date_t wallTime,
                             const OperationSessionInfo& sessionInfo,
                             boost::optional<StmtId> statementId,
-                            const OplogLink& oplogLink) {
+                            const OplogLink& oplogLink,
+                            boost::optional<repl::RetryImageEnum> needsRetryImage) {
     BSONObjBuilder b(256);
 
     b.append("ts", optime.getTimestamp());
@@ -401,6 +455,10 @@ OplogDocWriter _logOpWriter(OperationContext* opCtx,
 
     if (o2)
         b.append("o2", *o2);
+
+    if (needsRetryImage) {
+        b.append("needsRetryImage", repl::RetryImage_serializer(*needsRetryImage));
+    }
 
     invariant(wallTime != Date_t{});
     b.appendDate(OplogEntryBase::kWallClockTimeFieldName, wallTime);
@@ -490,7 +548,8 @@ OpTime logOp(OperationContext* opCtx,
              const OperationSessionInfo& sessionInfo,
              boost::optional<StmtId> statementId,
              const OplogLink& oplogLink,
-             const OplogSlot& oplogSlot) {
+             const OplogSlot& oplogSlot,
+             boost::optional<repl::RetryImageEnum> needsRetryImage) {
     // All collections should have UUIDs now, so all insert, update, and delete oplog entries should
     // also have uuids. Some no-op (n) and command (c) entries may still elide the uuid field.
     invariant(uuid || 'n' == *opstr || 'c' == *opstr,
@@ -539,7 +598,8 @@ OpTime logOp(OperationContext* opCtx,
                                wallClockTime,
                                sessionInfo,
                                statementId,
-                               oplogLink);
+                               oplogLink,
+                               needsRetryImage);
     const DocWriter* basePtr = &writer;
     auto timestamp = slot.getTimestamp();
     _logOpsInner(opCtx, nss, &basePtr, &timestamp, 1, oplog, slot, wallClockTime);
@@ -610,7 +670,8 @@ std::vector<OpTime> logInsertOps(OperationContext* opCtx,
                                           wallClockTime,
                                           sessionInfo,
                                           begin[i].stmtId,
-                                          oplogLink));
+                                          oplogLink,
+                                          {}));
         oplogLink.prevOpTime = insertStatementOplogSlot;
         timestamps[i] = oplogLink.prevOpTime.getTimestamp();
         opTimes.push_back(insertStatementOplogSlot);
@@ -1285,6 +1346,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
                              const BSONObj& op,
                              bool alwaysUpsert,
                              OplogApplication::Mode mode,
+                             const bool isDataConsistent,
                              IncrementOpsAppliedStatsFn incrementOpsAppliedStats) {
     LOG(3) << "applying op: " << redact(op)
            << ", oplog application mode: " << OplogApplication::modeToString(mode);
@@ -1648,6 +1710,19 @@ Status applyOperation_inlock(OperationContext* opCtx,
         request.setUpdateModification(o);
         request.setUpsert(upsert);
         request.setFromOplogApplication(true);
+        boost::optional<repl::RetryImageEnum> imageKind;
+        if (op.hasField(OplogEntryBase::kNeedsRetryImageFieldName)) {
+            imageKind = repl::RetryImage_parse(
+                IDLParserErrorContext("applyUpdate"),
+                op.getField(OplogEntryBase::kNeedsRetryImageFieldName).String());
+            if (mode != OplogApplication::Mode::kInitialSync && isDataConsistent) {
+                if (imageKind == repl::RetryImageEnum::kPreImage) {
+                    request.setReturnDocs(UpdateRequest::ReturnDocOption::RETURN_OLD);
+                } else if (imageKind == repl::RetryImageEnum::kPostImage) {
+                    request.setReturnDocs(UpdateRequest::ReturnDocOption::RETURN_NEW);
+                }
+            }
+        }
 
         Timestamp timestamp;
         if (assignOperationTimestamp) {
@@ -1655,6 +1730,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
         }
 
         const StringData ns = fieldNs.valueStringDataSafe();
+        bool upsertConfigImage = true;
         auto status = writeConflictRetry(opCtx, "applyOps_update", ns, [&] {
             WriteUnitOfWork wuow(opCtx);
             if (timestamp != Timestamp::min()) {
@@ -1700,7 +1776,18 @@ Status applyOperation_inlock(OperationContext* opCtx,
                     }
                 }
             }
-
+            if (op.hasField(OplogEntryBase::kNeedsRetryImageFieldName)) {
+                invariant(imageKind);
+                writeToImageCollection(opCtx,
+                                       op,
+                                       // If we did not request an image because we're in
+                                       // initial sync, the value passed in here is conveniently
+                                       // the empty BSONObj.
+                                       ur.requestedDocImage,
+                                       *imageKind,
+                                       getInvalidatingReason(mode, isDataConsistent),
+                                       &upsertConfigImage);
+            }
             wuow.commit();
             return Status::OK();
         });
@@ -1734,6 +1821,7 @@ Status applyOperation_inlock(OperationContext* opCtx,
         }
 
         const StringData ns = fieldNs.valueStringDataSafe();
+        bool upsertConfigImage = true;
         writeConflictRetry(opCtx, "applyOps_delete", ns, [&] {
             WriteUnitOfWork wuow(opCtx);
             if (timestamp != Timestamp::min()) {
@@ -1741,8 +1829,36 @@ Status applyOperation_inlock(OperationContext* opCtx,
             }
 
             if (opType[1] == 0) {
-                const auto justOne = true;
-                deleteObjects(opCtx, collection, requestNss, deleteCriteria, justOne);
+                const bool kNeedsRetryImage =
+                    op.hasField(OplogEntryBase::kNeedsRetryImageFieldName);
+                DeleteRequest request(requestNss);
+                request.setQuery(deleteCriteria);
+                if (mode != OplogApplication::Mode::kInitialSync && kNeedsRetryImage &&
+                    isDataConsistent) {
+                    // When in initial sync, we'll pass an empty image into
+                    // `writeToImageCollection`.
+                    request.setReturnDeleted(true);
+                }
+
+                DeleteResult result = deleteObject(opCtx, collection, request);
+                if (kNeedsRetryImage) {
+                    // Even if `result.nDeleted` is 0, we want to perform a write to the
+                    // imageCollection to advance the txnNumber/ts and invalidate the image. This
+                    // isn't strictly necessary for correctness -- the `config.transactions` table
+                    // is responsible for whether to retry. The motivation here is to simply reduce
+                    // the number of states related documents in the two collections can be in.
+                    BSONObj imageDoc;
+                    if (result.nDeleted > 0 && mode != OplogApplication::Mode::kInitialSync) {
+                        imageDoc = result.requestedPreImage.get();
+                    }
+
+                    writeToImageCollection(opCtx,
+                                           op,
+                                           imageDoc,
+                                           repl::RetryImageEnum::kPreImage,
+                                           getInvalidatingReason(mode, isDataConsistent),
+                                           &upsertConfigImage);
+                }
             } else
                 verify(opType[1] == 'b');  // "db" advertisement
             wuow.commit();

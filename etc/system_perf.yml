@@ -27,7 +27,9 @@ variables:
       - name: schedule_global_auto_tasks
         variant: task_generation
   _real_expansions: &_expansion_updates
-    []
+    # TODO: Disable in SERVER-57226.
+    - key: enable_detect_changes
+      value: "true"
   ###
 
 ###
@@ -39,10 +41,10 @@ variables:
 #      - name: schedule_global_auto_tasks
 #        variant: task_generation
 #  _skip_compile_amazon-64: &_compile_amazon-64
-#      - name: compile
-#        variant: compile-linux-64-amzn
 #      - name: schedule_global_auto_tasks
 #        variant: task_generation
+#      - name: compile
+#        variant: compile-linux-64-amzn
 #  _skip_expansions: &_expansion_updates
 #      # This is the normal (amazon2) "compile" artifact from https://evergreen.mongodb.com/task/sys_perf_4.2_compile_amazon2_compile_54e29d8dcca0b3d73898a384b57c516728edbcd2_21_04_02_18_14_59
 #      - key: mdb_binary_for_client
@@ -115,7 +117,7 @@ modules:
     repo: git@github.com:mongodb-labs/py-tpcc.git
     prefix: ../../src
     branch: master
-    ref: 2d19705337a40e24831a904266a648b85df5be84
+    ref: 46f8f42a71626fc2057d2604ab9359ccf0395ba0
 #  - name: mongo
 #    repo: git@github.com:mongodb/mongo.git
 #    prefix: ../../src
@@ -188,16 +190,26 @@ functions:
       params:
         script: ./src/dsi/run-dsi determine_failure -m TEST
   f_dsi_post_run:
-    - command: shell.exec
-      params:
-        script: ./src/dsi/run-dsi post_run
-    - command: attach.results
-      params:
-        file_location: ./build/EvergreenResultsJson/results.json
+    # TODO: SERVER-57226 will let us move this json.send to after dsi's post_run.
+    # This is preferred to keep DSI execution contiguous.
     - command: json.send
       params:
         name: perf
         file: ./build/LegacyPerfJson/perf.json
+    - command: shell.exec
+      params:
+        script: ./src/dsi/run-dsi post_run
+    - command: perf.send
+      params:
+        file: ./build/CedarReports/cedar_report.json
+        aws_key: ${terraform_key}
+        aws_secret: ${terraform_secret}
+        bucket: genny-metrics
+        region: us-east-1
+        prefix: ${task_id}_${execution}
+    - command: attach.results
+      params:
+        file_location: ./build/EvergreenResultsJson/results.json
     - command: s3.put
       params:
         aws_key: ${aws_key}
@@ -533,14 +545,6 @@ tasks:
         vars:
           test_control: "map_reduce_workloads"
 
-  - name: genny_canaries
-    priority: 5
-    commands:
-      - func: f_run_dsi_workload
-        vars:
-          test_control: "genny_canaries"
-
-
   - name: retryable_writes_workloads
     priority: 5
     commands:
@@ -662,14 +666,15 @@ tasks:
         vars:
           test_control: "initialsync-logkeeper"
           mongodb_setup: "initialsync-logkeeper-short"
-          # Logkeeper dataset with FCV set to 4.4
-          mongodb_dataset: "https://s3-us-west-2.amazonaws.com/dsi-donot-remove/InitialSyncLogKeeper/logkeeper-slice-data-mongodb-4.4.tgz"
+          # Logkeeper dataset with FCV set to 4.0
+          mongodb_dataset: "https://s3-us-west-2.amazonaws.com/dsi-donot-remove/InitialSyncLogKeeper/logkeeper-slice-data.tgz"
 
   - name: initialsync-logkeeper
     priority: 5
     exec_timeout_secs: 216000 # 2.5 days
     commands:
       - func: f_run_dsi_workload
+        timeout_secs: 216000 # 2.5 days
         vars:
           test_control: "initialsync-logkeeper"
 
@@ -765,7 +770,6 @@ buildvariants:
   - name: compile-rhel70
     display_name: Compile for Atlas-like
     modules: *modules
-    batchtime: 2880 # 48 hours
     expansions:
       <<: *compile-linux-64-amzn-expansions
       compile_flags: >-
@@ -782,7 +786,6 @@ buildvariants:
 
   - name: linux-1-node-replSet
     display_name: Linux 1-Node ReplSet
-    batchtime: 10080 # 7 days
     modules: *modules
     expansions:
       mongodb_setup: single-replica
@@ -795,6 +798,8 @@ buildvariants:
         - "rhel70-perf-single"
     depends_on: *_compile_amazon-64
     tasks: &1nodetasks
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
       - name: industry_benchmarks
       - name: ycsb_60GB
       - name: crud_workloads
@@ -820,7 +825,6 @@ buildvariants:
 
   - name: linux-standalone
     display_name: Linux Standalone
-    batchtime: 2880  # 48 hours
     modules: *modules
     expansions:
       mongodb_setup: standalone
@@ -838,7 +842,6 @@ buildvariants:
       - name: industry_benchmarks
       - name: ycsb_60GB
       - name: crud_workloads
-      - name: genny_canaries
       - name: cursor_manager
       - name: mixed_workloads
       - name: misc_workloads
@@ -853,7 +856,6 @@ buildvariants:
 
   - name: linux-standalone-audit
     display_name: Linux Standalone Audit
-    batchtime: 10080 # 7 days
     modules: *modules
     expansions:
       mongodb_setup: standalone-audit
@@ -867,6 +869,8 @@ buildvariants:
         - "rhel70-perf-single"
     depends_on: *_compile_amazon2
     tasks:
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
       - name: industry_benchmarks
       - name: crud_workloads
       - name: smoke_test
@@ -875,7 +879,7 @@ buildvariants:
     display_name: Linux 1-Node ReplSet ESE CBC
     modules: *modules
     expansions:
-      setup: single-replica-ese-cbc
+      mongodb_setup: single-replica-ese-cbc
       infrastructure_provisioning: single
       cluster: single
       platform: linux
@@ -887,12 +891,13 @@ buildvariants:
         - "rhel70-perf-single"
     depends_on: *_compile_amazon2
     tasks:
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
       - name: industry_benchmarks
       - name: smoke_test
 
   - name: linux-1-node-replSet-ese-gcm
     display_name: Linux 1-Node ReplSet ESE GCM
-    batchtime: 5760  # 4 days
     modules: *modules
     expansions:
       mongodb_setup: single-replica-ese-gcm
@@ -906,13 +911,14 @@ buildvariants:
         - "rhel70-perf-single"
     depends_on: *_compile_amazon2
     tasks:
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
       - name: industry_benchmarks
       - name: smoke_test
 
 
   - name: linux-3-shard
     display_name: Linux 3-Shard Cluster
-    batchtime: 10080 # 7 days
     modules: *modules
     expansions:
       mongodb_setup: shard
@@ -925,6 +931,8 @@ buildvariants:
         - "rhel70-perf-shard"
     depends_on: *_compile_amazon-64
     tasks:
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
       - name: industry_benchmarks
       - name: crud_workloads
       - name: mixed_workloads
@@ -940,7 +948,6 @@ buildvariants:
 
   - name: linux-shard-lite
     display_name: Linux Shard Lite Cluster
-    batchtime: 5760  # 4 days
     modules: *modules
     expansions:
       mongodb_setup: shard-lite
@@ -953,6 +960,8 @@ buildvariants:
         - "rhel70-perf-shard-lite"
     depends_on: *_compile_amazon-64
     tasks: &shardlitetasks
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
       - name: bestbuy_agg
       - name: bestbuy_agg_merge_different_db
       - name: bestbuy_agg_merge_same_db
@@ -972,10 +981,25 @@ buildvariants:
       - name: retryable_writes_workloads
       - name: smoke_test
 
+  - name: linux-shard-single
+    display_name: Linux Shard Single
+    modules: *modules
+    expansions:
+      mongodb_setup: shard-single
+      infrastructure_provisioning: shard-single
+      platform: linux
+      project_dir: *project_dir
+      authentication: enabled
+      storageEngine: wiredTiger
+    run_on:
+      - "rhel70-perf-shard-lite"
+    depends_on: *_compile_amazon-64
+    tasks:
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
 
   - name: linux-3-node-replSet
     display_name: Linux 3-Node ReplSet
-    batchtime: 2880  # 48 hours
     modules: *modules
     expansions:
       mongodb_setup: replica
@@ -988,6 +1012,8 @@ buildvariants:
         - "rhel70-perf-replset"
     depends_on: *_compile_amazon-64
     tasks: &3nodetasks
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
       - name: industry_benchmarks
       - name: ycsb_60GB
       - name: industry_benchmarks_secondary_reads
@@ -1017,7 +1043,6 @@ buildvariants:
 
   - name: linux-3-node-replSet-noflowcontrol
     display_name: Linux 3-Node ReplSet (Flow Control off)
-    batchtime: 10080  # 7 days
     modules: *modules
     expansions:
       mongodb_setup: replica-noflowcontrol
@@ -1030,6 +1055,8 @@ buildvariants:
         - "rhel70-perf-replset"
     depends_on: *_compile_amazon-64
     tasks:
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
       - name: industry_benchmarks
       - name: industry_benchmarks_secondary_reads
       - name: crud_workloads
@@ -1044,7 +1071,6 @@ buildvariants:
 
   - name: linux-3-node-replSet-ssl
     display_name: Linux 3-Node ReplSet (SSL)
-    batchtime: 10080 # 7 days
     modules: *modules
     expansions:
       mongodb_setup: replica-ssl
@@ -1057,12 +1083,13 @@ buildvariants:
         - "rhel70-perf-replset"
     depends_on: *_compile_amazon-64
     tasks:
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
       - name: industry_benchmarks
       - name: mixed_workloads
 
   - name: linux-3-node-replSet-initialsync
     display_name: Linux 3-Node ReplSet Initial Sync
-    batchtime: 2880  # 48 hours
     modules: *modules
     expansions:
       mongodb_setup: replica-2node
@@ -1075,18 +1102,19 @@ buildvariants:
         - "rhel70-perf-replset"
     depends_on: *_compile_amazon-64
     tasks:
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
       - name: initialsync
       - name: initialsync-logkeeper-short
 
   - name: linux-replSet-initialsync-logkeeper
     display_name: Linux ReplSet Initial Sync LogKeeper
-    batchtime: 10080 # 7 days
     modules: *modules
     expansions:
       mongodb_setup: initialsync-logkeeper
       infrastructure_provisioning: initialsync-logkeeper
-      # EBS logkeeper snapshot with FCV set to 4.4
-      snapshotId: snap-0dba360e743e27ea0
+      # EBS logkeeper snapshot with FCV set to 4.0
+      snapshotId: snap-041c3c57a1a4f5bba
       platform: linux
       authentication: disabled
       storageEngine: wiredTiger
@@ -1095,11 +1123,12 @@ buildvariants:
         - "rhel70-perf-initialsync-logkeeper"
     depends_on: *_compile_amazon-64
     tasks:
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
       - name: initialsync-logkeeper
 
   - name: atlas-like-M60
     display_name: M60-Like 3-Node ReplSet
-    batchtime: 5760  # 4 days
     modules: *modules
     expansions:
       mongodb_setup: atlas-like-replica
@@ -1113,6 +1142,8 @@ buildvariants:
         - "rhel70-perf-M60-like"
     depends_on: *_compile_rhel70
     tasks:  # Cannot use *3nodetasks because secondary_performance uses a special mongodb setup.
+      - name: schedule_patch_auto_tasks
+      - name: schedule_variant_auto_tasks
       - name: industry_benchmarks
       - name: ycsb_60GB
       - name: industry_benchmarks_secondary_reads

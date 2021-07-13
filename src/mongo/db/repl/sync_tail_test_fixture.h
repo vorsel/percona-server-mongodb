@@ -68,8 +68,7 @@ public:
                   const NamespaceString& nss,
                   OptionalCollectionUUID uuid,
                   StmtId stmtId,
-                  bool fromMigrate,
-                  const boost::optional<BSONObj>& deletedDoc) override;
+                  const OplogDeleteEntryArgs& args) override;
 
     /**
      * Called when SyncTail creates a collection.
@@ -130,7 +129,8 @@ protected:
     static Status noopApplyOperationFn(OperationContext*,
                                        MultiApplier::OperationPtrs*,
                                        SyncTail* st,
-                                       WorkerMultikeyPathInfo*) {
+                                       WorkerMultikeyPathInfo*,
+                                       const bool isDataConsistent) {
         return Status::OK();
     }
 

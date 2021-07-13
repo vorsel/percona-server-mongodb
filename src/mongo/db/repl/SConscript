@@ -40,6 +40,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         'dbcheck',
         'local_oplog_info',
+        'image_collection_entry',
         'repl_coordinator_interface',
         'repl_settings',
         'timestamp_block',
@@ -340,6 +341,7 @@ env.Library(
     LIBDEPS_PRIVATE=[
         'oplog',
         'oplog_application',
+        'repl_server_parameters',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/storage/storage_options',
     ],
@@ -1805,5 +1807,18 @@ env.Library(
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
         'election_reason_counter',
+    ],
+)
+
+env.Library(
+    target='image_collection_entry',
+    source=[
+        env.Idlc('image_collection_entry.idl')[0],
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/logical_session_id',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+        'oplog_entry',
     ],
 )

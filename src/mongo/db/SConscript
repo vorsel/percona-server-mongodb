@@ -801,6 +801,7 @@ env.Library(
         'session_catalog',
     ],
     LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/repl/repl_server_parameters',
         '$BUILD_DIR/mongo/idl/idl_parser',
         '$BUILD_DIR/mongo/idl/server_parameter',
         '$BUILD_DIR/mongo/util/concurrency/thread_pool',
@@ -914,6 +915,7 @@ env.Library(
     ],
     LIBDEPS=[
         '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/repl/repl_server_parameters',
     ],
 )
 
@@ -947,12 +949,14 @@ env.Library(
         'views/views_mongod',
         '$BUILD_DIR/mongo/base',
         '$BUILD_DIR/mongo/db/catalog/collection_catalog',
+        '$BUILD_DIR/mongo/db/repl/repl_server_parameters',
         '$BUILD_DIR/mongo/s/coreshard',
         "$BUILD_DIR/mongo/s/grid",
     ],
     LIBDEPS_PRIVATE=[
         'transaction',
         '$BUILD_DIR/mongo/db/commands/mongod_fcv',
+        '$BUILD_DIR/mongo/db/repl/image_collection_entry',
     ],
 )
 
@@ -2121,6 +2125,9 @@ env.Library(
         'repl/repl_coordinator_interface',
         'service_context',
         'update/update_driver',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/repl/image_collection_entry',
     ],
 )
 

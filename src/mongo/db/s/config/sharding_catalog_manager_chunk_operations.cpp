@@ -287,12 +287,13 @@ StatusWith<ChunkVersion> getMaxChunkVersionFromQueryResponse(
 
 }  // namespace
 
-Status ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
-                                                const NamespaceString& nss,
-                                                const OID& requestEpoch,
-                                                const ChunkRange& range,
-                                                const std::vector<BSONObj>& splitPoints,
-                                                const std::string& shardName) {
+StatusWith<BSONObj> ShardingCatalogManager::commitChunkSplit(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const OID& requestEpoch,
+    const ChunkRange& range,
+    const std::vector<BSONObj>& splitPoints,
+    const std::string& shardName) {
     // Take _kChunkOpLock in exclusive mode to prevent concurrent chunk splits, merges, and
     // migrations
     // TODO(SERVER-25359): Replace with a collection-specific lock map to allow splits/merges/
@@ -357,12 +358,12 @@ Status ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
 
     ChunkVersion currentMaxVersion = collVersion;
 
-    // If the incrementChunkMajorVersionOnChunkSplits flag is set, increment
-    // the major version only if the shard that owns the chunk being split has
-    // version == collection version. See SERVER-41480 for details.
+    // If the incrementChunkMajorVersionOnChunkSplits flag is set, increment the major version only
+    // if the shard that owns the chunk being split has shardVersion == collectionVersion. See
+    // SERVER-41480 for details.
     //
-    // This flag is only useful if there are some 4.0 routers still in the
-    // cluster, so we only use it if FCV is not fully upgraded.
+    // This flag is only useful if there are some 4.0 routers still in the cluster, so we only use
+    // it if FCV is not fully upgraded.
     const auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
     if (currentFCV != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42 &&
         incrementChunkMajorVersionOnChunkSplits.load() && shardVersion == collVersion) {
@@ -467,14 +468,10 @@ Status ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
         BSONObjBuilder b;
         b.append("ns", ChunkType::ConfigNS.ns());
         b.append("q",
-                 BSON("query" << BSON(ChunkType::ns(nss.ns()) << ChunkType::min() << range.getMin()
-                                                              << ChunkType::max() << range.getMax())
+                 BSON("query" << BSON(ChunkType::ns(nss.ns()) << ChunkType::min(range.getMin())
+                                                              << ChunkType::max(range.getMax()))
                               << "orderby" << BSON(ChunkType::lastmod() << -1)));
-        {
-            BSONObjBuilder bb(b.subobjStart("res"));
-            bb.append(ChunkType::epoch(), requestEpoch);
-            bb.append(ChunkType::shard(), shardName);
-        }
+        b.append("res", BSON(ChunkType::epoch(requestEpoch) << ChunkType::shard(shardName)));
         preCond.append(b.obj());
     }
 
@@ -523,17 +520,23 @@ Status ShardingCatalogManager::commitChunkSplit(OperationContext* opCtx,
         }
     }
 
-    return Status::OK();
+    // currentMaxVersion contains shard version with incremented minor version
+    BSONObjBuilder result;
+    currentMaxVersion.appendToCommand(&result);
+    return result.obj();
 }
 
-Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
-                                                const NamespaceString& nss,
-                                                const OID& requestEpoch,
-                                                const std::vector<BSONObj>& chunkBoundaries,
-                                                const std::string& shardName,
-                                                const boost::optional<Timestamp>& validAfter) {
+StatusWith<BSONObj> ShardingCatalogManager::commitChunkMerge(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const OID& requestEpoch,
+    const std::vector<BSONObj>& chunkBoundaries,
+    const std::string& shardName,
+    const boost::optional<Timestamp>& validAfter) {
     // This method must never be called with empty chunks to merge
     invariant(!chunkBoundaries.empty());
+
+    const auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
     // Take _kChunkOpLock in exclusive mode to prevent concurrent chunk splits, merges, and
     // migrations
@@ -548,7 +551,7 @@ Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
     // Get the max chunk version for this namespace.
     auto swCollVersion = getMaxChunkVersionFromQueryResponse(
         nss,
-        Grid::get(opCtx)->shardRegistry()->getConfigShard()->exhaustiveFindOnConfig(
+        configShard->exhaustiveFindOnConfig(
             opCtx,
             ReadPreferenceSetting{ReadPreference::PrimaryOnly},
             repl::ReadConcernLevel::kLocalReadConcern,
@@ -558,8 +561,7 @@ Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
             1));                             // Limit 1.
 
     if (!swCollVersion.isOK()) {
-        return swCollVersion.getStatus().withContext(str::stream()
-                                                     << "mergeChunk cannot merge chunks.");
+        return swCollVersion.getStatus().withContext("mergeChunk cannot merge chunks.");
     }
 
     auto collVersion = swCollVersion.getValue();
@@ -570,6 +572,25 @@ Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
                 "epoch of chunk does not match epoch of request. This most likely means "
                 "that the collection was dropped and re-created."};
     }
+
+    // Get the shard version (max chunk version) for the shard requesting the merge.
+    auto swShardVersion = getMaxChunkVersionFromQueryResponse(
+        nss,
+        configShard->exhaustiveFindOnConfig(
+            opCtx,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            repl::ReadConcernLevel::kLocalReadConcern,
+            ChunkType::ConfigNS,
+            BSON("ns" << nss.ns() << "shard"
+                      << shardName),         // Query all chunks for this namespace and shard.
+            BSON(ChunkType::lastmod << -1),  // Sort by version.
+            1));                             // Limit 1.
+
+    if (!swShardVersion.isOK()) {
+        return swShardVersion.getStatus().withContext("mergeChunk cannot merge chunks.");
+    }
+
+    auto shardVersion = swShardVersion.getValue();
 
     // Build chunks to be merged
     std::vector<ChunkType> chunksToMerge;
@@ -608,7 +629,19 @@ Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
     }
 
     ChunkVersion mergeVersion = collVersion;
-    mergeVersion.incMinor();
+    // If the incrementChunkMajorVersionOnChunkSplits flag is set, increment the major version only
+    // if the shard that owns the chunks being merged has shardVersion == collectionVersion. See
+    // SERVER-41480 for details.
+    //
+    // This flag is only useful if there are some 4.0 routers still in the cluster, so we only use
+    // it if FCV is not fully upgraded.
+    const auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
+    if (currentFCV != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42 &&
+        incrementChunkMajorVersionOnChunkSplits.load() && shardVersion == collVersion) {
+        mergeVersion.incMajor();
+    } else {
+        mergeVersion.incMinor();
+    }
 
     auto updates = buildMergeChunksTransactionUpdates(chunksToMerge, mergeVersion, validAfter);
     auto preCond = buildMergeChunksTransactionPrecond(chunksToMerge, collVersion);
@@ -640,8 +673,207 @@ Status ShardingCatalogManager::commitChunkMerge(OperationContext* opCtx,
     ShardingLogging::get(opCtx)->logChange(
         opCtx, "merge", nss.ns(), logDetail.obj(), WriteConcernOptions());
 
-    return Status::OK();
+    BSONObjBuilder result;
+    mergeVersion.appendToCommand(&result);
+
+    return result.obj();
 }
+
+StatusWith<BSONObj> ShardingCatalogManager::commitChunksMerge(
+    OperationContext* opCtx,
+    const NamespaceString& nss,
+    const UUID& requestCollectionUUID,
+    const ChunkRange& chunkRange,
+    const ShardId& shardId,
+    const boost::optional<Timestamp>& validAfter) {
+    if (!validAfter) {
+        return {ErrorCodes::IllegalOperation, "chunk operation requires validAfter timestamp"};
+    }
+
+    const auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
+
+    // Take _kChunkOpLock in exclusive mode to prevent concurrent chunk splits, merges, and
+    // migrations
+    // TODO(SERVER-25359): Replace with a collection-specific lock map to allow splits/merges/
+    // move chunks on different collections to proceed in parallel
+    Lock::ExclusiveLock lk(opCtx->lockState(), _kChunkOpLock);
+
+    // 1. Retrieve the initial collection and shard version values
+    //    to validate the request parameters and build up the logging info.
+    auto swCollVersion = getMaxChunkVersionFromQueryResponse(
+        nss,
+        configShard->exhaustiveFindOnConfig(
+            opCtx,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            repl::ReadConcernLevel::kLocalReadConcern,
+            ChunkType::ConfigNS,
+            BSON("ns" << nss.ns()),          // Query all chunks for this namespace.
+            BSON(ChunkType::lastmod << -1),  // Sort by version.
+            1));                             // Limit 1.
+
+    if (!swCollVersion.isOK()) {
+        return swCollVersion.getStatus().withContext(str::stream()
+                                                     << "mergeChunk cannot merge chunks.");
+    }
+
+    auto collVersion = swCollVersion.getValue();
+
+    auto swShardVersion = getMaxChunkVersionFromQueryResponse(
+        nss,
+        configShard->exhaustiveFindOnConfig(
+            opCtx,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            repl::ReadConcernLevel::kLocalReadConcern,
+            ChunkType::ConfigNS,
+            BSON("ns" << nss.ns() << "shard"
+                      << shardId.toString()),  // Query all chunks for this namespace and shard.
+            BSON(ChunkType::lastmod << -1),    // Sort by version.
+            1));                               // Limit 1.
+
+    if (!swShardVersion.isOK()) {
+        return swShardVersion.getStatus().withContext("mergeChunk cannot merge chunks.");
+    }
+
+    auto shardVersion = swShardVersion.getValue();
+
+    auto findCollResponse =
+        configShard->exhaustiveFindOnConfig(opCtx,
+                                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                            repl::ReadConcernLevel::kLocalReadConcern,
+                                            CollectionType::ConfigNS,
+                                            BSON("_id" << nss.ns()),
+                                            {},
+                                            1);
+    if (!findCollResponse.isOK()) {
+        return findCollResponse.getStatus();
+    }
+    if (findCollResponse.getValue().docs.empty()) {
+        return {ErrorCodes::Error(5678601),
+                str::stream() << "Collection '" << nss.ns() << "' no longer either exists"};
+    }
+
+    auto coll = uassertStatusOK(CollectionType::fromBSON(findCollResponse.getValue().docs[0]));
+    invariant(coll.getUUID());
+    auto collUUID = *(coll.getUUID());
+    if (collUUID != requestCollectionUUID) {
+        return {
+            ErrorCodes::InvalidUUID,
+            str::stream() << "UUID of collection does not match UUID of request. Colletion UUID: "
+                          << collUUID << ", request UUID: " << requestCollectionUUID};
+    }
+
+    // 2. Retrieve the list of chunks belonging to the requested shard + key range.
+    const auto shardChunksInRangeQuery = [&]() {
+        BSONObjBuilder queryBuilder;
+        queryBuilder << ChunkType::ns(coll.getNs().ns());
+        queryBuilder << ChunkType::shard(shardId.toString());
+        queryBuilder << ChunkType::min(BSON("$gte" << chunkRange.getMin()));
+        queryBuilder << ChunkType::min(BSON("$lt" << chunkRange.getMax()));
+        return queryBuilder.obj();
+    }();
+
+    const auto shardChunksInRangeResponse = uassertStatusOK(
+        configShard->exhaustiveFindOnConfig(opCtx,
+                                            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+                                            repl::ReadConcernLevel::kLocalReadConcern,
+                                            ChunkType::ConfigNS,
+                                            shardChunksInRangeQuery,
+                                            BSON(ChunkType::min << 1),
+                                            boost::none));
+
+    // Check if the chunk(s) have already been merged. If so, return success.
+    if (shardChunksInRangeResponse.docs.size() == 1) {
+        auto chunk =
+            uassertStatusOK(ChunkType::fromConfigBSON(shardChunksInRangeResponse.docs.back()));
+        uassert(
+            ErrorCodes::IllegalOperation,
+            str::stream() << "could not merge chunks, shard " << shardId
+                          << " does not contain a sequence of chunks that exactly fills the range "
+                          << chunkRange.toString(),
+            chunk.getRange() == chunkRange);
+        BSONObjBuilder result;
+        collVersion.appendToCommand(&result);
+        return result.obj();
+    }
+
+    // 3. Prepare the data for the merge
+    //    and ensure that the retrieved list of chunks covers the whole range.
+    std::vector<ChunkType> chunksToMerge;
+    for (const auto& chunkDoc : shardChunksInRangeResponse.docs) {
+        auto chunk = uassertStatusOK(ChunkType::fromConfigBSON(chunkDoc));
+        if (chunksToMerge.empty()) {
+            uassert(ErrorCodes::IllegalOperation,
+                    str::stream()
+                        << "could not merge chunks, shard " << shardId
+                        << " does not contain a sequence of chunks that exactly fills the range "
+                        << chunkRange.toString(),
+                    chunk.getMin().woCompare(chunkRange.getMin()) == 0);
+        } else {
+            uassert(ErrorCodes::IllegalOperation,
+                    str::stream()
+                        << "could not merge chunks, shard " << shardId
+                        << " does not contain a sequence of chunks that exactly fills the range "
+                        << chunkRange.toString(),
+                    chunk.getMin().woCompare(chunksToMerge.back().getMax()) == 0);
+        }
+        chunksToMerge.push_back(std::move(chunk));
+    }
+    uassert(ErrorCodes::IllegalOperation,
+            str::stream() << "could not merge chunks, shard " << shardId
+                          << " does not contain a sequence of chunks that exactly fills the range "
+                          << chunkRange.toString(),
+            !chunksToMerge.empty() &&
+                chunksToMerge.back().getMax().woCompare(chunkRange.getMax()) == 0);
+
+    ChunkVersion mergeVersion = collVersion;
+    // If the incrementChunkMajorVersionOnChunkSplits flag is set, increment the major version only
+    // if the shard that owns the chunks being merged has shardVersion == collectionVersion. See
+    // SERVER-41480 for details.
+    //
+    // This flag is only useful if there are some 4.0 routers still in the cluster, so we only use
+    // it if FCV is not fully upgraded.
+    const auto currentFCV = serverGlobalParams.featureCompatibility.getVersion();
+    if (currentFCV != ServerGlobalParams::FeatureCompatibility::Version::kFullyUpgradedTo42 &&
+        incrementChunkMajorVersionOnChunkSplits.load() && shardVersion == collVersion) {
+        mergeVersion.incMajor();
+    } else {
+        mergeVersion.incMinor();
+    }
+
+    auto updates = buildMergeChunksTransactionUpdates(chunksToMerge, mergeVersion, validAfter);
+    auto preCond = buildMergeChunksTransactionPrecond(chunksToMerge, collVersion);
+
+    // 4. apply the batch of updates to local metadata
+    uassertStatusOK(Grid::get(opCtx)->catalogClient()->applyChunkOpsDeprecated(
+        opCtx,
+        updates,
+        preCond,
+        nss,
+        mergeVersion,
+        WriteConcernOptions(),
+        repl::ReadConcernLevel::kLocalReadConcern));
+
+    // 5. log changes
+    BSONObjBuilder logDetail;
+    {
+        BSONArrayBuilder b(logDetail.subarrayStart("merged"));
+        for (const auto& chunkToMerge : chunksToMerge) {
+            b.append(chunkToMerge.toConfigBSON());
+        }
+    }
+    collVersion.appendLegacyWithField(&logDetail, "prevShardVersion");
+    mergeVersion.appendLegacyWithField(&logDetail, "mergedVersion");
+    // logDetail.append("owningShard", shardId); TODO not needed in v4.4?
+
+    ShardingLogging::get(opCtx)->logChange(
+        opCtx, "merge", nss.ns(), logDetail.obj(), WriteConcernOptions());
+
+    BSONObjBuilder result;
+    mergeVersion.appendToCommand(&result);
+
+    return result.obj();
+}
+
 
 StatusWith<BSONObj> ShardingCatalogManager::commitChunkMigration(
     OperationContext* opCtx,

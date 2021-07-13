@@ -42,16 +42,21 @@
 #include "mongo/db/commands/txn_cmds_gen.h"
 #include "mongo/db/concurrency/d_concurrency.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/logical_time_validator.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer_util.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/image_collection_entry_gen.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/oplog_entry_gen.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/server_options.h"
+#include "mongo/db/session_catalog.h"
 #include "mongo/db/session_catalog_mongod.h"
 #include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/transaction_participant.h"
@@ -88,7 +93,8 @@ repl::OpTime logOperation(OperationContext* opCtx,
                           const OperationSessionInfo& sessionInfo,
                           boost::optional<StmtId> stmtId,
                           const repl::OplogLink& oplogLink,
-                          const OplogSlot& oplogSlot) {
+                          const OplogSlot& oplogSlot,
+                          boost::optional<repl::RetryImageEnum> needsRetryImage) {
     auto& times = OpObserver::Times::get(opCtx).reservedOpTimes;
     auto opTime = repl::logOp(opCtx,
                               opstr,
@@ -101,7 +107,8 @@ repl::OpTime logOperation(OperationContext* opCtx,
                               sessionInfo,
                               stmtId,
                               oplogLink,
-                              oplogSlot);
+                              oplogSlot,
+                              needsRetryImage);
 
     times.push_back(opTime);
     return opTime;
@@ -167,13 +174,22 @@ struct OpTimeBundle {
 /**
  * Write oplog entry(ies) for the update operation.
  */
-OpTimeBundle replLogUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& args) {
+OpTimeBundle replLogUpdate(OperationContext* opCtx,
+                           const OplogUpdateEntryArgs& args,
+                           const bool storeImagesInSideCollection) {
     BSONObj storeObj;
+    boost::optional<repl::RetryImageEnum> needsRetryImage;
     if (args.updateArgs.storeDocOption == CollectionUpdateArgs::StoreDocOption::PreImage) {
         invariant(args.updateArgs.preImageDoc);
         storeObj = *args.updateArgs.preImageDoc;
+        if (storeImagesInSideCollection && opCtx->getTxnNumber()) {
+            needsRetryImage = repl::RetryImageEnum::kPreImage;
+        }
     } else if (args.updateArgs.storeDocOption == CollectionUpdateArgs::StoreDocOption::PostImage) {
         storeObj = args.updateArgs.updatedDoc;
+        if (storeImagesInSideCollection && opCtx->getTxnNumber()) {
+            needsRetryImage = repl::RetryImageEnum::kPostImage;
+        }
     }
 
     OperationSessionInfo sessionInfo;
@@ -189,7 +205,7 @@ OpTimeBundle replLogUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& 
     OpTimeBundle opTimes;
     opTimes.wallClockTime = getWallClockTimeForOpLog(opCtx);
 
-    if (!storeObj.isEmpty() && opCtx->getTxnNumber()) {
+    if (!storeImagesInSideCollection && !storeObj.isEmpty() && opCtx->getTxnNumber()) {
         auto noteUpdateOpTime = logOperation(opCtx,
                                              "n",
                                              args.nss,
@@ -201,7 +217,8 @@ OpTimeBundle replLogUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& 
                                              sessionInfo,
                                              args.updateArgs.stmtId,
                                              {},
-                                             OplogSlot());
+                                             OplogSlot(),
+                                             {});
 
         opTimes.prePostImageOpTime = noteUpdateOpTime;
 
@@ -224,7 +241,8 @@ OpTimeBundle replLogUpdate(OperationContext* opCtx, const OplogUpdateEntryArgs& 
                                        sessionInfo,
                                        args.updateArgs.stmtId,
                                        oplogLink,
-                                       OplogSlot());
+                                       OplogSlot(),
+                                       needsRetryImage);
 
     return opTimes;
 }
@@ -237,7 +255,8 @@ OpTimeBundle replLogDelete(OperationContext* opCtx,
                            OptionalCollectionUUID uuid,
                            StmtId stmtId,
                            bool fromMigrate,
-                           const boost::optional<BSONObj>& deletedDoc) {
+                           const boost::optional<BSONObj>& deletedDoc,
+                           const bool storeImagesInSideCollection) {
     OperationSessionInfo sessionInfo;
     repl::OplogLink oplogLink;
 
@@ -251,21 +270,27 @@ OpTimeBundle replLogDelete(OperationContext* opCtx,
     OpTimeBundle opTimes;
     opTimes.wallClockTime = getWallClockTimeForOpLog(opCtx);
 
+    boost::optional<repl::RetryImageEnum> needsRetryImage;
     if (deletedDoc && opCtx->getTxnNumber()) {
-        auto noteOplog = logOperation(opCtx,
-                                      "n",
-                                      nss,
-                                      uuid,
-                                      deletedDoc.get(),
-                                      nullptr,
-                                      false,
-                                      opTimes.wallClockTime,
-                                      sessionInfo,
-                                      stmtId,
-                                      {},
-                                      OplogSlot());
-        opTimes.prePostImageOpTime = noteOplog;
-        oplogLink.preImageOpTime = noteOplog;
+        if (storeImagesInSideCollection) {
+            needsRetryImage = repl::RetryImageEnum::kPreImage;
+        } else {
+            auto noteOplog = logOperation(opCtx,
+                                          "n",
+                                          nss,
+                                          uuid,
+                                          deletedDoc.get(),
+                                          nullptr,
+                                          false,
+                                          opTimes.wallClockTime,
+                                          sessionInfo,
+                                          stmtId,
+                                          {},
+                                          OplogSlot(),
+                                          {});
+            opTimes.prePostImageOpTime = noteOplog;
+            oplogLink.preImageOpTime = noteOplog;
+        }
     }
 
     auto& documentKey = documentKeyDecoration(opCtx);
@@ -280,7 +305,8 @@ OpTimeBundle replLogDelete(OperationContext* opCtx,
                                        sessionInfo,
                                        stmtId,
                                        oplogLink,
-                                       OplogSlot());
+                                       OplogSlot(),
+                                       needsRetryImage);
     return opTimes;
 }
 
@@ -307,8 +333,28 @@ OpTimeBundle replLogApplyOps(OperationContext* opCtx,
                                      sessionInfo,
                                      stmtId,
                                      oplogLink,
-                                     oplogSlot);
+                                     oplogSlot,
+                                     {});
     return times;
+}
+
+void writeToImageCollection(OperationContext* opCtx,
+                            const LogicalSessionId& sessionId,
+                            const Timestamp timestamp,
+                            repl::RetryImageEnum imageKind,
+                            const BSONObj& dataImage) {
+    repl::ImageEntry imageEntry;
+    invariant(opCtx->getLogicalSessionId());
+    imageEntry.set_id(sessionId);
+    imageEntry.setTxnNumber(opCtx->getTxnNumber().get());
+    imageEntry.setTs(timestamp);
+    imageEntry.setImageKind(imageKind);
+    imageEntry.setImage(dataImage);
+
+    repl::UnreplicatedWritesBlock unreplicated(opCtx);
+    AutoGetCollection imageCollectionRaii(
+        opCtx, NamespaceString::kConfigImagesNamespace, LockMode::MODE_IX);
+    Helpers::upsert(opCtx, NamespaceString::kConfigImagesNamespace.toString(), imageEntry.toBSON());
 }
 
 }  // namespace
@@ -345,7 +391,8 @@ void OpObserverImpl::onCreateIndex(OperationContext* opCtx,
                  {},
                  kUninitializedStmtId,
                  {},
-                 OplogSlot());
+                 OplogSlot(),
+                 {});
 }
 
 void OpObserverImpl::onStartIndexBuild(OperationContext* opCtx,
@@ -381,7 +428,8 @@ void OpObserverImpl::onStartIndexBuild(OperationContext* opCtx,
                  {},
                  kUninitializedStmtId,
                  {},
-                 OplogSlot());
+                 OplogSlot(),
+                 {});
 }
 
 void OpObserverImpl::onCommitIndexBuild(OperationContext* opCtx,
@@ -417,7 +465,8 @@ void OpObserverImpl::onCommitIndexBuild(OperationContext* opCtx,
                  {},
                  kUninitializedStmtId,
                  {},
-                 OplogSlot());
+                 OplogSlot(),
+                 {});
 }
 
 void OpObserverImpl::onAbortIndexBuild(OperationContext* opCtx,
@@ -453,7 +502,8 @@ void OpObserverImpl::onAbortIndexBuild(OperationContext* opCtx,
                  {},
                  kUninitializedStmtId,
                  {},
-                 OplogSlot());
+                 OplogSlot(),
+                 {});
 }
 
 void OpObserverImpl::onInserts(OperationContext* opCtx,
@@ -550,6 +600,8 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
     auto txnParticipant = TransactionParticipant::get(opCtx);
     const bool inMultiDocumentTransaction =
         txnParticipant && opCtx->writesAreReplicated() && txnParticipant.transactionIsOpen();
+    // Load only once to avoid race.
+    const bool storeImagesInSideCollection = repl::gStoreFindAndModifyImagesInSideCollection.load();
 
     OpTimeBundle opTime;
     if (inMultiDocumentTransaction) {
@@ -557,7 +609,29 @@ void OpObserverImpl::onUpdate(OperationContext* opCtx, const OplogUpdateEntryArg
             args.nss, args.uuid, args.updateArgs.update, args.updateArgs.criteria);
         txnParticipant.addTransactionOperation(opCtx, operation);
     } else {
-        opTime = replLogUpdate(opCtx, args);
+        opTime = replLogUpdate(opCtx, args, storeImagesInSideCollection);
+        // Check if we're in a retryable write that should save the image to
+        // `config.image_collection`.
+        if (storeImagesInSideCollection && opCtx->getTxnNumber() &&
+            args.updateArgs.storeDocOption != CollectionUpdateArgs::StoreDocOption::None) {
+            BSONObj imageDoc;
+            repl::RetryImageEnum imageKind;
+            if (args.updateArgs.storeDocOption == CollectionUpdateArgs::StoreDocOption::PreImage) {
+                invariant(args.updateArgs.preImageDoc);
+                imageDoc = *args.updateArgs.preImageDoc;
+                imageKind = repl::RetryImageEnum::kPreImage;
+            } else {
+                invariant(args.updateArgs.storeDocOption ==
+                          CollectionUpdateArgs::StoreDocOption::PostImage);
+                imageDoc = args.updateArgs.updatedDoc;
+                imageKind = repl::RetryImageEnum::kPostImage;
+            }
+            writeToImageCollection(opCtx,
+                                   *opCtx->getLogicalSessionId(),
+                                   opTime.writeOpTime.getTimestamp(),
+                                   imageKind,
+                                   imageDoc);
+        }
         SessionTxnRecord sessionTxnRecord;
         sessionTxnRecord.setLastWriteOpTime(opTime.writeOpTime);
         sessionTxnRecord.setLastWriteDate(opTime.wallClockTime);
@@ -603,21 +677,34 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
                               const NamespaceString& nss,
                               OptionalCollectionUUID uuid,
                               StmtId stmtId,
-                              bool fromMigrate,
-                              const boost::optional<BSONObj>& deletedDoc) {
+                              const OplogDeleteEntryArgs& args) {
     auto& documentKey = documentKeyDecoration(opCtx);
     invariant(!documentKey.isEmpty());
 
     auto txnParticipant = TransactionParticipant::get(opCtx);
     const bool inMultiDocumentTransaction =
         txnParticipant && opCtx->writesAreReplicated() && txnParticipant.transactionIsOpen();
+    // Load only once to avoid race.
+    const bool storeImagesInSideCollection = repl::gStoreFindAndModifyImagesInSideCollection.load();
 
     OpTimeBundle opTime;
     if (inMultiDocumentTransaction) {
         auto operation = OplogEntry::makeDeleteOperation(nss, uuid, documentKey);
         txnParticipant.addTransactionOperation(opCtx, operation);
     } else {
-        opTime = replLogDelete(opCtx, nss, uuid, stmtId, fromMigrate, deletedDoc);
+        boost::optional<BSONObj> deletedDoc =
+            args.deletedDoc ? boost::optional<BSONObj>(*(args.deletedDoc)) : boost::none;
+        opTime = replLogDelete(
+            opCtx, nss, uuid, stmtId, args.fromMigrate, deletedDoc, storeImagesInSideCollection);
+
+        if (storeImagesInSideCollection && deletedDoc && opCtx->getTxnNumber()) {
+            writeToImageCollection(opCtx,
+                                   *opCtx->getLogicalSessionId(),
+                                   opTime.writeOpTime.getTimestamp(),
+                                   repl::RetryImageEnum::kPreImage,
+                                   *deletedDoc);
+        }
+
         SessionTxnRecord sessionTxnRecord;
         sessionTxnRecord.setLastWriteOpTime(opTime.writeOpTime);
         sessionTxnRecord.setLastWriteDate(opTime.wallClockTime);
@@ -625,7 +712,7 @@ void OpObserverImpl::onDelete(OperationContext* opCtx,
     }
 
     if (nss != NamespaceString::kSessionTransactionsTableNamespace) {
-        if (!fromMigrate) {
+        if (!args.fromMigrate) {
             shardObserveDeleteOp(opCtx,
                                  nss,
                                  documentKey,
@@ -667,7 +754,8 @@ void OpObserverImpl::onInternalOpMessage(OperationContext* opCtx,
                  {},
                  kUninitializedStmtId,
                  {},
-                 OplogSlot());
+                 OplogSlot(),
+                 {});
 }
 
 void OpObserverImpl::onCreateCollection(OperationContext* opCtx,
@@ -693,7 +781,8 @@ void OpObserverImpl::onCreateCollection(OperationContext* opCtx,
                      {},
                      kUninitializedStmtId,
                      {},
-                     createOpTime);
+                     createOpTime,
+                     {});
     }
 }
 
@@ -731,7 +820,8 @@ void OpObserverImpl::onCollMod(OperationContext* opCtx,
                      {},
                      kUninitializedStmtId,
                      {},
-                     OplogSlot());
+                     OplogSlot(),
+                     {});
     }
 
     // Make sure the UUID values in the Collection metadata, the Collection object, and the UUID
@@ -765,7 +855,8 @@ void OpObserverImpl::onDropDatabase(OperationContext* opCtx, const std::string& 
                  {},
                  kUninitializedStmtId,
                  {},
-                 OplogSlot());
+                 OplogSlot(),
+                 {});
 
     uassert(
         50714, "dropping the admin database is not allowed.", dbName != NamespaceString::kAdminDb);
@@ -797,7 +888,8 @@ repl::OpTime OpObserverImpl::onDropCollection(OperationContext* opCtx,
                      {},
                      kUninitializedStmtId,
                      {},
-                     OplogSlot());
+                     OplogSlot(),
+                     {});
     }
 
     uassert(50715,
@@ -848,7 +940,8 @@ void OpObserverImpl::onDropIndex(OperationContext* opCtx,
                  {},
                  kUninitializedStmtId,
                  {},
-                 OplogSlot());
+                 OplogSlot(),
+                 {});
 }
 
 
@@ -888,7 +981,8 @@ repl::OpTime OpObserverImpl::preRenameCollection(OperationContext* const opCtx,
                  {},
                  kUninitializedStmtId,
                  {},
-                 OplogSlot());
+                 OplogSlot(),
+                 {});
 
     return {};
 }
@@ -944,7 +1038,8 @@ void OpObserverImpl::onEmptyCapped(OperationContext* opCtx,
                      {},
                      kUninitializedStmtId,
                      {},
-                     OplogSlot());
+                     OplogSlot(),
+                     {});
     }
 }
 
@@ -1258,7 +1353,8 @@ void logCommitOrAbortForPreparedTransaction(OperationContext* opCtx,
                                                   sessionInfo,
                                                   boost::none /* stmtId */,
                                                   oplogLink,
-                                                  oplogSlot);
+                                                  oplogSlot,
+                                                  {});
             invariant(oplogSlot.isNull() || oplogSlot == oplogOpTime);
 
             SessionTxnRecord sessionTxnRecord;
