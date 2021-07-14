@@ -216,13 +216,8 @@ install_golang() {
 
 install_gcc_8_centos(){
     if [ "${RHEL}" -lt 8 ]; then
-        until yum -y install centos-release-scl; do
-            echo "waiting"
-            sleep 1
-        done
-        yum -y install  gcc-c++ devtoolset-8-gcc-c++ devtoolset-8-binutils cmake3 rh-python36
+        yum -y install  gcc-c++ devtoolset-8-gcc-c++ devtoolset-8-binutils cmake3 python38
         source /opt/rh/devtoolset-8/enable
-        source /opt/rh/rh-python36/enable
     else
         yum -y install binutils gcc gcc-c++
     fi
@@ -347,21 +342,28 @@ install_deps() {
         yum -y install epel-release
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
         yum -y install cyrus-sasl-devel snappy-devel zlib-devel bzip2-devel scons rpmlint
-        yum -y install rpm-build git python-pip python-devel libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel which
+        yum -y install rpm-build git libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel which
         yum -y install openldap-devel krb5-devel xz-devel
+
+        yum -y install centos-release-scl
+        yum-config-manager --enable centos-sclo-rh-testing
+        yum -y install rh-python38-python rh-python38-python-devel rh-python38-python-pip
+        source /opt/rh/rh-python38/enable
+
         pip install --upgrade pip
-        pip2.7 install --user setuptools --upgrade
-        pip3.6 install --user typing pyyaml regex Cheetah3
+        pip install --user setuptools --upgrade
+        pip3.8 install --user typing pyyaml regex Cheetah3
         pip2.7 install --user typing pyyaml regex Cheetah Cheetah3
       else
         yum -y install bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
         yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
-        yum -y install python2-scons python2-pip python36-devel which
+        yum -y install python2-scons python2-pip which
         yum -y install redhat-rpm-config python2-devel e2fsprogs-devel expat-devel lz4-devel
         yum -y install openldap-devel krb5-devel xz-devel
+        yum -y install python38 python38-devel python38-pip
       fi
       if [ "x${RHEL}" == "x8" ]; then
-        /usr/bin/pip3.6 install --user typing pyyaml regex Cheetah3
+        /usr/bin/pip3.8 install --user typing pyyaml regex Cheetah3
         /usr/bin/pip2.7 install --user typing pyyaml regex Cheetah
       fi
       wget https://curl.se/download/curl-7.66.0.tar.gz
@@ -376,7 +378,7 @@ install_deps() {
       install_gcc_8_centos
       if [ -f /opt/rh/devtoolset-8/enable ]; then
         source /opt/rh/devtoolset-8/enable
-        source /opt/rh/rh-python36/enable
+        source /opt/rh/rh-python38/enable
       fi
       pip install --upgrade pip
 
@@ -515,7 +517,7 @@ build_srpm(){
     mv -fv ${TARFILE} ${WORKDIR}/rpmbuild/SOURCES
     if [ -f /opt/rh/devtoolset-8/enable ]; then
         source /opt/rh/devtoolset-8/enable
-        source /opt/rh/rh-python36/enable
+        source /opt/rh/rh-python38/enable
     fi
     rpmbuild -bs --define "_topdir ${WORKDIR}/rpmbuild" --define "dist .generic" rpmbuild/SPECS/$(basename ${SPEC_TMPL%.template})
     mkdir -p ${WORKDIR}/srpm
@@ -562,24 +564,24 @@ build_rpm(){
     tar vxzf ${TARF} --wildcards '*/etc' --strip=1
     if [ -f /opt/rh/devtoolset-8/enable ]; then
         source /opt/rh/devtoolset-8/enable
-        source /opt/rh/rh-python36/enable
+        source /opt/rh/rh-python38/enable
     fi
     RHEL=$(rpm --eval %rhel)
     ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
-    if [ "x${RHEL}" == "x8" ]; then
-        pip3.6 install --upgrade pip
-        pip3.6 install --user -r etc/pip/dev-requirements.txt
-        pip3.6 install --user -r etc/pip/evgtest-requirements.txt
-    else
+    if [ "x${RHEL}" == "x6" ]; then
         pip install --upgrade pip
         pip install --user -r etc/pip/dev-requirements.txt
         pip install --user -r etc/pip/evgtest-requirements.txt
+    else
+        pip3.8 install --upgrade pip
+        pip3.8 install --user -r etc/pip/dev-requirements.txt
+        pip3.8 install --user -r etc/pip/evgtest-requirements.txt
     fi
     #
     cd $WORKDIR
     if [ -f /opt/rh/devtoolset-8/enable ]; then
         source /opt/rh/devtoolset-8/enable
-        source /opt/rh/rh-python36/enable
+        source /opt/rh/rh-python38/enable
     fi
 
     echo "CC and CXX should be modified once correct compiller would be installed on Centos"
@@ -777,7 +779,7 @@ build_tarball(){
         RHEL=$(rpm --eval %rhel)
         if [ -f /opt/rh/devtoolset-8/enable ]; then
             source /opt/rh/devtoolset-8/enable
-            source /opt/rh/rh-python36/enable
+            source /opt/rh/rh-python38/enable
         fi
         echo "CC and CXX should be modified once correct compiller would be installed on Centos"
         if [ "x${RHEL}" == "x8" ]; then
