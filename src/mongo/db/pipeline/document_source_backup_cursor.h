@@ -39,6 +39,31 @@ class DocumentSourceBackupCursor : public DocumentSource {
 public:
     static constexpr StringData kStageName = "$backupCursor"_sd;
 
+    class LiteParsed final : public LiteParsedDocumentSource {
+    public:
+        using LiteParsedDocumentSource::LiteParsedDocumentSource;
+
+        static std::unique_ptr<LiteParsed> parse(const AggregationRequest& request,
+                                                 const BSONElement& spec);
+
+        stdx::unordered_set<NamespaceString> getInvolvedNamespaces() const final {
+            return stdx::unordered_set<NamespaceString>();
+        }
+
+        PrivilegeVector requiredPrivileges(bool isMongos) const final {
+            return {Privilege(ResourcePattern::forClusterResource(), ActionType::fsync)};
+        }
+
+        bool isInitialSource() const final {
+            return true;
+        }
+
+        bool allowedToPassthroughFromMongos() const final {
+            // $backupCursor must be run locally on a mongod.
+            return false;
+        }
+    };
+
     /**
      * Parses a $backupCursor stage from 'spec'.
      */
