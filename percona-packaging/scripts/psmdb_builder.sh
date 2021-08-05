@@ -251,6 +251,12 @@ install_gcc_54_deb(){
         rm -rf /usr/local/gcc-5.4.0
         mv gcc-5.4.0 /usr/local/
     fi
+    if [ x"${DEBIAN}" = xbullseye ]; then
+        wget https://jenkins.percona.com/downloads/gcc-5.4.0/gcc-5.4.0_ubuntu-focal-x64.tar.gz -O /tmp/gcc-5.4.0_ubuntu-focal-x64.tar.gz
+        tar -zxf /tmp/gcc-5.4.0_ubuntu-focal-x64.tar.gz
+        rm -rf /usr/local/gcc-5.4.0
+        mv gcc-5.4.0 /usr/local/
+    fi
 }
 
 set_compiler(){
@@ -296,7 +302,7 @@ aws_sdk_build(){
             else
                 ${CMAKE_CMD} CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3;transfer" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON || exit $?
             fi
-            make -j4 || exit $?
+            make -j8 || exit $?
             make install
     cd ${WORKDIR}
 }
@@ -388,16 +394,19 @@ EOL
         rm -f /etc/apt/sources.list.d/stretch.list
         apt-get -y update
       fi
-      wget https://repo.percona.com/apt/percona-release_latest.$(lsb_release -sc)_all.deb && dpkg -i percona-release_latest.$(lsb_release -sc)_all.deb
+      wget https://repo.percona.com/apt/pool/testing/p/percona-release/percona-release_1.0-27.generic_all.deb && dpkg -i percona-release_1.0-27.generic_all.deb
       percona-release enable tools testing
       apt-get -y update
-      INSTALL_LIST="git valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev dh-systemd libsasl2-dev gcc g++ cmake curl patchelf"
       if [ x"${DEBIAN}" = xfocal ]; then
-          INSTALL_LIST="${INSTALL_LIST} python2 python2-dev "
+          INSTALL_LIST="python2 python2-dev "
       else
-          INSTALL_LIST="${INSTALL_LIST} python python-dev "
+          INSTALL_LIST="python python-dev "
       fi
+      INSTALL_LIST="${INSTALL_LIST} git valgrind scons liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev libsasl2-dev gcc g++ cmake curl patchelf"
       INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev libldap2-dev libkrb5-dev"
+      if [ x"${DEBIAN}" != "xbullseye" ]; then
+          INSTALL_LIST="${INSTALL_LIST} dh-systemd "
+      fi
       until apt-get -y install dirmngr; do
         sleep 1
         echo "waiting"
@@ -410,6 +419,10 @@ EOL
       install_golang
       install_gcc_54_deb
       wget https://bootstrap.pypa.io/pip/2.7/get-pip.py
+      if [ x"${DEBIAN}" = "xbullseye" ]; then
+        update-alternatives --install /usr/bin/python python /usr/bin/python2.7 1
+	pip install pip --upgrade
+      fi
       if [ x"${DEBIAN}" = "xfocal" ]; then
           ln -s /usr/bin/python2 /usr/bin/python
       fi
@@ -633,6 +646,11 @@ build_source_deb(){
     sed -i 's:@@LOGDIR@@:mongodb:g' ${BUILDDIR}/debian/mongod.default
     sed -i 's:@@LOGDIR@@:mongodb:g' ${BUILDDIR}/debian/percona-server-mongodb-helper.sh
     #
+    if [ x"${DEBIAN}" = "xbullseye" ]; then
+        sed -i 's:dh-systemd,::' ${BUILDDIR}/debian/control
+        sed -i 's:etc/:/etc/:g' ${BUILDDIR}/debian/percona-server-mongodb-server.conffiles
+    fi
+    #
     mv ${BUILDDIR}/debian/mongod.default ${BUILDDIR}/debian/percona-server-mongodb-server.mongod.default
     mv ${BUILDDIR}/debian/mongod.service ${BUILDDIR}/debian/percona-server-mongodb-server.mongod.service
     #
@@ -791,7 +809,7 @@ build_tarball(){
             else
                 cmake CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3;transfer" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}" || exit $?
             fi
-            make -j4 || exit $?
+            make -j8 || exit $?
             make install
             mkdir -p ${INSTALLDIR}/include/
             mkdir -p ${INSTALLDIR}/lib/
