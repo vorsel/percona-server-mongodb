@@ -478,6 +478,8 @@ install_deps() {
       pip install --upgrade pip
 
     else
+      sed -i 's|http://archive.ubuntu.com|http://it.archive.ubuntu.com|g' /etc/apt/sources.list
+      sed -i 's|http://security.ubuntu.com|http://it.archive.ubuntu.com|g' /etc/apt/sources.list
       apt-get -y update
       DEBIAN_FRONTEND=noninteractive apt-get -y install curl lsb-release wget apt-transport-https software-properties-common
       export DEBIAN=$(lsb_release -sc)
