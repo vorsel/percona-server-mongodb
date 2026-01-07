@@ -309,6 +309,7 @@ set_compiler(){
 fix_rules(){
     sed -i 's|CC = gcc-5|CC = /opt/mongodbtoolchain/v4/bin/gcc|' debian/rules
     sed -i 's|CXX = g++-5|CXX = /opt/mongodbtoolchain/v4/bin/g++|' debian/rules
+    sed -i '/^PSMDB_VERSION :=/d' debian/rules
     return
 }
 
