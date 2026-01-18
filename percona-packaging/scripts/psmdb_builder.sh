@@ -383,7 +383,7 @@ install_deps() {
         yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm
         percona-release enable tools testing
         yum clean all
-        yum install -y patchelf
+        #yum install -y patchelf
       fi
       if [ x"$RHEL" = x7 ]; then
         yum -y install epel-release
@@ -418,7 +418,7 @@ install_deps() {
         yum -y install python38 python38-devel python38-pip
         ln -sf /usr/bin/scons-3 /usr/bin/scons
         /usr/bin/pip3.8 install --user typing pyyaml regex Cheetah3
-      elif [ x"$RHEL" = x9  -o x"$RHEL" = x2023 ]; then
+      elif [ x"$RHEL" = x2023 ]; then
         dnf config-manager --enable ol9_codeready_builder
 
         yum -y install oracle-epel-release-el9
@@ -426,6 +426,25 @@ install_deps() {
         yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
         yum -y install python3 python3-pip python3-devel
         yum -y install python3-scons 
+
+        yum -y install redhat-rpm-config which e2fsprogs-devel expat-devel lz4-devel
+        yum -y install openldap-devel krb5-devel xz-devel
+        /usr/bin/pip install --upgrade pip setuptools --ignore-installed
+        /usr/bin/pip install --user typing pyyaml==5.3.1 regex Cheetah3
+      elif [ x"$RHEL" = x9 ]; then
+        #dnf config-manager --enable ol9_codeready_builder
+       dnf install -y dnf-plugins-core
+       dnf config-manager --set-enabled crb
+       /usr/bin/crb enable
+       dnf install -y epel-release
+       wget https://rpmfind.net/linux/almalinux/9/AppStream/x86_64/os/Packages/snappy-devel-1.1.8-8.el9.x86_64.rpm
+        yum install -y ./snappy-devel-1.1.8-8.el9.x86_64.rpm
+
+        #yum -y install oracle-epel-release-el9
+        yum -y install bzip2-devel libpcap-devel gcc gcc-c++ rpm-build rpmlint
+        yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
+        yum -y install python3 python3-pip python3-devel
+        yum -y install python3-scons
 
         yum -y install redhat-rpm-config which e2fsprogs-devel expat-devel lz4-devel
         yum -y install openldap-devel krb5-devel xz-devel
