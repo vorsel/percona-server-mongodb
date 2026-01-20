@@ -425,9 +425,16 @@ install_deps() {
        dnf install -y dnf-plugins-core
        dnf config-manager --set-enabled crb
        /usr/bin/crb enable
-       dnf install -y epel-release
-       wget https://rpmfind.net/linux/almalinux/9/AppStream/x86_64/os/Packages/snappy-devel-1.1.8-8.el9.x86_64.rpm
-        yum install -y ./snappy-devel-1.1.8-8.el9.x86_64.rpm
+        dnf install -y epel-release
+        SNAPPY_ARCH="${ARCH:-$(uname -m)}"
+        if [ x"${SNAPPY_ARCH}" = xaarch64 ]; then
+          SNAPPY_ARCH="aarch64"
+        else
+          SNAPPY_ARCH="x86_64"
+        fi
+        SNAPPY_RPM="snappy-devel-1.1.8-8.el9.${SNAPPY_ARCH}.rpm"
+        wget "https://rpmfind.net/linux/almalinux/9/AppStream/${SNAPPY_ARCH}/os/Packages/${SNAPPY_RPM}"
+         yum install -y "./${SNAPPY_RPM}"
 
         #yum -y install oracle-epel-release-el9
         yum -y install bzip2-devel libpcap-devel gcc gcc-c++ rpm-build rpmlint
