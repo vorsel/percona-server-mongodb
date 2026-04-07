@@ -13,6 +13,12 @@ export USE_SSE=1
 export PATH := /usr/local/go/bin:$(PATH)
 export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1 -B/opt/mongodbtoolchain/v4/bin"
 
+ifdef REMOTE_CACHE_SERVER
+BAZEL_REMOTE_FLAGS = --remote_cache=grpc://$(REMOTE_CACHE_SERVER):1985 --remote_upload_local_results=true --remote_timeout=30s --bes_backend=grpc://$(REMOTE_CACHE_SERVER):1985 --bes_results_url=http://$(REMOTE_CACHE_SERVER):8080/invocation/ --bes_upload_mode=fully_async
+else
+BAZEL_REMOTE_FLAGS =
+endif
+
 $(info GLIBC_TUNABLES is $(GLIBC_TUNABLES))
 CC = gcc-5
 CXX = g++-5
@@ -34,7 +40,12 @@ override_dh_auto_clean:
 	find $(PSMSRC) -name '*.pyc' -delete
 
 percona-server-mongodb:
-	bazel build --config=psmdb_opt_release --define=MONGO_VERSION=$(PSMDB_VERSION) --define=GIT_COMMIT_HASH=$(PSMDB_GIT_HASH) install-dist-test
+	bazel build \
+		--config=psmdb_opt_release \
+		--define=MONGO_VERSION=$(PSMDB_VERSION) \
+		--define=GIT_COMMIT_HASH=$(PSMDB_GIT_HASH) \
+		$(BAZEL_REMOTE_FLAGS) \
+		install-dist-test
 
 compile-mongo-tools:
 	mkdir $(PSMSRC)/bin || true;

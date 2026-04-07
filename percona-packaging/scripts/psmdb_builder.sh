@@ -24,6 +24,7 @@ Usage: $0 [OPTIONS]
         --special_targets   Special targets for tests
         --jenkins_mode      If it is set it means that this script is used on jenkins infrastructure
         --debug             build debug tarball
+        --remote_cache_server  Bazel remote cache server IP (empty to disable)
         --help) usage ;;
 Example $0 --builddir=/tmp/PSMDB --get_sources=1 --build_src_rpm=1 --build_rpm=1
 EOF
@@ -61,6 +62,7 @@ parse_arguments() {
             --jenkins_mode=*) JENKINS_MODE="$val" ;;
             --debug=*) DEBUG="$val" ;;
             --special_targets=*) SPECIAL_TAR="$val" ;;
+            --remote_cache_server=*) REMOTE_CACHE_SERVER="$val" ;;
             --help) usage ;;
             *)
               if test -n "$pick_args"
@@ -562,7 +564,17 @@ build_srpm(){
     wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelversion
     wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelrc.psmdb
     wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.npmrc
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.prettierignore 
+    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.prettierignore
+    # Neutralize the block that disables Remote Cache
+    sed -i '/# Disable remote execution and remote cache/,/enable additional modules/d' .bazelrc.psmdb
+    # Remove settings that conflict with remote cache
+    sed -i '/grpc_keepalive_time/d' .bazelrc*
+    sed -i '/experimental_remote_downloader/d' .bazelrc*
+    sed -i '/remote_cache=/d' .bazelrc*
+    sed -i '/bes_backend=/d' .bazelrc*
+    sed -i '/bes_results_url=/d' .bazelrc*
+    sed -i '/remote_executor=/d' .bazelrc*
+    sed -i '/tls_/d' .bazelrc*
     cd ..
     tar --owner=0 --group=0 -czf ${PRODUCT_FULL}.tar.gz ${PRODUCT_FULL}
     #
@@ -727,7 +739,11 @@ build_rpm(){
     else
         export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1 -B/opt/mongodbtoolchain/v4/bin"
     fi
-    rpmbuild --define "_topdir ${WORKDIR}/rpmbuild" --define "dist .$OS_NAME" --rebuild rpmbuild/SRPMS/$SRC_RPM
+    RPMBUILD_REMOTE_CACHE=()
+    if [ -n "${REMOTE_CACHE_SERVER}" ]; then
+        RPMBUILD_REMOTE_CACHE=(--define "remote_cache_server ${REMOTE_CACHE_SERVER}")
+    fi
+    rpmbuild --define "_topdir ${WORKDIR}/rpmbuild" --define "dist .$OS_NAME" "${RPMBUILD_REMOTE_CACHE[@]}" --rebuild rpmbuild/SRPMS/$SRC_RPM
 
     return_code=$?
     if [ $return_code != 0 ]; then
@@ -871,6 +887,16 @@ build_deb(){
     wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelrc.psmdb
     wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.npmrc
     wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.prettierignore
+    # Neutralize the block that disables Remote Cache
+    sed -i '/# Disable remote execution and remote cache/,/enable additional modules/d' .bazelrc.psmdb
+    # Remove settings that conflict with remote cache
+    sed -i '/grpc_keepalive_time/d' .bazelrc*
+    sed -i '/experimental_remote_downloader/d' .bazelrc*
+    sed -i '/remote_cache=/d' .bazelrc*
+    sed -i '/bes_backend=/d' .bazelrc*
+    sed -i '/bes_results_url=/d' .bazelrc*
+    sed -i '/remote_executor=/d' .bazelrc*
+    sed -i '/tls_/d' .bazelrc*
     python3 buildscripts/install_bazel.py
     export PATH=\/root/.local/bin:$PATH >> ~/.bashrc
     source ~/.bashrc
@@ -913,6 +939,7 @@ build_deb(){
     export GOPATH=$PWD/../
     export PATH="/usr/local/go/bin:$PATH:$GOPATH"
     export GOBINPATH="/usr/local/go/bin"
+    export REMOTE_CACHE_SERVER
     dpkg-buildpackage -rfakeroot -us -uc -b
     mkdir -p $CURDIR/deb
     mkdir -p $WORKDIR/deb
@@ -1092,11 +1119,31 @@ build_tarball(){
     wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelrc.psmdb
     wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.npmrc
     wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.prettierignore
+    # Remove keepalive setting that breaks gRPC
+    sed -i '/grpc_keepalive_time/d' .bazelrc*
+    # Remove remote_downloader to avoid gRPC requests for source downloads
+    sed -i '/experimental_remote_downloader/d' .bazelrc*
+    # Clean up cache, BES, and TLS settings
+    sed -i '/remote_cache=/d' .bazelrc*
+    sed -i '/bes_backend=/d' .bazelrc*
+    sed -i '/bes_results_url=/d' .bazelrc*
+    sed -i '/remote_executor=/d' .bazelrc*
+    sed -i '/tls_/d' .bazelrc*
+
     python3 buildscripts/install_bazel.py
     export PATH=\/root/.local/bin:$PATH >> ~/.bashrc
     source ~/.bashrc
+    BAZEL_REMOTE_FLAGS=""
+    if [ -n "${REMOTE_CACHE_SERVER}" ]; then
+        BAZEL_REMOTE_FLAGS="--remote_cache=grpc://${REMOTE_CACHE_SERVER}:1985 --remote_upload_local_results=true --remote_timeout=30s --bes_backend=grpc://${REMOTE_CACHE_SERVER}:1985 --bes_results_url=http://${REMOTE_CACHE_SERVER}:8080/invocation/ --bes_upload_mode=fully_async"
+    fi
     bazel clean --expunge || true
-    bazel build --config=psmdb_opt_release --define=MONGO_VERSION=${VERSION}-${RELEASE} --define=GIT_COMMIT_HASH=${REVISION_LONG} install-dist-test
+    bazel build \
+        --config=psmdb_opt_release \
+        --define=MONGO_VERSION=${VERSION}-${RELEASE} \
+        --define=GIT_COMMIT_HASH=${REVISION_LONG} \
+        ${BAZEL_REMOTE_FLAGS} \
+        install-dist-test
     rm -rf .[^.]*
     mkdir -p ${PSMDIR}/bin
     for target in ${PSM_TARGETS[@]}; do
@@ -1340,6 +1387,7 @@ PSM_RELEASE="1"
 MONGO_TOOLS_TAG="master"
 PRODUCT=percona-server-mongodb
 DEBUG=0
+REMOTE_CACHE_SERVER=""
 parse_arguments PICK-ARGS-FROM-ARGV "$@"
 VERSION=${PSM_VER}
 RELEASE=${PSM_RELEASE}
