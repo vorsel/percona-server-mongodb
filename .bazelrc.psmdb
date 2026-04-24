@@ -93,5 +93,31 @@ common:psmdb_opt_release --//bazel/config:linkstatic=True
 common:psmdb_opt_release --//bazel/config:release=True
 
 ################################################################################
+# Profile for building against the Percona ondemand buildfarm remote executor.
+# Opt-in ONLY — no effect unless `--config=psmdb_buildfarm` is passed.
+#
+# Activates a stable per-distro routing tag via RBE_CONTAINER_IMAGE_PREFIX so
+# RBE workers register against that tag instead of the upstream SHA-pinned
+# URL from remote_execution_containers.bzl. Cache invalidation is still
+# driven by the upstream URL via cache-silo-key (see
+# bazel/platforms/platform_util.bzl), so refreshed runner containers still
+# invalidate the action cache correctly.
+#
+# RBE_CONTAINER_IMAGE_PREFIX and --remote_executor MUST be set as a pair.
+# Devs with a private buildfarm endpoint can override just --remote_executor
+# and --remote_cache via .bazelrc.local while keeping the routing prefix
+# from this config.
+################################################################################
+--config=psmdb_buildfarm
+common:psmdb_buildfarm --repo_env=RBE_CONTAINER_IMAGE_PREFIX=ghcr.io/vorsel/psmdb-rbe-routing
+common:psmdb_buildfarm --remote_executor=grpc://bb-central.percona.internal:8981
+common:psmdb_buildfarm --remote_cache=grpc://bb-central.percona.internal:8981
+common:psmdb_buildfarm --remote_instance_name=hardlinking
+common:psmdb_buildfarm --remote_upload_local_results=true
+common:psmdb_buildfarm --remote_timeout=10m
+common:psmdb_buildfarm --remote_cache_compression=false
+common:psmdb_buildfarm --grpc_keepalive_time=30s
+
+################################################################################
 # End of Percona-specific build profiles
 ################################################################################
