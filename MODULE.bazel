@@ -143,12 +143,13 @@ use_repo(multitool, "multitool")
 #
 # Opt-in stable routing tag for Bazel RBE workers. Default no-op unless
 # RBE_CONTAINER_IMAGE_PREFIX is set (via .bazelrc.psmdb `psmdb_buildfarm`
-# config or shell env). See bazel/platforms/rbe_container_routing.bzl.
-# Must be materialized before setup_local_config_platform below, since that
-# rule loads @rbe_container_routing//:defs.bzl.
-rbe_container_routing = use_repo_rule("//bazel/platforms:rbe_container_routing.bzl", "rbe_container_routing")
-
-rbe_container_routing(name = "rbe_container_routing")
+# config or shell env). Module extension (not use_repo_rule) so that the
+# @rbe_container_routing repo is materialized before bzlmod's synthetic
+# _repo_rules extension runs — local_config_platform.bzl (a use_repo_rule
+# target) loads @rbe_container_routing//:defs.bzl and would otherwise
+# cycle. See bazel/platforms/rbe_container_routing.bzl.
+rbe_container_routing_ext = use_extension("//bazel/platforms:rbe_container_routing.bzl", "rbe_container_routing")
+use_repo(rbe_container_routing_ext, "rbe_container_routing")
 
 setup_local_config_platform = use_repo_rule("//bazel/platforms:local_config_platform.bzl", "setup_local_config_platform")
 
