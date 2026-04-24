@@ -1,3 +1,4 @@
+load("@rbe_container_routing//:defs.bzl", "RBE_CONTAINER_IMAGE_PREFIX")
 load("//bazel/platforms:remote_execution_containers.bzl", "REMOTE_EXECUTION_CONTAINERS")
 load("//bazel/platforms:normalize.bzl", "ARCH_TO_PLATFORM_MAP", "OS_TO_PLATFORM_MAP")
 load("//bazel/toolchains/cc/mongo_linux:mongo_toolchain_version.bzl", "TOOLCHAIN_MAP")
@@ -73,6 +74,21 @@ def _setup_local_config_platform(ctx):
         web_url = REMOTE_EXECUTION_CONTAINERS[distro]["web-url"]
         dockerfile = REMOTE_EXECUTION_CONTAINERS[distro]["dockerfile"]
         print("Local host platform is configured to use this container if doing remote execution: {} built from {}".format(web_url, dockerfile))
+
+        # Opt-in RBE routing override (see bazel/platforms/rbe_container_routing.bzl
+        # and .bazelrc.psmdb). When RBE_CONTAINER_IMAGE_PREFIX is set, route remote
+        # actions via a stable per-distro tag instead of the upstream SHA-pinned
+        # URL so BuildBarn workers register against one handle across SHA churn.
+        # Cache invalidation is preserved by forcing cache-silo-key to the upstream
+        # container URL: when upstream refreshes the runner SHA, the silo key
+        # changes and Bazel's action cache invalidates correctly.
+        if RBE_CONTAINER_IMAGE_PREFIX:
+            routing_url = "docker://%s:%s-%s" % (RBE_CONTAINER_IMAGE_PREFIX, distro, arch)
+            cache_silo_override = '"cache-silo-key": "%s",' % container_url
+        else:
+            routing_url = container_url
+            cache_silo_override = cache_silo
+
         exec_props = """
     exec_properties = {
         "container-image": "%s",
@@ -80,7 +96,7 @@ def _setup_local_config_platform(ctx):
         "Pool": "%s",
         %s
     },
-""" % (container_url, remote_execution_pool, cache_silo)
+""" % (routing_url, remote_execution_pool, cache_silo_override)
         result = {"DISTRO": distro}
     elif distro != None and toolchain_exists:
         constraints_str += ',\n        "@//bazel/platforms:use_mongo_toolchain"'
@@ -141,5 +157,5 @@ setup_local_config_platform = repository_rule(
             doc = "Template modeling the builtin local config platform constraints file.",
         ),
     },
-    environ = ["USE_NATIVE_TOOLCHAIN"],
+    environ = ["USE_NATIVE_TOOLCHAIN", "RBE_CONTAINER_IMAGE_PREFIX"],
 )
