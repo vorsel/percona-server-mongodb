@@ -2,14 +2,6 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 load("//bazel/toolchains/cc/mongo_linux:mongo_toolchain.bzl", "setup_mongo_toolchains")
 load("//bazel/toolchains/cc/mongo_linux:mongo_gdb.bzl", "gdb_download")
 
-# Opt-in stable routing tag for Bazel RBE workers. Default no-op unless
-# RBE_CONTAINER_IMAGE_PREFIX is set (via .bazelrc.psmdb `psmdb_buildfarm`
-# config or shell env). See bazel/platforms/rbe_container_routing.bzl for
-# the rationale and activation instructions.
-load("//bazel/platforms:rbe_container_routing.bzl", "rbe_container_routing")
-
-rbe_container_routing(name = "rbe_container_routing")
-
 http_archive(
     name = "aspect_rules_lint",
     sha256 = "f60e4a737a5e09402f5fa3bd182efa80dac5523ca4b9bc5c6fa8c06fbfb46630",

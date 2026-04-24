@@ -141,6 +141,15 @@ use_repo(multitool, "multitool")
 ##pnpm = use_extension("@aspect_rules_js//npm:extensions.bzl", "pnpm")
 ##use_repo(pnpm, "pnpm")
 #
+# Opt-in stable routing tag for Bazel RBE workers. Default no-op unless
+# RBE_CONTAINER_IMAGE_PREFIX is set (via .bazelrc.psmdb `psmdb_buildfarm`
+# config or shell env). See bazel/platforms/rbe_container_routing.bzl.
+# Must be materialized before setup_local_config_platform below, since that
+# rule loads @rbe_container_routing//:defs.bzl.
+rbe_container_routing = use_repo_rule("//bazel/platforms:rbe_container_routing.bzl", "rbe_container_routing")
+
+rbe_container_routing(name = "rbe_container_routing")
+
 setup_local_config_platform = use_repo_rule("//bazel/platforms:local_config_platform.bzl", "setup_local_config_platform")
 
 setup_local_config_platform(name = "internal_platforms_do_not_use")
