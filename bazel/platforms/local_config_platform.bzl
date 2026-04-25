@@ -1,3 +1,4 @@
+load("//bazel/platforms:psmdb_rbe_containers.bzl", "PSMDB_REMOTE_EXECUTION_CONTAINERS")
 load("//bazel/platforms:remote_execution_containers.bzl", "REMOTE_EXECUTION_CONTAINERS")
 load("//bazel/platforms:normalize.bzl", "ARCH_TO_PLATFORM_MAP", "OS_TO_PLATFORM_MAP")
 load("//bazel/toolchains/cc/mongo_linux:mongo_toolchain_version.bzl", "TOOLCHAIN_MAP")
@@ -52,7 +53,22 @@ def _setup_local_config_platform(ctx):
     elif distro != None and distro in REMOTE_EXECUTION_CONTAINERS:
         constraints_str += ',\n        "@//bazel/platforms:use_mongo_toolchain"'
         constraints_str += ',\n        "@//bazel/platforms:%s"' % (distro)
-        container_url = REMOTE_EXECUTION_CONTAINERS[distro]["container-url"]
+
+        # Percona override: prefer PSMDB-specific image map for distros we serve
+        # via Percona BuildBarn (ghcr.io/vorsel/psmdb-buildbarn-runners) so the
+        # auto-generated host platform's container-image routes to a Percona
+        # worker queue. Distros not overridden in PSMDB_REMOTE_EXECUTION_CONTAINERS
+        # fall through to upstream's quay.io image unchanged. Mirrors the
+        # override done in bazel/platforms/platform_util.bzl for the explicit
+        # //bazel/platforms:<distro>_<arch> targets. See
+        # bazel/platforms/psmdb_rbe_containers.bzl for rationale and
+        # maintenance procedure.
+        psmdb_entry = PSMDB_REMOTE_EXECUTION_CONTAINERS.get(distro)
+        container_url = (
+            psmdb_entry["container-url"]
+            if psmdb_entry
+            else REMOTE_EXECUTION_CONTAINERS[distro]["container-url"]
+        )
         web_url = REMOTE_EXECUTION_CONTAINERS[distro]["web-url"]
         dockerfile = REMOTE_EXECUTION_CONTAINERS[distro]["dockerfile"]
         print("Local host platform is configured to use this container if doing remote execution: {} built from {}".format(web_url, dockerfile))

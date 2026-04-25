@@ -131,10 +131,23 @@ def main():
         enterprise_mod = REPO_ROOT / "src" / "mongo" / "db" / "modules" / "enterprise"
         if not enterprise_mod.exists():
             enterprise = False
-            print(
-                f"{enterprise_mod.relative_to(REPO_ROOT).as_posix()} missing, defaulting to local non-enterprise build (--config=local --//bazel/config:build_enterprise=False). Add the directory to not automatically add these options."
-            )
-            args = append_args(args, ["--config=local", "--//bazel/config:build_enterprise=False"])
+            # PSMDB-2034: Skip the auto-injection of `--config=local`
+            # when the user has explicitly opted into RBE remote execution
+            # via `--config=psmdb_buildfarm`. Upstream's `--config=local`
+            # resets `--remote_executor` and `--remote_cache` to the empty
+            # string; appended after psmdb_buildfarm it silently turns the
+            # build into a fully local one (Bazel's "later --config wins on
+            # conflicting flags" rule), defeating the whole point of the RBE
+            # flag. `--//bazel/config:build_enterprise=False` is otherwise
+            # compensated for by the file-wide `build --build_enterprise=False`
+            # line in .bazelrc.psmdb plus the explicit
+            # `common:psmdb_buildfarm --//bazel/config:build_enterprise=False`
+            # added in the RBE stanza, so dropping it here is safe.
+            if not any(a.startswith("--config=psmdb_buildfarm") for a in args):
+                print(
+                    f"{enterprise_mod.relative_to(REPO_ROOT).as_posix()} missing, defaulting to local non-enterprise build (--config=local --//bazel/config:build_enterprise=False). Add the directory to not automatically add these options."
+                )
+                args = append_args(args, ["--config=local", "--//bazel/config:build_enterprise=False"])
 
         atlas_mod = REPO_ROOT / "src" / "mongo" / "db" / "modules" / "atlas"
         if not atlas_mod.exists():
