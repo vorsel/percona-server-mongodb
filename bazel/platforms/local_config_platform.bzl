@@ -35,8 +35,14 @@ def _setup_local_config_platform(ctx):
     elif arch == "aarch64":
         arch = "arm64"
 
-    # EngFlow's "default" pool is ARM64
-    remote_execution_pool = "x86_64" if arch == "amd64" else "default"
+    # PSMDB RBE workers register with explicit Pool=x86_64 / Pool=aarch64
+    # (see jenkins-pipelines IaC/buildbarn/ondemand/compose/config/
+    # ondemand-pools.yaml `bazel_pool_value`). Upstream's default of
+    # "default" for non-amd64 was for EngFlow's ARM64 pool naming; we
+    # diverge here so the routing key matches our worker registration.
+    # Mirrors the same change in bazel/platforms/platform_util.bzl for the
+    # explicit //bazel/platforms:<distro>_<arch> targets.
+    remote_execution_pool = "x86_64" if arch == "amd64" else "aarch64"
     result = None
     toolchain_key = "{distro}_{arch}".format(distro = distro, arch = arch)
     print("Trying to find toolchain for {}".format(toolchain_key))
@@ -54,12 +60,13 @@ def _setup_local_config_platform(ctx):
         constraints_str += ',\n        "@//bazel/platforms:use_mongo_toolchain"'
         constraints_str += ',\n        "@//bazel/platforms:%s"' % (distro)
 
-        # Percona override: prefer PSMDB-specific image map for distros we serve
-        # via Percona BuildBarn (ghcr.io/vorsel/psmdb-buildbarn-runners) so the
-        # auto-generated host platform's container-image routes to a Percona
-        # worker queue. Distros not overridden in PSMDB_REMOTE_EXECUTION_CONTAINERS
-        # fall through to upstream's quay.io image unchanged. Mirrors the
-        # override done in bazel/platforms/platform_util.bzl for the explicit
+        # PSMDB override: prefer PSMDB-specific image map for distros we serve
+        # via the RBE cluster (ghcr.io/vorsel/psmdb-buildbarn-runners) so the
+        # auto-generated host platform's container-image routes to an RBE
+        # worker queue. Distros not overridden in
+        # PSMDB_REMOTE_EXECUTION_CONTAINERS fall through to upstream's
+        # quay.io image unchanged. Mirrors the override done in
+        # bazel/platforms/platform_util.bzl for the explicit
         # //bazel/platforms:<distro>_<arch> targets. See
         # bazel/platforms/psmdb_rbe_containers.bzl for rationale and
         # maintenance procedure.
