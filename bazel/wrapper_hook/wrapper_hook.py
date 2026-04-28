@@ -99,6 +99,7 @@ def main():
     # from bazel.wrapper_hook.git_age_check import check as git_age_check
     from bazel.wrapper_hook.lint import LinterFail
     from bazel.wrapper_hook.plus_interface import check_bazel_command_type, test_runner_interface
+    from bazel.wrapper_hook.rbe_auth import RbeAuthError, RbeAuthRequired, get_id_token
     from bazel.wrapper_hook.write_wrapper_hook_bazelrc import write_wrapper_hook_bazelrc
 
     th_all_header, hdr_state_all_header = spawn_all_headers_thread(REPO_ROOT)
@@ -174,6 +175,40 @@ def main():
         except LinterFail:
             # Linter fails preempt bazel run.
             sys.exit(3)
+
+        # PSMDB-2043: inject the OIDC bearer for the on-demand RBE
+        # buildfarm only when this build actually uses it. We key off
+        # `--config=psmdb_buildfarm` (the only config that flips
+        # --remote_executor to grpcs://bb-psmdb.ddns.net:8981 — see
+        # .bazelrc.psmdb). Local / CI-side EngFlow / public-release
+        # builds keep travelling through engflow_auth above and
+        # never hit Dex.
+        #
+        # Refresh / login is driven through `rbe_auth.get_id_token`:
+        #   * cached + fresh → zero RTT, append the header, done
+        #   * cached + expired with valid refresh_token → silent /token
+        #     refresh, then append
+        #   * no usable refresh + TTY → Device Code flow on stderr
+        #     (URL + user_code), polls Dex /token until login
+        #   * no usable refresh + non-TTY (Jenkins, scripted runs)
+        #     → fail fast with a pointer to `bazel-rbe-login`. We
+        #     deliberately don't inject a stale-or-empty header here:
+        #     letting Bazel run the build with no auth would just
+        #     produce Envoy 401s on every action and a much noisier
+        #     failure than this one.
+        if any(a.startswith("--config=psmdb_buildfarm") for a in args) or any(
+            a == "--config" and i + 1 < len(args) and args[i + 1] == "psmdb_buildfarm"
+            for i, a in enumerate(args)
+        ):
+            try:
+                token = run_with_terminal_output(get_id_token)
+            except RbeAuthRequired as e:
+                _info(f"RBE auth: {e}")
+                sys.exit(4)
+            except RbeAuthError as e:
+                _info(f"RBE auth failed: {e}")
+                sys.exit(4)
+            args = append_args(args, [f"--remote_header=authorization=Bearer {token}"])
     else:
         args = sys.argv[2:]
 
