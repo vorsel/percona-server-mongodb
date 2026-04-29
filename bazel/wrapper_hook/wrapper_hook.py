@@ -208,6 +208,15 @@ def main():
             a == "--config" and i + 1 < len(args) and args[i + 1] == "psmdb_buildfarm"
             for i, a in enumerate(args)
         ):
+            from bazel.wrapper_hook import rbe_auth
+
+            wrapper_debug("rbe_auth: --config=psmdb_buildfarm detected, fetching OIDC token")
+            pre = rbe_auth.status()
+            wrapper_debug(
+                f"rbe_auth: cache before — present={pre.get('present')} "
+                f"fresh={pre.get('fresh')} expires_at={pre.get('expires_at', 0)} "
+                f"sub={pre.get('subject', '')!r}"
+            )
             try:
                 token = run_with_terminal_output(get_id_token)
             except RbeAuthRequired as e:
@@ -216,6 +225,16 @@ def main():
             except RbeAuthError as e:
                 _info(f"RBE auth failed: {e}")
                 sys.exit(4)
+            post = rbe_auth.status()
+            wrapper_debug(
+                f"rbe_auth: cache after  — present={post.get('present')} "
+                f"fresh={post.get('fresh')} expires_at={post.get('expires_at', 0)} "
+                f"groups={post.get('groups')}"
+            )
+            wrapper_debug(
+                f"rbe_auth: token bearer={token[:12]}…{token[-6:]} (len={len(token)}); "
+                "appending --remote_header=authorization to args"
+            )
             args = append_args(args, [f"--remote_header=authorization=Bearer {token}"])
     else:
         args = sys.argv[2:]
