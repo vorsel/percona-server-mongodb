@@ -363,9 +363,11 @@ install_deps() {
       fi
       yum -y install wget sudo
       yum -y install perl
-      if [ x"$RHEL" != x2023 ]; then
-          install_mongodbtoolchain
-      fi
+      # PSMDB-2054: skip toolchain install for RBE — Bazel pulls hermetic
+      # mongo_toolchain_v5 from CAS at action time; runner image doesn't need v4.
+      #if [ x"$RHEL" != x2023 ]; then
+      #    install_mongodbtoolchain
+      #fi
       if [ x"$ARCH" = "xx86_64" ]; then
         yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm
         percona-release enable tools testing
@@ -385,7 +387,7 @@ install_deps() {
         yum -y install devtoolset-9
         yum -y install devtoolset-11-elfutils devtoolset-11-dwz
 
-        PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
+        #PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
 
         pip install --upgrade pip
         pip install --user setuptools --upgrade
@@ -400,10 +402,12 @@ install_deps() {
         yum -y install openldap-devel krb5-devel xz-devel
         yum -y install gcc-toolset-9 gcc-c++
         yum -y install gcc-toolset-11-dwz gcc-toolset-11-elfutils
-        yum -y install python38 python38-devel python38-pip
 
-        PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
-        /usr/bin/pip install --user typing pyyaml regex Cheetah3
+        yum -y install python3.11 python3.11-devel python3.11-pip
+        alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 11
+        alternatives --set python3 /usr/bin/python3.11
+
+        python3 -m pip install --user typing pyyaml regex Cheetah3
       elif [ x"$RHEL" = x9  -o x"$RHEL" = x2023 ]; then
         dnf config-manager --enable ol9_codeready_builder
 
@@ -456,6 +460,9 @@ install_deps() {
       fi
       INSTALL_LIST="${INSTALL_LIST} git valgrind liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev libsasl2-dev gcc g++ cmake curl"
       INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev libldap2-dev libkrb5-dev liblzma-dev patchelf libexpat1-dev sudo libfile-copy-recursive-perl"
+      # PSMDB-2054: native python3 is >= 3.10 on jammy / bookworm / noble (>= 3.9
+      # required for PEP 585 generics in buildscripts/), so no deadsnakes PPA needed.
+      INSTALL_LIST="${INSTALL_LIST} python3 python3-dev python3-pip python3-venv"
       until apt-get -y install dirmngr; do
         sleep 1
         echo "waiting"
@@ -467,16 +474,23 @@ install_deps() {
       apt-get -y install libext2fs-dev || apt-get -y install e2fslibs-dev
       install_golang
 
-      install_mongodbtoolchain
-      PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
-      update-alternatives --install /usr/bin/python python /opt/mongodbtoolchain/v4/bin/python3.10 1
+      # PSMDB-2054: skip toolchain install for RBE — Bazel pulls hermetic
+      # mongo_toolchain_v5 from CAS at action time. The legacy get-pip.py
+      # bootstrap below also relied on a `python` symlink created by the
+      # toolchain installer and now silently fails (`command not found`)
+      # without it; pip + setuptools come from the python3-pip apt package.
+      #install_mongodbtoolchain
+      #PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
+      #update-alternatives --install /usr/bin/python python /opt/mongodbtoolchain/v4/bin/python3.10 1
 
-      wget https://bootstrap.pypa.io/get-pip.py -O get-pip.py
-      python get-pip.py
-      easy_install pip
-      pip install setuptools
+      #wget https://bootstrap.pypa.io/get-pip.py -O get-pip.py
+      #python get-pip.py
+      #easy_install pip
+      #pip install setuptools
     fi
-    aws_sdk_build
+    # PSMDB-2054: aws-cpp-sdk now vendored in-tree starting from PSMDB 8.0;
+    # no need to build it from source here.
+    #aws_sdk_build
     #keep symbol table in the binary
     sed -i 's:$strip, "--remove-section=.comment":$strip, "--strip-debug", "--remove-section=.comment":g' /usr/bin/dh_strip
     return;
