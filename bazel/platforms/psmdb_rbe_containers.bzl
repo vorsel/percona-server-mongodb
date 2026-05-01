@@ -72,21 +72,21 @@
 
 PSMDB_REMOTE_EXECUTION_CONTAINERS = {
     "amazon_linux_2023": {
-        "container-url": "docker://ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81",
+        "container-url": "docker://ghcr.io/vorsel/psmdb-buildbarn-runners/amazonlinux-2023:master-5778d9300044e10ca309e589f9213b303a740563",
     },
     "debian12": {
-        "container-url": "docker://ghcr.io/vorsel/psmdb-buildbarn-runners/debian-bookworm:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81",
+        "container-url": "docker://ghcr.io/vorsel/psmdb-buildbarn-runners/debian-bookworm:master-5778d9300044e10ca309e589f9213b303a740563",
     },
     "rhel8": {
-        "container-url": "docker://ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81",
+        "container-url": "docker://ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-8:master-5778d9300044e10ca309e589f9213b303a740563",
     },
     "rhel9": {
-        "container-url": "docker://ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81",
+        "container-url": "docker://ghcr.io/vorsel/psmdb-buildbarn-runners/oraclelinux-9:master-5778d9300044e10ca309e589f9213b303a740563",
     },
     "ubuntu22": {
-        "container-url": "docker://ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81",
+        "container-url": "docker://ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-jammy:master-5778d9300044e10ca309e589f9213b303a740563",
     },
     "ubuntu24": {
-        "container-url": "docker://ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble:master-9b28c6ee49dc0118fe6bab8b7e28a87f8979be81",
+        "container-url": "docker://ghcr.io/vorsel/psmdb-buildbarn-runners/ubuntu-noble:master-5778d9300044e10ca309e589f9213b303a740563",
     },
 }
