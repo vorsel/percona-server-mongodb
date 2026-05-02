@@ -180,8 +180,7 @@ get_sources(){
     export PATH=\/root/.local/bin:$PATH >> ~/.bashrc
     source ~/.bashrc
     sed -i 's:build-id:build-id=sha1:' SConstruct
-
-    cd ../
+    cd ..
     tar --owner=0 --group=0 --exclude=.* -czf ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
     echo "UPLOAD=UPLOAD/experimental/BUILDS/${PRODUCT}-8.0/${PRODUCT}-${PSM_VER}-${PSM_RELEASE}/${PSM_BRANCH}/${REVISION}/${BUILD_ID}" >> percona-server-mongodb-80.properties
     mkdir -p $WORKDIR/source_tarball
@@ -291,20 +290,6 @@ install_gcc_deb(){
     fi
 }
 
-set_compiler(){
-    if [ x"$RHEL" != x2023 ]; then
-        export CC=/opt/mongodbtoolchain/v4/bin/gcc
-        export CXX=/opt/mongodbtoolchain/v4/bin/g++
-    fi
-    return
-}
-
-fix_rules(){
-    sed -i 's|CC = gcc-5|CC = /opt/mongodbtoolchain/v4/bin/gcc|' debian/rules
-    sed -i 's|CXX = g++-5|CXX = /opt/mongodbtoolchain/v4/bin/g++|' debian/rules
-    return
-}
-
 install_deps() {
     if [ $INSTALL = 0 ]
     then
@@ -329,11 +314,6 @@ install_deps() {
       fi
       yum -y install wget sudo
       yum -y install perl
-      # PSMDB-2054: skip toolchain install for RBE — Bazel pulls hermetic
-      # mongo_toolchain_v5 from CAS at action time; runner image doesn't need v4.
-      #if [ x"$RHEL" != x2023 ]; then
-      #    install_mongodbtoolchain
-      #fi
       if [ x"$ARCH" = "xx86_64" ]; then
         yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm
         percona-release enable tools testing
@@ -352,8 +332,6 @@ install_deps() {
         yum-config-manager --enable centos-sclo-rh-testing
         yum -y install devtoolset-9
         yum -y install devtoolset-11-elfutils devtoolset-11-dwz
-
-        #PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
 
         pip install --upgrade pip
         pip install --user setuptools --upgrade
@@ -439,39 +417,10 @@ install_deps() {
       done
       apt-get -y install libext2fs-dev || apt-get -y install e2fslibs-dev
       install_golang
-
-      # PSMDB-2054: skip toolchain install for RBE — Bazel pulls hermetic
-      # mongo_toolchain_v5 from CAS at action time. The legacy get-pip.py
-      # bootstrap below also relied on a `python` symlink created by the
-      # toolchain installer and now silently fails (`command not found`)
-      # without it; pip + setuptools come from the python3-pip apt package.
-      #install_mongodbtoolchain
-      #PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
-      #update-alternatives --install /usr/bin/python python /opt/mongodbtoolchain/v4/bin/python3.10 1
-
-      #wget https://bootstrap.pypa.io/get-pip.py -O get-pip.py
-      #python get-pip.py
-      #easy_install pip
-      #pip install setuptools
     fi
     #keep symbol table in the binary
     sed -i 's:$strip, "--remove-section=.comment":$strip, "--strip-debug", "--remove-section=.comment":g' /usr/bin/dh_strip
     return;
-}
-
-install_mongodbtoolchain(){
-    #curl -o toolchain_installer.sh https://jenkins.percona.com/downloads/mongodbtoolchain/installer.sh
-    curl -O https://downloads.percona.com/downloads/packaging/toolchain_installer.tar.gz
-    tar -zxvf toolchain_installer.tar.gz
-    if [ ! -z "${RHEL}" ]; then
-        OS_CODE_NAME=${RHEL}
-    else
-        OS_CODE_NAME=${DEBIAN}
-    fi
-    export USER=$(whoami)
-    #bash -x ./toolchain_installer.sh -k --download-url https://jenkins.percona.com/downloads/mongodbtoolchain/${OS_CODE_NAME}_mongodbtoolchain_${ARCH}.tar.gz || exit 1
-    bash -x ./installer.sh --keep-download --download-dir /tmp/ --download-url https://downloads.percona.com/downloads/packaging/${OS_CODE_NAME}_mongodbtoolchain_${ARCH}.tar.gz || exit 1
-    export PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
 }
 
 get_tar(){
@@ -658,13 +607,8 @@ build_rpm(){
         pip install --user -r etc/pip/evgtest-requirements.txt
         pip install --user -r etc/pip/compile-requirements.txt
         export PYTHONPATH="/usr/local/lib64/python3.11/site-packages:/usr/local/lib/python3.11/site-packages:$PYTHONPATH"
-#        export CC=/usr/bin/gcc
-#        export CXX=/usr/bin/g++
-    else
-         PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
     fi
-#        PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
-        pip install --upgrade pip
+    pip install --upgrade pip
 
     # PyYAML pkg installation fix, more info: https://github.com/yaml/pyyaml/issues/724
     pip install pyyaml==5.4.1 --no-build-isolation
@@ -674,16 +618,6 @@ build_rpm(){
     pip install 'poetry==2.0.0' 'pyproject-hooks==1.2.0'
     pip install 'mongo_tooling_metrics==1.0.8' 'retry' 'psutil' 'Cheetah3'
 
-
-    if [ "x${RHEL}" != "x2023" ]; then
-        echo "CC and CXX should be modified once correct compiller would be installed on Centos"
-        export CC=/opt/mongodbtoolchain/v4/bin/gcc
-        export CXX=/opt/mongodbtoolchain/v4/bin/g++
-        #update toolchain pathes to know about installed poetry
-        toolchain_revision=$(tar -ztf /tmp/mongodbtoolchain.tar.gz | head -1 | sed 's/\/$//')
-        /opt/mongodbtoolchain/revisions/${toolchain_revision}/scripts/install.sh
-    fi
-    #
     cd $WORKDIR
 
     echo "RHEL=${RHEL}" >> percona-server-mongodb-80.properties
@@ -697,11 +631,7 @@ build_rpm(){
     export GOBINPATH="/usr/local/go/bin"
 
     export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-    if [ "x${RHEL}" == "x2023" ]; then
-        export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1 "
-    else
-        export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1 -B/opt/mongodbtoolchain/v4/bin"
-    fi
+    export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
     rpmbuild --define "_topdir ${WORKDIR}/rpmbuild" --define "dist .$OS_NAME" --rebuild rpmbuild/SRPMS/$SRC_RPM
 
     return_code=$?
@@ -754,7 +684,6 @@ build_source_deb(){
     mv ${TARFILE} ${PRODUCT}_${VERSION}.orig.tar.gz
     cd ${BUILDDIR}
 
-    export PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
     pip install --upgrade pip
 
     # PyYAML pkg installation fix, more info: https://github.com/yaml/pyyaml/issues/724
@@ -765,14 +694,7 @@ build_source_deb(){
     pip install 'poetry==2.0.0' 'pyproject-hooks==1.2.0'
     pip install 'mongo_tooling_metrics==1.0.8' 'retry' 'psutil' 'Cheetah3'
 
-    #update toolchain pathes to know about installed poetry
-    toolchain_revision=$(tar -ztf /tmp/mongodbtoolchain.tar.gz | head -1 | sed 's/\/$//')
-    /opt/mongodbtoolchain/revisions/${toolchain_revision}/scripts/install.sh
-    poetry env use /opt/mongodbtoolchain/v4/bin/python3
     poetry install --no-root --sync
-
-    set_compiler
-    fix_rules
 
     dch -D unstable --force-distribution -v "${VERSION}-${RELEASE}" "Update to new Percona Server for MongoDB version ${VERSION}"
     dpkg-buildpackage -S
@@ -820,7 +742,6 @@ build_deb(){
     dpkg-source -x ${DSC}
     #
     cd ${PRODUCT}-${VERSION}
-    export PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
 
     pip install --upgrade pip
 
@@ -832,10 +753,6 @@ build_deb(){
     pip install 'poetry==2.0.0' 'pyproject-hooks==1.2.0'
     pip install 'mongo_tooling_metrics==1.0.8' 'retry' 'psutil' 'Cheetah3'
 
-    #update toolchain pathes to know about installed poetry
-    toolchain_revision=$(tar -ztf /tmp/mongodbtoolchain.tar.gz | head -1 | sed 's/\/$//')
-    /opt/mongodbtoolchain/revisions/${toolchain_revision}/scripts/install.sh
-    poetry env use /opt/mongodbtoolchain/v4/bin/python3
     poetry install --no-root --sync
 
     #
@@ -850,8 +767,6 @@ build_deb(){
     export PATH=\/root/.local/bin:$PATH >> ~/.bashrc
     source ~/.bashrc
     cp -av percona-packaging/debian/rules debian/
-    set_compiler
-    fix_rules
 
     if [ x"${DEBIAN}" = "xbullseye" -o x"${DEBIAN}" = "xbookworm" -o x"${DEBIAN}" = "xjammy" -o x"${DEBIAN}" = "xnoble" ]; then
         sed -i 's:dh-systemd,::' debian/control
@@ -868,7 +783,7 @@ build_deb(){
     dch -m -D "${DEBIAN}" --force-distribution -v "${VERSION}-${RELEASE}.${DEBIAN}" 'Update distribution'
     export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
-    export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1 -B/opt/mongodbtoolchain/v4/bin"
+    export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
 
     cd debian/
         wget https://raw.githubusercontent.com/Percona-Lab/telemetry-agent/phase-0/call-home.sh
@@ -932,30 +847,13 @@ build_tarball(){
     if [ ${DEBUG} = 1 ]; then
     TARBALL_SUFFIX=".dbg"
     fi
-    if [ -f /etc/debian_version ]; then
-        set_compiler
-    fi
     #
     if [ -f /etc/redhat-release -o -f /etc/amazon-linux-release ]; then
-    #export OS_RELEASE="centos$(lsb_release -sr | awk -F'.' '{print $1}')"
-        if [ x"$RHEL" = x7 ]; then
-            if [ -f /opt/rh/devtoolset-9/enable ]; then
-              source /opt/rh/devtoolset-9/enable
-              source /opt/rh/devtoolset-11/enable
-            fi
-        elif [ x"$RHEL" = x8 ]; then
+        if [ x"$RHEL" = x8 ]; then
             if [ -f /opt/rh/gcc-toolset-9/enable ]; then
               source /opt/rh/gcc-toolset-9/enable
               source /opt/rh/gcc-toolset-11/enable
             fi
-        fi
-        if [ "x${RHEL}" != "x2023" ]; then
-            echo "CC and CXX should be modified once correct compiller would be installed on Centos"
-            export CC=/opt/mongodbtoolchain/v4/bin/gcc
-            export CXX=/opt/mongodbtoolchain/v4/bin/g++
-        else
-            export CC=/usr/bin/gcc
-            export CXX=/usr/bin/g++
         fi
     fi
     #
@@ -984,12 +882,9 @@ build_tarball(){
     export USE_SSE=1
     #
 
-    # Finally build Percona Server for MongoDB with SCons
+    # Finally build Percona Server for MongoDB with Bazel
     cd ${PSMDIR_ABS}
-    if [ "x${RHEL}" != "x2023" ]; then
-        export PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
-        pip install --upgrade pip
-    fi
+    pip install --upgrade pip
     # PyYAML pkg installation fix, more info: https://github.com/yaml/pyyaml/issues/724
     pip install pyyaml==5.4.1 --no-build-isolation
     pip install 'referencing<0.30.0' --no-build-isolation
@@ -998,24 +893,10 @@ build_tarball(){
     pip install 'poetry==2.0.0' 'pyproject-hooks==1.2.0'
     pip install 'mongo_tooling_metrics==1.0.8' 'retry' 'psutil' 'Cheetah3'
 
-    #update toolchain pathes to know about installed poetry
-    if [ "x${RHEL}" != "x2023" ]; then
-    toolchain_revision=$(tar -ztf /tmp/mongodbtoolchain.tar.gz | head -1 | sed 's/\/$//')
-        /opt/mongodbtoolchain/revisions/${toolchain_revision}/scripts/install.sh
-        poetry env use /opt/mongodbtoolchain/v4/bin/python3
-    fi
     poetry install --no-root --sync
 
     export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-    if [ "x${RHEL}" == "x2023" ]; then
-        export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1 "
-    else
-        export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1 -B/opt/mongodbtoolchain/v4/bin"
-    fi
-    if [ x"${DEBIAN}" = "xstretch" ]; then
-      CURL_LINKFLAGS=$(pkg-config libcurl --static --libs)
-      export OPT_LINKFLAGS="${OPT_LINKFLAGS} ${CURL_LINKFLAGS}"
-    fi
+    export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
     wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelignore
     wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazeliskrc
     wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelrc
