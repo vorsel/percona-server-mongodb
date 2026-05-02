@@ -1027,7 +1027,8 @@ build_tarball(){
     export PATH=\/root/.local/bin:$PATH >> ~/.bashrc
     source ~/.bashrc
     bazel clean --expunge || true
-    bazel build --config=psmdb_opt_release --define=MONGO_VERSION=${VERSION}-${RELEASE} --define=GIT_COMMIT_HASH=${REVISION_LONG} install-dist-test
+    # PSMDB-2054: optional RBE injection. Empty when PSMDB_RBE_BAZEL_FLAGS is unset.
+    bazel build --config=psmdb_opt_release ${PSMDB_RBE_BAZEL_FLAGS:-} --define=MONGO_VERSION=${VERSION}-${RELEASE} --define=GIT_COMMIT_HASH=${REVISION_LONG} install-dist-test
     rm -rf .[^.]*
     mkdir -p ${PSMDIR}/bin
     for target in ${PSM_TARGETS[@]}; do
