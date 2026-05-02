@@ -138,19 +138,13 @@ bazel clean --expunge || true
 
 %build
 
-export CC=${CC:-gcc}
-export CXX=${CXX:-g++}
 export PSM_TARGETS="install-mongod install-mongos install-mongo install-perconadecrypt build/install/bin/mongobridge"
 export INSTALLDIR=$RPM_BUILD_DIR/install
 export TOOLS_TAGS="ssl sasl"
 export PORTABLE=1
 export USE_SSE=1
 export PATH=/usr/local/go/bin:$PATH
-%if  0%{?amzn} == 2023
 export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
-%else
-export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1 -B/opt/mongodbtoolchain/v4/bin"
-%endif
 export GLIBC_TUNABLES=${GLIBC_TUNABLES}
 
 export PATH=/usr/local/go/bin:${PATH}
@@ -159,14 +153,9 @@ export GOPATH=$(pwd)/
 export PATH="/usr/local/go/bin:$PATH:$GOPATH"
 export GOBINPATH="/usr/local/go/bin"
 
-# Build PSfMDB with SCons
+# Build PSfMDB with Bazel
 pushd $RPM_BUILD_DIR/%{src_dir}
-%if  0%{?amzn} == 2023
 poetry install --no-root --sync
-%else
-poetry env use /opt/mongodbtoolchain/v4/bin/python3
-poetry install --no-root --sync
-%endif
 # PSMDB-2054: optional RBE injection. Empty when PSMDB_RBE_BAZEL_FLAGS is unset.
 bazel build --config=psmdb_opt_release ${PSMDB_RBE_BAZEL_FLAGS:-} --define=MONGO_VERSION=%{version}-@@RELEASE@@ --define=GIT_COMMIT_HASH=@@PSMDB_GIT_HASH@@ install-dist-test
 rm -fr resmoke.ini
