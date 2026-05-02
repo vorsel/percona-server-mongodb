@@ -11,11 +11,8 @@ export TOOLS_TAGS=ssl sasl
 export PORTABLE=1
 export USE_SSE=1
 export PATH := /usr/local/go/bin:$(PATH)
-export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1 -B/opt/mongodbtoolchain/v4/bin"
 
 $(info GLIBC_TUNABLES is $(GLIBC_TUNABLES))
-CC = gcc-5
-CXX = g++-5
 #
 %:
 	dh $@
