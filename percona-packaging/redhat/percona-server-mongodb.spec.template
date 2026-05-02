@@ -59,12 +59,6 @@ BuildRoot:      /var/tmp/%{name}-%{version}-%{release}
 
 BuildRequires: gcc, make, cmake, gcc-c++, openssl-devel, cyrus-sasl-devel
 BuildRequires: snappy-devel, zlib-devel, bzip2-devel, libpcap-devel, openldap-devel, xz-devel
-%if 0%{?rhel} == 7
-BuildRequires: /usr/bin/scons
-%endif
-#%if 0%{?rhel} >= 8
-#BuildRequires: /usr/bin/scons-3
-#%endif
 
 Requires: %{name}-mongos = %{version}-%{release}
 Requires: %{name}-server = %{version}-%{release}
@@ -155,8 +149,6 @@ export GOBINPATH="/usr/local/go/bin"
 
 # Build PSfMDB with Bazel
 pushd $RPM_BUILD_DIR/%{src_dir}
-poetry install --no-root --sync
-# PSMDB-2054: optional RBE injection. Empty when PSMDB_RBE_BAZEL_FLAGS is unset.
 bazel build --config=psmdb_opt_release ${PSMDB_RBE_BAZEL_FLAGS:-} --define=MONGO_VERSION=%{version}-@@RELEASE@@ --define=GIT_COMMIT_HASH=@@PSMDB_GIT_HASH@@ install-dist-test
 rm -fr resmoke.ini
 popd
