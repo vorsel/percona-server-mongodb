@@ -179,9 +179,19 @@ get_sources(){
     python3 buildscripts/install_bazel.py
     export PATH=\/root/.local/bin:$PATH >> ~/.bashrc
     source ~/.bashrc
-    sed -i 's:build-id:build-id=sha1:' SConstruct
+
+    KEEP_DOTFILES='\.bazelrc|\.bazelrc\.psmdb|\.bazelrc\.fuzztest|\.bazelrc\.sync|\.bazelversion|\.bazeliskrc|\.bazelignore|\.npmrc|\.prettierrc|\.prettierignore|\.clang-format|\.clang-tidy\.in'
+    DROP_DOTFILES=$(ls -A | grep -E '^\.' | grep -vE "^(${KEEP_DOTFILES})$" || true)
+    if [ -n "$DROP_DOTFILES" ]; then
+        echo "Source-tarball dotfile cleanup — stripping:" >&2
+        echo "$DROP_DOTFILES" | sed 's/^/  /' >&2
+        echo "$DROP_DOTFILES" | xargs -r rm -rf
+    fi
+    # Scrub nested .git (submodules, mongo-tools clone) regardless of whitelist.
+    find . -name '.git' -prune -exec rm -rf {} +
+
     cd ..
-    tar --owner=0 --group=0 --exclude=.* -czf ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
+    tar --owner=0 --group=0 -czf ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}.tar.gz ${PRODUCT}-${PSM_VER}-${PSM_RELEASE}
     echo "UPLOAD=UPLOAD/experimental/BUILDS/${PRODUCT}-8.3/${PRODUCT}-${PSM_VER}-${PSM_RELEASE}/${PSM_BRANCH}/${REVISION}/${BUILD_ID}" >> percona-server-mongodb-83.properties
     mkdir -p $WORKDIR/source_tarball
     mkdir -p $CURDIR/source_tarball
@@ -320,23 +330,7 @@ install_deps() {
         yum clean all
         yum install -y patchelf
       fi
-      if [ x"$RHEL" = x7 ]; then
-        yum -y install epel-release
-        yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
-        yum -y install cyrus-sasl-devel cyrus-sasl-plain snappy-devel zlib-devel bzip2-devel rpmlint
-        yum -y install rpm-build git libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel which
-        yum -y install openldap-devel krb5-devel xz-devel
-        yum -y install libzstd
-
-        yum -y install centos-release-scl
-        yum-config-manager --enable centos-sclo-rh-testing
-        yum -y install devtoolset-9
-        yum -y install devtoolset-11-elfutils devtoolset-11-dwz
-
-        pip install --upgrade pip
-        pip install --user setuptools --upgrade
-        pip install --user typing pyyaml regex Cheetah3
-      elif [ x"$RHEL" = x8 ]; then
+      if [ x"$RHEL" = x8 ]; then
         yum-config-manager --enable ol8_codeready_builder
         yum -y install epel-release
         yum -y install bzip2-devel libpcap-devel snappy-devel rpm-build rpmlint
@@ -350,8 +344,6 @@ install_deps() {
         yum -y install python3.11 python3.11-devel python3.11-pip
         alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 11
         alternatives --set python3 /usr/bin/python3.11
-
-        python3 -m pip install --user typing pyyaml regex Cheetah3
       elif [ x"$RHEL" = x9  -o x"$RHEL" = x2023 ]; then
         dnf config-manager --enable ol9_codeready_builder
 
@@ -363,9 +355,6 @@ install_deps() {
         yum -y install $OPENSSL_EXCLUDE redhat-rpm-config which e2fsprogs-devel expat-devel lz4-devel
         yum -y install $OPENSSL_EXCLUDE openldap-devel krb5-devel xz-devel
         yum -y install $OPENSSL_EXCLUDE perl
-        /usr/bin/pip install --upgrade pip setuptools --ignore-installed
-        /usr/bin/pip install --user typing pyyaml==5.3.1 regex Cheetah3
-
       fi
       wget https://curl.se/download/curl-7.77.0.tar.gz -O curl-7.77.0.tar.gz
       tar -xzf curl-7.77.0.tar.gz
@@ -389,7 +378,6 @@ install_deps() {
           alternatives --install /usr/bin/python3 python3 /usr/bin/python3.9 10
           alternatives --auto python3
       fi
-      pip install --upgrade pip
 
     else
       apt-get -y update
@@ -404,8 +392,6 @@ install_deps() {
       fi
       INSTALL_LIST="${INSTALL_LIST} git valgrind liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev libsasl2-dev gcc g++ cmake curl"
       INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev libldap2-dev libkrb5-dev liblzma-dev patchelf libexpat1-dev sudo libfile-copy-recursive-perl"
-      # PSMDB-2054: native python3 is >= 3.10 on jammy / bookworm / noble (>= 3.9
-      # required for PEP 585 generics in buildscripts/), so no deadsnakes PPA needed.
       INSTALL_LIST="${INSTALL_LIST} python3 python3-dev python3-pip python3-venv"
       until apt-get -y install dirmngr; do
         sleep 1
@@ -481,15 +467,6 @@ build_srpm(){
     SRC_DIR=${TARFILE%.tar.gz}
     tar xzf ${WORKDIR}/${TARFILE}
     source ${WORKDIR}/percona-server-mongodb-83.properties
-    cd ${PRODUCT_FULL}
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelignore
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazeliskrc
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelrc
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelversion
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelrc.psmdb
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.npmrc
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.prettierignore 
-    cd ..
     tar --owner=0 --group=0 -czf ${PRODUCT_FULL}.tar.gz ${PRODUCT_FULL}
     #
     mkdir -vp rpmbuild/{SOURCES,SPECS,BUILD,SRPMS,RPMS}
@@ -596,29 +573,11 @@ build_rpm(){
     elif [ x"$RHEL" = x9 ]; then
       mv /usr/bin/python3 /usr/bin/python3_old
     fi
-    if [ "x${RHEL}" == "x2023" ]; then
-        pip install --upgrade pip
-        pip install --user  requirements_parser
-        pip install --user -r etc/pip/dev-requirements.txt
-        pip install --user -r etc/pip/evgtest-requirements.txt
-        pip install --user -r etc/pip/compile-requirements.txt
-        export PYTHONPATH="/usr/local/lib64/python3.11/site-packages:/usr/local/lib/python3.11/site-packages:$PYTHONPATH"
-    fi
 
     python3 buildscripts/install_bazel.py
     export PATH=\/root/.local/bin:$PATH >> ~/.bashrc
     source ~/.bashrc
     rm -rf install_bazel.py
-
-    pip install --upgrade pip
-
-    # PyYAML pkg installation fix, more info: https://github.com/yaml/pyyaml/issues/724
-    pip install pyyaml==5.4.1 --no-build-isolation
-    pip install 'referencing<0.30.0' --no-build-isolation
-    pip install 'jsonschema-specifications<=2023.07.1' --no-build-isolation
-
-    pip install 'poetry==2.0.0' 'pyproject-hooks==1.2.0'
-    pip install 'mongo_tooling_metrics==1.0.8' 'retry' 'psutil' 'Cheetah3'
 
     cd $WORKDIR
 
@@ -686,18 +645,6 @@ build_source_deb(){
     mv ${TARFILE} ${PRODUCT}_${VERSION}.orig.tar.gz
     cd ${BUILDDIR}
 
-    pip install --upgrade pip
-
-    # PyYAML pkg installation fix, more info: https://github.com/yaml/pyyaml/issues/724
-    pip install pyyaml==5.4.1 --no-build-isolation
-    pip install 'referencing<0.30.0' --no-build-isolation
-    pip install 'jsonschema-specifications<=2023.07.1' --no-build-isolation
-
-    pip install 'poetry==2.0.0' 'pyproject-hooks==1.2.0'
-    pip install 'mongo_tooling_metrics==1.0.8' 'retry' 'psutil' 'Cheetah3'
-
-    poetry install --no-root --sync
-
     dch -D unstable --force-distribution -v "${VERSION}-${RELEASE}" "Update to new Percona Server for MongoDB version ${VERSION}"
     dpkg-buildpackage -S
     cd ../
@@ -745,26 +692,6 @@ build_deb(){
     #
     cd ${PRODUCT}-${VERSION}
 
-    pip install --upgrade pip
-
-    # PyYAML pkg installation fix, more info: https://github.com/yaml/pyyaml/issues/724
-    pip install pyyaml==5.4.1 --no-build-isolation
-    pip install 'referencing<0.30.0' --no-build-isolation
-    pip install 'jsonschema-specifications<=2023.07.1' --no-build-isolation
-
-    pip install 'poetry==2.0.0' 'pyproject-hooks==1.2.0'
-    pip install 'mongo_tooling_metrics==1.0.8' 'retry' 'psutil' 'Cheetah3'
-
-    poetry install --no-root --sync
-
-    #
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelignore
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazeliskrc
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelrc
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelversion
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelrc.psmdb
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.npmrc
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.prettierignore
     python3 buildscripts/install_bazel.py
     export PATH=\/root/.local/bin:$PATH >> ~/.bashrc
     source ~/.bashrc
@@ -887,31 +814,14 @@ build_tarball(){
 
     # Finally build Percona Server for MongoDB with Bazel
     cd ${PSMDIR_ABS}
-    pip install --upgrade pip
-    # PyYAML pkg installation fix, more info: https://github.com/yaml/pyyaml/issues/724
-    pip install pyyaml==5.4.1 --no-build-isolation
-    pip install 'referencing<0.30.0' --no-build-isolation
-    pip install 'jsonschema-specifications<=2023.07.1' --no-build-isolation
-
-    pip install 'poetry==2.0.0' 'pyproject-hooks==1.2.0'
-    pip install 'mongo_tooling_metrics==1.0.8' 'retry' 'psutil' 'Cheetah3'
-
-    poetry install --no-root --sync
 
     export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelignore
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazeliskrc
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelrc
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelversion
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.bazelrc.psmdb
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.npmrc
-    wget https://raw.githubusercontent.com/percona/percona-server-mongodb/refs/heads/${BRANCH}/.prettierignore
     python3 buildscripts/install_bazel.py
     export PATH=\/root/.local/bin:$PATH >> ~/.bashrc
     source ~/.bashrc
+
     bazel clean --expunge || true
-    # PSMDB-2054: optional RBE injection. Empty when PSMDB_RBE_BAZEL_FLAGS is unset.
     bazel build --config=psmdb_opt_release ${PSMDB_RBE_BAZEL_FLAGS:-} --define=MONGO_VERSION=${VERSION}-${RELEASE} --define=GIT_COMMIT_HASH=${REVISION_LONG} install-dist-test
     rm -rf .[^.]*
     mkdir -p ${PSMDIR}/bin
