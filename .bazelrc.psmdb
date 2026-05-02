@@ -154,6 +154,7 @@ common:psmdb_opt_release --//bazel/config:release=True
 --config=psmdb_buildfarm
 common:psmdb_buildfarm --remote_executor=
 common:psmdb_buildfarm --remote_cache=
+
 # PSMDB-2034: Build Event Stream → bb-portal (build observability).
 # Same TLS+JWT path as --remote_executor (Envoy on the central node has
 # a second BES listener wired to the bb-portal-backend BES gRPC server,
@@ -168,20 +169,31 @@ common:psmdb_buildfarm --bes_backend=
 common:psmdb_buildfarm --bes_results_url=
 common:psmdb_buildfarm --remote_instance_name=hardlinking
 common:psmdb_buildfarm --remote_timeout=3600
+
 # NOTE: --remote_cache_compression is intentionally NOT enabled here.
 # Inherits the file-wide default (false). The central node's CAS frontend
 # does not advertise zstd compression support; turning compression on
 # breaks every action with "remote does not support compression".
 common:psmdb_buildfarm --remote_upload_local_results=true
+
 # Override the file-wide --grpc_keepalive_time=0s default. 0s disables
 # keepalive entirely, which Bazel rejects when --remote_executor is set
 # ("keepalive time must be positive"). 30s matches Bazel's documented
 # recommendation for long-lived RBE channels.
 common:psmdb_buildfarm --grpc_keepalive_time=30s
+
 # spawn_strategy: try remote first, fall back to local for actions the
-# remote cluster can't satisfy (e.g. CppLink, CppArchive — kept local by
-# the Jenkins job's --strategy overrides).
+# remote cluster can't satisfy.
 common:psmdb_buildfarm --spawn_strategy=remote,local
+
+# Per-mnemonic strategies (PSMDB-2034 empirical):
+#   CppCompile : explicit remote,local — primary RBE win, mirrors spawn_strategy
+#                so a future spawn_strategy tweak doesn't accidentally pull
+#                compiles back to local.
+#   CppLink    : pinned local — remote ~2x slowdown vs local.
+#   CppArchive : not pinned — PSMDB sets --skip_archive=True (no actions emitted).
+common:psmdb_buildfarm --strategy=CppCompile=remote,local
+common:psmdb_buildfarm --strategy=CppLink=local
 
 ################################################################################
 # End of Percona-specific build profiles
