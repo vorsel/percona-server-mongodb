@@ -351,6 +351,51 @@ def _do_device_code_login(*, status_stream) -> dict:
     return cache
 
 
+def get_cached_or_silent_refresh() -> dict:
+    """Return the cache dict with a usable id_token, no interactive prompts.
+
+    Designed for the Bazel `--credential_helper` subprocess (no TTY,
+    no stdin attached): never opens a Device Code flow, never prints
+    a login URL. Useful only when the cache has already been seeded
+    by a TTY-side `rbe_login.py` or by `wrapper_hook.get_id_token()`
+    on a developer workstation.
+
+    Order of attempts:
+      1. cached id_token still valid → return cache as-is (zero RTT)
+      2. cached refresh_token usable → silent /token refresh, save,
+         return new cache
+      3. neither → raise RbeAuthRequired (helper translates to exit 1)
+
+    Raises:
+      RbeAuthRequired — neither cache is fresh nor refresh is possible
+        (no refresh_token, or upstream refused the refresh). Caller
+        is expected to surface a useful "run rbe_login.py / set
+        PSMDB_RBE_*_TOKEN" message.
+      RbeAuthError — issuer not configured, network failure, etc.
+    """
+    cache = _load_cache()
+
+    cached_id = cache.get("id_token", "")
+    if cached_id and _is_token_fresh(cached_id):
+        return cache
+
+    refresh_token = cache.get("refresh_token", "")
+    if refresh_token:
+        resp = _exchange_refresh_token(refresh_token)
+        if "error" not in resp and "id_token" in resp:
+            cache = _normalize_token_response(resp)
+            _save_cache(cache)
+            return cache
+
+    raise RbeAuthRequired(
+        "RBE buildfarm needs a fresh login but no TTY is attached and "
+        "the cached refresh token is missing or rejected. Run "
+        "`percona-packaging/scripts/rbe_login.py` from an interactive "
+        "shell to authenticate, or export PSMDB_RBE_DEX_TOKEN / "
+        "PSMDB_RBE_JENKINS_TOKEN in your CI environment."
+    )
+
+
 def get_id_token(*, status_stream=None) -> str:
     """Return a fresh OIDC id_token for the buildfarm.
 
