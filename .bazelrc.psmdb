@@ -138,15 +138,33 @@ common:psmdb_opt_release --//bazel/config:release=True
 # read by bazel/wrapper_hook/rbe_auth.py at runtime (or from a hardcoded
 # constant once IT issues a permanent buildfarm hostname).
 #
-# Auth: PSMDB-2043 — bazel/wrapper_hook/wrapper_hook.py automatically
-# obtains an OIDC bearer (Dex Device Code flow on first use, silent
-# refresh thereafter, cached at ~/.cache/rbe/token.json mode 0600)
-# whenever it sees `--config=psmdb_buildfarm` and appends
-# `--remote_header=authorization=Bearer …` to the Bazel argv. We do
-# NOT put `--remote_header` in this file: the token is per-user,
-# expires every hour, and committing it would defeat the whole point.
-# Run `percona-packaging/scripts/rbe_login.py` once on a new machine
-# (or inside a non-TTY Jenkins runner) to seed the cache.
+# Auth: PSMDB-2034 — authentication is driven by Bazel's
+# CredentialHelper protocol. The helper lives at
+# `bazel/wrapper_hook/credential_helper.py` and is wired in via a
+# `--credential_helper=bb-psmdb.net=...` flag passed at
+# `bazel build` time (NOT pinned in this file — see the comment by
+# the empty endpoint flags below for why). A single FQDN pattern
+# covers BOTH the :8981 (RBE) and :1985 (BES) listeners on
+# bb-psmdb.net — Bazel matches the URI host without the port.
+# Bazel invokes the helper on every gRPC channel for this config and
+# caches the returned Bearer until the JWT's `exp - 60s`. As the
+# deadline approaches Bazel re-invokes the helper, so a long build
+# transparently rotates through fresh tokens without restart.
+#
+# The helper resolves a token in this priority order:
+#   1. PSMDB_RBE_DEX_TOKEN     — pre-exchanged Dex JWT (simple CI path)
+#   2. PSMDB_RBE_JENKINS_TOKEN — Jenkins-issued OIDC subject token,
+#      exchanged at the Dex /token endpoint via RFC 8693 token-exchange
+#      against the `bazel-jenkins` static client (see dex.yaml). Cached
+#      in ~/.cache/rbe/ci_token.json. Requires PSMDB_RBE_OIDC_ISSUER.
+#   3. ~/.cache/rbe/token.json — human cache seeded by either
+#      `percona-packaging/scripts/rbe_login.py` or by wrapper_hook.py
+#      pre-flight on a developer workstation (Device Code flow). The
+#      helper itself never opens a Device Code flow — it has no TTY.
+#
+# wrapper_hook.py performs the pre-flight (cache prime / Device Code)
+# only when none of PSMDB_RBE_DEX_TOKEN / PSMDB_RBE_JENKINS_TOKEN are
+# set, so CI runs go straight to the helper.
 #
 # `--remote_instance_name=hardlinking` is the cluster-side mount that
 # hardlinks CAS blobs into the worker FS — same identifier the
@@ -155,16 +173,36 @@ common:psmdb_opt_release --//bazel/config:release=True
 common:psmdb_buildfarm --remote_executor=
 common:psmdb_buildfarm --remote_cache=
 
+# NOTE: --credential_helper is intentionally NOT pinned in this file.
+# It must be passed at `bazel build` time the same way the four
+# endpoint URLs above are. Use the `%workspace%/` prefix so the
+# helper script is resolved relative to the Bazel workspace root —
+# Bazel's UnresolvedScopedCredentialHelperConverter rejects raw
+# relative paths that contain separators ("Path '<x>' must either
+# be absolute or not contain any path separators"). Only three
+# forms are accepted: absolute path, bare binary name (looked up
+# in $PATH), or `%workspace%/...`:
+#
+#   --credential_helper=bb-psmdb.net=%workspace%/bazel/wrapper_hook/credential_helper.py
+#
+# Pinning an EMPTY value (`common:psmdb_buildfarm --credential_helper=`)
+# would not just be a silent trap like the commented-out
+# --tls_client_certificate= block at the top of this file — it
+# would actively break the build, because the same converter
+# explicitly rejects empty input with OptionsParsingException
+# during bazelrc parsing, before any CLI override has a chance
+# to take effect. Keep the matching CLI call-site in
+# psmdb_buildfarm.env.local (developer copy-paste) and in the
+# Jenkins pipeline (CI).
+
 # PSMDB-2034: Build Event Stream → bb-portal (build observability).
 # Same TLS+JWT path as --remote_executor (Envoy on the central node has
 # a second BES listener wired to the bb-portal-backend BES gRPC server,
-# validating the same `bazel-cli` audience JWTs against Dex's JWKS).
-# The bes_results_url path is what bb-portal's own frontend serves —
-# the UI generates this exact pair when prompting clients to point at it.
-# wrapper_hook.py injects --bes_header=authorization=Bearer <jwt> at
-# argv-rewrite time; Bazel does NOT auto-forward --remote_header into
-# --bes_header (separate CLI surfaces, separate underlying gRPC
-# channels), hence the explicit injection.
+# validating the same Dex-issued JWTs). The bes_results_url path is
+# what bb-portal's own frontend serves — the UI generates this exact
+# pair when prompting clients to point at it. The credential_helper
+# directive above attaches the Authorization header on this channel
+# automatically; no separate --bes_header is required.
 common:psmdb_buildfarm --bes_backend=
 common:psmdb_buildfarm --bes_results_url=
 common:psmdb_buildfarm --remote_instance_name=hardlinking
