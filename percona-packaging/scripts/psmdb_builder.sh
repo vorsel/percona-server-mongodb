@@ -568,10 +568,7 @@ build_rpm(){
       if [ -f /opt/rh/gcc-toolset-9/enable ]; then
         source /opt/rh/gcc-toolset-9/enable
         source /opt/rh/gcc-toolset-11/enable
-        mv /usr/bin/python3 /usr/bin/python3_old
       fi
-    elif [ x"$RHEL" = x9 ]; then
-      mv /usr/bin/python3 /usr/bin/python3_old
     fi
 
     python3 buildscripts/install_bazel.py
