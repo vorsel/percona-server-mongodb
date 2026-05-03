@@ -176,71 +176,72 @@ def main():
             # Linter fails preempt bazel run.
             sys.exit(3)
 
-        # PSMDB-2043: inject the OIDC bearer for the on-demand RBE
-        # buildfarm only when this build actually uses it. We key off
-        # `--config=psmdb_buildfarm` (the only config that activates
-        # --remote_executor / --remote_cache / --bes_backend specified
-        # at the bazel build command line — see .bazelrc.psmdb). Local /
-        # CI-side EngFlow / public-release builds keep travelling
-        # through engflow_auth above and never hit Dex.
+        # PSMDB-2034: pre-flight the RBE buildfarm credential cache when
+        # this build is going to talk to the on-demand cluster. Detection
+        # keys off `--config=psmdb_buildfarm` (the only config that
+        # populates --remote_executor / --remote_cache / --bes_backend at
+        # the bazel build command line — see .bazelrc.psmdb). Local /
+        # CI-side EngFlow / public-release builds keep travelling through
+        # engflow_auth above and never hit Dex.
         #
-        # Refresh / login is driven through `rbe_auth.get_id_token`:
-        #   * cached + fresh → zero RTT, append the header, done
-        #   * cached + expired with valid refresh_token → silent /token
-        #     refresh, then append
-        #   * no usable refresh + TTY → Device Code flow on stderr
-        #     (URL + user_code), polls Dex /token until login
-        #   * no usable refresh + non-TTY (Jenkins, scripted runs)
-        #     → fail fast with a pointer to `percona-packaging/scripts/rbe_login.py`. We
-        #     deliberately don't inject a stale-or-empty header here:
-        #     letting Bazel run the build with no auth would just
-        #     produce Envoy 401s on every action and a much noisier
-        #     failure than this one.
+        # We do NOT append --remote_header / --bes_header here anymore.
+        # That lived in PSMDB-2043 as a static one-shot Bearer baked
+        # into argv, and it could not survive token expiry mid-build.
+        # Authentication is now driven by Bazel's CredentialHelper
+        # protocol — see `--credential_helper=…=bazel/wrapper_hook/credential_helper.py`
+        # in .bazelrc.psmdb. Bazel re-invokes the helper whenever the
+        # cached entry is about to expire, giving us mid-build rotation
+        # for free.
+        #
+        # The pre-flight here only covers what the helper cannot do
+        # itself: open a Device Code flow on a TTY. The helper runs as
+        # a Bazel subprocess with no controlling terminal, so it can
+        # only refresh, not log in fresh. Running `get_id_token()` here
+        # makes sure the cache is seeded (or freshly refreshed) before
+        # Bazel ever spawns the helper. CI runs that already have a
+        # PSMDB_RBE_DEX_TOKEN / PSMDB_RBE_JENKINS_TOKEN exported skip
+        # the pre-flight entirely — they don't need the local cache,
+        # and forcing a Device Code flow on a non-TTY runner that
+        # *does* have a valid CI token would just fail spuriously.
         if any(a.startswith("--config=psmdb_buildfarm") for a in args) or any(
             a == "--config" and i + 1 < len(args) and args[i + 1] == "psmdb_buildfarm"
             for i, a in enumerate(args)
         ):
             from bazel.wrapper_hook import rbe_auth
 
-            wrapper_debug("rbe_auth: --config=psmdb_buildfarm detected, fetching OIDC token")
-            pre = rbe_auth.status()
-            wrapper_debug(
-                f"rbe_auth: cache before — present={pre.get('present')} "
-                f"fresh={pre.get('fresh')} expires_at={pre.get('expires_at', 0)} "
-                f"sub={pre.get('subject', '')!r}"
+            ci_token_present = bool(
+                os.environ.get("PSMDB_RBE_DEX_TOKEN", "").strip()
+                or os.environ.get("PSMDB_RBE_JENKINS_TOKEN", "").strip()
             )
-            try:
-                token = run_with_terminal_output(get_id_token)
-            except RbeAuthRequired as e:
-                _info(f"RBE auth: {e}")
-                sys.exit(4)
-            except RbeAuthError as e:
-                _info(f"RBE auth failed: {e}")
-                sys.exit(4)
-            post = rbe_auth.status()
-            wrapper_debug(
-                f"rbe_auth: cache after  — present={post.get('present')} "
-                f"fresh={post.get('fresh')} expires_at={post.get('expires_at', 0)} "
-                f"groups={post.get('groups')}"
-            )
-            wrapper_debug(
-                f"rbe_auth: token bearer={token[:12]}…{token[-6:]} (len={len(token)}); "
-                "appending --remote_header / --bes_header authorization to args"
-            )
-            # Bazel does NOT auto-forward --remote_header into --bes_header:
-            # they're separate CLI surfaces driving separate gRPC channels
-            # (--remote_executor / --remote_cache vs --bes_backend). PSMDB-2034
-            # added a Build Event Stream sink (target specified at the bazel
-            # build command line via --bes_backend), validated against the
-            # same Dex `bazel-cli` audience that gates --remote_executor, so
-            # the same JWT works on both — but we have to attach it twice.
-            args = append_args(
-                args,
-                [
-                    f"--remote_header=authorization=Bearer {token}",
-                    f"--bes_header=authorization=Bearer {token}",
-                ],
-            )
+            if ci_token_present:
+                wrapper_debug(
+                    "rbe_auth: PSMDB_RBE_DEX_TOKEN or PSMDB_RBE_JENKINS_TOKEN set; "
+                    "skipping pre-flight (credential_helper will handle CI auth)"
+                )
+            else:
+                wrapper_debug(
+                    "rbe_auth: --config=psmdb_buildfarm detected, priming OIDC cache"
+                )
+                pre = rbe_auth.status()
+                wrapper_debug(
+                    f"rbe_auth: cache before — present={pre.get('present')} "
+                    f"fresh={pre.get('fresh')} expires_at={pre.get('expires_at', 0)} "
+                    f"sub={pre.get('subject', '')!r}"
+                )
+                try:
+                    run_with_terminal_output(get_id_token)
+                except RbeAuthRequired as e:
+                    _info(f"RBE auth: {e}")
+                    sys.exit(4)
+                except RbeAuthError as e:
+                    _info(f"RBE auth failed: {e}")
+                    sys.exit(4)
+                post = rbe_auth.status()
+                wrapper_debug(
+                    f"rbe_auth: cache after  — present={post.get('present')} "
+                    f"fresh={post.get('fresh')} expires_at={post.get('expires_at', 0)} "
+                    f"groups={post.get('groups')}"
+                )
     else:
         args = sys.argv[2:]
 
