@@ -108,12 +108,26 @@ TOKEN_EXCHANGE_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:id_token"
 # imported copy of rbe_auth from a previous build is not poisoned.
 OIDC_ISSUER_ENV = "PSMDB_RBE_OIDC_ISSUER"
 OIDC_AUDIENCE_ENV = "PSMDB_RBE_OIDC_AUDIENCE"
+# Dex requires a `connector_id` form field on the /token endpoint when
+# the grant is `urn:ietf:params:oauth:grant-type:token-exchange` —
+# without it Dex returns "invalid_request: Requested connector does
+# not exist", because Dex resolves the subject_token's issuer through
+# the matching connector and won't fall back to walking all connectors
+# (see dex/server/handlers.go ::handleTokenExchange). The value must
+# match `connectors[].id` in dex.yaml; the default below tracks the
+# `jenkins-psmdb-rbe` OIDC connector that the central node ships.
+OIDC_CONNECTOR_ENV = "PSMDB_RBE_OIDC_CONNECTOR_ID"
 DEX_TOKEN_ENV = "PSMDB_RBE_DEX_TOKEN"
 JENKINS_TOKEN_ENV = "PSMDB_RBE_JENKINS_TOKEN"
 
 # Public Dex client wired up for Jenkins token exchange — see the
 # `bazel-jenkins` static client in dex.yaml.
 JENKINS_CLIENT_ID = "bazel-jenkins"
+
+# Default connector id the helper passes when PSMDB_RBE_OIDC_CONNECTOR_ID
+# is not set. Matches the OIDC connector created for the Jenkins OIDC
+# Provider plugin issuer in IaC/buildbarn/ondemand/compose/dex/dex.yaml.
+DEFAULT_CONNECTOR_ID = "jenkins-psmdb-rbe"
 
 
 def _debug(msg: str) -> None:
@@ -198,7 +212,9 @@ def _post_form(url: str, form: dict) -> dict:
         raise rbe_auth.RbeAuthError(f"network error talking to {url}: {e}")
 
 
-def _exchange_jenkins_token(jenkins_jwt: str, issuer: str, audience: str) -> str:
+def _exchange_jenkins_token(
+    jenkins_jwt: str, issuer: str, audience: str, connector_id: str
+) -> str:
     """Run RFC 8693 token-exchange against Dex, return the Dex id_token."""
     resp = _post_form(
         f"{issuer.rstrip('/')}/token",
@@ -209,6 +225,7 @@ def _exchange_jenkins_token(jenkins_jwt: str, issuer: str, audience: str) -> str
             "subject_token_type": TOKEN_EXCHANGE_TOKEN_TYPE,
             "audience": audience,
             "scope": "openid",
+            "connector_id": connector_id,
         },
     )
     err = resp.get("error")
@@ -251,6 +268,9 @@ def _from_jenkins_env() -> str | None:
         return None
     issuer = os.environ.get(OIDC_ISSUER_ENV, "").strip()
     audience = os.environ.get(OIDC_AUDIENCE_ENV, "").strip() or "bazel-jenkins"
+    connector_id = (
+        os.environ.get(OIDC_CONNECTOR_ENV, "").strip() or DEFAULT_CONNECTOR_ID
+    )
     if not issuer:
         raise rbe_auth.RbeAuthError(
             f"{JENKINS_TOKEN_ENV} is set but {OIDC_ISSUER_ENV} is not. "
@@ -264,8 +284,11 @@ def _from_jenkins_env() -> str | None:
         _debug("CI cache hit (Dex token still fresh)")
         return cached
 
-    _debug(f"exchanging Jenkins token at {issuer}/token (aud={audience})")
-    new_token = _exchange_jenkins_token(jenkins, issuer, audience)
+    _debug(
+        f"exchanging Jenkins token at {issuer}/token "
+        f"(aud={audience}, connector_id={connector_id})"
+    )
+    new_token = _exchange_jenkins_token(jenkins, issuer, audience, connector_id)
     _save_ci_cache({"id_token": new_token, "fetched_at": int(time.time())})
     return new_token
 
