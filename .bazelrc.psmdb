@@ -217,8 +217,36 @@ common:psmdb_buildfarm --remote_upload_local_results=true
 # Override the file-wide --grpc_keepalive_time=0s default. 0s disables
 # keepalive entirely, which Bazel rejects when --remote_executor is set
 # ("keepalive time must be positive"). 30s matches Bazel's documented
-# recommendation for long-lived RBE channels.
+# recommendation for long-lived RBE channels. Pair with a 10s ack timeout
+# below so a half-broken connection (e.g. an Envoy worker thread that
+# stopped servicing this stream mid-build) is detected within ~40s
+# instead of hanging until --remote_timeout above.
 common:psmdb_buildfarm --grpc_keepalive_time=30s
+common:psmdb_buildfarm --grpc_keepalive_timeout=10s
+
+# PSMDB-2034: client-side resilience to transient gRPC UNAVAILABLE.
+#
+# In a Jenkins matrix burst, all ~11 stages × ~72 jobs/stage start their
+# Bazel client at roughly the same wall-clock instant. Each client opens
+# 3 channels (executor + cache + BES), so the central Envoy listener
+# takes ~2300 simultaneous TCP SYNs in the first second. Even with the
+# server-side knobs we tuned (tcp_backlog_size: 4096, reuse_port,
+# net.core.somaxconn=65535 — see envoy.yaml + bootstrap_host's sysctl),
+# a small fraction of SYNs may still queue past Bazel's 10 s default
+# SslHandshakeTimeoutException ceiling. Retrying with backoff is cheap
+# and turns those rare-but-still-real handshake misses from build
+# failures into a few extra seconds of wall clock.
+#
+# --remote_retries:        5 attempts (Bazel default; pinned explicitly
+#                          so a future Bazel default change can't make
+#                          our build less resilient).
+# --remote_retry_max_delay 15 s — exponential backoff cap. Bazel computes
+#                          1 s, 2 s, 4 s, 8 s, 15 s on the four retries
+#                          (capped at the max). Total worst-case ~30 s
+#                          before the action falls back to local via the
+#                          spawn_strategy=remote,local rule below.
+common:psmdb_buildfarm --remote_retries=5
+common:psmdb_buildfarm --remote_retry_max_delay=15s
 
 # spawn_strategy: try remote first, fall back to local for actions the
 # remote cluster can't satisfy.
