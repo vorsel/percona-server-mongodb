@@ -127,12 +127,11 @@ public:
 
         // Register the ServerStatusSection for the in-memory storage engine
         // and do that only once.
-        std::call_once(
-            initializeServerStatusSectionFlag, [] {
-                *ServerStatusSectionBuilder<WiredTigerServerStatusSection>(
-                     std::string{kInMemoryEngineName})
-                     .forShard();
-            });
+        std::call_once(initializeServerStatusSectionFlag, [] {
+            *ServerStatusSectionBuilder<WiredTigerServerStatusSection>(
+                 std::string{kInMemoryEngineName})
+                 .forShard();
+        });
 
         StorageEngineOptions options;
         options.directoryPerDB = params.directoryperdb;

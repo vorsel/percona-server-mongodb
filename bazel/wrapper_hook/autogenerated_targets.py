@@ -52,6 +52,7 @@ def generate_targets(
         targets.append(create_target(tag, filtered_labels))
     write_bazel_file(targets, output_file)
 
+
 # Don't pass args after '--' to bazel as these args are for the target executable
 def get_extra_args(args):
     extra_args = []
@@ -61,6 +62,7 @@ def get_extra_args(args):
         if arg.startswith("--"):
             extra_args.append(arg)
     return extra_args
+
 
 def get_bazel_labels_from_tags(args, bazel, tag):
     # This way we mostly keep the passed config, this parsing isn't perfect

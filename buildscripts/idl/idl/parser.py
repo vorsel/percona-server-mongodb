@@ -132,9 +132,9 @@ def _generic_parser(
                     )
             elif rule_desc.node_type == "scalar_or_sequence_or_mapping":
                 if ctxt.is_scalar_or_sequence_or_mapping_node(second_node, first_name):
-                   syntax_node.__dict__[first_name] = rule_desc.sequence_parser_func(
-                            ctxt, second_node
-                        )
+                    syntax_node.__dict__[first_name] = rule_desc.sequence_parser_func(
+                        ctxt, second_node
+                    )
             elif rule_desc.node_type == "mapping":
                 if ctxt.is_mapping_node(second_node, first_name):
                     syntax_node.__dict__[first_name] = rule_desc.mapping_parser_func(
@@ -332,13 +332,15 @@ def _parse_expression(ctxt, node):
 
     return expr
 
+
 def _parse_expression_or_sequence(ctxt, node):
     # type: (errors.ParserContext, Union[yaml.nodes.ScalarNode,yaml.nodes.SequenceNode,yaml.nodes.MappingNode]) -> Union[syntax.Expression,List[syntax.Expression]]
     """Parse an expression as either a scalar, sequence or a mapping."""
     if node.id == "sequence":
-        return [ _parse_expression(ctxt, child) for child in node.value ]
+        return [_parse_expression(ctxt, child) for child in node.value]
     else:
         return _parse_expression(ctxt, node)
+
 
 def _parse_sequence_of_scalar_or_mapping(ctxt, node):
     # type: (errors.ParserContext, yaml.nodes.SequenceNode) -> List[Union[str,syntax.Expression]]
@@ -1045,9 +1047,7 @@ def _parse_config_option(ctxt, spec, name, node):
                 mapping_parser_func=_parse_expression_or_sequence,
                 sequence_parser_func=_parse_sequence_of_scalar_or_mapping,
             ),
-            "hidden": _RuleDesc(
-                "scalar_or_mapping", mapping_parser_func=_parse_expression
-            ),
+            "hidden": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_expression),
             "redact": _RuleDesc("bool_scalar"),
             "default": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_expression),
             "implicit": _RuleDesc("scalar_or_mapping", mapping_parser_func=_parse_expression),

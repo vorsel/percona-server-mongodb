@@ -2,6 +2,7 @@
 """
 OIDC Identity Provider Server Mock
 """
+
 import argparse
 import logging
 import os
@@ -56,6 +57,7 @@ def log_pretty_json(log, title: str, json_obj: Dict):
             log(line)
     except TypeError as e:
         logger.error(f"Failed to serialize JSON: {e}")
+
 
 @dataclass
 class TokenParams:
@@ -156,13 +158,9 @@ class JWFactory:
                 "use": "sig",  # RFC 7517, Section 4.2
                 "alg": self.algorithm,  # RFC 7517, Section 4.4
                 "kid": kid,  # RFC 7517, Section 4.5
-                "x5c": [
-                    base64.b64encode(cert_der).decode("ascii")
-                ],  # RFC 7517, Section 4.7
+                "x5c": [base64.b64encode(cert_der).decode("ascii")],  # RFC 7517, Section 4.7
                 "x5t": b64url(hashlib.sha1(cert_der).digest()),  # RFC 7517, Section 4.8
-                "x5t#S256": b64url(
-                    hashlib.sha256(cert_der).digest()
-                ),  # RFC 7517, Section 4.9
+                "x5t#S256": b64url(hashlib.sha256(cert_der).digest()),  # RFC 7517, Section 4.9
             }
         )
 
@@ -224,7 +222,7 @@ class JWFactory:
         # Create new JWKs if requested by token's config
         if token_config.get("generate_jwks", False):
             logger.info(f"generate_jwks: true")
-            self.create_jwks();
+            self.create_jwks()
 
         expires_in_seconds = token_config.get("expires_in_seconds", 3600)
         key_id = token_config.get("key_id", 0)
@@ -260,9 +258,7 @@ class JWFactory:
             RSAPrivateKey: The private key.
         """
         if key_id >= len(self.keys):
-            raise ValueError(
-                f"invalid key_id: {key_id}, number_of_keys: {len(self.keys)}"
-            )
+            raise ValueError(f"invalid key_id: {key_id}, number_of_keys: {len(self.keys)}")
         return self.keys[key_id]["private_key"]
 
     def get_kid(self, key_id) -> str:
@@ -648,9 +644,7 @@ class IdPMock:
         }
         return (200, response)
 
-    def auto_introspect_token(
-        self, token: str, token_params: TokenParams
-    ) -> HandlerReturnType:
+    def auto_introspect_token(self, token: str, token_params: TokenParams) -> HandlerReturnType:
         """
         Automatically introspect the token.
         Args:
@@ -690,7 +684,7 @@ class IdPMock:
     def get_introspection_config(self, introspection: Dict) -> Dict:
         """
         Get the introspection configuration.
-        
+
         If introspection is a list, pop the first element, otherwise, use it as is
         Args:
             introspection (Dict): The introspection configuration dict.
@@ -707,7 +701,9 @@ class IdPMock:
 
         return introspection_config
 
-    def get_introspection_result(self, introspection_config: Dict, token: str, token_params: TokenParams) -> Tuple[int, Dict]:
+    def get_introspection_result(
+        self, introspection_config: Dict, token: str, token_params: TokenParams
+    ) -> Tuple[int, Dict]:
         """
         Get the introspection result based on the introspection configuration.
 
@@ -770,7 +766,7 @@ class IdPMock:
         token_params = self.jwts.get(token)
         if token_params is None:
             return ("Invalid token", None, None)
-        
+
         return (None, token, token_params)
 
     def handle_introspect(self, body) -> HandlerReturnType:
@@ -807,9 +803,7 @@ def build_parser() -> argparse.ArgumentParser:
         argparse.ArgumentParser: The argument parser.
     """
     parser = argparse.ArgumentParser(description="OIDC Identity Provider Mock")
-    parser.add_argument(
-        "-v", "--verbose", action="count", help="enable verbose logging"
-    )
+    parser.add_argument("-v", "--verbose", action="count", help="enable verbose logging")
     parser.add_argument(
         "--cert",
         type=str,
@@ -953,8 +947,7 @@ def main():
     if args.cert:
         logger.debug(f"Certificate: {args.cert}")
         if not args.issuer_url.startswith("https://"):
-            raise ValueError(("A certificate is provided but the `issuer_url` "
-                              "is not HTTPS"));
+            raise ValueError(("A certificate is provided but the `issuer_url` " "is not HTTPS"))
 
     config = parse_args(args)
     idp_config = create_idp_config(args, config)

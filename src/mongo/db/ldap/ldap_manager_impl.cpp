@@ -45,7 +45,6 @@ Copyright (C) 2019-present Percona and/or its affiliates. All rights reserved.
 #include <map>
 #include <memory>
 #include <mutex>
-
 #include <regex>
 #include <utility>
 #include <vector>

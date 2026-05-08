@@ -18,6 +18,7 @@ from bazel.wrapper_hook.wrapper_util import get_terminal_stream
 
 wrapper_debug(f"wrapper hook script is using {sys.executable}")
 
+
 # Append new_args before the '--' separator if it exists
 def append_args(args, new_args):
     if "--" in args:
@@ -25,6 +26,7 @@ def append_args(args, new_args):
         return args[:separator_index] + new_args + args[separator_index:]
     else:
         return args + new_args
+
 
 def _supports_color(stream):
     if os.name == "nt":
