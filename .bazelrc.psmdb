@@ -157,7 +157,7 @@ common:psmdb_opt_release --//bazel/config:release=True
 #      exchanged at the Dex /token endpoint via RFC 8693 token-exchange
 #      against the `bazel-jenkins` static client (see dex.yaml). Cached
 #      in ~/.cache/rbe/ci_token.json. Requires PSMDB_RBE_OIDC_ISSUER.
-#   3. ~/.cache/rbe/token.json — human cache seeded by either
+#   3. ~/.cache/rbe/token.json — user cache seeded by either
 #      `percona-packaging/scripts/rbe_login.py` or by wrapper_hook.py
 #      pre-flight on a developer workstation (Device Code flow). The
 #      helper itself never opens a Device Code flow — it has no TTY.
