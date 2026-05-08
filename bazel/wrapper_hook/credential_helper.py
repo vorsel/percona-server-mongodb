@@ -5,7 +5,7 @@ PSMDB-2034: Bazel CredentialHelper for the on-demand RBE buildfarm.
 Implements the Bazel credential helper protocol (Bazel ≥6, design doc
 https://github.com/bazelbuild/proposals/blob/main/designs/2022-06-07-bazel-credential-helpers.md):
 
-  stdin  : {"uri": "https://bb-psmdb.ddns.net:8981/..."}
+  stdin  : {"uri": "https://rbe-psmdb.percona.com:8981/..."}
   stdout : {"headers": {"Authorization": ["Bearer <jwt>"]},
             "expires": "2026-05-03T18:30:00Z"}
   exit 0 : success — Bazel caches the headers until `expires`
@@ -72,7 +72,7 @@ Token sources, in priority order (first hit wins):
       sidecar's atomic rename, which is by far the most likely
       reason an in-flight subject_token went stale.
 
-  (3) Human flow
+  (3) User flow
       Falls through to bazel.wrapper_hook.rbe_auth.get_cached_or_silent_refresh()
       which reads ~/.cache/rbe/token.json (seeded by `rbe_login.py`
       or by wrapper_hook.py during pre-flight) and refreshes via
@@ -111,12 +111,12 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from bazel.wrapper_hook import rbe_auth  # noqa: E402
 
-# CI cache lives next to the human cache so `rbe_login.py --status`
+# CI cache lives next to the user cache so `rbe_login.py --status`
 # and friends can pick it up if a developer ever runs the helper from
-# a TTY for diagnostics. mode 0600 like the human one.
+# a TTY for diagnostics. mode 0600 like the user one.
 CI_CACHE_PATH = pathlib.Path.home() / ".cache" / "rbe" / "ci_token.json"
 
-# Re-use the same skew constant the human path uses so a token that
+# Re-use the same skew constant the user path uses so a token that
 # rbe_auth deems "stale enough to refresh" is also "stale enough to
 # tell Bazel about". Keeps the two clocks aligned.
 EXP_SKEW_SECONDS = rbe_auth.EXP_SKEW_SECONDS
@@ -128,7 +128,7 @@ HTTP_TIMEOUT_SECONDS = rbe_auth.HTTP_TIMEOUT_SECONDS
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 TOKEN_EXCHANGE_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:id_token"
 
-# Same name the human flow uses; the helper reads PSMDB_RBE_OIDC_ISSUER
+# Same name the user flow uses; the helper reads PSMDB_RBE_OIDC_ISSUER
 # straight from the environment without reaching into rbe_auth's
 # module-level state, so a Bazel server that already holds an
 # imported copy of rbe_auth from a previous build is not poisoned.
@@ -382,7 +382,7 @@ def _from_jenkins_env() -> str | None:
         raise rbe_auth.RbeAuthError(
             f"{JENKINS_TOKEN_ENV}/{JENKINS_TOKEN_FILE_ENV} is set but "
             f"{OIDC_ISSUER_ENV} is not. Set PSMDB_RBE_OIDC_ISSUER to the Dex "
-            "issuer URL (e.g. https://bb-psmdb.ddns.net/dex)."
+            "issuer URL (e.g. https://rbe-psmdb.percona.com/dex)."
         )
 
     # CI cache hit: the previously exchanged Dex token is still fresh.
@@ -411,7 +411,7 @@ def _from_human_cache() -> str | None:
         cache = rbe_auth.get_cached_or_silent_refresh()
     except rbe_auth.RbeAuthRequired:
         return None
-    _debug("using human cache (~/.cache/rbe/token.json)")
+    _debug("using user cache (~/.cache/rbe/token.json)")
     return cache.get("id_token", "") or None
 
 
