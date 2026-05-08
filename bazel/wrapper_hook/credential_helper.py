@@ -35,16 +35,42 @@ Token sources, in priority order (first hit wins):
       result. Helper returns it verbatim and lets Bazel cache up to
       its `exp - skew`.
 
-  (2) PSMDB_RBE_JENKINS_TOKEN + PSMDB_RBE_OIDC_ISSUER + …
+  (2) PSMDB_RBE_JENKINS_TOKEN_FILE OR PSMDB_RBE_JENKINS_TOKEN, plus
+      PSMDB_RBE_OIDC_ISSUER + …
       Jenkins-issued OIDC subject token (RFC 8693 token-exchange).
-      Helper exchanges it for a Dex token against
-      $PSMDB_RBE_OIDC_ISSUER/token, file-caches the result under
-      ~/.cache/rbe/ci_token.json, and returns it. Subsequent
+      Two source variants share the rest of the path:
+
+        * PSMDB_RBE_JENKINS_TOKEN_FILE (preferred for CI):
+              Path to a workspace-shared file the Jenkins pipeline
+              keeps fresh through a sidecar `parallel` stage
+              (`withCredentials([string(...)])` reissues a new JWT
+              every TTL/2 minutes, then atomic-renames into place).
+              Helper reads the file on every invocation, so a build
+              longer than one Jenkins-OIDC TTL (typically 2 h) stays
+              authenticated indefinitely as long as the pipeline is
+              alive. If the file is missing/empty the helper falls
+              through to the env variant — keeps dev/test ergonomics.
+
+        * PSMDB_RBE_JENKINS_TOKEN (legacy / dev fallback):
+              Single one-shot JWT injected via `docker run -e ...`.
+              Cannot be refreshed mid-container, so any build that
+              outlives the issued token's `exp` will see Dex refuse
+              the next exchange with `access_denied`. Use the file
+              variant in CI.
+
+      Helper exchanges the chosen subject_token for a Dex token
+      against $PSMDB_RBE_OIDC_ISSUER/token, file-caches the result
+      under ~/.cache/rbe/ci_token.json, and returns it. Subsequent
       invocations within the cache window short-circuit; cache miss
-      re-runs the exchange. Required so the CI build stays
-      authenticated past the Dex token TTL while the Jenkins
-      subject_token is still alive (Jenkins-side TTL must be set
-      generously enough to cover the longest expected build).
+      re-runs the exchange (re-reading the JWT from whichever source
+      we picked).
+
+      If the first exchange after a cache miss fails with a
+      retryable Dex error (`access_denied`, `invalid_grant`, etc.)
+      and the source was the file, the helper re-reads the file
+      once and retries the exchange — this races against the
+      sidecar's atomic rename, which is by far the most likely
+      reason an in-flight subject_token went stale.
 
   (3) Human flow
       Falls through to bazel.wrapper_hook.rbe_auth.get_cached_or_silent_refresh()
@@ -119,6 +145,16 @@ OIDC_AUDIENCE_ENV = "PSMDB_RBE_OIDC_AUDIENCE"
 OIDC_CONNECTOR_ENV = "PSMDB_RBE_OIDC_CONNECTOR_ID"
 DEX_TOKEN_ENV = "PSMDB_RBE_DEX_TOKEN"
 JENKINS_TOKEN_ENV = "PSMDB_RBE_JENKINS_TOKEN"
+
+# Path to a sidecar-rotated JWT file. When set, takes priority over
+# JENKINS_TOKEN_ENV — see the module docstring for the full rationale.
+# The pipeline guarantees atomic-replace semantics on this path (write
+# tmp + rename), so a partial read is impossible.
+JENKINS_TOKEN_FILE_ENV = "PSMDB_RBE_JENKINS_TOKEN_FILE"
+
+# Dex error codes for which we re-read the sidecar file once and retry.
+# Anything else (network, 5xx, malformed response) bubbles up as-is.
+DEX_RETRYABLE_ERRORS = ("access_denied", "invalid_grant", "expired_token")
 
 # Public Dex client wired up for Jenkins token exchange — see the
 # `bazel-jenkins` static client in dex.yaml.
@@ -262,8 +298,79 @@ def _from_dex_env() -> str | None:
     return tok
 
 
+def _read_token_file(path: str) -> str | None:
+    """Read a JWT from a sidecar-rotated file. Returns stripped contents or None.
+
+    Atomic-replace semantics on the writer side mean we never see a
+    half-written token; a missing/empty file just means the sidecar
+    has not yet produced one.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            tok = f.read().strip()
+            return tok or None
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        _debug(f"could not read {path}: {e}")
+        return None
+
+
+def _read_jenkins_jwt() -> tuple[str | None, str]:
+    """Resolve the Jenkins-issued subject JWT.
+
+    Returns (jwt, source) where source is one of "file" / "env" / "none".
+    File takes priority — that's the path the Jenkins pipeline sidecar
+    rotates on a TTL/2 cadence. Env is the v0 single-shot path, kept
+    as a graceful fallback for dev/tests where there is no sidecar.
+    """
+    file_path = os.environ.get(JENKINS_TOKEN_FILE_ENV, "").strip()
+    if file_path:
+        tok = _read_token_file(file_path)
+        if tok:
+            return (tok, "file")
+        _debug(
+            f"{JENKINS_TOKEN_FILE_ENV}={file_path} but file missing/empty — "
+            "falling back to env"
+        )
+    tok = os.environ.get(JENKINS_TOKEN_ENV, "").strip()
+    if tok:
+        return (tok, "env")
+    return (None, "none")
+
+
+def _exchange_with_retry(
+    jenkins: str,
+    jwt_source: str,
+    issuer: str,
+    audience: str,
+    connector_id: str,
+) -> str:
+    """Run token-exchange. If the source is the sidecar file and Dex
+    refuses with a retryable error, re-read the file once and retry —
+    this races against the sidecar's atomic rename, which is by far
+    the most likely reason an in-flight subject_token went stale.
+    """
+    try:
+        return _exchange_jenkins_token(jenkins, issuer, audience, connector_id)
+    except rbe_auth.RbeAuthError as e:
+        if jwt_source != "file":
+            raise
+        msg = str(e)
+        if not any(code in msg for code in DEX_RETRYABLE_ERRORS):
+            raise
+        _debug(
+            f"first exchange failed ({msg}); re-reading sidecar file and "
+            "retrying once"
+        )
+        fresh, fresh_source = _read_jenkins_jwt()
+        if not fresh or fresh_source != "file":
+            raise
+        return _exchange_jenkins_token(fresh, issuer, audience, connector_id)
+
+
 def _from_jenkins_env() -> str | None:
-    jenkins = os.environ.get(JENKINS_TOKEN_ENV, "").strip()
+    jenkins, jwt_source = _read_jenkins_jwt()
     if not jenkins:
         return None
     issuer = os.environ.get(OIDC_ISSUER_ENV, "").strip()
@@ -273,9 +380,9 @@ def _from_jenkins_env() -> str | None:
     )
     if not issuer:
         raise rbe_auth.RbeAuthError(
-            f"{JENKINS_TOKEN_ENV} is set but {OIDC_ISSUER_ENV} is not. "
-            "Set PSMDB_RBE_OIDC_ISSUER to the Dex issuer URL "
-            "(e.g. https://bb-psmdb.ddns.net/dex)."
+            f"{JENKINS_TOKEN_ENV}/{JENKINS_TOKEN_FILE_ENV} is set but "
+            f"{OIDC_ISSUER_ENV} is not. Set PSMDB_RBE_OIDC_ISSUER to the Dex "
+            "issuer URL (e.g. https://bb-psmdb.ddns.net/dex)."
         )
 
     # CI cache hit: the previously exchanged Dex token is still fresh.
@@ -285,10 +392,10 @@ def _from_jenkins_env() -> str | None:
         return cached
 
     _debug(
-        f"exchanging Jenkins token at {issuer}/token "
-        f"(aud={audience}, connector_id={connector_id})"
+        f"exchanging Jenkins token (subject_source={jwt_source}) at "
+        f"{issuer}/token (aud={audience}, connector_id={connector_id})"
     )
-    new_token = _exchange_jenkins_token(jenkins, issuer, audience, connector_id)
+    new_token = _exchange_with_retry(jenkins, jwt_source, issuer, audience, connector_id)
     _save_ci_cache({"id_token": new_token, "fetched_at": int(time.time())})
     return new_token
 
@@ -360,10 +467,12 @@ def main() -> int:
                 "[rbe-helper] no usable PSMDB RBE credential.\n"
                 "  Tried (in order):\n"
                 f"    * env {DEX_TOKEN_ENV}   (not set or expired)\n"
-                f"    * env {JENKINS_TOKEN_ENV}+{OIDC_ISSUER_ENV} (not set)\n"
+                f"    * file {JENKINS_TOKEN_FILE_ENV} or env {JENKINS_TOKEN_ENV}, "
+                f"plus {OIDC_ISSUER_ENV} (not set)\n"
                 "    * ~/.cache/rbe/token.json (missing or refresh failed)\n"
                 "  Fix: export PSMDB_RBE_DEX_TOKEN / PSMDB_RBE_JENKINS_TOKEN "
-                "before invoking Bazel, or run "
+                "before invoking Bazel, point PSMDB_RBE_JENKINS_TOKEN_FILE at a "
+                "sidecar-rotated JWT file, or run "
                 "`percona-packaging/scripts/rbe_login.py` interactively first.",
                 file=sys.stderr,
             )
