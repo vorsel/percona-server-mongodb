@@ -342,6 +342,7 @@ install_deps() {
         yum -y install gcc-toolset-11-dwz gcc-toolset-11-elfutils
 
         yum -y install python3.11 python3.11-devel python3.11-pip
+        yum -y install cyrus-sasl-gssapi glibc-devel procps-ng systemtap-sdt-devel zip
         alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 11
         alternatives --set python3 /usr/bin/python3.11
       elif [ x"$RHEL" = x9  -o x"$RHEL" = x2023 ]; then
@@ -355,6 +356,19 @@ install_deps() {
         yum -y install $OPENSSL_EXCLUDE redhat-rpm-config which e2fsprogs-devel expat-devel lz4-devel
         yum -y install $OPENSSL_EXCLUDE openldap-devel krb5-devel xz-devel
         yum -y install $OPENSSL_EXCLUDE perl
+        yum -y install $OPENSSL_EXCLUDE cyrus-sasl-gssapi glibc-devel procps-ng systemtap-sdt-devel zip
+      elif [ x"$RHEL" = x10 ]; then
+        dnf config-manager --enable ol10_codeready_builder
+
+        yum -y install $OPENSSL_EXCLUDE oracle-epel-release-el10
+        yum -y install $OPENSSL_EXCLUDE bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
+        yum -y install $OPENSSL_EXCLUDE cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
+        yum -y install $OPENSSL_EXCLUDE python3 python3-pip python3-devel
+
+        yum -y install $OPENSSL_EXCLUDE redhat-rpm-config which e2fsprogs-devel expat-devel lz4-devel
+        yum -y install $OPENSSL_EXCLUDE openldap-devel krb5-devel xz-devel
+        yum -y install $OPENSSL_EXCLUDE perl
+        yum -y install $OPENSSL_EXCLUDE cyrus-sasl-gssapi glibc-devel procps-ng systemtap-sdt-devel zip
       fi
       wget https://curl.se/download/curl-7.77.0.tar.gz -O curl-7.77.0.tar.gz
       tar -xzf curl-7.77.0.tar.gz
@@ -384,15 +398,7 @@ install_deps() {
       DEBIAN_FRONTEND=noninteractive apt-get -y install curl lsb-release wget apt-transport-https software-properties-common
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
-      # Debian 13 (trixie) and Ubuntu 26.04 (resolute) ship without apt-key,
-      # which the legacy percona-release 1.0-27 postinst relies on (fails
-      # with `exit status 127`). Use the keyring-aware 1.0-33 build from
-      # the prel/apt path on those distros; keep 1.0-27 verbatim for the
-      # proven-stable pre-Trixie set.
       if [ x"${DEBIAN}" = "xtrixie" ] || [ x"${DEBIAN}" = "xresolute" ]; then
-        # 1.0-33 declares Depends: gnupg2 | gnupg — `apt install ./*.deb`
-        # resolves and installs them in one shot; `dpkg -i` would leave
-        # the package half-configured and fail with unmet dependencies.
         wget https://repo.percona.com/prel/apt/pool/main/p/percona-release/percona-release_1.0-33.generic_all.deb && DEBIAN_FRONTEND=noninteractive apt-get -y install ./percona-release_1.0-33.generic_all.deb
       else
         wget https://repo.percona.com/apt/pool/main/p/percona-release/percona-release_1.0-27.generic_all.deb && dpkg -i percona-release_1.0-27.generic_all.deb
@@ -405,6 +411,13 @@ install_deps() {
       INSTALL_LIST="${INSTALL_LIST} git valgrind liblz4-dev devscripts debhelper debconf libpcap-dev libbz2-dev libsnappy-dev pkg-config zlib1g-dev libzlcore-dev libsasl2-dev gcc g++ cmake curl"
       INSTALL_LIST="${INSTALL_LIST} libssl-dev libcurl4-openssl-dev libldap2-dev libkrb5-dev liblzma-dev patchelf libexpat1-dev sudo libfile-copy-recursive-perl"
       INSTALL_LIST="${INSTALL_LIST} python3 python3-dev python3-pip python3-venv"
+      INSTALL_LIST="${INSTALL_LIST} build-essential hostname iproute2 libgssapi-krb5-2 libxml2-dev openssl zip"
+      case "${DEBIAN}" in
+        bionic|focal|jammy|noble|resolute) INSTALL_LIST="${INSTALL_LIST} systemtap-sdt-dev";;
+      esac
+      case "${DEBIAN}" in
+        noble|resolute) INSTALL_LIST="${INSTALL_LIST} libncurses-dev";;
+      esac
       until apt-get -y install dirmngr; do
         sleep 1
         echo "waiting"
