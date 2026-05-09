@@ -390,7 +390,10 @@ install_deps() {
       # the prel/apt path on those distros; keep 1.0-27 verbatim for the
       # proven-stable pre-Trixie set.
       if [ x"${DEBIAN}" = "xtrixie" ] || [ x"${DEBIAN}" = "xresolute" ]; then
-        wget https://repo.percona.com/prel/apt/pool/main/p/percona-release/percona-release_1.0-33.generic_all.deb && dpkg -i percona-release_1.0-33.generic_all.deb
+        # 1.0-33 declares Depends: gnupg2 | gnupg — `apt install ./*.deb`
+        # resolves and installs them in one shot; `dpkg -i` would leave
+        # the package half-configured and fail with unmet dependencies.
+        wget https://repo.percona.com/prel/apt/pool/main/p/percona-release/percona-release_1.0-33.generic_all.deb && DEBIAN_FRONTEND=noninteractive apt-get -y install ./percona-release_1.0-33.generic_all.deb
       else
         wget https://repo.percona.com/apt/pool/main/p/percona-release/percona-release_1.0-27.generic_all.deb && dpkg -i percona-release_1.0-27.generic_all.deb
       fi
