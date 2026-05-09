@@ -21,6 +21,11 @@ REMOTE_EXECUTION_CONTAINERS = {
         "dockerfile": "bazel/remote_execution_container/debian12/Dockerfile",
         "web-url": "https://quay.io/repository/mongodb/bazel-remote-execution/manifest/sha256:24d21b038c38fa4bea9cef8913f62756b7df1faa8a893306f42fcb934b957504",
     },
+    "debian13": {
+        "container-url": "docker://quay.io/mongodb/bazel-remote-execution@sha256:d1df0fd76f9fdf28813fbe25dc9b989b5228f94cd37eae11fb194f67d3afdbbb",
+        "dockerfile": "bazel/remote_execution_container/debian12/Dockerfile",
+        "web-url": "https://quay.io/repository/mongodb/bazel-remote-execution/manifest/sha256:d1df0fd76f9fdf28813fbe25dc9b989b5228f94cd37eae11fb194f67d3afdbbb",
+    },
     "linux": {
         "_COMMENT": "Uses amazon linux 2 container",
         "container-url": "docker://quay.io/mongodb/bazel-remote-execution@sha256:672e55d036e2eb3e795a483c7704ca5fffe2fbf0a0989b7374474dc380bdb9f0",
