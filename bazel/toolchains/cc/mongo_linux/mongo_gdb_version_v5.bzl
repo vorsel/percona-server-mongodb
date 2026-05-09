@@ -132,9 +132,11 @@ TOOLCHAIN_MAP_V5 = {
         "sha": "f111ae80389ae91231596eea48af30bb910cbf32e292569767aa003c6e8cb3a7",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-ubuntu2404-7553752a78d885cc2f60c725bfb5cd66e4c4e02b.tar.gz",
     },
+    # PSMDB-2073 — same rationale as in mongo_toolchain_version_v5.bzl: pin GDB
+    # to debian13 build (glibc 2.41) until upstream ships a real ubuntu2604.
     "ubuntu26_x86_64": {
-        "platform_name": "ubuntu2404",
-        "sha": "f111ae80389ae91231596eea48af30bb910cbf32e292569767aa003c6e8cb3a7",
-        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-ubuntu2404-7553752a78d885cc2f60c725bfb5cd66e4c4e02b.tar.gz",
+        "platform_name": "debian13",
+        "sha": "e7c9280c0c76d713601817f40ef5f59381d7193ec3490ffb9d99c3bbdca20821",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-debian13-d02aeb1bc399436156aa04a08a2bf8158ae9852a.tar.gz",
     },
 }
