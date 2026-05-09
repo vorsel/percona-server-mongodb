@@ -384,7 +384,16 @@ install_deps() {
       DEBIAN_FRONTEND=noninteractive apt-get -y install curl lsb-release wget apt-transport-https software-properties-common
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
-      wget https://repo.percona.com/apt/pool/main/p/percona-release/percona-release_1.0-27.generic_all.deb && dpkg -i percona-release_1.0-27.generic_all.deb
+      # Debian 13 (trixie) and Ubuntu 26.04 (resolute) ship without apt-key,
+      # which the legacy percona-release 1.0-27 postinst relies on (fails
+      # with `exit status 127`). Use the keyring-aware 1.0-33 build from
+      # the prel/apt path on those distros; keep 1.0-27 verbatim for the
+      # proven-stable pre-Trixie set.
+      if [ x"${DEBIAN}" = "xtrixie" ] || [ x"${DEBIAN}" = "xresolute" ]; then
+        wget https://repo.percona.com/prel/apt/pool/main/p/percona-release/percona-release_1.0-33.generic_all.deb && dpkg -i percona-release_1.0-33.generic_all.deb
+      else
+        wget https://repo.percona.com/apt/pool/main/p/percona-release/percona-release_1.0-27.generic_all.deb && dpkg -i percona-release_1.0-27.generic_all.deb
+      fi
       percona-release enable tools testing
       apt-get update
       if [ x"${DEBIAN}" = "xfocal" ]; then
