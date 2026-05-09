@@ -90,16 +90,32 @@ PSMDB_REMOTE_EXECUTION_CONTAINERS = {
     "debian12": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:debian-bookworm-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14",
     },
+    # PSMDB-2028 — Debian 13 (Trixie). SHA placeholder: replace once
+    # the first sandbox build pushes :debian-trixie-master-<sha>.
+    "debian13": {
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:debian-trixie-master-0000000000000000000000000000000000000000",
+    },
     "rhel8": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14",
     },
     "rhel9": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14",
     },
+    # PSMDB-1943 — Oracle Linux 10. SHA placeholder: replace once
+    # the first sandbox build pushes :oraclelinux-10-master-<sha>.
+    "rhel10": {
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-10-master-0000000000000000000000000000000000000000",
+    },
     "ubuntu22": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14",
     },
     "ubuntu24": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14",
+    },
+    # PSMDB-2073 — Ubuntu 26.04 LTS (Resolute Raccoon). SHA placeholder:
+    # replace once the first sandbox build pushes
+    # :ubuntu-resolute-master-<sha>.
+    "ubuntu26": {
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-resolute-master-0000000000000000000000000000000000000000",
     },
 }
