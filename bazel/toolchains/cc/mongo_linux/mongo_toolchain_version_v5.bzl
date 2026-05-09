@@ -122,7 +122,17 @@ TOOLCHAIN_MAP_V5 = {
         "sha": "12fc1e0cd8630b40d28d4779540bee1779b08106bde295cdf86a541023bd0f2e",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-ubuntu2404-arm64-7553752a78d885cc2f60c725bfb5cd66e4c4e02b.tar.gz",
     },
+    "ubuntu26_aarch64": {
+        "platform_name": "ubuntu2404-arm64",
+        "sha": "12fc1e0cd8630b40d28d4779540bee1779b08106bde295cdf86a541023bd0f2e",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-ubuntu2404-arm64-7553752a78d885cc2f60c725bfb5cd66e4c4e02b.tar.gz",
+    },
     "ubuntu24_x86_64": {
+        "platform_name": "ubuntu2404",
+        "sha": "783f810e1bfac14e0afb31145af56df7457870145cf60c68546c4dcf35e8fc11",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-ubuntu2404-7553752a78d885cc2f60c725bfb5cd66e4c4e02b.tar.gz",
+    },
+    "ubuntu26_x86_64": {
         "platform_name": "ubuntu2404",
         "sha": "783f810e1bfac14e0afb31145af56df7457870145cf60c68546c4dcf35e8fc11",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-ubuntu2404-7553752a78d885cc2f60c725bfb5cd66e4c4e02b.tar.gz",
