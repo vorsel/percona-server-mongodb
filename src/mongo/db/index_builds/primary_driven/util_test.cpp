@@ -32,6 +32,7 @@
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer/op_observer_noop.h"
+#include "mongo/db/repl/timestamp_block.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_test_fixture.h"
 #include "mongo/db/shard_role/shard_catalog/collection.h"
 #include "mongo/db/shard_role/shard_catalog/index_catalog.h"
@@ -39,6 +40,7 @@
 #include "mongo/db/shard_role/shard_catalog/index_descriptor.h"
 #include "mongo/db/shard_role/shard_role.h"
 #include "mongo/db/shard_role/transaction_resources.h"
+#include "mongo/db/storage/ident.h"
 #include "mongo/db/storage/kv/kv_engine.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/db/storage/storage_engine.h"
@@ -176,8 +178,10 @@ private:
 TEST_F(UtilTest, Start) {
     auto buildUUID = UUID::gen();
     auto indexes = makeIndexes({"a", "b"});
+    const auto indexBuildIdent = ident::generateNewIndexBuildIdent(buildUUID);
 
-    ASSERT_OK(start(operationContext(), ns.dbName(), collUUID, buildUUID, indexes));
+    ASSERT_OK(
+        start(operationContext(), ns.dbName(), collUUID, buildUUID, indexes, indexBuildIdent));
 
     auto coll = acquireCollectionMaybeLockFree(
         operationContext(),
@@ -185,20 +189,21 @@ TEST_F(UtilTest, Start) {
                                                 {ns.dbName(), collUUID},
                                                 AcquisitionPrerequisites::OperationType::kRead));
 
+    auto& engine = *operationContext()->getServiceContext()->getStorageEngine()->getEngine();
+    auto& ru = *shard_role_details::getRecoveryUnit(operationContext());
     for (auto&& index : indexes) {
         auto entry = coll.getCollectionPtr()->getIndexCatalog()->findIndexByName(
             operationContext(), index.getIndexName(), IndexCatalog::InclusionPolicy::kUnfinished);
         ASSERT_TRUE(entry);
         EXPECT_FALSE(entry->isReady());
 
-        auto& engine = *operationContext()->getServiceContext()->getStorageEngine()->getEngine();
-        auto& ru = *shard_role_details::getRecoveryUnit(operationContext());
         EXPECT_TRUE(engine.hasIdent(ru, index.indexIdent));
         EXPECT_TRUE(engine.hasIdent(ru, *index.sorterIdent));
         EXPECT_TRUE(engine.hasIdent(ru, *index.sideWritesIdent));
         EXPECT_TRUE(engine.hasIdent(ru, *index.skippedRecordsIdent));
         EXPECT_TRUE(engine.hasIdent(ru, *index.constraintViolationsIdent));
     }
+    EXPECT_TRUE(engine.hasIdent(ru, indexBuildIdent));
 
     ASSERT_TRUE(opObserver().lastStartArgs);
     auto& args = *opObserver().lastStartArgs;
@@ -227,8 +232,11 @@ TEST_F(UtilTest, Commit) {
     multikey[1]->emplace_back();
     (*multikey[1])[0].insert(0);
 
-    ASSERT_OK(start(operationContext(), ns.dbName(), collUUID, buildUUID, indexes));
-    ASSERT_OK(commit(operationContext(), ns.dbName(), collUUID, buildUUID, indexes, multikey));
+    const auto indexBuildIdent = ident::generateNewIndexBuildIdent(buildUUID);
+    ASSERT_OK(
+        start(operationContext(), ns.dbName(), collUUID, buildUUID, indexes, indexBuildIdent));
+    ASSERT_OK(commit(
+        operationContext(), ns.dbName(), collUUID, buildUUID, indexes, multikey, indexBuildIdent));
 
     for (auto&& index : indexes) {
         auto& engine = *operationContext()->getServiceContext()->getStorageEngine();
@@ -241,6 +249,9 @@ TEST_F(UtilTest, Commit) {
         ASSERT_OK(engine.immediatelyCompletePendingDrop(operationContext(),
                                                         *index.constraintViolationsIdent));
     }
+    ASSERT_OK(
+        operationContext()->getServiceContext()->getStorageEngine()->immediatelyCompletePendingDrop(
+            operationContext(), indexBuildIdent));
 
     auto coll = acquireCollectionMaybeLockFree(
         operationContext(),
@@ -248,6 +259,8 @@ TEST_F(UtilTest, Commit) {
                                                 {ns.dbName(), collUUID},
                                                 AcquisitionPrerequisites::OperationType::kRead));
 
+    auto& engine = *operationContext()->getServiceContext()->getStorageEngine()->getEngine();
+    auto& ru = *shard_role_details::getRecoveryUnit(operationContext());
     for (size_t i = 0; i < indexes.size(); ++i) {
         auto entry = coll.getCollectionPtr()->getIndexCatalog()->findIndexByName(
             operationContext(), indexes[i].getIndexName(), IndexCatalog::InclusionPolicy::kReady);
@@ -259,14 +272,13 @@ TEST_F(UtilTest, Commit) {
             EXPECT_FALSE(entry->isMultikey(operationContext(), coll.getCollectionPtr()));
         }
 
-        auto& engine = *operationContext()->getServiceContext()->getStorageEngine()->getEngine();
-        auto& ru = *shard_role_details::getRecoveryUnit(operationContext());
         EXPECT_TRUE(engine.hasIdent(ru, indexes[i].indexIdent));
         EXPECT_FALSE(engine.hasIdent(ru, *indexes[i].sorterIdent));
         EXPECT_FALSE(engine.hasIdent(ru, *indexes[i].sideWritesIdent));
         EXPECT_FALSE(engine.hasIdent(ru, *indexes[i].skippedRecordsIdent));
         EXPECT_FALSE(engine.hasIdent(ru, *indexes[i].constraintViolationsIdent));
     }
+    EXPECT_FALSE(engine.hasIdent(ru, indexBuildIdent));
 
     ASSERT_TRUE(opObserver().lastCommitArgs);
     auto& args = *opObserver().lastCommitArgs;
@@ -292,8 +304,11 @@ TEST_F(UtilTest, Abort) {
     multikey[1]->emplace_back();
     (*multikey[1])[0].insert(0);
 
-    ASSERT_OK(start(operationContext(), ns.dbName(), collUUID, buildUUID, indexes));
-    ASSERT_OK(abort(operationContext(), ns.dbName(), collUUID, buildUUID, indexes, cause));
+    const auto indexBuildIdent = ident::generateNewIndexBuildIdent(buildUUID);
+    ASSERT_OK(
+        start(operationContext(), ns.dbName(), collUUID, buildUUID, indexes, indexBuildIdent));
+    ASSERT_OK(abort(
+        operationContext(), ns.dbName(), collUUID, buildUUID, indexes, indexBuildIdent, cause));
 
     for (auto&& index : indexes) {
         auto& engine = *operationContext()->getServiceContext()->getStorageEngine();
@@ -306,6 +321,9 @@ TEST_F(UtilTest, Abort) {
         ASSERT_OK(engine.immediatelyCompletePendingDrop(operationContext(),
                                                         *index.constraintViolationsIdent));
     }
+    ASSERT_OK(
+        operationContext()->getServiceContext()->getStorageEngine()->immediatelyCompletePendingDrop(
+            operationContext(), indexBuildIdent));
 
     auto coll = acquireCollectionMaybeLockFree(
         operationContext(),
@@ -313,18 +331,19 @@ TEST_F(UtilTest, Abort) {
                                                 {ns.dbName(), collUUID},
                                                 AcquisitionPrerequisites::OperationType::kRead));
 
+    auto& engine = *operationContext()->getServiceContext()->getStorageEngine()->getEngine();
+    auto& ru = *shard_role_details::getRecoveryUnit(operationContext());
     for (size_t i = 0; i < indexes.size(); ++i) {
         ASSERT_FALSE(coll.getCollectionPtr()->getIndexCatalog()->findIndexByName(
             operationContext(), indexes[i].getIndexName(), IndexCatalog::InclusionPolicy::kReady));
 
-        auto& engine = *operationContext()->getServiceContext()->getStorageEngine()->getEngine();
-        auto& ru = *shard_role_details::getRecoveryUnit(operationContext());
         EXPECT_FALSE(engine.hasIdent(ru, indexes[i].indexIdent));
         EXPECT_FALSE(engine.hasIdent(ru, *indexes[i].sorterIdent));
         EXPECT_FALSE(engine.hasIdent(ru, *indexes[i].sideWritesIdent));
         EXPECT_FALSE(engine.hasIdent(ru, *indexes[i].skippedRecordsIdent));
         EXPECT_FALSE(engine.hasIdent(ru, *indexes[i].constraintViolationsIdent));
     }
+    EXPECT_FALSE(engine.hasIdent(ru, indexBuildIdent));
 
     ASSERT_TRUE(opObserver().lastAbortArgs);
     auto& args = *opObserver().lastAbortArgs;
@@ -337,6 +356,88 @@ TEST_F(UtilTest, Abort) {
     ASSERT_EQ(args.cause, cause);
     EXPECT_FALSE(args.fromMigrate);
     EXPECT_FALSE(args.isTimeseries);
+}
+
+TEST_F(UtilTest, CommitUsesCommitTimestampForTemporaryTableDrops) {
+    auto buildUUID = UUID::gen();
+    auto indexes = makeIndexes({"a"});
+    std::vector<boost::optional<MultikeyPaths>> multikey(indexes.size());
+    auto indexBuildIdent = ident::generateNewIndexBuildIdent(buildUUID);
+
+    ASSERT_OK(
+        start(operationContext(), ns.dbName(), collUUID, buildUUID, indexes, indexBuildIdent));
+
+    const Timestamp commitTs(200, 0);
+    {
+        TimestampBlock tsBlock(operationContext(), commitTs);
+        ASSERT_OK(commit(operationContext(),
+                         ns.dbName(),
+                         collUUID,
+                         buildUUID,
+                         indexes,
+                         multikey,
+                         indexBuildIdent));
+    }
+
+    auto storageEngine = operationContext()->getServiceContext()->getStorageEngine();
+    for (auto&& index : indexes) {
+        // The drop was registered at the commit timestamp. A timestamp <= commitTs should fail.
+        ASSERT_THROWS_CODE(storageEngine->dropIdentTimestamped(
+                               operationContext(), *index.sideWritesIdent, commitTs),
+                           DBException,
+                           ErrorCodes::ObjectIsBusy);
+
+        // A timestamp greater than commitTs should succeed.
+        storageEngine->dropIdentTimestamped(
+            operationContext(), *index.sideWritesIdent, Timestamp(commitTs.getSecs() + 1, 0));
+    }
+}
+
+TEST_F(UtilTest, AbortUsesCommitTimestampForTemporaryTableDrops) {
+    auto buildUUID = UUID::gen();
+    auto indexes = makeIndexes({"a"});
+    auto indexBuildIdent = ident::generateNewIndexBuildIdent(buildUUID);
+    Status cause{ErrorCodes::Error{11130402}, "abort"};
+
+    ASSERT_OK(
+        start(operationContext(), ns.dbName(), collUUID, buildUUID, indexes, indexBuildIdent));
+
+    const Timestamp commitTs(300, 0);
+    {
+        TimestampBlock tsBlock(operationContext(), commitTs);
+        ASSERT_OK(abort(
+            operationContext(), ns.dbName(), collUUID, buildUUID, indexes, indexBuildIdent, cause));
+    }
+
+    auto storageEngine = operationContext()->getServiceContext()->getStorageEngine();
+    for (auto&& index : indexes) {
+        ASSERT_THROWS_CODE(storageEngine->dropIdentTimestamped(
+                               operationContext(), *index.sideWritesIdent, commitTs),
+                           DBException,
+                           ErrorCodes::ObjectIsBusy);
+
+        storageEngine->dropIdentTimestamped(
+            operationContext(), *index.sideWritesIdent, Timestamp(commitTs.getSecs() + 1, 0));
+    }
+}
+
+TEST_F(UtilTest, AbortWithNoCommitTimestampDropsImmediately) {
+    auto buildUUID = UUID::gen();
+    auto indexes = makeIndexes({"a"});
+    auto indexBuildIdent = ident::generateNewIndexBuildIdent(buildUUID);
+    Status cause{ErrorCodes::Error{11130403}, "abort"};
+
+    ASSERT_OK(
+        start(operationContext(), ns.dbName(), collUUID, buildUUID, indexes, indexBuildIdent));
+    ASSERT_OK(abort(
+        operationContext(), ns.dbName(), collUUID, buildUUID, indexes, indexBuildIdent, cause));
+
+    auto& engine = *operationContext()->getServiceContext()->getStorageEngine();
+    for (auto&& index : indexes) {
+        // Without a commit timestamp, the drop is registered as Immediate.
+        ASSERT_OK(
+            engine.immediatelyCompletePendingDrop(operationContext(), *index.sideWritesIdent));
+    }
 }
 
 }  // namespace

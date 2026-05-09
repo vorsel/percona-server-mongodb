@@ -7,9 +7,9 @@ import "jstests/multiVersion/libs/multi_rs.js";
 import {EncryptedClient} from "jstests/fle2/libs/encrypted_client_util.js";
 import {PrefixField, SubstringField, SuffixAndPrefixField, SuffixField} from "jstests/fle2/libs/qe_text_search_util.js";
 import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 
 const dbName = "qe_text_downgrade_test";
-// TODO: SERVER-123416 test downgrade also prevented by the existence of non-preview types.
 const forcePreview = true;
 const substrField = new SubstringField(20, 2, 10, false, false, 1, forcePreview);
 const suffixField = new SuffixField(2, 5, true, false, 1, forcePreview);
@@ -17,7 +17,7 @@ const prefixField = new PrefixField(2, 5, false, true, 1, forcePreview);
 const comboField = new SuffixAndPrefixField(2, 5, 2, 5, false, false, 1, forcePreview);
 
 function testBinaryDowngrade(queryTypeConfig) {
-    jsTestLog("Testing downgrade from latest to last-lts");
+    jsTest.log.info("Testing downgrade from latest to last-lts");
     const rst = new ReplSetTest({nodes: 2});
     rst.startSet();
     rst.initiate();
@@ -41,6 +41,29 @@ function testBinaryDowngrade(queryTypeConfig) {
             },
         }),
     );
+
+    // if featureFlagQEPrefixSuffixSearch is enabled, assert we can't create suffix or prefix
+    // preview types
+    // TODO: SERVER-118594 update this once featureFlagQEPrefixSuffixSearch is default-enabled
+    if (FeatureFlagUtil.isPresentAndEnabled(edb.getMongo(), "QEPrefixSuffixSearch")) {
+        if (!(queryTypeConfig instanceof SubstringField)) {
+            assert.commandFailed(
+                client.getDB().createCollection("basic_text", {
+                    encryptedFields: {
+                        "fields": [
+                            {
+                                path: "first",
+                                bsonType: "string",
+                                queries: queryTypeConfig.createQueryTypeDescriptor(),
+                            },
+                        ],
+                    },
+                }),
+            );
+            rst.stopSet();
+            return;
+        }
+    }
 
     assert.commandWorked(
         client.createEncryptionCollection("basic_text", {
