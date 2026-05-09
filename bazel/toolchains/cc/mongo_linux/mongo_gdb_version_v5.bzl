@@ -32,6 +32,11 @@ TOOLCHAIN_MAP_V5 = {
         "sha": "8e90d3ee0d0f2fcb01823ad305c0da3a3325d2d444d72faa4b58c849b28898fe",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-debian12-e921fc32d5c23d7cdb5cf406b05bf16eb5ab8dbd.tar.gz",
     },
+    "debian13_x86_64": {
+        "platform_name": "debian13",
+        "sha": "e7c9280c0c76d713601817f40ef5f59381d7193ec3490ffb9d99c3bbdca20821",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-debian13-d02aeb1bc399436156aa04a08a2bf8158ae9852a.tar.gz",
+    },
     "rhel8_aarch64": {
         "platform_name": "rhel82-arm64",
         "sha": "e3b8f4029bdaba8cc651923f2bb1b00fa98c292661bb3b20b3844d99c83f9677",
