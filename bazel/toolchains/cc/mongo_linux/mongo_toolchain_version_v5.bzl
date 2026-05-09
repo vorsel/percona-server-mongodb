@@ -117,9 +117,14 @@ TOOLCHAIN_MAP_V5 = {
         "sha": "58c0fddd2d31b7491bc4f03de779d8eedcfcd250fe469e85cbeb37dd191cdce3",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-ubuntu2404-868b3c714c67f4f245623d2f772d0fac95d936a2.tar.gz",
     },
+    # PSMDB-2073 — Ubuntu 26.04 (Resolute) has no upstream toolchain yet; the
+    # ubuntu2404 toolchain is built against glibc 2.39 and breaks on glibc 2.41
+    # hosts (gthread/pthread ABI mismatch in libstdc++ headers). Reuse the
+    # debian13 toolchain instead — same glibc 2.41 baseline. Drop this once
+    # MongoDB upstream ships a real ubuntu2604 toolchain (matching TOOLCHAIN_ID).
     "ubuntu26_x86_64": {
-        "platform_name": "ubuntu2404",
-        "sha": "783f810e1bfac14e0afb31145af56df7457870145cf60c68546c4dcf35e8fc11",
-        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-ubuntu2404-7553752a78d885cc2f60c725bfb5cd66e4c4e02b.tar.gz",
+        "platform_name": "debian13",
+        "sha": "2e308f90980a29c911ce51ff1bb1c8537086dc227badb0cf4a89cf510e4595b6",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-debian13-d02aeb1bc399436156aa04a08a2bf8158ae9852a.tar.gz",
     },
 }
