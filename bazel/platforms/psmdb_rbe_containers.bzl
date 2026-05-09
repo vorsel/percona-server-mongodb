@@ -93,7 +93,7 @@ PSMDB_REMOTE_EXECUTION_CONTAINERS = {
     # PSMDB-2028 — Debian 13 (Trixie). First image baked from this branch
     # by hetzner-psmdb-buildbarn-runner-sandbox.
     "debian13": {
-        "container-url": "docker://docker.io/perconalab/psmdb-rbe:debian-trixie-master-a8a34b7e58e716bbce70eb5ab637e69d3b2a85a6",
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:debian-trixie-master-4513e9fa839a33f982cad446e5d1fe941c4a2d3c",
     },
     "rhel8": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-8-master-52917c227b04255a129d9b5617228c2269662871",
@@ -104,7 +104,7 @@ PSMDB_REMOTE_EXECUTION_CONTAINERS = {
     # PSMDB-1943 — Oracle Linux 10. First image baked from this branch
     # by hetzner-psmdb-buildbarn-runner-sandbox.
     "rhel10": {
-        "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-10-master-a8a34b7e58e716bbce70eb5ab637e69d3b2a85a6",
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-10-master-4513e9fa839a33f982cad446e5d1fe941c4a2d3c",
     },
     "ubuntu22": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-jammy-master-52917c227b04255a129d9b5617228c2269662871",
@@ -115,6 +115,6 @@ PSMDB_REMOTE_EXECUTION_CONTAINERS = {
     # PSMDB-2073 — Ubuntu 26.04 LTS (Resolute Raccoon). First image baked
     # from this branch by hetzner-psmdb-buildbarn-runner-sandbox.
     "ubuntu26": {
-        "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-resolute-master-a8a34b7e58e716bbce70eb5ab637e69d3b2a85a6",
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-resolute-master-4513e9fa839a33f982cad446e5d1fe941c4a2d3c",
     },
 }
