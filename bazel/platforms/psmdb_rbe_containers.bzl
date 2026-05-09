@@ -90,10 +90,10 @@ PSMDB_REMOTE_EXECUTION_CONTAINERS = {
     "debian12": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:debian-bookworm-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14",
     },
-    # PSMDB-2028 — Debian 13 (Trixie). SHA placeholder: replace once
-    # the first sandbox build pushes :debian-trixie-master-<sha>.
+    # PSMDB-2028 — Debian 13 (Trixie). First image baked from this branch
+    # by hetzner-psmdb-buildbarn-runner-sandbox.
     "debian13": {
-        "container-url": "docker://docker.io/perconalab/psmdb-rbe:debian-trixie-master-0000000000000000000000000000000000000000",
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:debian-trixie-master-a8a34b7e58e716bbce70eb5ab637e69d3b2a85a6",
     },
     "rhel8": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14",
@@ -101,10 +101,10 @@ PSMDB_REMOTE_EXECUTION_CONTAINERS = {
     "rhel9": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14",
     },
-    # PSMDB-1943 — Oracle Linux 10. SHA placeholder: replace once
-    # the first sandbox build pushes :oraclelinux-10-master-<sha>.
+    # PSMDB-1943 — Oracle Linux 10. First image baked from this branch
+    # by hetzner-psmdb-buildbarn-runner-sandbox.
     "rhel10": {
-        "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-10-master-0000000000000000000000000000000000000000",
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-10-master-a8a34b7e58e716bbce70eb5ab637e69d3b2a85a6",
     },
     "ubuntu22": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14",
@@ -112,10 +112,9 @@ PSMDB_REMOTE_EXECUTION_CONTAINERS = {
     "ubuntu24": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.0-4f903c5eb2b598da55a69bbc70f786238302aa14",
     },
-    # PSMDB-2073 — Ubuntu 26.04 LTS (Resolute Raccoon). SHA placeholder:
-    # replace once the first sandbox build pushes
-    # :ubuntu-resolute-master-<sha>.
+    # PSMDB-2073 — Ubuntu 26.04 LTS (Resolute Raccoon). First image baked
+    # from this branch by hetzner-psmdb-buildbarn-runner-sandbox.
     "ubuntu26": {
-        "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-resolute-master-0000000000000000000000000000000000000000",
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-resolute-master-a8a34b7e58e716bbce70eb5ab637e69d3b2a85a6",
     },
 }
