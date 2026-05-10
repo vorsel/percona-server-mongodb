@@ -32,6 +32,11 @@ TOOLCHAIN_MAP_V4 = {
         "sha": "40e94b657eddbe3c8cf89678e51c1a6f34d4a8cd73335962aa909ebed62270e3",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v4_toolchain-debian12-84bea98f485ef8c1af3f0612c56423fac4ea6256.tar.gz",
     },
+    "debian13_x86_64": {
+        "platform_name": "debian13",
+        "sha": "a5f517ce1251fbc37590f3d9f816ac3260adc0b8dbd28d735070e10408d85632",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v4_toolchain-debian13-7553752a78d885cc2f60c725bfb5cd66e4c4e02b.tar.gz",
+    },
     "rhel8_aarch64": {
         "platform_name": "rhel82-arm64",
         "sha": "1c5ffab1382ee37c6f3b64ee9b908b56f7fafb5ee413068a312cbae6c9ddbb47",
@@ -72,6 +77,16 @@ TOOLCHAIN_MAP_V4 = {
         "sha": "dbb449ece5981817e60f22fc72ac467991b17db6316bfeec655131d784181ef3",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v4_toolchain-rhel90-84bea98f485ef8c1af3f0612c56423fac4ea6256.tar.gz",
     },
+    "rhel10_aarch64": {
+        "platform_name": "rhel10",
+        "sha": "9167b2311959ecc1447cc87301438294c64da59ab145c02552931bb148247123",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v4_toolchain-rhel10-arm64-7553752a78d885cc2f60c725bfb5cd66e4c4e02b.tar.gz",
+    },
+    "rhel10_x86_64": {
+        "platform_name": "rhel10",
+        "sha": "9910edcec9bc2098e00f15831a8c18f17a6a84b7f0f04f37d44e2d81c0daa020",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v4_toolchain-rhel10-7553752a78d885cc2f60c725bfb5cd66e4c4e02b.tar.gz",
+    },
     "suse15_x86_64": {
         "platform_name": "suse15",
         "sha": "9464edde3999d4456cbcea0085c52b027547c3d8b52c17a408fe191ae26dabd5",
@@ -111,5 +126,15 @@ TOOLCHAIN_MAP_V4 = {
         "platform_name": "ubuntu2404",
         "sha": "fdd1930124357b255e60dbace9fcbe667d1042d573d50727633d26ed26ad973c",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v4_toolchain-ubuntu2404-84bea98f485ef8c1af3f0612c56423fac4ea6256.tar.gz",
+    },
+    "ubuntu26_aarch64": {
+        "platform_name": "ubuntu2404-arm64",
+        "sha": "f928f901239e600c0db65588f9d810b156a612edfbfbdcdf01dd5b531d7e3b7d",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v4_toolchain-ubuntu2404-arm64-7553752a78d885cc2f60c725bfb5cd66e4c4e02b.tar.gz",
+    },
+    "ubuntu26_x86_64": {
+        "platform_name": "debian13",
+        "sha": "a5f517ce1251fbc37590f3d9f816ac3260adc0b8dbd28d735070e10408d85632",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v4_toolchain-debian13-7553752a78d885cc2f60c725bfb5cd66e4c4e02b.tar.gz",
     },
 }
