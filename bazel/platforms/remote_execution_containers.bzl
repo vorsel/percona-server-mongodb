@@ -37,6 +37,11 @@ REMOTE_EXECUTION_CONTAINERS = {
         "dockerfile": "bazel/remote_execution_container/rhel89/Dockerfile",
         "web-url": "https://quay.io/repository/mongodb/bazel-remote-execution/manifest/sha256:f80dfd1e9a9d1ea28225b6ecb8049e5789cc365176a0766422771d58dda3708f",
     },
+    "rhel10": {
+        "container-url": "docker://quay.io/mongodb/bazel-remote-execution@sha256:b027821747bc93162db8757c86ef1747c7c464dd3c2a2392bb3005565d793811",
+        "dockerfile": "bazel/remote_execution_container/rhel93/Dockerfile",
+        "web-url": "https://quay.io/repository/mongodb/bazel-remote-execution/manifest/sha256:b027821747bc93162db8757c86ef1747c7c464dd3c2a2392bb3005565d793811",
+    },
     "rhel9": {
         "container-url": "docker://quay.io/mongodb/bazel-remote-execution@sha256:89dbd46e1e9540b8689bf5431a78afe0cc15906b1ba0d6babf00ee59aba574b3",
         "dockerfile": "bazel/remote_execution_container/rhel93/Dockerfile",
