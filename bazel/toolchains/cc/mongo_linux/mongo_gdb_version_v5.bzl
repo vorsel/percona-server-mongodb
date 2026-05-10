@@ -77,6 +77,22 @@ TOOLCHAIN_MAP_V5 = {
         "sha": "d04680a41b5b804a22f5880bf5458b3c13e0fca2863afc0529a5bf26ab74938a",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-rhel90-84bea98f485ef8c1af3f0612c56423fac4ea6256.tar.gz",
     },
+    # PSMDB-1943 — v8.0 baseline 84bea98f never published rhel10 GDB; reuse
+    # master patch ID e921fc32 (same mix-ID strategy as debian13 / ubuntu26
+    # entries above). `_gdb_download` would otherwise emit a no-op BUILD
+    # file with no `:gdb` target, and downstream `*_with_debug` targets
+    # (e.g. //src/mongo/db/query/search/mongotmock:mongotmock_with_debug)
+    # would fail analysis with `no such target @@gdb//:gdb`.
+    "rhel10_x86_64": {
+        "platform_name": "rhel10",
+        "sha": "4f8bf9a3ce2454a6ce2636e45746dc2a25de139413fe2e60c28aac9b44b07df9",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-rhel10-e921fc32d5c23d7cdb5cf406b05bf16eb5ab8dbd.tar.gz",
+    },
+    "rhel10_aarch64": {
+        "platform_name": "rhel10",
+        "sha": "52869b742dc8a3550d9656187a4c0e8f95fe8bea542949c25717557cbfbafd42",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-rhel10-arm64-e921fc32d5c23d7cdb5cf406b05bf16eb5ab8dbd.tar.gz",
+    },
     "suse15_x86_64": {
         "platform_name": "suse15",
         "sha": "9e9491110957e301c2612f4550975319f9b13b8544ba1871d413f8924102a28e",
