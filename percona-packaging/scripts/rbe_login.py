@@ -70,7 +70,9 @@ def _fmt_expiry(expires_at: int) -> str:
 def _cmd_status() -> int:
     s = rbe_auth.status()
     if not s.get("present"):
-        print("rbe-auth: no cached token (run `percona-packaging/scripts/rbe_login.py` to authenticate).")
+        print(
+            "rbe-auth: no cached token (run `percona-packaging/scripts/rbe_login.py` to authenticate)."
+        )
         return 1
     print(f"rbe-auth: token cache    : {rbe_auth.CACHE_PATH}")
     print(f"rbe-auth: issuer         : {s.get('issuer', '')}")
@@ -78,7 +80,9 @@ def _cmd_status() -> int:
     print(f"rbe-auth: audience       : {s.get('audience', '')}")
     print(f"rbe-auth: groups         : {', '.join(s.get('groups') or []) or '(none)'}")
     print(f"rbe-auth: expires        : {_fmt_expiry(s.get('expires_at', 0))}")
-    print(f"rbe-auth: usable now     : {'yes' if s.get('fresh') else 'no — refresh / re-login required'}")
+    print(
+        f"rbe-auth: usable now     : {'yes' if s.get('fresh') else 'no — refresh / re-login required'}"
+    )
     return 0 if s.get("fresh") else 2
 
 
@@ -123,8 +127,14 @@ def main(argv=None) -> int:
         description="Authenticate against the PSMDB Bazel RBE buildfarm (OIDC).",
     )
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--status", action="store_true", help="show cache state without contacting the server")
-    group.add_argument("--logout", action="store_true", help="delete the cached token file")
+    group.add_argument(
+        "--status",
+        action="store_true",
+        help="show cache state without contacting the server",
+    )
+    group.add_argument(
+        "--logout", action="store_true", help="delete the cached token file"
+    )
     group.add_argument(
         "--print-token",
         action="store_true",

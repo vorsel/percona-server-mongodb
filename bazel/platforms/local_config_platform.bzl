@@ -89,9 +89,7 @@ def _setup_local_config_platform(ctx):
         # maintenance procedure.
         psmdb_entry = PSMDB_REMOTE_EXECUTION_CONTAINERS.get(distro)
         container_url = (
-            psmdb_entry["container-url"]
-            if psmdb_entry
-            else REMOTE_EXECUTION_CONTAINERS[distro]["container-url"]
+            psmdb_entry["container-url"] if psmdb_entry else REMOTE_EXECUTION_CONTAINERS[distro]["container-url"]
         )
         web_url = REMOTE_EXECUTION_CONTAINERS[distro]["web-url"]
         dockerfile = REMOTE_EXECUTION_CONTAINERS[distro]["dockerfile"]

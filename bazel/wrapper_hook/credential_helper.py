@@ -182,7 +182,9 @@ def _jwt_exp(jwt: str) -> int:
         return 0
     pad = "=" * (-len(payload_b64) % 4)
     try:
-        return int(json.loads(base64.urlsafe_b64decode(payload_b64 + pad)).get("exp", 0))
+        return int(
+            json.loads(base64.urlsafe_b64decode(payload_b64 + pad)).get("exp", 0)
+        )
     except (ValueError, json.JSONDecodeError, TypeError):
         return 0
 
@@ -237,7 +239,9 @@ def _post_form(url: str, form: dict) -> dict:
     )
     ctx = ssl.create_default_context()
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(
+            req, context=ctx, timeout=HTTP_TIMEOUT_SECONDS
+        ) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         try:
@@ -395,7 +399,9 @@ def _from_jenkins_env() -> str | None:
         f"exchanging Jenkins token (subject_source={jwt_source}) at "
         f"{issuer}/token (aud={audience}, connector_id={connector_id})"
     )
-    new_token = _exchange_with_retry(jenkins, jwt_source, issuer, audience, connector_id)
+    new_token = _exchange_with_retry(
+        jenkins, jwt_source, issuer, audience, connector_id
+    )
     _save_ci_cache({"id_token": new_token, "fetched_at": int(time.time())})
     return new_token
 
@@ -442,7 +448,9 @@ def _read_request() -> dict:
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        raise rbe_auth.RbeAuthError(f"could not parse Bazel CredentialHelper request: {e}")
+        raise rbe_auth.RbeAuthError(
+            f"could not parse Bazel CredentialHelper request: {e}"
+        )
 
 
 def _emit(token: str) -> None:

@@ -190,7 +190,9 @@ def _post_form(url: str, form: dict) -> dict:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, context=_ssl_context(), timeout=HTTP_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(
+            req, context=_ssl_context(), timeout=HTTP_TIMEOUT_SECONDS
+        ) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         # Dex returns OAuth-format JSON errors (e.g. invalid_grant,
@@ -227,7 +229,9 @@ def _start_device_code() -> dict:
     )
 
 
-def _poll_device_token(device_code: str, interval: int, expires_in: int, *, status_stream) -> dict:
+def _poll_device_token(
+    device_code: str, interval: int, expires_in: int, *, status_stream
+) -> dict:
     """Poll /token with grant_type=device_code until success/denial/timeout.
 
     Honours RFC 8628 polling rules:
@@ -267,14 +271,20 @@ def _poll_device_token(device_code: str, interval: int, expires_in: int, *, stat
                 "`percona-packaging/scripts/rbe_login.py` to try again"
             )
         if err == "access_denied":
-            raise RbeAuthError("login denied — your GitHub account is not in an allowed Percona team")
-        raise RbeAuthError(f"OIDC token endpoint error: {err}: {resp.get('error_description', '')}")
+            raise RbeAuthError(
+                "login denied — your GitHub account is not in an allowed Percona team"
+            )
+        raise RbeAuthError(
+            f"OIDC token endpoint error: {err}: {resp.get('error_description', '')}"
+        )
 
 
 # ---------------------------------------------------------------------
 # UX.
 # ---------------------------------------------------------------------
-def _print_login_prompt(verification_uri_complete: str, user_code: str, expires_in: int, *, stream) -> None:
+def _print_login_prompt(
+    verification_uri_complete: str, user_code: str, expires_in: int, *, stream
+) -> None:
     """Single mid-build prompt — no pre-warning of upcoming expiry.
 
     Per design (PSMDB-2043 discussion): humans only see the prompt when
@@ -332,7 +342,9 @@ def _do_device_code_login(*, status_stream) -> dict:
     """
     start = _start_device_code()
     if "error" in start:
-        raise RbeAuthError(f"/device/code error: {start['error']}: {start.get('error_description', '')}")
+        raise RbeAuthError(
+            f"/device/code error: {start['error']}: {start.get('error_description', '')}"
+        )
     _print_login_prompt(
         verification_uri_complete=start["verification_uri_complete"],
         user_code=start["user_code"],
