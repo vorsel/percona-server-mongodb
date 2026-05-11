@@ -28,6 +28,21 @@ def append_args(args, new_args):
         return args + new_args
 
 
+def _has_config_value(args, name: str) -> bool:
+    """True iff `--config=<name>` or `--config <name>` is present in args.
+
+    Bazel accepts both forms; covering only `--config=<name>` lets the
+    space-separated form slip past guards that gate RBE wiring (see
+    PSMDB-2034 review on PR #1845).
+    """
+    for i, a in enumerate(args):
+        if a == f"--config={name}":
+            return True
+        if a == "--config" and i + 1 < len(args) and args[i + 1] == name:
+            return True
+    return False
+
+
 def _supports_color(stream):
     if os.name == "nt":
         return False
@@ -152,7 +167,7 @@ def main():
             # line in .bazelrc.psmdb plus the explicit
             # `common:psmdb_buildfarm --//bazel/config:build_enterprise=False`
             # added in the RBE stanza, so dropping it here is safe.
-            if not any(a.startswith("--config=psmdb_buildfarm") for a in args):
+            if not _has_config_value(args, "psmdb_buildfarm"):
                 print(
                     f"{enterprise_mod.relative_to(REPO_ROOT).as_posix()} missing, defaulting to local non-enterprise build (--config=local --//bazel/config:build_enterprise=False). Add the directory to not automatically add these options."
                 )
@@ -213,20 +228,23 @@ def main():
         # the pre-flight entirely — they don't need the local cache,
         # and forcing a Device Code flow on a non-TTY runner that
         # *does* have a valid CI token would just fail spuriously.
-        if any(a.startswith("--config=psmdb_buildfarm") for a in args) or any(
-            a == "--config" and i + 1 < len(args) and args[i + 1] == "psmdb_buildfarm"
-            for i, a in enumerate(args)
-        ):
+        if _has_config_value(args, "psmdb_buildfarm"):
             from bazel.wrapper_hook import rbe_auth
 
+            # PSMDB_RBE_JENKINS_TOKEN_FILE is the preferred CI subject-token
+            # source (sidecar-rotated path, see credential_helper.py). Treat
+            # it as a CI-token presence signal too, so pre-flight is skipped
+            # whenever credential_helper can authenticate non-interactively.
             ci_token_present = bool(
                 os.environ.get("PSMDB_RBE_DEX_TOKEN", "").strip()
                 or os.environ.get("PSMDB_RBE_JENKINS_TOKEN", "").strip()
+                or os.environ.get("PSMDB_RBE_JENKINS_TOKEN_FILE", "").strip()
             )
             if ci_token_present:
                 wrapper_debug(
-                    "rbe_auth: PSMDB_RBE_DEX_TOKEN or PSMDB_RBE_JENKINS_TOKEN set; "
-                    "skipping pre-flight (credential_helper will handle CI auth)"
+                    "rbe_auth: PSMDB_RBE_DEX_TOKEN / PSMDB_RBE_JENKINS_TOKEN / "
+                    "PSMDB_RBE_JENKINS_TOKEN_FILE set; skipping pre-flight "
+                    "(credential_helper will handle CI auth)"
                 )
             else:
                 wrapper_debug("rbe_auth: --config=psmdb_buildfarm detected, priming OIDC cache")
