@@ -93,6 +93,7 @@ plus a sibling import of bazel.wrapper_hook.rbe_auth.
 from __future__ import annotations
 
 import base64
+import binascii
 import datetime
 import errno
 import json
@@ -101,6 +102,7 @@ import pathlib
 import socket
 import ssl
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -185,7 +187,7 @@ def _jwt_exp(jwt: str) -> int:
         return int(
             json.loads(base64.urlsafe_b64decode(payload_b64 + pad)).get("exp", 0)
         )
-    except (ValueError, json.JSONDecodeError, TypeError):
+    except (ValueError, json.JSONDecodeError, TypeError, binascii.Error):
         return 0
 
 
@@ -209,19 +211,27 @@ def _load_ci_cache() -> dict:
 
 
 def _save_ci_cache(data: dict) -> None:
+    # Per-call unique temp file + os.replace — Bazel can spawn the
+    # credential helper in parallel for multiple gRPC channels in the
+    # same build, and a fixed-name temp would let one helper rename a
+    # half-written file produced by another into the live cache slot.
     CI_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CI_CACHE_PATH.with_suffix(CI_CACHE_PATH.suffix + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=CI_CACHE_PATH.name + ".",
+        suffix=".tmp",
+        dir=str(CI_CACHE_PATH.parent),
+    )
     try:
+        os.chmod(tmp_path, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, sort_keys=True)
     except Exception:
         try:
-            tmp.unlink()
+            os.unlink(tmp_path)
         except OSError:
             pass
         raise
-    os.replace(str(tmp), str(CI_CACHE_PATH))
+    os.replace(tmp_path, str(CI_CACHE_PATH))
 
 
 # --------------------------------------------------------------------
@@ -271,7 +281,8 @@ def _exchange_jenkins_token(
     err = resp.get("error")
     if err:
         raise rbe_auth.RbeAuthError(
-            f"Dex token-exchange refused: {err}: {resp.get('error_description', '')}"
+            f"Dex token-exchange refused: {err}: {resp.get('error_description', '')}",
+            error_code=err,
         )
     # Dex returns the new id_token in `access_token` for token-exchange
     # responses (per RFC 8693 §2.2.1) — `id_token` is also populated for
@@ -360,12 +371,15 @@ def _exchange_with_retry(
     except rbe_auth.RbeAuthError as e:
         if jwt_source != "file":
             raise
-        msg = str(e)
-        if not any(code in msg for code in DEX_RETRYABLE_ERRORS):
+        # Decide retryability from the structured Dex `error` code carried
+        # on the exception, not from substring-matching the human message.
+        # Wording changes (Dex upgrades, locale, etc.) shouldn't break
+        # retries, and unrelated text shouldn't accidentally match.
+        if e.error_code not in DEX_RETRYABLE_ERRORS:
             raise
         _debug(
-            f"first exchange failed ({msg}); re-reading sidecar file and "
-            "retrying once"
+            f"first exchange failed ({e.error_code}); re-reading sidecar "
+            "file and retrying once"
         )
         fresh, fresh_source = _read_jenkins_jwt()
         if not fresh or fresh_source != "file":

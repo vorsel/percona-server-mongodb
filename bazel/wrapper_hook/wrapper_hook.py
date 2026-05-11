@@ -87,14 +87,20 @@ def main():
         ):
             from bazel.wrapper_hook import rbe_auth
 
+            # PSMDB_RBE_JENKINS_TOKEN_FILE is the preferred CI subject-token
+            # source (sidecar-rotated path, see credential_helper.py). Treat
+            # it as a CI-token presence signal too, so pre-flight is skipped
+            # whenever credential_helper can authenticate non-interactively.
             ci_token_present = bool(
                 os.environ.get("PSMDB_RBE_DEX_TOKEN", "").strip()
                 or os.environ.get("PSMDB_RBE_JENKINS_TOKEN", "").strip()
+                or os.environ.get("PSMDB_RBE_JENKINS_TOKEN_FILE", "").strip()
             )
             if ci_token_present:
                 wrapper_debug(
-                    "rbe_auth: PSMDB_RBE_DEX_TOKEN or PSMDB_RBE_JENKINS_TOKEN set; "
-                    "skipping pre-flight (credential_helper will handle CI auth)"
+                    "rbe_auth: PSMDB_RBE_DEX_TOKEN / PSMDB_RBE_JENKINS_TOKEN / "
+                    "PSMDB_RBE_JENKINS_TOKEN_FILE set; skipping pre-flight "
+                    "(credential_helper will handle CI auth)"
                 )
             else:
                 wrapper_debug(

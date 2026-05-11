@@ -31,6 +31,7 @@ never touch the RBE buildfarm never trigger this.
 """
 
 import base64
+import binascii
 import errno
 import json
 import os
@@ -38,6 +39,7 @@ import pathlib
 import socket
 import ssl
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -75,7 +77,17 @@ HTTP_TIMEOUT_SECONDS = 15
 
 
 class RbeAuthError(RuntimeError):
-    """Anything that prevents us from getting a usable id_token."""
+    """Anything that prevents us from getting a usable id_token.
+
+    Carries an optional `error_code` attribute (e.g. Dex's structured
+    `error` field from a /token response) so callers can make retry
+    decisions on the code rather than substring-matching the human
+    message — which is brittle to wording changes.
+    """
+
+    def __init__(self, *args, error_code: str | None = None):
+        super().__init__(*args)
+        self.error_code = error_code
 
 
 class RbeAuthRequired(RbeAuthError):
@@ -119,7 +131,7 @@ def _decode_jwt_payload(jwt: str) -> dict:
     pad = "=" * (-len(payload_b64) % 4)
     try:
         return json.loads(base64.urlsafe_b64decode(payload_b64 + pad))
-    except (ValueError, json.JSONDecodeError) as e:
+    except (ValueError, json.JSONDecodeError, binascii.Error) as e:
         raise RbeAuthError(f"could not decode JWT payload: {e}")
 
 
@@ -150,26 +162,30 @@ def _load_cache() -> dict:
 def _save_cache(data: dict) -> None:
     """Atomic write with mode 0600.
 
-    `os.rename` is atomic on POSIX so a concurrent reader either sees
-    the old file or the new one, never a half-written one. Two
-    concurrent writers would both succeed; one of their token sets
-    sticks. That's fine — refresh tokens are reusable until first use,
-    and even if both writers exchanged independently the second one
-    just writes a slightly fresher copy.
+    Uses a per-call unique temp file (`tempfile.mkstemp` in the cache
+    dir) + `os.replace` so two concurrent writers can't race on the
+    same fixed-name temp path: that would let one process rename a
+    half-written file produced by the other into the live cache slot.
+    `os.replace` is atomic on POSIX, so a concurrent reader still sees
+    either the old file or one new one, never a torn one.
     """
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CACHE_PATH.with_suffix(CACHE_PATH.suffix + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=CACHE_PATH.name + ".",
+        suffix=".tmp",
+        dir=str(CACHE_PATH.parent),
+    )
     try:
+        os.chmod(tmp_path, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, sort_keys=True)
     except Exception:
         try:
-            tmp.unlink()
+            os.unlink(tmp_path)
         except OSError:
             pass
         raise
-    os.replace(str(tmp), str(CACHE_PATH))
+    os.replace(tmp_path, str(CACHE_PATH))
 
 
 # ---------------------------------------------------------------------
