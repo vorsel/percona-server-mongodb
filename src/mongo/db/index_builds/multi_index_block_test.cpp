@@ -32,6 +32,7 @@
 #include "mongo/base/error_codes.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index_builds/multi_index_block_gen.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/op_observer/op_observer_noop.h"
 #include "mongo/db/operation_context.h"
@@ -54,6 +55,7 @@
 #include "mongo/otel/metrics/metrics_test_util.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
 
 #include <boost/optional/optional.hpp>
@@ -286,8 +288,7 @@ TEST_F(MultiIndexBlockTest, AbortWithoutCleanupAfterInsertingSingleDocument) {
         {},
         /*saveCursorBeforeWrite*/ []() {},
         /*restoreCursorAfterWrite*/ []() {}));
-    auto isResumable = false;
-    indexer->abortWithoutCleanup(operationContext(), coll.get(), isResumable);
+    indexer->abortWithoutCleanup(operationContext(), coll.get());
 }
 
 TEST_F(MultiIndexBlockTest, PersistResumeStateOnAbortWithoutCleanup) {
@@ -314,8 +315,8 @@ TEST_F(MultiIndexBlockTest, PersistResumeStateOnAbortWithoutCleanup) {
                                                    boost::none));
     ASSERT_EQUALS(1U, specs.size());
 
-    auto isResumable = true;
-    indexer->abortWithoutCleanup(operationContext(), coll.get(), isResumable);
+    indexer->setIsResumable(true);
+    indexer->abortWithoutCleanup(operationContext(), coll.get());
     auto indexBuildIdent = findPersistedResumeState(
         operationContext(), buildUUID, IndexBuildPhaseEnum::kInitialized, autoColl->uuid());
     ASSERT_TRUE(indexBuildIdent);
@@ -347,8 +348,8 @@ TEST_F(MultiIndexBlockTest, PersistResumeStateOnRequestAndCommit) {
                                                    boost::none));
     ASSERT_EQUALS(1U, specs.size());
 
-    auto isResumable = true;
-    indexer->persistResumeState(operationContext(), coll.get(), isResumable);
+    indexer->setIsResumable(true);
+    indexer->persistResumeState(operationContext(), coll.get());
     auto indexBuildIdent = findPersistedResumeState(
         operationContext(), buildUUID, IndexBuildPhaseEnum::kInitialized, autoColl->uuid());
     ASSERT_TRUE(indexBuildIdent);
@@ -390,13 +391,13 @@ TEST_F(MultiIndexBlockTest, PersistResumeStateOnRequestAndOnAbort) {
                                                    boost::none));
     ASSERT_EQUALS(1U, specs.size());
 
-    auto isResumable = true;
-    indexer->persistResumeState(operationContext(), coll.get(), isResumable);
+    indexer->setIsResumable(true);
+    indexer->persistResumeState(operationContext(), coll.get());
     auto indexBuildIdent = findPersistedResumeState(
         operationContext(), buildUUID, IndexBuildPhaseEnum::kInitialized, autoColl->uuid());
     ASSERT_TRUE(indexBuildIdent);
 
-    indexer->abortWithoutCleanup(operationContext(), coll.get(), isResumable);
+    indexer->abortWithoutCleanup(operationContext(), coll.get());
     indexBuildIdent = findPersistedResumeState(operationContext(), buildUUID);
     ASSERT_TRUE(indexBuildIdent);
 
@@ -970,8 +971,8 @@ TEST_F(MultiIndexBlockTest, AbortWithoutCleanupDoesNotDropTables) {
 
     auto sideWritesIdent = *indexBuildInfo.sideWritesIdent;
 
-    auto isResumable = true;
-    indexer->abortWithoutCleanup(operationContext(), coll.get(), isResumable);
+    indexer->setIsResumable(true);
+    indexer->abortWithoutCleanup(operationContext(), coll.get());
 
     // After abortWithoutCleanup, the ident should still exist and not be drop-pending.
     ASSERT_TRUE(storageEngine->getEngine()->hasIdent(
@@ -1268,7 +1269,7 @@ TEST_F(MultiIndexBlockTest, PersistResumeStateUsesContainerWrites) {
     ASSERT_TRUE(storageEngine->getEngine()->hasIdent(
         *shard_role_details::getRecoveryUnit(operationContext()), handle.indexBuildIdent));
 
-    indexer->persistResumeState(operationContext(), coll.get(), /*isResumable=*/true);
+    indexer->persistResumeState(operationContext(), coll.get());
 
     // Exactly one container insert against the resume-state ident, at fixed key 0.
     ASSERT_EQUALS(1U, observer.countInsertsForIdent(handle.indexBuildIdent));
@@ -1316,8 +1317,8 @@ TEST_F(MultiIndexBlockTest, PersistResumeStateOverwritesPriorState) {
     auto handle =
         setUpKReplicatePrimaryDrivenBuild(operationContext(), indexer, autoColl, coll, getNSS());
 
-    indexer->persistResumeState(operationContext(), coll.get(), /*isResumable=*/true);
-    indexer->persistResumeState(operationContext(), coll.get(), /*isResumable=*/true);
+    indexer->persistResumeState(operationContext(), coll.get());
+    indexer->persistResumeState(operationContext(), coll.get());
 
     // The first write inserts at key 0; the second sees an existing key and updates in place.
     ASSERT_EQUALS(1U, observer.countInsertsForIdent(handle.indexBuildIdent));
@@ -1361,7 +1362,7 @@ TEST_F(MultiIndexBlockTest, AbortWithoutCleanupUsesContainerWrites) {
     auto handle =
         setUpKReplicatePrimaryDrivenBuild(operationContext(), indexer, autoColl, coll, getNSS());
 
-    indexer->abortWithoutCleanup(operationContext(), coll.get(), /*isResumable=*/true);
+    indexer->abortWithoutCleanup(operationContext(), coll.get());
 
     ASSERT_EQUALS(1U, observer.countInsertsForIdent(handle.indexBuildIdent));
 
@@ -1395,8 +1396,9 @@ TEST_F(MultiIndexBlockTest, PersistResumeStateNoOpWhenNotResumable) {
 
     auto handle =
         setUpKReplicatePrimaryDrivenBuild(operationContext(), indexer, autoColl, coll, getNSS());
+    indexer->setIsResumable(false);
 
-    indexer->persistResumeState(operationContext(), coll.get(), /*isResumable=*/false);
+    indexer->persistResumeState(operationContext(), coll.get());
 
     ASSERT_EQUALS(0U, observer.countInsertsForIdent(handle.indexBuildIdent));
     ASSERT_FALSE(readReplicatedResumeState(operationContext(), handle.buildUUID));
@@ -1418,6 +1420,7 @@ TEST_F(MultiIndexBlockTest, HybridBuildDoesNotUseContainerWrites) {
     auto indexer = getIndexer();
     const auto buildUUID = UUID::gen();
     indexer->setBuildUUID(buildUUID);
+    indexer->setIsResumable(true);
     // No setContainerWriteBehavior — defaults to kDoNotReplicate (hybrid).
 
     AutoGetCollection autoColl(operationContext(), getNSS(), MODE_X);
@@ -1438,12 +1441,142 @@ TEST_F(MultiIndexBlockTest, HybridBuildDoesNotUseContainerWrites) {
                             MultiIndexBlock::InitMode::SteadyState,
                             boost::none));
 
-    indexer->persistResumeState(operationContext(), coll.get(), /*isResumable=*/true);
+    indexer->persistResumeState(operationContext(), coll.get());
 
     // Hybrid builds use the regular RecordStore path, so the OpObserver sees no container ops.
     ASSERT_EQUALS(0U, observer.intInserts.size());
 
     indexer->abortIndexBuild(operationContext(), coll, MultiIndexBlock::kNoopOnCleanUpFn);
 }
+
+TEST_F(MultiIndexBlockTest, WriteStateToContainerOnSpillWhenResumable) {
+    RAIIServerParameterControllerForTest ffContainerWrites{"featureFlagContainerWrites", true};
+    RAIIServerParameterControllerForTest ffPDIB{"featureFlagPrimaryDrivenIndexBuilds", true};
+    RAIIServerParameterControllerForTest ffResumable{"featureFlagResumablePrimaryDrivenIndexBuilds",
+                                                     true};
+
+    // Lower the per-build memory limit to 0.5 MB.
+    auto prevMemLimitMB = maxIndexBuildMemoryUsageMegabytes.swap(0.5);
+    ON_BLOCK_EXIT([prevMemLimitMB] { maxIndexBuildMemoryUsageMegabytes.store(prevMemLimitMB); });
+
+    promoteMockReplCoordToPrimary(getServiceContext());
+    auto& observer = installResumeStateContainerObserver(operationContext());
+
+    auto& indexer = *getIndexer();
+    AutoGetCollection autoColl(operationContext(), getNSS(), MODE_X);
+    CollectionWriter coll(operationContext(), autoColl);
+
+    auto buildUUID = UUID::gen();
+    indexer.setBuildUUID(buildUUID);
+    indexer.setIndexBuildMethod(IndexBuildMethodEnum::kPrimaryDriven);
+    indexer.setContainerWriteBehavior(ContainerWriteBehavior::kReplicate);
+    indexer.setIsResumable(true);
+
+    // Insert enough indexable data to exceed the 1 MB memory limit. 20 documents with 64 KB strings
+    // puts us comfortably above the limit.
+    WriteUnitOfWork wuow(operationContext());
+    std::string val(64 * 1024, 'a');
+    for (auto i = 0; i < 20; ++i) {
+        ASSERT_OK(Helpers::insert(operationContext(), *autoColl, BSON("_id" << i << "a" << val)));
+    }
+    wuow.commit();
+
+    auto& engine = *operationContext()->getServiceContext()->getStorageEngine();
+    auto indexBuildInfo =
+        IndexBuildInfo(BSON("key" << BSON("a" << 1) << "name"
+                                  << "a_1"
+                                  << "v" << static_cast<int>(IndexConfig::kLatestIndexVersion)),
+                       "index-1",
+                       engine);
+
+    ASSERT_OK(indexer.init(operationContext(),
+                           coll,
+                           {indexBuildInfo},
+                           MultiIndexBlock::kNoopOnInitFn,
+                           MultiIndexBlock::InitMode::SteadyState,
+                           boost::none));
+
+    auto indexBuildIdent = ident::generateNewIndexBuildIdent(buildUUID);
+    ASSERT_TRUE(engine.getEngine()->hasIdent(
+        *shard_role_details::getRecoveryUnit(operationContext()), indexBuildIdent));
+
+    // Insert the data into the sorter. The first spill will trigger an insert into the index build
+    // ident, and subsequent spills will trigger updates to the index build ident.
+    ASSERT_OK(indexer.insertAllDocumentsInCollection(operationContext(), getNSS()));
+    EXPECT_EQ(observer.countInsertsForIdent(indexBuildIdent), 1);
+    EXPECT_GE(observer.countUpdatesForIdent(indexBuildIdent), 1);
+
+    auto persisted = readReplicatedResumeState(operationContext(), buildUUID);
+    ASSERT_TRUE(persisted.has_value());
+    auto resumeInfo =
+        ResumeIndexInfo::parse(*persisted, IDLParserContext("WriteStateToContainerOnSpill"));
+    EXPECT_EQ(resumeInfo.getBuildUUID(), buildUUID);
+    EXPECT_EQ(resumeInfo.getCollectionUUID(), autoColl->uuid());
+    EXPECT_EQ(resumeInfo.getIndexes().size(), 1);
+    EXPECT_EQ(resumeInfo.getIndexes()[0].getSpec()["name"].String(), "a_1");
+
+    indexer.abortIndexBuild(operationContext(), coll, MultiIndexBlock::kNoopOnCleanUpFn);
+}
+
+TEST_F(MultiIndexBlockTest, DoNotWriteStateToContainerOnSpillWhenNotResumable) {
+    RAIIServerParameterControllerForTest ffContainerWrites{"featureFlagContainerWrites", true};
+    RAIIServerParameterControllerForTest ffPDIB{"featureFlagPrimaryDrivenIndexBuilds", true};
+    RAIIServerParameterControllerForTest ffResumable{"featureFlagResumablePrimaryDrivenIndexBuilds",
+                                                     true};
+
+    // Lower the per-build memory limit to 0.5 MB.
+    auto prevMemLimitMB = maxIndexBuildMemoryUsageMegabytes.swap(0.5);
+    ON_BLOCK_EXIT([prevMemLimitMB] { maxIndexBuildMemoryUsageMegabytes.store(prevMemLimitMB); });
+
+    promoteMockReplCoordToPrimary(getServiceContext());
+    auto& observer = installResumeStateContainerObserver(operationContext());
+
+    auto& indexer = *getIndexer();
+    AutoGetCollection autoColl(operationContext(), getNSS(), MODE_X);
+    CollectionWriter coll(operationContext(), autoColl);
+
+    auto buildUUID = UUID::gen();
+    indexer.setBuildUUID(buildUUID);
+    indexer.setIndexBuildMethod(IndexBuildMethodEnum::kPrimaryDriven);
+    indexer.setContainerWriteBehavior(ContainerWriteBehavior::kReplicate);
+    indexer.setIsResumable(false);
+
+    // Insert enough indexable data to exceed the 1 MB memory limit. 20 documents with 64 KB strings
+    // puts us comfortably above the limit.
+    WriteUnitOfWork wuow(operationContext());
+    std::string val(64 * 1024, 'a');
+    for (auto i = 0; i < 20; ++i) {
+        ASSERT_OK(Helpers::insert(operationContext(), *autoColl, BSON("_id" << i << "a" << val)));
+    }
+    wuow.commit();
+
+    auto& engine = *operationContext()->getServiceContext()->getStorageEngine();
+    auto indexBuildInfo =
+        IndexBuildInfo(BSON("key" << BSON("a" << 1) << "name"
+                                  << "a_1"
+                                  << "v" << static_cast<int>(IndexConfig::kLatestIndexVersion)),
+                       "index-1",
+                       engine);
+
+    ASSERT_OK(indexer.init(operationContext(),
+                           coll,
+                           {indexBuildInfo},
+                           MultiIndexBlock::kNoopOnInitFn,
+                           MultiIndexBlock::InitMode::SteadyState,
+                           boost::none));
+
+    auto indexBuildIdent = ident::generateNewIndexBuildIdent(buildUUID);
+    EXPECT_FALSE(engine.getEngine()->hasIdent(
+        *shard_role_details::getRecoveryUnit(operationContext()), indexBuildIdent));
+
+    // Insert the data into the sorter. The first spill will trigger an insert into the index build
+    // ident, and subsequent spills will trigger updates to the index build ident.
+    ASSERT_OK(indexer.insertAllDocumentsInCollection(operationContext(), getNSS()));
+    EXPECT_EQ(observer.countInsertsForIdent(indexBuildIdent), 0);
+    EXPECT_GE(observer.countUpdatesForIdent(indexBuildIdent), 0);
+
+    indexer.abortIndexBuild(operationContext(), coll, MultiIndexBlock::kNoopOnCleanUpFn);
+}
+
 }  // namespace
 }  // namespace mongo

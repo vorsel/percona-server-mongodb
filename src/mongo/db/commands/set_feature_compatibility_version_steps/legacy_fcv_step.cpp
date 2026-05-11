@@ -113,12 +113,10 @@ void handleDropPendingDBsGarbage(OperationContext* parentOpCtx) {
         };
         request.setReadConcern(repl::ReadConcernArgs::kMajority);
 
-        // TODO(SERVER-113504): Consider using kIdempotent since onRetry allows read only
-        // aggregation processes to be restarted.
         uassertStatusOK(configShard->runAggregation(
             opCtx,
             request,
-            Shard::RetryPolicy::kStrictlyNotIdempotent,
+            Shard::RetryPolicy::kIdempotent,
             [&](const std::vector<BSONObj>& batch, const boost::optional<BSONObj>&) {
                 invariant(batch.size() == 1);
                 const auto bsonVersion = batch[0][DatabaseType::kVersionFieldName];
@@ -527,8 +525,6 @@ private:
 
     // TODO (SERVER-98118): Remove once v9.0 become last-lts.
     void _resetPlacementHistory(OperationContext* opCtx, const FCV requestedVersion) {
-        // TODO (SERVER-108188): Avoid resetting config.placementHistory if its initialization
-        // metadata already bring the expected version.
         if (!feature_flags::gFeatureFlagChangeStreamPreciseShardTargeting.isEnabledOnVersion(
                 requestedVersion)) {
             return;

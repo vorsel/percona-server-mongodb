@@ -53,7 +53,6 @@
 #include "mongo/db/query/plan_yield_policy.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_feature_flags_gen.h"
-#include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
 #include "mongo/db/shard_role/lock_manager/d_concurrency.h"
 #include "mongo/db/shard_role/lock_manager/exception_util.h"
@@ -196,6 +195,10 @@ bool shouldRelaxConstraints(OperationContext* opCtx, const CollectionPtr& collec
     return !isPrimary;
 }
 
+using OnSpillFn = sorter::ContainerBasedSpiller<key_string::Value,
+                                                mongo::NullValue,
+                                                BtreeExternalSortComparison>::OnSpillFn;
+
 std::shared_ptr<sorter::Spiller<key_string::Value, mongo::NullValue, BtreeExternalSortComparison>>
 makeSpiller(OperationContext* opCtx,
             const CollectionPtr& collection,
@@ -204,7 +207,8 @@ makeSpiller(OperationContext* opCtx,
             SorterFileStats& fileStats,
             SorterContainerStats& containerStats,
             const DatabaseName& dbName,
-            ContainerWriteBehavior containerWriteBehavior) {
+            ContainerWriteBehavior containerWriteBehavior,
+            OnSpillFn onSpill = nullptr) {
     if (containerWriteBehavior == ContainerWriteBehavior::kReplicate) {
         invariant(!stateInfo);
         return std::make_shared<sorter::ContainerBasedSpiller<key_string::Value,
@@ -216,11 +220,12 @@ makeSpiller(OperationContext* opCtx,
             containerStats,
             dbName,
             sorter::kLatestChecksumVersion,
-            [] {},
+            std::move(onSpill),
             primaryDrivenIndexBuildSorterInsertionBatchSize.load(),
             primaryDrivenIndexBuildSorterInsertionBatchBytes.load(),
             static_cast<int64_t>(indexBuildSpillingMinAvailableDiskSpaceBytes.load()));
     }
+    invariant(!onSpill);
 
     using FileBasedSpiller =
         sorter::FileBasedSpiller<key_string::Value, mongo::NullValue, BtreeExternalSortComparison>;
@@ -808,7 +813,12 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(
                                     index.real->getSorterFileStats(),
                                     index.real->getSorterContainerStats(),
                                     collection->nss().dbName(),
-                                    _containerWriteBehavior),
+                                    _containerWriteBehavior,
+                                    [this, opCtx] {
+                                        if (_isResumable) {
+                                            _writeStateToContainer(opCtx);
+                                        }
+                                    }),
                         getEachIndexBuildMaxMemoryUsageBytes(boost::none, _indexes.size()),
                         /*stateInfo=*/boost::none,
                         collection->nss().dbName(),
@@ -1467,21 +1477,15 @@ void MultiIndexBlock::appendBuildInfo(BSONObjBuilder* builder) const {
     builder->append("phaseStr", idl::serialize(_phase));
 }
 
-void MultiIndexBlock::persistResumeState(OperationContext* opCtx,
-                                         const CollectionPtr& collection,
-                                         bool isResumable) {
-    const bool useContainerWrite = _containerWriteBehavior == ContainerWriteBehavior::kReplicate &&
-        feature_flags::gResumablePrimaryDrivenIndexBuilds.isEnabledUseLastLTSFCVWhenUninitialized(
-            VersionContext::getDecoration(opCtx),
-            serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
-    if (!isResumable || (_method != IndexBuildMethodEnum::kHybrid && !useContainerWrite)) {
+void MultiIndexBlock::persistResumeState(OperationContext* opCtx, const CollectionPtr& collection) {
+    if (!_isResumable) {
         return;
     }
 
     invariant(!_buildIsCleanedUp);
     invariant(_buildUUID);
 
-    if (useContainerWrite) {
+    if (_containerWriteBehavior == ContainerWriteBehavior::kReplicate) {
         _writeStateToContainer(opCtx);
     } else {
         _writeStateToDisk(opCtx);
@@ -1489,15 +1493,10 @@ void MultiIndexBlock::persistResumeState(OperationContext* opCtx,
 }
 
 void MultiIndexBlock::abortWithoutCleanup(OperationContext* opCtx,
-                                          const CollectionPtr& collection,
-                                          bool isResumable) {
+                                          const CollectionPtr& collection) {
     invariant(!_buildIsCleanedUp);
-    const bool useContainerWrite = _containerWriteBehavior == ContainerWriteBehavior::kReplicate &&
-        feature_flags::gResumablePrimaryDrivenIndexBuilds.isEnabledUseLastLTSFCVWhenUninitialized(
-            VersionContext::getDecoration(opCtx),
-            serverGlobalParams.featureCompatibility.acquireFCVSnapshot());
 
-    if (isResumable && (_method == IndexBuildMethodEnum::kHybrid || useContainerWrite)) {
+    if (_isResumable) {
         invariant(_buildUUID && collection);
         // Aborting without cleanup is done during shutdown. At this point the operation context is
         // killed, but acquiring locks must succeed.
@@ -1516,7 +1515,7 @@ void MultiIndexBlock::abortWithoutCleanup(OperationContext* opCtx,
             index.block->createDeferredTables(opCtx);
         }
 
-        if (useContainerWrite) {
+        if (_containerWriteBehavior == ContainerWriteBehavior::kReplicate) {
             _writeStateToContainer(opCtx);
         } else {
             _writeStateToDisk(opCtx);
@@ -1625,9 +1624,21 @@ BSONObj MultiIndexBlock::_constructStateObject() const {
         IndexStateInfo indexStateInfo;
 
         if (_phase != IndexBuildPhaseEnum::kDrainWrites) {
-            // Persist the data to disk so that we see all of the data that has been inserted into
-            // the Sorter.
-            indexStateInfo = index.bulk->persistDataForShutdown();
+            switch (_containerWriteBehavior) {
+                case ContainerWriteBehavior::kDoNotReplicate: {
+                    // Persist the data to disk so that we see all of the data that has been
+                    // inserted into the Sorter.
+                    indexStateInfo = index.bulk->persistDataForShutdown();
+                    break;
+                }
+                case ContainerWriteBehavior::kReplicate: {
+                    // When replicating container writes, the persisted state is written via a
+                    // callback that is run when a spill occurs. So, we can simply get persisted
+                    // state without forcing another spill.
+                    indexStateInfo = index.bulk->getPersistedState();
+                    break;
+                }
+            }
         }
 
         auto& indexBuildInfo = index.block->getIndexBuildInfo();

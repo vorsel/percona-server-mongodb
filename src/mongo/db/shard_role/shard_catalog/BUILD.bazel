@@ -208,8 +208,24 @@ mongo_cc_library(
     deps = [
         ":durable_catalog",
         "//src/mongo/db:server_base",
+        "//src/mongo/db/index_builds:resumable_index_builds_common",
         "//src/mongo/db/storage:mdb_catalog",
         "//src/mongo/db/storage:storage_engine_impl",
+    ],
+)
+
+mongo_cc_library(
+    name = "shard_catalog_history_cleanup",
+    srcs = [
+        "//src/mongo/db/shard_role/shard_catalog:shard_catalog_history_cleanup.cpp",
+    ],
+    deps = [
+        "//src/mongo/db:dbdirectclient",
+        "//src/mongo/db:rw_concern_d",
+        "//src/mongo/db:server_feature_flags",
+        "//src/mongo/db:shard_role_api",
+        "//src/mongo/db/repl:replica_set_aware_service",
+        "//src/mongo/db/s:sharding_commands_d",
     ],
 )
 
@@ -458,6 +474,7 @@ mongo_cc_unit_test(
         "index_catalog_impl_test.cpp",
         "index_signature_test.cpp",
         "rename_collection_test.cpp",
+        "shard_catalog_history_cleanup_test.cpp",
     ],
     tags = ["mongo_unittest_eighth_group"],
     deps = [
@@ -469,6 +486,7 @@ mongo_cc_unit_test(
         ":collection_mock",
         ":collection_options",
         ":database_holder",
+        ":shard_catalog_history_cleanup",
         "//src/mongo/db:dbhelpers",
         "//src/mongo/db:index_key_validate",
         "//src/mongo/db:multitenancy",

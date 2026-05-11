@@ -32,6 +32,7 @@
 #include "mongo/db/aggregated_index_usage_tracker.h"
 #include "mongo/db/audit.h"
 #include "mongo/db/index_builds/index_build_interceptor.h"
+#include "mongo/db/index_builds/resumable_index_builds_common.h"
 #include "mongo/db/index_key_validate.h"
 #include "mongo/db/op_observer/op_observer.h"
 #include "mongo/db/query/collection_index_usage_tracker_decoration.h"
@@ -298,6 +299,20 @@ Status abort(OperationContext* opCtx,
 
     wuow.commit();
     return Status::OK();
+}
+
+ResumeIndexInfo resumeInfo(OperationContext* opCtx, const std::string& ident) {
+    uassert(ErrorCodes::InvalidOptions,
+            "Invalid index build resume state ident",
+            ident::isInternalIdent(ident, kIndexBuildIdentStem));
+
+    auto resumeIndexInfo = index_builds::readResumeIndexInfo(
+        opCtx->getServiceContext()->getStorageEngine(), opCtx, ident);
+
+    uassert(ErrorCodes::FailedToParse,
+            "Failed to read/parse the index build resume state",
+            resumeIndexInfo);
+    return *resumeIndexInfo;
 }
 
 }  // namespace mongo::index_builds::primary_driven

@@ -1872,8 +1872,7 @@ void IndexBuildsCoordinator::_completeExternalAbort(OperationContext* opCtx,
         // No locks are required when aborting due to rollback. This performs no storage engine
         // writes, only cleans up the remaining in-memory state.
         CollectionWriter coll(opCtx, replState->collectionUUID);
-        _indexBuildsManager.abortIndexBuildWithoutCleanup(
-            opCtx, coll.get(), replState->buildUUID, replState->isResumable());
+        _indexBuildsManager.abortIndexBuildWithoutCleanup(opCtx, coll.get(), replState->buildUUID);
     }
 
     replState->completeAbort(opCtx);
@@ -1901,7 +1900,7 @@ void IndexBuildsCoordinator::_completeAbortForShutdown(
         try {
             // Leave it as-if kill -9 happened. Startup recovery will restart the index build.
             _indexBuildsManager.abortIndexBuildWithoutCleanup(
-                opCtx, collection, replState->buildUUID, replState->isResumable());
+                opCtx, collection, replState->buildUUID);
 
             replState->abortForShutdown(opCtx);
             activeIndexBuilds.unregisterIndexBuild(
@@ -2115,8 +2114,44 @@ void IndexBuildsCoordinator::_onStepUpAsyncTaskFn(OperationContext* opCtx) {
                                                  Status{ErrorCodes::InterruptedDueToReplStateChange,
                                                         "aborting all two-phase index builds"});
         }
-        for (auto&& [buildUUID, build] :
-             index_builds::primary_driven::registry(opCtx->getServiceContext()).all()) {
+
+        _resumePrimaryDrivenIndexBuildsOnStepUp(opCtx);
+
+        auto builds = activeIndexBuilds.getAllIndexBuilds();
+        forEachIndexBuild(builds,
+                          "IndexBuildsCoordinator::_onStepUpAsyncTaskFn"_sd,
+                          signalCommitQuorumAndRetrySkippedRecords);
+    } catch (const DBException& ex) {
+        LOGV2_DEBUG(7333100, 1, "Step-up task interrupted", "status"_attr = ex);
+    }
+    LOGV2(7508300, "Finished performing asynchronous step-up checks on index builds");
+}
+
+void IndexBuildsCoordinator::_resumePrimaryDrivenIndexBuildsOnStepUp(OperationContext* opCtx) {
+    const auto vCtx = VersionContext::getDecoration(opCtx);
+    const auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
+    const bool resumablePdibEnabled =
+        feature_flags::gResumablePrimaryDrivenIndexBuilds.isEnabledUseLastLTSFCVWhenUninitialized(
+            vCtx, fcvSnapshot);
+
+    for (auto&& [buildUUID, build] :
+         index_builds::primary_driven::registry(opCtx->getServiceContext()).all()) {
+
+        // TODO(SERVER-125682): Attempt to resume primary-driven index build.
+        bool resumeSucceeded = false;
+        if (resumablePdibEnabled && build.indexBuildIdent) {
+            try {
+                auto resumeInfo =
+                    index_builds::primary_driven::resumeInfo(opCtx, *build.indexBuildIdent);
+                resumeSucceeded = true;
+            } catch (const DBException& e) {
+                LOGV2(12500301,
+                      "Index build: failed to resume, aborting instead",
+                      "buildUUID"_attr = buildUUID,
+                      "error"_attr = e);
+            }
+        }
+        if (!resumeSucceeded) {
             uassertStatusOK(index_builds::primary_driven::abort(
                 opCtx,
                 build.dbName,
@@ -2130,15 +2165,7 @@ void IndexBuildsCoordinator::_onStepUpAsyncTaskFn(OperationContext* opCtx) {
                   "Aborted primary-driven index build upon step up",
                   "buildUUID"_attr = buildUUID);
         }
-
-        auto builds = activeIndexBuilds.getAllIndexBuilds();
-        forEachIndexBuild(builds,
-                          "IndexBuildsCoordinator::_onStepUpAsyncTaskFn"_sd,
-                          signalCommitQuorumAndRetrySkippedRecords);
-    } catch (const DBException& ex) {
-        LOGV2_DEBUG(7333100, 1, "Step-up task interrupted", "status"_attr = ex);
     }
-    LOGV2(7508300, "Finished performing asynchronous step-up checks on index builds");
 }
 
 IndexBuilds IndexBuildsCoordinator::stopIndexBuildsForRollback(OperationContext* opCtx) {
@@ -2953,6 +2980,11 @@ IndexBuildsCoordinator::PostSetupAction IndexBuildsCoordinator::_setUpIndexBuild
             auto lastOpTimeBeforeInterceptors =
                 indexBuildOptions.startIndexBuildOpTime.value_or(getLatestOplogOpTime(opCtx));
             replState->setLastOpTimeBeforeInterceptors(lastOpTimeBeforeInterceptors);
+
+            // The hybrid build only becomes resumable once _lastOpTimeBeforeInterceptors is set.
+            // setUpIndexBuild ran before this and so set the builder's _isResumable to false;
+            // refresh it now so a later persistResumeState / abortWithoutCleanup will write state.
+            _indexBuildsManager.setIsResumable(replState->buildUUID, true);
         }
     } catch (DBException& ex) {
         // It is fine to let the build continue even if we are interrupted, interrupt check before

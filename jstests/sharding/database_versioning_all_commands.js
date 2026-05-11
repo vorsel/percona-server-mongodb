@@ -1134,6 +1134,7 @@ const allTestCases = {
                         _shardsvrReshardDonorCriticalSectionStarted: UUID(),
                     };
                 },
+                expectedFailureCode: ErrorCodes.IllegalOperation,
             },
         },
         _shardsvrReshardDonorRecipientsFinishedCloning: {

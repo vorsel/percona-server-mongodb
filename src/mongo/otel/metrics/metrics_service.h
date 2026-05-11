@@ -31,6 +31,7 @@
 
 #include "mongo/base/string_data.h"
 #include "mongo/config.h"
+#include "mongo/db/commands/server_status/server_status_metric.h"
 #include "mongo/otel/metrics/metric_names.h"
 #include "mongo/otel/metrics/metric_unit.h"
 #include "mongo/otel/metrics/metrics_counter.h"
@@ -93,6 +94,12 @@ struct HistogramOptions {
      * information.
      */
     boost::optional<std::vector<double>> explicitBucketBoundaries;
+    /**
+     * Controls how the histogram is serialized to BSON (currently used for server status
+     * reporting). Defaults to kAverage, which is cheaper since it only tracks an exponential
+     * moving average and a total count. Use kBucketCounts if per-bucket counts are needed.
+     */
+    HistogramSerializationFormat serializationFormat = HistogramSerializationFormat::kAverage;
 };
 
 /**
@@ -107,6 +114,9 @@ public:
         static MetricsService metricsService;
         return metricsService;
     }
+
+    /** `metricTreeSet` is provided for testing purposes. */
+    MetricsService(MetricTreeSet& metricTreeSet = globalMetricTreeSet());
 
     /**
      * Creates an int64_t counter with the provided parameters. The function will throw an exception
@@ -298,12 +308,6 @@ public:
         const AttributeDefinition<AttributeTs>&... defs,
         const HistogramOptions& options = {});
 
-    /**
-     * Used in unit tests only. Removes all metrics registered by this MetricsService from the
-     * internal map and from the serverStatus metric trees.
-     */
-    void clearForTests();
-
     /** Returns the attribute names for a metric in definition order. Exposed for testing only. */
     MONGO_MOD_PRIVATE std::vector<std::string> getAttributeNamesForTests(MetricName name) const;
 
@@ -493,6 +497,9 @@ private:
         OwnedMetric metric;
     };
 
+    // Where serverStatus metrics are registered.
+    MetricTreeSet& _metricTreeSet;
+
     // Guards `_observableInstruments` and `_metrics`.
     mutable std::mutex _mutex;
 
@@ -650,9 +657,16 @@ Histogram<T, AttributeTs...>& MetricsService::_createHistogram(
             auto meter = opentelemetry::metrics::Provider::GetMeterProvider()->GetMeter(
                 std::string{kMeterName});
             return std::make_unique<HistogramImpl<T, AttributeTs...>>(
-                *meter, nameStr, description, unitStr, options.explicitBucketBoundaries, defs...);
+                *meter,
+                nameStr,
+                description,
+                unitStr,
+                options.serializationFormat,
+                options.explicitBucketBoundaries,
+                defs...);
 #else
-            return std::make_unique<HistogramImpl<T, AttributeTs...>>(defs...);
+            return std::make_unique<HistogramImpl<T, AttributeTs...>>(
+                options.serializationFormat, options.explicitBucketBoundaries, defs...);
 #endif  // MONGO_CONFIG_OTEL
         },
         /* addObservable= */

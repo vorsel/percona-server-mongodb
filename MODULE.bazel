@@ -310,6 +310,10 @@ setup_pgo_data = use_repo_rule("//bazel/repository_rules:pgo_data.bzl", "setup_p
 
 setup_pgo_data(name = "pgo_data")
 
+setup_cspgo_data = use_repo_rule("//bazel/repository_rules:cspgo_data.bzl", "setup_cspgo_data")
+
+setup_cspgo_data(name = "cspgo_data")
+
 setup_bolt_data = use_repo_rule("//bazel/repository_rules:bolt_data.bzl", "setup_bolt_data")
 
 setup_bolt_data(name = "bolt_data")
@@ -367,7 +371,7 @@ use_repo(rust_host, "rust_host_tools_nightly")
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 crate.spec(
     package = "wasmtime",
-    version = "=40.0.2",
+    version = "=44.0.1",
 )
 crate.spec(
     features = [
@@ -377,7 +381,7 @@ crate.spec(
         "wasi",
     ],
     package = "wasmtime-c-api-impl",
-    version = "=40.0.2",
+    version = "=44.0.1",
 )
 
 # We partially custom build wasmtime_c because otherwise it tries to use cmake
@@ -426,7 +430,7 @@ crate.spec(
         "pulley",
     ],
     package = "wasmtime-cli",
-    version = "=40.0.2",
+    version = "=44.0.1",
 )
 
 # This causes us to build the actual binary and not just the rlib
