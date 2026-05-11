@@ -248,7 +248,7 @@ def _post_form(url: str, form: dict) -> dict:
     ctx = ssl.create_default_context()
     try:
         with urllib.request.urlopen(req, context=ctx, timeout=HTTP_TIMEOUT_SECONDS) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         try:
             return json.loads(e.read().decode("utf-8"))
@@ -256,6 +256,16 @@ def _post_form(url: str, form: dict) -> dict:
             raise rbe_auth.RbeAuthError(f"HTTP {e.code} from {url}: {e.reason}")
     except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as e:
         raise rbe_auth.RbeAuthError(f"network error talking to {url}: {e}")
+    # 2xx path: validate JSON shape so a proxy/captive-portal HTML body
+    # or a truncated read surfaces as a controlled RbeAuthError instead
+    # of a raw json.JSONDecodeError traceback in Bazel's helper-stderr
+    # surface.
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as e:
+        raise rbe_auth.RbeAuthError(
+            f"non-JSON 2xx response from {url} ({e}); " f"first 200 chars: {body[:200]!r}"
+        )
 
 
 def _exchange_jenkins_token(jenkins_jwt: str, issuer: str, audience: str, connector_id: str) -> str:

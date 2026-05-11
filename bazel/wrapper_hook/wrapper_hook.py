@@ -32,10 +32,16 @@ def _has_config_value(args, name: str) -> bool:
     """True iff `--config=<name>` or `--config <name>` is present in args.
 
     Bazel accepts both forms; covering only `--config=<name>` lets the
-    space-separated form slip past guards that gate RBE wiring (see
-    PSMDB-2034 review on PR #1845).
+    space-separated form slip past guards that gate RBE wiring.
+
+    Stop scanning at the `--` separator: anything after it goes to the
+    test/run binary, not to Bazel, so e.g.
+    `bazel test //... -- --config psmdb_buildfarm` must NOT be mis-read
+    as a Bazel config.
     """
     for i, a in enumerate(args):
+        if a == "--":
+            return False
         if a == f"--config={name}":
             return True
         if a == "--config" and i + 1 < len(args) and args[i + 1] == name:
