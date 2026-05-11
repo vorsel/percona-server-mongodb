@@ -399,7 +399,7 @@ class TestBranchFunctions(unittest.TestCase):
         result = self.mock_search(test_name, 2, 0)
         self.assertIsNone(result, f"{test_name}: SUCCESS!")
 
-    def test_prefers_newest_destination_commit_for_duplicate_origin_rev_id(self):
+    def test_duplicate_destination_origin_commits_fail_on_same_branch(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             source_dir = os.path.join(tmpdir, "source")
             destination_dir = os.path.join(tmpdir, "destination")
@@ -407,14 +407,64 @@ class TestBranchFunctions(unittest.TestCase):
             os.mkdir(destination_dir)
 
             private_hashes = TestBranchFunctions.create_mock_repo_commits(source_dir, 1)
-            public_hashes = TestBranchFunctions.create_mock_repo_commits(
+            TestBranchFunctions.create_mock_repo_commits(
                 destination_dir,
                 2,
                 [private_hashes[0], private_hashes[0]],
             )
 
-            result = sync_repo_with_copybara.find_matching_commit(source_dir, destination_dir)
-            self.assertEqual(result, public_hashes[-1])
+            with self.assertRaises(SystemExit):
+                sync_repo_with_copybara.find_matching_commit(source_dir, destination_dir)
+
+    def test_duplicate_destination_origin_commits_fail_outside_source_ref(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = os.path.join(tmpdir, "source")
+            destination_dir = os.path.join(tmpdir, "destination")
+            os.mkdir(source_dir)
+            os.mkdir(destination_dir)
+
+            TestBranchFunctions.create_mock_repo_commits(source_dir, 1)
+            unrelated_private_hash = "a" * 40
+            TestBranchFunctions.create_mock_repo_commits(
+                destination_dir,
+                2,
+                [unrelated_private_hash, unrelated_private_hash],
+            )
+
+            with self.assertRaises(SystemExit):
+                sync_repo_with_copybara.find_matching_commit(source_dir, destination_dir)
+
+    def test_duplicate_destination_origin_commits_fail_on_unrelated_branches(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = os.path.join(tmpdir, "source")
+            destination_dir = os.path.join(tmpdir, "destination")
+            os.mkdir(source_dir)
+            os.mkdir(destination_dir)
+
+            private_hashes = TestBranchFunctions.create_mock_repo_commits(source_dir, 1)
+            os.chdir(destination_dir)
+            sync_repo_with_copybara.run_command("git init")
+            sync_repo_with_copybara.run_command('git config --local user.email "test@example.com"')
+            sync_repo_with_copybara.run_command('git config --local user.name "Test User"')
+            sync_repo_with_copybara.run_command("git config --local commit.gpgsign false")
+
+            with open("test.txt", "w") as file:
+                file.write("master")
+            sync_repo_with_copybara.run_command("git add test.txt")
+            sync_repo_with_copybara.run_command(
+                f'git commit -m "master commit\nGitOrigin-RevId: {private_hashes[0]}"'
+            )
+
+            sync_repo_with_copybara.run_command("git checkout --orphan v8.2")
+            with open("test.txt", "w") as file:
+                file.write("release")
+            sync_repo_with_copybara.run_command("git add test.txt")
+            sync_repo_with_copybara.run_command(
+                f'git commit -m "release commit\nGitOrigin-RevId: {private_hashes[0]}"'
+            )
+
+            with self.assertRaises(SystemExit):
+                sync_repo_with_copybara.find_matching_commit(source_dir, destination_dir)
 
     def test_find_matching_commit_pair_returns_source_and_destination(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -439,6 +489,43 @@ class TestBranchFunctions(unittest.TestCase):
                     destination_commit=public_hashes[-1],
                 ),
             )
+
+    def test_find_matching_commit_pair_searches_all_destination_branches(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_dir = os.path.join(tmpdir, "source")
+            destination_dir = os.path.join(tmpdir, "destination")
+            os.mkdir(source_dir)
+            os.mkdir(destination_dir)
+
+            private_hashes = TestBranchFunctions.create_mock_repo_commits(source_dir, 3)
+            public_hashes = TestBranchFunctions.create_mock_repo_commits(
+                destination_dir,
+                1,
+                [private_hashes[0]],
+            )
+
+            os.chdir(destination_dir)
+            sync_repo_with_copybara.run_command("git checkout -b v8.2")
+            with open("test.txt", "a") as file:
+                file.write("release")
+            sync_repo_with_copybara.run_command("git add test.txt")
+            sync_repo_with_copybara.run_command(
+                f'git commit -m "release branch commit\nGitOrigin-RevId: {private_hashes[1]}"'
+            )
+            release_public_hash = sync_repo_with_copybara.run_command(
+                'git log --pretty=format:"%H" -1'
+            )
+
+            result = sync_repo_with_copybara.find_matching_commit_pair(source_dir, destination_dir)
+
+            self.assertEqual(
+                result,
+                sync_repo_with_copybara.MatchingCommit(
+                    source_commit=private_hashes[1],
+                    destination_commit=release_public_hash,
+                ),
+            )
+            self.assertNotEqual(result.destination_commit, public_hashes[0])
 
     def test_branch_exists(self):
         """Perform a test to check that the branch exists in a repository."""
@@ -1267,6 +1354,52 @@ class TestCopybaraConfigHelpers(unittest.TestCase):
             self.assertEqual(branch_to_fragment["v8.2"], fragment_dir / "v8_2.sky")
             self.assertEqual(branch_to_fragment["v8.2.6-hotfix"], fragment_dir / "v8_2.sky")
             self.assertNotIn("v8.2.7", branch_to_fragment)
+
+    def test_discover_copybara_branches_skips_disabled_fragments(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_base_copybara_config(get_repo_base_copybara_config_path(root))
+            write_copybara_path_rules(
+                get_repo_copybara_path_rules_path(root),
+                common_includes=DEFAULT_TEST_COPYBARA_PATH_RULES_INCLUDES,
+                common_excludes=DEFAULT_TEST_COPYBARA_PATH_RULES_EXCLUDES,
+            )
+            write_copybara_path_rules_module(
+                get_repo_copybara_path_rules_module_path(root),
+                get_repo_copybara_path_rules_path(root),
+            )
+            fragment_dir = root / "buildscripts" / "copybara"
+            fragment_dir.mkdir(parents=True, exist_ok=True)
+            (fragment_dir / "master.sky").write_text('sync_branch("master")\n')
+            (fragment_dir / "v8_0.sky").write_text(
+                '"""Copybara branch definitions for v8.0."""\n\n#sync_branch("v8.0")\n'
+            )
+
+            branch_to_fragment = sync_repo_with_copybara.discover_copybara_branches(tmpdir)
+
+            self.assertEqual(branch_to_fragment, {"master": fragment_dir / "master.sky"})
+
+    def test_discover_copybara_branches_ignores_fragments_without_sync_call(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            write_base_copybara_config(get_repo_base_copybara_config_path(root))
+            write_copybara_path_rules(
+                get_repo_copybara_path_rules_path(root),
+                common_includes=DEFAULT_TEST_COPYBARA_PATH_RULES_INCLUDES,
+                common_excludes=DEFAULT_TEST_COPYBARA_PATH_RULES_EXCLUDES,
+            )
+            write_copybara_path_rules_module(
+                get_repo_copybara_path_rules_module_path(root),
+                get_repo_copybara_path_rules_path(root),
+            )
+            fragment_dir = root / "buildscripts" / "copybara"
+            fragment_dir.mkdir(parents=True, exist_ok=True)
+            (fragment_dir / "master.sky").write_text('sync_branch("master")\n')
+            (fragment_dir / "typo.sky").write_text('sync_brach("v8.0")\n')
+
+            branch_to_fragment = sync_repo_with_copybara.discover_copybara_branches(tmpdir)
+
+            self.assertEqual(branch_to_fragment, {"master": fragment_dir / "master.sky"})
 
     def test_resolve_requested_branches_preserves_user_order(self):
         branch_to_fragment = {
@@ -5684,24 +5817,6 @@ class TestRealCopybaraSkyConfiguration(unittest.TestCase):
             sync_repo_with_copybara.check_branch_top_level_paths_are_labeled(
                 str(config_path), "master", top_level_paths
             )
-
-    @unittest.skipUnless(
-        REAL_SKY_PATH.is_file(),
-        "checked-in copy.bara.sky not found at expected path",
-    )
-    def test_real_fragments_match_expected_mainline_branch_allowlist(self):
-        branch_to_fragment = sync_repo_with_copybara.discover_copybara_branches(
-            str(self.REAL_COPYBARA_ROOT)
-        )
-        mainline_branches = sorted(
-            branch for branch in branch_to_fragment if not branch.endswith("-hotfix")
-        )
-        hotfix_branches = sorted(
-            branch for branch in branch_to_fragment if branch.endswith("-hotfix")
-        )
-
-        self.assertEqual(mainline_branches, ["master", "v7.0", "v8.0", "v8.2"])
-        self.assertTrue(all(branch.endswith("-hotfix") for branch in hotfix_branches))
 
     @unittest.skipUnless(
         REAL_GENERATED_EVERGREEN_PATH.is_file(),

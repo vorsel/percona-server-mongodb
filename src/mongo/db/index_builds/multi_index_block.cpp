@@ -1187,6 +1187,8 @@ Status MultiIndexBlock::dumpInsertsFromBulk(
                             opCtx, indexIdent, IndexCatalog::InclusionPolicy::kUnfinished)};
             };
 
+            const bool periodicResumeStateWrites =
+                _isResumable && _containerWriteBehavior == ContainerWriteBehavior::kReplicate;
             Status status = _indexes[i].bulk->commit(
                 opCtx,
                 *shard_role_details::getRecoveryUnit(opCtx),
@@ -1214,6 +1216,10 @@ Status MultiIndexBlock::dumpInsertsFromBulk(
                 },
                 onDuplicateRecord,
                 yieldFn,
+                periodicResumeStateWrites ? IndexAccessMethod::OnNKeysLoadedFn(
+                                                [this, opCtx] { _writeStateToContainer(opCtx); })
+                                          : IndexAccessMethod::OnNKeysLoadedFn([]() {}),
+                primaryDrivenIndexBuildLoadResumeStateWriteIntervalKeys.load(),
                 (this->_containerWriteBehavior == ContainerWriteBehavior::kReplicate)
                     ? primaryDrivenIndexBuildIndexInsertionBatchSize.load()
                     : 1,
@@ -1245,6 +1251,7 @@ Status MultiIndexBlock::drainBackgroundWrites(
     invariant(_phase == IndexBuildPhaseEnum::kBulkLoad ||
                   _phase == IndexBuildPhaseEnum::kDrainWrites,
               idl::serialize(_phase));
+    const bool firstDrain = _phase == IndexBuildPhaseEnum::kBulkLoad;
     _phase = IndexBuildPhaseEnum::kDrainWrites;
 
     ReadSourceScope readSourceScope(opCtx, readSource);
@@ -1253,6 +1260,12 @@ Status MultiIndexBlock::drainBackgroundWrites(
     CollectionPtr coll = CollectionPtr::CollectionPtr_UNSAFE(
         CollectionCatalog::get(opCtx)->lookupCollectionByUUID(opCtx, _collectionUUID.value()));
     coll.makeYieldable(opCtx, LockedCollectionYieldRestore(opCtx, coll));
+
+    const bool hasBulkLoader = !_indexes.empty() && _indexes.front().bulk;
+    if (firstDrain && _containerWriteBehavior == ContainerWriteBehavior::kReplicate &&
+        _isResumable && hasBulkLoader) {
+        _writeStateToContainer(opCtx);
+    }
 
     // Drain side-writes table for each index. This only drains what is visible. Assuming intent
     // locks are held on the user collection, more writes can come in after this drain completes.
@@ -1579,22 +1592,28 @@ void MultiIndexBlock::_writeStateToContainer(OperationContext* opCtx) const {
     IntegerKeyedContainer& container =
         std::get<std::reference_wrapper<IntegerKeyedContainer>>(rs.getContainer()).get();
 
-    static constexpr int64_t kResumeStateKey = 0;
+    static constexpr int64_t kResumeStateKey = 1;
 
-    WriteUnitOfWork wuow(opCtx);
-    auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
-    std::span<const char> value(obj.objdata(), obj.objsize());
-    const bool keyExists = container.getCursor(ru)->find(kResumeStateKey).has_value();
-    auto status = keyExists
-        ? container_write::update(opCtx, ru, container, kResumeStateKey, value)
-        : container_write::insert(
-              opCtx, ru, container, kResumeStateKey, value, container::ExistingKeyPolicy::reject);
-    massertStatusOK(status.withContext(
-        str::stream() << "Index build: failed to write resumable state via container write. "
-                      << "buildUUID: " << _buildUUID << ", collectionUUID: " << _collectionUUID
-                      << ", details: " << obj.toString()));
+    writeConflictRetry(opCtx, "writeIndexBuildStateToContainer", NamespaceString::kEmpty, [&] {
+        WriteUnitOfWork wuow(opCtx);
+        auto& ru = *shard_role_details::getRecoveryUnit(opCtx);
+        std::span<const char> value(obj.objdata(), obj.objsize());
+        const bool keyExists = container.getCursor(ru)->find(kResumeStateKey).has_value();
+        auto status = keyExists
+            ? container_write::update(opCtx, ru, container, kResumeStateKey, value)
+            : container_write::insert(opCtx,
+                                      ru,
+                                      container,
+                                      kResumeStateKey,
+                                      value,
+                                      container::ExistingKeyPolicy::reject);
+        massertStatusOK(status.withContext(
+            str::stream() << "Index build: failed to write resumable state via container write. "
+                          << "buildUUID: " << _buildUUID << ", collectionUUID: " << _collectionUUID
+                          << ", details: " << obj.toString()));
 
-    wuow.commit();
+        wuow.commit();
+    });
 
     LOGV2_DEBUG(12558700,
                 1,

@@ -281,6 +281,9 @@ void statsToBSON(const stage_builder::PlanStageToQsnMap& planStageQsnMap,
                 bob->append("numDocsEstimate", ce);
             }
         }
+        if (est.indexSeekCE.has_value()) {
+            bob->append("indexSeekEstimate", est.indexSeekCE->toDouble());
+        }
     }
 
     // Display the BSON representation of the filter, if there is one.
@@ -690,7 +693,11 @@ void statsToBSON(const stage_builder::PlanStageToQsnMap& planStageQsnMap,
             bob->appendNumber("nMatched", static_cast<long long>(spec->nMatched));
             bob->appendNumber("nWouldModify", static_cast<long long>(spec->nModified));
             bob->appendNumber("nWouldUpsert", static_cast<long long>(spec->nUpserted));
-            if (feature_flags::gFeatureFlagQueryMemoryTracking.isEnabled()) {
+            // peakTrackedMemBytes tracks memory used by the record ID deduplicator, which is only
+            // populated when an actual write occurs (indexesAffected=true). In explain mode no
+            // writes are committed, so this value is always 0 and is omitted to avoid confusion.
+            if (feature_flags::gFeatureFlagQueryMemoryTracking.isEnabled() &&
+                spec->peakTrackedMemBytes > 0) {
                 bob->appendNumber("peakTrackedMemBytes",
                                   static_cast<long long>(spec->peakTrackedMemBytes));
             }

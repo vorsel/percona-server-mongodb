@@ -4,6 +4,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 set -o errexit
 set -o pipefail
 
+# Variant: streams_image_build_and_push_sanitizer.sh. Keep in sync.
 REGISTRY="664315256653.dkr.ecr.us-east-1.amazonaws.com"
 REPO="${streams_ecr_repo:-mongo/mongostream-testing}"
 IMAGE="$REGISTRY/$REPO"

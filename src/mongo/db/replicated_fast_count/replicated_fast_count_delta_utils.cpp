@@ -136,6 +136,33 @@ void recordCollectionCreate(const UUID& uuid, SizeCountDeltas& sizeCountDeltasOu
     massert(12054100, "Encountered writes to a collection before it was created", inserted);
 }
 
+void recordCollectionCreateFromMigrate(const repl::OplogEntry& entry,
+                                       SizeCountDeltas& sizeCountDeltasOut) {
+    auto it = sizeCountDeltasOut.find(*entry.getUuid());
+    invariant(it != sizeCountDeltasOut.end());
+
+    // When processing oplog entries, we generally expect a collection create oplog entry to precede
+    // any other oplog entries with the same UUID, but there is one exception. During shard
+    // migration, a collection can be created on a shard, migrated away from the shard, then
+    // migrated back to the shard. When this happens, the collection is dropped then re-created with
+    // the same UUID because UUIDs are preserved across migrations. To handle this case, we allow
+    // the existing sizeCountDeltasOut key-value pair to be reset to zero.
+    massert(12554002,
+            fmt::format("Unexpected pre-existing size/count state when processing shard migration "
+                        "collection create oplog entry. entry: {}, sizeCountDelta: {}",
+                        redact(entry.toStringForLogging()),
+                        it->second.toString()),
+            it->second.state == DDLState::kDropped);
+
+    // We use DDLState::kDroppedAndRecreated so that:
+    //  1. persistCheckpoint() permits a pre-existing entry for this UUID in the SizeCountStore. It
+    //  expects no prior entry for kCreated.
+    //  2. readAndIncrementSizeCounts() knows not to increment this SizeCountDelta entry with the
+    //  stale persisted size/count of this collection before it was dropped.
+    it->second =
+        SizeCountDelta{CollectionSizeCount{.size = 0, .count = 0}, DDLState::kDroppedAndRecreated};
+}
+
 void recordCollectionDrop(const UUID& uuid, SizeCountDeltas& sizeCountDeltasOut) {
     auto [it, inserted] = sizeCountDeltasOut.try_emplace(
         uuid, SizeCountDelta{CollectionSizeCount{.size = 0, .count = 0}, DDLState::kDropped});
@@ -243,27 +270,39 @@ int processOplogEntry(const repl::OplogEntry& entry,
     if (entry.getCommandType() == repl::OplogEntry::CommandType::kApplyOps) {
         return extractSizeCountDeltasForApplyOps(entry, uuidFilter, sizeCountDeltasOut);
     }
+
     const auto& entryUuid = entry.getUuid();
     if (uuidFilter && entryUuid != uuidFilter) {
         return 0;
     }
-    if (entry.getCommandType() == repl::OplogEntry::CommandType::kTruncateRange) {
-        const auto delta = extractSizeCountDeltaForTruncateRange(entry);
-        recordCollectionSizeCountDelta(*entryUuid, delta, sizeCountDeltasOut);
-        return 1;
+
+    switch (entry.getCommandType()) {
+        case repl::OplogEntry::CommandType::kTruncateRange: {
+            const auto delta = extractSizeCountDeltaForTruncateRange(entry);
+            // Truncation returns an estimate on the number of records and bytes that were removed.
+            // We accept that size and count might be slightly off after performing truncation.
+            recordCollectionSizeCountDelta(*entryUuid, delta, sizeCountDeltasOut);
+            return 1;
+        }
+        case repl::OplogEntry::CommandType::kCreate:
+            if (entry.getFromMigrate().value_or(false) && sizeCountDeltasOut.contains(*entryUuid)) {
+                recordCollectionCreateFromMigrate(entry, sizeCountDeltasOut);
+            } else {
+                recordCollectionCreate(*entryUuid, sizeCountDeltasOut);
+            }
+            return 1;
+        case repl::OplogEntry::CommandType::kDrop:
+            recordCollectionDrop(*entryUuid, sizeCountDeltasOut);
+            return 1;
+        default:
+            break;
     }
-    if (entry.getCommandType() == repl::OplogEntry::CommandType::kCreate) {
-        recordCollectionCreate(*entryUuid, sizeCountDeltasOut);
-        return 1;
-    }
-    if (entry.getCommandType() == repl::OplogEntry::CommandType::kDrop) {
-        recordCollectionDrop(*entryUuid, sizeCountDeltasOut);
-        return 1;
-    }
+
     if (auto delta = extractSizeCountDeltaForOp(entry); delta.has_value()) {
         recordCollectionSizeCountDelta(*entryUuid, *delta, sizeCountDeltasOut);
         return 1;
     }
+
     return 0;
 }
 
@@ -333,13 +372,22 @@ int extractSizeCountDeltasForApplyOps(const repl::OplogEntry& applyOpsEntry,
 OplogScanResult aggregateSizeCountDeltasInOplog(SeekableRecordCursor& oplogCursor,
                                                 const Timestamp& seekAfterTS,
                                                 const boost::optional<UUID>& uuidFilter,
-                                                bool isCheckpoint) {
+                                                bool isCheckpoint,
+                                                const boost::optional<UUID>& oplogUuid) {
     OplogScanResult result;
     RecordId seekRid =
         massertStatusOK(record_id_helpers::keyForOptime(seekAfterTS, KeyFormat::Long));
 
+    const bool trackOplog = oplogUuid.has_value();
+
     for (auto rec = oplogCursor.seek(seekRid, SeekableRecordCursor::BoundInclusion::kExclude); rec;
          rec = oplogCursor.next()) {
+
+        if (trackOplog) {
+            result.deltas[*oplogUuid].sizeCount.size += static_cast<int64_t>(rec->data.size());
+            result.deltas[*oplogUuid].sizeCount.count += 1;
+        }
+
         const auto entry = massertStatusOK(repl::OplogEntry::parse(rec->data.toBson()));
         const auto& nss = entry.getNss();
         // Do not advance lastTimestamp for writes to the fast count store collections themselves.
@@ -358,6 +406,17 @@ OplogScanResult aggregateSizeCountDeltasInOplog(SeekableRecordCursor& oplogCurso
             recordCheckpointSizeCountEntryProcessed(numSizeCountEntries);
         }
     }
+
+    // If we did not advance the timestamp (i.e, we did not see any oplog entries for operations
+    // that were not on the fast count collections themselves), we shouldn't persist any deltas. We
+    // update the delta entry for the oplogUuid unconditionally, so if we only saw oplog entries on
+    // fast count collections we should remove the entry here and keep 'deltas' empty.
+    // The size and count of oplog entries operating on fast count collections will be included in
+    // the next checkpoint pass that includes operations on non-fast-count collections.
+    if (isCheckpoint && trackOplog && !result.lastTimestamp) {
+        result.deltas.erase(*oplogUuid);
+    }
+
     return result;
 }
 
@@ -366,6 +425,13 @@ void readAndIncrementSizeCounts(OperationContext* opCtx, SizeCountDeltas& deltas
     const CollectionPtr& coll = acquisition.getCollectionPtr();
 
     for (auto& [uuid, delta] : deltas) {
+        // Only incorporate persisted size/count for collections that were not created or dropped in
+        // this checkpoint window. kCreated has no prior persisted entry, kDropped will be removed,
+        // and kDroppedAndRecreated represents a new collection that should ignore previous stale,
+        // persisted size/count data.
+        if (delta.state != DDLState::kNone) {
+            continue;
+        }
         const RecordId rid = record_id_helpers::keyForDoc(
                                  BSON("_id" << uuid),
                                  clustered_util::makeDefaultClusteredIdIndex().getIndexSpec(),
@@ -380,6 +446,5 @@ void readAndIncrementSizeCounts(OperationContext* opCtx, SizeCountDeltas& deltas
     }
 }
 }  // namespace replicated_fast_count
-
 
 }  // namespace mongo
