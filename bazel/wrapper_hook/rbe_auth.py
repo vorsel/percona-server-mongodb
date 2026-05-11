@@ -44,6 +44,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Optional
 
 # --- Buildfarm identity (see module docstring on resolution order) ---
 # Hardcode this once IT issues a permanent buildfarm hostname; until
@@ -85,7 +86,7 @@ class RbeAuthError(RuntimeError):
     message — which is brittle to wording changes.
     """
 
-    def __init__(self, *args, error_code: str | None = None):
+    def __init__(self, *args, error_code: Optional[str] = None):
         super().__init__(*args)
         self.error_code = error_code
 
