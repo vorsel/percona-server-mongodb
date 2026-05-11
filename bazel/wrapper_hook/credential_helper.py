@@ -248,9 +248,7 @@ def _post_form(url: str, form: dict) -> dict:
         raise rbe_auth.RbeAuthError(f"network error talking to {url}: {e}")
 
 
-def _exchange_jenkins_token(
-    jenkins_jwt: str, issuer: str, audience: str, connector_id: str
-) -> str:
+def _exchange_jenkins_token(jenkins_jwt: str, issuer: str, audience: str, connector_id: str) -> str:
     """Run RFC 8693 token-exchange against Dex, return the Dex id_token."""
     resp = _post_form(
         f"{issuer.rstrip('/')}/token",
@@ -330,8 +328,7 @@ def _read_jenkins_jwt() -> tuple[str | None, str]:
         if tok:
             return (tok, "file")
         _debug(
-            f"{JENKINS_TOKEN_FILE_ENV}={file_path} but file missing/empty — "
-            "falling back to env"
+            f"{JENKINS_TOKEN_FILE_ENV}={file_path} but file missing/empty — " "falling back to env"
         )
     tok = os.environ.get(JENKINS_TOKEN_ENV, "").strip()
     if tok:
@@ -359,10 +356,7 @@ def _exchange_with_retry(
         msg = str(e)
         if not any(code in msg for code in DEX_RETRYABLE_ERRORS):
             raise
-        _debug(
-            f"first exchange failed ({msg}); re-reading sidecar file and "
-            "retrying once"
-        )
+        _debug(f"first exchange failed ({msg}); re-reading sidecar file and " "retrying once")
         fresh, fresh_source = _read_jenkins_jwt()
         if not fresh or fresh_source != "file":
             raise
@@ -375,9 +369,7 @@ def _from_jenkins_env() -> str | None:
         return None
     issuer = os.environ.get(OIDC_ISSUER_ENV, "").strip()
     audience = os.environ.get(OIDC_AUDIENCE_ENV, "").strip() or "bazel-jenkins"
-    connector_id = (
-        os.environ.get(OIDC_CONNECTOR_ENV, "").strip() or DEFAULT_CONNECTOR_ID
-    )
+    connector_id = os.environ.get(OIDC_CONNECTOR_ENV, "").strip() or DEFAULT_CONNECTOR_ID
     if not issuer:
         raise rbe_auth.RbeAuthError(
             f"{JENKINS_TOKEN_ENV}/{JENKINS_TOKEN_FILE_ENV} is set but "

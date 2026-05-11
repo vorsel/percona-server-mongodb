@@ -17,6 +17,7 @@ from bazel.wrapper_hook.wrapper_util import get_terminal_stream
 
 wrapper_debug(f"wrapper hook script is using {sys.executable}")
 
+
 # Append new_args before the '--' separator if it exists
 def append_args(args, new_args):
     if "--" in args:
@@ -24,6 +25,7 @@ def append_args(args, new_args):
         return args[:separator_index] + new_args + args[separator_index:]
     else:
         return args + new_args
+
 
 def _supports_color(stream):
     if os.name == "nt":
@@ -148,7 +150,9 @@ def main():
                 print(
                     f"{enterprise_mod.relative_to(REPO_ROOT).as_posix()} missing, defaulting to local non-enterprise build (--config=local --//bazel/config:build_enterprise=False). Add the directory to not automatically add these options."
                 )
-                args = append_args(args, ["--config=local", "--//bazel/config:build_enterprise=False"])
+                args = append_args(
+                    args, ["--config=local", "--//bazel/config:build_enterprise=False"]
+                )
 
         atlas_mod = REPO_ROOT / "src" / "mongo" / "db" / "modules" / "atlas"
         if not atlas_mod.exists():
@@ -219,9 +223,7 @@ def main():
                     "skipping pre-flight (credential_helper will handle CI auth)"
                 )
             else:
-                wrapper_debug(
-                    "rbe_auth: --config=psmdb_buildfarm detected, priming OIDC cache"
-                )
+                wrapper_debug("rbe_auth: --config=psmdb_buildfarm detected, priming OIDC cache")
                 pre = rbe_auth.status()
                 wrapper_debug(
                     f"rbe_auth: cache before — present={pre.get('present')} "

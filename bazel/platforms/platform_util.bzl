@@ -12,9 +12,7 @@ def setup_platform(arch, distro_or_os, cache_silo):
     # and maintenance procedure.
     psmdb_entry = PSMDB_REMOTE_EXECUTION_CONTAINERS.get(distro_or_os)
     container_url = (
-        psmdb_entry["container-url"]
-        if psmdb_entry
-        else REMOTE_EXECUTION_CONTAINERS[distro_or_os]["container-url"]
+        psmdb_entry["container-url"] if psmdb_entry else REMOTE_EXECUTION_CONTAINERS[distro_or_os]["container-url"]
     )
 
     exec_properties = {
