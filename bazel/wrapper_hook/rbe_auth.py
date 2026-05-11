@@ -209,7 +209,7 @@ def _post_form(url: str, form: dict) -> dict:
         with urllib.request.urlopen(
             req, context=_ssl_context(), timeout=HTTP_TIMEOUT_SECONDS
         ) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         # Dex returns OAuth-format JSON errors (e.g. invalid_grant,
         # authorization_pending) with non-2xx status. Surface the body
@@ -221,6 +221,18 @@ def _post_form(url: str, form: dict) -> dict:
             raise RbeAuthError(f"HTTP {e.code} from {url}: {e.reason}")
     except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as e:
         raise RbeAuthError(f"network error talking to {url}: {e}")
+    # 2xx path: read succeeded, but a transparent proxy / captive
+    # portal can still hand back HTML or a truncated body. Validate
+    # JSON shape and re-raise as RbeAuthError so callers (and the
+    # credential-helper subprocess) get a controlled, user-facing
+    # failure instead of a raw json.JSONDecodeError traceback.
+
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as e:
+        raise RbeAuthError(
+            f"non-JSON 2xx response from {url} ({e}); " f"first 200 chars: {body[:200]!r}"
+        )
 
 
 # ---------------------------------------------------------------------
