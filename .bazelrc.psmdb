@@ -153,19 +153,28 @@ common:psmdb_opt_release --//bazel/config:release=True
 # transparently rotates through fresh tokens without restart.
 #
 # The helper resolves a token in this priority order:
-#   1. PSMDB_RBE_DEX_TOKEN     — pre-exchanged Dex JWT (simple CI path)
-#   2. PSMDB_RBE_JENKINS_TOKEN — Jenkins-issued OIDC subject token,
-#      exchanged at the Dex /token endpoint via RFC 8693 token-exchange
-#      against the `bazel-jenkins` static client (see dex.yaml). Cached
-#      in ~/.cache/rbe/ci_token.json. Requires PSMDB_RBE_OIDC_ISSUER.
-#   3. ~/.cache/rbe/token.json — user cache seeded by either
+#   1. PSMDB_RBE_DEX_TOKEN          — pre-exchanged Dex JWT (simple CI
+#      path; no exchange step, the JWT is already a Dex id_token).
+#   2. PSMDB_RBE_JENKINS_TOKEN_FILE — path to a Jenkins-issued OIDC
+#      subject token on disk. The pipeline-side sidecar atomic-renames
+#      a fresh JWT into this path every TTL/2 min so a build outliving
+#      one Jenkins-OIDC TTL stays authenticated. Preferred CI config.
+#      Exchanged at the Dex /token endpoint via RFC 8693 token-exchange
+#      against the `bazel-jenkins` static client (see dex.yaml). Dex
+#      response cached in ~/.cache/rbe/ci_token.json. Requires
+#      PSMDB_RBE_OIDC_ISSUER.
+#   3. PSMDB_RBE_JENKINS_TOKEN      — same exchange as (2), but the
+#      Jenkins JWT itself sits in an env var instead of a file. Dev /
+#      test fallback only; production CI should use the _FILE variant
+#      so mid-build re-read can survive the OIDC-token TTL.
+#   4. ~/.cache/rbe/token.json      — user cache seeded by either
 #      `percona-packaging/scripts/rbe_login.py` or by wrapper_hook.py
 #      pre-flight on a developer workstation (Device Code flow). The
 #      helper itself never opens a Device Code flow — it has no TTY.
 #
 # wrapper_hook.py performs the pre-flight (cache prime / Device Code)
-# only when none of PSMDB_RBE_DEX_TOKEN / PSMDB_RBE_JENKINS_TOKEN are
-# set, so CI runs go straight to the helper.
+# only when NONE of PSMDB_RBE_DEX_TOKEN / PSMDB_RBE_JENKINS_TOKEN_FILE /
+# PSMDB_RBE_JENKINS_TOKEN is set, so CI runs go straight to the helper.
 #
 # `--remote_instance_name=hardlinking` is the cluster-side mount that
 # hardlinks CAS blobs into the worker FS — same identifier the
