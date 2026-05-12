@@ -1263,5 +1263,11 @@ error_codes:
       categories: [StreamProcessorUserError, StreamProcessorRetryableError],
     }
 
+  - {
+      code: 505,
+      name: InterruptedDueToLogServerDisconnect,
+      categories: [Interruption],
+    }
+
   # ^^^^
   # Add new codes, sequentially numbered, above.
