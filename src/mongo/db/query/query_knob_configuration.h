@@ -31,6 +31,8 @@
 
 #include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_integration_knobs_gen.h"
+#include "mongo/db/query/query_knob.h"
+#include "mongo/db/query/query_knob_snapshot.h"
 #include "mongo/db/query/query_optimization_knobs_gen.h"
 #include "mongo/db/query/query_settings/query_settings_gen.h"
 #include "mongo/util/modules.h"
@@ -47,6 +49,14 @@ public:
      * override the query knob values.
      */
     QueryKnobConfiguration(const query_settings::QuerySettings& querySettings);
+
+    /**
+     * Read a knob value from the snapshot. T is deduced from the descriptor.
+     */
+    template <typename T>
+    T get(const QueryKnob<T>& knob) const {
+        return _snapshot.get<T>(knob.id);
+    }
 
     QueryFrameworkControlEnum getInternalQueryFrameworkControlForOp() const;
     QueryPlanRankerModeEnum getPlanRankerMode() const;
@@ -120,47 +130,6 @@ public:
     bool getEnablePipelineOptimizationAdditionalTestingRules() const;
 
 private:
-    QueryFrameworkControlEnum _queryFrameworkControlValue;
-    QueryPlanRankerModeEnum _planRankerMode;
-    QueryPlanRankingStrategyForAutomaticQueryPlanRankerModeEnum
-        _planRankingStrategyForAutomaticQueryPlanRankerMode;
-    SamplingConfidenceIntervalEnum _samplingConfidenceInterval;
-    SamplingCEMethodEnum _samplingCEMethod;
-    int64_t _numChunksForChunkBasedSampling;
-    double _samplingMarginOfError;
-    SbeHashAggIncreasedSpillingModeEnum _sbeHashAggIncreasedSpillingMode;
-    size_t _planEvaluationMaxResults;
-    size_t _plannerMaxIndexedSolutions;
-    double _planEvaluationCollFraction;
-    double _planTotalEvaluationCollFraction;
-    size_t _maxScansToExplodeValue;
-    bool _sbeDisableGroupPushdownValue;
-    bool _sbeDisableLookupPushdownValue;
-    bool _sbeDisableTimeSeriesValue;
-    bool _measureQueryExecutionTimeInNanoseconds;
-    bool _useMultiplannerForSingleSolutions;
-
-    // Join-ordering values.
-    bool _isJoinOrderingEnabled;
-    int64_t _randomJoinOrderSeed;
-    JoinReorderModeEnum _joinReorderMode;
-    JoinPlanTreeShapeEnum _joinPlanTreeShape;
-    ForcedJoinMethodEnum _joinMethod;
-    int64_t _maxNodesInJoinGraph;
-    int64_t _maxEdgesInJoinGraph;
-    int64_t _maxNumberNodesConsideredForImplicitEdges;
-    bool _enableJoinEnumerationHJOrderPruning;
-    int64_t _internalJoinPlanSamplingSize;
-    bool _internalJoinEnumerateCollScanPlans;
-    size_t _minAllPlansEnumerationSubsetLevel;
-    size_t _maxAllPlansEnumerationSubsetLevel;
-    bool _enableJoinOptimizationUseIndexUniqueness;
-    SamplingCEMethodEnum _joinSamplingCEMethod;
-
-    int64_t _internalQuerySpillingMinAvailableDiskSpaceBytes;
-    int64_t _internalMaxGroupAccumulatorsInSbe;
-
-    bool _enablePathArrayness;
-    bool _enablePipelineOptimizationAdditionalTestingRules;
+    QueryKnobSnapshot _snapshot;
 };
 }  // namespace mongo

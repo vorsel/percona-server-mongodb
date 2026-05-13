@@ -30,8 +30,10 @@
 #include "mongo/db/index_builds/multi_index_block.h"
 
 #include "mongo/base/error_codes.h"
+#include "mongo/db/collection_crud/container_write.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/preallocated_container_pool.h"
 #include "mongo/db/index_builds/multi_index_block_gen.h"
 #include "mongo/db/index_builds/resumable_index_builds_common.h"
 #include "mongo/db/namespace_string.h"
@@ -58,6 +60,8 @@
 #include "mongo/util/assert_util.h"
 #include "mongo/util/scopeguard.h"
 #include "mongo/util/str.h"
+
+#include <variant>
 
 #include <boost/optional/optional.hpp>
 #include <fmt/format.h>
@@ -1436,44 +1440,58 @@ TEST_F(MultiIndexBlockTest, AbortWithNoCommitTimestampDropsImmediately) {
         *shard_role_details::getRecoveryUnit(operationContext()), sideWritesIdent));
 }
 
-// OpObserver that records integer-keyed onContainerInsert/onContainerUpdate calls so tests can
-// verify that _writeStateToContainer went through the container_write path (which
-// fires the observer).
+// OpObserver that records onContainerInsert/onContainerUpdate calls so tests can verify that
+// _writeStateToContainer went through the container_write path (which fires the observer).
 class ResumeStateContainerInsertObserver : public OpObserverNoop {
 public:
-    using OpObserverNoop::onContainerInsert;
-    using OpObserverNoop::onContainerUpdate;
-
     void onContainerInsert(OperationContext*,
                            StringData ident,
                            int64_t key,
                            std::span<const char> value) override {
-        intInserts.push_back({std::string{ident}, key, std::string{value.begin(), value.end()}});
+        inserts.push_back({std::string{ident}, key, std::string{value.begin(), value.end()}});
+    }
+
+    void onContainerInsert(OperationContext*,
+                           StringData ident,
+                           std::span<const char> key,
+                           std::span<const char> value) override {
+        inserts.push_back({std::string{ident},
+                           std::string{key.begin(), key.end()},
+                           std::string{value.begin(), value.end()}});
     }
 
     void onContainerUpdate(OperationContext*,
                            StringData ident,
                            int64_t key,
                            std::span<const char> value) override {
-        intUpdates.push_back({std::string{ident}, key, std::string{value.begin(), value.end()}});
+        updates.push_back({std::string{ident}, key, std::string{value.begin(), value.end()}});
+    }
+
+    void onContainerUpdate(OperationContext*,
+                           StringData ident,
+                           std::span<const char> key,
+                           std::span<const char> value) override {
+        updates.push_back({std::string{ident},
+                           std::string{key.begin(), key.end()},
+                           std::string{value.begin(), value.end()}});
     }
 
     struct Op {
         std::string ident;
-        int64_t key;
+        std::variant<int64_t, std::string> key;
         std::string value;
     };
-    std::vector<Op> intInserts;
-    std::vector<Op> intUpdates;
+    std::vector<Op> inserts;
+    std::vector<Op> updates;
 
     size_t countInsertsForIdent(StringData ident) const {
         return std::count_if(
-            intInserts.begin(), intInserts.end(), [&](const Op& op) { return op.ident == ident; });
+            inserts.begin(), inserts.end(), [&](const Op& op) { return op.ident == ident; });
     }
 
     size_t countUpdatesForIdent(StringData ident) const {
         return std::count_if(
-            intUpdates.begin(), intUpdates.end(), [&](const Op& op) { return op.ident == ident; });
+            updates.begin(), updates.end(), [&](const Op& op) { return op.ident == ident; });
     }
 };
 
@@ -1542,6 +1560,105 @@ KReplicateBuildHandle setUpKReplicatePrimaryDrivenBuild(OperationContext* opCtx,
     return {buildUUID, std::move(indexBuildInfo), ident::generateNewIndexBuildIdent(buildUUID)};
 }
 
+TEST_F(MultiIndexBlockTest, CommitToleratesKeysAlreadyInContainer) {
+    RAIIServerParameterControllerForTest ffContainerWrites{"featureFlagContainerWrites", true};
+    RAIIServerParameterControllerForTest ffPDIB{"featureFlagPrimaryDrivenIndexBuilds", true};
+    RAIIServerParameterControllerForTest ffResumable{"featureFlagResumablePrimaryDrivenIndexBuilds",
+                                                     true};
+
+    promoteMockReplCoordToPrimary(getServiceContext());
+    static_cast<repl::ReplicationCoordinatorMock*>(
+        repl::ReplicationCoordinator::get(getServiceContext()))
+        ->alwaysAllowWrites(true);
+
+    auto& observer = installResumeStateContainerObserver(operationContext());
+
+    auto indexer = getIndexer();
+    indexer->setBuildUUID(UUID::gen());
+    indexer->setIndexBuildMethod(IndexBuildMethodEnum::kPrimaryDriven);
+    indexer->setContainerWriteBehavior(ContainerWriteBehavior::kReplicate);
+    indexer->setIsResumable(true);
+
+    AutoGetCollection autoColl(operationContext(), getNSS(), MODE_X);
+    CollectionWriter coll(operationContext(), autoColl);
+
+    {
+        WriteUnitOfWork wuow{operationContext()};
+        ASSERT_OK(Helpers::insert(operationContext(), *autoColl, BSON("_id" << 0 << "a" << 1)));
+        wuow.commit();
+    }
+
+    auto* storageEngine = operationContext()->getServiceContext()->getStorageEngine();
+    auto indexBuildInfo =
+        IndexBuildInfo(BSON("key" << BSON("a" << 1) << "name"
+                                  << "a_1"
+                                  << "v" << static_cast<int>(IndexConfig::kLatestIndexVersion)),
+                       "index-1",
+                       *storageEngine);
+
+    ASSERT_OK(indexer->init(operationContext(),
+                            coll,
+                            {indexBuildInfo},
+                            MultiIndexBlock::kNoopOnInitFn,
+                            MultiIndexBlock::InitMode::SteadyState,
+                            boost::none));
+    ASSERT_OK(indexer->insertAllDocumentsInCollection(operationContext(), getNSS()));
+
+    auto* indexEntry = autoColl->getIndexCatalog()->findIndexByName(
+        operationContext(), "a_1", IndexCatalog::InclusionPolicy::kUnfinished);
+    ASSERT(indexEntry);
+    auto* iam = indexEntry->accessMethod()->asSortedData();
+    ASSERT(iam);
+
+    auto record = autoColl->getCursor(operationContext())->next();
+    ASSERT(record);
+    auto recordId = record->id;
+
+    auto& containerPool = PreallocatedContainerPool::get(operationContext());
+    SharedBufferFragmentBuilder pooledBuilder{1024};
+    KeyStringSet keys;
+    KeyStringSet multikeyMetadataKeys;
+    auto multikeyPaths = containerPool.multikeyPaths();
+    iam->getKeys(operationContext(),
+                 *autoColl,
+                 indexEntry,
+                 pooledBuilder,
+                 BSON("_id" << 0 << "a" << 1),
+                 InsertDeleteOptions::ConstraintEnforcementMode::kEnforceConstraints,
+                 SortedDataIndexAccessMethod::GetKeysContext::kAddingKeys,
+                 &keys,
+                 &multikeyMetadataKeys,
+                 multikeyPaths.get(),
+                 recordId);
+    ASSERT_EQ(keys.size(), 1);
+
+    {
+        WriteUnitOfWork wuow{operationContext()};
+        ASSERT_OK(container_write::insert(operationContext(),
+                                          *shard_role_details::getRecoveryUnit(operationContext()),
+                                          iam->getSortedDataInterface()->getContainer(),
+                                          keys.begin()->getView(),
+                                          keys.begin()->getTypeBitsView(),
+                                          container::ExistingKeyPolicy::overwrite));
+        wuow.commit();
+    }
+
+    auto insertsBefore = observer.countInsertsForIdent(indexBuildInfo.indexIdent);
+    EXPECT_GT(insertsBefore, 0);
+
+    {
+        WriteUnitOfWork wuow{operationContext()};
+        ASSERT_OK(indexer->commit(operationContext(),
+                                  coll.getWritableCollection(operationContext()),
+                                  MultiIndexBlock::kNoopOnCreateEachFn,
+                                  MultiIndexBlock::kNoopOnCommitFn));
+        wuow.commit();
+    }
+
+    // The commit should have skipped the key that was previously inserted.
+    EXPECT_EQ(observer.countInsertsForIdent(indexBuildInfo.indexIdent), insertsBefore);
+}
+
 // persistResumeState for a primary-driven build with kReplicate goes through the container_write
 // API: a single record is written at the fixed resume-state key, the OpObserver sees one
 // onContainerInsert against the per-build ident, and the persisted document parses as
@@ -1591,10 +1708,10 @@ TEST_F(MultiIndexBlockTest, PersistResumeStateUsesContainerWrites) {
 
     // The observer's buffered BSONObj parses to the same buildUUID we read from the ident.
     auto resumeIt =
-        std::find_if(observer.intInserts.begin(), observer.intInserts.end(), [&](const auto& ins) {
+        std::find_if(observer.inserts.begin(), observer.inserts.end(), [&](const auto& ins) {
             return ins.ident == handle.indexBuildIdent;
         });
-    ASSERT_NOT_EQUALS(resumeIt, observer.intInserts.end());
+    ASSERT_NOT_EQUALS(resumeIt, observer.inserts.end());
     EXPECT_EQ(
         handle.buildUUID,
         ResumeIndexInfo::parse(BSONObj(resumeIt->value.data()), IDLParserContext("ResumeIndexInfo"))
@@ -1764,7 +1881,7 @@ TEST_F(MultiIndexBlockTest, HybridBuildDoesNotUseContainerWrites) {
     indexer->persistResumeState(operationContext(), coll.get());
 
     // Hybrid builds use the regular RecordStore path, so the OpObserver sees no container ops.
-    ASSERT_EQUALS(0U, observer.intInserts.size());
+    ASSERT_EQUALS(0U, observer.inserts.size());
 
     indexer->abortIndexBuild(operationContext(), coll, MultiIndexBlock::kNoopOnCleanUpFn);
 }
@@ -2063,14 +2180,14 @@ TEST_F(MultiIndexBlockTest, LoadWritesResumeStatePeriodicallyForPrimaryDrivenBui
     // load phase (kBulkLoad), proving the writes really come from this code path and not from
     // init / collection-scan.
     std::vector<ResumeIndexInfo> persistedStates;
-    for (const auto& op : observer.intInserts) {
+    for (const auto& op : observer.inserts) {
         if (op.ident == indexBuildIdent) {
             BSONObj obj(op.value.data());
             persistedStates.push_back(
                 ResumeIndexInfo::parse(obj, IDLParserContext("ResumeIndexInfo")));
         }
     }
-    for (const auto& op : observer.intUpdates) {
+    for (const auto& op : observer.updates) {
         if (op.ident == indexBuildIdent) {
             BSONObj obj(op.value.data());
             persistedStates.push_back(
