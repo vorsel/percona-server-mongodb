@@ -9,8 +9,25 @@ common --experimental_remote_downloader=
 common --remote_cache=
 common --bes_backend=
 common --bes_results_url=
-common --tls_client_certificate=
-common --tls_client_key=
+# Do NOT uncomment the two lines below. They were here to "clear" the
+# upstream defaults but the empty value is itself a trap:
+#
+#common --tls_client_certificate=
+#common --tls_client_key=
+#
+# Bazel's options parser stores whatever string follows the `=` as the
+# field value, including the empty string. There is NO sentinel ("",
+# "null", "unset", "/dev/null") that means "unset" for a String option
+# — only OMITTING the flag entirely yields Java null, which is the
+# real "no client cert" state. With grpcs:// endpoints (e.g. our
+# buildfarm — endpoint passed via --remote_executor on the bazel build
+# command line) Bazel feeds the value straight into
+# GoogleAuthUtils.createSSlContext → Netty → PemReader,
+# which tries to open the path '' as a PEM file and crashes:
+#   Failed to init TLS infrastructure using '' as client certificate:
+#   File does not contain valid certificates:
+# Our buildfarm is server-side TLS only (Envoy doesn't request a
+# client cert), so omitting both flags is correct.
 common --remote_cache_compression=false
 common --remote_upload_local_results=false
 common --grpc_keepalive_time=0s
@@ -91,6 +108,168 @@ common:psmdb_opt --//bazel/config:dbg=False
 common:psmdb_opt_release --config=psmdb_opt
 common:psmdb_opt_release --//bazel/config:linkstatic=True
 common:psmdb_opt_release --//bazel/config:release=True
+
+################################################################################
+# PSMDB RBE (psmdb_buildfarm) profile
+################################################################################
+# Activate the on-demand RBE cluster for remote execution + cache. This
+# overrides the unconditional "remote disabled" defaults at the top of this
+# file by re-pointing every transport. Use it whenever you want a build to
+# dispatch CppCompile actions to remote workers.
+#
+# Routing: PSMDB's bazel/platforms/psmdb_rbe_containers.bzl pins each
+# supported distro_or_os key to an immutable Docker Hub image tag at
+# docker.io/perconalab/psmdb-rbe (`:<distro>-<psmdb-version>-<git-sha>`,
+# distro carried in the tag, single repository). That URL is
+# byte-for-byte what the RBE scheduler uses as the routing key against
+# worker queues. When the git-sha suffixes are bumped, action cache
+# naturally invalidates because the routing key (a platform property)
+# is part of the Bazel action digest.
+#
+# Endpoint: grpcs:// (TLS terminated by Envoy on the central node), with
+# a hostname the Let's Encrypt cert is issued for. The hostname resolves
+# to a Hetzner Floating IP pinned to the central VM (survives VM redeploy);
+# the primary IP rotates and is intentionally not used.
+#
+# Endpoint URLs are NOT hardcoded in this file. They are passed at
+# `bazel build` time via four CLI flags below (--remote_executor,
+# --remote_cache, --bes_backend, --bes_results_url) — the values are
+# left empty here so a CLI override fully populates them. The OIDC
+# issuer URL similarly comes from the PSMDB_RBE_OIDC_ISSUER env var
+# read by bazel/wrapper_hook/rbe_auth.py at runtime (or from a hardcoded
+# constant once IT issues a permanent buildfarm hostname).
+#
+# Auth: PSMDB-2034 — authentication is driven by Bazel's
+# CredentialHelper protocol. The helper lives at
+# `bazel/wrapper_hook/credential_helper.py` and is wired in via a
+# `--credential_helper=bb-psmdb.net=...` flag passed at
+# `bazel build` time (NOT pinned in this file — see the comment by
+# the empty endpoint flags below for why). A single FQDN pattern
+# covers BOTH the :8981 (RBE) and :1985 (BES) listeners on
+# bb-psmdb.net — Bazel matches the URI host without the port.
+# Bazel invokes the helper on every gRPC channel for this config and
+# caches the returned Bearer until the JWT's `exp - 60s`. As the
+# deadline approaches Bazel re-invokes the helper, so a long build
+# transparently rotates through fresh tokens without restart.
+#
+# The helper resolves a token in this priority order:
+#   1. PSMDB_RBE_DEX_TOKEN          — pre-exchanged Dex JWT (simple CI
+#      path; no exchange step, the JWT is already a Dex id_token).
+#   2. PSMDB_RBE_JENKINS_TOKEN_FILE — path to a Jenkins-issued OIDC
+#      subject token on disk. The pipeline-side sidecar atomic-renames
+#      a fresh JWT into this path every TTL/2 min so a build outliving
+#      one Jenkins-OIDC TTL stays authenticated. Preferred CI config.
+#      Exchanged at the Dex /token endpoint via RFC 8693 token-exchange
+#      against the `bazel-jenkins` static client (see dex.yaml). Dex
+#      response cached in ~/.cache/rbe/ci_token.json. Requires
+#      PSMDB_RBE_OIDC_ISSUER.
+#   3. PSMDB_RBE_JENKINS_TOKEN      — same exchange as (2), but the
+#      Jenkins JWT itself sits in an env var instead of a file. Dev /
+#      test fallback only; production CI should use the _FILE variant
+#      so mid-build re-read can survive the OIDC-token TTL.
+#   4. ~/.cache/rbe/token.json      — user cache seeded by either
+#      `percona-packaging/scripts/rbe_login.py` or by wrapper_hook.py
+#      pre-flight on a developer workstation (Device Code flow). The
+#      helper itself never opens a Device Code flow — it has no TTY.
+#
+# wrapper_hook.py performs the pre-flight (cache prime / Device Code)
+# only when NONE of PSMDB_RBE_DEX_TOKEN / PSMDB_RBE_JENKINS_TOKEN_FILE /
+# PSMDB_RBE_JENKINS_TOKEN is set, so CI runs go straight to the helper.
+#
+# `--remote_instance_name=hardlinking` is the cluster-side mount that
+# hardlinks CAS blobs into the worker FS — same identifier the
+# scheduler's predeclared queues are anchored on.
+--config=psmdb_buildfarm
+common:psmdb_buildfarm --remote_executor=
+common:psmdb_buildfarm --remote_cache=
+
+# NOTE: --credential_helper is intentionally NOT pinned in this file.
+# It must be passed at `bazel build` time the same way the four
+# endpoint URLs above are. Use the `%workspace%/` prefix so the
+# helper script is resolved relative to the Bazel workspace root —
+# Bazel's UnresolvedScopedCredentialHelperConverter rejects raw
+# relative paths that contain separators ("Path '<x>' must either
+# be absolute or not contain any path separators"). Only three
+# forms are accepted: absolute path, bare binary name (looked up
+# in $PATH), or `%workspace%/...`:
+#
+#   --credential_helper=bb-psmdb.net=%workspace%/bazel/wrapper_hook/credential_helper.py
+#
+# Pinning an EMPTY value (`common:psmdb_buildfarm --credential_helper=`)
+# would not just be a silent trap like the commented-out
+# --tls_client_certificate= block at the top of this file — it
+# would actively break the build, because the same converter
+# explicitly rejects empty input with OptionsParsingException
+# during bazelrc parsing, before any CLI override has a chance
+# to take effect. Keep the matching CLI call-site in
+# psmdb_buildfarm.env.local (developer copy-paste) and in the
+# Jenkins pipeline (CI).
+
+# PSMDB-2034: Build Event Stream → bb-portal (build observability).
+# Same TLS+JWT path as --remote_executor (Envoy on the central node has
+# a second BES listener wired to the bb-portal-backend BES gRPC server,
+# validating the same Dex-issued JWTs). The bes_results_url path is
+# what bb-portal's own frontend serves — the UI generates this exact
+# pair when prompting clients to point at it. The credential_helper
+# directive above attaches the Authorization header on this channel
+# automatically; no separate --bes_header is required.
+common:psmdb_buildfarm --bes_backend=
+common:psmdb_buildfarm --bes_results_url=
+common:psmdb_buildfarm --remote_instance_name=hardlinking
+common:psmdb_buildfarm --remote_timeout=3600
+
+# NOTE: --remote_cache_compression is intentionally NOT enabled here.
+# Inherits the file-wide default (false). The central node's CAS frontend
+# does not advertise zstd compression support; turning compression on
+# breaks every action with "remote does not support compression".
+common:psmdb_buildfarm --remote_upload_local_results=true
+
+# Override the file-wide --grpc_keepalive_time=0s default. 0s disables
+# keepalive entirely, which Bazel rejects when --remote_executor is set
+# ("keepalive time must be positive"). 30s matches Bazel's documented
+# recommendation for long-lived RBE channels. Pair with a 10s ack timeout
+# below so a half-broken connection (e.g. an Envoy worker thread that
+# stopped servicing this stream mid-build) is detected within ~40s
+# instead of hanging until --remote_timeout above.
+common:psmdb_buildfarm --grpc_keepalive_time=30s
+common:psmdb_buildfarm --grpc_keepalive_timeout=10s
+
+# PSMDB-2034: client-side resilience to transient gRPC UNAVAILABLE.
+#
+# In a Jenkins matrix burst, all ~11 stages × ~72 jobs/stage start their
+# Bazel client at roughly the same wall-clock instant. Each client opens
+# 3 channels (executor + cache + BES), so the central Envoy listener
+# takes ~2300 simultaneous TCP SYNs in the first second. Even with the
+# server-side knobs we tuned (tcp_backlog_size: 4096, reuse_port,
+# net.core.somaxconn=65535 — see envoy.yaml + bootstrap_host's sysctl),
+# a small fraction of SYNs may still queue past Bazel's 10 s default
+# SslHandshakeTimeoutException ceiling. Retrying with backoff is cheap
+# and turns those rare-but-still-real handshake misses from build
+# failures into a few extra seconds of wall clock.
+#
+# --remote_retries:        5 attempts (Bazel default; pinned explicitly
+#                          so a future Bazel default change can't make
+#                          our build less resilient).
+# --remote_retry_max_delay 15 s — exponential backoff cap. Bazel computes
+#                          1 s, 2 s, 4 s, 8 s, 15 s on the four retries
+#                          (capped at the max). Total worst-case ~30 s
+#                          before the action falls back to local via the
+#                          spawn_strategy=remote,local rule below.
+common:psmdb_buildfarm --remote_retries=5
+common:psmdb_buildfarm --remote_retry_max_delay=15s
+
+# spawn_strategy: try remote first, fall back to local for actions the
+# remote cluster can't satisfy.
+common:psmdb_buildfarm --spawn_strategy=remote,local
+
+# Per-mnemonic strategies (PSMDB-2034 empirical):
+#   CppCompile : explicit remote,local — primary RBE win, mirrors spawn_strategy
+#                so a future spawn_strategy tweak doesn't accidentally pull
+#                compiles back to local.
+#   CppLink    : pinned local — remote ~2x slowdown vs local.
+#   CppArchive : not pinned — PSMDB sets --skip_archive=True (no actions emitted).
+common:psmdb_buildfarm --strategy=CppCompile=remote,local
+common:psmdb_buildfarm --strategy=CppLink=local
 
 ################################################################################
 # End of Percona-specific build profiles
