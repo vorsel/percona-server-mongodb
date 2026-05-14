@@ -17,6 +17,7 @@ from bazel.wrapper_hook.wrapper_util import get_terminal_stream
 
 wrapper_debug(f"wrapper hook script is using {sys.executable}")
 
+
 # Append new_args before the '--' separator if it exists
 def append_args(args, new_args):
     if "--" in args:
@@ -24,6 +25,28 @@ def append_args(args, new_args):
         return args[:separator_index] + new_args + args[separator_index:]
     else:
         return args + new_args
+
+
+def _has_config_value(args, name: str) -> bool:
+    """True iff `--config=<name>` or `--config <name>` is present in args.
+
+    Bazel accepts both forms; covering only `--config=<name>` lets the
+    space-separated form slip past guards that gate RBE wiring.
+
+    Stop scanning at the `--` separator: anything after it goes to the
+    test/run binary, not to Bazel, so e.g.
+    `bazel test //... -- --config psmdb_buildfarm` must NOT be mis-read
+    as a Bazel config.
+    """
+    for i, a in enumerate(args):
+        if a == "--":
+            return False
+        if a == f"--config={name}":
+            return True
+        if a == "--config" and i + 1 < len(args) and args[i + 1] == name:
+            return True
+    return False
+
 
 def _supports_color(stream):
     if os.name == "nt":
@@ -99,6 +122,7 @@ def main():
     # from bazel.wrapper_hook.git_age_check import check as git_age_check
     from bazel.wrapper_hook.lint import LinterFail
     from bazel.wrapper_hook.plus_interface import check_bazel_command_type, test_runner_interface
+    from bazel.wrapper_hook.rbe_auth import RbeAuthError, RbeAuthRequired, get_id_token
     from bazel.wrapper_hook.write_wrapper_hook_bazelrc import write_wrapper_hook_bazelrc
 
     th_all_header, hdr_state_all_header = spawn_all_headers_thread(REPO_ROOT)
@@ -131,10 +155,25 @@ def main():
         enterprise_mod = REPO_ROOT / "src" / "mongo" / "db" / "modules" / "enterprise"
         if not enterprise_mod.exists():
             enterprise = False
-            print(
-                f"{enterprise_mod.relative_to(REPO_ROOT).as_posix()} missing, defaulting to local non-enterprise build (--config=local --//bazel/config:build_enterprise=False). Add the directory to not automatically add these options."
-            )
-            args = append_args(args, ["--config=local", "--//bazel/config:build_enterprise=False"])
+            # PSMDB-2034: Skip the auto-injection of `--config=local`
+            # when the user has explicitly opted into RBE remote execution
+            # via `--config=psmdb_buildfarm`. Upstream's `--config=local`
+            # resets `--remote_executor` and `--remote_cache` to the empty
+            # string; appended after psmdb_buildfarm it silently turns the
+            # build into a fully local one (Bazel's "later --config wins on
+            # conflicting flags" rule), defeating the whole point of the RBE
+            # flag. `--//bazel/config:build_enterprise=False` is otherwise
+            # compensated for by the file-wide `build --build_enterprise=False`
+            # line in .bazelrc.psmdb plus the explicit
+            # `common:psmdb_buildfarm --//bazel/config:build_enterprise=False`
+            # added in the RBE stanza, so dropping it here is safe.
+            if not _has_config_value(args, "psmdb_buildfarm"):
+                print(
+                    f"{enterprise_mod.relative_to(REPO_ROOT).as_posix()} missing, defaulting to local non-enterprise build (--config=local --//bazel/config:build_enterprise=False). Add the directory to not automatically add these options."
+                )
+                args = append_args(
+                    args, ["--config=local", "--//bazel/config:build_enterprise=False"]
+                )
 
         atlas_mod = REPO_ROOT / "src" / "mongo" / "db" / "modules" / "atlas"
         if not atlas_mod.exists():
@@ -161,6 +200,74 @@ def main():
         except LinterFail:
             # Linter fails preempt bazel run.
             sys.exit(3)
+
+        # PSMDB-2034: pre-flight the RBE buildfarm credential cache when
+        # this build is going to talk to the on-demand cluster. Detection
+        # keys off `--config=psmdb_buildfarm` (the only config that
+        # populates --remote_executor / --remote_cache / --bes_backend at
+        # the bazel build command line — see .bazelrc.psmdb). Local /
+        # CI-side EngFlow / public-release builds keep travelling through
+        # engflow_auth above and never hit Dex.
+        #
+        # We do NOT append --remote_header / --bes_header here anymore.
+        # That lived in PSMDB-2043 as a static one-shot Bearer baked
+        # into argv, and it could not survive token expiry mid-build.
+        # Authentication is now driven by Bazel's CredentialHelper
+        # protocol — see `--credential_helper=…=bazel/wrapper_hook/credential_helper.py`
+        # in .bazelrc.psmdb. Bazel re-invokes the helper whenever the
+        # cached entry is about to expire, giving us mid-build rotation
+        # for free.
+        #
+        # The pre-flight here only covers what the helper cannot do
+        # itself: open a Device Code flow on a TTY. The helper runs as
+        # a Bazel subprocess with no controlling terminal, so it can
+        # only refresh, not log in fresh. Running `get_id_token()` here
+        # makes sure the cache is seeded (or freshly refreshed) before
+        # Bazel ever spawns the helper. CI runs that already have a
+        # PSMDB_RBE_DEX_TOKEN / PSMDB_RBE_JENKINS_TOKEN exported skip
+        # the pre-flight entirely — they don't need the local cache,
+        # and forcing a Device Code flow on a non-TTY runner that
+        # *does* have a valid CI token would just fail spuriously.
+        if _has_config_value(args, "psmdb_buildfarm"):
+            from bazel.wrapper_hook import rbe_auth
+
+            # PSMDB_RBE_JENKINS_TOKEN_FILE is the preferred CI subject-token
+            # source (sidecar-rotated path, see credential_helper.py). Treat
+            # it as a CI-token presence signal too, so pre-flight is skipped
+            # whenever credential_helper can authenticate non-interactively.
+            ci_token_present = bool(
+                os.environ.get("PSMDB_RBE_DEX_TOKEN", "").strip()
+                or os.environ.get("PSMDB_RBE_JENKINS_TOKEN", "").strip()
+                or os.environ.get("PSMDB_RBE_JENKINS_TOKEN_FILE", "").strip()
+            )
+            if ci_token_present:
+                wrapper_debug(
+                    "rbe_auth: PSMDB_RBE_DEX_TOKEN / PSMDB_RBE_JENKINS_TOKEN / "
+                    "PSMDB_RBE_JENKINS_TOKEN_FILE set; skipping pre-flight "
+                    "(credential_helper will handle CI auth)"
+                )
+            else:
+                wrapper_debug("rbe_auth: --config=psmdb_buildfarm detected, priming OIDC cache")
+                pre = rbe_auth.status()
+                wrapper_debug(
+                    f"rbe_auth: cache before — present={pre.get('present')} "
+                    f"fresh={pre.get('fresh')} expires_at={pre.get('expires_at', 0)} "
+                    f"sub={pre.get('subject', '')!r}"
+                )
+                try:
+                    run_with_terminal_output(get_id_token)
+                except RbeAuthRequired as e:
+                    _info(f"RBE auth: {e}")
+                    sys.exit(4)
+                except RbeAuthError as e:
+                    _info(f"RBE auth failed: {e}")
+                    sys.exit(4)
+                post = rbe_auth.status()
+                wrapper_debug(
+                    f"rbe_auth: cache after  — present={post.get('present')} "
+                    f"fresh={post.get('fresh')} expires_at={post.get('expires_at', 0)} "
+                    f"groups={post.get('groups')}"
+                )
     else:
         args = sys.argv[2:]
 
