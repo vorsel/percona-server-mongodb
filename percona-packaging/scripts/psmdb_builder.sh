@@ -912,6 +912,50 @@ build_tarball(){
 
     # Finally build Percona Server for MongoDB with SCons
     cd ${PSMDIR_ABS}
+    # OL7-only patch: kernel 3.10 has no <linux/tls.h>. Inject an autoconf-style
+    # kTLS detect into aws-sdk-cpp SConscript so s2n uses its stub fallback.
+    # Local to this build only; the source tree in git stays clean.
+    if [ "x${RHEL}" = "x7" ]; then
+        patch -p1 <<'PATCH_EOF' || { echo "OL7 kTLS patch failed -- aborting build"; exit 1; }
+diff --git a/src/third_party/aws-sdk-cpp/SConscript b/src/third_party/aws-sdk-cpp/SConscript
+--- a/src/third_party/aws-sdk-cpp/SConscript
++++ b/src/third_party/aws-sdk-cpp/SConscript
+@@ -15,6 +15,21 @@ env.Append(CPPPATH=[
+     f"platform/linux_{ARCH}/crt/aws-crt-cpp/generated/include"
+ ])
+
++# kTLS (kernel TLS offload) needs `<linux/tls.h>` with `struct
++# tls12_crypto_info_aes_gcm_128`, which appeared in Linux 4.13. Older kernels
++# (e.g. RHEL/CentOS 7 on 3.10) don't ship the header. `s2n_ktls_crypto.h`
++# provides a stub fallback for that case, so detect availability at configure
++# time instead of assuming presence on every x86_64 Linux build host.
++KTLS_AVAILABLE = False
++if ARCH == AMD64:
++    conf = Configure(env, help=False)
++    KTLS_AVAILABLE = bool(conf.CheckType(
++        'struct tls12_crypto_info_aes_gcm_128',
++        includes='#include <linux/tls.h>\n',
++        language='C',
++    ))
++    env = conf.Finish()
++
+
+ envAwsCJson = env.Clone()
+ envAwsCJson.Append(CPPPATH=["dist/crt/aws-crt-cpp/crt/aws-c-common/source/external"])
+@@ -274,7 +289,10 @@ envAwsS2n.Append(
+         "S2N_MADVISE_SUPPORTED",
+         "S2N_STACKTRACE",
+         "s2n_EXPORTS",
+-    ] + {AMD64: ["S2N_CPUID_AVAILABLE", "S2N_KTLS_SUPPORTED"], ARM64: []}[ARCH],
++    ] + {
++        AMD64: ["S2N_CPUID_AVAILABLE"] + (["S2N_KTLS_SUPPORTED"] if KTLS_AVAILABLE else []),
++        ARM64: [],
++    }[ARCH],
+     CCFLAGS=[
+         # It was required to split the "-include utils/s2n_prelude.h" into two
+         # parts. Otherwise, `gcc` doesn't understand that. Clearly, the parts
+PATCH_EOF
+    fi
     if [ "x${RHEL}" != "x2023" ]; then
         export PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
         pip install --upgrade pip
