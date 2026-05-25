@@ -95,6 +95,15 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install PSMDB build / link dependencies
+        # GHA runners are stock ubuntu-latest; Reuse the canonical installer
+        # so the package set stays in lockstep.
+        run: |
+          set -euo pipefail
+          sudo bash percona-packaging/scripts/psmdb_builder.sh \
+            --builddir=./ \
+            --install_deps=1
+
       - name: Install Bazel
         # Canonical PSMDB Bazel installer — downloads the pinned
         # Bazel binary (S3-hosted, same artefact dev laptops and
@@ -132,30 +141,3 @@ jobs:
             --jobs=300 \
             --credential_helper=bb-psmdb.ddns.net=%workspace%/bazel/wrapper_hook/credential_helper.py \
             ${{ inputs.target }}
-
-      # Temporary diagnostic — print the structure of the Dex-issued JWT
-      # that credential_helper cached, so we can see exactly where the
-      # federated identity claims live (vs `federated_claims.user_id` we
-      # assumed). Sensitive timing fields (exp/iat/*_hash) are stripped;
-      # the audience secret is auto-masked by GitHub. Remove this step
-      # once the RBAC sub-prefix gate is verified end-to-end.
-      - name: Debug — decode cached Dex JWT structure
-        if: failure()
-        run: |
-          set -euo pipefail
-          CACHE=~/.cache/rbe/gha_token.json
-          if [[ ! -f "$CACHE" ]]; then
-            echo "no gha_token.json cached — credential_helper never wrote one"
-            exit 0
-          fi
-          # Extract the JWT payload (second base64url segment), pad,
-          # url→std base64, decode, pretty-print without claims that
-          # leak nothing useful (timestamps, hashes).
-          payload=$(jq -r .id_token "$CACHE" | cut -d. -f2)
-          pad=$(( (4 - ${#payload} % 4) % 4 ))
-          for _ in $(seq 1 "$pad"); do payload="${payload}="; done
-          printf '%s' "$payload" \
-            | tr '_-' '/+' \
-            | base64 -d 2>/dev/null \
-            | jq 'del(.exp,.iat,.at_hash,.c_hash,.nonce)'
-
