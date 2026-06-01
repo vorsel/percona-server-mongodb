@@ -1,0 +1,169 @@
+# PSMDB Bazel RBE smoke-test under GitHub Actions.
+#
+# Template for developers who want to drive a Bazel build against the
+# PSMDB RBE buildfarm from GitHub Actions instead of a laptop / Jenkins
+# pipeline. Copy this file under a new name in this directory, change
+# the trigger / target, and ship.
+#
+# WHY YOU SEE THIS BOILERPLATE
+#
+#   The buildfarm enforces an audience-scoped, environment-scoped
+#   trust boundary at Envoy. Every workflow that talks to the
+#   buildfarm MUST:
+#
+#     1. Declare `permissions: id-token: write` on the job that runs
+#        the build. Without it the GHA runtime refuses to inject the
+#        OIDC-mint env vars (ACTIONS_ID_TOKEN_REQUEST_URL / _TOKEN),
+#        and `bazel/wrapper_hook/credential_helper.py`'s GHA tier
+#        falls through to its lower-priority sources, which (in a
+#        clean GHA runner) all fail too.
+#
+#     2. Declare `environment: rbe` on the job. This is the ONLY way
+#        to make the minted GH OIDC token's `sub` claim carry the
+#        `:environment:rbe` suffix that Envoy's RBAC filter requires
+#        (see envoy.yaml on the buildfarm side). The matching
+#        deployment environment is configured in this repo's
+#        Settings → Environments → rbe. Removing the line makes
+#        Envoy reject every gRPC with HTTP 403.
+#
+#     3. Reference the buildfarm coordination secrets:
+#         * secrets.PSMDB_RBE_OIDC_ISSUER  — Dex issuer URL
+#         * secrets.PSMDB_RBE_GHA_AUDIENCE — soft-secret audience
+#                                            string the Dex github-
+#                                            actions connector pins.
+#        Both are stored in the repo / org Secrets store so GHA
+#        auto-masks them in workflow logs.
+#
+# Triggers: deliberately `workflow_dispatch`-only so this smoke-test
+# never fires on push / pull_request and never burns runner minutes
+# unintentionally. Add other triggers when you fork this file.
+
+name: rbe-smoketest
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Bazel target to build'
+        required: true
+        type: string
+        default: 'install-dist-test'
+      mongo_version:
+        description: 'MONGO_VERSION define passed to Bazel'
+        required: true
+        type: string
+        default: '8.3.0-0'
+
+# Top-level permissions are inherited per-job unless overridden; we
+# scope them tightly here to OIDC-mint + checkout.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rbe-build:
+    name: bazel build via RBE
+    runs-on: ubuntu-latest
+    # 4 hours: deliberately generous so a cold-cache install-dist-test
+    # (~90 min observed on warm) plus first-time runner toolchain
+    # download fits with headroom. Job timeout is the only ceiling
+    # short-circuiting a hung credential helper / Envoy gate.
+    timeout-minutes: 240
+
+    # Deployment environment binds this job to GitHub's `rbe`
+    # environment object — the resulting OIDC token's `sub` claim
+    # becomes `repo:<owner>/<repo>:environment:rbe` (instead of
+    # `:ref:refs/heads/<branch>`), which is the exact-match pattern
+    # Envoy's RBAC filter on the buildfarm enforces. Without this
+    # line the token's `sub` is branch-shaped and Envoy denies the
+    # request with HTTP 403 even though Dex would happily mint the
+    # JWT — defence-in-depth, see auth plan §"Step 5d".
+    environment: rbe
+
+    env:
+      # Coordination strings consumed by the helper's GHA tier
+      # (see bazel/wrapper_hook/credential_helper.py constants
+      # GHA_AUDIENCE_ENV / OIDC_ISSUER_ENV). Stored in repo / org
+      # Secrets so GitHub auto-masks the values in this job's log
+      # output even if `set -x` or curl -v slip in elsewhere.
+      PSMDB_RBE_OIDC_ISSUER: ${{ secrets.PSMDB_RBE_OIDC_ISSUER }}
+      PSMDB_RBE_GHA_AUDIENCE: ${{ secrets.PSMDB_RBE_GHA_AUDIENCE }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install PSMDB build / link dependencies
+        # GHA runners are stock ubuntu-latest; Reuse the canonical installer
+        # so the package set stays in lockstep.
+        run: |
+          set -euo pipefail
+          sudo bash percona-packaging/scripts/psmdb_builder.sh \
+            --builddir=./ \
+            --install_deps=1
+
+      - name: Install Bazel
+        # Canonical PSMDB Bazel installer — downloads the pinned
+        # Bazel binary (S3-hosted, same artefact dev laptops and
+        # Jenkins pipelines use) plus buildozer/buildifier to
+        # $HOME/.local/bin. Using bazelisk directly would deviate
+        # from the rest of the PSMDB build path and risk picking
+        # up a different Bazel version than what the WORKSPACE
+        # was tested against.
+        run: |
+          set -euo pipefail
+          python3 buildscripts/install_bazel.py
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Bazel build via RBE
+        # Same command shape the developer quickstart documents; the
+        # only addition is the credential_helper hooked to the
+        # buildfarm hostname so the helper's GHA tier runs on each
+        # cache miss. Bazel re-invokes the helper as the cached Dex
+        # JWT's `expires` deadline approaches, which keeps long
+        # builds authenticated without a sidecar refresh loop.
+        run: |
+          set -euo pipefail
+          bazel build \
+            --config=psmdb_opt_release \
+            --config=psmdb_buildfarm \
+            --remote_executor=grpcs://bb-psmdb.ddns.net:8981 \
+            --remote_cache=grpcs://bb-psmdb.ddns.net:8981 \
+            --bes_backend=grpcs://bb-psmdb.ddns.net:1985 \
+            --bes_results_url=https://bb-psmdb.ddns.net:7986/bazel-invocations/ \
+            --announce_rc \
+            --strategy=CppCompile=remote,local \
+            --strategy=CppLink=local \
+            --define=MONGO_VERSION=${{ inputs.mongo_version }} \
+            --define=GIT_COMMIT_HASH=$(git rev-parse HEAD) \
+            --jobs=300 \
+            --credential_helper=bb-psmdb.ddns.net=%workspace%/bazel/wrapper_hook/credential_helper.py \
+            ${{ inputs.target }}
+
+      # Temporary diagnostic — print the structure of the Dex-issued JWT
+      # that credential_helper cached, so we can see exactly where the
+      # federated identity claims live (vs `federated_claims.user_id` we
+      # assumed). Sensitive timing fields (exp/iat/*_hash) are stripped;
+      # the audience secret is auto-masked by GitHub. Remove this step
+      # once the RBAC sub-prefix gate is verified end-to-end.
+      - name: Debug — decode cached Dex JWT structure
+        if: failure()
+        run: |
+          set -euo pipefail
+          CACHE=~/.cache/rbe/gha_token.json
+          if [[ ! -f "$CACHE" ]]; then
+            echo "no gha_token.json cached — credential_helper never wrote one"
+            exit 0
+          fi
+          # Extract the JWT payload (second base64url segment), pad,
+          # url→std base64, decode, pretty-print without claims that
+          # leak nothing useful (timestamps, hashes).
+          payload=$(jq -r .id_token "$CACHE" | cut -d. -f2)
+          pad=$(( (4 - ${#payload} % 4) % 4 ))
+          for _ in $(seq 1 "$pad"); do payload="${payload}="; done
+          printf '%s' "$payload" \
+            | tr '_-' '/+' \
+            | base64 -d 2>/dev/null \
+            | jq 'del(.exp,.iat,.at_hash,.c_hash,.nonce)'
