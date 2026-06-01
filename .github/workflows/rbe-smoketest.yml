@@ -52,7 +52,7 @@ on:
         description: 'MONGO_VERSION define passed to Bazel'
         required: true
         type: string
-        default: '9.0.100-0'
+        default: '8.3.0-0'
 
 # Top-level permissions are inherited per-job unless overridden; we
 # scope them tightly here to OIDC-mint + checkout.
@@ -78,7 +78,7 @@ jobs:
     # line the token's `sub` is branch-shaped and Envoy denies the
     # request with HTTP 403 even though Dex would happily mint the
     # JWT — defence-in-depth, see auth plan §"Step 5d".
-    environment: psmdb-rbe
+    environment: rbe
 
     env:
       # Coordination strings consumed by the helper's GHA tier
