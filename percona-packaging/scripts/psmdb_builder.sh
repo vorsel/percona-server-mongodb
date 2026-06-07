@@ -364,7 +364,7 @@ install_deps() {
 
         PATH=/opt/mongodbtoolchain/v4/bin/:$PATH
         /usr/bin/pip install --user typing pyyaml regex Cheetah3
-      elif [ x"$RHEL" = x9  -o x"$RHEL" = x2023 ]; then
+      elif [ x"$RHEL" = x2023 ]; then
         dnf config-manager --enable ol9_codeready_builder
 
         yum -y install oracle-epel-release-el9
@@ -373,6 +373,22 @@ install_deps() {
         yum -y install python3 python3-pip python3-devel
         yum -y install python3-scons
 
+        yum -y install redhat-rpm-config which e2fsprogs-devel expat-devel lz4-devel
+        yum -y install openldap-devel krb5-devel xz-devel
+        yum -y install perl
+        /usr/bin/pip install --upgrade pip setuptools --ignore-installed
+        /usr/bin/pip install --user typing pyyaml==5.3.1 regex Cheetah3
+      elif [ x"$RHEL" = x9 ]; then
+        # el9.6: build on AlmaLinux with vault repos pinned by the Jenkins job
+        # (psmdb-el9.x.groovy), which enables BaseOS/AppStream/Extras/CRB from
+        # the frozen vault minor. snappy-devel/libpcap-devel come from the
+        # pinned vault (AppStream/CRB); only python3-scons needs EPEL. OpenSSL
+        # stays at the vault minor, so no --exclude is needed here.
+        dnf install -y epel-release
+        yum -y install snappy-devel bzip2-devel libpcap-devel gcc gcc-c++ rpm-build rpmlint
+        yum -y install cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
+        yum -y install python3 python3-pip python3-devel
+        yum -y install python3-scons
         yum -y install redhat-rpm-config which e2fsprogs-devel expat-devel lz4-devel
         yum -y install openldap-devel krb5-devel xz-devel
         yum -y install perl
