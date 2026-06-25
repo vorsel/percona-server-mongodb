@@ -174,6 +174,11 @@ get_sources(){
 
     sed -i '/GetLinuxDistroAndVersion()/ s/os, version, err = GetLinuxDistroAndVersion()/os, version, err = "rhel", "9.3", nil/' release/platform/platform.go || exit 1
 
+    go mod edit -dropreplace golang.org/x/crypto@v0.45.0 -dropreplace golang.org/x/net@v0.47.0 || exit 1
+    go get golang.org/x/crypto@v0.52.0 golang.org/x/net@v0.55.0 || exit 1
+    go mod tidy || exit 1
+    go mod vendor || exit 1
+
     cd ${WORKDIR}
     source percona-server-mongodb-60.properties
     #
@@ -232,7 +237,7 @@ install_golang() {
         return 1
     fi
 
-    GO_VERSION="1.25.10"
+    GO_VERSION="1.25.11"
     GO_TAR="go${GO_VERSION}.linux-${GO_ARCH}.tar.gz"
     GO_SHA="${GO_TAR}.sha256"
     GO_URL="https://downloads.percona.com/downloads/packaging/go/${GO_TAR}"
@@ -418,7 +423,7 @@ install_deps() {
         yum -y install python38 python38-devel python38-pip
         ln -sf /usr/bin/scons-3 /usr/bin/scons
         /usr/bin/pip3.8 install --user typing pyyaml regex Cheetah3
-      elif [ x"$RHEL" = x2023 ]; then
+      elif [ x"$RHEL" = x9  -o x"$RHEL" = x2023 ]; then
         dnf config-manager --enable ol9_codeready_builder
 
         yum -y install oracle-epel-release-el9
