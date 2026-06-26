@@ -909,6 +909,7 @@ build_tarball(){
     if [ "x${RHEL}" = "x7" ]; then
         patch -p1 <<'PATCH_EOF' || { echo "OL7 kTLS patch failed -- aborting build"; exit 1; }
 diff --git a/src/third_party/aws-sdk-cpp/SConscript b/src/third_party/aws-sdk-cpp/SConscript
+index 033b5a3db41..5c33fa456a6 100644
 --- a/src/third_party/aws-sdk-cpp/SConscript
 +++ b/src/third_party/aws-sdk-cpp/SConscript
 @@ -15,6 +15,21 @@ env.Append(CPPPATH=[
@@ -930,10 +931,10 @@ diff --git a/src/third_party/aws-sdk-cpp/SConscript b/src/third_party/aws-sdk-cp
 +    ))
 +    env = conf.Finish()
 +
-
  envAwsCJson = env.Clone()
  envAwsCJson.Append(CPPPATH=["dist/crt/aws-crt-cpp/crt/aws-c-common/source/external"])
-@@ -274,7 +289,10 @@ envAwsS2n.Append(
+ envAwsCJson.Library(
+@@ -254,7 +269,10 @@ envAwsS2n.Append(
          "S2N_MADVISE_SUPPORTED",
          "S2N_STACKTRACE",
          "s2n_EXPORTS",
