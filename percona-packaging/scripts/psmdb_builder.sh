@@ -337,7 +337,7 @@ install_deps() {
         yum -y install rpmbuild rpm-build libpcap-devel gcc make cmake gcc-c++ openssl-devel
         yum -y install cyrus-sasl-devel cyrus-sasl-plain snappy-devel zlib-devel bzip2-devel scons rpmlint
         yum -y install rpm-build git libopcodes libcurl-devel rpmlint e2fsprogs-devel expat-devel lz4-devel which
-        yum -y install openldap-devel krb5-devel xz-devel
+        yum -y install openldap-devel krb5-devel xz-devel patch
        yum -y install libzstd
 
         yum -y install centos-release-scl
