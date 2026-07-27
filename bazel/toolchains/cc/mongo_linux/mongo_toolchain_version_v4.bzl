@@ -32,6 +32,11 @@ TOOLCHAIN_MAP_V4 = {
         "sha": "40e94b657eddbe3c8cf89678e51c1a6f34d4a8cd73335962aa909ebed62270e3",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v4_toolchain-debian12-84bea98f485ef8c1af3f0612c56423fac4ea6256.tar.gz",
     },
+    "debian13_aarch64": {
+        "platform_name": "debian13-arm64",
+        "sha": "f7841b75759f14f378924a3148bda9044eceffb51531a80de0cd599cecbc1b03",
+        "url": "https://psmdb-arm64-toolchains.s3.us-west-2.amazonaws.com/output/edf71c48476695b4bb7bb3ee0e098920dc226a99/bazel_v4_toolchain-debian13-arm64-edf71c48476695b4bb7bb3ee0e098920dc226a99.tar.gz",
+    },
     "debian13_x86_64": {
         "platform_name": "debian13",
         "sha": "fed85558c36fb06788bd89c0be712b5ebd7b59bb850c8a4c77fc821be7834993",
