@@ -1925,6 +1925,7 @@
         "pkg:github/abseil/abseil-cpp@20230802.1",
         "pkg:github/antirez/linenoise@6cdc775807e57b2c3fd64bd207814f8ee1fe35f3",
         "pkg:github/arximboldi/immer@0b3aaf699b9d6f2e89f8e2b6d1221c307e02bda3",
+        "pkg:github/boostorg/boost@boost-1.79.0",
         "pkg:github/chriskohlhoff/asio@asio-1-12-2",
         "pkg:github/confluentinc/librdkafka@2.0.2",
         "pkg:github/cyrusimap/cyrus-sasl@cyrus-sasl-2.1.28",
@@ -1986,6 +1987,10 @@
     },
     {
       "ref": "pkg:github/arximboldi/immer@0b3aaf699b9d6f2e89f8e2b6d1221c307e02bda3",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:github/boostorg/boost@boost-1.79.0",
       "dependsOn": []
     },
     {
