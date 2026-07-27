@@ -2108,6 +2108,7 @@
         "pkg:github/madler/zlib@1.3.2",
         "pkg:github/mongodb/libmongocrypt@e656245b7ebc742df210c8156b9aac41bdd5d113",
         "pkg:github/mongodb/mongo-c-driver@1.27.6",
+        "pkg:github/mpark/variant@v1.4.0",
         "pkg:github/pcre2project/pcre2@pcre2-10.40",
         "pkg:github/protocolbuffers/protobuf@v3.19.5",
         "pkg:github/schemastore/schemastore@6847cfc3a17a04a7664474212db50c627e1e3408",
@@ -2241,6 +2242,10 @@
     },
     {
       "ref": "pkg:github/mongodb/mongo-c-driver@1.27.6",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:github/mpark/variant@v1.4.0",
       "dependsOn": []
     },
     {
