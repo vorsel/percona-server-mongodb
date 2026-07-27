@@ -25,6 +25,14 @@
       "group": "percona",
       "name": "percona-server-mongodb",
       "version": "v7.0",
+      "description": "Percona Server for MongoDB",
+      "licenses": [
+        {
+          "license": {
+            "id": "SSPL-1.0"
+          }
+        }
+      ],
       "cpe": "cpe:2.3:a:percona:percona-server-mongodb:7.0.*:*:*:*:*:*:*:*",
       "purl": "pkg:github/percona/percona-server-mongodb@v7.0",
       "externalReferences": [
