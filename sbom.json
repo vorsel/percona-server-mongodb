@@ -1590,6 +1590,48 @@
       "scope": "required"
     },
     {
+      "type": "application",
+      "bom-ref": "pkg:github/mongodb/mongo@v7.0",
+      "supplier": {
+        "name": "MongoDB, Inc.",
+        "url": [
+          "https://mongodb.com"
+        ]
+      },
+      "author": "MongoDB, Inc.",
+      "publisher": "MongoDB, Inc.",
+      "group": "mongodb",
+      "name": "mongodb/mongo",
+      "version": "v7.0",
+      "cpe": "cpe:2.3:a:mongodb:mongodb:7.0.*:*:*:*:*:*:*:*",
+      "purl": "pkg:github/mongodb/mongo@v7.0",
+      "externalReferences": [
+        {
+          "type": "license",
+          "url": "https://raw.githubusercontent.com/mongodb/mongo/refs/heads/master/LICENSE-Community.txt",
+          "comment": "Server Side Public License 1.0"
+        },
+        {
+          "type": "website",
+          "url": "https://www.mongodb.com/products/self-managed/community-edition",
+          "comment": "MongoDB Community Edition is self-managed and can be hosted locally or in the cloud."
+        },
+        {
+          "type": "website",
+          "url": "https://www.mongodb.com/products/self-managed/enterprise-advanced",
+          "comment": "MongoDB Enterprise Advanced has powerful tools for automation, operations, and security in self-managed environments."
+        },
+        {
+          "type": "release-notes",
+          "url": "https://www.mongodb.com/docs/manual/release-notes/"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/mongodb/mongo"
+        }
+      ]
+    },
+    {
       "type": "library",
       "bom-ref": "pkg:github/mpark/variant@v1.4.0",
       "author": "Michael Park",
@@ -2083,7 +2125,7 @@
   ],
   "dependencies": [
     {
-      "ref": "pkg:github/percona/percona-server-mongodb@v7.0",
+      "ref": "pkg:github/mongodb/mongo@v7.0",
       "dependsOn": [
         "pkg:deb/debian/firefox-esr@140.9.0esr-1?arch=source",
         "pkg:generic/intel/IntelRDFPMathLib@2.0.1",
@@ -2122,10 +2164,7 @@
         "pkg:github/schemastore/schemastore@6847cfc3a17a04a7664474212db50c627e1e3408",
         "pkg:github/snowballstem/snowball@1.0.0",
         "pkg:github/unicode-org/icu@icu-release-57-1",
-        "pkg:github/wiredtiger/wiredtiger@11.2.0",
-        "pkg:github/libarchive/libarchive@v3.8.4",
-        "pkg:github/aws/aws-sdk-cpp@1.11.471",
-        "pkg:github/OpenKMIP/libkmip@66119416e2c89ab182343900418cecafe02b6e8d"
+        "pkg:github/wiredtiger/wiredtiger@11.2.0"
       ]
     },
     {
@@ -2273,6 +2312,15 @@
     {
       "ref": "pkg:github/pcre2project/pcre2@pcre2-10.40",
       "dependsOn": []
+    },
+    {
+      "ref": "pkg:github/percona/percona-server-mongodb@v7.0",
+      "dependsOn": [
+        "pkg:github/aws/aws-sdk-cpp@1.11.471",
+        "pkg:github/libarchive/libarchive@v3.8.4",
+        "pkg:github/mongodb/mongo@v7.0",
+        "pkg:github/OpenKMIP/libkmip@66119416e2c89ab182343900418cecafe02b6e8d"
+      ]
     },
     {
       "ref": "pkg:github/protocolbuffers/protobuf@v3.19.5",
