@@ -23,9 +23,9 @@ a notice will be included in
 
 | Name                                                 | License                           | Vendored Version                         | Emits persisted data | Distributed in Release Binaries |
 | ---------------------------------------------------- | --------------------------------- | ---------------------------------------- | -------------------- | ------------------------------- |
-| [AWS SDK for C++]                                    | Apache-2.0                        | 1.11.471                                 |                      | ✗                               |
 | [Abseil Common Libraries (C++)]                      | Apache-2.0                        | 20211102.0                               |                      | ✗                               |
 | [Asio C++ Library]                                   | BSL-1.0                           | 1.12.2                                   |                      | ✗                               |
+| [AWS SDK for C++]                                    | Apache-2.0                        | 1.11.471                                 |                      | ✗                               |
 | [benchmark]                                          | Apache-2.0                        | 1.5.2                                    |                      |                                 |
 | [Boost C++ Libraries]                                | BSL-1.0                           | 1.79.0                                   |                      | ✗                               |
 | [c-ares]                                             | MIT                               | 1.19.1                                   |                      | ✗                               |
