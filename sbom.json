@@ -25,6 +25,14 @@
       "group": "percona",
       "name": "percona-server-mongodb",
       "version": "v8.0",
+      "description": "Percona Server for MongoDB",
+      "licenses": [
+        {
+          "license": {
+            "id": "SSPL-1.0"
+          }
+        }
+      ],
       "cpe": "cpe:2.3:a:percona:percona-server-mongodb:8.0.*:*:*:*:*:*:*:*",
       "purl": "pkg:github/percona/percona-server-mongodb@v8.0",
       "externalReferences": [
@@ -403,6 +411,55 @@
           "value": "false"
         }
       ]
+    },
+    {
+      "type": "library",
+      "name": "AWS SDK for C++",
+      "version": "1.11.471",
+      "bom-ref": "pkg:github/aws/aws-sdk-cpp@1.11.471",
+      "purl": "pkg:github/aws/aws-sdk-cpp@1.11.471",
+      "supplier": {
+        "name": "AWS",
+        "url": [
+          "https://aws.amazon.com/sdk-for-cpp/"
+        ]
+      },
+      "author": "Amazon.com, Inc.",
+      "group": "amazon.opensource",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "copyright": "Amazon.com, Inc. or its affiliates",
+      "properties": [
+        {
+          "name": "internal:team_responsible",
+          "value": "Percona Server for MongoDB Team"
+        },
+        {
+          "name": "emits_persisted_data",
+          "value": "false"
+        },
+        {
+          "name": "info_link",
+          "value": "https://aws.amazon.com/sdk-for-cpp/"
+        },
+        {
+          "name": "import_script_path",
+          "value": "src/third_party/aws-sdk-cpp/scripts/import.sh"
+        }
+      ],
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "src/third_party/aws-sdk-cpp"
+          }
+        ]
+      },
+      "scope": "required"
     },
     {
       "type": "library",
@@ -1150,6 +1207,57 @@
     },
     {
       "type": "library",
+      "name": "libarchive",
+      "version": "3.8.4",
+      "bom-ref": "pkg:github/libarchive/libarchive@v3.8.4",
+      "purl": "pkg:github/libarchive/libarchive@v3.8.4",
+      "supplier": {
+        "name": "libarchive",
+        "url": [
+          "https://www.libarchive.org"
+        ]
+      },
+      "author": "Tim Kientzle and contributors",
+      "group": "libarchive",
+      "description": "Multi-format archive and compression library",
+      "licenses": [
+        {
+          "license": {
+            "name": "A mix of BSD-2-Clause and others",
+            "url": "https://raw.githubusercontent.com/libarchive/libarchive/refs/tags/v3.8.4/COPYING"
+          }
+        }
+      ],
+      "copyright": "Copyright (C) Tim Kientzle",
+      "properties": [
+        {
+          "name": "internal:team_responsible",
+          "value": "Percona Server for MongoDB Team"
+        },
+        {
+          "name": "emits_persisted_data",
+          "value": "true"
+        },
+        {
+          "name": "info_link",
+          "value": "https://www.libarchive.org"
+        },
+        {
+          "name": "import_script_path",
+          "value": "src/third_party/libarchive/scripts/import.sh"
+        }
+      ],
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "src/third_party/libarchive"
+          }
+        ]
+      },
+      "scope": "required"
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:github/libtom/libtomcrypt@v1.18.2",
       "supplier": {
         "name": "LibTom Projects",
@@ -1400,6 +1508,124 @@
           "value": "true"
         }
       ]
+    },
+    {
+      "type": "application",
+      "bom-ref": "pkg:github/mongodb/mongo@v8.0",
+      "supplier": {
+        "name": "MongoDB, Inc.",
+        "url": [
+          "https://mongodb.com"
+        ]
+      },
+      "author": "MongoDB, Inc.",
+      "publisher": "MongoDB, Inc.",
+      "group": "mongodb",
+      "name": "mongodb/mongo",
+      "version": "v8.0",
+      "description": "The MongoDB Database",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "SSPL-1.0 OR LicenseRef-MongoDB-Enterprise-Advanced-License"
+        }
+      ],
+      "copyright": "MongoDB, Inc.",
+      "cpe": "cpe:2.3:a:mongodb:mongodb:8.0.*:*:*:*:*:*:*:*",
+      "purl": "pkg:github/mongodb/mongo@v8.0",
+      "externalReferences": [
+        {
+          "type": "license",
+          "url": "https://raw.githubusercontent.com/mongodb/mongo/refs/heads/master/LICENSE-Community.txt",
+          "comment": "Server Side Public License 1.0"
+        },
+        {
+          "type": "website",
+          "url": "https://www.mongodb.com/products/self-managed/community-edition",
+          "comment": "MongoDB Community Edition is self-managed and can be hosted locally or in the cloud."
+        },
+        {
+          "type": "website",
+          "url": "https://www.mongodb.com/products/self-managed/enterprise-advanced",
+          "comment": "MongoDB Enterprise Advanced has powerful tools for automation, operations, and security in self-managed environments."
+        },
+        {
+          "type": "release-notes",
+          "url": "https://www.mongodb.com/docs/manual/release-notes/"
+        },
+        {
+          "type": "vcs",
+          "url": "https://github.com/mongodb/mongo"
+        }
+      ],
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "src/mongo"
+          }
+        ]
+      },
+      "properties": [
+        {
+          "name": "emits_persisted_data",
+          "value": "true"
+        },
+        {
+          "name": "internal:team_responsible",
+          "value": "MongoDB Team"
+        },
+        {
+          "name": "mdb_first_party",
+          "value": "true"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:github/OpenKMIP/libkmip@66119416e2c89ab182343900418cecafe02b6e8d",
+      "supplier": {
+        "name": "OpenKMIP"
+      },
+      "author": "Peter Hamilton",
+      "group": "OpenKMIP",
+      "name": "libkmip",
+      "version": "66119416e2c89ab182343900418cecafe02b6e8d",
+      "description": "A C implementation of the KMIP specification",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR BSD-3-Clause"
+        }
+      ],
+      "copyright": "Copyright (C) Peter Hamilton",
+      "purl": "pkg:github/OpenKMIP/libkmip@66119416e2c89ab182343900418cecafe02b6e8d",
+      "externalReferences": [
+        {
+          "url": "https://github.com/OpenKMIP/libkmip.git",
+          "type": "distribution"
+        }
+      ],
+      "properties": [
+        {
+          "name": "internal:team_responsible",
+          "value": "Percona Server for MongoDB Team"
+        },
+        {
+          "name": "emits_persisted_data",
+          "value": "false"
+        },
+        {
+          "name": "import_script_path",
+          "value": "src/third_party/libkmip/scripts/import.sh"
+        }
+      ],
+      "evidence": {
+        "occurrences": [
+          {
+            "location": "src/third_party/libkmip"
+          }
+        ]
+      },
+      "scope": "required"
     },
     {
       "type": "library",
@@ -1764,158 +1990,11 @@
           "value": "false"
         }
       ]
-    },
-    {
-      "type": "library",
-      "name": "libarchive",
-      "version": "3.8.4",
-      "bom-ref": "pkg:github/libarchive/libarchive@v3.8.4",
-      "purl": "pkg:github/libarchive/libarchive@v3.8.4",
-      "supplier": {
-        "name": "libarchive",
-        "url": [
-          "https://www.libarchive.org"
-        ]
-      },
-      "author": "Tim Kientzle and contributors",
-      "group": "libarchive",
-      "description": "Multi-format archive and compression library",
-      "licenses": [
-        {
-          "license": {
-            "name": "A mix of BSD-2-Clause and others",
-            "url": "https://raw.githubusercontent.com/libarchive/libarchive/refs/tags/v3.8.4/COPYING"
-          }
-        }
-      ],
-      "copyright": "Copyright (C) Tim Kientzle",
-      "properties": [
-        {
-          "name": "internal:team_responsible",
-          "value": "Percona Server for MongoDB Team"
-        },
-        {
-          "name": "emits_persisted_data",
-          "value": "true"
-        },
-        {
-          "name": "info_link",
-          "value": "https://www.libarchive.org"
-        },
-        {
-          "name": "import_script_path",
-          "value": "src/third_party/libarchive/scripts/import.sh"
-        }
-      ],
-      "evidence": {
-        "occurrences": [
-          {
-            "location": "src/third_party/libarchive"
-          }
-        ]
-      },
-      "scope": "required"
-    },
-    {
-      "type": "library",
-      "name": "AWS SDK for C++",
-      "version": "1.11.471",
-      "bom-ref": "pkg:github/aws/aws-sdk-cpp@1.11.471",
-      "purl": "pkg:github/aws/aws-sdk-cpp@1.11.471",
-      "supplier": {
-        "name": "AWS",
-        "url": [
-          "https://aws.amazon.com/sdk-for-cpp/"
-        ]
-      },
-      "author": "Amazon.com, Inc.",
-      "group": "amazon.opensource",
-      "licenses": [
-        {
-          "license": {
-            "id": "Apache-2.0"
-          }
-        }
-      ],
-      "copyright": "Amazon.com, Inc. or its affiliates",
-      "properties": [
-        {
-          "name": "internal:team_responsible",
-          "value": "Percona Server for MongoDB Team"
-        },
-        {
-          "name": "emits_persisted_data",
-          "value": "false"
-        },
-        {
-          "name": "info_link",
-          "value": "https://aws.amazon.com/sdk-for-cpp/"
-        },
-        {
-          "name": "import_script_path",
-          "value": "src/third_party/aws-sdk-cpp/scripts/import.sh"
-        }
-      ],
-      "evidence": {
-        "occurrences": [
-          {
-            "location": "src/third_party/aws-sdk-cpp"
-          }
-        ]
-      },
-      "scope": "required"
-    },
-    {
-      "type": "library",
-      "bom-ref": "pkg:github/OpenKMIP/libkmip@66119416e2c89ab182343900418cecafe02b6e8d",
-      "supplier": {
-        "name": "OpenKMIP"
-      },
-      "author": "Peter Hamilton",
-      "group": "OpenKMIP",
-      "name": "libkmip",
-      "version": "66119416e2c89ab182343900418cecafe02b6e8d",
-      "description": "A C implementation of the KMIP specification",
-      "licenses": [
-        {
-          "expression": "Apache-2.0 OR BSD-3-Clause"
-        }
-      ],
-      "copyright": "Copyright (C) Peter Hamilton",
-      "purl": "pkg:github/OpenKMIP/libkmip@66119416e2c89ab182343900418cecafe02b6e8d",
-      "externalReferences": [
-        {
-          "url": "https://github.com/OpenKMIP/libkmip.git",
-          "type": "distribution"
-        }
-      ],
-      "properties": [
-        {
-          "name": "internal:team_responsible",
-          "value": "Percona Server for MongoDB Team"
-        },
-        {
-          "name": "emits_persisted_data",
-          "value": "false"
-        },
-        {
-          "name": "import_script_path",
-          "value": "src/third_party/libkmip/scripts/import.sh"
-        }
-      ],
-      "evidence": {
-        "occurrences": [
-          {
-            "location": "src/third_party/libkmip"
-          }
-        ]
-      },
-      "scope": "required"
     }
   ],
   "dependencies": [
     {
-      "ref": "pkg:github/percona/percona-server-mongodb@v8.0",
+      "ref": "pkg:github/mongodb/mongo@v8.0",
       "dependsOn": [
         "pkg:deb/debian/firefox-esr@140.9.0esr-1?arch=source",
         "pkg:generic/intel/IntelRDFPMathLib@2.0.1",
@@ -1925,6 +2004,7 @@
         "pkg:github/abseil/abseil-cpp@20230802.1",
         "pkg:github/antirez/linenoise@6cdc775807e57b2c3fd64bd207814f8ee1fe35f3",
         "pkg:github/arximboldi/immer@0b3aaf699b9d6f2e89f8e2b6d1221c307e02bda3",
+        "pkg:github/boostorg/boost@boost-1.79.0",
         "pkg:github/chriskohlhoff/asio@asio-1-12-2",
         "pkg:github/confluentinc/librdkafka@2.0.2",
         "pkg:github/cyrusimap/cyrus-sasl@cyrus-sasl-2.1.28",
@@ -1950,10 +2030,7 @@
         "pkg:github/schemastore/schemastore@6847cfc3a17a04a7664474212db50c627e1e3408",
         "pkg:github/snowballstem/snowball@1.0.0",
         "pkg:github/unicode-org/icu@icu-release-57-1",
-        "pkg:github/wiredtiger/wiredtiger@11.3.0",
-        "pkg:github/libarchive/libarchive@v3.8.4",
-        "pkg:github/aws/aws-sdk-cpp@1.11.471",
-        "pkg:github/OpenKMIP/libkmip@66119416e2c89ab182343900418cecafe02b6e8d"
+        "pkg:github/wiredtiger/wiredtiger@11.3.0"
       ]
     },
     {
@@ -1986,6 +2063,16 @@
     },
     {
       "ref": "pkg:github/arximboldi/immer@0b3aaf699b9d6f2e89f8e2b6d1221c307e02bda3",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:github/aws/aws-sdk-cpp@1.11.471",
+      "dependsOn": [
+        "pkg:github/madler/zlib@1.3.2"
+      ]
+    },
+    {
+      "ref": "pkg:github/boostorg/boost@boost-1.79.0",
       "dependsOn": []
     },
     {
@@ -2049,6 +2136,10 @@
       "dependsOn": []
     },
     {
+      "ref": "pkg:github/libarchive/libarchive@v3.8.4",
+      "dependsOn": []
+    },
+    {
       "ref": "pkg:github/libtom/libtomcrypt@v1.18.2",
       "dependsOn": []
     },
@@ -2067,6 +2158,19 @@
     {
       "ref": "pkg:github/mongodb/mongo-c-driver@1.27.6",
       "dependsOn": []
+    },
+    {
+      "ref": "pkg:github/OpenKMIP/libkmip@66119416e2c89ab182343900418cecafe02b6e8d",
+      "dependsOn": []
+    },
+    {
+      "ref": "pkg:github/percona/percona-server-mongodb@v8.0",
+      "dependsOn": [
+        "pkg:github/aws/aws-sdk-cpp@1.11.471",
+        "pkg:github/libarchive/libarchive@v3.8.4",
+        "pkg:github/mongodb/mongo@v8.0",
+        "pkg:github/OpenKMIP/libkmip@66119416e2c89ab182343900418cecafe02b6e8d"
+      ]
     },
     {
       "ref": "pkg:github/pcre2project/pcre2@pcre2-10.40",
@@ -2098,20 +2202,6 @@
     },
     {
       "ref": "pkg:pypi/ocspresponder@0.5.0",
-      "dependsOn": []
-    },
-    {
-      "ref": "pkg:github/libarchive/libarchive@v3.8.4",
-      "dependsOn": []
-    },
-    {
-      "ref": "pkg:github/aws/aws-sdk-cpp@1.11.471",
-      "dependsOn": [
-        "pkg:github/madler/zlib@v1.3.1"
-      ]
-    },
-    {
-      "ref": "pkg:github/OpenKMIP/libkmip@66119416e2c89ab182343900418cecafe02b6e8d",
       "dependsOn": []
     }
   ]
