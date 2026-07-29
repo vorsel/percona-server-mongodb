@@ -66,6 +66,7 @@
 #include "mongo/s/transaction_router_resource_yielder.h"
 #include "mongo/s/would_change_owning_shard_exception.h"
 #include "mongo/s/write_ops/write_without_shard_key_util.h"
+#include "mongo/util/fail_point.h"
 #include "mongo/util/timer.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
@@ -73,6 +74,8 @@
 
 namespace mongo {
 namespace {
+
+MONGO_FAIL_POINT_DEFINE(findAndModifyChangeOwningShardThrowsInterruptedAtShutdown);
 
 constexpr size_t kMaxDatabaseCreationAttempts = 3u;
 
@@ -442,12 +445,7 @@ Status FindAndModifyCmd::explain(OperationContext* opCtx,
         // Check whether the query portion needs to be rewritten for FLE.
         auto findAndModifyRequest = write_ops::FindAndModifyCommandRequest::parse(
             IDLParserContext("ClusterFindAndModify"), request.body);
-        if (shouldDoFLERewrite(findAndModifyRequest)) {
-            {
-                stdx::lock_guard<Client> lk(*opCtx->getClient());
-                CurOp::get(opCtx)->setShouldOmitDiagnosticInformation_inlock(lk, true);
-            }
-
+        if (prepareForFLERewrite(opCtx, findAndModifyRequest.getEncryptionInformation())) {
             auto newRequest = processFLEFindAndModifyExplainMongos(opCtx, findAndModifyRequest);
             return newRequest.first.toBSON(request.body);
         } else {
@@ -527,8 +525,12 @@ bool FindAndModifyCmd::run(OperationContext* opCtx,
                            BSONObjBuilder& result) {
     const NamespaceString nss(CommandHelpers::parseNsCollectionRequired(dbName, cmdObj));
 
-    if (processFLEFindAndModify(opCtx, cmdObj, result) == FLEBatchResult::kProcessed) {
-        return true;
+    if (auto request = write_ops::FindAndModifyCommandRequest::parse(
+            IDLParserContext("ClusterFindAndModify"), cmdObj);
+        prepareForFLERewrite(opCtx, request.getEncryptionInformation())) {
+        if (processFLEFindAndModify(opCtx, request, result) == FLEBatchResult::kProcessed) {
+            return true;
+        }
     }
 
     // Collect metrics.
@@ -839,6 +841,11 @@ void FindAndModifyCmd::_handleWouldChangeOwningShardErrorRetryableWriteLegacy(
     BSONObjBuilder* result) {
     RouterOperationContextSession routerSession(opCtx);
     try {
+        if (MONGO_unlikely(
+                findAndModifyChangeOwningShardThrowsInterruptedAtShutdown.shouldFail())) {
+            uasserted(ErrorCodes::InterruptedAtShutdown, "interrupted at shutdown");
+        }
+
         auto& readConcernArgs = repl::ReadConcernArgs::get(opCtx);
         readConcernArgs = repl::ReadConcernArgs(repl::ReadConcernLevel::kLocalReadConcern);
 
@@ -894,8 +901,9 @@ void FindAndModifyCmd::_handleWouldChangeOwningShardErrorRetryableWriteLegacy(
         }
 
         auto txnRouterForAbort = TransactionRouter::get(opCtx);
-        if (txnRouterForAbort)
+        if (txnRouterForAbort && txnRouterForAbort.isInitialized()) {
             txnRouterForAbort.implicitlyAbortTransaction(opCtx, e.toStatus());
+        }
 
         throw;
     }

@@ -105,6 +105,7 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/stdx/thread.h"
 #include "mongo/transport/ingress_handshake_metrics.h"
+#include "mongo/transport/message_filter_hooks.h"
 #include "mongo/transport/transport_layer_manager.h"
 #include "mongo/util/admin_access.h"
 #include "mongo/util/cmdline_utils/censor_cmdline.h"
@@ -260,7 +261,7 @@ void implicitlyAbortAllTransactions(OperationContext* opCtx) {
         }
 
         auto txnRouter = TransactionRouter::get(newOpCtx);
-        if (txnRouter.isInitialized()) {
+        if (txnRouter && txnRouter.isInitialized()) {
             txnRouter.implicitlyAbortTransaction(newOpCtx, shutDownStatus);
         }
     }
@@ -698,6 +699,8 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
 
     logMongosVersionInfo(nullptr);
 
+    transport::initMessageFilterPluginLoader("mongos");
+
     // Set up the periodic runner for background job execution
     {
         auto runner = makePeriodicRunner(serviceContext);
@@ -793,7 +796,7 @@ ExitCode runMongosServer(ServiceContext* serviceContext) {
     startMongoSFTDC();
 
     if (mongosGlobalParams.scriptingEnabled) {
-        ScriptEngine::setup();
+        ScriptEngine::setup(ExecutionEnvironment::Server);
     }
 
     if (auto const globalLDAPManager = LDAPManager::get(serviceContext)) {

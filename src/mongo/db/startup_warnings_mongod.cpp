@@ -44,6 +44,7 @@
 #include <sys/resource.h>
 #endif  // _WIN32
 
+#include "mongo/bson/bson_validate_gen.h"
 #include "mongo/db/query/query_knobs_gen.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/startup_warnings_common.h"

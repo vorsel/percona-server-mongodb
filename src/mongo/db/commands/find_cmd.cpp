@@ -38,6 +38,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/commands/run_aggregate.h"
 #include "mongo/db/commands/test_commands_enabled.h"
+#include "mongo/db/curop_failpoint_helpers.h"
 #include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/disk_use_options_gen.h"
@@ -81,6 +82,7 @@ namespace mongo {
 namespace {
 
 MONGO_FAIL_POINT_DEFINE(allowExternalReadsForReverseOplogScanRule);
+MONGO_FAIL_POINT_DEFINE(hangBeforeFetcherFindCommandOnOplog);
 
 const auto kTermField = "term"_sd;
 
@@ -445,6 +447,14 @@ public:
             // The presence of a term in the request indicates that this is an internal replication
             // oplog read request.
             if (term && isOplogNss) {
+                if (MONGO_unlikely(hangBeforeFetcherFindCommandOnOplog.shouldFail())) {
+                    LOGV2(10616500,
+                          "Hit hangBeforeFetcherFindCommandOnOplog enabled, hanging while set");
+                    CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                        &hangBeforeFetcherFindCommandOnOplog,
+                        opCtx,
+                        "hangBeforeFetcherFindCommandOnOplog");
+                }
                 // We do not want to wait to take tickets for internal (replication) oplog reads.
                 // Stalling on ticket acquisition can cause complicated deadlocks. Primaries may
                 // depend on data reaching secondaries in order to proceed; and secondaries may get
@@ -797,18 +807,18 @@ public:
                 std::move(nss),
                 APIParameters::get(opCtx).getAPIStrict().value_or(false));
 
+            Variables::validateRuntimeConstantsArePermitted(
+                opCtx, findCommand->getLegacyRuntimeConstants());
+
             // Rewrite any FLE find payloads that exist in the query if this is a FLE 2 query.
             if (shouldDoFLERewrite(findCommand)) {
                 invariant(findCommand->getNamespaceOrUUID().isNamespaceString());
                 LOGV2_DEBUG(
                     7964101, 2, "Processing Queryable Encryption command", "cmd"_attr = cmdObj);
-
-                if (!findCommand->getEncryptionInformation()->getCrudProcessed().value_or(false)) {
+                if (prepareForFLERewrite(opCtx, findCommand->getEncryptionInformation())) {
                     processFLEFindD(
                         opCtx, findCommand->getNamespaceOrUUID().nss(), findCommand.get());
                 }
-                stdx::lock_guard<Client> lk(*opCtx->getClient());
-                CurOp::get(opCtx)->setShouldOmitDiagnosticInformation_inlock(lk, true);
             }
 
             if (findCommand->getMirrored().value_or(false)) {

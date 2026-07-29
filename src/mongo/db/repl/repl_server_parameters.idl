@@ -32,6 +32,7 @@ global:
     cpp_namespace: "mongo::repl"
     cpp_includes:
       - "mongo/client/read_preference.h"
+      - "mongo/db/repl/repl_worker_pool_thread_count.h"
 
 imports:
     - "mongo/db/basic_types.idl"
@@ -70,9 +71,11 @@ server_parameters:
         default: 3
 
     initialSyncOplogFetcherBatchSize:
-        description: The batchSize to use for the find/getMore queries called by the OplogFetcher
-        set_at: startup
-        cpp_vartype: int
+        description: >-
+            The batchSize to use for the find/getMore queries called by the OplogFetcher. If set
+            at runtime, this value will be used for the next initial sync attempt.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
         cpp_varname: initialSyncOplogFetcherBatchSize
         # 16MB max batch size / 12 byte min doc size * 10 (for good measure) =
         #     defaultBatchSize to use.
@@ -151,8 +154,8 @@ server_parameters:
         description: >-
             How long, in milliseconds, to wait for more data when an oplog application batch is
             not full.
-        set_at: startup
-        cpp_vartype: int
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
         cpp_varname: oplogBatchDelayMillis
         default: 0
         validator:
@@ -161,8 +164,8 @@ server_parameters:
     # From bgsync.cpp
     bgSyncOplogFetcherBatchSize:
         description: The batchSize to use for the find/getMore queries called by the OplogFetcher
-        set_at: startup
-        cpp_vartype: int
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
         cpp_varname: bgSyncOplogFetcherBatchSize
         # 16MB max batch size / 12 byte min doc size * 10 (for good measure) =
         #     defaultBatchSize to use.
@@ -213,8 +216,8 @@ server_parameters:
         description: >-
             Limit for the number of bytes of data inserted per storage transaction
             (WriteUnitOfWork) by collectionBulkLoader during initial sync collection cloning
-        set_at: startup
-        cpp_vartype: int
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
         cpp_varname: collectionBulkLoaderBatchSizeInBytes
         default:
             expr: 256 * 1024
@@ -225,8 +228,8 @@ server_parameters:
             The batch size (number of documents) to use for the queries in the
             CollectionCloner. Default of '0' means the limit is the number of documents
             that will fit in a single BSON object.
-        set_at: startup
-        cpp_vartype: int
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
         cpp_varname: collectionClonerBatchSize
         default: 0
         validator:
@@ -257,27 +260,6 @@ server_parameters:
         default: 10
         validator:
             gte: 0
-
-    # From oplog_applier.cpp
-    replWriterThreadCount:
-        description: The number of threads in the thread pool used to apply the oplog
-        set_at: startup
-        cpp_vartype: int
-        cpp_varname: replWriterThreadCount
-        default: 16
-        validator:
-            gte: 1
-            lte: 256
-
-    replWriterMinThreadCount:
-        description: The minimum number of threads in the thread pool used to apply the oplog
-        set_at: startup
-        cpp_vartype: int
-        cpp_varname: replWriterMinThreadCount
-        default: 0
-        validator:
-            gte: 0
-            lte: 256
 
     replBatchLimitOperations:
         description: The maximum number of operations to apply in a single batch
@@ -401,7 +383,7 @@ server_parameters:
         description: >-
             Number of seconds to add to the `find` and `getMore` timeouts for oplog fetching to
             calculate the network timeout for the requests.
-        set_at: [ startup ]
+        set_at: [startup, runtime]
         cpp_vartype: AtomicWord<int>
         cpp_varname: oplogNetworkTimeoutBufferSeconds
         default: 5
@@ -461,7 +443,7 @@ server_parameters:
             When enabled, allows a node to override the cluster-wide chainingAllowed setting.
             If chaining is disabled in the replica set, enabling this parameter allows the node
             to chain regardless.
-        set_at: [ startup ]
+        set_at: [startup, runtime]
         cpp_vartype: AtomicWord<bool>
         cpp_varname: enableOverrideClusterChainingSetting
         default: false
@@ -694,7 +676,7 @@ server_parameters:
     fileBasedInitialSyncMaxCyclesWithoutProgress:
         description: >-
             Specifies the max number of cycles that file copy based initial sync runs trying to
-            clone updates while the lag between the syncing node and the sync source is higher than 
+            clone updates while the lag between the syncing node and the sync source is higher than
             fileBasedInitialSyncMaxLagSec.
         set_at: startup
         cpp_vartype: int
@@ -707,8 +689,8 @@ server_parameters:
         description: >-
             Period of time, in milliseconds, syncing node may wait for the sync source to have the
             full oplog history up to the backup point in time.
-        set_at: startup
-        cpp_vartype: int
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
         cpp_varname: fileBasedInitialSyncExtendCursorTimeoutMS
         default:
             expr: 180 * 1000
@@ -840,6 +822,42 @@ server_parameters:
         cpp_varname: skipApplyingDbCheckBatchOnSecondary
         default: false
 
+
+    syncSourceResolverFindFetcherTimeoutMillis:
+        description: >-
+            The maximum amount of time that the fetcher in the sync source resolver will wait
+            for the find to return. This value is adjustable to allow users to minimize
+            the amount of time the resolver will spend waiting for a sync source candidate to respond.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<int>
+        cpp_varname: syncSourceResolverFindFetcherTimeoutMillis
+        default: 30000
+        redact: false
+
+    minWaitForStreamingHelloMillis:
+        description: >-
+            Minimum timeout in milliseconds for pre-auth streamable hello commands.
+            If a client supplies a maxAwaitTimeMS below this value, the server will
+            either abort the operation or clamp the timeout to this floor, depending
+            on the value of abortStreamingHelloWithSmallTimeout.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<long long>
+        cpp_varname: minWaitForStreamingHelloMillis
+        default: 1000
+        validator:
+            gte: 0
+        redact: false
+
+    abortStreamingHelloWithSmallTimeout:
+        description: >-
+            When true, pre-auth streamable hello commands with a maxAwaitTimeMS below
+            minWaitForStreamingHelloMillis will fail. When false, the server will
+            clamp the effective timeout to minWaitForStreamingHelloMillis instead.
+        set_at: [startup, runtime]
+        cpp_vartype: AtomicWord<bool>
+        cpp_varname: abortStreamingHelloWithSmallTimeout
+        default: false
+        redact: false
 
 feature_flags:
     featureFlagRetryableFindAndModify:

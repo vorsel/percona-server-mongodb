@@ -34,6 +34,7 @@
 
 #include "mongo/base/data_view.h"
 #include "mongo/bson/bson_depth.h"
+#include "mongo/bson/bson_validate_gen.h"
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonelementvalue.h"
 #include "mongo/bson/util/bsoncolumn.h"
@@ -770,6 +771,8 @@ public:
                         return Status::OK();
                     }
                 } else if (bsoncolumn::isUncompressedLiteralControlByte(control)) {
+                    bsoncolumn::assertNotCodeWScope(
+                        static_cast<BSONType>(static_cast<int8_t>(control)));
                     int size;
                     if (MONGO_likely(mode == BSONValidateMode::kDefault))
                         size = ValidateBuffer<precise, DefaultValidator>(
@@ -786,6 +789,8 @@ public:
                     else
                         MONGO_UNREACHABLE;
 
+                    // ptr is safe to dereference due to checks above, and we have confirmed size is
+                    // within the buffer.
                     ptr += size;
                 } else if (bsoncolumn::isInterleavedStartControlByte(control)) {
                     // interleaved objects begin with a reference object, and then a series
@@ -826,6 +831,8 @@ public:
                     ptr += 1 + size;
                 }
             }
+        } catch (const ExceptionFor<ErrorCodes::InvalidBSONType>& e) {
+            return Status(e.code(), str::stream() << e.what());
         } catch (const ExceptionForCat<ErrorCategory::ValidationError>& e) {
             return Status(e.code(), str::stream() << e.what());
         }

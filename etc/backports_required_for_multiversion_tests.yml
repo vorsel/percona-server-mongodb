@@ -21,6 +21,8 @@
 #
 last-continuous:
   all:
+  - test_file: jstests/aggregation/expressions/const_literal_bsoncolumn.js
+    ticket: SERVER-129103
   - test_file: jstests/noPassthrough/timeseries_initial_sync_mixed_bucket_geo_index.js
     ticket: SERVER-121132
   - test_file: jstests/core/index/elemmatch_index.js
@@ -671,13 +673,23 @@ last-continuous:
     ticket: SERVER-116327
   - test_file: jstests/change_streams/filter_excludes_resume_point.js
     ticket: SERVER-112849
+  - test_file: jstests/replsets/configurable_fetcher_timeout.js
+    ticket: SERVER-106165
   - test_file: jstests/concurrency/fsm_workloads/update_and_batched_delete.js
     ticket: SERVER-95570
+  - test_file: jstests/core/timeseries/write/timeseries_bypass_document_validation_raw_buckets.js
+    ticket: SERVER-121714
   - test_file: jstests/aggregation/expressions/trim.js
     ticket: SERVER-120668
+  - test_file: jstests/change_streams/events_containing_version_literals.js
+    ticket: SERVER-111406
+  - test_file: jstests/noPassthrough/query/runtime_constants_user_roles_auth_bypass.js
+    ticket: SERVER-128433
   suites: null
 last-lts:
   all:
+  - test_file: jstests/aggregation/expressions/const_literal_bsoncolumn.js
+    ticket: SERVER-129103
   - test_file: jstests/noPassthrough/timeseries_initial_sync_mixed_bucket_geo_index.js
     ticket: SERVER-121132
   - test_file: jstests/core/index/elemmatch_index.js
@@ -1398,8 +1410,16 @@ last-lts:
     ticket: SERVER-116327
   - test_file: jstests/change_streams/filter_excludes_resume_point.js
     ticket: SERVER-112849
+  - test_file: jstests/replsets/configurable_fetcher_timeout.js
+    ticket: SERVER-106165
   - test_file: jstests/concurrency/fsm_workloads/update_and_batched_delete.js
     ticket: SERVER-95570
+  - test_file: jstests/core/timeseries/write/timeseries_bypass_document_validation_raw_buckets.js
+    ticket: SERVER-121714
   - test_file: jstests/aggregation/expressions/trim.js
     ticket: SERVER-120668
+  - test_file: jstests/change_streams/events_containing_version_literals.js
+    ticket: SERVER-111406
+  - test_file: jstests/noPassthrough/query/runtime_constants_user_roles_auth_bypass.js
+    ticket: SERVER-128433
   suites: null

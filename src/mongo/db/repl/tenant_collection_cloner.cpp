@@ -84,7 +84,7 @@ TenantCollectionCloner::TenantCollectionCloner(const NamespaceString& sourceNss,
       _sourceNss(sourceNss),
       _collectionOptions(collectionOptions),
       _sourceDbAndUuid(NamespaceString("UNINITIALIZED")),
-      _collectionClonerBatchSize(collectionClonerBatchSize),
+      _collectionClonerBatchSize(collectionClonerBatchSize.load()),
       _countStage("count", this, &TenantCollectionCloner::countStage),
       _checkIfDonorCollectionIsEmptyStage(
           "checkIfDonorCollectionIsEmpty",
@@ -541,7 +541,7 @@ void TenantCollectionCloner::insertDocuments(std::vector<BSONObj> docsToInsert) 
     // collection document insertion.
     DisableDocumentValidation documentValidationDisabler(
         opCtx,
-        DocumentValidationSettings::kDisableSchemaValidation |
+        DocumentValidationSettings::kDisableSchemaValidationForInternalOp |
             DocumentValidationSettings::kDisableInternalValidation);
 
     write_ops::InsertCommandRequest insertOp(_existingNss.value_or(_sourceNss));

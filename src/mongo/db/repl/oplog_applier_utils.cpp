@@ -337,7 +337,10 @@ void OplogApplierUtils::addDerivedCommitsOrAborts(
     // When this commit refers to a split prepare, we split the commit and add them
     // to the writers that have been assigned split prepare ops.
     for (const auto& sessInfo : *sessionInfos) {
-        addToWriterVectorImpl(sessInfo.requesterId,
+        // The number of workers could have changed since the prepare phase: mod by list size to
+        // make sure we are still in bounds.
+        const auto idx = sessInfo.requesterId % writerVectors->size();
+        addToWriterVectorImpl(idx,
                               writerVectors,
                               commitOrAbortOp,
                               ApplicationInstruction::applySplitPreparedTxnOp,
@@ -382,7 +385,7 @@ Status OplogApplierUtils::applyOplogEntryOrGroupedInsertsCommon(
     const bool isDataConsistent,
     IncrementOpsAppliedStatsFn incrementOpsAppliedStats,
     OpCounters* opCounters) {
-    invariant(DocumentValidationSettings::get(opCtx).isSchemaValidationDisabled());
+    invariant(DocumentValidationSettings::get(opCtx).isSchemaValidationDisabledForInternalOp());
 
     const auto& op = entryOrGroupedInserts.getOp();
     // Count each log op application as a separate operation, for reporting purposes.
@@ -526,7 +529,7 @@ Status OplogApplierUtils::applyOplogBatchCommon(
 
     // We cannot do document validation, because document validation could have been disabled when
     // these oplog entries were generated.
-    DisableDocumentValidation validationDisabler(opCtx);
+    DisableDocumentValidationForInternalOp validationDisabler(opCtx);
     // Group the operations by namespace in order to get larger groups for bulk inserts, but do not
     // mix up the current order of oplog entries within the same namespace (thus *stable* sort).
     stableSortByNamespace(ops);
@@ -565,11 +568,13 @@ Status OplogApplierUtils::applyOplogBatchCommon(
                     continue;
                 }
 
-                LOGV2_FATAL_CONTINUE(21237,
-                                     "Error applying operation ({oplogEntry}): {error}",
-                                     "Error applying operation",
-                                     "oplogEntry"_attr = redact(op->toBSONForLogging()),
-                                     "error"_attr = causedBy(redact(status)));
+                LOGV2_FATAL_CONTINUE(
+                    21237,
+                    "Error applying operation ({oplogEntry}) at optime {opTime}: {error}",
+                    "Error applying operation",
+                    "opTime"_attr = op->getOpTime(),
+                    "oplogEntry"_attr = redact(op->toBSONForLogging()),
+                    "error"_attr = causedBy(redact(status)));
                 return status;
             }
         } catch (const DBException& e) {
@@ -586,11 +591,13 @@ Status OplogApplierUtils::applyOplogBatchCommon(
                 continue;
             }
 
-            LOGV2_FATAL_CONTINUE(21238,
-                                 "writer worker caught exception: {error} on: {oplogEntry}",
-                                 "Writer worker caught exception",
-                                 "error"_attr = redact(e),
-                                 "oplogEntry"_attr = redact(op->toBSONForLogging()));
+            LOGV2_FATAL_CONTINUE(
+                21238,
+                "writer worker caught exception: {error} on: {oplogEntry} at opTime {opTime}",
+                "Writer worker caught exception",
+                "error"_attr = redact(e),
+                "opTime"_attr = op->getOpTime(),
+                "oplogEntry"_attr = redact(op->toBSONForLogging()));
             return e.toStatus();
         }
     }

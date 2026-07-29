@@ -546,10 +546,21 @@ connection_runtime_config = [
             periodic checkpoints''',
             min='0', max='100000'),
         ]),
-    Config('checkpoint_cleanup', 'none', r'''
-        control how aggressively obsolete content is removed when creating checkpoints.
-        Default to none, which means no additional work is done to find obsolete content.
-        ''', choices=['none', 'reclaim_space']),
+    Config('checkpoint_cleanup', '', r'''
+        periodically checkpoint cleanup the database.''',
+        type='category', subconfig=[
+        Config('method', 'none', r'''
+            control how aggressively obsolete content is removed by reading the internal pages.
+            Default to none, which means no additional work is done to find obsolete content.
+            ''', choices=['none', 'reclaim_space']),
+        Config('use_thread', 'false', r'''
+            if true, a dedicated utility thread performs checkpoint cleanup asynchronously.
+            When false (default), cleanup runs inline during the checkpoint tree walk.''',
+            type='boolean'),
+        Config('wait', '300', r'''
+            seconds to wait between each checkpoint cleanup''',
+            min='1', max='100000'),
+        ]),
     Config('debug_mode', '', r'''
         control the settings of various extended debugging features''',
         type='category', subconfig=[
@@ -813,9 +824,10 @@ connection_runtime_config = [
         type='list', undoc=True,
         choices=[
         'aggressive_sweep', 'backup_rename', 'checkpoint_evict_page', 'checkpoint_handle',
-        'checkpoint_slow', 'checkpoint_stop', 'compact_slow', 'evict_reposition',
-        'failpoint_eviction_fail_after_reconciliation',
-        'failpoint_history_store_delete_key_from_ts', 'history_store_checkpoint_delay',
+        'checkpoint_slow', 'checkpoint_stop', 'compact_slow', 'conn_close_stress_log_printf',
+        'evict_reposition', 'failpoint_eviction_fail_after_reconciliation',
+        'failpoint_history_store_delete_key_from_ts', 'failpoint_rec_split_write',
+        'history_store_checkpoint_delay',
         'history_store_search', 'history_store_sweep_race', 'prepare_checkpoint_delay',
         'prepare_resolution', 'prepare_resolution_2', 'sleep_before_read_overflow_onpage',
         'split_1', 'split_2', 'split_3', 'split_4', 'split_5','split_6', 'split_7',
@@ -1774,6 +1786,14 @@ methods = {
 ]),
 
 'WT_SESSION.checkpoint' : Method([
+    Config('debug', '', r'''
+        configure debug specific behavior on a checkpoint. Generally only used for internal testing
+        purposes''',
+        type='category', subconfig=[
+        Config('checkpoint_cleanup', 'false', r'''
+            if true, checkpoint cleanup thread is triggered to perform the checkpoint cleanup''',
+            type='boolean'),
+        ]),
     Config('drop', '', r'''
         specify a list of checkpoints to drop. The list may additionally contain one of the
         following keys: \c "from=all" to drop all checkpoints, \c "from=<checkpoint>" to drop

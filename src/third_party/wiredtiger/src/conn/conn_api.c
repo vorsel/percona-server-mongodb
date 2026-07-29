@@ -1187,6 +1187,7 @@ err:
      * we're about to do a final checkpoint separately from the checkpoint server.
      */
     WT_TRET(__wt_capacity_server_destroy(session));
+    WT_TRET(__wt_checkpoint_cleanup_destroy(session));
     WT_TRET(__wt_checkpoint_server_destroy(session));
 
     /* Perform a final checkpoint and shut down the global transaction state. */
@@ -2359,11 +2360,13 @@ __wt_timing_stress_config(WT_SESSION_IMPL *session, const char *cfg[])
       {"checkpoint_slow", WT_TIMING_STRESS_CHECKPOINT_SLOW},
       {"checkpoint_stop", WT_TIMING_STRESS_CHECKPOINT_STOP},
       {"compact_slow", WT_TIMING_STRESS_COMPACT_SLOW},
+      {"conn_close_stress_log_printf", WT_TIMING_STRESS_CLOSE_STRESS_LOG},
       {"evict_reposition", WT_TIMING_STRESS_EVICT_REPOSITION},
       {"failpoint_eviction_fail_after_reconciliation",
         WT_TIMING_STRESS_FAILPOINT_EVICTION_FAIL_AFTER_RECONCILIATION},
       {"failpoint_history_delete_key_from_ts",
         WT_TIMING_STRESS_FAILPOINT_HISTORY_STORE_DELETE_KEY_FROM_TS},
+      {"failpoint_rec_split_write", WT_TIMING_STRESS_FAILPOINT_REC_SPLIT_WRITE},
       {"history_store_checkpoint_delay", WT_TIMING_STRESS_HS_CHECKPOINT_DELAY},
       {"history_store_search", WT_TIMING_STRESS_HS_SEARCH},
       {"history_store_sweep_race", WT_TIMING_STRESS_HS_SWEEP},
@@ -2962,10 +2965,6 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
     WT_ERR(__wt_config_gets(session, cfg, "cache_cursors", &cval));
     if (cval.val)
         F_SET(conn, WT_CONN_CACHE_CURSORS);
-
-    WT_ERR(__wt_config_gets(session, cfg, "checkpoint_cleanup", &cval));
-    if (WT_STRING_MATCH("reclaim_space", cval.str, cval.len))
-        F_SET(conn, WT_CONN_CKPT_CLEANUP_SKIP_INT);
 
     WT_ERR(__wt_config_gets(session, cfg, "checkpoint_sync", &cval));
     if (cval.val)
