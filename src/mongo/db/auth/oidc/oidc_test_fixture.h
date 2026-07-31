@@ -38,6 +38,7 @@ Copyright (C) 2025-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/db/auth/oidc/oidc_identity_providers_registry.h"
 #include "mongo/db/auth/oidc/oidc_server_parameters_gen.h"
 #include "mongo/db/concurrency/locker_noop_client_observer.h"
+#include "mongo/idl/server_parameter_test_util.h"
 #include "mongo/unittest/assert.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/periodic_runner.h"
@@ -368,7 +369,10 @@ public:
     OidcTestFixture()
         : _serviceContext(createServiceContext()),
           _client(_serviceContext->makeClient("OidcTestFixtureClient")),
-          _operationContext(_serviceContext->makeOperationContext(_client.get())) {}
+          _operationContext(_serviceContext->makeOperationContext(_client.get())),
+          // JWKSFetcherMock reports real wall-clock fetch times, so disable the JWKS
+          // quiesce period to prevent back-to-back refreshes in tests from being skipped.
+          _quiescePeriodController("JWKSMinimumQuiescePeriodSecs", 0) {}
 
     void setUp() override {
         OidcIdentityProvidersRegistry::set(_serviceContext.get(),
@@ -410,6 +414,7 @@ private:
     std::unique_ptr<ServiceContext> _serviceContext;
     ServiceContext::UniqueClient _client;
     ServiceContext::UniqueOperationContext _operationContext;
+    RAIIServerParameterControllerForTest _quiescePeriodController;
 };
 
 }  // namespace mongo
