@@ -41,6 +41,7 @@ Copyright (C) 2025-present Percona and/or its affiliates. All rights reserved.
 #include "mongo/unittest/assert.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/periodic_runner.h"
+#include "mongo/util/system_clock_source.h"
 
 namespace mongo {
 
@@ -233,17 +234,22 @@ struct JWKSFetcherFactoryMock : public JWKSFetcherFactory {
             : _factoryMock(factoryMock), _issuer(issuer) {}
 
         crypto::JWKSet fetch() override {
-
+            _lastAttemptedFetchTime = SystemClockSource::get()->now();
             return _factoryMock.fetch(_issuer);
         }
 
-        void setQuiesce(Date_t quiesce) override {
-            FAIL("setQuiesce() should not be called");
+        Date_t getLastAttemptedFetchTime() const override {
+            return _lastAttemptedFetchTime;
+        }
+
+        ClockSource* getClockSource() const override {
+            return SystemClockSource::get();
         }
 
     private:
         const JWKSFetcherFactoryMock& _factoryMock;
         std::string _issuer;
+        Date_t _lastAttemptedFetchTime;
     };
 
 public:
