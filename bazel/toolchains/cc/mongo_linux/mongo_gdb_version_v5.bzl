@@ -82,15 +82,15 @@ TOOLCHAIN_MAP_V5 = {
         "sha": "d04680a41b5b804a22f5880bf5458b3c13e0fca2863afc0529a5bf26ab74938a",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-rhel90-84bea98f485ef8c1af3f0612c56423fac4ea6256.tar.gz",
     },
+    "rhel10_aarch64": {
+        "platform_name": "rhel10-arm64",
+        "sha": "25f8d22e26d5e1354645c4427a1708258604be0076c318aaf790571dd917bb9b",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-rhel10-arm64-d02aeb1bc399436156aa04a08a2bf8158ae9852a.tar.gz",
+    },
     "rhel10_x86_64": {
         "platform_name": "rhel10",
-        "sha": "a778ecd2a50e3aaed9ab7acac672712f61df97157e1c0ee142211275e547e691",
-        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-rhel10-edf71c48476695b4bb7bb3ee0e098920dc226a99.tar.gz",
-    },
-    "rhel10_aarch64": {
-        "platform_name": "rhel10",
-        "sha": "97324ef9a2b9dff0f3a7b0b8dbe27aec10820b04f3e36fa4f79de5c6c63d4969",
-        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-rhel10-arm64-edf71c48476695b4bb7bb3ee0e098920dc226a99.tar.gz",
+        "sha": "f27711d02641a31c0884c13a3cd9fd2d76558df73ef764bdfa7397cc19aeaca4",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_gdb-rhel10-d02aeb1bc399436156aa04a08a2bf8158ae9852a.tar.gz",
     },
     "suse15_x86_64": {
         "platform_name": "suse15",

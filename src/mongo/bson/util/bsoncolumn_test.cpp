@@ -49,6 +49,7 @@
 #include "mongo/bson/bsontypes_util.h"
 #include "mongo/bson/oid.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/bson/util/bsoncolumn_expressions.h"
 #include "mongo/bson/util/bsoncolumn_helpers.h"
 #include "mongo/bson/util/bsoncolumn_test_util.h"
 #include "mongo/bson/util/bsoncolumnbuilder.h"
@@ -523,9 +524,13 @@ public:
         BSONColumn column(buffer, size);
 
         BSONColumnBuilder reference;
+        size_t cnt = 0;
         for (auto&& elem : column) {
             reference.append(elem);
+            ++cnt;
         }
+
+        ASSERT_EQ(bsoncolumn::count(buffer, size), cnt);
 
         BSONColumnBuilder<> reopen(buffer, size);
         [[maybe_unused]] auto diff = reference.intermediate();
@@ -720,6 +725,30 @@ public:
                                              intermediate.length);
             }
         }
+
+        // Verify min, max & minmax
+        {
+            BSONColumn col(columnBinary);
+            std::vector<BSONElement> elems;
+            for (auto&& elem : col) {
+                elems.push_back(elem);
+            }
+
+            // Compute expected min/max.
+            auto [expectedMin, expectedMax] = bsoncolumn::expectedMinMax(elems);
+            boost::intrusive_ptr allocator{new bsoncolumn::ElementStorage()};
+
+            // Verify optimized min, max and minmax expressions against expected values.
+            BSONElement minElem = min<BSONElementMaterializer>(columnBinary, allocator);
+            ASSERT_TRUE(minElem.binaryEqualValues(expectedMin));
+
+            BSONElement maxElem = max<BSONElementMaterializer>(columnBinary, allocator);
+            ASSERT_TRUE(maxElem.binaryEqualValues(expectedMax));
+
+            auto [minmaxMin, minmaxMax] = minmax<BSONElementMaterializer>(columnBinary, allocator);
+            ASSERT_TRUE(minmaxMin.binaryEqualValues(expectedMin));
+            ASSERT_TRUE(minmaxMax.binaryEqualValues(expectedMax));
+        }
     }
 
     static void verifyDecompressionInterleaved(const std::vector<BSONElement>& input,
@@ -909,6 +938,7 @@ public:
             ASSERT_EQ(col.size(), expected.size());
             ASSERT_EQ(std::distance(col.begin(), col.end()), expected.size());
             ASSERT_EQ(col.size(), expected.size());
+            ASSERT_EQ(bsoncolumn::count(columnBinary), expected.size());
 
             auto it = col.begin();
             for (auto elem : expected) {
@@ -1007,10 +1037,48 @@ public:
             col.decompressIterative<BSONElementMaterializer>(container, allocator);
             ASSERT_EQ(container.size(), expected.size());
             auto actual = container.begin();
+            BSONElement actualFirst;
+            BSONElement actualLast;
+            BSONElement actualMin;
+            BSONElement actualMax;
             for (auto&& elem : expected) {
                 elem.binaryEqualValues(*actual);
                 ++actual;
+                if (actualFirst.eoo()) {
+                    actualFirst = elem;
+                }
+                if (!elem.eoo()) {
+                    actualLast = elem;
+                }
+
+                if (actualMin.eoo()) {
+                    actualMin = elem;
+                    actualMax = elem;
+                } else if (!elem.eoo()) {
+                    if (elem.woCompare(actualMin) < 0) {
+                        actualMin = elem;
+                    }
+                    if (elem.woCompare(actualMax) > 0) {
+                        actualMax = elem;
+                    }
+                }
             }
+
+            BSONElement firstElem = first<BSONElementMaterializer>(columnBinary, allocator);
+            ASSERT_TRUE(firstElem.binaryEqualValues(actualFirst));
+
+            BSONElement lastElem = last<BSONElementMaterializer>(columnBinary, allocator);
+            ASSERT_TRUE(lastElem.binaryEqualValues(actualLast));
+
+            BSONElement minElem = min<BSONElementMaterializer>(columnBinary, allocator);
+            ASSERT_TRUE(minElem.binaryEqualValues(actualMin));
+
+            BSONElement maxElem = max<BSONElementMaterializer>(columnBinary, allocator);
+            ASSERT_TRUE(maxElem.binaryEqualValues(actualMax));
+
+            auto minmaxElems = minmax<BSONElementMaterializer>(columnBinary, allocator);
+            ASSERT_TRUE(minmaxElems.first.binaryEqualValues(actualMin));
+            ASSERT_TRUE(minmaxElems.second.binaryEqualValues(actualMax));
         }
 
         // Verify we can decompress the entire column using the block-based API using the
@@ -2581,6 +2649,32 @@ TEST_F(BSONColumnTest, DoubleRle) {
     verifyDecompression(binData, elems);
 }
 
+TEST_F(BSONColumnTest, MixedIntegralCanonicalTypes) {
+    // This test is mixing types of the same canonical type and verifies that everything works as
+    // expected, including the min, max and minmax expressions.
+    auto int64Ten = createElementInt64(10);
+    auto doubleFive = createElementDouble(5.0);
+    auto doubleTwo = createElementDouble(2.0);
+    auto int64Twenty = createElementInt64(20);
+
+    cb.append(int64Ten);
+    cb.append(doubleFive);
+    cb.append(doubleTwo);
+    cb.append(int64Twenty);
+    auto binData = cb.finalize();
+
+    BufBuilder expected;
+    appendLiteral(expected, int64Ten);
+    appendLiteral(expected, doubleFive);
+    appendSimple8bControl(expected, 0b1001, 0b0000);
+    appendSimple8bBlocks64(expected, {deltaDouble(doubleTwo, doubleFive, 1.0)}, 1);
+    appendLiteral(expected, int64Twenty);
+    appendEOO(expected);
+
+    verifyBinary(binData, expected);
+    verifyDecompression(binData, {int64Ten, doubleFive, doubleTwo, int64Twenty});
+}
+
 TEST_F(BSONColumnTest, Decimal128Base) {
     auto elemDec128 = createElementDecimal128(Decimal128());
 
@@ -3159,44 +3253,24 @@ TEST_F(BSONColumnTest, DBRefAfterChangeBack) {
     verifyDecompression(binData, {elemInt32, dbRef, dbRef});
 }
 
-TEST_F(BSONColumnTest, CodeWScopeBasic) {
-    auto first = createCodeWScope("code", BSONObj());
-    auto second = createCodeWScope("diffCode", BSONObj());
-    cb.append(first);
-    cb.append(second);
-    cb.append(second);
-
-    BufBuilder expected;
-    appendLiteral(expected, first);
-    appendLiteral(expected, second);
-    appendSimple8bControl(expected, 0b1000, 0b0000);
-    appendSimple8bBlock64(expected, kDeltaForBinaryEqualValues);
-    appendEOO(expected);
-
-    auto binData = cb.finalize();
-    verifyBinary(binData, expected);
-    verifyDecompression(binData, {first, second, second});
+TEST_F(BSONColumnTest, CodeWScopeAppendRejects) {
+    // Creation: BSONColumnBuilder must reject CodeWScope elements.
+    auto codeWScope = createCodeWScope("code", BSONObj());
+    ASSERT_THROWS_CODE(cb.append(codeWScope), DBException, ErrorCodes::InvalidBSONColumn);
 }
 
-TEST_F(BSONColumnTest, CodeWScopeAfterChangeBack) {
+TEST_F(BSONColumnTest, CodeWScopeDecompressRejects) {
+    // Decompression: iterating a column that contains a CodeWScope literal must throw, even
+    // when the bytes were stored by bypassing BSONColumnBuilder.
     auto codeWScope = createCodeWScope("code", BSONObj());
-    auto elemInt32 = createElementInt32(0);
+    BufBuilder raw;
+    appendLiteral(raw, codeWScope);
+    appendEOO(raw);
 
-    cb.append(elemInt32);
-    cb.append(codeWScope);
-    cb.append(codeWScope);
-
-    BufBuilder expected;
-    appendLiteral(expected, elemInt32);
-    appendLiteral(expected, codeWScope);
-    appendSimple8bControl(expected, 0b1000, 0b0000);
-    appendSimple8bBlock64(expected, kDeltaForBinaryEqualValues);
-
-    appendEOO(expected);
-
-    auto binData = cb.finalize();
-    verifyBinary(binData, expected);
-    verifyDecompression(binData, {elemInt32, codeWScope, codeWScope});
+    BSONColumn col(createBSONColumn(raw.buf(), raw.len()));
+    ASSERT_THROWS_CODE(std::for_each(col.begin(), col.end(), [](const auto&) {}),
+                       DBException,
+                       ErrorCodes::InvalidBSONColumn);
 }
 
 TEST_F(BSONColumnTest, SymbolBasic) {
@@ -8272,7 +8346,6 @@ TEST_F(BSONColumnTest, InvalidDeltaAfterInterleaved) {
 TEST_F(BSONColumnTest, InvalidDelta) {
     testInvalidDelta(createRegex());
     testInvalidDelta(createDBRef("ns", OID{"112233445566778899AABBCC"}));
-    testInvalidDelta(createCodeWScope("code", BSONObj{}));
     testInvalidDelta(createSymbol("symbol"));
     testInvalidDelta(BSON("obj" << BSON("a" << 1)).firstElement());
     testInvalidDelta(BSON("arr" << BSON_ARRAY("a")).firstElement());
@@ -9368,6 +9441,20 @@ public:
 
     static Element materializeMissing(ElementStorage& a) {
         return std::monostate();
+    }
+
+    static bool isMissing(Element elem) {
+        return std::holds_alternative<std::monostate>(elem);
+    }
+
+    static int canonicalType(const Element& elem) {
+        return elem.index();
+    }
+
+    static int compare(const Element& lhs,
+                       const Element& rhs,
+                       const StringDataComparator* comparator) {
+        return 0;
     }
 };
 

@@ -44,11 +44,11 @@
 #include "mongo/stdx/condition_variable.h"
 #include "mongo/stdx/unordered_map.h"
 #include "mongo/transport/ingress_handshake_metrics.h"
+#include "mongo/transport/message_filter_hooks.h"
 #include "mongo/transport/session.h"
 #include "mongo/transport/session_manager_common_gen.h"
 #include "mongo/transport/session_workflow.h"
 #include "mongo/transport/transport_options_gen.h"
-#include "mongo/util/net/socket_utils.h"
 #include "mongo/util/processinfo.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kNetwork
@@ -73,9 +73,6 @@ struct ClientSummary {
     friend logv2::DynamicAttributes logAttrs(const ClientSummary& m) {
         logv2::DynamicAttributes attrs;
         attrs.add("remote", m.remote);
-        if (isUnixDomainSocket(m.local.host())) {
-            attrs.add("unixSockPath", m.local);
-        }
         attrs.add("isLoadBalanced", m.isLoadBalanced);
         attrs.add("isProxyUnixSock", m.isProxyUnixSock);
         if (m.isLoadBalanced || m.isProxyUnixSock) {
@@ -90,8 +87,6 @@ struct ClientSummary {
 
     UUID uuid;
     HostAndPort remote;
-    // `local` is here only so that we can use it to indicate the path to the unix domain socket
-    // when the client is connected to a unix domain socket.
     HostAndPort local;
     HostAndPort sourceClient;
     SessionId id;
@@ -298,6 +293,10 @@ SessionManagerCommon::~SessionManagerCommon() = default;
 
 void SessionManagerCommon::startSession(std::shared_ptr<Session> session) {
     invariant(session);
+    invariant(session->isIngress());
+
+    MessageHooks::onConnectionEstablished(*session);
+
     IngressHandshakeMetrics::get(*session).onSessionStarted(_svcCtx->getTickSource());
 
     serverGlobalParams.maxIncomingConnsOverride.refreshSnapshot(maxIncomingConnsOverride);

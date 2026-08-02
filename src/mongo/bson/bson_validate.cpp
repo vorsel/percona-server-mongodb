@@ -55,6 +55,7 @@
 #include "mongo/bson/util/bsoncolumn_util.h"
 #include "mongo/crypto/encryption_fields_util.h"
 #include "mongo/crypto/fle_field_schema_gen.h"
+#include "mongo/logv2/log.h"
 #include "mongo/platform/compiler.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/decimal_counter.h"
@@ -791,6 +792,7 @@ public:
                         return Status::OK();
                     }
                 } else if (bsoncolumn::isUncompressedLiteralControlByte(control)) {
+                    bsoncolumn::assertNotCodeWScope(static_cast<BSONType>(control));
                     int size;
                     if (MONGO_likely(mode == BSONValidateModeEnum::kDefault))
                         size = ValidateBuffer<precise, DefaultValidator>(
@@ -807,6 +809,8 @@ public:
                     else
                         MONGO_UNREACHABLE;
 
+                    // ptr is safe to dereference due to checks above, and we have confirmed size is
+                    // within the buffer.
                     ptr += size;
                 } else if (bsoncolumn::isInterleavedStartControlByte(control)) {
                     // interleaved objects begin with a reference object, and then a series
@@ -847,7 +851,7 @@ public:
                     ptr += 1 + size;
                 }
             }
-        } catch (const ExceptionForCat<ErrorCategory::ValidationError>& e) {
+        } catch (const DBException& e) {
             return Status(e.code(), str::stream() << e.what());
         }
 

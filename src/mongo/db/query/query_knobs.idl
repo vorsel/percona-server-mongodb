@@ -642,6 +642,18 @@ server_parameters:
         gt: 0
     redact: false
 
+  internalQueryMaxExpressionOutputBytes:
+    description: "Limits the size in bytes of an expression's materialized output (e.g. $array,
+    $concatArrays, $setUnion, $zip, object construction)."
+    set_at: [ startup, runtime ]
+    cpp_varname: "internalQueryMaxExpressionOutputBytes"
+    cpp_vartype: AtomicWord<int>
+    default:
+      expr: std::numeric_limits<int>::max()
+    validator:
+        gt: 0
+    redact: false
+
   internalQueryMaxMapReduceExpressionBytes:
     description: "Limits the amount of memory that can be used while constructing the result of a $map or $range expression"
     set_at: [ startup, runtime ]
@@ -665,6 +677,18 @@ server_parameters:
         gt: 0
     on_update: plan_cache_util::clearSbeCacheOnParameterChange
     redact: false
+
+  internalQueryMaxMemoryIntensiveExpressions:
+      description: >-
+          Limits the number of memory-intensive aggregation expressions that can appear in a single query.
+      set_at: [startup, runtime]
+      cpp_varname: "internalQueryMaxMemoryIntensiveExpressions"
+      cpp_vartype: AtomicWord<int>
+      default:
+          expr: std::numeric_limits<int>::max()
+      validator:
+          gte: 0
+      redact: false
 
   internalQueryJavaScriptHeapSizeLimitMB:
     description: "Limits the JavaScript heap size used in aggregation. Will defer to the global

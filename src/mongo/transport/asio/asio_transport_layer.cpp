@@ -1130,6 +1130,9 @@ Status AsioTransportLayer::setup() {
             if (auto lastSlashIndex = addrStr.rfind('/'); lastSlashIndex != StringData::npos &&
                 addrStr.substr(lastSlashIndex + 1).starts_with("proxy")) {
                 setUnixDomainSocketPermissions(addrStr, kProxyUnixDomainSocketPerms);
+                if (serverGlobalParams.proxySocketGid) {
+                    setUnixDomainSocketGroup(addr.toString(), *serverGlobalParams.proxySocketGid);
+                }
             } else {
                 setUnixDomainSocketPermissions(addrStr, serverGlobalParams.unixSocketPermissions);
             }
@@ -1422,6 +1425,11 @@ void AsioTransportLayer::_acceptConnection(GenericAcceptor& acceptor) {
             _acceptConnection(acceptor);
         });
 
+
+        constexpr static auto logOnError = [](const DBException& e) {
+            LOGV2_WARNING(23023, "Error accepting new connection", "error"_attr = e);
+        };
+
         try {
             std::shared_ptr<AsioSession> session(
                 new SyncAsioSession(this, std::move(peerSocket), true));
@@ -1475,7 +1483,11 @@ void AsioTransportLayer::_acceptConnection(GenericAcceptor& acceptor) {
                     .getAsync([this, session = std::move(session), t = std::move(token)](Status s) {
                         if (s.isOK()) {
                             invariant(!!_sessionManager);
-                            _sessionManager->startSession(std::move(session));
+                            try {
+                                _sessionManager->startSession(std::move(session));
+                            } catch (const DBException& e) {
+                                logOnError(e);
+                            }
                         }
                         // We will release the token (i.e. `t`) as we leave this function.
                     });
@@ -1489,7 +1501,7 @@ void AsioTransportLayer::_acceptConnection(GenericAcceptor& acceptor) {
                     5746600, "Error accepting new connection", "error"_attr = e.code().message());
             }
         } catch (const DBException& e) {
-            LOGV2_WARNING(23023, "Error accepting new connection", "error"_attr = e);
+            logOnError(e);
         }
     };
 

@@ -40,6 +40,7 @@ if [ "$SEORDER" == "1" ]; then
 fi
 
 # install packages needed by check_has_tag.py
+# Keep this in sync with jstests/libs/python.js getPython3Binary().
 PYTHON=/opt/mongodbtoolchain/v4/bin/python3
 if [[ (-f "$PYTHON" || -L "$PYTHON") && -x "$PYTHON" ]]; then
   echo "==== Found python3 in $PYTHON"

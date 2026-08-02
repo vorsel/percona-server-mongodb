@@ -371,6 +371,8 @@ public:
 
     static constexpr bool kCollectsPositionInfo = PositionInfoAppender<Container>;
 
+    void eof() {}
+
     void append(bool val) {
         _last = CMaterializer::materialize(*_allocator, val);
         _collection.push_back(_last);
@@ -536,30 +538,6 @@ public:
     }
 
     /**
-     * Return first non-missing element stored in this BSONColumn
-     */
-    BSONElement first() const;
-
-    /**
-     * Return last non-missing element stored in this BSONColumn
-     */
-    BSONElement last() const;
-
-    /**
-     * Return 'min' element in this BSONColumn.
-     *
-     * TODO: Do we need to specify ComparisonRulesSet here?
-     */
-    BSONElement min(const StringDataComparator* comparator = nullptr) const;
-
-    /**
-     * Return 'max' element in this BSONColumn.
-     *
-     * TODO: Do we need to specify ComparisonRulesSet here?
-     */
-    BSONElement max(const StringDataComparator* comparator = nullptr) const;
-
-    /**
      * Return sum of all elements stored in this BSONColumn.
      *
      * The BSONColumn must only contain NumberInt, NumberLong, NumberDouble, NumberDecimal types,
@@ -644,6 +622,7 @@ void BSONColumnBlockBased::decompress(boost::intrusive_ptr<ElementStorage> alloc
                 8517800, "BSONColumn data ended without reaching end of buffer", ptr + 1 == end);
             break;
         } else if (isUncompressedLiteralControlByte(control)) {
+            assertNotCodeWScope(control);
             // The BSONColumn encoding guarantees that the field name is just a single null byte.
             BSONElement literal(ptr, 1, BSONElement::TrustedInitTag{});
             dassert(BSONElement{ptr}.fieldNameSize() == 1,  // size includes null byte

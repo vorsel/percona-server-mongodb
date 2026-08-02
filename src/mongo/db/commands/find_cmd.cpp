@@ -115,6 +115,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/query_analysis_writer.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_cache_gen.h"
 #include "mongo/db/stats/counters.h"
 #include "mongo/db/stats/resource_consumption_metrics.h"
 #include "mongo/db/storage/recovery_unit.h"
@@ -629,6 +630,12 @@ public:
                 // stalled replicating because of an inability to acquire a read ticket.
                 admissionPriority.emplace(opCtx, AdmissionContext::Priority::kExempt);
             }
+            // Session collection reads from internal clients (findRemovedSessions) must make
+            // forward progress to prevent TooManyLogicalSessions errors under heavy load.
+            if (!admissionPriority && _ns == NamespaceString::kLogicalSessionsNamespace &&
+                opCtx->getClient()->isInternalClient()) {
+                admissionPriority.emplace(opCtx, AdmissionContext::Priority::kExempt);
+            }
 
             // If this read represents a reverse oplog scan, we want to bypass oplog visibility
             // rules in the case of secondaries. We normally only read from these nodes at batch
@@ -1048,19 +1055,14 @@ public:
 
         void _rewriteFLEPayloads(OperationContext* opCtx) {
             // Rewrite any FLE find payloads that exist in the query if this is a FLE 2 query.
-            if (shouldDoFLERewrite(_cmdRequest)) {
+            if (prepareForFLERewrite(opCtx, _cmdRequest->getEncryptionInformation())) {
                 invariant(_cmdRequest->getNamespaceOrUUID().isNamespaceString());
                 LOGV2_DEBUG(7964101,
                             2,
                             "Processing Queryable Encryption command",
                             "cmd"_attr = _request.body);
 
-                if (!_cmdRequest->getEncryptionInformation()->getCrudProcessed().value_or(false)) {
-                    processFLEFindD(
-                        opCtx, _cmdRequest->getNamespaceOrUUID().nss(), _cmdRequest.get());
-                }
-                stdx::lock_guard<Client> lk(*opCtx->getClient());
-                CurOp::get(opCtx)->setShouldOmitDiagnosticInformation_inlock(lk, true);
+                processFLEFindD(opCtx, _cmdRequest->getNamespaceOrUUID().nss(), _cmdRequest.get());
             }
         }
     };
@@ -1091,6 +1093,9 @@ private:
         if (auto& nss = findCommand->getNamespaceOrUUID(); nss.isNamespaceString()) {
             CommandHelpers::ensureValidCollectionName(nss.nss());
         }
+
+        Variables::validateRuntimeConstantsArePermitted(opCtx,
+                                                        findCommand->getLegacyRuntimeConstants());
 
         // TODO: SERVER-73632 Remove Feature Flag for PM-635.
         // Forbid users from passing 'querySettings' explicitly.

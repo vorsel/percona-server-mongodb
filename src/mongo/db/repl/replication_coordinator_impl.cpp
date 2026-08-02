@@ -5464,10 +5464,8 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
                               "offendingConfigs"_attr = offendingConfigs);
     }
 
-    // If the SplitHorizon has changed, reply to all waiting hellos with an error.
-    _errorOnPromisesIfHorizonChanged(lk, opCtx, oldConfig, newConfig, _selfIndex, myIndex);
-
     LOGV2(21392, "New replica set config in use", "config"_attr = _rsConfig.unsafePeek().toBSON());
+    const auto oldIndex = _selfIndex;
     _selfIndex = myIndex;
     if (_selfIndex >= 0) {
         LOGV2(21393,
@@ -5476,6 +5474,10 @@ ReplicationCoordinatorImpl::_setCurrentRSConfig(WithLock lk,
     } else {
         LOGV2(21394, "This node is not a member of the config");
     }
+
+    // If the SplitHorizon has changed, reply to all waiting hellos with an error.
+    _errorOnPromisesIfHorizonChanged(lk, opCtx, oldConfig, newConfig, oldIndex, myIndex);
+
     if (replica_set_endpoint::isFeatureFlagEnabledIgnoreFCV() &&
         serverGlobalParams.clusterRole.has(ClusterRole::ConfigServer)) {
         // The feature flag check here needs to ignore the FCV since the
@@ -5690,7 +5692,7 @@ ReadPreference ReplicationCoordinatorImpl::_getSyncSourceReadPreference(WithLock
         enableOverrideClusterChainingSetting.load()) {
         // No update to read preference necessary.
 
-    } else if (!memberState.primary()) {
+    } else if (!memberState.primary() && _selfIndex >= 0) {
         // SERVER-105416: If we are the only electable node, then we need to be able to sync from
         // secondaries.
         // Otherwise, if we are not the primary and chaining is disabled in the config (without

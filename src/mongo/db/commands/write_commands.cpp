@@ -88,6 +88,7 @@
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/service_context.h"
+#include "mongo/db/session/logical_session_cache_gen.h"
 #include "mongo/db/shard_role.h"
 #include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
 #include "mongo/db/timeseries/timeseries_update_delete_util.h"
@@ -299,19 +300,12 @@ public:
             dassert(write_ops::verifySizeEstimate(request(), &unparsedRequest()));
 
             doTransactionValidationForWrites(opCtx, ns());
-            if (request().getEncryptionInformation().has_value()) {
-                {
-                    // Flag set here and in fle_crud.cpp since this only executes on a mongod.
-                    stdx::lock_guard<Client> lk(*opCtx->getClient());
-                    CurOp::get(opCtx)->setShouldOmitDiagnosticInformation_inlock(lk, true);
-                }
 
-                if (!request().getEncryptionInformation()->getCrudProcessed().value_or(false)) {
-                    write_ops::InsertCommandReply insertReply;
-                    auto batch = processFLEInsert(opCtx, request(), &insertReply);
-                    if (batch == FLEBatchResult::kProcessed) {
-                        return insertReply;
-                    }
+            if (prepareForFLERewrite(opCtx, request().getEncryptionInformation())) {
+                write_ops::InsertCommandReply insertReply;
+                auto batch = processFLEInsert(opCtx, request(), &insertReply);
+                if (batch == FLEBatchResult::kProcessed) {
+                    return insertReply;
                 }
             }
 
@@ -419,6 +413,8 @@ public:
                    const OpMsgRequest& opMsgRequest)
             : InvocationBaseGen(opCtx, command, opMsgRequest), _commandObj(opMsgRequest.body) {
             UpdateOp::validate(request());
+            Variables::validateRuntimeConstantsArePermitted(opCtx,
+                                                            request().getLegacyRuntimeConstants());
 
             invariant(_commandObj.isOwned());
 
@@ -501,16 +497,18 @@ public:
             dassert(write_ops::verifySizeEstimate(request(), &unparsedRequest()));
 
             doTransactionValidationForWrites(opCtx, ns());
+
+            // Session collection upserts from internal clients (refreshSessions) must make forward
+            // progress to prevent TooManyLogicalSessions errors under heavy write load.
+            boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> admissionPriority;
+            if (ns() == NamespaceString::kLogicalSessionsNamespace &&
+                opCtx->getClient()->isInternalClient()) {
+                admissionPriority.emplace(opCtx, AdmissionContext::Priority::kExempt);
+            }
+
             write_ops::UpdateCommandReply updateReply;
-            if (request().getEncryptionInformation().has_value()) {
-                {
-                    // Flag set here and in fle_crud.cpp since this only executes on a mongod.
-                    stdx::lock_guard<Client> lk(*opCtx->getClient());
-                    CurOp::get(opCtx)->setShouldOmitDiagnosticInformation_inlock(lk, true);
-                }
-                if (!request().getEncryptionInformation().value().getCrudProcessed()) {
-                    return processFLEUpdate(opCtx, request());
-                }
+            if (prepareForFLERewrite(opCtx, request().getEncryptionInformation())) {
+                return processFLEUpdate(opCtx, request());
             }
 
             auto [isTimeseriesViewRequest, bucketNs] =
@@ -625,19 +623,12 @@ public:
 
             UpdateRequest updateRequest(request().getUpdates()[0]);
             updateRequest.setNamespaceString(nss);
-            if (shouldDoFLERewrite(request())) {
-                {
-                    stdx::lock_guard<Client> lk(*opCtx->getClient());
-                    CurOp::get(opCtx)->setShouldOmitDiagnosticInformation_inlock(lk, true);
-                }
-
-                if (!request().getEncryptionInformation()->getCrudProcessed().value_or(false)) {
-                    updateRequest.setQuery(
-                        processFLEWriteExplainD(opCtx,
-                                                write_ops::collationOf(request().getUpdates()[0]),
-                                                request(),
-                                                updateRequest.getQuery()));
-                }
+            if (prepareForFLERewrite(opCtx, request().getEncryptionInformation())) {
+                updateRequest.setQuery(
+                    processFLEWriteExplainD(opCtx,
+                                            write_ops::collationOf(request().getUpdates()[0]),
+                                            request(),
+                                            updateRequest.getQuery()));
             }
 
             updateRequest.setLegacyRuntimeConstants(request().getLegacyRuntimeConstants().value_or(
@@ -722,6 +713,8 @@ public:
                    const OpMsgRequest& opMsgRequest)
             : InvocationBaseGen(opCtx, command, opMsgRequest), _commandObj(opMsgRequest.body) {
             DeleteOp::validate(request());
+            Variables::validateRuntimeConstantsArePermitted(opCtx,
+                                                            request().getLegacyRuntimeConstants());
         }
 
         bool supportsWriteConcern() const final {
@@ -743,19 +736,20 @@ public:
             dassert(write_ops::verifySizeEstimate(request(), &unparsedRequest()));
 
             doTransactionValidationForWrites(opCtx, ns());
+
+            // Session collection deletes from internal clients (removeRecords) must make forward
+            // progress to prevent TooManyLogicalSessions errors under heavy write load.
+            boost::optional<ScopedAdmissionPriority<ExecutionAdmissionContext>> admissionPriority;
+            if (ns() == NamespaceString::kLogicalSessionsNamespace &&
+                opCtx->getClient()->isInternalClient()) {
+                admissionPriority.emplace(opCtx, AdmissionContext::Priority::kExempt);
+            }
+
             write_ops::DeleteCommandReply deleteReply;
             OperationSource source = OperationSource::kStandard;
 
-            if (request().getEncryptionInformation().has_value()) {
-                {
-                    // Flag set here and in fle_crud.cpp since this only executes on a mongod.
-                    stdx::lock_guard<Client> lk(*opCtx->getClient());
-                    CurOp::get(opCtx)->setShouldOmitDiagnosticInformation_inlock(lk, true);
-                }
-
-                if (!request().getEncryptionInformation()->getCrudProcessed().value_or(false)) {
-                    return processFLEDelete(opCtx, request());
-                }
+            if (prepareForFLERewrite(opCtx, request().getEncryptionInformation())) {
+                return processFLEDelete(opCtx, request());
             }
 
             if (auto [isTimeseriesViewRequest, _] =
@@ -810,16 +804,9 @@ public:
 
             const auto& firstDelete = request().getDeletes()[0];
             BSONObj query = firstDelete.getQ();
-            if (shouldDoFLERewrite(request())) {
-                {
-                    stdx::lock_guard<Client> lk(*opCtx->getClient());
-                    CurOp::get(opCtx)->setShouldOmitDiagnosticInformation_inlock(lk, true);
-                }
-
-                if (!request().getEncryptionInformation()->getCrudProcessed().value_or(false)) {
-                    query = processFLEWriteExplainD(
-                        opCtx, write_ops::collationOf(firstDelete), request(), query);
-                }
+            if (prepareForFLERewrite(opCtx, request().getEncryptionInformation())) {
+                query = processFLEWriteExplainD(
+                    opCtx, write_ops::collationOf(firstDelete), request(), query);
             }
             deleteRequest.setQuery(std::move(query));
 

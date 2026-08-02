@@ -724,8 +724,20 @@ const char* ExpressionAnyElementTrue::getOpName() const {
 Value ExpressionArray::evaluate(const Document& root, Variables* variables) const {
     vector<Value> values;
     values.reserve(_children.size());
+
+    size_t currentMemoryBytes = 0;
+    const size_t maxMemoryBytes = internalQueryMaxExpressionOutputBytes.loadRelaxed();
+
     for (auto&& expr : _children) {
         Value elemVal = expr->evaluate(root, variables);
+        currentMemoryBytes += elemVal.getApproximateSize();
+        if (MONGO_unlikely(currentMemoryBytes > maxMemoryBytes)) {
+            uasserted(ErrorCodes::ExceededMemoryLimit,
+                      str::stream() << "$array would use too much memory (" << currentMemoryBytes
+                                    << " bytes) and cannot spill to disk. Memory limit: "
+                                    << maxMemoryBytes << " bytes");
+        }
+
         values.push_back(elemVal.missing() ? Value(BSONNULL) : std::move(elemVal));
     }
     return Value(std::move(values));
@@ -1196,6 +1208,9 @@ Value ExpressionConcatArrays::evaluate(const Document& root, Variables* variable
     const size_t n = _children.size();
     vector<Value> values;
 
+    size_t currentMemoryBytes = 0;
+    const size_t maxMemoryBytes = internalQueryMaxExpressionOutputBytes.loadRelaxed();
+
     for (size_t i = 0; i < n; ++i) {
         Value val = _children[i]->evaluate(root, variables);
         if (val.nullish()) {
@@ -1208,7 +1223,17 @@ Value ExpressionConcatArrays::evaluate(const Document& root, Variables* variable
                 val.isArray());
 
         const auto& subValues = val.getArray();
-        values.insert(values.end(), subValues.begin(), subValues.end());
+        for (const auto& subValue : subValues) {
+            currentMemoryBytes += subValue.getApproximateSize();
+            if (MONGO_unlikely(currentMemoryBytes > maxMemoryBytes)) {
+                uasserted(ErrorCodes::ExceededMemoryLimit,
+                          str::stream()
+                              << "$concatArrays would use too much memory (" << currentMemoryBytes
+                              << " bytes) and cannot spill to disk. Memory limit: "
+                              << maxMemoryBytes << " bytes");
+            }
+            values.push_back(subValue);
+        }
     }
     return Value(std::move(values));
 }
@@ -1294,9 +1319,29 @@ const char* ExpressionCond::getOpName() const {
 
 /* ---------------------- ExpressionConstant --------------------------- */
 
+namespace {
+// The Column (7) BinData subtype is not allowed in $const or $literal.
+void assertNoBSONColumn(const BSONElement& elem) {
+    if (elem.type() == BSONType::BinData) {
+        uassert(ErrorCodes::FailedToParse,
+                "BSONColumn (BinData subtype 7) is not allowed as an expression literal",
+                elem.binDataType() != BinDataType::Column);
+    } else if (elem.type() == BSONType::Object || elem.type() == BSONType::Array) {
+        for (const auto& child : elem.embeddedObject()) {
+            assertNoBSONColumn(child);
+        }
+    } else if (elem.type() == BSONType::CodeWScope) {
+        for (const auto& child : elem.codeWScopeObject()) {
+            assertNoBSONColumn(child);
+        }
+    }
+}
+}  // namespace
+
 intrusive_ptr<Expression> ExpressionConstant::parse(ExpressionContext* const expCtx,
                                                     BSONElement exprElement,
                                                     const VariablesParseState& vps) {
+    assertNoBSONColumn(exprElement);
     return new ExpressionConstant(expCtx, Value(exprElement));
 }
 
@@ -2419,6 +2464,7 @@ boost::intrusive_ptr<ExpressionObject> ExpressionObject::create(
 intrusive_ptr<ExpressionObject> ExpressionObject::parse(ExpressionContext* const expCtx,
                                                         BSONObj obj,
                                                         const VariablesParseState& vps) {
+    expCtx->checkAndIncrementMemoryIntensiveExprCount("$object"_sd);
     // Make sure we don't have any duplicate field names.
     stdx::unordered_set<string> specifiedFields;
 
@@ -2467,8 +2513,20 @@ intrusive_ptr<Expression> ExpressionObject::optimize() {
 
 Value ExpressionObject::evaluate(const Document& root, Variables* variables) const {
     MutableDocument outputDoc;
+
+    size_t currentMemoryBytes = 0;
+    const size_t maxMemoryBytes = internalQueryMaxExpressionOutputBytes.loadRelaxed();
+
     for (auto&& pair : _expressions) {
-        outputDoc.addField(pair.first, pair.second->evaluate(root, variables));
+        Value elemVal = pair.second->evaluate(root, variables);
+        currentMemoryBytes += pair.first.size() + elemVal.getApproximateSize();
+        if (MONGO_unlikely(currentMemoryBytes > maxMemoryBytes)) {
+            uasserted(ErrorCodes::ExceededMemoryLimit,
+                      str::stream() << "$object would use too much memory (" << currentMemoryBytes
+                                    << " bytes) and cannot spill to disk. Memory limit: "
+                                    << maxMemoryBytes << " bytes");
+        }
+        outputDoc.addField(pair.first, std::move(elemVal));
     }
     return outputDoc.freezeToValue();
 }
@@ -3100,6 +3158,7 @@ intrusive_ptr<Expression> ExpressionMap::parse(ExpressionContext* const expCtx,
     MONGO_verify(expr.fieldNameStringData() == "$map");
 
     uassert(16878, "$map only supports an object as its argument", expr.type() == Object);
+    expCtx->checkAndIncrementMemoryIntensiveExprCount(expr.fieldNameStringData());
 
     // "in" must be parsed after "as" regardless of BSON order
     BSONElement inputElem;
@@ -4703,7 +4762,7 @@ intrusive_ptr<Expression> ExpressionReduce::parse(ExpressionContext* const expCt
             str::stream() << "$reduce requires an object as an argument, found: "
                           << typeName(expr.type()),
             expr.type() == Object);
-
+    expCtx->checkAndIncrementMemoryIntensiveExprCount(expr.fieldNameStringData());
 
     // vpsSub is used only to parse 'in', which must have access to $$this and $$value.
     VariablesParseState vpsSub(vps);
@@ -5370,6 +5429,10 @@ const char* ExpressionSetIsSubset::getOpName() const {
 Value ExpressionSetUnion::evaluate(const Document& root, Variables* variables) const {
     ValueSet unionedSet = getExpressionContext()->getValueComparator().makeOrderedValueSet();
     const size_t n = _children.size();
+
+    size_t currentMemoryBytes = 0;
+    const size_t maxMemoryBytes = internalQueryMaxExpressionOutputBytes.loadRelaxed();
+
     for (size_t i = 0; i < n; i++) {
         const Value newEntries = _children[i]->evaluate(root, variables);
         if (newEntries.nullish()) {
@@ -5380,7 +5443,19 @@ Value ExpressionSetUnion::evaluate(const Document& root, Variables* variables) c
                               << " is of type: " << typeName(newEntries.getType()),
                 newEntries.isArray());
 
-        unionedSet.insert(newEntries.getArray().begin(), newEntries.getArray().end());
+        for (const auto& newEntry : newEntries.getArray()) {
+            const auto [it, inserted] = unionedSet.insert(newEntry);
+            if (inserted) {
+                currentMemoryBytes += it->getApproximateSize();
+                if (MONGO_unlikely(currentMemoryBytes > maxMemoryBytes)) {
+                    uasserted(ErrorCodes::ExceededMemoryLimit,
+                              str::stream()
+                                  << "$setUnion would use too much memory (" << currentMemoryBytes
+                                  << " bytes) and cannot spill to disk. Memory limit: "
+                                  << maxMemoryBytes << " bytes");
+                }
+            }
+        }
     }
     return Value(vector<Value>(unionedSet.begin(), unionedSet.end()));
 }
@@ -6372,6 +6447,7 @@ intrusive_ptr<Expression> ExpressionZip::parse(ExpressionContext* const expCtx,
             str::stream() << "$zip only supports an object as an argument, found "
                           << typeName(expr.type()),
             expr.type() == Object);
+    expCtx->checkAndIncrementMemoryIntensiveExprCount(expr.fieldNameStringData());
 
     auto useLongestLength = false;
     std::vector<boost::intrusive_ptr<Expression>> children;
@@ -6487,6 +6563,9 @@ Value ExpressionZip::evaluate(const Document& root, Variables* variables) const 
     output.reserve(outputLength);
     outputChild.reserve(_inputs.size());
 
+    size_t currentMemoryBytes = 0;
+    const size_t maxMemoryBytes = internalQueryMaxExpressionOutputBytes.loadRelaxed();
+
     for (size_t row = 0; row < outputLength; row++) {
         outputChild.clear();
         for (size_t col = 0; col < _inputs.size(); col++) {
@@ -6498,7 +6577,15 @@ Value ExpressionZip::evaluate(const Document& root, Variables* variables) const 
                 outputChild.push_back(evaluatedDefaults[col]);
             }
         }
-        output.push_back(Value(outputChild));
+        Value rowValue(outputChild);
+        currentMemoryBytes += rowValue.getApproximateSize();
+        if (MONGO_unlikely(currentMemoryBytes > maxMemoryBytes)) {
+            uasserted(ErrorCodes::ExceededMemoryLimit,
+                      str::stream() << "$zip would use too much memory (" << currentMemoryBytes
+                                    << " bytes) and cannot spill to disk. Memory limit: "
+                                    << maxMemoryBytes << " bytes");
+        }
+        output.push_back(std::move(rowValue));
     }
 
     return Value(std::move(output));
@@ -7166,6 +7253,9 @@ private:
                                   << typeCode,
                     // Allowed ranges are 0-8 (pre-defined types) and 128-255 (user-defined types).
                     isValidBinDataType(typeCode) || isValidUserDefinedBinDataType(typeCode));
+            uassert(12910300,
+                    "$convert to BinData subtype Column (7) is not allowed",
+                    typeCode != static_cast<int>(BinDataType::Column));
 
             return static_cast<BinDataType>(typeCode);
         }

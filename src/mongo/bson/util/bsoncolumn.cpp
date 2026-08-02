@@ -117,6 +117,7 @@ char* ElementStorage::allocate(int bytes) {
         // Keep track of current block if it exists.
         if (_block) {
             _blocks.push_back(std::move(_block));
+            _totalBlocksCapacity += _capacity;
         }
 
         // If contiguous mode is enabled we need to copy data from the previous block
@@ -469,6 +470,7 @@ BSONColumn::Iterator::DecodingState::loadControl(ElementStorage& allocator,
     // Load current control byte, it can be either a literal or Simple-8b deltas
     uint8_t control = *buffer;
     if (bsoncolumn::isUncompressedLiteralControlByte(control)) {
+        bsoncolumn::assertNotCodeWScope(control);
         // Load BSONElement from the literal and set last encoded in case we need to calculate
         // deltas from this literal
         BSONElement literalElem(buffer, 1, BSONElement::TrustedInitTag{});
@@ -685,7 +687,7 @@ BSONColumn::BSONColumn(const char* buffer, size_t size)
 }
 
 BSONColumn::BSONColumn(BSONElement bin) {
-    tassert(5857700,
+    uassert(5857700,
             "Invalid BSON type for column",
             bin.type() == BSONType::BinData && bin.binDataType() == BinDataType::Column);
 
@@ -696,7 +698,7 @@ BSONColumn::BSONColumn(BSONElement bin) {
 
 BSONColumn::BSONColumn(BSONBinData bin)
     : BSONColumn(static_cast<const char*>(bin.data), bin.length) {
-    tassert(6179300, "Invalid BSON type for column", bin.type == BinDataType::Column);
+    uassert(6179300, "Invalid BSON type for column", bin.type == BinDataType::Column);
 }
 
 void BSONColumn::_initialValidate() {
@@ -780,27 +782,7 @@ BSONColumnBlockBased::BSONColumnBlockBased(const char* buffer, size_t size)
 
 BSONColumnBlockBased::BSONColumnBlockBased(BSONBinData bin)
     : BSONColumnBlockBased(static_cast<const char*>(bin.data), bin.length) {
-    tassert(8471202, "Invalid BSON type for column", bin.type == BinDataType::Column);
-}
-
-BSONElement BSONColumnBlockBased::first() const {
-    invariant(false, "not implemented");
-    return BSONElement();
-}
-
-BSONElement BSONColumnBlockBased::last() const {
-    invariant(false, "not implemented");
-    return BSONElement();
-}
-
-BSONElement BSONColumnBlockBased::min(const StringDataComparator* comparator) const {
-    invariant(false, "not implemented");
-    return BSONElement();
-}
-
-BSONElement BSONColumnBlockBased::max(const StringDataComparator* comparator) const {
-    invariant(false, "not implemented");
-    return BSONElement();
+    uassert(8471202, "Invalid BSON type for column", bin.type == BinDataType::Column);
 }
 
 BSONElement BSONColumnBlockBased::sum() const {

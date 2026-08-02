@@ -29,6 +29,7 @@
 
 #pragma once
 
+#include "mongo/bson/bsonobj.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/util/simple8b.h"
 #include "mongo/platform/int128.h"
@@ -45,6 +46,12 @@ static constexpr std::array<uint8_t, Simple8bTypeUtil::kMemoryAsInteger + 1>
 
 inline bool isUncompressedLiteralControlByte(uint8_t control) {
     return (control & 0xE0) == 0 || control == (uint8_t)MinKey || control == (uint8_t)MaxKey;
+}
+
+inline void assertNotCodeWScope(uint8_t control) {
+    uassert(ErrorCodes::InvalidBSONColumn,
+            "CodeWScope is not a valid BSONColumn element type",
+            control != static_cast<uint8_t>(BSONType::CodeWScope));
 }
 
 inline bool isInterleavedStartControlByte(char control) {
@@ -78,6 +85,12 @@ inline uint32_t numElemsForControlByte(const char* control) {
     }
     return num;
 }
+
+/*
+ * Calculate number of interleaved streams for a reference object and interleaved control byte. Will
+ * throw if no scalar streams are found as that is an invalid reference object for the control byte.
+ */
+uint32_t numInterleavedStreams(const BSONObj& refObj, uint8_t control);
 
 inline uint8_t scaleIndexForControlByte(uint8_t control) {
     static constexpr std::array<uint8_t, 16> kControlToScaleIndex = {kInvalidScaleIndex,
