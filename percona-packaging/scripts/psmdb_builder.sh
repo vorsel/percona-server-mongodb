@@ -493,10 +493,6 @@ install_deps() {
         # bazel/remote_execution_container/repin_dockerfiles.sh:
         yum -y install $OPENSSL_EXCLUDE cyrus-sasl-gssapi glibc-devel procps-ng systemtap-sdt-devel ncurses-libs
       fi
-      # dropped vendored curl 7.77.0: scons-era static-link dep (pkg-config
-      # libcurl --static) the bazel build doesn't use — bazel links system
-      # libcurl. it only shadowed system libcurl via LD_LIBRARY_PATH and
-      # broke git-over-https on el10 (PSMDB-1943).
       install_golang
       if [ x"$RHEL" = x8 ]; then
         if [ -f /opt/rh/gcc-toolset-9/enable ]; then
@@ -701,7 +697,6 @@ build_rpm(){
     #
     set_gopath "$(pwd)/"
 
-    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
     rpmbuild --define "_topdir ${WORKDIR}/rpmbuild" --define "dist .$OS_NAME" --rebuild rpmbuild/SRPMS/$SRC_RPM
 
@@ -810,7 +805,6 @@ build_deb(){
     export PSMDB_GIT_HASH="${REVISION_LONG}"
 
     dch -m -D "${DEBIAN}" --force-distribution -v "${VERSION}-${RELEASE}.${DEBIAN}" 'Update distribution'
-    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
     export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
 
@@ -919,7 +913,6 @@ build_tarball(){
     cp sbom.cdx.json ${PSMDIR}/doc || abort '`build_tarball`: SBOM copying failed'
 
     # Finally build Percona Server for MongoDB with Bazel
-    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
     python3 buildscripts/install_bazel.py
 
