@@ -31,6 +31,8 @@
 
 #include "mongo/db/pipeline/granularity_rounder.h"
 
+#include "mongo/db/query/util/represent_as_util.h"
+
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/platform/bits.h"
 
@@ -56,6 +58,7 @@ void uassertNonNegativeNumber(Value value) {
     double number = value.coerceToDouble();
     uassert(40266, "A granularity rounder cannot round NaN", !std::isnan(number));
     uassert(40267, "A granularity rounder can only round non-negative numbers", number >= 0.0);
+    uassert(11785400, "A granularity rounder can only round finite numbers", std::isfinite(number));
 }
 }  // namespace
 
@@ -68,11 +71,11 @@ Value GranularityRounderPowersOfTwo::roundUp(Value value) {
 
     Value exp;
     if (value.getType() == BSONType::NumberDouble) {
-        exp = Value(static_cast<int>(std::floor(std::log2(value.getDouble())) + 1.0));
+        exp = Value(representAsChecked<int>(std::floor(std::log2(value.getDouble())) + 1.0));
     } else if (value.getType() == BSONType::NumberDecimal) {
         Decimal128 input = value.getDecimal();
         exp = Value(Decimal128(
-            static_cast<int>((std::floor(input.logarithm(Decimal128(2)).toDouble()) + 1.0))));
+            representAsChecked<int>(std::floor(input.logarithm(Decimal128(2)).toDouble()) + 1.0)));
     } else {
         long long number = value.getLong();
 
@@ -94,11 +97,11 @@ Value GranularityRounderPowersOfTwo::roundDown(Value value) {
 
     Value exp;
     if (value.getType() == BSONType::NumberDouble) {
-        exp = Value(static_cast<int>(std::ceil(std::log2(value.getDouble())) - 1.0));
+        exp = Value(representAsChecked<int>(std::ceil(std::log2(value.getDouble())) - 1.0));
     } else if (value.getType() == BSONType::NumberDecimal) {
         Decimal128 input = value.getDecimal();
         exp = Value(Decimal128(
-            static_cast<int>((std::ceil(input.logarithm(Decimal128(2)).toDouble()) - 1.0))));
+            representAsChecked<int>(std::ceil(input.logarithm(Decimal128(2)).toDouble()) - 1.0)));
     } else {
         long long number = value.getLong();
 

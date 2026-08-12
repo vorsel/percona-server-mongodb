@@ -21,7 +21,15 @@
 #
 last-continuous:
   all:
-  - test_file: jstests/aggregation/expressions/const_literal_bsoncolumn.js
+  - test_file: jstests/auth/apply_ops_uuid_ddl_auth_divergence.js
+    ticket: SERVER-130139
+  - test_file: jstests/aggregation/accumulators/percentiles_syntax.js
+    ticket: SERVER-129617
+  - test_file: jstests/aggregation/expressions/const_literal_bindata_restricted_subtypes.js
+    ticket: SERVER-130168
+  - test_file: jstests/aggregation/expressions/percentile_expression_syntax.js
+    ticket: SERVER-129617
+  - test_file: jstests/aggregation/expressions/subtype.js
     ticket: SERVER-129103
   - test_file: jstests/noPassthrough/timeseries_initial_sync_mixed_bucket_geo_index.js
     ticket: SERVER-121132
@@ -573,6 +581,8 @@ last-continuous:
     ticket: SERVER-91195
   - test_file: jstests/sharding/coordinate_txn_commit_with_tickets_exhausted.js
     ticket: SERVER-92292
+  - test_file: jstests/sharding/txn_prepared_participant_unauthorized_commit_abort.js
+    ticket: SERVER-130544
   - test_file: jstests/core/sparse_index_supports_ne_null.js
     ticket: SERVER-37164
   - test_file: jstests/core/timeseries/timeseries_insert_mixed_schema_bucket.js
@@ -641,6 +651,8 @@ last-continuous:
     ticket: SERVER-108341
   - test_file: jstests/core/query/update/update_set_unset.js
     ticket: SERVER-103960
+  - test_file: jstests/core/query/where/where_system_js.js
+    ticket: SERVER-130167
   - test_file: jstests/core/write/update/updatea.js
     ticket: SERVER-103960
   - test_file: jstests/core/txns/multi_statement_transaction_abort.js
@@ -688,7 +700,15 @@ last-continuous:
   suites: null
 last-lts:
   all:
-  - test_file: jstests/aggregation/expressions/const_literal_bsoncolumn.js
+  - test_file: jstests/auth/apply_ops_uuid_ddl_auth_divergence.js
+    ticket: SERVER-130139
+  - test_file: jstests/aggregation/accumulators/percentiles_syntax.js
+    ticket: SERVER-129617
+  - test_file: jstests/aggregation/expressions/const_literal_bindata_restricted_subtypes.js
+    ticket: SERVER-130168
+  - test_file: jstests/aggregation/expressions/percentile_expression_syntax.js
+    ticket: SERVER-129617
+  - test_file: jstests/aggregation/expressions/subtype.js
     ticket: SERVER-129103
   - test_file: jstests/noPassthrough/timeseries_initial_sync_mixed_bucket_geo_index.js
     ticket: SERVER-121132
@@ -798,6 +818,8 @@ last-lts:
     ticket: SERVER-56377
   - test_file: jstests/sharding/txn_writes_during_movechunk.js
     ticket: SERVER-56518
+  - test_file: jstests/sharding/txn_prepared_participant_unauthorized_commit_abort.js
+    ticket: SERVER-130544
   - test_file: jstests/concurrency/fsm_workloads/collmod_writeconflict.js
     ticket: SERVER-56772
   - test_file: jstests/sharding/cwwc_conflict_add_shard.js
@@ -1378,6 +1400,8 @@ last-lts:
     ticket: SERVER-108341
   - test_file: jstests/core/query/update/update_set_unset.js
     ticket: SERVER-103960
+  - test_file: jstests/core/query/where/where_system_js.js
+    ticket: SERVER-130167
   - test_file: jstests/core/write/update/updatea.js
     ticket: SERVER-103960
   - test_file: jstests/core/txns/multi_statement_transaction_abort.js
