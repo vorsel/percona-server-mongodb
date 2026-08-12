@@ -223,7 +223,7 @@
     },
     "//bazel:bzlmod.bzl%setup_mongo_python_toolchains": {
       "general": {
-        "bzlTransitiveDigest": "RdJLzmziTpyFfvABlOQ4Eii28kEvEow4Ag1pjiVneeU=",
+        "bzlTransitiveDigest": "qzKmvcDZW3h7prJ9NoXpPBTey9TLh8om0dMYfJ+yN14=",
         "usagesDigest": "bUxjq9n+hj2YwYT/lcSP4lHyQ2GVy5JpFgSmddUqUZg=",
         "recordedFileInputs": {},
         "recordedDirentsInputs": {},

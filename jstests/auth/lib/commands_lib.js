@@ -3339,8 +3339,9 @@ export const authCommandsLib = {
         {
           testname: "compactStructuredEncryptionData",
           command: {compactStructuredEncryptionData: "foo", compactionTokens : {}},
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
+          skipTest: (conn) => {
+              return isStandalone(conn);
+          },
           setup: function(db) {
               assert.commandWorked(db.createCollection("foo", {
                 encryptedFields: {
@@ -3363,23 +3364,31 @@ export const authCommandsLib = {
                 runOnDb: firstDbName,
                 roles: { readWrite : 1, readWriteAnyDatabase : 1, dbOwner : 1, root : 1, __system : 1 },
                 privileges:
-                    [{resource: {db: firstDbName, collection: "foo"}, actions: ["compactStructuredEncryptionData"]}],
+                    [{resource: {db: firstDbName, collection: ""}, actions: ["compactStructuredEncryptionData"]}],
                 expectFail: true // Missing compaction token.
               },
               {
                 runOnDb: secondDbName,
                 roles: { readWriteAnyDatabase : 1, root : 1, __system : 1 },
                 privileges:
-                    [{resource: {db: secondDbName, collection: "foo"}, actions: ["compactStructuredEncryptionData"]}],
+                    [{resource: {db: secondDbName, collection: ""}, actions: ["compactStructuredEncryptionData"]}],
                 expectFail: true // Missing compaction token.
-              }
+              },
+              {
+                // privilege must be conferred at db scope, not exact-namespace scope
+                expectAuthzFailure: true,
+                runOnDb: firstDbName,
+                privileges:
+                    [{resource: {db: firstDbName, collection: "foo"}, actions: ["compactStructuredEncryptionData"]}],
+              },
           ]
         },
         {
           testname: "cleanupStructuredEncryptionData",
           command: {cleanupStructuredEncryptionData: "foo", cleanupTokens : {}},
-          skipSharded: true,
-          skipUnlessReplicaSet: true,
+          skipTest: (conn) => {
+              return isStandalone(conn);
+          },
           setup: function(db) {
               assert.commandWorked(db.createCollection("foo", {
                 encryptedFields: {
@@ -3402,16 +3411,23 @@ export const authCommandsLib = {
                 runOnDb: firstDbName,
                 roles: { readWrite : 1, readWriteAnyDatabase : 1, dbOwner : 1, root : 1, __system : 1 },
                 privileges:
-                    [{resource: {db: firstDbName, collection: "foo"}, actions: ["cleanupStructuredEncryptionData"]}],
-                expectFail: true // Missing compaction token.
+                    [{resource: {db: firstDbName, collection: ""}, actions: ["cleanupStructuredEncryptionData"]}],
+                expectFail: true // Missing cleanup token.
               },
               {
                 runOnDb: secondDbName,
                 roles: { readWriteAnyDatabase : 1, root : 1, __system : 1 },
                 privileges:
-                    [{resource: {db: secondDbName, collection: "foo"}, actions: ["cleanupStructuredEncryptionData"]}],
-                expectFail: true // Missing compaction token.
-              }
+                    [{resource: {db: secondDbName, collection: ""}, actions: ["cleanupStructuredEncryptionData"]}],
+                expectFail: true // Missing cleanup token.
+              },
+              {
+                // privilege must be conferred at db scope, not exact-namespace scope
+                expectAuthzFailure: true,
+                runOnDb: firstDbName,
+                privileges:
+                    [{resource: {db: firstDbName, collection: "foo"}, actions: ["cleanupStructuredEncryptionData"]}],
+              },
           ]
         },
         {
@@ -6133,16 +6149,36 @@ export const authCommandsLib = {
           testcases: [
               {
                 runOnDb: firstDbName,
-                roles: roles_dbAdmin,
+                roles: roles_dbAdminAny,
                 privileges:
-                    [{resource: {db: firstDbName, collection: ""}, actions: ["enableProfiler"]}]
+                    [{resource: {db: "", collection: ""}, actions: ["enableProfiler"]}]
               },
               {
-                runOnDb: secondDbName,
-                roles: roles_dbAdminAny,
+                runOnDb: firstDbName,
                 privileges: [
-                    {resource: {db: secondDbName, collection: ""}, actions: ["enableProfiler"]}
-                ]
+                    {resource: {db: firstDbName, collection: ""}, actions: ["enableProfiler"]}
+                ],
+                expectAuthzFailure: true
+              }
+          ]
+        },
+        {
+          testname: "profileSetSlowms",
+          command: {profile: -1, slowms: 100},
+          skipSharded: true,
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_dbAdminAny,
+                privileges:
+                    [{resource: {db: "", collection: ""}, actions: ["enableProfiler"]}]
+              },
+              {
+                runOnDb: firstDbName,
+                privileges: [
+                    {resource: {db: firstDbName, collection: ""}, actions: ["enableProfiler"]}
+                ],
+                expectAuthzFailure: true
               }
           ]
         },
@@ -6164,7 +6200,7 @@ export const authCommandsLib = {
         },
         {
           testname: "profile_mongos",
-          command: {profile: 0, slowms: 10, sampleRate: 0.5},
+          command: {profile: 0},
           skipUnlessSharded: true,
           testcases: [
               {
@@ -6176,6 +6212,48 @@ export const authCommandsLib = {
               {
                 runOnDb: firstDbName,
                 roles: roles_dbAdmin,
+                privileges:
+                    [{resource: {db: firstDbName, collection: ""}, actions: ["enableProfiler"]}]
+              }
+          ]
+        },
+        {
+          testname: "profileSetSlowms_mongos",
+          command: {profile: 0, slowms: 10},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_dbAdminAny,
+                privileges:
+                    [{resource: {db: "", collection: ""}, actions: ["enableProfiler"]}]
+              },
+              {
+                runOnDb: firstDbName,
+                privileges: [
+                    {resource: {db: firstDbName, collection: ""}, actions: ["enableProfiler"]}
+                ],
+                expectAuthzFailure: true
+              }
+          ]
+        },
+        {
+          testname: "profileSetSampleRate_mongos",
+          command: {profile: 0, sampleRate: 0.5},
+          skipUnlessSharded: true,
+          testcases: [
+              {
+                runOnDb: firstDbName,
+                roles: roles_dbAdminAny,
+                privileges:
+                    [{resource: {db: "", collection: ""}, actions: ["enableProfiler"]}]
+              },
+              {
+                runOnDb: firstDbName,
+                privileges: [
+                    {resource: {db: firstDbName, collection: ""}, actions: ["enableProfiler"]}
+                ],
+                expectAuthzFailure: true
               }
           ]
         },

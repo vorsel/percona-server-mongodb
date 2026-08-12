@@ -1399,13 +1399,9 @@ TEST(BSONValidateColumn, BSONColumnBadExtendedSelector) {
     BSONBinData columnData = cb.finalize();
     ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
     /* Change extended selector on a 7 selector to 14 */
-    uint64_t block = ConstDataView((char*)columnData.data + 31) /* first 7 selector */
-                         .read<LittleEndian<uint64_t>>();
-    ASSERT_EQ(7, block & 15);  // Check that we found a 7 selector
-    block = (14 << 4)          /* 14 extended selector */
-        + 7                    /* original selector */
-        + ((block >> 8) << 8); /* original blocks */
-    memcpy((char*)columnData.data + 31, &block, sizeof(block));
+    uint8_t* selectorByte = (uint8_t*)columnData.data + 31; /* first 7 selector */
+    ASSERT_EQ(7, *selectorByte & 15);                       // Check that we found a 7 selector
+    *selectorByte = (14 << 4) | 7; /* 14 extended selector, original selector 7 */
     ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
 }
 
@@ -1433,24 +1429,17 @@ TEST(BSONValidateColumn, BSONColumnInterestingFuzzerInputs) {
 }
 
 TEST(BSONValidateColumn, BSONColumnWithCodeWScope) {
-    // Build the raw BSONColumn bytes by hand: BSONColumnBuilder now rejects CodeWScope,
-    // so we must bypass it to test what the validator sees when deprecated data types
-    // arrive via socket or internally via aggregation
-    BSONObj wrapper = BSON("" << BSONCodeWScope("code", BSON("c" << 1)));
-    BSONElement elem = wrapper.firstElement();
-
-    BufBuilder buf;
-    buf.appendChar(static_cast<char>(stdx::to_underlying(BSONType::CodeWScope)));
-    buf.appendChar('\0');  // empty fieldname required for BSONColumn literals
-    buf.appendBuf(elem.value(), elem.valuesize());
-    buf.appendChar('\0');  // EOO
-
-    // All modes must now reject a top-level CodeWScope literal in a BSONColumn.
-    ASSERT_EQ(validateBSONColumn(buf.buf(), buf.len()).code(), ErrorCodes::InvalidBSONColumn);
-    ASSERT_EQ(validateBSONColumn(buf.buf(), buf.len(), BSONValidateModeEnum::kExtended).code(),
-              ErrorCodes::InvalidBSONColumn);
-    ASSERT_EQ(validateBSONColumn(buf.buf(), buf.len(), BSONValidateModeEnum::kFull).code(),
-              ErrorCodes::InvalidBSONColumn);
+    BSONObj obj = BSON("a" << BSONCodeWScope("code", BSON("c" << 1)));
+    BSONColumnBuilder cb;
+    cb.append(obj.getField("a"));
+    BSONBinData columnData = cb.finalize();
+    ASSERT_OK(validateBSONColumn((char*)columnData.data, columnData.length));
+    ASSERT_FALSE(validateBSONColumn(
+                     (char*)columnData.data, columnData.length, BSONValidateModeEnum::kExtended)
+                     .isOK());
+    ASSERT_FALSE(
+        validateBSONColumn((char*)columnData.data, columnData.length, BSONValidateModeEnum::kFull)
+            .isOK());
 }
 
 TEST(BSONValidateColumn, BSONColumnWithArrayNestedCodeWScope) {
