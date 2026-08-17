@@ -478,15 +478,21 @@ install_deps() {
           # d4c639cf4a7).
           yum -y install $OPENSSL_EXCLUDE libzstd
         fi
+      elif [ x"$RHEL" = x10 ]; then
+        dnf config-manager --enable ol10_codeready_builder
+
+        yum -y install $OPENSSL_EXCLUDE oracle-epel-release-el10
+        yum -y install $OPENSSL_EXCLUDE bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
+        yum -y install $OPENSSL_EXCLUDE cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
+        yum -y install $OPENSSL_EXCLUDE python3 python3-pip python3-devel
+
+        yum -y install $OPENSSL_EXCLUDE redhat-rpm-config which e2fsprogs-devel expat-devel lz4-devel
+        yum -y install $OPENSSL_EXCLUDE openldap-devel krb5-devel xz-devel
+        yum -y install $OPENSSL_EXCLUDE perl
+        # PSMDB-2072: RBE Bazel build deps, mirroring upstream mongo
+        # bazel/remote_execution_container/repin_dockerfiles.sh on r8.3.2:
+        yum -y install $OPENSSL_EXCLUDE cyrus-sasl-gssapi glibc-devel procps-ng systemtap-sdt-devel ncurses-libs
       fi
-      wget https://curl.se/download/curl-7.77.0.tar.gz -O curl-7.77.0.tar.gz
-      tar -xzf curl-7.77.0.tar.gz
-      cd curl-7.77.0
-        ./configure --with-openssl
-        make -j${NCPU}
-        make install
-      cd ../
-#
       install_golang
       if [ x"$RHEL" = x8 ]; then
         if [ -f /opt/rh/gcc-toolset-9/enable ]; then
@@ -694,7 +700,6 @@ build_rpm(){
     #
     set_gopath "$(pwd)/"
 
-    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
     rpmbuild --define "_topdir ${WORKDIR}/rpmbuild" --define "dist .$OS_NAME" --rebuild rpmbuild/SRPMS/$SRC_RPM
 
@@ -803,7 +808,6 @@ build_deb(){
     export PSMDB_GIT_HASH="${REVISION_LONG}"
 
     dch -m -D "${DEBIAN}" --force-distribution -v "${VERSION}-${RELEASE}.${DEBIAN}" 'Update distribution'
-    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
     export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
 
@@ -913,7 +917,6 @@ build_tarball(){
     cp sbom.cdx.json ${PSMDIR}/doc || abort '`build_tarball`: SBOM copying failed'
 
     # Finally build Percona Server for MongoDB with Bazel
-    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
     python3 buildscripts/install_bazel.py
 
