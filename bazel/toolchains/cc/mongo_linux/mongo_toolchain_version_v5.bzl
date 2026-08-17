@@ -32,6 +32,19 @@ TOOLCHAIN_MAP_V5 = {
         "sha": "783294fe1418f4ad5ea522a3956f842517dd99297a2e694f7cc2abbc13acfd3c",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-debian12-e921fc32d5c23d7cdb5cf406b05bf16eb5ab8dbd.tar.gz",
     },
+    # debian13 is pinned to toolchain rev edf71c48 (not TOOLCHAIN_ID above):
+    # upstream never published a trixie build at e921fc32, and edf71c48 is the
+    # rev our arm64 rebuild was made from, so both arches stay in sync.
+    "debian13_aarch64": {
+        "platform_name": "debian13-arm64",
+        "sha": "21a84e97802edfb0463d0ad7b4c1582e37a0685922e4fa4bde8579395e84e188",
+        "url": "https://psmdb-arm64-toolchains.s3.us-west-2.amazonaws.com/output/edf71c48476695b4bb7bb3ee0e098920dc226a99/bazel_v5_toolchain-debian13-arm64-edf71c48476695b4bb7bb3ee0e098920dc226a99.tar.gz",
+    },
+    "debian13_x86_64": {
+        "platform_name": "debian13",
+        "sha": "4da8eba427e33b7858a3085dbada8e6626113dc02dff1c99162262b3cf20adc2",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-debian13-edf71c48476695b4bb7bb3ee0e098920dc226a99.tar.gz",
+    },
     "rhel8_aarch64": {
         "platform_name": "rhel82-arm64",
         "sha": "2c49497e4c95577e67d8fd87923f76faf8140906b78c45a941dee7d90572ec4a",

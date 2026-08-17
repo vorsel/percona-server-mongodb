@@ -56,7 +56,7 @@ def _setup_local_config_platform(ctx):
     if ctx.os.environ.get("USE_NATIVE_TOOLCHAIN"):
         exec_props = ""
         result = {"USE_NATIVE_TOOLCHAIN": "1"}
-    elif distro != None and distro in REMOTE_EXECUTION_CONTAINERS:
+    elif distro != None and (distro in REMOTE_EXECUTION_CONTAINERS or distro in PSMDB_REMOTE_EXECUTION_CONTAINERS):
         constraints_str += ',\n        "@//bazel/platforms:use_mongo_toolchain"'
         constraints_str += ',\n        "@//bazel/platforms:%s"' % (distro)
 
@@ -74,9 +74,12 @@ def _setup_local_config_platform(ctx):
         container_url = (
             psmdb_entry["container-url"] if psmdb_entry else REMOTE_EXECUTION_CONTAINERS[distro]["container-url"]
         )
-        web_url = REMOTE_EXECUTION_CONTAINERS[distro]["web-url"]
-        dockerfile = REMOTE_EXECUTION_CONTAINERS[distro]["dockerfile"]
-        print("Local host platform is configured to use this container if doing remote execution: {} built from {}".format(web_url, dockerfile))
+        if distro in REMOTE_EXECUTION_CONTAINERS:
+            web_url = REMOTE_EXECUTION_CONTAINERS[distro]["web-url"]
+            dockerfile = REMOTE_EXECUTION_CONTAINERS[distro]["dockerfile"]
+            print("Local host platform is configured to use this container if doing remote execution: {} built from {}".format(web_url, dockerfile))
+        else:
+            print("Local host platform is configured to use this container if doing remote execution: {}".format(container_url))
         exec_props = """
     exec_properties = {
         "container-image": "%s",

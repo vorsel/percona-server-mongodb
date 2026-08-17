@@ -90,6 +90,9 @@ PSMDB_REMOTE_EXECUTION_CONTAINERS = {
     "debian12": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c",
     },
+    "debian13": {
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:debian-trixie-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c",
+    },
     "rhel8": {
         "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c",
     },
