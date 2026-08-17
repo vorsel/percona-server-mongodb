@@ -83,23 +83,35 @@
 #          structure, resolve the conflict to keep our `psmdb_entry`
 #          override path (the deviation is small and easy to re-apply).
 
+# NB: 2d593e6f8e85 is not the last commit that touched psmdb_builder.sh on this
+# branch. The images under that tag were re-baked from this branch's script with
+# the runner workflow's mongo_sha_override, so the routing keys (and the pools
+# behind them) stay put while the deb13 + el10 changes land as one commit. The
+# real source commit is in each image's org.percona.psmdb.source_sha label.
+# Next ordinary rebuild puts tag and commit back in sync.
 PSMDB_REMOTE_EXECUTION_CONTAINERS = {
     "amazon_linux_2023": {
-        "container-url": "docker://docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c",
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:amazonlinux-2023-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856",
     },
     "debian12": {
-        "container-url": "docker://docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c",
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:debian-bookworm-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856",
+    },
+    "debian13": {
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:debian-trixie-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856",
     },
     "rhel8": {
-        "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c",
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-8-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856",
     },
     "rhel9": {
-        "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c",
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-9-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856",
+    },
+    "rhel10": {
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:oraclelinux-10-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856",
     },
     "ubuntu22": {
-        "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c",
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-jammy-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856",
     },
     "ubuntu24": {
-        "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-ac06e9e70d1a21e006bceaadb822bc93de7b768c",
+        "container-url": "docker://docker.io/perconalab/psmdb-rbe:ubuntu-noble-8.3-2d593e6f8e85df6f1865ceff13993a02a595d856",
     },
 }
