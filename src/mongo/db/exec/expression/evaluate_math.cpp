@@ -28,6 +28,7 @@
  */
 
 
+#include "mongo/bson/bson_depth.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/db/exec/convert_utils.h"
 #include "mongo/db/exec/expression/evaluate.h"
@@ -1470,6 +1471,16 @@ private:
         };
     }
 
+    static void validateFixedSizeBinDataSubtype(BinDataType binDataType, int actualSize) {
+        static_assert(UUID::kNumBytes == 16);
+        if (binDataType == BinDataType::bdtUUID || binDataType == BinDataType::MD5Type) {
+            uassert(13016802,
+                    str::stream() << "$convert to BinData subtype " << static_cast<int>(binDataType)
+                                  << " requires exactly " << UUID::kNumBytes << " bytes",
+                    actualSize == UUID::kNumBytes);
+        }
+    }
+
     static Value parseStringToBinData(ExpressionContext* const expCtx,
                                       Value inputValue,
                                       FormatArg format,
@@ -1477,31 +1488,27 @@ private:
         auto input = inputValue.getStringData();
         auto binDataType = computeBinDataType(subtypeValue);
 
+        std::string decoded;
         try {
             uassert(4341116,
                     "Only the 'uuid' format is allowed with the UUID subtype",
                     (format == BinDataFormat::kUuid) == (binDataType == BinDataType::newUUID));
 
             switch (format) {
-                case BinDataFormat::kBase64: {
-                    auto decoded = base64::decode(input);
-                    return Value(BSONBinData(decoded.data(), decoded.size(), binDataType));
-                }
-                case BinDataFormat::kBase64Url: {
-                    auto decoded = base64url::decode(input);
-                    return Value(BSONBinData(decoded.data(), decoded.size(), binDataType));
-                }
-                case BinDataFormat::kHex: {
-                    auto decoded = hexblob::decode(input);
-                    return Value(BSONBinData(decoded.data(), decoded.size(), binDataType));
-                }
-                case BinDataFormat::kUtf8: {
+                case BinDataFormat::kBase64:
+                    decoded = base64::decode(input);
+                    break;
+                case BinDataFormat::kBase64Url:
+                    decoded = base64url::decode(input);
+                    break;
+                case BinDataFormat::kHex:
+                    decoded = hexblob::decode(input);
+                    break;
+                case BinDataFormat::kUtf8:
                     uassert(
                         4341119, str::stream() << "Invalid UTF-8: " << input, isValidUTF8(input));
-
-                    auto decoded = std::string{input};
-                    return Value(BSONBinData(decoded.data(), decoded.size(), binDataType));
-                }
+                    decoded = std::string{input};
+                    break;
                 case BinDataFormat::kUuid: {
                     auto uuid = uassertStatusOK(UUID::parse(input));
                     return Value(uuid);
@@ -1515,6 +1522,10 @@ private:
                       str::stream() << "Failed to parse BinData '" << inputValue.getString()
                                     << "' in $convert with no onError value: " << ex.reason());
         }
+
+        validateFixedSizeBinDataSubtype(binDataType, static_cast<int>(decoded.size()));
+
+        return Value(BSONBinData(decoded.data(), decoded.size(), binDataType));
     }
 
     static Value performConvertToTrue(ExpressionContext* const expCtx, Value inputValue) {
@@ -1676,7 +1687,7 @@ private:
                                               ByteOrderArg byteOrder,
                                               SubtypeArg subtypeValue) {
         if (!feature_flags::gFeatureFlagConvertBinDataVectors.isEnabled(
-                VersionContext::getDecoration(expCtx->getOperationContext()),
+                expCtx->versionContextForFeatureFlagCheck(),
                 serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
             uasserted(10506607, "$convert from BinData vector to BSON array is not enabled");
         }
@@ -1696,7 +1707,7 @@ private:
                                               ByteOrderArg byteOrder,
                                               SubtypeArg subtypeValue) {
         if (!feature_flags::gFeatureFlagConvertBinDataVectors.isEnabled(
-                VersionContext::getDecoration(expCtx->getOperationContext()),
+                expCtx->versionContextForFeatureFlagCheck(),
                 serverGlobalParams.featureCompatibility.acquireFCVSnapshot())) {
             uasserted(10506608, "$convert from BSON array to BinData vector is not enabled");
         }
@@ -1842,6 +1853,9 @@ private:
                                                   ConvertByteOrderType byteOrder,
                                                   SubtypeArg subtypeValue) {
         auto binDataType = computeBinDataType(subtypeValue);
+        // sizeof(ValueType) is a compile-time constant (4 or 8 for numeric types) and never
+        // equals 16, so this always rejects bdtUUID and MD5Type on numeric inputs.
+        validateFixedSizeBinDataSubtype(binDataType, static_cast<int>(sizeof(ValueType)));
         std::array<char, sizeof(ValueType)> valBytes;
         DataView dataView(valBytes.data());
         switch (byteOrder) {
@@ -1898,11 +1912,25 @@ private:
                     str::stream() << "In $convert, numeric value for 'subtype' does not correspond "
                                      "to a BinData type: "
                                   << typeCode,
-                    // Allowed ranges are 0-8 (pre-defined types) and 128-255 (user-defined types).
                     isValidBinDataType(typeCode) || isValidUserDefinedBinDataType(typeCode));
-            uassert(12910300,
-                    "$convert to BinData subtype Column (7) is not allowed",
-                    typeCode != static_cast<int>(BinDataType::Column));
+            struct BannedSubtype {
+                int subtypeCode;
+                int errCode;
+                const char* name;
+            };
+            static constexpr BannedSubtype kBannedSubtypes[] = {
+                {static_cast<int>(BinDataType::ByteArrayDeprecated),
+                 13016800,
+                 "ByteArrayDeprecated (2)"},
+                {static_cast<int>(BinDataType::Encrypt), 13016801, "Encrypt (6)"},
+                {static_cast<int>(BinDataType::Column), 12910300, "Column (7)"},
+            };
+            for (const auto& [subtypeCode, errCode, subtypeName] : kBannedSubtypes) {
+                uassert(errCode,
+                        str::stream()
+                            << "$convert to BinData subtype " << subtypeName << " is not allowed",
+                        typeCode != subtypeCode);
+            }
 
             return static_cast<BinDataType>(typeCode);
         }
@@ -2050,7 +2078,7 @@ public:
     JsonStringGenerator(ExpressionContext* expCtx, size_t maxSize)
         : _expCtx(expCtx), _maxSize(maxSize) {}
 
-    void writeValue(fmt::memory_buffer& buffer, const Value& val) const {
+    void writeValue(fmt::memory_buffer& buffer, const Value& val) {
         switch (val.getType()) {
             // The below types have a JSON counterpart.
             case BSONType::eoo:
@@ -2129,7 +2157,9 @@ private:
         }
     }
 
-    void writeObject(fmt::memory_buffer& buffer, const Document& doc) const {
+    void writeObject(fmt::memory_buffer& buffer, const Document& doc) {
+        ++_depth;
+        uassertDepthLimit();
         buffer.push_back('{');
         bool first{true};
         for (auto it = doc.fieldIterator(); it.more();) {
@@ -2143,9 +2173,12 @@ private:
             writeValue(buffer, value);
         }
         buffer.push_back('}');
+        --_depth;
     }
 
-    void writeArray(fmt::memory_buffer& buffer, const std::vector<Value>& arr) const {
+    void writeArray(fmt::memory_buffer& buffer, const std::vector<Value>& arr) {
+        ++_depth;
+        uassertDepthLimit();
         buffer.push_back('[');
         for (size_t i = 0; i < arr.size(); i++) {
             if (i > 0) {
@@ -2155,6 +2188,15 @@ private:
             writeValue(buffer, arr[i]);
         }
         buffer.push_back(']');
+        --_depth;
+    }
+
+    void uassertDepthLimit() const {
+        static const auto depthLimit = 2 * BSONDepth::getMaxAllowableDepth();
+        uassert(ErrorCodes::ConversionFailure,
+                str::stream() << "Result exceeds maximum depth limit of "
+                              << BSONDepth::getMaxAllowableDepth() << " levels of nesting",
+                _depth <= depthLimit);
     }
 
     /**
@@ -2184,6 +2226,7 @@ private:
 
     ExpressionContext* const _expCtx;
     const size_t _maxSize;
+    size_t _depth = 0;
 };
 
 std::string stringifyObjectOrArray(ExpressionContext* const expCtx, Value val) {

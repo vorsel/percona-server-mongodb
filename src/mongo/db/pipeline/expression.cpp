@@ -46,6 +46,7 @@
 // IWYU pragma: no_include <pstl/glue_algorithm_defs.h>
 // IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
 
+#include "mongo/base/data_view.h"
 #include "mongo/base/parse_number.h"
 #include "mongo/bson/bsonelement_comparator_interface.h"
 #include "mongo/bson/bsonmisc.h"
@@ -197,15 +198,18 @@ void Expression::registerExpression(string key,
                                     Parser parser,
                                     AllowedWithApiStrict allowedWithApiStrict,
                                     AllowedWithClientType allowedWithClientType,
-                                    FeatureFlag* featureFlag) {
+                                    FeatureFlag* featureFlag,
+                                    bool shouldOmitDiagnosticInformation) {
     auto op = parserMap.find(key);
     massert(17064,
             str::stream() << "Duplicate expression (" << key << ") registered.",
             op == parserMap.end());
     parserMap[key] =
         ParserRegistration{parser, allowedWithApiStrict, allowedWithClientType, featureFlag};
-    // Add this expression to the global map of operator counters for expressions.
-    operatorCountersAggExpressions.addCounter(key);
+    if (!shouldOmitDiagnosticInformation) {
+        // Add this expression to the global map of operator counters for expressions.
+        operatorCountersAggExpressions.addCounter(key);
+    }
 }
 
 void Expression::registerDisabledExpressionName(string key, ExpressionDisabledReason reason) {
@@ -860,19 +864,38 @@ const char* ExpressionCond::getOpName() const {
 /* ---------------------- ExpressionConstant --------------------------- */
 
 namespace {
-// The Column (7) BinData subtype is not allowed in $const or $literal.
-void assertNoBSONColumn(const BSONElement& elem) {
+// Subtype 7 (Column) is banned; subtypes 2, 3, and 5 are structurally validated.
+void assertNoRestrictedBinDataSubtype(const BSONElement& elem) {
     if (elem.type() == BSONType::binData) {
+        const auto subtype = elem.binDataType();
+        if (subtype == BinDataType::ByteArrayDeprecated) {
+            int len;
+            const char* data = elem.binData(len);
+            uassert(ErrorCodes::FailedToParse,
+                    "BinData subtype ByteArrayDeprecated (2) requires a valid inner length prefix",
+                    len >= 4 &&
+                        ConstDataView(data).read<LittleEndian<int32_t>>() ==
+                            static_cast<int32_t>(len - 4));
+        }
+        if (subtype == BinDataType::bdtUUID || subtype == BinDataType::MD5Type) {
+            int len;
+            elem.binData(len);
+            uassert(ErrorCodes::FailedToParse,
+                    str::stream() << "BinData subtype " << static_cast<int>(subtype)
+                                  << " requires exactly " << UUID::kNumBytes
+                                  << " bytes as an expression literal",
+                    len == UUID::kNumBytes);
+        }
         uassert(ErrorCodes::FailedToParse,
                 "BSONColumn (BinData subtype 7) is not allowed as an expression literal",
-                elem.binDataType() != BinDataType::Column);
+                subtype != BinDataType::Column);
     } else if (elem.type() == BSONType::object || elem.type() == BSONType::array) {
         for (const auto& child : elem.embeddedObject()) {
-            assertNoBSONColumn(child);
+            assertNoRestrictedBinDataSubtype(child);
         }
     } else if (elem.type() == BSONType::codeWScope) {
         for (const auto& child : elem.codeWScopeObject()) {
-            assertNoBSONColumn(child);
+            assertNoRestrictedBinDataSubtype(child);
         }
     }
 }
@@ -881,7 +904,7 @@ void assertNoBSONColumn(const BSONElement& elem) {
 intrusive_ptr<Expression> ExpressionConstant::parse(ExpressionContext* const expCtx,
                                                     BSONElement exprElement,
                                                     const VariablesParseState& vps) {
-    assertNoBSONColumn(exprElement);
+    assertNoRestrictedBinDataSubtype(exprElement);
     return new ExpressionConstant(expCtx, Value(exprElement));
 }
 
@@ -1943,6 +1966,7 @@ REGISTER_EXPRESSION_CONDITIONALLY(meta,
                                   AllowedWithApiStrict::kConditionally,
                                   AllowedWithClientType::kAny,
                                   nullptr, /* featureFlag */
+                                  false,   /* shouldOmitDiagnosticInformation */
                                   true);
 
 void ExpressionMeta::_assertMetaFieldCompatibleWithStrictAPI(ExpressionContext* const expCtx,
@@ -2078,7 +2102,8 @@ REGISTER_EXPRESSION_CONDITIONALLY(
     ExpressionInternalRawSortKey::parse,
     AllowedWithApiStrict::kInternal,
     AllowedWithClientType::kInternal,
-    nullptr, /* nullptr */
+    nullptr, /* featureFlag */
+    false,   /* shouldOmitDiagnosticInformation */
     true);   // The 'condition' is always true - we just wanted to restrict to internal.
 
 intrusive_ptr<Expression> ExpressionInternalRawSortKey::parse(ExpressionContext* const expCtx,
@@ -2293,7 +2318,7 @@ ExpressionInternalFLEEqual::ExpressionInternalFLEEqual(ExpressionContext* const 
     expCtx->setSbeCompatibility(SbeCompatibility::notCompatible);
 }
 
-REGISTER_STABLE_EXPRESSION(_internalFleEq, ExpressionInternalFLEEqual::parse);
+REGISTER_STABLE_EXPRESSION_NO_METRICS(_internalFleEq, ExpressionInternalFLEEqual::parse);
 
 intrusive_ptr<Expression> ExpressionInternalFLEEqual::parse(ExpressionContext* const expCtx,
                                                             BSONElement expr,
@@ -2348,7 +2373,7 @@ ExpressionInternalFLEBetween::ExpressionInternalFLEBetween(
     expCtx->setSbeCompatibility(SbeCompatibility::notCompatible);
 }
 
-REGISTER_STABLE_EXPRESSION(_internalFleBetween, ExpressionInternalFLEBetween::parse);
+REGISTER_STABLE_EXPRESSION_NO_METRICS(_internalFleBetween, ExpressionInternalFLEBetween::parse);
 
 intrusive_ptr<Expression> ExpressionInternalFLEBetween::parse(ExpressionContext* const expCtx,
                                                               BSONElement expr,
@@ -5431,11 +5456,11 @@ bool ExpressionEncTextSearch::canBeEvaluated() const {
 }
 
 /* --------------------------------- encStrStartsWith ------------------------------------------- */
-REGISTER_EXPRESSION_WITH_FEATURE_FLAG(encStrStartsWith,
-                                      ExpressionEncStrStartsWith::parse,
-                                      AllowedWithApiStrict::kNeverInVersion1,
-                                      AllowedWithClientType::kAny,
-                                      &gFeatureFlagQETextSearchPreview);
+REGISTER_EXPRESSION_WITH_FEATURE_FLAG_NO_METRICS(encStrStartsWith,
+                                                 ExpressionEncStrStartsWith::parse,
+                                                 AllowedWithApiStrict::kNeverInVersion1,
+                                                 AllowedWithClientType::kAny,
+                                                 &gFeatureFlagQETextSearchPreview);
 
 ExpressionEncStrStartsWith::ExpressionEncStrStartsWith(ExpressionContext* const expCtx,
                                                        boost::intrusive_ptr<Expression> input,
@@ -5477,11 +5502,11 @@ Value ExpressionEncStrStartsWith::evaluate(const Document& root, Variables* vari
 }
 
 /* --------------------------------- encStrEndsWith ------------------------------------------- */
-REGISTER_EXPRESSION_WITH_FEATURE_FLAG(encStrEndsWith,
-                                      ExpressionEncStrEndsWith::parse,
-                                      AllowedWithApiStrict::kNeverInVersion1,
-                                      AllowedWithClientType::kAny,
-                                      &gFeatureFlagQETextSearchPreview);
+REGISTER_EXPRESSION_WITH_FEATURE_FLAG_NO_METRICS(encStrEndsWith,
+                                                 ExpressionEncStrEndsWith::parse,
+                                                 AllowedWithApiStrict::kNeverInVersion1,
+                                                 AllowedWithClientType::kAny,
+                                                 &gFeatureFlagQETextSearchPreview);
 
 ExpressionEncStrEndsWith::ExpressionEncStrEndsWith(ExpressionContext* const expCtx,
                                                    boost::intrusive_ptr<Expression> input,
@@ -5523,11 +5548,11 @@ Value ExpressionEncStrEndsWith::evaluate(const Document& root, Variables* variab
 }
 
 /* --------------------------------- encStrContains------------------------------------------- */
-REGISTER_EXPRESSION_WITH_FEATURE_FLAG(encStrContains,
-                                      ExpressionEncStrContains::parse,
-                                      AllowedWithApiStrict::kNeverInVersion1,
-                                      AllowedWithClientType::kAny,
-                                      &gFeatureFlagQETextSearchPreview);
+REGISTER_EXPRESSION_WITH_FEATURE_FLAG_NO_METRICS(encStrContains,
+                                                 ExpressionEncStrContains::parse,
+                                                 AllowedWithApiStrict::kNeverInVersion1,
+                                                 AllowedWithClientType::kAny,
+                                                 &gFeatureFlagQETextSearchPreview);
 
 ExpressionEncStrContains::ExpressionEncStrContains(ExpressionContext* const expCtx,
                                                    boost::intrusive_ptr<Expression> input,
@@ -5570,11 +5595,11 @@ Value ExpressionEncStrContains::evaluate(const Document& root, Variables* variab
 
 /* --------------------------------- encStrNormalizedEq -------------------------------------------
  */
-REGISTER_EXPRESSION_WITH_FEATURE_FLAG(encStrNormalizedEq,
-                                      ExpressionEncStrNormalizedEq::parse,
-                                      AllowedWithApiStrict::kNeverInVersion1,
-                                      AllowedWithClientType::kAny,
-                                      &gFeatureFlagQETextSearchPreview);
+REGISTER_EXPRESSION_WITH_FEATURE_FLAG_NO_METRICS(encStrNormalizedEq,
+                                                 ExpressionEncStrNormalizedEq::parse,
+                                                 AllowedWithApiStrict::kNeverInVersion1,
+                                                 AllowedWithClientType::kAny,
+                                                 &gFeatureFlagQETextSearchPreview);
 
 ExpressionEncStrNormalizedEq::ExpressionEncStrNormalizedEq(
     ExpressionContext* const expCtx,
