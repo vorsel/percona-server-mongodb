@@ -462,6 +462,9 @@ install_deps() {
       # — added to repin_dockerfiles.sh COMMON_PACKAGES["debian"] on
       # upstream master only (not backported to r8.3.2 / r8.0.23).
       INSTALL_LIST="${INSTALL_LIST} hostname iproute2 openssl zip"
+      # the v5 toolchain clang links libncurses.so.6, which slim debian/ubuntu
+      # images don't ship (upstream master adds it for debian:12 the same way)
+      INSTALL_LIST="${INSTALL_LIST} libncurses6"
       # PSMDB-2072: systemtap-sdt-dev is in ADDITIONAL_PACKAGES for
       # ubuntu:22.04 and ubuntu:24.04 (SERVER-93258 d4c639cf4a7 init).
 
