@@ -21,6 +21,10 @@
 #
 last-continuous:
   all:
+    - test_file: jstests/core/query/doc_validation/doc_validation_invalid_validators.js
+      ticket: SERVER-131412
+    - test_file: jstests/noPassthrough/query/profile/profile_filter.js
+      ticket: SERVER-131412
     - test_file: jstests/aggregation/expressions/regex_backslash_c.js
       ticket: SERVER-127985
     - test_file: jstests/replsets/arbiter_afterClusterTime_read_concern.js
@@ -47,6 +51,8 @@ last-continuous:
       ticket: SERVER-129617
     - test_file: jstests/aggregation/expressions/subtype.js
       ticket: SERVER-129103
+    - test_file: jstests/aggregation/sources/bucket/bucket_literal_values.js
+      ticket: SERVER-134618
     - test_file: jstests/core/administrative/filemd5.js
       ticket: SERVER-119317
     - test_file: jstests/core/index/elemmatch_index.js
@@ -229,9 +235,17 @@ last-continuous:
       ticket: SERVER-131326
     - test_file: jstests/noPassthrough/network/min_wait_streaming_hello_mongos.js
       ticket: SERVER-132650
+    - test_file: jstests/sharding/query/graph_lookup/graph_lookup_spill_on_merging_shard.js
+      ticket: SERVER-130431
+    - test_file: jstests/sharding/reshard_collection_hashed_prefix_with_zones.js
+      ticket: SERVER-133282
   suites: null
 last-lts:
   all:
+    - test_file: jstests/core/query/doc_validation/doc_validation_invalid_validators.js
+      ticket: SERVER-131412
+    - test_file: jstests/noPassthrough/query/profile/profile_filter.js
+      ticket: SERVER-131412
     - test_file: jstests/replsets/arbiter_afterClusterTime_read_concern.js
       ticket: SERVER-130759
     - test_file: jstests/auth/apply_ops_uuid_ddl_auth_divergence.js
@@ -248,6 +262,8 @@ last-lts:
       ticket: SERVER-129617
     - test_file: jstests/aggregation/expressions/subtype.js
       ticket: SERVER-129103
+    - test_file: jstests/aggregation/sources/bucket/bucket_literal_values.js
+      ticket: SERVER-134618
     - test_file: jstests/core/administrative/filemd5.js
       ticket: SERVER-119317
     - test_file: jstests/core/index/elemmatch_index.js
@@ -284,6 +300,8 @@ last-lts:
       ticket: SERVER-95869
     - test_file: jstests/core/index/wildcard/compound_wildcard_index_residual.js
       ticket: SERVER-83322
+    - test_file: jstests/concurrency/fsm_workloads/random_moveChunk/random_moveChunk_multi_update_delete_paused_migrations.js
+      ticket: SERVER-97297
     - test_file: jstests/core/index/wildcard/wildcard_index_basic_index_bounds.js
       ticket: SERVER-83322
     - test_file: jstests/core/query/query_settings/query_settings_and_index_filters.js
@@ -414,6 +432,10 @@ last-lts:
       ticket: SERVER-83760
     - test_file: jstests/replsets/catchup_ignores_old_heartbeats.js
       ticket: SERVER-86674
+    - test_file: jstests/sharding/query/graph_lookup/graph_lookup_spill_on_merging_shard.js
+      ticket: SERVER-130431
+    - test_file: jstests/sharding/reshard_collection_hashed_prefix_with_zones.js
+      ticket: SERVER-133282
     - test_file: jstests/sharding/resharding_default_collation.js
       ticket: SERVER-89744
     - test_file: jstests/sharding/move_chunk_deferred_lookup.js
