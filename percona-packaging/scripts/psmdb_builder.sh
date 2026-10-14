@@ -482,15 +482,23 @@ install_deps() {
           # (not `iproute2` as on Debian);
           yum -y install $OPENSSL_EXCLUDE hostname iproute openssl
         fi
+      elif [ x"$RHEL" = x10 ]; then
+        dnf config-manager --enable ol10_codeready_builder
+
+        yum -y install $OPENSSL_EXCLUDE oracle-epel-release-el10
+        yum -y install $OPENSSL_EXCLUDE bzip2-devel libpcap-devel snappy-devel gcc gcc-c++ rpm-build rpmlint
+        yum -y install $OPENSSL_EXCLUDE cmake cyrus-sasl-devel make openssl-devel zlib-devel libcurl-devel git
+        yum -y install $OPENSSL_EXCLUDE python3 python3-pip python3-devel
+
+        yum -y install $OPENSSL_EXCLUDE redhat-rpm-config which e2fsprogs-devel expat-devel lz4-devel
+        yum -y install $OPENSSL_EXCLUDE openldap-devel krb5-devel xz-devel
+        yum -y install $OPENSSL_EXCLUDE perl
+        # PSMDB-2072: RBE Bazel build deps, mirroring upstream mongo
+        # bazel/remote_execution_container/repin_dockerfiles.sh:
+        yum -y install $OPENSSL_EXCLUDE cyrus-sasl-gssapi glibc-devel procps-ng systemtap-sdt-devel ncurses-libs
+        # same SERVER-122806 test-deps as rhel8/9 (COMMON_PACKAGES["rhel"])
+        yum -y install $OPENSSL_EXCLUDE zip
       fi
-      wget https://curl.se/download/curl-7.77.0.tar.gz -O curl-7.77.0.tar.gz
-      tar -xzf curl-7.77.0.tar.gz
-      cd curl-7.77.0
-        ./configure --with-openssl
-        make -j${NCPU}
-        make install
-      cd ../
-#
       install_golang
       if [ x"$RHEL" = x8 ]; then
         if [ -f /opt/rh/gcc-toolset-9/enable ]; then
@@ -508,7 +516,7 @@ install_deps() {
 
     else
       apt-get -y update
-      DEBIAN_FRONTEND=noninteractive apt-get -y install curl lsb-release wget apt-transport-https software-properties-common
+      DEBIAN_FRONTEND=noninteractive apt-get -y install curl lsb-release wget apt-transport-https
       export DEBIAN=$(lsb_release -sc)
       export ARCH=$(echo $(uname -m) | sed -e 's:i686:i386:g')
       wget https://repo.percona.com/prel/apt/pool/main/p/percona-release/percona-release_1.0-33.generic_all.deb && DEBIAN_FRONTEND=noninteractive apt-get -y install ./percona-release_1.0-33.generic_all.deb
@@ -533,10 +541,10 @@ install_deps() {
       # `jq` and `uuid-runtime` are needed by `generate_release_sbom`
       INSTALL_LIST="${INSTALL_LIST} jq uuid-runtime"
 
-      if [ x"${DEBIAN}" = "xjammy" ] || [ x"${DEBIAN}" = "xnoble" ]; then
+      if [ x"${DEBIAN}" = "xjammy" ] || [ x"${DEBIAN}" = "xnoble" ] || [ x"${DEBIAN}" = "xresolute" ]; then
         INSTALL_LIST="${INSTALL_LIST} systemtap-sdt-dev"
       fi
-      if [ x"${DEBIAN}" = "xnoble" ]; then
+      if [ x"${DEBIAN}" = "xnoble" ] || [ x"${DEBIAN}" = "xresolute" ]; then
         INSTALL_LIST="${INSTALL_LIST} libncurses-dev"
       fi
       until apt-get -y install dirmngr; do
@@ -700,7 +708,6 @@ build_rpm(){
     #
     set_gopath "$(pwd)/"
 
-    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
     rpmbuild --define "_topdir ${WORKDIR}/rpmbuild" --define "dist .$OS_NAME" --rebuild rpmbuild/SRPMS/$SRC_RPM
 
@@ -740,7 +747,7 @@ build_source_deb(){
     sed -i 's:@@LOGDIR@@:mongodb:g' ${BUILDDIR}/debian/mongod.default
     sed -i 's:@@LOGDIR@@:mongodb:g' ${BUILDDIR}/debian/percona-server-mongodb-helper.sh
     #
-    if [ x"${DEBIAN}" = "xbullseye" -o x"${DEBIAN}" = "xbookworm" -o x"${DEBIAN}" = "xjammy" -o x"${DEBIAN}" = "xnoble" ]; then
+    if [ x"${DEBIAN}" = "xbullseye" -o x"${DEBIAN}" = "xbookworm" -o x"${DEBIAN}" = "xtrixie" -o x"${DEBIAN}" = "xjammy" -o x"${DEBIAN}" = "xnoble" -o x"${DEBIAN}" = "xresolute" ]; then
         sed -i 's:dh-systemd,::' ${BUILDDIR}/debian/control
     fi
     #
@@ -796,7 +803,7 @@ build_deb(){
     python3 buildscripts/install_bazel.py
     cp -av percona-packaging/debian/rules debian/
 
-    if [ x"${DEBIAN}" = "xbullseye" -o x"${DEBIAN}" = "xbookworm" -o x"${DEBIAN}" = "xjammy" -o x"${DEBIAN}" = "xnoble" ]; then
+    if [ x"${DEBIAN}" = "xbullseye" -o x"${DEBIAN}" = "xbookworm" -o x"${DEBIAN}" = "xtrixie" -o x"${DEBIAN}" = "xjammy" -o x"${DEBIAN}" = "xnoble" -o x"${DEBIAN}" = "xresolute" ]; then
         sed -i 's:dh-systemd,::' debian/control
     fi
     sed -i 's|VersionStr="$(go run release/release.go get-version)"|VersionStr="$PSMDB_TOOLS_REVISION"|' mongo-tools/set_goenv.sh
@@ -809,7 +816,6 @@ build_deb(){
     export PSMDB_GIT_HASH="${REVISION_LONG}"
 
     dch -m -D "${DEBIAN}" --force-distribution -v "${VERSION}-${RELEASE}.${DEBIAN}" 'Update distribution'
-    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 
     export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
 
@@ -919,7 +925,6 @@ build_tarball(){
     cp sbom.cdx.json ${PSMDIR}/doc || abort '`build_tarball`: SBOM copying failed'
 
     # Finally build Percona Server for MongoDB with Bazel
-    export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
     export OPT_LINKFLAGS="${LINKFLAGS} -Wl,--build-id=sha1"
     python3 buildscripts/install_bazel.py
 
