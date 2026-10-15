@@ -284,6 +284,13 @@ common:psmdb_buildfarm --strategy=GpgSign=local
 # its default and start trying to build enterprise targets we don't ship.
 common:psmdb_buildfarm --//bazel/config:build_enterprise=False
 
+# Keep upstream's RBE sysroot off. Their `common:local` sets
+# USE_RBE_SYSROOT=1, so on an AL2023 host a local (non-RBE) build would make
+# sysroot_dump pull the upstream quay image (not our perconalab/psmdb-rbe one)
+# and fail outright inside our build containers, which have no docker/podman.
+# This file is imported after .bazelrc, so this `common:local` value wins.
+common:local --repo_env=USE_RBE_SYSROOT=0
+
 ################################################################################
 # PSMDB remote unittest profile (psmdb_remote_unittest)
 ################################################################################
