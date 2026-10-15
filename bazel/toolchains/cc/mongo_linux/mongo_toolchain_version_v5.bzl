@@ -42,6 +42,13 @@ TOOLCHAIN_MAP_V5 = {
         "sha": "783294fe1418f4ad5ea522a3956f842517dd99297a2e694f7cc2abbc13acfd3c",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-debian12-e921fc32d5c23d7cdb5cf406b05bf16eb5ab8dbd.tar.gz",
     },
+    # upstream has no debian13 arm64 build; ours is rebuilt from the same
+    # rev 69f8a935 as the x86 one (psmdb-arm64-toolchains).
+    "debian13_aarch64": {
+        "platform_name": "debian13-arm64",
+        "sha": "bd7a90d6e265ebf7dc1dc614d721348a6acd494ef7bcfdc3df9af7be41e6dc93",
+        "url": "https://psmdb-arm64-toolchains.s3.us-west-2.amazonaws.com/output/69f8a93565c8f7c0561159108bfe258d46e45d3e/bazel_v5_toolchain-debian13-arm64-69f8a93565c8f7c0561159108bfe258d46e45d3e.tar.gz",
+    },
     "debian13_x86_64": {
         "platform_name": "debian13",
         "sha": "4c3d58179b6abb929ae2f0bfd8767fb823dcef82a9db17a12894832688af399b",
@@ -151,5 +158,15 @@ TOOLCHAIN_MAP_V5 = {
         "platform_name": "ubuntu2404",
         "sha": "44581b6a7e0df623cecc6a9f56c958f4a981293a9df338c5a95a5aa08310fd0a",
         "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-ubuntu2404-e921fc32d5c23d7cdb5cf406b05bf16eb5ab8dbd.tar.gz",
+    },
+    "ubuntu26_aarch64": {
+        "platform_name": "ubuntu2604-arm64",
+        "sha": "4a3eb9555e679bcb2416948e65db54b6363d114343aa51cf0e42058fdcf2f008",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-ubuntu2604-arm64-edf71c48476695b4bb7bb3ee0e098920dc226a99.tar.gz",
+    },
+    "ubuntu26_x86_64": {
+        "platform_name": "ubuntu2604",
+        "sha": "a2b2126664f36f0fdbc8e377d889b4a536550c9f6ed389d7bbaf6777599c9943",
+        "url": "https://s3.amazonaws.com/boxes.10gen.com/build/toolchain/bazel_v5_toolchain-ubuntu2604-edf71c48476695b4bb7bb3ee0e098920dc226a99.tar.gz",
     },
 }
