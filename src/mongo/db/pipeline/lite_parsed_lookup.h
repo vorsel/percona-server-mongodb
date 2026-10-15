@@ -42,7 +42,10 @@ public:
                       boost::optional<StageParamsPipeline> subpipelineStageParams = boost::none,
                       boost::optional<int64_t> internalFieldMatchPipelineIdx = boost::none,
                       bool internalFromIsAView = false,
-                      bool noUserPipeline = false)
+                      bool noUserPipeline = false,
+                      FirstStageViewApplicationPolicy subpipelineViewPolicy =
+                          FirstStageViewApplicationPolicy::kDefaultPrepend,
+                      size_t subpipelineViewPrefixLen = 0)
         : DefaultStageParams(ownedBsonObj.firstElement()),
           fromNss(std::move(fromNss)),
           as(std::move(as)),
@@ -57,6 +60,8 @@ public:
           internalFieldMatchPipelineIdx(std::move(internalFieldMatchPipelineIdx)),
           internalFromIsAView(internalFromIsAView),
           noUserPipeline(noUserPipeline),
+          subpipelineViewPolicy(subpipelineViewPolicy),
+          subpipelineViewPrefixLen(subpipelineViewPrefixLen),
           _ownedOriginalBson(std::move(ownedBsonObj)) {}
 
     static const Id& id;
@@ -95,6 +100,19 @@ public:
     // = boost::none instead of [], even after a view subpipeline is materialized.
     bool noUserPipeline = false;
 
+    // The subpipeline's first (desugared) stage's view-application policy. kDefaultPrepend (the
+    // default) means the stage is view-agnostic, so when 'fromNss' is a view the resolved view
+    // pipeline is prepended ahead of the user subpipeline as usual. kDoNothing means the stage
+    // applies the view itself (e.g. an extension search stage), so the view pipeline must not be
+    // prepended to the resolved pipeline.
+    FirstStageViewApplicationPolicy subpipelineViewPolicy =
+        FirstStageViewApplicationPolicy::kDefaultPrepend;
+
+    // How many of the leading stages in 'subpipelineStageParams' came from the resolved view
+    // definition rather than from the user's subpipeline, used by DocumentSourceLookUp as the split
+    // point when parsing the subpipeline. 0 when 'fromNss' is not a view.
+    size_t subpipelineViewPrefixLen = 0;
+
 private:
     // Owns the BSON buffer that DefaultStageParams::_originalSpec points into.
     BSONObj _ownedOriginalBson;
@@ -109,6 +127,7 @@ public:
                                                    const LiteParserOptions& options);
 
     LiteParsedLookUp(const BSONElement& spec,
+                     const LiteParserOptions& options,
                      NamespaceString foreignNss,
                      boost::optional<OwnedLiteParsedPipeline> pipeline,
                      std::vector<BSONObj> rawPipeline,
@@ -139,7 +158,7 @@ public:
 
     std::unique_ptr<StageParams> getStageParams() const override;
 
-    void validate() const override;
+    void validate(const OperationContext* opCtx) const override;
 
     // Moved from document_source_lookup.cpp so createFromBson can still call it.
     static void validateLookupCollectionlessPipeline(const std::vector<BSONObj>& pipeline);

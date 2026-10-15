@@ -26,6 +26,8 @@
 
 namespace mongo {
 
+class FixedFCVRegion;
+
 namespace resharding {
 class CoordinatorCommitMonitor;
 }  // namespace resharding
@@ -166,6 +168,17 @@ public:
         ServiceContext* serviceContext);
     ~ReshardingCoordinator() override = default;
 
+    /**
+     * Same as PrimaryOnlyService::TypedInstance::getOrCreate, but requires the caller to hold a
+     * FixedFCVRegion for the duration of the call, since the coordinator's creation must not race
+     * with an FCV transition.
+     */
+    static std::shared_ptr<ReshardingCoordinator> getOrCreate(OperationContext* opCtx,
+                                                              repl::PrimaryOnlyService* service,
+                                                              BSONObj initialState,
+                                                              const FixedFCVRegion& fcvRegion,
+                                                              bool checkOptions = true);
+
     SemiFuture<void> run(std::shared_ptr<executor::ScopedTaskExecutor> executor,
                          const CancellationToken& token) noexcept override;
 
@@ -191,6 +204,15 @@ public:
 
     CommonReshardingMetadata getMetadata() const {
         return _metadata;
+    }
+
+    /**
+     * Returns true if this instance was recovered from a coordinator document that had already
+     * reached kQuiesced, i.e. the resharding operation it represents finished on a previous
+     * primary.
+     */
+    bool isRecoveryInQuiesce() const {
+        return _isRecoveryInQuiesce;
     }
 
     /**
@@ -278,9 +300,9 @@ private:
     void _stopMigrations(const std::shared_ptr<executor::ScopedTaskExecutor>& executor);
 
     /**
-     * Helper to re-enable chunk migrations on abort.
+     * Re-enables chunk migrations on the source namespace during teardown.
      */
-    void _resumeMigrations(OperationContext* opCtx, boost::optional<Status> abortReason);
+    void _resumeMigrations(OperationContext* opCtx);
 
     /**
      * Runs resharding up through preparing to persist the decision.
@@ -522,12 +544,13 @@ private:
         resharding::PhaseTransitionFn phaseTransitionFn);
 
     /**
-     * Updates the entry for this resharding operation in config.reshardingOperations to the
-     * quiesced state, or removes it if quiesce isn't being done.  Removes the resharding fields
-     * from the catalog entries.
+     * Tears down the resharding coordinator: re-enables migrations, releases the internal session,
+     * then removes or quiesces the coordinator document and resharding fields. The whole sequence
+     * is retried until it succeeds or the coordinator steps down.
      */
-    void _removeOrQuiesceCoordinatorDocAndRemoveReshardingFields(
-        OperationContext* opCtx, boost::optional<Status> abortReason = boost::none);
+    ExecutorFuture<void> _cleanupCoordinator(
+        const std::shared_ptr<executor::ScopedTaskExecutor>& executor,
+        boost::optional<Status> abortReason = boost::none);
 
     /**
      * Sends '_flushRoutingTableCacheUpdatesWithWriteConcern' to ensure donor state machine creation
@@ -708,7 +731,7 @@ private:
     // CancelableOperationContext must have a thread that is always available to it to mark its
     // opCtx as killed when the cancelToken has been cancelled.
     const std::shared_ptr<ThreadPool> _markKilledExecutor;
-    std::unique_ptr<HierarchicalCancelableOperationContextFactory> _cancelableOpCtxFactory;
+    std::shared_ptr<HierarchicalCancelableOperationContextFactory> _cancelableOpCtxFactory;
 
     /**
      * Must be locked while the `_canEnterCritical` promise is being fulfilled.
@@ -762,6 +785,7 @@ private:
     OperationSessionTracker _sessionTracker;
 
     const bool _isRecovery;
+    const bool _isRecoveryInQuiesce;
 };
 
 }  // namespace mongo

@@ -1118,6 +1118,7 @@ mongo_cc_library(
         ":oplog",
         ":primary_only_service",
         ":repl_coordinator_interface",
+        ":repl_server_parameters",
         ":repl_settings",
         ":replica_set_messages",
         ":replication_auth",
@@ -1913,8 +1914,11 @@ mongo_cc_unit_test(
         "//src/mongo/db:server_base",
         "//src/mongo/db:service_context_d_test_fixture",
         "//src/mongo/db:service_context_test_fixture",
+        "//src/mongo/db/auth",
         "//src/mongo/db/auth:authmocks",
         "//src/mongo/db/auth:authorization_manager_global",
+        "//src/mongo/db/auth:authorization_session_test_fixture",
+        "//src/mongo/db/auth:authprivilege",
         "//src/mongo/db/commands:create_command",
         "//src/mongo/db/commands:mongod_fcv",
         "//src/mongo/db/exec/mutable_bson",
@@ -2229,7 +2233,6 @@ mongo_cc_unit_test(
         ":replication_recovery",
         ":storage_interface",
         "//src/mongo/db/session:session_catalog_mongod",
-        "//src/mongo/db/storage:journal_flusher",
     ],
 )
 

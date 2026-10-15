@@ -77,8 +77,6 @@ DocumentSourceSearchMeta::distributedPlanLogic(const DistributedPlanContext* ctx
 namespace {
 InternalSearchMongotRemoteSpec prepareInternalSearchMetaMongotSpec(
     const BSONObj& spec, const intrusive_ptr<ExpressionContext>& expCtx) {
-    search_helpers::validateViewNotSetByUser(expCtx, spec);
-
     if (spec.hasField(InternalSearchMongotRemoteSpec::kMongotQueryFieldName)) {
         // The existence of this field name indicates that this spec was already serialized from a
         // mongos process. Parse out of the IDL spec format, rather than just expecting only the
@@ -136,6 +134,14 @@ InternalSearchMongotRemoteSpec prepareInternalSearchMetaMongotSpec(
     return internalSpec;
 }
 }  // namespace
+
+Value DocumentSourceSearchMeta::serialize(const query_shape::SerializationOptions& opts) const {
+    // For query stats, serialize the mongot query as a single anonymized object.
+    if (opts.isSerializingForQueryStats()) {
+        return Value(Document{{getSourceName(), opts.serializeLiteral(getSearchQuery())}});
+    }
+    return DocumentSourceInternalSearchMongotRemote::serialize(opts);
+}
 
 std::list<intrusive_ptr<DocumentSource>> DocumentSourceSearchMeta::createFromBson(
     BSONElement elem, const intrusive_ptr<ExpressionContext>& expCtx) {

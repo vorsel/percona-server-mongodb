@@ -118,6 +118,18 @@ TEST_F(LiteParsedLookUpTest, StageParamsForwardsIsHybridSearchFlag) {
     ASSERT_TRUE(typed->isHybridSearch);
 }
 
+TEST_F(LiteParsedLookUpTest, StageParamsForwardsSubpipelineViewPolicy) {
+    // An ordinary subpipeline first stage defaults to kDefaultPrepend.
+    auto* typed =
+        parseAndGetParams(R"({$lookup: {from: "foreign", as: "a", pipeline: [{$match: {}}]}})");
+    ASSERT(typed->subpipelineViewPolicy == FirstStageViewApplicationPolicy::kDefaultPrepend);
+
+    // A first stage that applies the view itself forwards kDoNothing.
+    typed = parseAndGetParams(
+        R"({$lookup: {from: "foreign", as: "a", pipeline: [{$_internalSearchIdLookup: {}}]}})");
+    ASSERT(typed->subpipelineViewPolicy == FirstStageViewApplicationPolicy::kDoNothing);
+}
+
 TEST_F(LiteParsedLookUpTest, StageParamsCarriesLetVarsAndUnwindSpec) {
     auto* typed = parseAndGetParams(R"({
         $lookup: {
@@ -139,7 +151,7 @@ TEST_F(LiteParsedLookUpTest, RequiredPrivilegesIncludesForeignFind) {
 
 TEST_F(LiteParsedLookUpTest, ValidatePassesForSameDatabaseLookup) {
     auto lp = parse(R"({$lookup: {from: "foreign", as: "a", pipeline: [{$match: {x: 1}}]}})");
-    ASSERT_DOES_NOT_THROW(lp->validate());
+    ASSERT_DOES_NOT_THROW(lp->validate(nullptr));
 }
 
 TEST_F(LiteParsedLookUpTest, ParseRejectsCrossDbByDefault) {
@@ -153,14 +165,14 @@ TEST_F(LiteParsedLookUpTest, ParseAllowsCrossDbToConfigCacheChunks) {
     // config.cache.chunks.* is explicitly allowed.
     auto lp = parse(
         R"({$lookup: {from: {db: "config", coll: "cache.chunks.test.foo"}, as: "a", pipeline: []}})");
-    ASSERT_DOES_NOT_THROW(lp->validate());
+    ASSERT_DOES_NOT_THROW(lp->validate(nullptr));
 }
 
 TEST_F(LiteParsedLookUpTest, ParseAllowsCrossDbWhenAllowGenericForeignDbLookupSet) {
     LiteParserOptions opts;
     opts.allowGenericForeignDbLookup = true;
     auto lp = parse(R"({$lookup: {from: {db: "other", coll: "c"}, as: "a", pipeline: []}})", opts);
-    ASSERT_DOES_NOT_THROW(lp->validate());
+    ASSERT_DOES_NOT_THROW(lp->validate(nullptr));
 }
 
 }  // namespace

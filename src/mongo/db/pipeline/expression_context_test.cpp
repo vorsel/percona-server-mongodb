@@ -7,21 +7,21 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
 #include "mongo/bson/timestamp.h"
+#include "mongo/db/feature_flag.h"
 #include "mongo/db/logical_time.h"
 #include "mongo/db/memory_tracking/memory_usage_tracker.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
 #include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/expression.h"
 #include "mongo/db/pipeline/expression_context_builder.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/pipeline_factory.h"
 #include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
-#include "mongo/db/query/collation/collator_factory_interface.h"
-#include "mongo/db/query/collation/collator_factory_mock.h"
-#include "mongo/db/query/collation/collator_interface_mock.h"
-#include "mongo/db/query/find_command.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/topology/vector_clock/vector_clock_mutable.h"
+#include "mongo/transport/mock_session.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
@@ -35,6 +35,37 @@ namespace {
 using namespace std::literals::string_view_literals;
 
 using ExpressionContextTest = ServiceContextTest;
+
+TEST_F(ExpressionContextTest, AdoptsOpCtxInstalledIFRContext) {
+    // When no IFRContext is threaded in and the opCtx already has one installed, the
+    // ExpressionContext must adopt that same instance (by identity), so a flag disabled on the
+    // operation's context is observed here and by the egress metadata hook.
+    auto opCtx = makeOperationContext();
+    auto installed = IncrementalFeatureRolloutContext::forTest({});
+    IncrementalFeatureRolloutContext::set(opCtx.get(), installed);
+
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx.get())
+                      .ns(NamespaceString::createNamespaceString_forTest("test"sv, "namespace"sv))
+                      .build();
+
+    ASSERT_EQ(expCtx->getIfrContext().get(), installed.get());
+}
+
+TEST_F(ExpressionContextTest, BindsToOpCtxPerOperationIFRContext) {
+    // When none is threaded in, the ctor sources the context from get(opCtx), binding this
+    // ExpressionContext to the single per-operation IFRContext. A flag disabled on that context
+    // (e.g. by an IFR retry) is therefore observed here and by the egress metadata hook.
+    auto opCtx = makeOperationContext();
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx.get())
+                      .ns(NamespaceString::createNamespaceString_forTest("test"sv, "namespace"sv))
+                      .build();
+
+    ASSERT(expCtx->getIfrContext());
+    ASSERT_EQ(expCtx->getIfrContext().get(),
+              IncrementalFeatureRolloutContext::get(opCtx.get()).get());
+}
 
 TEST_F(ExpressionContextTest, ExpressionContextSummonsMissingTimeValues) {
     auto opCtx = makeOperationContext();
@@ -378,113 +409,6 @@ TEST_F(ExpressionContextTest, AllowPartialResultsIsNotInheritedBySubPipeline) {
     ASSERT_FALSE(subExpCtx->getAllowPartialResults());
 }
 
-// Tests for ExpressionContextBuilder::fromRequest(FindCommandRequest) IDHACK eligibility.
-// The key behavior: when there is no explicit request collation, isIdHackQuery is set based
-// purely on query structure, regardless of whether the collection has a default collator.
-// Before SERVER-123100 this was only done when the collection had no collator, which was a bug
-// because an inherited (no-request) collation always matches the collection's default.
-
-TEST_F(ExpressionContextTest, FindOnIdWithNoCollationSetsIsIdHackQuery) {
-    auto opCtx = makeOperationContext();
-    auto request = FindCommandRequest(NamespaceString::createNamespaceString_forTest("test.coll"));
-    request.setFilter(fromjson("{_id: 1}"));
-
-    auto expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), request, nullptr).build();
-    ASSERT_TRUE(expCtx->isIdHackQuery());
-}
-
-TEST_F(ExpressionContextTest, FindOnIdWithCollectionCollatorSetsIsIdHackQuery) {
-    // Regression test for SERVER-123100: before this fix, a find on _id against a collection with
-    // a custom collator (but no explicit request collation) would not set isIdHackQuery=true,
-    // causing the IDHACK/express fast path to be skipped.
-    auto opCtx = makeOperationContext();
-    auto request = FindCommandRequest(NamespaceString::createNamespaceString_forTest("test.coll"));
-    request.setFilter(fromjson("{_id: 1}"));
-
-    CollatorInterfaceMock collectionCollator(CollatorInterfaceMock::MockType::kReverseString);
-    auto expCtx =
-        ExpressionContextBuilder{}.fromRequest(opCtx.get(), request, &collectionCollator).build();
-    ASSERT_TRUE(expCtx->isIdHackQuery());
-}
-
-TEST_F(ExpressionContextTest, FindOnNonIdFieldDoesNotSetIsIdHackQuery) {
-    auto opCtx = makeOperationContext();
-    auto request = FindCommandRequest(NamespaceString::createNamespaceString_forTest("test.coll"));
-    request.setFilter(fromjson("{a: 1}"));
-
-    CollatorInterfaceMock collectionCollator(CollatorInterfaceMock::MockType::kReverseString);
-    auto expCtx =
-        ExpressionContextBuilder{}.fromRequest(opCtx.get(), request, &collectionCollator).build();
-    ASSERT_FALSE(expCtx->isIdHackQuery());
-}
-
-TEST_F(ExpressionContextTest, FindOnIdWithMismatchedCollationDoesNotSetIsIdHackQuery) {
-    // When the request carries an explicit collation that does not match the collection's default
-    // collator, the collatorsMatch() check returns false and isIdHackQuery must remain false.
-    // This exercises the 'else if (haveMatchingCollators)' branch in fromRequest.
-    auto opCtx = makeOperationContext();
-    CollatorFactoryInterface::set(opCtx->getServiceContext(),
-                                  std::make_unique<CollatorFactoryMock>());
-
-    auto request = FindCommandRequest(NamespaceString::createNamespaceString_forTest("test.coll"));
-    request.setFilter(fromjson("{_id: 1}"));
-    // Any non-simple spec; CollatorFactoryMock always parses non-simple specs as kReverseString.
-    request.setCollation(BSON("locale" << "mock_always_equal"));
-
-    // Collection collator is kAlwaysEqual — its spec differs from kReverseString, so
-    // collatorsMatch returns false and isIdHackQuery must not be set.
-    CollatorInterfaceMock collectionCollator(CollatorInterfaceMock::MockType::kAlwaysEqual);
-    auto expCtx =
-        ExpressionContextBuilder{}.fromRequest(opCtx.get(), request, &collectionCollator).build();
-    ASSERT_FALSE(expCtx->isIdHackQuery());
-}
-
-TEST_F(ExpressionContextTest, FindOnIdWithMatchingExplicitCollationSetsIsIdHackQuery) {
-    // When the request carries an explicit collation that matches the collection's default
-    // collator, haveMatchingCollators is true and isIdHackQuery must be set based on the filter.
-    // CollatorFactoryMock always parses any non-simple spec as kReverseString, so both the
-    // request collator and the collection collator are kReverseString and their specs match.
-    auto opCtx = makeOperationContext();
-    CollatorFactoryInterface::set(opCtx->getServiceContext(),
-                                  std::make_unique<CollatorFactoryMock>());
-
-    auto request = FindCommandRequest(NamespaceString::createNamespaceString_forTest("test.coll"));
-    request.setFilter(fromjson("{_id: 1}"));
-    request.setCollation(BSON("locale" << "mock_reverse"));
-
-    CollatorInterfaceMock collectionCollator(CollatorInterfaceMock::MockType::kReverseString);
-    auto expCtx =
-        ExpressionContextBuilder{}.fromRequest(opCtx.get(), request, &collectionCollator).build();
-    ASSERT_TRUE(expCtx->isIdHackQuery());
-}
-
-TEST_F(ExpressionContextTest, FindOnIdWithHintDoesNotSetIsIdHackQuery) {
-    // A hint disqualifies IDHACK: isIdHackEligibleQueryWithoutCollator() returns false whenever
-    // the hint is non-empty, regardless of the filter shape.
-    auto opCtx = makeOperationContext();
-    auto request = FindCommandRequest(NamespaceString::createNamespaceString_forTest("test.coll"));
-    request.setFilter(fromjson("{_id: 1}"));
-    request.setHint(fromjson("{_id: 1}"));
-
-    auto expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), request, nullptr).build();
-    ASSERT_FALSE(expCtx->isIdHackQuery());
-}
-
-TEST_F(ExpressionContextTest, SetIsIdHackQueryIsIdempotent) {
-    // setIsIdHackQuery(true) on an already-true flag must be a no-op, not a tassert failure.
-    // This exercises the monotone-upgrade invariant: false→true is allowed, true→true is
-    // also allowed, and true→false would fire the tassert.
-    auto opCtx = makeOperationContext();
-    auto request = FindCommandRequest(NamespaceString::createNamespaceString_forTest("test.coll"));
-    request.setFilter(fromjson("{_id: 1}"));
-
-    auto expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), request, nullptr).build();
-    ASSERT_TRUE(expCtx->isIdHackQuery());
-    // Calling setIsIdHackQuery(true) again must not throw or tassert.
-    expCtx->setIsIdHackQuery(true);
-    ASSERT_TRUE(expCtx->isIdHackQuery());
-}
-
 // The expression fallback tracker rolls up into the per-query OperationMemoryUsageTracker (so the
 // per-query limit is enforced) only when both memory-tracking feature flags are enabled.
 TEST_F(ExpressionContextTest,
@@ -648,6 +572,123 @@ TEST_F(ExpressionContextTest, ExcludeOperationMemoryTrackingIsPropagatedToCopies
     auto copy = makeCopyFromExpressionContext(
         expCtx, NamespaceString::createNamespaceString_forTest("test"sv, "other"sv));
     ASSERT_TRUE(copy->getExcludeOperationMemoryTracking());
+}
+
+TEST_F(ExpressionContextTest, isReparsingRepresentativeQueryShapeIsPropagatedToCopies) {
+    // Sub-pipeline contexts for $lookup, $unionWith and $graphLookup are all built from
+    // makeCopyFromExpressionContext, so without this the flag would be lost at the first
+    // sub-pipeline boundary of a re-parsed query shape.
+    auto opCtx = makeOperationContext();
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx.get())
+                      .ns(NamespaceString::createNamespaceString_forTest("test"sv, "coll"sv))
+                      .isReparsingRepresentativeQueryShape(true)
+                      .build();
+
+    auto copy = makeCopyFromExpressionContext(
+        expCtx, NamespaceString::createNamespaceString_forTest("test"sv, "other"sv));
+    ASSERT_TRUE(copy->getIsReparsingRepresentativeQueryShape());
+}
+
+TEST_F(ExpressionContextTest, isReparsingRepresentativeQueryShapeDefaultsToFalse) {
+    auto opCtx = makeOperationContext();
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx.get())
+                      .ns(NamespaceString::createNamespaceString_forTest("test"sv, "coll"sv))
+                      .build();
+    ASSERT_FALSE(expCtx->getIsReparsingRepresentativeQueryShape());
+}
+
+// An internal-only expression must still be rejected when an external client sends it, but must
+// parse when the server re-parses a stored query shape that contains it. Otherwise reading
+// $queryStats as an external client fails on any entry recorded for an internal client. See
+// SERVER-130571.
+class InternalOnlyExpressionParseTest : public ExpressionContextTest {
+protected:
+    static constexpr auto kInternalOnlyExpression =
+        "{$_internalIndexKey: {doc: '$foo', spec: {key: {a: 1}, name: 'bar'}}}";
+
+    // A client with a transport session and no internal tag is an external (user) client. Note that
+    // the default unittest client has no session at all, which counts as internal.
+    ServiceContext::UniqueClient makeExternalClient() {
+        return getServiceContext()->getService()->makeClient(
+            "external", transport::MockSession::create(/*transportLayer=*/nullptr));
+    }
+};
+
+TEST_F(InternalOnlyExpressionParseTest, RejectedForExternalClient) {
+    auto client = makeExternalClient();
+    auto opCtx = client->makeOperationContext();
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx.get())
+                      .ns(NamespaceString::createNamespaceString_forTest("test"sv, "coll"sv))
+                      .build();
+
+    ASSERT_THROWS_CODE(Expression::parseExpression(expCtx.get(),
+                                                   fromjson(kInternalOnlyExpression),
+                                                   expCtx->variablesParseState),
+                       AssertionException,
+                       5491300);
+}
+
+TEST_F(InternalOnlyExpressionParseTest, AllowedForExternalClientWhenParsingQueryShape) {
+    auto client = makeExternalClient();
+    auto opCtx = client->makeOperationContext();
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx.get())
+                      .ns(NamespaceString::createNamespaceString_forTest("test"sv, "coll"sv))
+                      .isReparsingRepresentativeQueryShape(true)
+                      .build();
+
+    ASSERT(Expression::parseExpression(
+        expCtx.get(), fromjson(kInternalOnlyExpression), expCtx->variablesParseState));
+}
+
+TEST_F(
+    ExpressionContextTest,
+    ExpressionFallbackTrackerStandaloneWhenExpressionFallbackExcludedFromOperationMemoryTracking) {
+    unittest::ServerParameterGuard queryMemTracking{"featureFlagQueryMemoryTracking", true};
+    unittest::ServerParameterGuard exprMemTracking{"featureFlagExpressionMemoryTracking", true};
+    // Tiny per-expression cap, generous per-query limit. If the fallback rolled up to the operation
+    // tracker it would be bounded by the generous per-query limit and stay within limit; a
+    // standalone fallback is bounded by the tiny per-expression cap and exceeds it.
+    unittest::ServerParameterGuard exprCap{"internalQueryMaxSingleExpressionMemoryUsageBytes", 4};
+    unittest::ServerParameterGuard perQueryLimit{"internalQueryMaxMemoryUsageBytesPerOperation",
+                                                 10 * 1024 * 1024};
+
+    auto opCtx = makeOperationContext();
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx.get())
+                      .ns(NamespaceString::createNamespaceString_forTest("test"sv, "coll"sv))
+                      .excludeExpressionFallbackFromOperationMemoryTracking(true)
+                      .build();
+
+    auto& tracker = expCtx->getExpressionFallbackTracker();
+    tracker.add(100);  // Exceeds the per-expression cap; only a rolled-up tracker would be within.
+    ASSERT_FALSE(tracker.withinMemoryLimit(opCtx.get()));
+    tracker.add(-100);
+}
+
+TEST_F(ExpressionContextTest, StageMemoryTrackerUnaffectedByExpressionFallbackExclusion) {
+    unittest::ServerParameterGuard queryMemTracking{"featureFlagQueryMemoryTracking", true};
+    unittest::ServerParameterGuard exprMemTracking{"featureFlagExpressionMemoryTracking", true};
+    // Tiny per-query limit; the stage tracker's own cap is left at its generous default. If the
+    // stage tracker rolls up (as it must), it is bounded by the tiny per-query limit and exceeds
+    // it.
+    unittest::ServerParameterGuard perQueryLimit{"internalQueryMaxMemoryUsageBytesPerOperation", 4};
+
+    auto opCtx = makeOperationContext();
+    auto expCtx = ExpressionContextBuilder{}
+                      .opCtx(opCtx.get())
+                      .ns(NamespaceString::createNamespaceString_forTest("test"sv, "coll"sv))
+                      .excludeExpressionFallbackFromOperationMemoryTracking(true)
+                      .build();
+
+    auto stageTracker =
+        OperationMemoryUsageTracker::createChunkedSimpleMemoryUsageTrackerForStage(*expCtx);
+    stageTracker.add(100);  // Exceeds the per-query limit via the operation-tracker base chain.
+    ASSERT_FALSE(stageTracker.withinMemoryLimit(opCtx.get()));
+    stageTracker.add(-100);
 }
 
 }  // namespace

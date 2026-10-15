@@ -52,30 +52,6 @@ spidermonkey_wasi_repo(
     ] * 5,
 )
 
-# SourceGraph indexer
-http_file(
-    name = "scip-clang",
-    executable = True,
-    sha256 = "9fc7d1c309f8adee1b8663efa802efa7363ef22ee06f4711117535e406690689",
-    urls = [
-        # Implements retry by relisting each url multiple times to be used as a failover.
-        # TODO(SERVER-86719): Re-implement http_archive to allow sleeping between retries
-        "https://github.com/sourcegraph/scip-clang/releases/download/v0.3.2/scip-clang-x86_64-linux",
-    ] * 5,
-)
-
-# SourceGraph CLI
-http_file(
-    name = "scip-src",
-    executable = True,
-    sha256 = "eb3d627c4dad56b9f5d06634b90384104db065d410c4b338fa5e6558be4f3ad9",
-    urls = [
-        # Implements retry by relisting each url multiple times to be used as a failover.
-        # TODO(SERVER-86719): Re-implement http_archive to allow sleeping between retries
-        "https://github.com/sourcegraph/src-cli/releases/download/6.4.0/src_linux_amd64",
-    ] * 5,
-)
-
 bazel_dep(name = "rules_cc", version = "0.2.10")
 bazel_dep(name = "rules_fuzzing", version = "0.6.0")
 bazel_dep(name = "rules_proto", version = "7.1.0")
@@ -410,6 +386,9 @@ crate.annotation(
         "//bazel/wasmtime:store_hh_resource_limiter.patch",
         "//bazel/wasmtime:val_raw_u8_list_h.patch",
         "//bazel/wasmtime:val_raw_u8_list_rs.patch",
+        "//bazel/wasmtime:config_wasm_backtrace_rs.patch",
+        "//bazel/wasmtime:config_wasm_backtrace_h.patch",
+        "//bazel/wasmtime:config_wasm_backtrace_hh.patch",
     ],
 )
 
@@ -421,6 +400,13 @@ crate.annotation(
 # (the test harness), and wasmtime-wave (the value serialisation layer) so
 # that all three agree on the Val enum layout.
 # TODO (SERVER-127394): Contribute these patches upstream to the wasmtime repo
+#
+# signals_sigaltstack_ss_disable.patch (BF-44398/BF-44848, wasmtime#13857):
+# Stack::drop munmaps the per-thread sigaltstack without SS_DISABLE, leaving a
+# dangling kernel registration. ASan's thread teardown then unmaps whatever
+# range is still registered, which by that point has been reused for live heap
+# allocations — corrupting the address space of unrelated threads on *aubsan
+# variants.
 crate.annotation(
     crate = "wasmtime",
     patch_args = ["-p1"],
@@ -428,6 +414,7 @@ crate.annotation(
         "//bazel/wasmtime:val_bytes_fast_path.patch",
         "//bazel/wasmtime:val_bytes_lift_fast_path.patch",
         "//bazel/wasmtime:val_bytes_wave_fast_path.patch",
+        "//bazel/wasmtime:signals_sigaltstack_ss_disable.patch",
     ],
 )
 crate.annotation(

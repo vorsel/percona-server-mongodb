@@ -11,9 +11,10 @@
 #include "mongo/db/global_catalog/type_collection.h"
 #include "mongo/db/op_observer/op_observer_noop.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
+#include "mongo/db/read_concern_mongod_gen.h"
 #include "mongo/db/repl/oplog_entry.h"
-#include "mongo/db/shard_role/shard_catalog/collection_cache_recoverer.h"
 #include "mongo/db/shard_role/shard_catalog/collection_metadata.h"
+#include "mongo/db/shard_role/shard_catalog/collection_metadata_synchronizer.h"
 #include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
 #include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
 #include "mongo/db/shard_role/shard_catalog/type_oplog_catalog_metadata_gen.h"
@@ -26,6 +27,7 @@
 #include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/uuid.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
@@ -39,6 +41,7 @@ const NamespaceString kFromNss =
     NamespaceString::createNamespaceString_forTest("TestDB", "FromColl");
 const NamespaceString kToNss = NamespaceString::createNamespaceString_forTest("TestDB", "ToColl");
 const std::string kShardKey = "_id";
+const ShardId kCurrentShardId{"myShardName"};
 
 // Builds a point on the shard key, e.g. key(50) -> {_id: 50}. Accepts MINKEY/MAXKEY too.
 BSONObj key(const auto& value) {
@@ -145,7 +148,7 @@ CollectionAndChunksMetadata makeCollectionMetadata(const NamespaceString& nss, i
         auto min = i == 0 ? key(MINKEY) : key((i * 100));
         auto max = i == (nChunks - 1) ? key(MAXKEY) : key(((i + 1) * 100));
         auto range = ChunkRange(min, max);
-        auto& chunk = chunks.emplace_back(uuid, std::move(range), chunkVersion, ShardId("0"));
+        auto& chunk = chunks.emplace_back(uuid, std::move(range), chunkVersion, kCurrentShardId);
         chunk.setName(OID::gen());
         chunkVersion.incMajor();
     }
@@ -161,7 +164,7 @@ ChunkType makeChunk(const CollectionType& collType,
                     BSONObj min,
                     BSONObj max,
                     ChunkVersion version,
-                    ShardId shardId = ShardId("0")) {
+                    ShardId shardId = kCurrentShardId) {
     ChunkType chunk(collType.getUuid(),
                     ChunkRange(std::move(min), std::move(max)),
                     version,
@@ -182,10 +185,10 @@ std::vector<BSONObj> toConfigBSONVector(const std::vector<ChunkType>& chunks) {
 std::vector<ChunkType> makeSplitChunks(const CollectionType& collType, const ChunkType& chunk) {
     auto splitVersion = chunk.getVersion();
     splitVersion.incMajor();
-    auto splitFirst = makeChunk(collType, chunk.getMin(), key(50), splitVersion);
+    auto splitFirst = makeChunk(collType, chunk.getMin(), key(50), splitVersion, chunk.getShard());
 
     splitVersion.incMinor();
-    auto splitSecond = makeChunk(collType, key(50), chunk.getMax(), splitVersion);
+    auto splitSecond = makeChunk(collType, key(50), chunk.getMax(), splitVersion, chunk.getShard());
 
     return {std::move(splitFirst), std::move(splitSecond)};
 }
@@ -1795,27 +1798,82 @@ TEST_F(CommitCollectionMetadataLocallyTest, DropCollectionClearsCSR) {
     ASSERT_FALSE(metadata) << "CSR should have no metadata after drop";
 }
 
-TEST_F(CommitCollectionMetadataLocallyTest, CommitNotifiesInFlightRecoverer) {
+TEST_F(CommitCollectionMetadataLocallyTest, CommitNotifiesInFlightMetadataSynchronizer) {
     auto [collType, chunks] = makeCollectionMetadata(2);
     mockCatalogClient()->setCollectionMetadata(collType, chunks);
 
     shard_catalog_commit::commitCollectionMetadataLocally(operationContext(), kTestNss);
 
-    // Simulate a recovery round that has already read from disk and is waiting to drain.
-    auto recoverer = std::make_shared<CollectionCacheRecoverer>(
-        kTestNss, CancellationToken::uncancelable(), CollectionMetadata::UNTRACKED());
+    // Simulate an in-flight recovery round so the drop's invalidate is delivered to it.
+    // Use the sync disk-read path so this fixture does not need its own executor pool.
+    const auto originalTestingSnapshotBehaviorInIsolation = gTestingSnapshotBehaviorInIsolation;
+    ON_BLOCK_EXIT(
+        [&] { gTestingSnapshotBehaviorInIsolation = originalTestingSnapshotBehaviorInIsolation; });
+    gTestingSnapshotBehaviorInIsolation = true;
+
+    auto synchronizer = std::make_shared<CollectionMetadataSynchronizer>(
+        kTestNss, CancellationToken::uncancelable());
     {
         auto scopedCsr = CollectionShardingRuntime::acquireExclusive(operationContext(), kTestNss);
-        scopedCsr->setCollectionRecoverer(recoverer);
+        scopedCsr->setMetadataSynchronizer(synchronizer);
     }
-    auto roundId = recoverer->start(operationContext(), nullptr);
+    synchronizer->start(operationContext(), nullptr /* executor */);
+    ASSERT_OK(synchronizer->getMetadataFuture().getNoThrow(operationContext()));
 
-    // Drop the collection. This should notify the recoverer about the drop.
+    // Drop the collection. This should notify the synchronizer about the drop.
     shard_catalog_commit::commitDropCollectionLocally(
         operationContext(), kTestNss, collType.getUuid());
 
-    // The recoverer should force a new recovery instead of returning the metadata before the drop.
-    ASSERT_FALSE(recoverer->drainAndApply(operationContext(), roundId));
+    // The synchronizer should abort instead of returning metadata from before the drop.
+    ASSERT_FALSE(synchronizer->drainAndApply(operationContext()));
+}
+
+TEST_F(CommitCollectionMetadataLocallyTest,
+       CommitCollectionMetadataRestartsInFlightSynchronizerWithLatestDiskState) {
+    const auto originalTestingSnapshotBehaviorInIsolation = gTestingSnapshotBehaviorInIsolation;
+    ON_BLOCK_EXIT(
+        [&] { gTestingSnapshotBehaviorInIsolation = originalTestingSnapshotBehaviorInIsolation; });
+    gTestingSnapshotBehaviorInIsolation = true;
+
+    auto [collType, chunks] = makeCollectionMetadata(2);
+    mockCatalogClient()->setCollectionMetadata(collType, chunks);
+
+    // Persist the first catalog view locally. The synchronizer below reads this view before the
+    // commit replaces it with the newer global-catalog view.
+    shard_catalog_commit::commitCollectionMetadataLocally(operationContext(), kTestNss);
+
+    auto synchronizer = std::make_shared<CollectionMetadataSynchronizer>(
+        kTestNss, CancellationToken::uncancelable());
+    {
+        auto scopedCsr = CollectionShardingRuntime::acquireExclusive(operationContext(), kTestNss);
+        scopedCsr->setMetadataSynchronizer(synchronizer);
+    }
+    synchronizer->start(operationContext(), nullptr /* executor */);
+    ASSERT_OK(synchronizer->getMetadataFuture().getNoThrow(operationContext()));
+
+    // Bump the shard version by splitting one chunk and call commitCollectionMetadataLocally()
+    // accordingly.
+    auto updatedChunks = makeSplitChunks(collType, chunks[0]);
+    mockCatalogClient()->setCollectionMetadata(collType, updatedChunks);
+    shard_catalog_commit::commitCollectionMetadataLocally(operationContext(), kTestNss);
+
+    // The previous recovery should have been invalidated.
+    ASSERT_FALSE(synchronizer->drainAndApply(operationContext()));
+
+    // Next recovery trigger (new single-shot instance) will install the new metadata.
+    synchronizer = std::make_shared<CollectionMetadataSynchronizer>(
+        kTestNss, CancellationToken::uncancelable());
+    {
+        auto scopedCsr = CollectionShardingRuntime::acquireExclusive(operationContext(), kTestNss);
+        scopedCsr->setMetadataSynchronizer(nullptr);
+        scopedCsr->setMetadataSynchronizer(synchronizer);
+    }
+    synchronizer->start(operationContext(), nullptr /* executor */);
+    ASSERT_OK(synchronizer->getMetadataFuture().getNoThrow(operationContext()));
+
+    auto recoveredMetadata = synchronizer->drainAndApply(operationContext());
+    ASSERT_TRUE(recoveredMetadata);
+    ASSERT_EQ(recoveredMetadata->getShardPlacementVersion(), updatedChunks.back().getVersion());
 }
 
 TEST_F(CommitCollectionMetadataLocallyTest, DropCollectionIsNoOpOnEmptyCatalog) {
@@ -1841,7 +1899,7 @@ TEST_F(CommitCollectionMetadataLocallyTest, DropCollectionOnlyDeletesTargetColle
         ChunkType chunk(uuid,
                         ChunkRange(key(MINKEY), key(MAXKEY)),
                         ChunkVersion({epoch, ts}, {1, 0}),
-                        ShardId("0"));
+                        kCurrentShardId);
         chunk.setName(OID::gen());
         return CollectionAndChunksMetadata{std::move(coll), {std::move(chunk)}};
     }();
@@ -2334,6 +2392,40 @@ TEST_F(CommitCollectionMetadataLocallyTest, RenameUnownedNonPrimaryClearsTargetM
 
     auto scopedCsr = CollectionShardingRuntime::acquireShared(operationContext(), kToNss);
     ASSERT_FALSE(scopedCsr->getCurrentMetadataIfKnown());
+}
+
+TEST_F(CommitCollectionMetadataLocallyTest, InvalidateAllCollectionMetadataClearsAllCSRs) {
+    // Seed two collections and confirm each has installed metadata.
+    auto [collType1, chunks1] = makeCollectionMetadata(kTestNss, 2);
+    mockCatalogClient()->setCollectionMetadata(collType1, chunks1);
+    shard_catalog_commit::commitCollectionMetadataLocally(operationContext(), kTestNss);
+
+    const auto secondNss = NamespaceString::createNamespaceString_forTest("TestDB", "OtherColl");
+    createTestCollection(operationContext(), secondNss);
+    auto [collType2, chunks2] = makeCollectionMetadata(secondNss, 2);
+    mockCatalogClient()->setCollectionMetadata(collType2, chunks2);
+    shard_catalog_commit::commitCollectionMetadataLocally(operationContext(), secondNss);
+
+    ASSERT_TRUE(CollectionShardingRuntime::acquireShared(operationContext(), kTestNss)
+                    ->getCurrentMetadataIfKnown());
+    ASSERT_TRUE(CollectionShardingRuntime::acquireShared(operationContext(), secondNss)
+                    ->getCurrentMetadataIfKnown());
+
+    shard_catalog_commit::commitInvalidateAllCollectionMetadata(operationContext());
+
+    // Exactly one 'c' oplog entry with an `invalidateAllCollectionMetadata` field is emitted.
+    auto entries =
+        findLocalDocs(NamespaceString::kRsOplogNamespace,
+                      BSON("op" << "c"
+                                << "o.invalidateAllCollectionMetadata" << BSON("$exists" << true)));
+    ASSERT_EQ(entries.size(), 1u);
+
+    // Every CSR is cleared, but durable state is untouched.
+    ASSERT_FALSE(CollectionShardingRuntime::acquireShared(operationContext(), kTestNss)
+                     ->getCurrentMetadataIfKnown());
+    ASSERT_FALSE(CollectionShardingRuntime::acquireShared(operationContext(), secondNss)
+                     ->getCurrentMetadataIfKnown());
+    ASSERT_EQ(countLocalDocs(NamespaceString::kConfigShardCatalogCollectionsNamespace), 2);
 }
 
 }  // namespace

@@ -423,6 +423,12 @@ public:
      */
     void stopExpressionCounters();
 
+    /**
+     * Increments the memory-intensive expression counter and throws ExceededMemoryLimit if it
+     * exceeds internalQueryMaxMemoryIntensiveExpressions.
+     */
+    void checkAndIncrementMemoryIntensiveExprCount(std::string_view exprName);
+
     bool expressionCountersAreActive() const {
         return static_cast<bool>(_expressionCounters);
     }
@@ -731,6 +737,14 @@ public:
         _params.isParsingCollectionValidator = isParsingCollectionValidator;
     }
 
+    bool getIsReparsingRepresentativeQueryShape() const {
+        return _params.isReparsingRepresentativeQueryShape;
+    }
+
+    void setIsReparsingRepresentativeQueryShape(bool isReparsingRepresentativeQueryShape) {
+        _params.isReparsingRepresentativeQueryShape = isReparsingRepresentativeQueryShape;
+    }
+
     bool getIsProfileFilter() const {
         return _params.isProfileFilter;
     }
@@ -748,6 +762,17 @@ public:
             _expressionFallbackTracker.reset();
         }
         _params.excludeOperationMemoryTracking = excludeOperationMemoryTracking;
+    }
+
+    bool getExcludeExpressionFallbackFromOperationMemoryTracking() const {
+        return _params.excludeExpressionFallbackFromOperationMemoryTracking;
+    }
+
+    void setExcludeExpressionFallbackFromOperationMemoryTracking(bool exclude) {
+        if (_params.excludeExpressionFallbackFromOperationMemoryTracking != exclude) {
+            _expressionFallbackTracker.reset();
+        }
+        _params.excludeExpressionFallbackFromOperationMemoryTracking = exclude;
     }
 
     bool getExprUnstableForApiV1() const {
@@ -987,19 +1012,6 @@ public:
     }
 
     /**
-     * Sets the IDHACK eligibility flag. Used when an aggregation pipeline is converted to a
-     * find-style canonical query, since the flag cannot be computed at aggregation ExpCtx build
-     * time (the collection is not yet available).
-     *
-     * The flag may not be cleared once set. Downstream code (express path, SBE selection,
-     * index-catalog skip) may have already branched on it.
-     */
-    inline void setIsIdHackQuery(bool v) {
-        tassert(12310000, "isIdHackQuery may not be cleared once set", !_params.isIdHackQuery || v);
-        _params.isIdHackQuery = v;
-    }
-
-    /**
      * Returns if query contains encryption information as part of the request.
      */
     inline bool isFleQuery() const {
@@ -1231,6 +1243,9 @@ protected:
         bool isParsingViewDefinition = false;
         // True if this ExpressionContext is used to parse a collection validator expression.
         bool isParsingCollectionValidator = false;
+        // True if this ExpressionContext is used to re-parse an already-validated, server-stored
+        // query rather than a pipeline supplied directly by a client.
+        bool isReparsingRepresentativeQueryShape = false;
         // True if this ExpressionContext belongs to a profile filter. Like a collection validator,
         // a profile filter outlives the OperationContext it was parsed under.
         bool isProfileFilter = false;
@@ -1238,6 +1253,11 @@ protected:
         // not report to (or be bounded by) the operation-wide OperationMemoryUsageTracker.
         // Standalone per-stage and per-expression limits still apply.
         bool excludeOperationMemoryTracking = false;
+        // When true, the expression fallback tracker (see getExpressionFallbackTracker()) is not
+        // rolled up into the operation-wide OperationMemoryUsageTracker; it becomes a standalone
+        // tracker bounded only by the per-expression safety cap. Stage-level memory trackers are
+        // unaffected.
+        bool excludeExpressionFallbackFromOperationMemoryTracking = false;
         // These fields can be used in a context when API version validations were not enforced
         // during parse time (Example creating a view or validator), but needs to be enforce while
         // querying later.
@@ -1329,6 +1349,7 @@ protected:
             invariant(opCtx);
 
             opCtx->checkForInterrupt();
+            checkForQueryMemoryLoadShedding(opCtx);
             if (--_verySlowTick == 0) {
                 checkForInterruptVerySlow();
             }
@@ -1336,6 +1357,9 @@ protected:
 
         // Performs the work around checking for interrupt that can't be inlined.
         void checkForInterruptVerySlow();
+
+        // Evaluates the query-memory load-shed decision.
+        void checkForQueryMemoryLoadShedding(OperationContext* opCtx);
 
         static constexpr int32_t kInterruptCheckPeriod = 128;
         static constexpr int32_t kVerySlowInterruptCheckPeriod = 8;  // Runs every 1024 ticks
@@ -1403,6 +1427,7 @@ private:
     // Created lazily and reused across all documents/expressions in this query.
     boost::optional<SimpleMemoryUsageTracker> _expressionFallbackTracker;
 
+    uint32_t _memoryIntensiveExprCount = 0;
     bool _gotTemporarilyUnavailableException = false;
 
     bool _isCappedDelete = false;

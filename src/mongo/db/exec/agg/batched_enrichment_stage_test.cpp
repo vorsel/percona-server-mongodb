@@ -6,8 +6,11 @@
 #include "mongo/db/exec/agg/mock_stage.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/document_value/value.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
 #include "mongo/db/pipeline/change_stream_invalidation_info.h"
 #include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/await_data_state.h"
+#include "mongo/db/query/query_test_service_context.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/intrusive_counter.h"
@@ -30,16 +33,21 @@ public:
         : BatchedEnrichmentStage("$mockEnrich", expCtx, limits) {}
 
     // The transform applied to each data event in enrich(). Defaults to tagging it 'enriched:
-    // true'.
-    std::function<Document(Document)> enrichFn = [](Document d) {
+    // true'. Returning boost::none drops the event.
+    std::function<boost::optional<Document>(Document)> enrichFn = [](Document d) {
         MutableDocument md(std::move(d));
         md.addField("enriched", Value(true));
         return md.freeze();
     };
 
+    // Optional output cap: when set, its return value is the remaining emit budget (boost::none =
+    // unbounded, 0 = stop). Drives both the fill cap and the stop condition.
+    std::function<boost::optional<size_t>()> remainingFn;
+
     int beginCalls = 0;
     int closeCalls = 0;
     int enrichCalls = 0;
+    int exhaustedCalls = 0;
     bool scopeOpen = false;
 
 protected:
@@ -53,10 +61,16 @@ protected:
         scopeOpen = false;
         ++closeCalls;
     }
-    Document enrich(Document event) override {
+    boost::optional<Document> enrich(Document event) override {
         ASSERT_TRUE(scopeOpen) << "enrich() called outside an open scope";
         ++enrichCalls;
         return enrichFn(std::move(event));
+    }
+    boost::optional<size_t> remainingDocumentsToEmit() const override {
+        return remainingFn ? remainingFn() : boost::none;
+    }
+    void onExhausted() override {
+        ++exhaustedCalls;
     }
 };
 
@@ -186,6 +200,44 @@ TEST_F(BatchedEnrichmentStageTest, MaxEventsOfOneEnrichesEachEventInItsOwnScope)
     ASSERT_EQ(stage->beginCalls, 3);
     ASSERT_EQ(stage->closeCalls, 3);
     ASSERT_EQ(stage->enrichCalls, 3);
+}
+
+TEST_F(BatchedEnrichmentStageTest, AwaitingInsertsFlushesFirstEventThenBatchesOnceFlagClears) {
+    // Models the real getMore lifecycle. Entering the batch, 'shouldWaitForInserts' is set: the
+    // stage must not accumulate: each buffered event has to reach the top of the pipeline so
+    // getMore can observe it and clear the flag, mirroring what CursorStage does one stage lower.
+    // Otherwise the fill would block on the insert notifier until 'maxInputEvents' events arrive,
+    // turning per-event latency into per-batch latency. getMore then clears the flag the moment it
+    // delivers that first event, so the events still available are batched normally from there on.
+    auto source = MockStage::createForTest(
+        std::vector<Document>{dataEvent(1), dataEvent(2), dataEvent(3)}, _expCtx);
+    auto stage = makeStage(std::move(source), looseLimits());
+    awaitDataState(_expCtx->getOperationContext()).shouldWaitForInserts = true;
+
+    // First getNext: despite batchSize of 100, the guard stops the fill after one event, so it is
+    // enriched alone in its own scope. Contrast EnrichesAllEventsInArrivalOrderInOneScope (flag
+    // unset), where the identical input enriches all three under a single scope on this call.
+    auto first = stage->getNext();
+    ASSERT_TRUE(first.isAdvanced());
+    ASSERT_EQ(first.getDocument()["_id"].getInt(), 1);
+    ASSERT_TRUE(first.getDocument()["enriched"].getBool());
+    ASSERT_EQ(stage->enrichCalls, 1);
+    ASSERT_EQ(stage->beginCalls, 1);
+
+    // getMore clears the flag once the first event has been delivered.
+    awaitDataState(_expCtx->getOperationContext()).shouldWaitForInserts = false;
+
+    // The two remaining events are now batched together under a single scope.
+    auto out = drainToEOF(*stage);
+    ASSERT_EQ(out.size(), 2u);
+    ASSERT_EQ(out[0].getDocument()["_id"].getInt(), 2);
+    ASSERT_EQ(out[1].getDocument()["_id"].getInt(), 3);
+
+    // Three events enriched total, across two scopes: one for the awaited first event, then one for
+    // the batched remainder.
+    ASSERT_EQ(stage->enrichCalls, 3);
+    ASSERT_EQ(stage->beginCalls, 2);
+    ASSERT_EQ(stage->closeCalls, 2);
 }
 
 TEST_F(BatchedEnrichmentStageTest, MaxInputBytesStopsFillButAlwaysAdmitsAtLeastOneEvent) {
@@ -402,7 +454,7 @@ TEST_F(BatchedEnrichmentStageTest, EnrichThrowClosesScopeAndPropagates) {
     auto source =
         MockStage::createForTest(std::vector<Document>{dataEvent(1), dataEvent(2)}, _expCtx);
     auto stage = makeStage(std::move(source), looseLimits());
-    stage->enrichFn = [](Document) -> Document {
+    stage->enrichFn = [](Document) -> boost::optional<Document> {
         uasserted(ErrorCodes::InternalError, "simulated enrich failure");
     };
 
@@ -449,6 +501,88 @@ TEST_F(BatchedEnrichmentStageTest, BufferedMemoryIsTrackedAndReturnsToZeroWhenDr
     ASSERT_EQ(stage->beginCalls, 1);
     ASSERT_EQ(stage->closeCalls, 1);
     ASSERT_EQ(stage->enrichCalls, 3);
+}
+
+TEST_F(BatchedEnrichmentStageTest, MemoryTrackerRebindsToNewOperationAcrossGetMoreOpCtxSwap) {
+    // Regression test for the getMore crash that reverted the reland: the stage's memory tracker
+    // kept its base pointed at the first operation's memory tracker, which dangled once that
+    // operation context was destroyed at the end of a getMore. On the multi-cursor $$SEARCH_META
+    // path the operation tracker is NOT carried across the swap (unlike a ClientCursorPin cursor),
+    // so the next add() through the stale base wrote into freed memory and crashed. detach()/
+    // reattach() must drop the base before the old operation dies and re-bind to the new one.
+    //
+    // This test buffers events under one operation, destroys it, reattaches to a fresh operation,
+    // and finishes draining -- asserting the accounting follows the new operation and nothing
+    // dangles. Requires featureFlagQueryMemoryTracking (default-on, not FCV-gated) so a base
+    // operation tracker exists at all.
+    QueryTestServiceContext serviceContext;
+
+    // Pre-declare the second operation context so it outlives 'stage' at scope exit; the tracker
+    // holds a non-owning base pointer, so the operation tracker must not be freed before the stage.
+    ServiceContext::UniqueOperationContext opCtxB;
+
+    auto opCtxA = serviceContext.makeOperationContext();
+    auto expCtx = make_intrusive<ExpressionContextForTest>(opCtxA.get());
+    auto source = MockStage::createForTest(
+        std::vector<Document>{dataEvent(1), dataEvent(2), dataEvent(3)}, expCtx);
+    auto stage = make_intrusive<EnrichmentStageMock>(expCtx, looseLimits());
+    MockStage::setSource_forTest(stage, source.get());
+    _source = source;  // keep the source alive for the stage's lifetime
+
+    // Emit one event: the loose caps enrich all three in one window, so two stay buffered and the
+    // tracked bytes roll up onto opCtxA's operation memory tracker.
+    auto first = stage->getNext();
+    ASSERT_TRUE(first.isAdvanced());
+    ASSERT_EQ(first.getDocument()["_id"].getInt(), 1);
+    const int64_t buffered = stage->bufferedMemoryBytes_forTest();
+    ASSERT_GT(buffered, 0);
+    ASSERT_TRUE(OperationMemoryUsageTracker::hasTrackerOnOpCtx(opCtxA.get()));
+    {
+        // The first operation's tracker reflects the buffered bytes. Peeking by moving it off and
+        // back does not disturb the stage's base, which points at the same object.
+        auto opTrackerA = OperationMemoryUsageTracker::detachFromOpCtxIfAvailable(opCtxA.get());
+        ASSERT_TRUE(opTrackerA);
+        ASSERT_EQ(opTrackerA->inUseTrackedMemoryBytes(), buffered);
+        OperationMemoryUsageTracker::attachToOpCtxIfAvailable(opCtxA.get(), std::move(opTrackerA));
+    }
+
+    // The getMore boundary: detach, then destroy the first operation context (and with it its
+    // operation memory tracker). Pre-fix the stage's tracker base still pointed here.
+    stage->detachFromOperationContext();
+    opCtxA.reset();
+
+    // Reattach to a brand-new operation, as the $search results pipeline does on the next getMore.
+    opCtxB = serviceContext.makeOperationContext();
+    expCtx->setOperationContext(opCtxB.get());
+    stage->reattachToOperationContext(opCtxB.get());
+
+    // Accounting followed the swap: the buffered bytes are unchanged and now roll up onto the new
+    // operation's tracker, not the destroyed one.
+    ASSERT_EQ(stage->bufferedMemoryBytes_forTest(), buffered);
+    ASSERT_TRUE(OperationMemoryUsageTracker::hasTrackerOnOpCtx(opCtxB.get()));
+    {
+        auto opTrackerB = OperationMemoryUsageTracker::detachFromOpCtxIfAvailable(opCtxB.get());
+        ASSERT_TRUE(opTrackerB);
+        ASSERT_EQ(opTrackerB->inUseTrackedMemoryBytes(), buffered);
+        OperationMemoryUsageTracker::attachToOpCtxIfAvailable(opCtxB.get(), std::move(opTrackerB));
+    }
+
+    // Draining touches the (rebound) tracker on every pop; pre-fix that wrote through a dangling
+    // base into freed memory. It must finish cleanly, return the remaining events in order, and
+    // settle back to zero.
+    int expectedId = 2;
+    int emitted = 1;
+    while (true) {
+        auto next = stage->getNext();
+        if (next.isEOF()) {
+            break;
+        }
+        ASSERT_TRUE(next.isAdvanced());
+        ASSERT_EQ(next.getDocument()["_id"].getInt(), expectedId++);
+        ++emitted;
+    }
+    ASSERT_EQ(emitted, 3);
+    ASSERT_EQ(stage->bufferedMemoryBytes_forTest(), 0);
 }
 
 TEST_F(BatchedEnrichmentStageTest,
@@ -554,6 +688,121 @@ TEST_F(BatchedEnrichmentStageTest, InterruptIsCheckedAndPropagates) {
     // exact counts depend on interrupt timing, but begin/close must balance).
     ASSERT_FALSE(stage->scopeOpen);
     ASSERT_EQ(stage->beginCalls, stage->closeCalls);
+}
+
+TEST_F(BatchedEnrichmentStageTest, DroppedEventsAreNotEmitted) {
+    auto source = MockStage::createForTest(
+        std::vector<Document>{dataEvent(0), dataEvent(1), dataEvent(2), dataEvent(3)}, _expCtx);
+    auto stage = makeStage(std::move(source), looseLimits());
+    // Drop odd _ids by returning boost::none; even _ids pass through.
+    stage->enrichFn = [](Document d) -> boost::optional<Document> {
+        if (d["_id"].getInt() % 2 != 0) {
+            return boost::none;
+        }
+        return d;
+    };
+
+    auto out = drainToEOF(*stage);
+
+    ASSERT_EQ(out.size(), 2u);
+    ASSERT_EQ(out[0].getDocument()["_id"].getInt(), 0);
+    ASSERT_EQ(out[1].getDocument()["_id"].getInt(), 2);
+    // All four entered enrich (two dropped) under a single scope.
+    ASSERT_EQ(stage->enrichCalls, 4);
+    ASSERT_EQ(stage->beginCalls, 1);
+    ASSERT_EQ(stage->closeCalls, 1);
+}
+
+TEST_F(BatchedEnrichmentStageTest, WholeWindowDroppedInOneFillReturnsEOF) {
+    auto source = MockStage::createForTest(
+        std::vector<Document>{dataEvent(1), dataEvent(2), dataEvent(3)}, _expCtx);
+    auto stage = makeStage(std::move(source), looseLimits());
+    stage->enrichFn = [](Document) -> boost::optional<Document> {
+        return boost::none;
+    };
+
+    auto out = drainToEOF(*stage);
+
+    ASSERT_TRUE(out.empty());
+    // One window enriched (and dropped) all three, opened/closed once, then EOF surfaced.
+    ASSERT_EQ(stage->enrichCalls, 3);
+    ASSERT_EQ(stage->beginCalls, 1);
+    ASSERT_EQ(stage->closeCalls, 1);
+    ASSERT_GTE(stage->exhaustedCalls, 1);
+}
+
+TEST_F(BatchedEnrichmentStageTest, WholeWindowDroppedAcrossFillsRefillsUntilEOF) {
+    auto source = MockStage::createForTest(
+        std::vector<Document>{dataEvent(1), dataEvent(2), dataEvent(3)}, _expCtx);
+    auto limits = looseLimits();
+    limits.maxInputEvents = 1;  // one event per fill -> a separate window each
+    auto stage = makeStage(std::move(source), limits);
+    stage->enrichFn = [](Document) -> boost::optional<Document> {
+        return boost::none;
+    };
+
+    auto out = drainToEOF(*stage);
+
+    ASSERT_TRUE(out.empty());
+    // Each event fills+enriches(drops) in its own window; doGetNext() loops and refills until EOF.
+    ASSERT_EQ(stage->enrichCalls, 3);
+    ASSERT_EQ(stage->beginCalls, 3);
+    ASSERT_EQ(stage->closeCalls, 3);
+}
+
+TEST_F(BatchedEnrichmentStageTest, EmitBudgetStopsAtCapAndDoesNotOverPullUpstream) {
+    auto source = MockStage::createForTest(
+        std::vector<Document>{dataEvent(1), dataEvent(2), dataEvent(3), dataEvent(4), dataEvent(5)},
+        _expCtx);
+    auto stage = makeStage(std::move(source), looseLimits());
+    int emitted = 0;
+    stage->enrichFn = [&](Document d) -> boost::optional<Document> {
+        ++emitted;
+        return d;
+    };
+    // Budget of 2: allow two emits, then stop. The remaining allowance also caps the fill.
+    stage->remainingFn = [&]() -> boost::optional<size_t> {
+        return emitted >= 2 ? 0u : static_cast<size_t>(2 - emitted);
+    };
+
+    auto out = drainToEOF(*stage);
+
+    ASSERT_EQ(out.size(), 2u);
+    ASSERT_EQ(out[0].getDocument()["_id"].getInt(), 1);
+    ASSERT_EQ(out[1].getDocument()["_id"].getInt(), 2);
+    // The budget caps the fill, so only 2 events are pulled and enriched; 3,4,5 are never pulled
+    // from upstream (they remain queued in the source), not pulled-then-discarded.
+    ASSERT_EQ(stage->enrichCalls, 2);
+    ASSERT_EQ(_source->size(), 3u);
+    ASSERT_GTE(stage->exhaustedCalls, 1);
+    ASSERT_FALSE(stage->scopeOpen);
+}
+
+TEST_F(BatchedEnrichmentStageTest, ZeroEmitBudgetAtStartReturnsEOFWithoutFillingOrEnriching) {
+    auto source =
+        MockStage::createForTest(std::vector<Document>{dataEvent(1), dataEvent(2)}, _expCtx);
+    auto stage = makeStage(std::move(source), looseLimits());
+    stage->remainingFn = []() -> boost::optional<size_t> {
+        return 0u;
+    };
+
+    ASSERT_TRUE(stage->getNext().isEOF());
+    // Capped before any fill: nothing pulled, no scope opened, no event enriched.
+    ASSERT_EQ(stage->enrichCalls, 0);
+    ASSERT_EQ(stage->beginCalls, 0);
+    ASSERT_GTE(stage->exhaustedCalls, 1);
+    ASSERT_FALSE(stage->scopeOpen);
+}
+
+TEST_F(BatchedEnrichmentStageTest, OnExhaustedFiresWhenUpstreamReachesEOF) {
+    auto source =
+        MockStage::createForTest(std::vector<Document>{dataEvent(1), dataEvent(2)}, _expCtx);
+    auto stage = makeStage(std::move(source), looseLimits());
+
+    auto out = drainToEOF(*stage);
+
+    ASSERT_EQ(out.size(), 2u);
+    ASSERT_GTE(stage->exhaustedCalls, 1);
 }
 
 }  // namespace

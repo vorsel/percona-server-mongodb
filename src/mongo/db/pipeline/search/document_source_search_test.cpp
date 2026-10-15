@@ -11,6 +11,7 @@
 #include "mongo/db/pipeline/document_source_add_fields.h"
 #include "mongo/db/pipeline/document_source_internal_document_results_and_metadata.h"
 #include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
 #include "mongo/db/pipeline/lite_parsed_document_source.h"
 #include "mongo/db/pipeline/pipeline.h"
 #include "mongo/db/pipeline/search/document_source_internal_search_id_lookup.h"
@@ -20,6 +21,7 @@
 #include "mongo/db/query/query_feature_flags_gen.h"
 #include "mongo/db/query/search/mongot_options.h"
 #include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
+#include "mongo/transport/mock_session.h"
 #include "mongo/unittest/death_test.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -34,6 +36,24 @@ namespace {
 using boost::intrusive_ptr;
 using std::list;
 using std::vector;
+
+// One spec per internal-only field. Used by both the external-client rejection test and the
+// internal-client acceptance test so the two stay in lock-step as fields are added.
+static const std::vector<std::pair<std::string, std::string>> kInternalSearchFieldCases = {
+    {"mongotQuery",
+     R"({$search: {mongotQuery: {index: "default", text: {query: "hello", path: "body"}}}})"},
+    {"mergingPipeline",
+     R"({$search: {mergingPipeline: [{$lookup: {from: "secret", as: "leak", pipeline: []}}]}})"},
+    {"metadataMergeProtocolVersion", R"({$search: {metadataMergeProtocolVersion: 1}})"},
+    {"requiresSearchSequenceToken", R"({$search: {requiresSearchSequenceToken: true}})"},
+    {"requiresSearchMetaCursor", R"({$search: {requiresSearchMetaCursor: true}})"},
+    {"view",
+     R"({$search: {view: {name: "secretView", effectivePipeline: [{$match: {leaked: true}}]}}})"},
+    {"limit", R"({$search: {limit: 100}})"},
+    {"sortSpec", R"({$search: {sortSpec: {field: 1}}})"},
+    {"mongotDocsRequested", R"({$search: {mongotDocsRequested: 50}})"},
+    {"docsNeededBounds", R"({$search: {docsNeededBounds: {minBounds: 1, maxBounds: 100}}})"},
+};
 
 class SearchTest : service_context_test::WithSetupTransportLayer,
                    public AggregationContextFixture {};
@@ -292,6 +312,114 @@ TEST_F(SearchTest,
         expCtx, nonExtensionStage, boost::none)};
     auto pipeline = Pipeline::create(std::move(stages), expCtx);
     ASSERT_FALSE(search_helpers::isExtensionMongotPipeline(pipeline.get()));
+}
+
+// Each internal routing field must be individually rejected when supplied by an external client.
+TEST_F(SearchTest, ExternalClientCannotSupplyInternalSearchFields) {
+    auto session = transport::MockSession::create(nullptr);
+    auto externalClient = getServiceContext()->getService()->makeClient("externalClient", session);
+    auto externalOpCtx = externalClient->makeOperationContext();
+
+    auto nss = getExpCtx()->getNamespaceString();
+    for (const auto& [fieldName, specJson] : kInternalSearchFieldCases) {
+        SCOPED_TRACE(fieldName);
+        const auto specBson = fromjson(specJson);
+        auto lpds = SearchLiteParsed::parse(nss, specBson.firstElement(), LiteParserOptions{});
+        ASSERT_THROWS_CODE(lpds->validate(externalOpCtx.get()), AssertionException, 5491300);
+    }
+}
+
+// Internal clients (no transport session) must still be able to supply internal routing fields,
+// since they are set by the router during sharded search planning. Iterates the same case list
+// as the external-client test so the two stay in sync.
+TEST_F(SearchTest, InternalClientCanSupplyInternalSearchFields) {
+    // The default test client has no transport session and is treated as internal.
+    auto opCtx = getExpCtx()->getOperationContext();
+    auto nss = getExpCtx()->getNamespaceString();
+
+    for (const auto& [fieldName, specJson] : kInternalSearchFieldCases) {
+        SCOPED_TRACE(fieldName);
+        const auto specBson = fromjson(specJson);
+        auto lpds = SearchLiteParsed::parse(nss, specBson.firstElement(), LiteParserOptions{});
+        ASSERT_DOES_NOT_THROW(lpds->validate(opCtx));
+    }
+}
+
+// createFromBson must accept a spec already in its serialized internal ('mongotQuery') form;
+// validation of those fields belongs to the LiteParse layer.
+TEST_F(SearchTest, CreateFromBsonAcceptsSerializedInternalSpec) {
+    auto expCtx = getExpCtx();
+    expCtx->setMongoProcessInterface(std::make_unique<MockMongoInterface>());
+
+    const auto serializedSpec = fromjson(R"({
+        $search: {
+            mongotQuery: {index: "default", text: {query: "hello", path: "body"}, count: {type: "total"}},
+            metadataMergeProtocolVersion: 1,
+            mergingPipeline: []
+        }
+    })");
+
+    ASSERT_DOES_NOT_THROW(
+        DocumentSourceSearch::createFromBson(serializedSpec.firstElement(), expCtx));
+}
+
+TEST_F(SearchTest, SerializeAnonymizesMongotQueryForQueryStats) {
+    const auto mongotQuery = fromjson("{index: 'default', text: {query: 'cakes', path: 'title'}}");
+    const auto stageObj = BSON("$search" << mongotQuery);
+
+    auto expCtx = getExpCtx();
+    expCtx->setMongoProcessInterface(std::make_unique<MockMongoInterface>());
+
+    intrusive_ptr<DocumentSource> searchDS =
+        DocumentSourceSearch::createFromBson(stageObj.firstElement(), expCtx);
+
+    const auto anonymized = Document({{"$search", Value(std::string{"?object"})}});
+
+    // Query stats must collapse the whole query to a single anonymized object, regardless of
+    // topology.
+    expCtx->setInRouter(false);
+    ASSERT_DOCUMENT_EQ(
+        searchDS->serialize(query_shape::SerializationOptions::kDebugQueryShapeSerializeOptions)
+            .getDocument(),
+        anonymized);
+
+    expCtx->setInRouter(true);
+    ASSERT_DOCUMENT_EQ(
+        searchDS->serialize(query_shape::SerializationOptions::kDebugQueryShapeSerializeOptions)
+            .getDocument(),
+        anonymized);
+}
+
+TEST_F(SearchTest, SerializeForExplainEmitsFullSpecOnlyOnRouter) {
+    const auto mongotQuery = fromjson("{index: 'default', text: {query: 'cakes', path: 'title'}}");
+    const auto stageObj = BSON("$search" << mongotQuery);
+
+    auto expCtx = getExpCtx();
+    expCtx->setMongoProcessInterface(std::make_unique<MockMongoInterface>());
+
+    intrusive_ptr<DocumentSource> searchDS =
+        DocumentSourceSearch::createFromBson(stageObj.firstElement(), expCtx);
+
+    query_shape::SerializationOptions opts;
+    opts.verbosity = ExplainOptions::Verbosity::kQueryPlanner;
+
+    // On a shard, explain only needs the mongotQuery, so the $search value is just the user query.
+    expCtx->setInRouter(false);
+    auto onShard = searchDS->serialize(opts);
+    ASSERT_DOCUMENT_EQ(onShard.getDocument(), Document({{"$search", Document(mongotQuery)}}));
+
+    // On a router, explain emits the full spec so the internal routing fields reach the shards.
+    expCtx->setInRouter(true);
+    auto onRouter = searchDS->serialize(opts);
+    ASSERT_DOCUMENT_EQ(onRouter.getDocument(),
+                       searchDS->serialize(query_shape::SerializationOptions{}).getDocument());
+    ASSERT_DOCUMENT_NE(onRouter.getDocument(), onShard.getDocument());
+    ASSERT_DOCUMENT_EQ(onRouter.getDocument()
+                           .getField("$search")
+                           .getDocument()
+                           .getField("mongotQuery")
+                           .getDocument(),
+                       Document(mongotQuery));
 }
 
 }  // namespace

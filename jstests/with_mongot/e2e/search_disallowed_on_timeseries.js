@@ -140,12 +140,24 @@ assert.commandWorked(bulk.execute());
                 },
             },
         ],
+        [
+            {
+                $unionWith: {
+                    coll: searchView,
+                    pipeline: [{$match: {}}],
+                },
+            },
+        ],
     ];
     subPipelines.forEach((pipeline) => {
         assert.commandFailedWithCode(
             nonTSColl.runCommand("aggregate", {pipeline: pipeline, cursor: {}}),
             // TODO SERVER-121094 Delete code 10557302 once we only validate in LPP.
-            [10557302, 12093200, 10623000, 40602],
+            // 65180 is the extension $search's "view definition is incompatible with Atlas
+            // Search" error, surfaced when the view resolution runs through the extension path.
+            // 13130801 is the $lookup/$graphLookup/$unionWith rejection when their foreign
+            // namespace is a search view over a timeseries collection.
+            [10557302, 12093200, 10623000, 40602, 65180, 13130801],
             `Expected failure for pipeline: ${tojson(pipeline)}`,
         );
     });

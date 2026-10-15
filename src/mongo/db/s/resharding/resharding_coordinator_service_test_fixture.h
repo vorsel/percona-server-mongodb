@@ -7,6 +7,7 @@
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobj.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/feature_compatibility_version_document_gen.h"
 #include "mongo/db/global_catalog/type_chunk.h"
 #include "mongo/db/global_catalog/type_collection.h"
 #include "mongo/db/op_observer/op_observer_registry.h"
@@ -114,6 +115,10 @@ public:
     void pushSearchIndexError(ErrorCodes::Error errorCode) {
         _searchIndexResults.push_back(
             Status{errorCode, "Failing call to searchIndexExistsForCollection"});
+    }
+
+    void pushResumeMigrationsError(ErrorCodes::Error errorCode) {
+        _resumeMigrationsErrors.push_back(errorCode);
     }
 
     void tellAllDonorsToRefresh(OperationContext* opCtx,
@@ -287,9 +292,14 @@ public:
 
     void resumeMigrations(OperationContext* opCtx,
                           const NamespaceString& nss,
-                          const UUID&,
                           ReshardingAuthoritativeMetadataAccessLevelEnum,
                           std::function<OperationSessionInfo()>) override {
+        if (!_resumeMigrationsErrors.empty()) {
+            auto errorCode = _resumeMigrationsErrors.front();
+            _resumeMigrationsErrors.erase(_resumeMigrationsErrors.begin());
+            uasserted(errorCode, "Simulating resumeMigrations failure");
+        }
+
         DBDirectClient client(opCtx);
         client.update(NamespaceString::kConfigsvrCollectionsNamespace,
                       BSON(CollectionType::kNssFieldName << NamespaceStringUtil::serialize(
@@ -348,6 +358,8 @@ private:
 
     std::vector<StatusWith<bool>> _searchIndexResults;
     bool _searchIndexDefaultResult{false};
+
+    std::vector<ErrorCodes::Error> _resumeMigrationsErrors;
 
     CoordinatorStateEnum _getCurrentPhaseOnDisk(OperationContext* opCtx) {
         DBDirectClient client(opCtx);
@@ -469,6 +481,14 @@ public:
 
     void setUp() override {
         ConfigServerTestFixture::setUp();
+
+        // Creating a resharding coordinator checks whether an FCV transition is in progress, which
+        // requires a global FCV document to be set.
+        // TODO(SERVER-131381): Review/rework this logic to avoid relying on FCV internals
+        FeatureCompatibilityVersionDocument fcvDoc;
+        // (Generic FCV reference): Required test only setup.
+        fcvDoc.setVersion(multiversion::GenericFCV::kLatest);
+        serverGlobalParams.mutableFCV.setVersionFromFCVDocument(fcvDoc);
 
         std::vector<ShardType> shards;
         for (const auto& id : getShardIds()) {

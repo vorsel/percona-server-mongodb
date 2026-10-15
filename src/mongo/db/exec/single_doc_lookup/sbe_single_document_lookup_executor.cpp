@@ -47,11 +47,8 @@ std::unique_ptr<CanonicalQuery> buildCanonicalQuery(OperationContext* opCtx,
     auto findCmd = std::make_unique<FindCommandRequest>(nss);
     findCmd->setFilter(filter);
 
-    // Clear the IDHACK flag that ExpressionContextBuilder auto-sets for an '{_id: X}' filter, so
-    // the planner enumerates indexes (and produces the index-aware SBE plan).
     auto cq = std::make_unique<CanonicalQuery>(CanonicalQueryParams{
-        .expCtx =
-            ExpressionContextBuilder{}.fromRequest(opCtx, *findCmd).isIdHackQuery(false).build(),
+        .expCtx = ExpressionContextBuilder{}.fromRequest(opCtx, *findCmd).build(),
         .parsedFind = ParsedFindCommandParams{std::move(findCmd)},
     });
 
@@ -244,7 +241,20 @@ SbeSingleDocumentLookupExecutor::PreparedExecutor::make(OperationContext* opCtx,
         .canonicalQuery = *cq,
         .collections = collections,
         .plannerOptions = plannerOptions,
+        // The planner should enumerate indexes (and produces the index-aware SBE plan) even if the
+        // IDHACK path is eligible.
+        .alwaysFillOutCollectionInfo = true,
     });
+
+    if (applyShardFilter) {
+        // The QueryPlannerParams constructor above runs requiresShardFiltering(), which drops
+        // INCLUDE_SHARD_FILTER when the query fully targets one shard by its shard key -- valid
+        // only because a shard can't own orphans in its own ranges. That fails here: mongot's
+        // index also yields orphan _ids, so an _id equality on an _id-sharded collection would
+        // skip filtering. Re-apply the option so the filter is always planned.
+        plannerParams.mainCollectionInfo.options |= QueryPlannerParams::INCLUDE_SHARD_FILTER;
+        plannerParams.shardKey = coll.getCollectionPtr().getShardKeyPattern().toBSON();
+    }
     auto solutions = uassertStatusOK(QueryPlanner::plan(*cq, plannerParams));
     if (solutions.empty()) {
         return boost::none;

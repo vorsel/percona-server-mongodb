@@ -3,6 +3,7 @@
 
 #include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/global_catalog/type_chunk.h"
 #include "mongo/db/global_catalog/type_collection.h"
@@ -97,9 +98,11 @@ public:
         meta.setStartTime(getServiceContext()->getFastClockSource()->now());
         meta.setProvenance(GetParam());
 
+        const auto fcvSnapshot = serverGlobalParams.featureCompatibility.acquireFCVSnapshot();
+        meta.setStartingFCV(fcvSnapshot.getVersion());
+
         ForwardableOperationMetadata fom;
-        fom.setVersionContext(
-            VersionContext{serverGlobalParams.featureCompatibility.acquireFCVSnapshot()});
+        fom.setVersionContext(VersionContext{fcvSnapshot});
         meta.setForwardableOpMetadata(std::move(fom));
 
         ReshardingCoordinatorDocument doc(CoordinatorStateEnum::kUnused, donors, recipients);
@@ -214,7 +217,8 @@ TEST_P(ReshardingCoordinatorServiceProvenanceTest, FullLifecycleSucceeds) {
     auto presetChunks = seedSourceChunksAndComputeReshardedChunks();
     doc.setPresetReshardedChunks(presetChunks);
 
-    auto coordinator = ReshardingCoordinator::getOrCreate(opCtx, _service, doc.toBSON());
+    auto coordinator =
+        ReshardingCoordinator::getOrCreate(opCtx, _service, doc.toBSON(), FixedFCVRegion{opCtx});
 
     waitUntilCommittedCoordinatorDocReach(opCtx, CoordinatorStateEnum::kPreparingToDonate);
     if (sourceMigrationsAreBlocked()) {

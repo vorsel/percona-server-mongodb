@@ -3,7 +3,11 @@
 
 #include "mongo/db/admission/rate_limiter.h"
 
+#include "mongo/bson/bsonelement.h"
+#include "mongo/bson/bsonobj.h"
+#include "mongo/db/admission/ticketing/admission_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/duration.h"
 #include "mongo/util/scopeguard.h"
 
@@ -163,6 +167,10 @@ public:
                      static_cast<long double>(readScopedTokenBucket().available(nowInSeconds()))));
     }
 
+    TickSource* tickSource() const {
+        return _tickSource;
+    }
+
 private:
     WriteRarelyRWMutex _rwMutex;
     TickSource* _tickSource;
@@ -170,10 +178,15 @@ private:
 };
 
 RateLimiter::DeferredToken::DeferredToken(RateLimiterPrivate* impl,
+                                          AdmissionContext* admCtx,
                                           double numTokens,
                                           Milliseconds timeEnqueued,
                                           Milliseconds napTime)
-    : _impl(impl), _numTokens(numTokens), _timeEnqueued(timeEnqueued), _napTime(napTime) {}
+    : _impl(impl),
+      _admCtx(admCtx),
+      _numTokens(numTokens),
+      _timeEnqueued(timeEnqueued),
+      _napTime(napTime) {}
 
 
 RateLimiter::DeferredToken::~DeferredToken() {
@@ -186,7 +199,19 @@ RateLimiter::DeferredToken::~DeferredToken() {
     _impl->metricsRecorder->record(RemovedFromQueue{});
 }
 
-Status RateLimiter::DeferredToken::get(OperationContext* opCtx) && {
+Status RateLimiter::DeferredToken::get(OperationContext* opCtx, AdmissionContext* admCtx) && {
+    invariant(_impl);
+    tassert(10550201,
+            "an admission context was bound to this token when its slot was reserved",
+            !admCtx || !_admCtx);
+    if (admCtx) {
+        _admCtx = admCtx;
+    }
+
+    return std::move(*this).get(opCtx, opCtx->getServiceContext()->getPreciseClockSource());
+}
+
+Status RateLimiter::DeferredToken::get(Interruptible* interruptible, ClockSource* clockSrc) && {
     invariant(_impl);
 
     if (isReady()) {
@@ -197,10 +222,25 @@ Status RateLimiter::DeferredToken::get(OperationContext* opCtx) && {
     }
 
     auto* impl = std::exchange(_impl, nullptr);
+    auto* tickSource = impl->tickSource();
+    boost::optional<WaitingForAdmissionGuard> admissionGuard;
+    if (_admCtx) {
+        admissionGuard.emplace(_admCtx, tickSource);
+    }
 
-    ON_BLOCK_EXIT([impl] {
+    const auto queuedBefore = _admCtx ? _admCtx->totalTimeQueuedMicros() : Microseconds{0};
+    const auto startTicks = tickSource->getTicks();
+    ON_BLOCK_EXIT([&] {
         impl->metricsRecorder->record(RemovedFromQueue{});
         impl->queued.fetchAndSubtract(1);
+
+        // Retiring the guard is what accumulates this wait onto the admission context, so it has
+        // to happen before the context can be read back.
+        admissionGuard.reset();
+        const auto queued = _admCtx
+            ? _admCtx->totalTimeQueuedMicros() - queuedBefore
+            : tickSource->ticksTo<Microseconds>(tickSource->getTicks() - startTicks);
+        impl->metricsRecorder->record(TimeQueuedMicros{durationCount<Microseconds>(queued)});
     });
 
     // The system can wait arbitrarily long between acquiring a deferred token and calling get() on
@@ -214,14 +254,14 @@ Status RateLimiter::DeferredToken::get(OperationContext* opCtx) && {
         return Status::OK();
     }
 
-    Date_t deadline = opCtx->getServiceContext()->getPreciseClockSource()->now() + adjustedNapTime;
+    Date_t deadline = clockSrc->now() + adjustedNapTime;
     try {
         LOGV2_DEBUG(10550200,
                     4,
                     "Going to sleep waiting for token acquisition",
                     "rateLimiterName"_attr = impl->name,
                     "napTimeMillis"_attr = adjustedNapTime.toString());
-        opCtx->sleepUntil(deadline);
+        interruptible->sleepUntil(deadline);
     } catch (const DBException& e) {
         impl->metricsRecorder->record(InterruptedInQueue{});
         LOGV2_DEBUG(10440800,
@@ -282,8 +322,17 @@ RateLimiter::RateLimiter(double refreshRatePerSec,
 
 RateLimiter::~RateLimiter() = default;
 
-boost::optional<RateLimiter::DeferredToken> RateLimiter::acquireToken(double numTokensToConsume) {
-    const bool hangInLimiter = hangInRateLimiter.shouldFail();
+boost::optional<RateLimiter::DeferredToken> RateLimiter::acquireToken(AdmissionContext* admCtx,
+                                                                      double numTokensToConsume) {
+    // This failpoint is shared by every RateLimiter wrapper (ingress request, egress response,
+    // session establishment, etc). To keep a test that forces queueing on one limiter from parking
+    // every other limiter, callers MUST scope it by providing a limiter name when enabling the
+    // failpoint.
+    const bool hangInLimiter =
+        hangInRateLimiter.shouldFail([&name = _impl->name](const BSONObj& data) {
+            const auto el = data.getField("limiter");
+            return !el.eoo() && el.str() == name.c_str();
+        });
     const auto maxQueueDepth = _impl->maxQueueDepth.loadRelaxed();
     if (!hangInLimiter && (maxQueueDepth <= 0 || _impl->queued.load() >= maxQueueDepth)) {
         // Queueing unavailable (disabled or currently full): use try-acquire semantics.
@@ -291,7 +340,8 @@ boost::optional<RateLimiter::DeferredToken> RateLimiter::acquireToken(double num
             return boost::none;
         }
         _impl->metricsRecorder->record(AverageTimeQueuedMicros{0});
-        return DeferredToken(_impl.get(), numTokensToConsume, Milliseconds{0}, Milliseconds{0});
+        return DeferredToken(
+            _impl.get(), admCtx, numTokensToConsume, Milliseconds{0}, Milliseconds{0});
     }
 
     _impl->metricsRecorder->record(AttemptedAdmission{});
@@ -315,21 +365,28 @@ boost::optional<RateLimiter::DeferredToken> RateLimiter::acquireToken(double num
             return boost::none;
         }
         _impl->metricsRecorder->record(AddedToQueue{});
-        return DeferredToken(_impl.get(), numTokensToConsume, _impl->nowInMillis(), napTime);
+        return DeferredToken(
+            _impl.get(), admCtx, numTokensToConsume, _impl->nowInMillis(), napTime);
     }
 
     // Token immediately available.
     _impl->metricsRecorder->record(SuccessfulAdmission{numTokensToConsume});
     _impl->metricsRecorder->record(AverageTimeQueuedMicros{0});
-    return DeferredToken(_impl.get(), numTokensToConsume, Milliseconds{0}, Milliseconds{0});
+    return DeferredToken(_impl.get(), admCtx, numTokensToConsume, Milliseconds{0}, Milliseconds{0});
 }
 
-Status RateLimiter::acquireToken(OperationContext* opCtx, double numTokensToConsume) {
-    auto tokenResult = acquireToken(numTokensToConsume);
+Status RateLimiter::acquireToken(OperationContext* opCtx,
+                                 AdmissionContext* admCtx,
+                                 double numTokensToConsume) {
+    auto tokenResult = acquireToken(admCtx, numTokensToConsume);
     if (!tokenResult) {
         return _impl->rejectedStatus;
     }
     return std::move(*tokenResult).get(opCtx);
+}
+
+Status RateLimiter::acquireToken(OperationContext* opCtx, double numTokensToConsume) {
+    return acquireToken(opCtx, nullptr, numTokensToConsume);
 }
 
 bool RateLimiter::tryAcquireToken(double numTokensToConsume) {
@@ -397,6 +454,7 @@ void RateLimiter::appendStats(BSONObjBuilder* bob) const {
     if (const auto avg = recorder.averageTimeQueuedMicros()) {
         bob->append("averageTimeQueuedMicros", *avg);
     }
+    bob->append("totalTimeQueuedMicros", recorder.totalTimeQueuedMicros());
 
     bob->append("tokensAcquired", recorder.tokensAcquired());
     bob->append("currentQueueDepth", recorder.addedToQueue() - recorder.removedFromQueue());

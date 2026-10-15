@@ -94,6 +94,7 @@ public:
     LiteParsedPipeline(const LiteParsedPipeline& other)
         : _originalParseNss(other._originalParseNss),
           _isRunningAgainstView_ForHybridSearch(other._isRunningAgainstView_ForHybridSearch),
+          _numPrependedViewStages(other._numPrependedViewStages),
           _hasChangeStream(&computeHasChangeStream),
           _involvedNamespaces(&computeInvolvedNamespaces) {
 
@@ -110,6 +111,7 @@ public:
         std::swap(_originalParseNss, other._originalParseNss);
         std::swap(_isRunningAgainstView_ForHybridSearch,
                   other._isRunningAgainstView_ForHybridSearch);
+        std::swap(_numPrependedViewStages, other._numPrependedViewStages);
         // _hasChangeStream and _involvedNamespaces are Deferred and will be recomputed on demand,
         // so we just reset them to point to our _stageSpecs.
         _hasChangeStream = Deferred<bool (*)(const StageSpecs&)>(&computeHasChangeStream);
@@ -466,6 +468,18 @@ public:
     }
 
     /**
+     * The number of stages at the front of this pipeline that came from a prepended view definition
+     * rather than from the user's request. See '_numPrependedViewStages'.
+     *
+     * Since getStageParams() emits exactly one StageParams per lite-parsed stage, this is a valid
+     * index into the pipeline it returns. It is NOT a valid index into a serialized DocumentSource
+     * pipeline, because alias stages ($sortByCount, $bucket, ...) expand only at parse time.
+     */
+    size_t getNumPrependedViewStages() const {
+        return _numPrependedViewStages;
+    }
+
+    /**
      * Returns the StageParams for each stage in this pipeline.
      */
     StageParamsPipeline getStageParams() const {
@@ -537,11 +551,35 @@ public:
     void bindResolvedNamespaceToStages(const ResolvedNamespace& view,
                                        const ResolvedNamespaceMap& resolvedNamespaces);
 
+    /**
+     * Returns the FirstStageViewApplicationPolicy of the first stage the *user* wrote, skipping
+     * over any view-definition stages that handleView() prepended onto this pipeline. Returns
+     * kDefaultPrepend if there are no user stages.
+     *
+     * Never use a prepended view stage's policy to decide whether a view prefix can be discarded;
+     * the view would be silently dropped from the query.
+     *
+     * TODO SERVER-120477 Remove this when legacy mongot is removed.
+     */
+    FirstStageViewApplicationPolicy getUserFirstStageViewApplicationPolicy() const;
+
 private:
     /**
      * Checks that no stage in the pipeline has canRunOnTimeseries == false.
      */
     void validateTimeseries() const;
+
+    /**
+     * Returns true if this pipeline has at least one stage that the user wrote, i.e. one that
+     * handleView() did not prepend.
+     */
+    bool _hasUserStages() const;
+
+    /**
+     * Returns the first stage the user wrote, skipping any stages handleView() prepended. Requires
+     * _hasUserStages().
+     */
+    const LiteParsedDocumentSource* _getFirstUserStage() const;
 
     // This is logically const - any changes to _stageSpecs will invalidate cached copies of
     // "_hasChangeStream" and "_involvedNamespaces" below.
@@ -554,6 +592,13 @@ private:
     // TODO SERVER-121094 This can be removed once hybrid search views are validated in
     // LiteParsed using the LiteParsedConstraints.
     bool _isRunningAgainstView_ForHybridSearch = false;
+
+    // Number of stages at the front of '_stageSpecs' that came from a view definition prepended by
+    // handleView(), rather than from the pipeline the user wrote. Maintained by _stitchFront() and
+    // adjusted by replaceStageWith() when one of those prepended stages is desugared in place. Used
+    // by getUserFirstStageViewApplicationPolicy() and getNumPrependedViewStages().
+    // TODO SERVER-120477 Remove this when legacy mongot is removed.
+    size_t _numPrependedViewStages = 0;
 
     /**
      * Prepend 'prefix' stages in front of this pipeline, taking ownership of prefix.

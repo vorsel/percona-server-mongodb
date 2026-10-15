@@ -69,6 +69,7 @@ mongo_cc_library(
         "//src/mongo/db/shard_role/shard_catalog:db_raii.cpp",
     ],
     deps = [
+        "//src/mongo/client:backoff_with_jitter",
         "//src/mongo/db:multitenancy",
         "//src/mongo/db:server_base",
         "//src/mongo/db:shard_role_api",
@@ -114,6 +115,17 @@ mongo_cc_unit_test(
         "//src/mongo/db/shard_role/shard_catalog:database_holder_mock",
         "//src/mongo/db/sharding_environment:shard_server_test_fixture",
         "//src/mongo/util:progress_meter",
+    ],
+)
+
+mongo_cc_unit_test(
+    name = "post_resharding_placement_test",
+    srcs = [
+        "post_resharding_placement_test.cpp",
+    ],
+    tags = ["mongo_unittest_fourth_group"],
+    deps = [
+        ":shard_role",
     ],
 )
 

@@ -38,11 +38,13 @@ executor:
               mode:
                 activationProbability: 0
             featureFlagContainerWrites: true
+            featureFlagExtensionsApiSignatureValidation: false
             featureFlagPrimaryDrivenIndexBuilds: true
             featureFlagRecordIdsReplicated: true
             featureFlagResumablePrimaryDrivenIndexBuilds: true
           setParametersMongos:
             featureFlagContainerWrites: true
+            featureFlagExtensionsApiSignatureValidation: false
             featureFlagPrimaryDrivenIndexBuilds: true
             featureFlagRecordIdsReplicated: true
             featureFlagResumablePrimaryDrivenIndexBuilds: true
@@ -51,6 +53,7 @@ matrix_suite: true
 selector:
   exclude_with_any_tags:
     - requires_kernel_619
+    - requires_kernel_7014
     - resumable_primary_driven_index_builds_incompatible
     - primary_driven_index_builds_incompatible
     - rolling_index_builds

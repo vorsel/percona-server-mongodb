@@ -67,7 +67,7 @@ a notice will be included in
 | [S2 Geometry Library]                                | Apache-2.0                                     | a25c502bda9d7e0274b9e2b7825fbddf13cc0306 | ✗                    | ✗                               |
 | [s2n-tls TLS library]                                | Apache-2.0                                     | 1.7.3                                    |                      | ✗                               |
 | [SafeInt]                                            | MIT                                            | 3.0.28a                                  |                      | ✗                               |
-| [siphash]                                            | CC0-1.0, MIT, Apache 2.0 with LLVM exception   | 32d067603b93b47828700880649198e0bfbbcffa |                      | ✗                               |
+| [siphash]                                            | MIT                                            | 32d067603b93b47828700880649198e0bfbbcffa |                      | ✗                               |
 | [snappy]                                             | BSD-3-Clause                                   | 1.1.10                                   | ✗                    | ✗                               |
 | [Snowball Stemming Algorithms (libstemmer)]          | BSD-3-Clause                                   | 1.0.0                                    | ✗                    | ✗                               |
 | [tcmalloc]                                           | Apache-2.0                                     | f3b20f9a07e175c5d897df7b49d9830d4efa6110 |                      | ✗                               |
@@ -133,22 +133,6 @@ a notice will be included in
 [yaml-cpp]: https://github.com/jbeder/yaml-cpp.git
 [zlib]: https://zlib.net/fossils/
 
-## WiredTiger Vendored Test Libraries
-
-The following libraries are transitively included by WiredTiger,
-and are used by that component for testing. They don't appear in
-released binary artifacts.
-
-| Name                           |
-| ------------------------------ |
-| pkg:pypi/concurrencytest@0.1.2 |
-| pkg:pypi/discover@0.4.0        |
-| pkg:pypi/extras@0.0.3          |
-| pkg:pypi/iso8601@2.1.0         |
-| pkg:pypi/python-subunit@1.4.4  |
-| pkg:pypi/testscenarios@0.4     |
-| pkg:pypi/testtools@2.7.1       |
-
 ## Dynamically Linked Libraries
 
 Percona Server for MongoDB needs to load libraries provided and managed by the
@@ -181,7 +165,3 @@ examples and can differ from platform to platform.
    The majority of Valgrind is licensed under the GPL, with the exception of a single
    header file which is licensed under a BSD license. This BSD licensed header is the only
    file from Valgrind which is vendored and consumed by MongoDB.
-
-2. <a id="note_wt" href="#ref_wt">^</a>
-   WiredTiger is maintained by MongoDB in a separate repository. As a part of our
-   development process, we periodically ingest the latest snapshot of that repository.

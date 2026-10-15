@@ -34,6 +34,16 @@ namespace mongo::exec::agg {
  * the subclass implements beginBatch()/closeBatch() and enrich(). One fill batch may open several
  * scopes, since the output-byte cap can suspend enrichment mid-input, so "batch" in
  * beginBatch/closeBatch is the enrich sub-batch, not the fill batch.
+ *
+ * enrich() may drop an event by returning boost::none (e.g. $search idLookup drops a document whose
+ * _id no longer resolves, or an orphan). A subclass may also cap its own output via
+ * remainingDocumentsToEmit(): once it hits 0 the stage stops pulling upstream, drops any
+ * still-buffered input, and surfaces EOF after the already-enriched output drains; a positive value
+ * also caps how far the next fill advances upstream. Because a whole
+ * fill window can be dropped, doGetNext() refills (loops back to the fill phase) instead of
+ * assuming every fill yields at least one emittable result; the loop is bounded because each fill
+ * consumes at least one upstream event or records a boundary (EOF/pause/control) and upstream is
+ * finite.
  */
 class BatchedEnrichmentStage : public Stage {
 public:
@@ -56,7 +66,7 @@ public:
          * Suspend the enrich scope after the event that crosses this many output bytes. Enrichment
          * can inflate an event (a post-image up to 16MB), so the meaningful memory bound is on the
          * output. There is no output event-count cap: output count is already bounded by
-         * maxInputEvents (enrich is 1:1).
+         * maxInputEvents (enrich emits at most one output per input, and may emit none).
          */
         size_t maxOutputBytes;
     };
@@ -74,6 +84,20 @@ public:
     int64_t peakBufferedMemoryBytes_forTest() const {
         return _memTracker.peakTrackedMemoryBytes();
     }
+
+    /**
+     * Release / re-bind the memory tracker's operation-scoped base across getMore opCtx swaps. The
+     * base lives on the OperationContext and is not carried across the $search results pipeline's
+     * reattach, so it must be dropped on detach and re-bound on reattach to avoid a dangling
+     * pointer. A subclass overriding these must call the base implementation.
+     *
+     * TODO SERVER-131203: these overrides (and the SimpleMemoryUsageTracker::resetBase() /
+     * OperationMemoryUsageTracker::rebindToOperation() helpers they rely on) are a stopgap for the
+     * getMore opCtx-swap crash and are not a pattern to reuse; remove them once this stage's memory
+     * tracking is properly integrated with the operation memory tracker.
+     */
+    void detachFromOperationContext() override;
+    void reattachToOperationContext(OperationContext* opCtx) override;
 
 protected:
     BatchedEnrichmentStage(std::string_view stageName,
@@ -94,17 +118,49 @@ protected:
      * Enrich one buffered event; called only inside an open scope, and only for data events
      * (kAdvanced). Non-advanced events pass through untouched without entering enrich().
      *
+     * Returns the enriched document to emit, or boost::none to drop the event (emit nothing for
+     * it).
+     *
      * Must not call back into this stage (getNext() or any other method).
      */
-    virtual Document enrich(Document event) = 0;
+    virtual boost::optional<Document> enrich(Document event) = 0;
+
+    /**
+     * How many more documents this stage may still emit before it must stop, or boost::none for no
+     * self-imposed cap (bounded only by upstream). One value drives two behaviours so a subclass
+     * expresses its budget once:
+     *   - 0 means "stop now": the base stops pulling upstream, drops any still-buffered input, and
+     *     surfaces EOF after the already-enriched output drains. The source may still have data --
+     *     the subclass is choosing to stop, not observing EOF. Checked per-event during enrichment
+     *     as well, so a window never emits past the cap.
+     *   - a positive value caps the next fill at min(maxInputEvents, this), so a stage stopping
+     *     after a fixed count (e.g. $search idLookup honouring a 'limit') doesn't advance -- and do
+     *     work in -- the upstream stage for documents it would discard (which would inflate the
+     *     upstream stage's explain 'nReturned'). Safe as a fill cap because enrich() emits at most
+     *     one output per input; only an upper bound, since drops are topped up by the refill loop.
+     * The default never caps.
+     */
+    virtual boost::optional<size_t> remainingDocumentsToEmit() const {
+        return boost::none;
+    }
+
+    /**
+     * Invoked when the stage observes that its input is exhausted -- either upstream returned EOF
+     * or remainingDocumentsToEmit() hit 0. Fired by emit() as the terminating EOF is surfaced
+     * (the single exhaustion signal for both causes). May fire on more than one getNext() once
+     * exhausted, so implementations must be idempotent. Default is a no-op.
+     */
+    virtual void onExhausted() {}
 
 private:
     /**
-     * The phases the stage moves through, in order. doGetNext() resumes at '_phase' and falls
-     * through the later phases, so each runs at most once per call (no loop).
-     *   kBuffer: nothing buffered; gather upstream events into '_inputBuffer'.
-     *   kEnrich: input buffered, output drained; enrich within a batch window into '_outputBuffer'.
-     *   kEmit:   return one enriched document, else the buffered non-advanced result.
+     * The phases the stage moves through, in order. doGetNext() resumes at '_phase' and runs the
+     * phases to produce one result. It loops back to kBuffer when a fill window yields nothing to
+     * emit (every event dropped) and no non-advanced result or buffered exception is pending, so a
+     * fully-dropped window refills rather than returning early. kBuffer: nothing buffered; gather
+     * upstream events into '_inputBuffer'. kEnrich: input buffered, output drained; enrich within a
+     * batch window into '_outputBuffer'. kEmit: return one enriched document, else the buffered
+     * non-advanced result (or rethrow the buffered exception).
      */
     enum class Phase { kBuffer, kEnrich, kEmit };
 
@@ -133,10 +189,24 @@ private:
     void enrichBatch();
 
     /**
-     * Returns one enriched document from '_outputBuffer'. When empty, rethrows the buffered
-     * exception if one is stashed, else returns the buffered non-advanced result.
+     * Returns the next enriched document from '_outputBuffer'. When the output buffer is empty a
+     * buffered non-advanced result (control event, pause, or the terminating EOF) or a buffered
+     * exception must be pending -- doGetNext() never calls emit() on a fully-dropped window -- so
+     * this rethrows the buffered exception if one is stashed, else returns that result. Fires
+     * onExhausted() as it surfaces a terminating EOF.
      */
     GetNextResult emit();
+
+    /**
+     * Drops all still-buffered input events (accounting for the freed memory). Used when the emit
+     * cap ends the stage with input still buffered.
+     */
+    void discardInputBuffer();
+
+    /**
+     * True once remainingDocumentsToEmit() reaches 0: the stage has emitted its cap and must stop.
+     */
+    bool atEmitCap() const;
 
     /**
      * Account for a document entering (trackPush) or leaving (trackPop) a buffer.

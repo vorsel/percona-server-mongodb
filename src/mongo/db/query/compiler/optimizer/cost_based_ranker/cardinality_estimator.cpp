@@ -11,6 +11,7 @@
 #include "mongo/db/query/compiler/optimizer/index_bounds_builder/index_bounds_builder.h"
 #include "mongo/db/query/compiler/physical_model/query_solution/stage_types.h"
 #include "mongo/db/query/query_optimization_knobs_gen.h"
+#include "mongo/logv2/log.h"
 
 #include <string_view>
 
@@ -192,6 +193,21 @@ CEResult CardinalityEstimator::estimate(const QuerySolutionNode* node) {
     if (!ceRes.isOK()) {
         return ceRes;
     }
+
+    // A zero scan estimate fails the whole plan because CBR does not always pick the better plan
+    // in this case.
+    if (nodeType == STAGE_IXSCAN && ceRes.getValue() == zeroCE) {
+        LOGV2_DEBUG(13336200,
+                    2,
+                    "Aborting CBR plan estimation: a scan node's cardinality estimate is zero. "
+                    "The plan will be ranked by the multi-planner instead",
+                    "stage"_attr = nodeStageTypeToString(node),
+                    "ceSource"_attr = toStringData(ceRes.getValue().source()));
+        return Status(ErrorCodes::ZeroCEEstimate,
+                      str::stream() << "Node " << nodeStageTypeToString(node)
+                                    << " has a zero cardinality estimate");
+    }
+
     if (isConjunctionBreaker) {
         popSelectivities();
         _inputCard = ceRes.getValue();
@@ -368,7 +384,12 @@ CEResult CardinalityEstimator::estimate(const MatchExpression* node, const bool 
                 estimate(static_cast<const InternalSchemaAllowedPropertiesMatchExpression*>(node));
             break;
         default:
-            MONGO_UNIMPLEMENTED_TASSERT(9586708);
+            // CBR does not know how to estimate this match expression type. Fall back to
+            // multi-planning.
+            return Status(ErrorCodes::UnsupportedCbrNode,
+                          str::stream() << "unsupported match expression type "
+                                        << static_cast<int>(node->matchType())
+                                        << " for CBR CE mode " << idlSerialize(_ceMode));
     }
 
     return ceRes;
@@ -1542,7 +1563,12 @@ void CardinalityEstimator::propagateLimit(const QuerySolutionNode* node, size_t 
         }
         case STAGE_PROJECTION_DEFAULT:
         case STAGE_PROJECTION_COVERED:
-        case STAGE_PROJECTION_SIMPLE: {
+        case STAGE_PROJECTION_SIMPLE:
+        // A shard filter is estimated as a pass-through on the basis that chunk migrations are rare
+        // and so effectively no documents are filtered out. The limit is therefore propagated
+        // through it unchanged, consistent with that estimate.
+        // TODO SERVER-132848: Move these passthrough stages to be with the FETCH node.
+        case STAGE_SHARDING_FILTER: {
             // passthrough
             applyLimitToSelf();
             propagateToChildren(limit);

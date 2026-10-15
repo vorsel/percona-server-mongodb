@@ -32,20 +32,14 @@
 
 rollout:
   featureFlagGetExecutorDeferredEngineChoice: {}
-  featureFlagSbeEqLookupUnwindDynamicIndexedLoopJoin: {}
   featureFlagSbeEqLookupUnwindHashJoin: {}
-  featureFlagSbeEqLookupUnwindIndexedLoopJoin: {}
   featureFlagSbeEqLookupUnwindLocalCollscan: {}
   featureFlagSbeEqLookupUnwindLocalComplexDataAccessPlans: {}
   featureFlagSbeEqLookupUnwindLocalIxscanFetch: {}
-  featureFlagSbeEqLookupUnwindNestedLoopJoin: {}
   featureFlagSbeNonLeadingMatch: {}
   featureFlagSbeTransformStages: {}
-  featureFlagUnifiedWriteExecutor: {}
 
 release:
-  featureFlagChangeStreamOptimizedUpdateLookup: {}
-  featureFlagChangeStreamReaderV2: {}
   featureFlagCostBasedRanker: {}
   featureFlagExtensionsInsideHybridSearch: {}
   featureFlagExtractFieldPathsSbeStage: {}
@@ -54,4 +48,5 @@ release:
   featureFlagSbeAccumulators: {}
   featureFlagSbeUpgradeBinaryTrees: {}
   featureFlagSearchExtension: {}
+  featureFlagUnifiedWriteExecutor: {}
   featureFlagVectorSearchExtension: {}

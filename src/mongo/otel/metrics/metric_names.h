@@ -173,7 +173,43 @@ public:
     static constexpr MetricName kIngressRequestRateLimiterTimeQueuedMicros = MetricNameMaker::make(
         "mongodb.serverStatus.network.ingressRequestRateLimiter.timeQueuedMicros");
 
+    // Egress Response Rate Limiter (Admission Control) Metrics. These mirror the fields that
+    // RateLimiter::appendStats() reports under serverStatus.network.egressResponseRateLimiter.
+    static constexpr MetricName kEgressResponseRateLimiterAttemptedAdmissions =
+        MetricNameMaker::make(
+            "mongodb.serverStatus.network.egressResponseRateLimiter.attemptedAdmissions");
+    static constexpr MetricName kEgressResponseRateLimiterSuccessfulAdmissions =
+        MetricNameMaker::make(
+            "mongodb.serverStatus.network.egressResponseRateLimiter.successfulAdmissions");
+    static constexpr MetricName kEgressResponseRateLimiterRejectedAdmissions =
+        MetricNameMaker::make(
+            "mongodb.serverStatus.network.egressResponseRateLimiter.rejectedAdmissions");
+    static constexpr MetricName kEgressResponseRateLimiterExemptedAdmissions =
+        MetricNameMaker::make(
+            "mongodb.serverStatus.network.egressResponseRateLimiter.exemptedAdmissions");
+    static constexpr MetricName kEgressResponseRateLimiterAddedToQueue = MetricNameMaker::make(
+        "mongodb.serverStatus.network.egressResponseRateLimiter.addedToQueue");
+    static constexpr MetricName kEgressResponseRateLimiterRemovedFromQueue = MetricNameMaker::make(
+        "mongodb.serverStatus.network.egressResponseRateLimiter.removedFromQueue");
+    static constexpr MetricName kEgressResponseRateLimiterInterruptedInQueue =
+        MetricNameMaker::make(
+            "mongodb.serverStatus.network.egressResponseRateLimiter.interruptedInQueue");
+    static constexpr MetricName kEgressResponseRateLimiterTokensAcquired = MetricNameMaker::make(
+        "mongodb.serverStatus.network.egressResponseRateLimiter.tokensAcquired");
+    static constexpr MetricName kEgressResponseRateLimiterCurrentQueueDepth = MetricNameMaker::make(
+        "mongodb.serverStatus.network.egressResponseRateLimiter.currentQueueDepth");
+    static constexpr MetricName kEgressResponseRateLimiterTotalAvailableTokens =
+        MetricNameMaker::make(
+            "mongodb.serverStatus.network.egressResponseRateLimiter.totalAvailableTokens");
+    static constexpr MetricName kEgressResponseRateLimiterAverageTimeQueuedMicros =
+        MetricNameMaker::make(
+            "mongodb.serverStatus.network.egressResponseRateLimiter.averageTimeQueuedMicros");
+    static constexpr MetricName kEgressResponseRateLimiterTimeQueuedMicros = MetricNameMaker::make(
+        "mongodb.serverStatus.network.egressResponseRateLimiter.timeQueuedMicros");
+
     // Query Execution Team Metrics
+    static constexpr MetricName kQueryMemoryLoadSheddingOperationsShed =
+        MetricNameMaker::make("mongodb.serverStatus.queryMemory.loadShedding.operationsShed");
     static constexpr MetricName kChangeStreamCursorsTotalOpened =
         MetricNameMaker::make("mongodb.serverStatus.metrics.changeStreams.cursor.totalOpened");
     static constexpr MetricName kChangeStreamCursorsLifespan =
@@ -278,15 +314,15 @@ public:
     static constexpr MetricName kChangeStreamOptionCursorMaxTimeMS =
         MetricNameMaker::make("mongodb.serverStatus.metrics.changeStreams.option.cursor.maxTimeMS");
     static constexpr MetricName kChangeStreamCursorDocsReturned =
-        MetricNameMaker::make("serverStatus.metrics.changeStreams.cursor.docsReturned");
+        MetricNameMaker::make("mongodb.serverStatus.metrics.changeStreams.cursor.docsReturned");
     static constexpr MetricName kChangeStreamCursorBytesReturned =
-        MetricNameMaker::make("serverStatus.metrics.changeStreams.cursor.bytesReturned");
+        MetricNameMaker::make("mongodb.serverStatus.metrics.changeStreams.cursor.bytesReturned");
     static constexpr MetricName kChangeStreamCursorBatchesReturned =
-        MetricNameMaker::make("serverStatus.metrics.changeStreams.cursor.batchesReturned");
+        MetricNameMaker::make("mongodb.serverStatus.metrics.changeStreams.cursor.batchesReturned");
     static constexpr MetricName kChangeStreamCursorDocsExamined =
-        MetricNameMaker::make("serverStatus.metrics.changeStreams.cursor.docsExamined");
+        MetricNameMaker::make("mongodb.serverStatus.metrics.changeStreams.cursor.docsExamined");
     static constexpr MetricName kChangeStreamCursorBytesRead =
-        MetricNameMaker::make("serverStatus.metrics.changeStreams.cursor.bytesRead");
+        MetricNameMaker::make("mongodb.serverStatus.metrics.changeStreams.cursor.bytesRead");
 
     // Storage Execution Team Metrics
     static constexpr MetricName kIndexBuildsActive =
@@ -350,8 +386,6 @@ public:
         MetricNameMaker::make("mongodb.serverStatus.indexBuilds.keysInsertedFromScan");
     static constexpr MetricName kIndexBuildDocsScanned =
         MetricNameMaker::make("mongodb.serverStatus.indexBuilds.docsScanned");
-    static constexpr MetricName kIndexBuildKeysGeneratedFromScan =
-        MetricNameMaker::make("mongodb.serverStatus.indexBuilds.keysGeneratedFromScan");
     static constexpr MetricName kIndexBuildResumeSucceeded =
         MetricNameMaker::make("mongodb.serverStatus.indexBuilds.resume.succeeded");
     static constexpr MetricName kIndexBuildResumeFailed =

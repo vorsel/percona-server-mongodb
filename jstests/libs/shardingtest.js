@@ -2,6 +2,7 @@ import {getTimeseriesCollForDDLOps} from "jstests/core/timeseries/libs/viewless_
 import {FeatureFlagUtil} from "jstests/libs/feature_flag_util.js";
 import {Thread} from "jstests/libs/parallelTester.js";
 import {ReplSetTest} from "jstests/libs/replsettest.js";
+import {setFCVWithRetryOnBackgroundOpInProgress} from "jstests/libs/set_fcv_helpers.js";
 
 // Symbol used to override the constructor. Please do not use this, it's only meant to aid
 // in migrating the jstest corpus to proper module usage.
@@ -1314,6 +1315,13 @@ export class ShardingTest {
                     startOptions.setParameter = startOptions.setParameter ?? {};
                     startOptions.setParameter.opentelemetryTraceDirectory = jsTestOptions().otelTraceDirectory;
                 }
+                // Enable resharding document-count validation (off by default) in test clusters.
+                if (!clusterVersionInfo.isMixedVersion) {
+                    startOptions.setParameter = startOptions.setParameter ?? {};
+                    if (startOptions.setParameter.reshardingDocumentVerification === undefined) {
+                        startOptions.setParameter.reshardingDocumentVerification = true;
+                    }
+                }
                 rstOptions = Object.merge(rstOptions, otherParams.configReplSetTestOptions);
 
                 let nodeOptions = [];
@@ -1392,6 +1400,11 @@ export class ShardingTest {
                 if (jsTestOptions().otelTraceDirectory && !clusterVersionInfo.isMixedVersion &&
                     MongoRunner.compareBinVersions(MongoRunner.getBinVersionFor(rsDefaults.binVersion || "latest"), MongoRunner.getBinVersionFor("8.3.0")) >= 0) {
                     rsDefaults.setParameter.opentelemetryTraceDirectory = jsTestOptions().otelTraceDirectory;
+                }
+                // Enable resharding document-count validation (off by default) in test clusters.
+                if (!clusterVersionInfo.isMixedVersion &&
+                    rsDefaults.setParameter.reshardingDocumentVerification === undefined) {
+                    rsDefaults.setParameter.reshardingDocumentVerification = true;
                 }
 
                 let rsSettings = rsDefaults.settings;
@@ -1728,13 +1741,12 @@ export class ShardingTest {
             if (_hasNewFeatureCompatibilityVersion() && clusterVersionInfo.isMixedVersion) {
                 const fcv = binVersionToFCV(clusterVersionInfo.oldestBinVersion);
                 function setFeatureCompatibilityVersion() {
-                    assert.commandWorked(
-                        csrsPrimary.adminCommand({
-                            setFeatureCompatibilityVersion: fcv,
-                            confirm: true,
-                            fromConfigServer: true,
-                        }),
-                    );
+                    // Startup system index builds can still be in flight here and hold a stale
+                    // operation FCV, which makes setFCV fail with
+                    // BackgroundOperationInProgressForNamespace. Retry until they drain.
+                    setFCVWithRetryOnBackgroundOpInProgress(csrsPrimary, fcv, {
+                        fromConfigServer: true,
+                    });
 
                     // Wait for the new featureCompatibilityVersion to propagate to all nodes in the
                     // CSRS to ensure that older versions of mongos can successfully connect.

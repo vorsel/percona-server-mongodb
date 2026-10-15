@@ -3,14 +3,17 @@
 
 #pragma once
 
+#include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/matcher/expression_algo.h"
+#include "mongo/db/matcher/matchable.h"
 #include "mongo/db/pipeline/expression.h"
 #include "mongo/util/modules.h"
 
 #include <memory>
 
 #include <boost/intrusive_ptr.hpp>
+#include <boost/optional.hpp>
 
 namespace mongo {
 
@@ -28,6 +31,9 @@ public:
     // the MatchExpression. The optional 'ctx' parameter carries evaluation state (see
     // EvaluationContext); when it holds a memory tracker, memory usage observed while evaluating
     // any $expr sub-expressions within the match expression is accumulated against it.
+    //
+    // Not thread-safe: callers must ensure no concurrent calls to process() on the same
+    // instance.
     bool process(const Document& input, const EvaluationContext& ctx = {}) const;
 
     std::unique_ptr<MatchExpression>& getExpression() {
@@ -46,10 +52,16 @@ public:
         return _predicate;
     }
 
+    void releaseBuffer(SimpleMemoryUsageTracker* tracker) const;
+
+    int64_t bufferCapacity() const;
+
 private:
     // Determines whether all paths have unique first fields. This is called once during object
     // construction to determine the value of '_dependenciesHaveUniqueFirstFields'.
     static bool dependenciesHaveUniqueFirstFields(const OrderedPathSet& paths);
+
+    void trackBufferMemory(const EvaluationContext& ctx) const;
 
     std::unique_ptr<MatchExpression> _expression;
 
@@ -65,6 +77,12 @@ private:
     // Store the BSONObj that backs this '_expression' so that it doesn't get disposed before the
     // match expression does.
     BSONObj _predicate;
+
+    // Reused across process() calls.
+    mutable boost::optional<BSONObjBuilder> _buffer;
+
+    // The '_buffer' capacity charged to memory tracking so far.
+    mutable int64_t _trackedBufferBytes = 0;
 };
 
 }  // namespace mongo

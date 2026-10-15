@@ -1646,8 +1646,11 @@ BSONObj finalizePipelineAndTargetShardsForExplain(
             // TODO SERVER-124003 Figure out a way to either avoid this serialized BSON or reuse it
             // as much as possible.
             query_shape::SerializationOptions wireOpts{.isSerializingForRemoteDispatch = true};
-            LiteParsedPipeline liteParsedPipeline(expCtx->getNamespaceString(),
-                                                  pipelineToTarget->serializeToBson(wireOpts));
+            LiteParsedPipeline liteParsedPipeline(
+                expCtx->getNamespaceString(),
+                pipelineToTarget->serializeToBson(wireOpts),
+                false /* isRunningAgainstView_ForHybridSearch */,
+                LiteParserOptions{.ifrContext = expCtx->getIfrContext()});
             PipelineDataSource pipelineDataSource = getPipelineDataSource(liteParsedPipeline);
 
             auto ifrCtx = expCtx->getIfrContext();
@@ -1919,7 +1922,8 @@ std::unique_ptr<Pipeline> targetShardsAndAddMergeCursors(
                 expCtx,
                 std::move(pipelineToTarget),
                 aggRequest,
-                getPipelineDataSource(LiteParsedPipeline(aggRequest)),
+                getPipelineDataSource(LiteParsedPipeline(
+                    aggRequest, false, LiteParserOptions{.ifrContext = expCtx->getIfrContext()})),
                 routingCtx,
                 shardCursorsSortSpec,
                 shardTargetingPolicy,
@@ -1984,8 +1988,11 @@ std::unique_ptr<Pipeline> finalizeAndMaybePreparePipelineForExecution(
             // TODO SERVER-124003 Figure out a way to either avoid this serialized BSON or reuse it
             // as much as possible.
             query_shape::SerializationOptions wireOpts{.isSerializingForRemoteDispatch = true};
-            LiteParsedPipeline liteParsedPipeline(expCtx->getNamespaceString(),
-                                                  pipelineToTarget->serializeToBson(wireOpts));
+            LiteParsedPipeline liteParsedPipeline(
+                expCtx->getNamespaceString(),
+                pipelineToTarget->serializeToBson(wireOpts),
+                false /* isRunningAgainstView_ForHybridSearch */,
+                LiteParserOptions{.ifrContext = expCtx->getIfrContext()});
             PipelineDataSource pipelineDataSource = getPipelineDataSource(liteParsedPipeline);
 
             auto ifrCtx = expCtx->getIfrContext();

@@ -6,7 +6,9 @@
 #include "mongo/db/memory_tracking/memory_usage_tracker.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_knob_descriptors_execution.h"
+#include "mongo/db/service_context.h"
 #include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
 
 #include <limits>
 
@@ -15,8 +17,8 @@
 namespace mongo {
 namespace {
 
-const OperationContext::Decoration<std::unique_ptr<OperationMemoryUsageTracker>> _getFromOpCtx =
-    OperationContext::declareDecoration<std::unique_ptr<OperationMemoryUsageTracker>>();
+const OperationContext::Decoration<std::shared_ptr<OperationMemoryUsageTracker>> _getFromOpCtx =
+    OperationContext::declareDecoration<std::shared_ptr<OperationMemoryUsageTracker>>();
 
 }  // namespace
 
@@ -32,8 +34,8 @@ OperationMemoryUsageTracker* OperationMemoryUsageTracker::getOperationMemoryUsag
     OperationContext* opCtx) {
     OperationMemoryUsageTracker* opTracker = _getFromOpCtx(opCtx).get();
     if (!opTracker) {
-        auto uniqueTracker = std::make_unique<OperationMemoryUsageTracker>(opCtx);
-        opTracker = uniqueTracker.get();
+        auto sharedTracker = std::make_shared<OperationMemoryUsageTracker>(opCtx);
+        opTracker = sharedTracker.get();
         opTracker->setWriteToCurOp(
             [opTracker](int64_t inUseTrackedMemoryBytes, int64_t peakTrackedMemBytes) {
                 if (opTracker->_opCtx) {
@@ -43,7 +45,7 @@ OperationMemoryUsageTracker* OperationMemoryUsageTracker::getOperationMemoryUsag
                     LOGV2_DEBUG(10430900, 3, "No OperationContext on OperationMemoryUsageTracker");
                 }
             });
-        _getFromOpCtx(opCtx) = std::move(uniqueTracker);
+        _getFromOpCtx(opCtx) = std::move(sharedTracker);
     }
 
     return opTracker;
@@ -127,28 +129,59 @@ MemoryUsageTracker OperationMemoryUsageTracker::createMemoryUsageTrackerImpl(
     return MemoryUsageTracker{opTracker, allowDiskUse, maxMemoryUsageBytes, chunkSize};
 }
 
-std::unique_ptr<OperationMemoryUsageTracker> OperationMemoryUsageTracker::moveFromOpCtxIfAvailable(
-    OperationContext* opCtx) {
-    std::unique_ptr<OperationMemoryUsageTracker> tracker = std::move(_getFromOpCtx(opCtx));
+std::shared_ptr<OperationMemoryUsageTracker>
+OperationMemoryUsageTracker::detachFromOpCtxIfAvailable(OperationContext* opCtx) {
+    invariant(opCtx);
+    std::shared_ptr<OperationMemoryUsageTracker> tracker = std::move(_getFromOpCtx(opCtx));
     if (tracker) {
+        // The tracker outlives its opCtx while stashed on the cursor between getMores.
         tracker->_opCtx = nullptr;
     }
     return tracker;
 }
 
-void OperationMemoryUsageTracker::moveToOpCtxIfAvailable(
-    OperationContext* opCtx, std::unique_ptr<OperationMemoryUsageTracker> tracker) {
+void OperationMemoryUsageTracker::attachToOpCtxIfAvailable(
+    OperationContext* opCtx,
+    std::shared_ptr<OperationMemoryUsageTracker> tracker,
+    ReportToCurOp reportToCurOp) {
     invariant(opCtx);
-    if (tracker) {
+    if (!tracker) {
+        // Nothing to publish. Leave any tracker already on the opCtx in place.
+        return;
+    }
+    if (reportToCurOp == ReportToCurOp::kYes) {
         tracker->_opCtx = opCtx;
         CurOp::get(opCtx)->setMemoryTrackingStats(tracker->inUseTrackedMemoryBytes(),
                                                   tracker->peakTrackedMemoryBytes());
+    } else {
+        // Reset tracker _opCtx to not report to curOp.
+        tracker->_opCtx = nullptr;
     }
     _getFromOpCtx(opCtx) = std::move(tracker);
 }
 
+std::shared_ptr<OperationMemoryUsageTracker> OperationMemoryUsageTracker::getOwningIfExists(
+    OperationContext* opCtx) {
+    invariant(opCtx);
+    return _getFromOpCtx(opCtx);
+}
+
 bool OperationMemoryUsageTracker::hasTrackerOnOpCtx(OperationContext* opCtx) {
     return _getFromOpCtx(opCtx) != nullptr;
+}
+
+OperationMemoryUsageTracker* OperationMemoryUsageTracker::getIfExists(OperationContext* opCtx) {
+    return _getFromOpCtx(opCtx).get();
+}
+
+void OperationMemoryUsageTracker::rebindToOperation(SimpleMemoryUsageTracker& tracker,
+                                                    const ExpressionContext& expCtx,
+                                                    OperationContext* opCtx) {
+    if (!feature_flags::gFeatureFlagQueryMemoryTracking.isEnabled() ||
+        expCtx.getExcludeOperationMemoryTracking()) {
+        return;
+    }
+    tracker.resetBase(getOperationMemoryUsageTracker(opCtx));
 }
 
 }  // namespace mongo

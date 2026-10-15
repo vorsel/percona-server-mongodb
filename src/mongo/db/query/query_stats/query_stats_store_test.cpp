@@ -28,6 +28,7 @@
 #include "mongo/db/service_context_test_fixture.h"
 #include "mongo/db/shard_role/shard_catalog/collection_type.h"
 #include "mongo/platform/decimal128.h"
+#include "mongo/transport/mock_session.h"
 #include "mongo/unittest/server_parameter_guard.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/assert_util.h"
@@ -55,6 +56,16 @@ int countAllEntries(const QueryStatsStore& store) {
     int numKeys = 0;
     store.forEach([&](auto&& key, auto&& entry) { numKeys++; });
     return numKeys;
+}
+
+BSONObj buildLargeAndFilter(int numClauses) {
+    BSONObjBuilder bob;
+    BSONArrayBuilder andBob(bob.subarrayStart("$and"));
+    for (int i = 1; i <= numClauses; i++) {
+        andBob.append(BSON("x" << BSON("$lt" << i << "$gte" << i)));
+    }
+    andBob.doneFast();
+    return bob.obj();
 }
 
 static const NamespaceStringOrUUID kDefaultTestNss =
@@ -235,28 +246,19 @@ TEST_F(QueryStatsStoreTest, EvictionTest) {
     ASSERT_EQ(countAllEntries(queryStatsStoreTwo), 0);
 }
 
-TEST_F(QueryStatsStoreTest, GenerateMaxBsonSizeQueryShape) {
+TEST_F(QueryStatsStoreTest, RegisterRequestSkipsShapeExceedingMaxUserSize) {
     const NamespaceString nss = NamespaceString::createNamespaceString_forTest("testDB.testColl");
     FindCommandRequest fcr((NamespaceStringOrUUID(nss)));
     // This creates a query that is just below the 16 MB memory limit.
     int limit = 225500;
-    BSONObjBuilder bob;
-    BSONArrayBuilder andBob(bob.subarrayStart("$and"));
-    for (int i = 1; i <= limit; i++) {
-        BSONObjBuilder childrenBob;
-        childrenBob.append("x", BSON("$lt" << i << "$gte" << i));
-        andBob.append(childrenBob.obj());
-    }
-    andBob.doneFast();
-    fcr.setFilter(bob.obj());
+    fcr.setFilter(buildLargeAndFilter(limit));
     auto fcrCopy = std::make_unique<FindCommandRequest>(fcr);
     auto opCtx = makeOperationContext();
     auto expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *fcrCopy).build();
     auto parsedFind = uassertStatusOK(parsed_find_command::parse(expCtx, {std::move(fcrCopy)}));
-    unittest::ServerParameterGuard controller("featureFlagQueryStats", true);
 
-    auto&& globalQueryStatsStoreManager = QueryStatsStoreManager::get(opCtx->getServiceContext());
-    globalQueryStatsStoreManager = std::make_unique<QueryStatsStoreManager>(500000, 1000);
+    QueryStatsStoreManager::getRateLimiter(opCtx->getServiceContext())
+        .configureSampleBased(1000, 0);
 
     // The shapification process will bloat the input query over the 16 MB memory limit. Assert
     // that calling registerRequest() doesn't throw and that the opDebug isn't registered with a
@@ -276,6 +278,42 @@ TEST_F(QueryStatsStoreTest, GenerateMaxBsonSizeQueryShape) {
     })());
     auto& opDebug = CurOp::get(*opCtx)->debug();
     ASSERT_EQ(opDebug.getQueryStatsInfo().keyHash, boost::none);
+}
+
+TEST_F(QueryStatsStoreTest, RegisterRequestSkipsKeyExceedingMaxUserSize) {
+    // The shapified filter is under BSONObjMaxUserSize, but the full key exceeds it, so
+    // registerRequest() must not record it.
+    const NamespaceString nss = NamespaceString::createNamespaceString_forTest("testDB.testColl");
+    FindCommandRequest fcr((NamespaceStringOrUUID(nss)));
+    // ~100000 clauses shapify to a filter of ~7.5MB, which is under BSONObjMaxUserSize.
+    fcr.setFilter(buildLargeAndFilter(100000));
+    // Inflate the key with a large hint so the serialized key exceeds BSONObjMaxUserSize while the
+    // query shape stays under it.
+    BSONObjBuilder hintBob;
+    for (int i = 0; i < 800000; i++) {
+        hintBob.append("f" + std::to_string(i), 1);
+    }
+    fcr.setHint(hintBob.obj());
+    auto fcrCopy = std::make_unique<FindCommandRequest>(fcr);
+    auto opCtx = makeOperationContext();
+    auto expCtx = ExpressionContextBuilder{}.fromRequest(opCtx.get(), *fcrCopy).build();
+    auto parsedFind = uassertStatusOK(parsed_find_command::parse(expCtx, {std::move(fcrCopy)}));
+
+    QueryStatsStoreManager::getRateLimiter(opCtx->getServiceContext())
+        .configureSampleBased(1000, 0);
+
+    auto statusWithShape =
+        shape_helpers::tryMakeShape<query_shape::FindCmdShape>(*parsedFind, expCtx);
+    ASSERT_OK(statusWithShape.getStatus());
+    ASSERT_DOES_NOT_THROW(([&]() {
+        query_stats::registerRequest(opCtx.get(), nss, [&]() {
+            return std::make_unique<query_stats::FindKey>(expCtx,
+                                                          *parsedFind->findCommandRequest,
+                                                          std::move(statusWithShape.getValue()),
+                                                          query_shape::CollectionType::kCollection);
+        });
+    })());
+    ASSERT_EQ(CurOp::get(*opCtx)->debug().getQueryStatsInfo().keyHash, boost::none);
 }
 
 TEST_F(QueryStatsStoreTest, CorrectlyRedactsFindCommandRequestAllFields) {
@@ -1334,6 +1372,109 @@ TEST_F(QueryStatsStoreTest, CorrectlyTokenizesAggregateCommandRequestEmptyFields
             "collectionType": "collection"
         })",
         shapified);  // NOLINT (test auto-update)
+}
+
+TEST_F(QueryStatsStoreTest, AggKeyWithInternalOnlyExpressionIsSerializableByExternalClient) {
+    // Because we now collect query stats for internal clients, we may end up trying to re-parse a
+    // pipeline using an internal-client-only expression (i.e '$_internalIndexKey') when collecting
+    // query stats. Collecting query stats is done via an external-client context, so we must not
+    // apply the internal-client restriction to the stored shape.
+    auto expCtx = make_intrusive<ExpressionContextForTest>(kDefaultTestNss.nss());
+    AggregateCommandRequest acr(kDefaultTestNss.nss());
+    auto rawPipeline = {fromjson(R"({
+            $replaceRoot: {newRoot: {
+                k: {$_internalIndexKey: {doc: '$$ROOT', spec: {key: {a: 1}, name: 'a_1'}}}
+            }}
+        })")};
+    acr.setPipeline(rawPipeline);
+    // The default test client has no transport session, so it counts as internal and this initial
+    // parse is permitted.
+    auto pipeline =
+        pipeline_factory::makePipeline(rawPipeline, expCtx, pipeline_factory::kOptionsMinimal);
+
+    auto aggShape = std::make_unique<query_shape::AggCmdShape>(
+        acr, acr.getNamespace(), pipeline->getInvolvedCollections(), *pipeline, expCtx);
+
+    // Assert the stored form explicitly, rather than relying on the constructor happening to
+    // serialize the pipeline. This is all the shape retains: the Pipeline built above is discarded,
+    // so what gets re-parsed below is this BSON and nothing else. Requesting the representative
+    // options returns that stored copy directly, without a re-parse.
+    auto stored = aggShape->toBson(
+        expCtx->getOperationContext(),
+        query_shape::SerializationOptions::kRepresentativeQueryShapeSerializeOptions,
+        SerializationContext::stateDefault());
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT (test auto-update)
+        R"({
+            "cmdNs": {
+                "db": "testDB",
+                "coll": "testColl"
+            },
+            "command": "aggregate",
+            "pipeline": [
+                {
+                    "$replaceRoot": {
+                        "newRoot": {
+                            "k": {
+                                "$_internalIndexKey": {
+                                    "doc": "$$ROOT",
+                                    "spec": {
+                                        "key": {
+                                            "a": 1
+                                        },
+                                        "name": "a_1"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        })",
+        stored);
+
+    auto aggKey = std::make_unique<AggKey>(
+        expCtx, acr, std::move(aggShape), pipeline->getInvolvedCollections(), collectionType);
+
+    // A client with a transport session and no internal tag is an external (user) client.
+    auto readClient = getServiceContext()->getService()->makeClient(
+        "external", transport::MockSession::create(/*transportLayer=*/nullptr));
+    auto readOpCtx = readClient->makeOperationContext();
+    auto shapified =
+        aggKey->toBson(readOpCtx.get(),
+                       query_shape::SerializationOptions::kDebugShapeAndMarkIdentifiers_FOR_TEST,
+                       SerializationContext::stateDefault());
+
+    ASSERT_BSONOBJ_EQ_AUTO(  // NOLINT (test auto-update)
+        R"({
+            "queryShape": {
+                "cmdNs": {
+                    "db": "HASH<testDB>",
+                    "coll": "HASH<testColl>"
+                },
+                "command": "aggregate",
+                "pipeline": [
+                    {
+                        "$replaceRoot": {
+                            "newRoot": {
+                                "HASH<k>": {
+                                    "$_internalIndexKey": {
+                                        "doc": "$$ROOT",
+                                        "spec": {
+                                            "key": {
+                                                "a": 1
+                                            },
+                                            "name": "a_1"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            "collectionType": "collection"
+        })",
+        shapified);
 }
 
 TEST_F(QueryStatsStoreTest,

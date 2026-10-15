@@ -21,23 +21,71 @@
 #
 last-patch:
   all:
+    - test_file: jstests/auth/apply_ops_uuid_ddl_auth_divergence.js
+      ticket: SERVER-130139
+    - test_file: jstests/concurrency/fsm_workloads/ddl/random_ddl/random_ddl_critical_section_with_replica_set_write_block.js
+      ticket: SERVER-121079
+    - test_file: jstests/concurrency/fsm_workloads/ddl/random_ddl/random_ddl_replica_set_write_block.js
+      ticket: SERVER-121079
+    - test_file: jstests/core/administrative/block_replica_set_writes.js
+      ticket: SERVER-121079
     - test_file: jstests/core/index/wildcard/compound_wildcard_index_residual.js
       ticket: SERVER-83322
     - test_file: jstests/core/index/wildcard/wildcard_index_basic_index_bounds.js
       ticket: SERVER-83322
+    - test_file: jstests/core/query/boolean_simplifier_tautology.js
+      ticket: SERVER-131802
     - test_file: jstests/core/query/distinct/distinct_replanning.js
       ticket: SERVER-125858
     - test_file: jstests/core/query/group_sbe_accumulator_limit.js
       ticket: SERVER-118700
+    - test_file: jstests/core/query/parsing/write_command_duplicate_stmt_ids_validation.js
+      ticket: SERVER-131326
+    - test_file: jstests/core/query/query_settings/query_settings_raw_data.js
+      ticket: SERVER-112940
+    - test_file: jstests/core/query/where/where_system_js.js
+      ticket: SERVER-130167
     - test_file: jstests/core/timeseries/ddl/reindex_timeseries.js
       ticket: SERVER-127051
+    - test_file: jstests/core/txns/multi_statement_transaction_command_args.js
+      ticket: SERVER-127661
     - test_file: jstests/fle2/implicit_ecoc_creation.js
       ticket: SERVER-126384
+    - test_file: jstests/noPassthrough/network/min_wait_streaming_hello_mongos.js
+      ticket: SERVER-132650
+    - test_file: jstests/sharding/internal_txns/retryable_writes_oplog_entries.js
+      ticket: SERVER-131326
+    - test_file: jstests/sharding/txn_prepared_participant_unauthorized_commit_abort.js
+      ticket: SERVER-130544
   suites: null
 last-continuous:
   all:
+    - test_file: jstests/aggregation/accumulators/percentiles_syntax.js
+      ticket: SERVER-129617
+    - test_file: jstests/aggregation/expressions/const_literal_bindata_restricted_subtypes.js
+      ticket: SERVER-130168
+    - test_file: jstests/aggregation/expressions/convert_bindata.js
+      ticket: SERVER-129103
+    - test_file: jstests/aggregation/expressions/convert_bindata_restricted_subtypes.js
+      ticket: SERVER-130168
+    - test_file: jstests/aggregation/expressions/percentile_expression_syntax.js
+      ticket: SERVER-129617
+    - test_file: jstests/aggregation/expressions/regex_backslash_c.js
+      ticket: SERVER-127985
+    - test_file: jstests/aggregation/expressions/subtype.js
+      ticket: SERVER-129103
+    - test_file: jstests/auth/apply_ops_uuid_ddl_auth_divergence.js
+      ticket: SERVER-130139
+    - test_file: jstests/concurrency/fsm_workloads/ddl/random_ddl/random_ddl_critical_section_with_replica_set_write_block.js
+      ticket: SERVER-121079
+    - test_file: jstests/concurrency/fsm_workloads/ddl/random_ddl/random_ddl_replica_set_write_block.js
+      ticket: SERVER-121079
+    - test_file: jstests/concurrency/fsm_workloads/random_moveChunk/random_moveChunk_timeseries_reopening_stale_config.js
+      ticket: SERVER-131302
     - test_file: jstests/concurrency/fsm_workloads/random_moveChunk/random_moveChunk_with_maxkey_docs.js
       ticket: SERVER-121533
+    - test_file: jstests/core/administrative/block_replica_set_writes.js
+      ticket: SERVER-121079
     - test_file: jstests/core/administrative/filemd5.js
       ticket: SERVER-119317
     - test_file: jstests/core/clustered/clustered_collection_bounded_scan.js
@@ -46,6 +94,8 @@ last-continuous:
       ticket: SERVER-124967
     - test_file: jstests/core/index/geo/geo_circle_spilling.js
       ticket: SERVER-124376
+    - test_file: jstests/core/index/geo/geo_s2stale_polygon_parse.js
+      ticket: SERVER-130202
     - test_file: jstests/core/index/index_on_incorrect_collection.js
       ticket: SERVER-121132
     - test_file: jstests/core/index/not_index_tagging.js
@@ -54,14 +104,22 @@ last-continuous:
       ticket: SERVER-83322
     - test_file: jstests/core/index/wildcard/wildcard_index_basic_index_bounds.js
       ticket: SERVER-83322
+    - test_file: jstests/core/query/boolean_simplifier_tautology.js
+      ticket: SERVER-131802
     - test_file: jstests/core/query/distinct/distinct_replanning.js
       ticket: SERVER-125858
     - test_file: jstests/core/query/group_sbe_accumulator_limit.js
       ticket: SERVER-118700
+    - test_file: jstests/core/query/parsing/write_command_duplicate_stmt_ids_validation.js
+      ticket: SERVER-131326
+    - test_file: jstests/core/query/query_settings/query_settings_raw_data.js
+      ticket: SERVER-112940
+    - test_file: jstests/core/query/sbe/sbe_prepare_for_decimal123_invalidation.js
+      ticket: SERVER-130247
     - test_file: jstests/core/query/sparse_index_supports_ne_null.js
       ticket: SERVER-125555
-    - test_file: jstests/core/repro/dbcase2.js
-      ticket: SERVER-95530
+    - test_file: jstests/core/query/where/where_system_js.js
+      ticket: SERVER-130167
     - test_file: jstests/core/timeseries/ddl/reindex_timeseries.js
       ticket: SERVER-127051
     - test_file: jstests/core/timeseries/query/timeseries_explain_delete.js
@@ -70,10 +128,16 @@ last-continuous:
       ticket: SERVER-95352
     - test_file: jstests/core/timeseries/write/timeseries_bypass_document_validation_raw_buckets.js
       ticket: SERVER-121714
+    - test_file: jstests/core/txns/multi_statement_transaction_command_args.js
+      ticket: SERVER-127661
     - test_file: jstests/fle2/implicit_ecoc_creation.js
       ticket: SERVER-126384
     - test_file: jstests/noPassthrough/ddl/clear_jumbo.js
       ticket: SERVER-125661
+    - test_file: jstests/noPassthrough/network/min_wait_streaming_hello_mongos.js
+      ticket: SERVER-132650
+    - test_file: jstests/noPassthrough/query/runtime_constants_user_roles_auth_bypass.js
+      ticket: SERVER-128433
     - test_file: jstests/noPassthrough/read_write_concern/read_pref.js
       ticket: SERVER-128221
     - test_file: jstests/noPassthrough/read_write_concern/read_preference_metrics_mongos.js
@@ -82,6 +146,8 @@ last-continuous:
       ticket: SERVER-123567
     - test_file: jstests/noPassthrough/txns_retryable_writes_sessions/transaction_open_limit.js
       ticket: SERVER-108215
+    - test_file: jstests/replsets/arbiter_afterClusterTime_read_concern.js
+      ticket: SERVER-130759
     - test_file: jstests/replsets/atlas_initialsync_workflows.js
       ticket: SERVER-128307
     - test_file: jstests/replsets/force_reconfig_sets_newly_added_field_correctly.js
@@ -120,10 +186,18 @@ last-continuous:
       ticket: SERVER-127620
     - test_file: jstests/sharding/chunk_migration_maxkey_boundary.js
       ticket: SERVER-121533
+    - test_file: jstests/sharding/internal_txns/retryable_writes_oplog_entries.js
+      ticket: SERVER-131326
+    - test_file: jstests/sharding/query/change_streams/change_stream_update_lookup_sharded_insert_update.js
+      ticket: SERVER-131202
+    - test_file: jstests/sharding/range_deleter_does_not_block_stepdown_with_prepare_conflict.js
+      ticket: SERVER-131283
     - test_file: jstests/sharding/read_write_concern_defaults_application.js
       ticket: SERVER-127620
     - test_file: jstests/sharding/safe_secondary_reads_single_migration_suspend_range_deletion.js
       ticket: SERVER-127620
+    - test_file: jstests/sharding/txn_prepared_participant_unauthorized_commit_abort.js
+      ticket: SERVER-130544
   suites: null
 last-lts:
   all:
@@ -131,20 +205,36 @@ last-lts:
       ticket: SERVER-112267
     - test_file: jstests/aggregation/accumulators/group_doing_merge.js
       ticket: SERVER-99616
+    - test_file: jstests/aggregation/accumulators/percentiles_syntax.js
+      ticket: SERVER-129617
     - test_file: jstests/aggregation/bugs/lookup_using_hashed_index.js
       ticket: SERVER-92668
     - test_file: jstests/aggregation/bugs/server94212.js
       ticket: SERVER-94212
+    - test_file: jstests/aggregation/expressions/const_literal_bindata_restricted_subtypes.js
+      ticket: SERVER-130168
+    - test_file: jstests/aggregation/expressions/convert_bindata.js
+      ticket: SERVER-129103
+    - test_file: jstests/aggregation/expressions/convert_bindata_restricted_subtypes.js
+      ticket: SERVER-130168
     - test_file: jstests/aggregation/expressions/null_chars_string_input.js
       ticket: SERVER-95687
+    - test_file: jstests/aggregation/expressions/percentile_expression_syntax.js
+      ticket: SERVER-129617
     - test_file: jstests/aggregation/expressions/reduce_overflow.js
       ticket: SERVER-102364
+    - test_file: jstests/aggregation/expressions/regex_backslash_c.js
+      ticket: SERVER-127985
+    - test_file: jstests/aggregation/expressions/subtype.js
+      ticket: SERVER-129103
     - test_file: jstests/aggregation/expressions/trim.js
       ticket: SERVER-120668
     - test_file: jstests/aggregation/group_by_objectid.js
       ticket: SERVER-90173
     - test_file: jstests/aggregation/group_with_acc_n_to_distinct_scan.js
       ticket: SERVER-90017
+    - test_file: jstests/aggregation/optimization/do_not_push_match_past_rename_onto_dotted_path.js
+      ticket: SERVER-132414
     - test_file: jstests/aggregation/optimization/elemmatch_deps.js
       ticket: SERVER-112844
     - test_file: jstests/aggregation/optimization/match_swapping_renamed_fields.js
@@ -165,6 +255,8 @@ last-lts:
       ticket: SERVER-90485
     - test_file: jstests/aggregation/variables/subpipeline_system_variables.js
       ticket: SERVER-114384
+    - test_file: jstests/auth/apply_ops_uuid_ddl_auth_divergence.js
+      ticket: SERVER-130139
     - test_file: jstests/auth/commands_builtin_roles_replset.js
       ticket: SERVER-92411
     - test_file: jstests/auth/curop_auth_info.js
@@ -217,6 +309,10 @@ last-lts:
       ticket: SERVER-99618
     - test_file: jstests/concurrency/fsm_workloads/ddl/collMod/collMod_options_with_index_ops.js
       ticket: SERVER-107819
+    - test_file: jstests/concurrency/fsm_workloads/ddl/random_ddl/random_ddl_critical_section_with_replica_set_write_block.js
+      ticket: SERVER-121079
+    - test_file: jstests/concurrency/fsm_workloads/ddl/random_ddl/random_ddl_replica_set_write_block.js
+      ticket: SERVER-121079
     - test_file: jstests/concurrency/fsm_workloads/query/remove/update_and_batched_delete.js
       ticket: SERVER-95570
     - test_file: jstests/concurrency/fsm_workloads/query/update/upsert_unique_index_collation.js
@@ -225,6 +321,8 @@ last-lts:
       ticket: SERVER-94787
     - test_file: jstests/concurrency/fsm_workloads/random_moveChunk/random_moveChunk_multi_update_delete_paused_migrations.js
       ticket: SERVER-97297
+    - test_file: jstests/concurrency/fsm_workloads/random_moveChunk/random_moveChunk_timeseries_reopening_stale_config.js
+      ticket: SERVER-131302
     - test_file: jstests/concurrency/fsm_workloads/random_moveChunk/random_moveChunk_with_maxkey_docs.js
       ticket: SERVER-121533
     - test_file: jstests/concurrency/fsm_workloads/random_update_delete_with_move_collection.js
@@ -235,6 +333,8 @@ last-lts:
       ticket: SERVER-113887
     - test_file: jstests/concurrency/fsm_workloads/timeseries/timeseries_reshard_with_inserts.js
       ticket: SERVER-93149
+    - test_file: jstests/core/administrative/block_replica_set_writes.js
+      ticket: SERVER-121079
     - test_file: jstests/core/administrative/connection_status.js
       ticket: SERVER-95952
     - test_file: jstests/core/administrative/filemd5.js
@@ -301,6 +401,8 @@ last-lts:
       ticket: SERVER-91616
     - test_file: jstests/core/query/boolean_simplifier_stress.js
       ticket: SERVER-114126
+    - test_file: jstests/core/query/boolean_simplifier_tautology.js
+      ticket: SERVER-131802
     - test_file: jstests/core/query/collation/collation.js
       ticket: SERVER-115810
     - test_file: jstests/core/query/collation/collation_mismatch_mapreduce.js
@@ -341,6 +443,8 @@ last-lts:
       ticket: SERVER-98676
     - test_file: jstests/core/query/notablescan_sbe_consistency.js
       ticket: SERVER-110058
+    - test_file: jstests/core/query/parsing/write_command_duplicate_stmt_ids_validation.js
+      ticket: SERVER-131326
     - test_file: jstests/core/query/partial_index_pbt.js
       ticket: SERVER-102825
     - test_file: jstests/core/query/plan_cache/elem_match_index_diff_types.js
@@ -375,6 +479,8 @@ last-lts:
       ticket: SERVER-91954
     - test_file: jstests/core/query/query_settings/query_settings_query_framework.js
       ticket: SERVER-91954
+    - test_file: jstests/core/query/query_settings/query_settings_raw_data.js
+      ticket: SERVER-112940
     - test_file: jstests/core/query/query_settings/query_settings_reject_application.js
       ticket: SERVER-91954
     - test_file: jstests/core/query/query_settings/query_settings_reject_application_bypass.js
@@ -395,6 +501,8 @@ last-lts:
       ticket: SERVER-91616
     - test_file: jstests/core/query/regex/regex_max_pattern_length.js
       ticket: SERVER-86326
+    - test_file: jstests/core/query/sbe/sbe_prepare_for_decimal123_invalidation.js
+      ticket: SERVER-130247
     - test_file: jstests/core/query/sbe/sbe_unwind_empty_array_index.js
       ticket: SERVER-116450
     - test_file: jstests/core/query/sort/sortk.js
@@ -403,8 +511,8 @@ last-lts:
       ticket: SERVER-125555
     - test_file: jstests/core/query/update/update_set_unset.js
       ticket: SERVER-103960
-    - test_file: jstests/core/repro/dbcase2.js
-      ticket: SERVER-95530
+    - test_file: jstests/core/query/where/where_system_js.js
+      ticket: SERVER-130167
     - test_file: jstests/core/sparse_index_supports_ne_null.js
       ticket: SERVER-37164
     - test_file: jstests/core/timeseries/ddl/reindex_timeseries.js
@@ -467,6 +575,8 @@ last-lts:
       ticket: SERVER-93099
     - test_file: jstests/core/txns/multi_statement_transaction_abort.js
       ticket: SERVER-84081
+    - test_file: jstests/core/txns/multi_statement_transaction_command_args.js
+      ticket: SERVER-127661
     - test_file: jstests/core/txns/rename_collection_not_blocked_by_txn.js
       ticket: SERVER-106706
     - test_file: jstests/core/write/bypass_empty_ts_replacement.js
@@ -505,6 +615,8 @@ last-lts:
       ticket: SERVER-93149
     - test_file: jstests/noPassthrough/move_primary_failpoint.js
       ticket: SERVER-90465
+    - test_file: jstests/noPassthrough/network/min_wait_streaming_hello_mongos.js
+      ticket: SERVER-132650
     - test_file: jstests/noPassthrough/network/set_step_params.js
       ticket: SERVER-102477
     - test_file: jstests/noPassthrough/profile_planning_time_stats.js
@@ -515,6 +627,8 @@ last-lts:
       ticket: SERVER-110058
     - test_file: jstests/noPassthrough/query/out_merge/out_timeseries_cleans_up_bucket_collections.js
       ticket: SERVER-93149
+    - test_file: jstests/noPassthrough/query/runtime_constants_user_roles_auth_bypass.js
+      ticket: SERVER-128433
     - test_file: jstests/noPassthrough/read_write_concern/read_pref.js
       ticket: SERVER-128221
     - test_file: jstests/noPassthrough/read_write_concern/read_preference_metrics_mongos.js
@@ -531,6 +645,8 @@ last-lts:
       ticket: SERVER-108215
     - test_file: jstests/query_golden/distinct_index_eligibility_md.js
       ticket: SERVER-111486
+    - test_file: jstests/replsets/arbiter_afterClusterTime_read_concern.js
+      ticket: SERVER-130759
     - test_file: jstests/replsets/atlas_initialsync_workflows.js
       ticket: SERVER-128307
     - test_file: jstests/replsets/auth_coordinateCommitTransaction.js
@@ -683,6 +799,8 @@ last-lts:
       ticket: SERVER-103566
     - test_file: jstests/sharding/index_not_cloned_on_non_owner_shards.js
       ticket: SERVER-102165
+    - test_file: jstests/sharding/internal_txns/retryable_writes_oplog_entries.js
+      ticket: SERVER-131326
     - test_file: jstests/sharding/invalid_shard_identity_doc.js
       ticket: SERVER-88735
     - test_file: jstests/sharding/killop.js
@@ -725,6 +843,8 @@ last-lts:
       ticket: SERVER-120349
     - test_file: jstests/sharding/query/change_streams/change_stream_update_lookup_collation.js
       ticket: SERVER-95976
+    - test_file: jstests/sharding/query/change_streams/change_stream_update_lookup_sharded_insert_update.js
+      ticket: SERVER-131202
     - test_file: jstests/sharding/query/explain/explain_find_transformed_query.js
       ticket: SERVER-82471
     - test_file: jstests/sharding/query/index_scan_in_backward_direction.js
@@ -739,6 +859,8 @@ last-lts:
       ticket: SERVER-92690
     - test_file: jstests/sharding/query/owning_shard_expression.js
       ticket: SERVER-95670
+    - test_file: jstests/sharding/range_deleter_does_not_block_stepdown_with_prepare_conflict.js
+      ticket: SERVER-131283
     - test_file: jstests/sharding/read_write_concern_defaults_application.js
       ticket: SERVER-127620
     - test_file: jstests/sharding/refresh_sessions.js
@@ -845,6 +967,8 @@ last-lts:
       ticket: SERVER-107535
     - test_file: jstests/sharding/txn_participant_adds_additional_participants.js
       ticket: SERVER-89806
+    - test_file: jstests/sharding/txn_prepared_participant_unauthorized_commit_abort.js
+      ticket: SERVER-130544
     - test_file: jstests/sharding/txn_two_phase_commit_failover.js
       ticket: SERVER-41314
     - test_file: jstests/sharding/txn_two_phase_commit_killop.js

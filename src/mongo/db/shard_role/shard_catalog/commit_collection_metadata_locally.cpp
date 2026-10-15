@@ -283,17 +283,23 @@ repl::MutableOplogEntry makeShardCatalogCommandOplogEntry(OperationContext* opCt
 void logShardCatalogCommandOplogEntry(OperationContext* opCtx,
                                       repl::MutableOplogEntry& oplogEntry,
                                       const char* opName) {
+    repl::OpTime slot;
     writeConflictRetry(opCtx, opName, NamespaceString::kRsOplogNamespace, [&] {
         AutoGetOplogFastPath oplogWrite(opCtx, OplogAccessMode::kWrite);
         WriteUnitOfWork wuow(opCtx);
-        repl::OpTime opTime = repl::logOp(opCtx, &oplogEntry);
+        slot = repl::logOp(opCtx, &oplogEntry);
         uassert(10281501,
                 str::stream() << "Failed to create new oplog entry for " << opName
                               << " with opTime: " << oplogEntry.getOpTime().toString() << ": "
                               << redact(oplogEntry.toBSON()),
-                !opTime.isNull());
+                !slot.isNull());
         wuow.commit();
     });
+
+    // repl::logOp() clears the mutable oplog entry's OpTime before returning so the entry can be
+    // reused on a write-conflict retry. Restore the OpTime to the actual value after the oplog
+    // entry is successfully committed; otherwise, it will remain 0.
+    oplogEntry.setOpTime(slot);
 }
 
 void invalidateCollectionMetadata(
@@ -328,6 +334,18 @@ void setAllowChunkOperationsOnSecondaries(OperationContext* opCtx,
     auto entry = SetAllowChunkOperationsOplogEntry{std::string(nss.coll()), allowChunkOperations};
     auto oplogEntry = makeShardCatalogCommandOplogEntry(opCtx, nss, uuid, entry.toBSON());
     logShardCatalogCommandOplogEntry(opCtx, oplogEntry, "setAllowChunkOperations");
+}
+
+repl::MutableOplogEntry makeGlobalShardCatalogCommandOplogEntry(OperationContext* opCtx,
+                                                                BSONObj object) {
+    repl::MutableOplogEntry oplogEntry;
+    oplogEntry.setOpType(repl::OpTypeEnum::kCommand);
+    oplogEntry.setVersionContextIfHasOperationFCV(VersionContext::getDecoration(opCtx));
+    oplogEntry.setNss(NamespaceString::makeCommandNamespace(DatabaseName::kAdmin));
+    oplogEntry.setObject(std::move(object));
+    oplogEntry.setOpTime(OplogSlot());
+    oplogEntry.setWallClockTime(opCtx->fastClockSource().now());
+    return oplogEntry;
 }
 
 CollectionMetadata buildOwnedCollectionMetadata(OperationContext* opCtx,
@@ -613,6 +631,19 @@ void deleteOverlappingChunksLocally(OperationContext* opCtx,
 }
 
 }  // namespace
+
+void commitInvalidateAllCollectionMetadata(OperationContext* opCtx) {
+    LOGV2_DEBUG(13169803, 1, "Emitting invalidateAllCollectionMetadata oplog entry");
+
+    InvalidateAllCollectionMetadataOplogEntry entry;
+    entry.setInvalidateAllCollectionMetadata(1);
+    auto oplogEntry = makeGlobalShardCatalogCommandOplogEntry(opCtx, entry.toBSON());
+
+    logShardCatalogCommandOplogEntry(opCtx, oplogEntry, "invalidateAllCollectionMetadata");
+
+    opCtx->getServiceContext()->getOpObserver()->onInvalidateAllCollectionMetadata(
+        opCtx, repl::OplogEntry(oplogEntry.toBSON()));
+}
 
 void commitDropCollectionLocally(OperationContext* opCtx,
                                  const NamespaceString& nss,
@@ -1014,10 +1045,10 @@ void commitDropOfStaleChunksForRename(OperationContext* opCtx,
     // consistent view of the data) or none (and thus fail the read):
     // * Dropping the collection entry first means that either the disk recovery sees all previous
     //   metadata or nothing.
-    // * The invalidate is done first in order to inform concurrent recoverers that the data they
-    //   read is no longer valid.
+    // * The invalidate is done first in order to inform concurrent metadata synchronizers that the
+    //   data they read is no longer valid.
     // * And finally the last clear ensures that if any recovery succeeded before the invalidate got
-    //   received by the recoverer then it will leave the CSR in the cleared state for future
+    //   received by the synchronizer then it will leave the CSR in the cleared state for future
     //   readers.
     //
     // This is exclusively a problem for PIT readers on shards that no longer own any chunk and

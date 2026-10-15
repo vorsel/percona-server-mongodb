@@ -14,26 +14,23 @@ namespace mongo {
 class [[MONGO_MOD_PARENT_PRIVATE]] CollectionShardingMetadataStatistics {
 public:
     void report(BSONObjBuilder& builder) const {
-        builder.append("countRecoverersCreated", _countRecoverersCreated.get());
+        builder.append("countMetadataSynchronizersCreated",
+                       _countMetadataSynchronizersCreated.get());
         builder.append("countDiskRecoveriesPerformed", _countDiskRecoveriesPerformed.get());
-        builder.append("countVersionMismatchResolutionsBeforeRecovery",
-                       _countVersionMismatchResolutionsBeforeRecovery.get());
-        builder.append("countVersionMismatchResolutionsAfterRecovery",
-                       _countVersionMismatchResolutionsAfterRecovery.get());
+        builder.append("countVersionMismatchResolutions", _countVersionMismatchResolutions.get());
         builder.append("countPostRecoveryWaitsResolvedByConfigTime",
                        _countPostRecoveryWaitsResolvedByConfigTime.get());
         builder.append("countPostRecoveryWaitsResolvedByVersionChange",
                        _countPostRecoveryWaitsResolvedByVersionChange.get());
         builder.append("totalPostRecoveryWaitMillis", _totalPostRecoveryWaitMillis.get());
         builder.append("totalDiskRecoveryMillis", _totalDiskRecoveryMillis.get());
-        builder.append("countDiskRecoveryNoProgressRetries",
-                       _countDiskRecoveryNoProgressRetries.get());
-        builder.append("countDiskRecoveryAttemptsExhausted",
-                       _countDiskRecoveryAttemptsExhausted.get());
+        builder.append("totalDiskRecoveryChunksRead", _totalDiskRecoveryChunksRead.get());
         builder.append("countInvalidateCollectionMetadataOplogEntriesApplied",
                        _countInvalidateCollectionMetadataOplogEntriesApplied.get());
         builder.append("countInvalidateCollectionMetadataOplogEntriesForDroppedCollections",
                        _countInvalidateCollectionMetadataOplogEntriesForDroppedCollections.get());
+        builder.append("countInvalidateAllCollectionMetadataOplogEntriesApplied",
+                       _countInvalidateAllCollectionMetadataOplogEntriesApplied.get());
         builder.append("countUpdateCollectionMetadataOplogEntriesApplied",
                        _countUpdateCollectionMetadataOplogEntriesApplied.get());
         builder.append("countUpdateCollectionMetadataChangedChunksApplied",
@@ -53,20 +50,16 @@ public:
                        _countLocalCollectionMetadataRenames.get());
     }
 
-    void registerRecovererCreated() {
-        _countRecoverersCreated.incrementRelaxed();
+    void registerMetadataSynchronizerCreated() {
+        _countMetadataSynchronizersCreated.incrementRelaxed();
     }
 
     void registerDiskRecovery() {
         _countDiskRecoveriesPerformed.incrementRelaxed();
     }
 
-    void registerVersionMismatchResolvedBeforeRecovery() {
-        _countVersionMismatchResolutionsBeforeRecovery.incrementRelaxed();
-    }
-
-    void registerVersionMismatchResolvedAfterRecovery() {
-        _countVersionMismatchResolutionsAfterRecovery.incrementRelaxed();
+    void registerVersionMismatchResolved() {
+        _countVersionMismatchResolutions.incrementRelaxed();
     }
 
     void registerPostRecoveryWaitResolvedByConfigTime() {
@@ -85,12 +78,8 @@ public:
         _totalDiskRecoveryMillis.incrementRelaxed(millis);
     }
 
-    void registerDiskRecoveryNoProgressRetry() {
-        _countDiskRecoveryNoProgressRetries.incrementRelaxed();
-    }
-
-    void registerDiskRecoveryAttemptsExhausted() {
-        _countDiskRecoveryAttemptsExhausted.incrementRelaxed();
+    void registerDiskRecoveryChunksRead(long long numChunks) {
+        _totalDiskRecoveryChunksRead.incrementRelaxed(numChunks);
     }
 
     void registerInvalidateCollectionMetadataOplogEntryApplied(bool forDroppedCollection) {
@@ -98,6 +87,10 @@ public:
         if (forDroppedCollection) {
             _countInvalidateCollectionMetadataOplogEntriesForDroppedCollections.incrementRelaxed();
         }
+    }
+
+    void registerInvalidateAllCollectionMetadataOplogEntryApplied() {
+        _countInvalidateAllCollectionMetadataOplogEntriesApplied.incrementRelaxed();
     }
 
     void registerUpdateCollectionMetadataOplogEntryApplied(long long numChangedChunks) {
@@ -134,14 +127,13 @@ public:
     }
 
 private:
-    // CollectionCacheRecoverer instances registered under the CSR exclusive lock.
-    Counter64 _countRecoverersCreated;
+    // CollectionMetadataSynchronizer instances registered under the CSR exclusive lock.
+    Counter64 _countMetadataSynchronizersCreated;
     // Completed on-disk authoritative collection metadata recovery rounds.
     Counter64 _countDiskRecoveriesPerformed;
-    // Mismatches resolved without reading disk (cached CSS already sufficient).
-    Counter64 _countVersionMismatchResolutionsBeforeRecovery;
-    // Mismatches resolved after on-disk recovery (CSS now matches router view).
-    Counter64 _countVersionMismatchResolutionsAfterRecovery;
+    // Authoritative shard-version mismatches resolved (cached CSS sufficient, or after recovery /
+    // configTime wait).
+    Counter64 _countVersionMismatchResolutions;
     // Post-recovery waits that completed once cluster configTime advanced.
     Counter64 _countPostRecoveryWaitsResolvedByConfigTime;
     // Post-recovery waits that completed when the CSS placement version changed.
@@ -150,14 +142,14 @@ private:
     Counter64 _totalPostRecoveryWaitMillis;
     // Wall-clock time spent in on-disk recovery (snapshot wait + drain + install).
     Counter64 _totalDiskRecoveryMillis;
-    // Recovery-loop iterations that made no progress against the no-progress budget.
-    Counter64 _countDiskRecoveryNoProgressRetries;
-    // Recoveries that exhausted the no-progress budget and surfaced StaleConfig.
-    Counter64 _countDiskRecoveryAttemptsExhausted;
+    // Total chunks read from the on-disk shard catalog across all disk recoveries.
+    Counter64 _totalDiskRecoveryChunksRead;
     // invalidateCollectionMetadata ('c') oplog entries applied on replication secondaries.
     Counter64 _countInvalidateCollectionMetadataOplogEntriesApplied;
     // Subset of the above for dropped/untracked collection clears.
     Counter64 _countInvalidateCollectionMetadataOplogEntriesForDroppedCollections;
+    // invalidateAllCollectionMetadata ('c') oplog entries applied on replication secondaries.
+    Counter64 _countInvalidateAllCollectionMetadataOplogEntriesApplied;
     // updateCollectionMetadata ('c') oplog entries applied on replication secondaries.
     Counter64 _countUpdateCollectionMetadataOplogEntriesApplied;
     // Total changed chunks merged by those updateCollectionMetadata delta applications.

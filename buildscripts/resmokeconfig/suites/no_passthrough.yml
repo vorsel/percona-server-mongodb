@@ -20,6 +20,7 @@ selector:
     - jstests/noPassthrough/libs/**/*.js
   exclude_with_any_tags:
     - requires_kernel_619
+    - requires_kernel_7014
 
 # noPassthrough tests start their own mongod's.
 executor:
@@ -31,4 +32,14 @@ executor:
       - src/mongo/db/modules/*/jstests/live_restore/*.js
   config:
     shell_options:
+      global_vars:
+        TestData:
+          setParameters:
+            # Test extensions are signed with a test key, never the production key, so they cannot
+            # pass signature validation on secure-mode (release) builds -- where this suite runs as a
+            # release_critical task. Disable validation so jstests/noPassthrough/extensions/* can load
+            # their test-signed extensions.
+            featureFlagExtensionsApiSignatureValidation: false
+          setParametersMongos:
+            featureFlagExtensionsApiSignatureValidation: false
       nodb: ""

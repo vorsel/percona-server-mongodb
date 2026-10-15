@@ -556,6 +556,7 @@ mongo_cc_library(
         "//conditions:default": [],
     }) + select({
         "//bazel/config:enterprise_feature_ldap_enabled": [
+            "//src/mongo/db/modules/enterprise/src/ldap:ldap_check_cyrus_sasl_version",
             "//src/mongo/db/modules/enterprise/src/ldap:ldap_health_observer",
             "//src/mongo/db/modules/enterprise/src/ldap:ldap_manager_init",
         ],
@@ -573,7 +574,7 @@ mongo_cc_library(
         ],
         "//conditions:default": [],
     }) + select({
-        "//bazel/config:server_js_enabled": [
+        "//bazel/config:server_js_engine_allowed": [
             "//src/mongo/scripting:scripting_server",
         ],
         "//conditions:default": ["//src/mongo/scripting:scripting_none"],

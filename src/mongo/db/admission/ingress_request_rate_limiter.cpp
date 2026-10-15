@@ -7,18 +7,16 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/bson/json.h"
 #include "mongo/db/admission/app_name_exemption_matcher.h"
-#include "mongo/db/admission/ingress_admission_context.h"
+#include "mongo/db/admission/ingress_request_admission_context.h"
 #include "mongo/db/admission/ingress_request_rate_limiter_gen.h"
 #include "mongo/db/admission/rate_limiter_otel_metrics_recorder.h"
 #include "mongo/db/admission/ticketing/admission_context.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/curop.h"
 #include "mongo/db/service_context.h"
 #include "mongo/otel/metrics/metric_names.h"
 #include "mongo/rpc/metadata/client_metadata.h"
 #include "mongo/transport/cidr_range_list_parameter.h"
 #include "mongo/util/decorable.h"
-#include "mongo/util/scopeguard.h"
 
 #include <memory>
 #include <string_view>
@@ -178,7 +176,7 @@ IngressRequestRateLimiter::IngressRequestRateLimiter()
           static_cast<double>(gIngressRequestRateLimiterRatePerSec.load()),
           gIngressRequestRateLimiterBurstCapacitySecs.load(),
           gIngressRequestAdmissionMaxQueueDepth.load(),
-          "ingressRequestRateLimiter",
+          std::string(kRateLimiterName),
           RateLimiter::Options{.metricsRecorder = std::make_unique<RateLimiterOtelMetricsRecorder>(
                                    ingressRequestRateLimiterSpec())}} {
     if (const auto scopedFp = ingressRequestRateLimiterFractionalRateOverride.scoped();
@@ -195,10 +193,9 @@ IngressRequestRateLimiter& IngressRequestRateLimiter::get(ServiceContext* servic
 void IngressRequestRateLimiter::installOtelMetrics(ServiceContext* svcCtx) {
     _metricsSamplingJob =
         static_cast<RateLimiterOtelMetricsRecorder&>(_rateLimiter.stats())
-            .installOtelMetrics(svcCtx->getPeriodicRunner(),
-                                Seconds{1},
-                                "ingressRequestRateLimiter",
-                                [this] { return _rateLimiter.sampledAvailableTokens(); });
+            .installOtelMetrics(svcCtx->getPeriodicRunner(), Seconds{1}, kRateLimiterName, [this] {
+                return _rateLimiter.sampledAvailableTokens();
+            });
 }
 
 const Status& IngressRequestRateLimiter::rejectionStatus() {
@@ -245,13 +242,14 @@ Status IngressRequestRateLimiter::waitForAdmission(OperationContext* opCtx) {
         return Status::OK();
     }
 
-    WaitingForAdmissionGuard waitingGuard(&IngressAdmissionContext::get(opCtx),
-                                          opCtx->getServiceContext()->getTickSource());
-    // TODO SERVER-131015: remove this pause invocation and rely on the queue registry to account
-    // for this queueing time.
-    CurOp::get(opCtx)->pauseTimer();
-    ON_BLOCK_EXIT([&] { CurOp::get(opCtx)->resumeTimer(); });
-    return std::move(*deferredToken).get(opCtx);
+    auto& admCtx = IngressRequestAdmissionContext::get(opCtx);
+    const Status status = std::move(*deferredToken).get(opCtx, &admCtx);
+
+    if (status.isOK()) {
+        admCtx.recordAdmission();
+    }
+
+    return status;
 }
 
 void IngressRequestRateLimiter::clearDeferredAdmissionToken(Client* client) {

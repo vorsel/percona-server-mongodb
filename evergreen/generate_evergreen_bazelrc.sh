@@ -35,6 +35,21 @@ else
     echo "common --define GIT_COMMIT_HASH=${GIT_REV}" >>.bazelrc.git
 fi
 
+# Size the Bazel server JVM heap as a fraction of the host's physical RAM.
+# Defaults to 0.5 for all Evergreen jobs; individual tasks may override via the
+# bazel_jvm_heap_ram_ratio expansion. This gives the Bazel server enough heap to
+# hold many concurrent, remotely executed actions in memory (most JVMs otherwise
+# default to just 25% of physical RAM). Linux only; /proc/meminfo is unavailable
+# on Windows/macOS.
+bazel_jvm_heap_ram_ratio="${bazel_jvm_heap_ram_ratio:-0.5}"
+if [[ -n "${bazel_jvm_heap_ram_ratio}" ]] && [[ -r /proc/meminfo ]]; then
+    mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    if [[ -n "${mem_kb}" ]]; then
+        xmx_mb=$(awk -v kb="${mem_kb}" -v r="${bazel_jvm_heap_ram_ratio}" 'BEGIN {printf "%d", kb / 1024 * r}')
+        echo "startup --host_jvm_args=-Xmx${xmx_mb}m" >>.bazelrc.evergreen
+    fi
+fi
+
 if [[ "${requester}" == "commit" ]]; then
     mongo_version=$(awk -F'MONGO_VERSION=' '/MONGO_VERSION=/ { split($2, version, /[[:space:]]/); print version[1]; exit }' .bazelrc.target_mongo_version)
     if [[ -z "${mongo_version}" ]]; then
@@ -49,6 +64,17 @@ if [[ "${evergreen_remote_exec}" != "on" ]]; then
     echo "common --remote_executor=" >>.bazelrc.evergreen
     echo "common --modify_execution_info=.*=+no-remote-exec" >>.bazelrc.evergreen
     echo "common --jobs=auto" >>.bazelrc.evergreen
+
+    # The RBE container sysroot dump is only enabled on Amazon Linux 2023
+    # hosts: libs2n aggressively loads the highest openssl symbols available
+    # at build time, which breaks at runtime on older minor versions of other
+    # distros. The sysroot_dump repo rule no-ops on other distros anyway, so
+    # skip the flags entirely elsewhere.
+    # os-release values may be quoted or unquoted depending on the image.
+    if grep -qsE '^ID="?amzn"?$' /etc/os-release && grep -qsE '^VERSION_ID="?2023"?$' /etc/os-release; then
+        echo "common --repo_env=USE_RBE_SYSROOT=1" >>.bazelrc.evergreen
+        echo "common --//bazel/config:use_rbe_sysroot=True" >>.bazelrc.evergreen
+    fi
 fi
 
 uri="https://spruce.mongodb.com/task/${task_id:?}?execution=${execution:?}"

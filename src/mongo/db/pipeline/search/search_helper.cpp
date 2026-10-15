@@ -28,11 +28,13 @@
 #include "mongo/s/query/exec/document_source_merge_cursors.h"
 #include "mongo/util/assert_util.h"
 
+#include <array>
 #include <list>
 #include <set>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include <boost/optional/optional.hpp>
 #include <boost/smart_ptr/intrusive_ptr.hpp>
@@ -187,6 +189,29 @@ parseMongotResponseCursors(std::vector<std::unique_ptr<executor::TaskExecutorCur
     }
     return result;
 }
+
+// Single source of truth for the security-trusted, mongod-owned $vectorSearch field names. mongod
+// derives these from trusted sources (the target collection name, its UUID, and the authorized view
+// name) when building the command sent to mongot.
+constexpr std::array kVectorSearchTrustedFields{mongot_cursor::kVectorSearchCmd,
+                                                mongot_cursor::kCollectionUuidField,
+                                                mongot_cursor::kViewNameField};
+
+static const std::vector<std::string_view>& getInternalOnlyFieldNames() {
+    static const std::vector<std::string_view> fields = {
+        InternalSearchMongotRemoteSpec::kMongotQueryFieldName,
+        InternalSearchMongotRemoteSpec::kMetadataMergeProtocolVersionFieldName,
+        InternalSearchMongotRemoteSpec::kMergingPipelineFieldName,
+        InternalSearchMongotRemoteSpec::kLimitFieldName,
+        InternalSearchMongotRemoteSpec::kRequiresSearchSequenceTokenFieldName,
+        InternalSearchMongotRemoteSpec::kSortSpecFieldName,
+        InternalSearchMongotRemoteSpec::kMongotDocsRequestedFieldName,
+        InternalSearchMongotRemoteSpec::kRequiresSearchMetaCursorFieldName,
+        InternalSearchMongotRemoteSpec::kDocsNeededBoundsFieldName,
+        InternalSearchMongotRemoteSpec::kViewFieldName,
+    };
+    return fields;
+}
 }  // namespace
 
 void planShardedSearch(const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -244,6 +269,18 @@ bool hasReferenceToSearchMeta(const DocumentSource& ds) {
     ds.addVariableRefs(&refs);
     return Variables::hasVariableReferenceTo(refs,
                                              std::set<Variables::Id>{Variables::kSearchMetaId});
+}
+
+void excludeOperationMemoryTrackingForSecondaryMetadataCursor(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx) {
+    if (expCtx->getExcludeOperationMemoryTracking()) {
+        return;
+    }
+    LOGV2_DEBUG(13090700,
+                4,
+                "Disabling operation memory tracking: this $search query establishes a secondary "
+                "metadata cursor that shares the operation's memory tracker");
+    expCtx->setExcludeOperationMemoryTracking(true);
 }
 
 bool canMovePastDuringSplit(const DocumentSource& ds) {
@@ -694,20 +731,20 @@ boost::optional<SearchQueryViewSpec> getViewFromBSONObj(const BSONObj& spec) {
     return boost::none;
 }
 
-void validateViewNotSetByUser(boost::intrusive_ptr<ExpressionContext> expCtx, const BSONObj& spec) {
-    // During $rankFusion parsing, if there's more than 1 mongot input pipeline, a view key will be
-    // injected during the parsing of that mongot stage (ex: $search, $vectorSearch, $searchMeta).
-    // Since $rankFusion passes the serialized version of the parsed pipeline to a
-    // DocumentSource::UnionWith(..) constructor, that serialized pipeline eventually gets reparsed.
-    // Because the view key already exists in the pipeline and the internal client flag is not set,
-    // this internal client error gets thrown.
+void validateInternalSearchFieldsNotSetByUser(const OperationContext* opCtx, const BSONObj& spec) {
+    for (const auto& name : getInternalOnlyFieldNames()) {
+        if (spec.hasField(name)) {
+            assertAllowedInternalIfRequired(opCtx, name, AllowedWithClientType::kInternal);
+        }
+    }
+}
 
-    // To avoid that, the isHybridSearch flag is only set after the initial parsing of the
-    // user-provided $rankFusion/$scoreFusion pipeline and its value is checked here to avoid
-    // throwing an internal client error.
-    if (spec.hasField(kViewFieldName) && !expCtx->isHybridSearch()) {
-        assertAllowedInternalIfRequired(
-            expCtx->getOperationContext(), kViewFieldName, AllowedWithClientType::kInternal);
+void validateUserSpecDoesNotOverrideTrustedFields(const BSONObj& spec) {
+    for (const auto& field : kVectorSearchTrustedFields) {
+        uassert(12961800,
+                str::stream() << "Cannot specify the reserved field '" << field
+                              << "' in a $vectorSearch stage",
+                !spec.hasField(field));
     }
 }
 

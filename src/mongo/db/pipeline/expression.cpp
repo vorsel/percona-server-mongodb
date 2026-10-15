@@ -21,6 +21,8 @@
 // IWYU pragma: no_include <pstl/glue_algorithm_defs.h>
 // IWYU pragma: no_include "boost/container/detail/std_fwd.hpp"
 
+#include "mongo/base/data_view.h"
+#include "mongo/bson/bsonmisc.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/bsontypes_util.h"
 #include "mongo/bson/oid.h"
@@ -230,7 +232,7 @@ intrusive_ptr<Expression> Expression::parseExpression(ExpressionContext* const e
         expCtx->ignoreFeatureInParserOrRejectAndThrow(opName, *entry.featureFlag);
     }
 
-    if (expCtx->getOperationContext()) {
+    if (expCtx->getOperationContext() && !expCtx->getIsReparsingRepresentativeQueryShape()) {
         assertLanguageFeatureIsAllowed(expCtx->getOperationContext(),
                                        opName,
                                        entry.allowedWithApiStrict,
@@ -902,10 +904,55 @@ const char* ExpressionCond::getOpName() const {
 
 /* ---------------------- ExpressionConstant --------------------------- */
 
+namespace {
+// Subtype 7 (Column) is banned; subtypes 2, 3, and 5 are structurally validated.
+void assertNoRestrictedBinDataSubtype(const BSONElement& elem) {
+    if (elem.type() == BSONType::binData) {
+        const auto subtype = elem.binDataType();
+        if (subtype == BinDataType::ByteArrayDeprecated) {
+            int len;
+            const char* data = elem.binData(len);
+            uassert(ErrorCodes::FailedToParse,
+                    "BinData subtype ByteArrayDeprecated (2) requires a valid inner length prefix",
+                    len >= 4 &&
+                        ConstDataView(data).read<LittleEndian<int32_t>>() ==
+                            static_cast<int32_t>(len - 4));
+        }
+        if (subtype == BinDataType::bdtUUID || subtype == BinDataType::MD5Type) {
+            int len;
+            elem.binData(len);
+            uassert(ErrorCodes::FailedToParse,
+                    str::stream() << "BinData subtype " << static_cast<int>(subtype)
+                                  << " requires exactly " << UUID::kNumBytes
+                                  << " bytes as an expression literal",
+                    len == UUID::kNumBytes);
+        }
+        uassert(ErrorCodes::FailedToParse,
+                "BSONColumn (BinData subtype 7) is not allowed as an expression literal",
+                subtype != BinDataType::Column);
+    } else if (elem.type() == BSONType::object || elem.type() == BSONType::array) {
+        for (const auto& child : elem.embeddedObject()) {
+            assertNoRestrictedBinDataSubtype(child);
+        }
+    } else if (elem.type() == BSONType::codeWScope) {
+        for (const auto& child : elem.codeWScopeObject()) {
+            assertNoRestrictedBinDataSubtype(child);
+        }
+    }
+}
+}  // namespace
+
 intrusive_ptr<Expression> ExpressionConstant::parse(ExpressionContext* const expCtx,
                                                     BSONElement exprElement,
                                                     const VariablesParseState& vps) {
-    return new ExpressionConstant(expCtx, Value(exprElement));
+    assertNoRestrictedBinDataSubtype(exprElement);
+    Value exprValue = Value(exprElement);
+    // Shred values when parsing collection-validator constants to avoid lazily
+    // populating the BSON cache on write paths.
+    if (MONGO_unlikely(expCtx->getIsParsingCollectionValidator())) {
+        exprValue = exprValue.shred();
+    }
+    return new ExpressionConstant(expCtx, std::move(exprValue));
 }
 
 
@@ -1649,6 +1696,7 @@ boost::intrusive_ptr<ExpressionObject> ExpressionObject::create(
 intrusive_ptr<ExpressionObject> ExpressionObject::parse(ExpressionContext* const expCtx,
                                                         BSONObj obj,
                                                         const VariablesParseState& vps) {
+    expCtx->checkAndIncrementMemoryIntensiveExprCount("$object"sv);
     // Make sure we don't have any duplicate field names.
     stdx::unordered_set<string> specifiedFields;
 
@@ -3845,6 +3893,7 @@ intrusive_ptr<Expression> ExpressionZip::parse(ExpressionContext* const expCtx,
             str::stream() << "$zip only supports an object as an argument, found "
                           << typeName(expr.type()),
             expr.type() == BSONType::object);
+    expCtx->checkAndIncrementMemoryIntensiveExprCount(expr.fieldNameStringData());
 
     auto useLongestLength = false;
     std::vector<boost::intrusive_ptr<Expression>> children;

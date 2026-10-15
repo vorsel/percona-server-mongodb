@@ -90,10 +90,6 @@ DeduplicatorReporter::DeduplicatorReporter(std::function<void(int64_t, int64_t)>
     tassert(11114200, "Expected positive value for chunkSize", _chunkSize > 0);
 }
 
-void SimpleMemoryUsageTracker::add(int64_t diff) {
-    addInternal(diff, true /* report */);
-}
-
 void SimpleMemoryUsageTracker::addInternal(int64_t diff, bool report) {
     _inUseTrackedMemoryBytes += diff;
     tassert(6128100,
@@ -123,6 +119,19 @@ void SimpleMemoryUsageTracker::addInternal(int64_t diff, bool report) {
         _base->addInternal(diff, report);
     } else if (_writeToCurOp && report) {
         _writeToCurOp(_inUseTrackedMemoryBytes, _peakTrackedMemoryBytes);
+    }
+}
+
+void SimpleMemoryUsageTracker::resetBase(SimpleMemoryUsageTracker* base) {
+    // Move our contribution off the old base and onto the new one so the ancestor chain's totals
+    // stay consistent. When old and new are the same object (e.g. the operation tracker was carried
+    // across a getMore) this nets to zero rather than double-counting.
+    if (_base) {
+        _base->add(-_inUseTrackedMemoryBytes);
+    }
+    _base = base;
+    if (_base) {
+        _base->add(_inUseTrackedMemoryBytes);
     }
 }
 
@@ -200,12 +209,9 @@ void DeduplicatorReporter::add(int64_t bytesDiff, int64_t recordsDiff) {
     }
 }
 
-void SimpleMemoryUsageTracker::assertWithinMemoryLimit(OperationContext* opCtx,
-                                                       std::string_view name,
-                                                       std::string_view stageName) const {
-    if (withinMemoryLimit(opCtx)) {
-        return;
-    }
+void SimpleMemoryUsageTracker::uassertedMemoryLimitExceeded(OperationContext* opCtx,
+                                                            std::string_view name,
+                                                            std::string_view stageName) const {
     str::stream msg;
     msg << name << " needs too much memory.";
     if (!stageName.empty()) {

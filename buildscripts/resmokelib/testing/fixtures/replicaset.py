@@ -225,6 +225,10 @@ class ReplicaSetFixture(interface.ReplFixture, interface._DockerComposeInterface
 
     def setup(self):
         """Set up the replica set."""
+        # Defer mongot readiness until after replSetInitiate.
+        for node in self._all_mongot_nodes():
+            node.defer_mongot_await_ready = True
+
         start_node = 0
         if self.use_auto_bootstrap_procedure:
             # We need to wait for the first node to finish auto-bootstrapping so that we can
@@ -330,7 +334,7 @@ class ReplicaSetFixture(interface.ReplFixture, interface._DockerComposeInterface
             # want to skip reconfiguring the replset (which adds the other nodes
             # to the auto-bootstrapped replset).
             self.logger.info("Configuration exists. Skipping initializing the replset.")
-            self._await_mongot_community()
+            self._await_all_mongots_ready()
             self.removeshard_teardown_marker = False
             return
 
@@ -363,6 +367,10 @@ class ReplicaSetFixture(interface.ReplFixture, interface._DockerComposeInterface
         # When this is True, we are running in Antithesis & modify the config to surface more bugs
         if self.config.NOOP_MONGO_D_S_PROCESSES:
             repl_config["settings"]["electionTimeoutMillis"] = 2000
+            # electionTimeoutMillis must be strictly greater than heartbeatIntervalMillis
+            # (default 2000), so shorten the heartbeat interval rather than lengthening the
+            # election timeout.
+            repl_config["settings"]["heartbeatIntervalMillis"] = 1000
             repl_config["settings"]["chainingAllowed"] = False
             repl_config["settings"]["heartbeatTimeoutSecs"] = 1
             repl_config["settings"]["catchUpTimeoutMillis"] = 0
@@ -389,12 +397,81 @@ class ReplicaSetFixture(interface.ReplFixture, interface._DockerComposeInterface
             # nodes are subsequently added to the set, since such nodes cannot set their FCV to
             # "latest". Therefore, we make sure the primary is "last-lts" FCV before adding in
             # nodes of different binary versions to the replica set.
-            client.admin.command(
-                {
-                    "setFeatureCompatibilityVersion": self.fcv,
-                    "fromConfigServer": True,
-                }
-            )
+            #
+            # An in-flight index build that has pinned a stale Operation FCV will cause setFCV to
+            # fail with BackgroundOperationInProgressForNamespace (12587). Retry until the build
+            # drains; index builds are short-lived at fixture-setup time.
+            #
+            # A previous transition that stopped while cleaning up internal server metadata blocks
+            # any transition in the opposite direction (7428200 if a downgrade stopped, 10778001 if
+            # an upgrade did). The server only accepts continuing in the interrupted direction, so
+            # drive the FCV document's targetVersion to completion and then retry ours.
+            _BACKGROUND_OPERATION_IN_PROGRESS_FOR_NAMESPACE = 12587
+            _INCOMPLETE_TRANSITION_CODES = (7428200, 10778001)
+            _SET_FCV_RETRY_TIMEOUT_SECS = 5 * 60
+            _SET_FCV_RETRY_INTERVAL_SECS = 0.2
+            start_time = time.monotonic()
+            while True:
+                try:
+                    client.admin.command(
+                        {
+                            "setFeatureCompatibilityVersion": self.fcv,
+                            "fromConfigServer": True,
+                        }
+                    )
+                    break
+                except pymongo.errors.OperationFailure as err:
+                    if (
+                        err.code != _BACKGROUND_OPERATION_IN_PROGRESS_FOR_NAMESPACE
+                        and err.code not in _INCOMPLETE_TRANSITION_CODES
+                    ):
+                        raise
+                    elapsed = time.monotonic() - start_time
+                    if elapsed > _SET_FCV_RETRY_TIMEOUT_SECS:
+                        raise pymongo.errors.OperationFailure(
+                            f"setFeatureCompatibilityVersion({self.fcv}) still failing after"
+                            f" {elapsed:.1f}s: {err}",
+                            code=err.code,
+                        )
+                    if err.code in _INCOMPLETE_TRANSITION_CODES:
+                        fcv_doc = client.admin["system.version"].find_one(
+                            {"_id": "featureCompatibilityVersion"}
+                        )
+                        pending_fcv = (fcv_doc or {}).get("targetVersion")
+                        if pending_fcv is None:
+                            raise
+                        self.logger.info(
+                            "Completing an interrupted FCV transition to %s before retrying"
+                            " setFeatureCompatibilityVersion(%s) (%.1fs elapsed): %s",
+                            pending_fcv,
+                            self.fcv,
+                            elapsed,
+                            err,
+                        )
+                        try:
+                            client.admin.command(
+                                {
+                                    "setFeatureCompatibilityVersion": pending_fcv,
+                                    "fromConfigServer": True,
+                                }
+                            )
+                        except pymongo.errors.OperationFailure as completion_err:
+                            # Best effort: the retry below observes the same incomplete-transition
+                            # error and tries again.
+                            self.logger.info(
+                                "Failed to complete the interrupted FCV transition to %s: %s",
+                                pending_fcv,
+                                completion_err,
+                            )
+                    else:
+                        self.logger.info(
+                            "Retrying setFeatureCompatibilityVersion(%s) after"
+                            " BackgroundOperationInProgressForNamespace (%.1fs elapsed): %s",
+                            self.fcv,
+                            elapsed,
+                            err,
+                        )
+                    time.sleep(_SET_FCV_RETRY_INTERVAL_SECS)
 
         if self.nodes[1:]:
             # Wait to connect to each of the secondaries before running the replSetReconfig
@@ -406,15 +483,11 @@ class ReplicaSetFixture(interface.ReplFixture, interface._DockerComposeInterface
             for ind in range(2, len(members) + 1):
                 self._add_node_to_repl_set(client, repl_config, ind, members)
 
-        self._await_mongot_community()
+        # The replica set is initiated and has a primary; per-node mongot lease startup now has a
+        # valid replication source. Await mongot readiness on each node that launched one.
+        self._await_all_mongots_ready()
 
         self.removeshard_teardown_marker = False
-
-    def _await_mongot_community(self):
-        """Wait for mongot-community after the replica set is initialized."""
-        for node in self.nodes:
-            if node.launch_mongot_community_bool and node.mongot is not None:
-                node.await_mongot_community_ready()
 
     def _all_mongo_d_s_t(self):
         """Return a list of all `mongo{d,s,t}` `Process` instances in this fixture."""
@@ -428,6 +501,23 @@ class ReplicaSetFixture(interface.ReplFixture, interface._DockerComposeInterface
     def _all_mongots(self):
         """Return a list of all `mongot` `Process` instances in this fixture."""
         return [node.mongot for node in self.nodes]
+
+    def _all_mongot_nodes(self):
+        """Return the member nodes that may have launched a co-located mongot."""
+        nodes = list(self.nodes)
+        if self.initial_sync_node:
+            nodes.append(self.initial_sync_node)
+        return nodes
+
+    def _await_all_mongots_ready(self):
+        """
+        Await mongot readiness on every node once the replica set is initiated. Deferred out of each
+        node's setup() because mongot's lease manager needs an initiated replica set to replicate
+        from.
+        """
+        for node in self._all_mongot_nodes():
+            node.await_mongot_ready()
+            node.defer_mongot_await_ready = False
 
     def pids(self):
         """:return: all pids owned by this fixture if any."""

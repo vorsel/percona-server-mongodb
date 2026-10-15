@@ -1030,31 +1030,14 @@ SecondParseRequirement maybeApplyViewPipeline(const AggExState& aggExState,
         return SecondParseRequirement::kReparseFromBson;
     }
 
-    // For search queries on views don't do any of the pipeline stitching that is done for
-    // normal views.
-    // TODO SERVER-115069 Remove this once search queries are desugared at LiteParsed time and
-    // handle the view through a bindResolvedNamespace() override.
-    if (search_helpers::isMongotLiteParsedPipeline(*desugaredLPP)) {
-        // Still call bindResolvedNamespace() on all stages so that any extension stages further in
-        // the pipeline get properly validated against the view.
-        if (aggExState.isView()) {
-            LOGV2_DEBUG(
-                11856001, 4, "Skipping view pipeline prepend because this is a mongot query");
-            PipelineResolver::validateStagesOnView(
-                desugaredLPP,
-                aggExState.getResolvedNamespace(),
-                aggExState.getOriginalNss(),
-                uassertStatusOK(aggCatalogState.resolveInvolvedNamespaces(aggExState.getOpCtx())),
-                LiteParserOptions{.ifrContext = aggExState.getIfrContext()});
-            return currentRequirement;
-        }
-
-        auto resolvedNamespaces =
-            uassertStatusOK(aggCatalogState.resolveInvolvedNamespaces(aggExState.getOpCtx()));
-        bool anyViewBound = PipelineResolver::resolveInvolvedNamespacesOnLiteParsedPipeline(
-            desugaredLPP, aggExState.getOriginalNss(), resolvedNamespaces);
-        return anyViewBound ? SecondParseRequirement::kReparseFromLPP : currentRequirement;
-    }
+    // Mongot pipelines get the view bound to their stages — recursively, so nested mongot or
+    // extension stages are bound too — rather than prepended; see the isMongotLiteParsedPipeline
+    // branch in resolveInvolvedNamespacesOnLiteParsedPipeline. Compute this before the resolver
+    // runs: stitching can change the front stage, and the early return below must agree with the
+    // resolver's bind-vs-prepend decision.
+    // TODO SERVER-115069 Remove the mongot special-casing once search queries are desugared at
+    // LiteParsed time and handle the view through a bindResolvedNamespace() override.
+    const bool isMongotPipeline = search_helpers::isMongotLiteParsedPipeline(*desugaredLPP);
 
     auto resolvedNamespaces =
         uassertStatusOK(aggCatalogState.resolveInvolvedNamespaces(aggExState.getOpCtx()));
@@ -1071,6 +1054,15 @@ SecondParseRequirement maybeApplyViewPipeline(const AggExState& aggExState,
 
     bool anyViewBound = PipelineResolver::resolveInvolvedNamespacesOnLiteParsedPipeline(
         desugaredLPP, aggExState.getOriginalNss(), resolvedNamespaces);
+
+    if (isMongotPipeline && aggExState.isView()) {
+        // The view was bound rather than prepended, so no reparse is needed on its account.
+        // Sub-pipeline stitching only reaches the executed pipeline via a reparse, but mongot
+        // pipelines with view-targeting sub-pipelines desugar at LiteParsed time, which already
+        // makes 'currentRequirement' kReparseFromLPP; non-desugared ones keep the
+        // DocumentSource-level view fallback.
+        return currentRequirement;
+    }
 
     return anyViewBound ? SecondParseRequirement::kReparseFromLPP : currentRequirement;
 }
@@ -1674,7 +1666,35 @@ Status _runAggregate(std::unique_ptr<AggExState> aggExState, rpc::ReplyBuilderIn
     return executeResolvedAggregate(*aggExState, *aggCatalogState, result);
 }
 
+// Schedules `flag` to be disabled on the next retry iteration.
+void disableIfrFlag(
+    IncrementalRolloutFeatureFlag* flag,
+    stdx::unordered_set<IncrementalRolloutFeatureFlag*>& ifrFlagsToDisableOnRetries) {
+    ifrFlagsToDisableOnRetries.insert(flag);
+}
+
 }  // namespace
+
+bool shouldPropagateIfrKickbackToRouter(OperationContext* opCtx,
+                                        const AggregateCommandRequest& request) {
+    // If this pipeline is merging cursors, we need to propagate the error and retry from the very
+    // beginning (back on the router originating the request) in order to reestablish the cursors.
+    if (aggregation_request_helper::hasMergeCursors(request)) {
+        return true;
+    }
+
+    // Likewise, if a router (either mongos or a shard acting like a router) produced this request,
+    // the router should re-derive it under the new flag value. For queries on views, if the view is
+    // unsharded the aggregation will be retried locally by the command (count/distinct/find). If
+    // the aggregation is on a sharded collection, the router will retry the operation using mongos
+    // retry loop.
+    //
+    // It is safe to throw this error back up to the router since the router has the retry logic,
+    // and if flags did not exist on the router they would be pinned to false on this shard.
+    return (OperationShardingState::get(opCtx).shouldBeTreatedAsFromRouter(opCtx) ||
+            aggregation_request_helper::getFromRouter(request)) &&
+        IncrementalFeatureRolloutContext::get(opCtx)->isInstalledFromWire();
+}
 
 // TODO SERVER-93536 take these variables in by rvalue to take internal ownership of them.
 Status runAggregate(
@@ -1686,19 +1706,17 @@ Status runAggregate(
     boost::optional<ExplainOptions::Verbosity> verbosity,
     rpc::ReplyBuilderInterface* result,
     const std::vector<std::pair<NamespaceString, std::vector<ExternalDataSourceInfo>>>&
-        usedExternalDataSources,
-    std::shared_ptr<IncrementalFeatureRolloutContext> ifrContext) {
-    // Creates or passes IFRContext for the aggregation, which will be shared among the root
-    // ExpressionContext and any child ExpressionContexts that are created, for example, as part
-    // of sub-pipeline execution.
-    if (ifrContext == nullptr) {
-        ifrContext = std::make_shared<IncrementalFeatureRolloutContext>();
-    }
+        usedExternalDataSources) {
+    auto ifrContext = IncrementalFeatureRolloutContext::get(opCtx);
 
     stdx::unordered_set<IncrementalRolloutFeatureFlag*> initialFlagsToDisable;
     std::unique_ptr<LiteParsedPipeline> updatedLiteParsed;
     auto body =
         [&](stdx::unordered_set<IncrementalRolloutFeatureFlag*>& ifrFlagsToDisableOnRetries) {
+            // Discard any partially-built reply from a previous (failed) attempt so every retry
+            // starts from a clean reply, regardless of which error triggered it.
+            result->reset();
+
             // Track potentially multiple IFR flags. For example, consider the following case:
             // 1. runAggregate with IFR Flag A enabled
             // 2. IFRFlagRetryInfo gets thrown signalling to disable IFR Flag A
@@ -1759,18 +1777,29 @@ Status runAggregate(
     auto onIFRError =
         [&](const ExceptionFor<ErrorCodes::IFRFlagRetry>& ex,
             stdx::unordered_set<IncrementalRolloutFeatureFlag*>& ifrFlagsToDisableOnRetries) {
-            // If this pipeline is merging cursors, we need to propagate the error and retry from
-            // the very beginning (back on the router originating the request) in order to
-            // reestablish the cursors.
-            if (aggregation_request_helper::hasMergeCursors(request)) {
+            // This request cannot be re-derived here, so hand the kickback to whoever produced it.
+            if (shouldPropagateIfrKickbackToRouter(opCtx, request)) {
                 throw ex;
             }
-            ifrFlagsToDisableOnRetries.insert(IncrementalRolloutFeatureFlag::findByName(
-                ex.extraInfo<IFRFlagRetryInfo>()->getDisabledFlagName()));
+
+            auto retryInfo = ex.extraInfo<IFRFlagRetryInfo>();
+            tassert(13130503, "IFR retry is missing its IFRFlagRetryInfo", retryInfo);
+
+            // 'findByName()' returns nullptr for a flag this binary does not know about, and a null
+            // flag would be dereferenced when the retry body disables the accumulated flags.
+            std::string_view disabledFlagName = retryInfo->getDisabledFlagName();
+            auto* flag = IncrementalRolloutFeatureFlag::findByName(disabledFlagName);
+            tassert(13130502,
+                    str::stream() << "IFR retry referenced an unknown feature flag: "
+                                  << disabledFlagName,
+                    flag);
+
+            disableIfrFlag(flag, ifrFlagsToDisableOnRetries);
         };
 
     // Retry on CollectionBecameView if the namespace concurrently transitioned from collection to
-    // view during aggregation planning.
+    // view during aggregation planning. The reply builder is reset at the top of `body` on every
+    // attempt, so no per-handler reset is needed here.
     return retryOnWithState("runAggregate",
                             std::move(initialFlagsToDisable),
                             kDefaultMaxRetries,

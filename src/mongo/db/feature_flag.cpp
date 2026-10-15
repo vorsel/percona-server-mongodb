@@ -7,7 +7,6 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/feature_compatibility_version_parser.h"
 #include "mongo/db/ifr_unrecognized_flag_info.h"
-#include "mongo/db/operation_context.h"
 #include "mongo/db/query/util/deferred.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/version_context.h"
@@ -289,6 +288,32 @@ struct OpCtxIfrContext {
 };
 const auto getIfrContextOnOpCtx = OperationContext::declareDecoration<OpCtxIfrContext>();
 
+// Process-wide IFR wire-protocol counters. Each is bumped inline as `fromWire()` resolves a payload
+// and surfaced through the "ifr" serverStatus section (see incremental_rollout_metrics.cpp).
+Atomic<int64_t>& getWireInstallsCounter() {
+    static Atomic<int64_t> sCounter{0};
+    return sCounter;
+}
+
+Atomic<int64_t>& getUnknownWireFlagErrorsCounter() {
+    static Atomic<int64_t> sCounter{0};
+    return sCounter;
+}
+
+Atomic<int64_t>& getUnknownWireFlagsDroppedCounter() {
+    static Atomic<int64_t> sCounter{0};
+    return sCounter;
+}
+
+Atomic<int64_t>& getAbsentFlagsConservativeFalseCounter() {
+    static Atomic<int64_t> sCounter{0};
+    return sCounter;
+}
+
+Atomic<int64_t>& getAbsentFlagsLocalDefaultCounter() {
+    static Atomic<int64_t> sCounter{0};
+    return sCounter;
+}
 }  // namespace
 
 IncrementalRolloutFeatureFlag* IncrementalRolloutFeatureFlag::findByName(
@@ -341,6 +366,35 @@ MONGO_INITIALIZER(CacheIfrFlagsIntroducedSinceLastLTS)(InitializerContext*) {
     IncrementalFeatureRolloutContext::initShardServerDefaultTemplate();
 }
 
+// static
+int64_t IncrementalRolloutFeatureFlag::getWireInstallsCount() {
+    return getWireInstallsCounter().load();
+}
+
+// static
+int64_t IncrementalRolloutFeatureFlag::getUnknownWireFlagErrorsCount() {
+    return getUnknownWireFlagErrorsCounter().load();
+}
+
+// static
+int64_t IncrementalRolloutFeatureFlag::getUnknownWireFlagsDroppedCount() {
+    return getUnknownWireFlagsDroppedCounter().load();
+}
+
+// static
+int64_t IncrementalRolloutFeatureFlag::getAbsentFlagsConservativeFalseCount() {
+    return getAbsentFlagsConservativeFalseCounter().load();
+}
+
+// static
+int64_t IncrementalRolloutFeatureFlag::getAbsentFlagsLocalDefaultCount() {
+    return getAbsentFlagsLocalDefaultCounter().load();
+}
+
+void IncrementalRolloutFeatureFlag::recordWireInstall(bool value) {
+    (value ? _numTrueWireInstalls : _numFalseWireInstalls).fetchAndAddRelaxed(1);
+}
+
 bool IncrementalRolloutFeatureFlag::checkEnabled() {
     auto checkResult = _value.load();
     (checkResult ? _numTrueChecks : _numFalseChecks).addAndFetch(1);
@@ -353,7 +407,9 @@ void IncrementalRolloutFeatureFlag::appendFlagStats(BSONArrayBuilder& flagStats)
         .append("value", _value.loadRelaxed())
         .append("falseChecks", static_cast<long long>(_numFalseChecks.loadRelaxed()))
         .append("trueChecks", static_cast<long long>(_numTrueChecks.loadRelaxed()))
-        .append("numToggles", static_cast<long long>(_numToggles.loadRelaxed()));
+        .append("numToggles", static_cast<long long>(_numToggles.loadRelaxed()))
+        .append("trueWireInstalls", static_cast<long long>(_numTrueWireInstalls.loadRelaxed()))
+        .append("falseWireInstalls", static_cast<long long>(_numFalseWireInstalls.loadRelaxed()));
 }
 
 void IncrementalRolloutFeatureFlag::appendFlagsStats(BSONArrayBuilder& flagStats) {
@@ -417,43 +473,6 @@ void IncrementalRolloutFeatureFlag::registerFlag(IncrementalRolloutFeatureFlag* 
 }
 
 // static
-std::shared_ptr<IncrementalFeatureRolloutContext> IncrementalFeatureRolloutContext::get(
-    OperationContext* opCtx) {
-    // Forces materialization of whatever initializer is present (the default empty context, or one
-    // an install path assigned).
-    return *getIfrContextOnOpCtx(opCtx).deferred;
-}
-
-// static
-std::shared_ptr<IncrementalFeatureRolloutContext> IncrementalFeatureRolloutContext::tryGet(
-    OperationContext* opCtx) {
-    // Never forces; an unmaterialized context is treated as absent.
-    auto& deferred = getIfrContextOnOpCtx(opCtx).deferred;
-    return deferred.isInitialized() ? *deferred : nullptr;
-}
-
-// static
-bool IncrementalFeatureRolloutContext::isInstalled(OperationContext* opCtx) {
-    return getIfrContextOnOpCtx(opCtx).deferred.isInitialized();
-}
-
-// static
-void IncrementalFeatureRolloutContext::set(OperationContext* opCtx,
-                                           std::shared_ptr<IncrementalFeatureRolloutContext> ctx) {
-    auto& deferred = getIfrContextOnOpCtx(opCtx).deferred;
-    // Install-once invariant: replacing a context that already cached its egress serialization
-    // would silently drop that resolved state. Only a materialized context can have cached it.
-    if (deferred.isInitialized()) {
-        tassert(13002310,
-                "Refusing to replace an IFRContext whose egress metadata has already been cached",
-                !(*deferred)->hasCachedEgressMetadataForTest());
-    }
-    // Eager install: value is materialized immediately, so it is visible to tryGet()/isInstalled()
-    // and serialized on egress.
-    deferred = DeferredIfrContext(std::move(ctx));
-}
-
-// static
 IncrementalFeatureRolloutContext::IncrementalFeatureRolloutContext() = default;
 IncrementalFeatureRolloutContext::~IncrementalFeatureRolloutContext() = default;
 
@@ -511,40 +530,6 @@ void IncrementalFeatureRolloutContext::initShardServerDefaultTemplate() {
     }
 }
 
-// static
-void IncrementalFeatureRolloutContext::installForRequestWithoutIfrFlags(OperationContext* opCtx) {
-
-    // A shard server that receives no ifrFlags got the request from a pre-9.0 router, an old shard,
-    // or a background thread — none of which coordinated a value — should conservatively disable
-    // every release flag introduced at kLatest to keep shards from turning a feature on before
-    // their siblings do. Any shard might be the first upgraded in the deployment, so we need to
-    // wait for a signal that other shards are ready to turn on a new behavior across the whole
-    // cluster. This will come when the routing layer is upgraded.
-    //
-    // This is deliberately FCV-independent, and in balance with a pure replica set deployment. In
-    // a replica set deployment we expect requests from clients to come in soon after upgrading
-    // (before setFCV command) to use the new defaults of the feature flags. So in this case the
-    // lack of ifrFlags on the request indicates we should use whatever the current settings are on
-    // this node.
-    //
-    // We discriminate between the two based on whether we have the shard server role.
-    //
-    // This isn't great, but it's a stopgap. In the v9.1+ future, a "pre-9.0 router" won't exist,
-    // and we will expect all incoming requests to have their flags specified. Then we can remove
-    // this condition and have no fear using the local settings if we don't hear otherwise.
-    const auto clusterRole = serverGlobalParams.clusterRole;
-    if (clusterRole.has(ClusterRole::ShardServer)) {
-        // Defer cloning the all-flags-off template until a flag is actually consulted. If nothing
-        // consults one, the context stays unmaterialized and no ifrFlags are forwarded downstream.
-        getIfrContextOnOpCtx(opCtx).deferred =
-            DeferredIfrContext([] { return mutableShardServerDefaultTemplate().clone(); });
-    } else if (clusterRole.hasExclusively(ClusterRole::RouterServer)) {
-        // Avoid deferring initialization on mongos - we want to eagerly initialize to make sure
-        // everyone's on the same page.
-        set(opCtx, std::make_shared<IncrementalFeatureRolloutContext>());
-    }
-}
-
 // Constructor for IFRContext sent from wire.
 IncrementalFeatureRolloutContext::IncrementalFeatureRolloutContext(
     std::span<const BSONObj> flags, std::unique_ptr<IFRSenderVersion> senderVersion)
@@ -552,6 +537,12 @@ IncrementalFeatureRolloutContext::IncrementalFeatureRolloutContext(
     tassert(13013608,
             "Expected sender version to be resolved by this point",
             _senderVersion != nullptr);
+
+    // Count this as a wire install as soon as we begin processing the payload, rather than only on
+    // successful completion below: per-flag counters (recordWireInstall) are bumped inline as each
+    // flag is processed, so if a later flag in the payload throws, those per-flag bumps would
+    // otherwise be unmatched by any aggregate-counter increment for this request.
+    getWireInstallsCounter().fetchAndAddRelaxed(1);
 
     // Track which active flags arrived so the post-loop can fill in the absent ones (scenario
     // 4).
@@ -577,11 +568,13 @@ IncrementalFeatureRolloutContext::IncrementalFeatureRolloutContext(
         if (flag != nullptr) {
             // Scenario 1: recognized flag — store the sender's value. A flag appearing twice in one
             // payload is a malformed request from the sender; treat it as a protocol error.
-            _savedFlagValues[flag] = valueElem.boolean();
+            const bool wireValue = valueElem.boolean();
+            _savedFlagValues[flag] = wireValue;
             tassert(13024005,
                     str::stream() << "Sender specified IFR flag '" << flagName
                                   << "' more than once",
                     receivedFlags.insert(flag).second);
+            flag->recordWireInstall(wireValue);
             // TODO SERVER-130479 Missing a possible scenario: flag was removed in an earlier
             // version.
         } else if (*_senderVersion <= localSenderVersion()) {
@@ -607,6 +600,8 @@ IncrementalFeatureRolloutContext::IncrementalFeatureRolloutContext(
                             "Dropped unrecognized IFR flag from wire",
                             "flagName"_attr = flagName);
             }
+            getUnknownWireFlagsDroppedCounter().fetchAndAddRelaxed(1);
+            _unknownWireFlags.emplace(std::string{flagName});
         }
     }
 
@@ -614,6 +609,7 @@ IncrementalFeatureRolloutContext::IncrementalFeatureRolloutContext(
     // recognize, so treat it as a programmer error. Report all such flags together, attaching the
     // structured UnrecognizedIFRFlagInfo so callers can inspect the full set without re-parsing.
     if (!unknownFlags.empty()) {
+        getUnknownWireFlagErrorsCounter().fetchAndAddRelaxed(1);
         tasserted(makeUnrecognizedIFRFlagStatus(std::move(unknownFlags), *_senderVersion));
     }
 
@@ -632,9 +628,11 @@ IncrementalFeatureRolloutContext::IncrementalFeatureRolloutContext(
             flagIntroVersion);
         if (*_senderVersion < toFullVersion(*flagIntroVersion)) {
             // Sender predates this flag's introduction — conservative false.
+            getAbsentFlagsConservativeFalseCounter().fetchAndAddRelaxed(1);
             _savedFlagValues[flag] = false;
         } else {
             // Sender is same/newer (or no version info) — use this binary's local default.
+            getAbsentFlagsLocalDefaultCounter().fetchAndAddRelaxed(1);
             _savedFlagValues[flag] = flag->checkEnabled();
         }
     }

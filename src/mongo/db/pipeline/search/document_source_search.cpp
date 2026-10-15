@@ -46,13 +46,20 @@ std::string_view removePrefixWorkaround(std::string_view key, std::string_view p
 
 Rarely _samplerSearchBeta;
 
-std::unique_ptr<SearchLiteParsed> parseSearchBeta(const NamespaceString& nss,
-                                                  const BSONElement& spec,
-                                                  const LiteParserOptions& options) {
+std::unique_ptr<LiteParsedDocumentSource> parseSearchBeta(const NamespaceString& nss,
+                                                          const BSONElement& spec,
+                                                          const LiteParserOptions& options) {
     if (_samplerSearchBeta.tick()) {
         LOGV2_WARNING(12165200, "$searchBeta is deprecated. Use $search instead.");
     }
-    return SearchLiteParsed::parse(nss, spec, options);
+
+    // $searchBeta is a deprecated alias for $search. Re-dispatch through the $search parser.
+    BSONObjBuilder searchBuilder;
+    searchBuilder.appendAs(spec, DocumentSourceSearch::kStageName);
+    BSONObj searchSpec = searchBuilder.obj();
+    auto liteParsed = LiteParsedDocumentSource::parse(nss, searchSpec, options);
+    liteParsed->makeOwned();
+    return liteParsed;
 }
 }  // namespace
 
@@ -91,14 +98,23 @@ std::string_view DocumentSourceSearch::getSourceName() const {
 }
 
 Value DocumentSourceSearch::serialize(const query_shape::SerializationOptions& opts) const {
-    // If we aren't serializing for query stats or explain, serialize the full spec.
-    // If we are in a router, serialize the full spec.
-    // Otherwise, just serialize the mongotQuery.
-    if ((!opts.isSerializingForQueryStats() && !opts.isSerializingForExplain()) ||
-        getExpCtx()->getInRouter()) {
+    // Emits just the mongot query, dropping the spec's internal routing fields.
+    auto serializeUserQuery = [&] {
+        return Value(DOC(getSourceName() << opts.serializeLiteral(_spec.getMongotQuery())));
+    };
+
+    // For re-parseable output, emit the user query — the full IDL form's internal routing fields
+    // would trip the LiteParse-layer check on re-parse. Query stats also emits the user query.
+    if (opts.serializeForReparse || opts.isSerializingForQueryStats()) {
+        return serializeUserQuery();
+    }
+
+    // Otherwise emit the full spec so the internal routing fields reach the shards. This covers all
+    // non-explain serialization and explain when running on a router.
+    if (!opts.isSerializingForExplain() || getExpCtx()->getInRouter()) {
         return Value(Document{{getSourceName(), _spec.toBSON()}});
     }
-    return Value(DOC(getSourceName() << opts.serializeLiteral(_spec.getMongotQuery())));
+    return serializeUserQuery();
 }
 
 intrusive_ptr<DocumentSource> DocumentSourceSearch::createFromBson(
@@ -109,8 +125,6 @@ intrusive_ptr<DocumentSource> DocumentSourceSearch::createFromBson(
             str::stream() << "$search value must be an object. Found: " << typeName(elem.type()),
             elem.type() == BSONType::object);
     auto specObj = elem.embeddedObject();
-
-    search_helpers::validateViewNotSetByUser(expCtx, specObj);
 
     // If kMongotQueryFieldName is present, this is the case that we re-create the
     // DocumentSource from a serialized DocumentSourceSearch that was originally parsed on a
@@ -134,6 +148,12 @@ intrusive_ptr<DocumentSource> DocumentSourceSearch::createFromBson(
     if (auto view = spec.getView()) {
         search_helpers::validateMongotIndexedViewsFF(expCtx, view->getEffectivePipeline());
         search_index_view_validation::validate(*view);
+    }
+
+    // Disable operation memory tracking for $search queries with metadata cursors.
+    if (!expCtx->getInRouter() && spec.getMetadataMergeProtocolVersion().has_value() &&
+        spec.getRequiresSearchMetaCursor()) {
+        search_helpers::excludeOperationMemoryTrackingForSecondaryMetadataCursor(expCtx);
     }
 
     return make_intrusive<DocumentSourceSearch>(expCtx, std::move(spec));

@@ -743,7 +743,8 @@ void ShardServerOpObserver::onCollMod(OperationContext* opCtx,
 
 void ShardServerOpObserver::onReplicationRollback(OperationContext* opCtx,
                                                   const RollbackObserverInfo& rbInfo) {
-    ShardingRecoveryService::get(opCtx)->onReplicationRollback(opCtx, rbInfo.rollbackNamespaces);
+    ShardingRecoveryService::get(opCtx)->onReplicationRollback(
+        opCtx, rbInfo.rollbackNamespaces, rbInfo.rollbackCommandCounts);
 }
 
 void ShardServerOpObserver::onCreateDatabaseMetadata(OperationContext* opCtx,
@@ -794,10 +795,9 @@ void ShardServerOpObserver::onCreateDatabaseMetadata(OperationContext* opCtx,
 
         auto scopedCsr = CollectionShardingRuntime::acquireExclusive(opCtx, nss);
         if (scopedCsr->getCurrentMetadataIfKnown() && scopedCsr->isUnowned()) {
-            LOGV2_DEBUG(12932800,
-                        2,
-                        "Clearing collection metadata after createDatabase metadata commit",
-                        logAttrs(nss));
+            LOGV2_INFO(12932800,
+                       "Clearing collection metadata after createDatabase metadata commit",
+                       logAttrs(nss));
 
             scopedCsr->clearCollectionMetadata(opCtx);
         }
@@ -820,8 +820,73 @@ void ShardServerOpObserver::onDropDatabaseMetadata(OperationContext* opCtx,
 
     LOGV2_DEBUG(12920501, 1, "Applying dropDatabaseMetadata oplog entry", logAttrs(dbName));
 
-    auto scopedDsr = DatabaseShardingRuntime::acquireExclusive(opCtx, dbName);
-    scopedDsr->clearDbMetadata(opCtx);
+    {
+        auto scopedDsr = DatabaseShardingRuntime::acquireExclusive(opCtx, dbName);
+        scopedDsr->clearDbMetadata(opCtx);
+    }
+
+    // Untracked/unowned collections need their metadata dropped since this shard no longer owns any
+    // collection data. Tracked collections do not need their state cleared out because the drop
+    // database coordinator already takes care of them. The only other DDL that issues a
+    // dropDatabase oplog entry is movePrimary which doesn't invalidate tracked collections but must
+    // invalidate untracked collections.
+    for (const auto& nss : CollectionShardingState::getCollectionNames(opCtx)) {
+        if (nss.dbName() != dbName) {
+            continue;
+        }
+
+        auto scopedCsr = CollectionShardingRuntime::acquireExclusive(opCtx, nss);
+        if (const auto cm = scopedCsr->getCurrentMetadataIfKnown(); cm && !cm->hasRoutingTable()) {
+            LOGV2_INFO(13247700,
+                       "Clearing collection metadata after dropDatabase metadata commit",
+                       logAttrs(nss));
+            scopedCsr->clearCollectionMetadata(opCtx, true /* collIsDropped */);
+        }
+    }
+}
+
+void ShardServerOpObserver::onInvalidateAllCollectionMetadata(OperationContext* opCtx,
+                                                              const repl::OplogEntry& op) {
+    // TODO (SERVER-91505): Determine if we should change this to check isDataConsistent.
+    if (repl::ReplicationCoordinator::get(opCtx)->isInInitialSyncOrRollback()) {
+        return;
+    }
+
+    InvalidateAllCollectionMetadataOplogEntry::parse(
+        op.getObject(), IDLParserContext("InvalidateAllCollectionMetadataOplogEntryContext"));
+
+    ShardingStatistics::get(opCtx)
+        .collectionShardingMetadataStatistics
+        .registerInvalidateAllCollectionMetadataOplogEntryApplied();
+
+    LOGV2_DEBUG(13169801, 1, "Applying invalidateAllCollectionMetadata oplog entry");
+
+    for (const auto& nss : CollectionShardingState::getCollectionNames(opCtx)) {
+        auto scopedCsr = CollectionShardingRuntime::acquireExclusive(opCtx, nss);
+        scopedCsr->clearCollectionMetadata(opCtx);
+    }
+}
+
+void ShardServerOpObserver::onInvalidateAllDatabaseMetadata(OperationContext* opCtx,
+                                                            const repl::OplogEntry& op) {
+    // TODO (SERVER-91505): Determine if we should change this to check isDataConsistent.
+    if (repl::ReplicationCoordinator::get(opCtx)->isInInitialSyncOrRollback()) {
+        return;
+    }
+
+    InvalidateAllDatabaseMetadataOplogEntry::parse(
+        op.getObject(), IDLParserContext("InvalidateAllDatabaseMetadataOplogEntryContext"));
+
+    ShardingStatistics::get(opCtx)
+        .databaseShardingMetadataStatistics
+        .registerInvalidateAllDatabaseMetadataOplogEntryApplied();
+
+    LOGV2_DEBUG(13169802, 1, "Applying invalidateAllDatabaseMetadata oplog entry");
+
+    for (const auto& dbName : DatabaseShardingState::getDatabaseNames(opCtx)) {
+        auto scopedDsr = DatabaseShardingRuntime::acquireExclusive(opCtx, dbName);
+        scopedDsr->clearDbMetadata(opCtx);
+    }
 }
 
 void ShardServerOpObserver::onInvalidateCollectionMetadata(OperationContext* opCtx,
@@ -854,15 +919,16 @@ void ShardServerOpObserver::onInvalidateCollectionMetadata(OperationContext* opC
     auto scopedCsr = CollectionShardingRuntime::acquireExclusive(opCtx, nss);
 
     // We have to consider concurrent recovery threads reading the durable state. As the drain and
-    // install is an atomic operation the presence of a recoverer means that we still haven't
-    // drained and applied the changes. The invalidate has to be communicated to the recovery
-    // threads such that a new durable read is performed as whatever was read before is now invalid.
-    // The recoverer evaluates the entry's precondition against the metadata it recovers from disk.
+    // install is an atomic operation the presence of a metadata synchronizer means that we still
+    // haven't drained and applied the changes. The invalidate has to be communicated to the
+    // recovery threads such that a new durable read is performed as whatever was read before is now
+    // invalid. The synchronizer evaluates the entry's precondition against the metadata it recovers
+    // from disk.
     //
-    // The lack of a recoverer means we're free to evaluate the precondition against the currently
-    // installed collection metadata and, if it holds, clear it.
-    if (auto recoverer = scopedCsr->getCollectionCacheRecoverer()) {
-        recoverer->onOplogEntry(op.getTimestamp(), entry);
+    // The lack of a metadata synchronizer means we're free to evaluate the precondition against the
+    // currently installed collection metadata and, if it holds, clear it.
+    if (auto synchronizer = scopedCsr->getMetadataSynchronizer()) {
+        synchronizer->onOplogEntry(op.getTimestamp(), entry);
     } else if (shouldInvalidateCollectionMetadataLocally(entry, *scopedCsr)) {
         scopedCsr->clearCollectionMetadata(opCtx, entry.getForDroppedCollection());
     }
@@ -897,11 +963,11 @@ void ShardServerOpObserver::onUpdateCollectionMetadata(OperationContext* opCtx,
 
     auto scopedCsr = CollectionShardingRuntime::acquireExclusive(opCtx, nss);
 
-    // If cache recovery is in progress, defer applying the delta update until the recovery has
-    // installed the durable metadata snapshot read from disk. The recoverer will replay this oplog
-    // entry on top of that snapshot before the CSR publishes the recovered metadata.
-    if (auto recoverer = scopedCsr->getCollectionCacheRecoverer()) {
-        recoverer->onOplogEntry(op.getTimestamp(), entry);
+    // If disk recovery is in progress, defer applying the delta update until the recovery has
+    // installed the durable metadata snapshot read from disk. The metadata synchronizer will replay
+    // this oplog entry on top of that snapshot before the CSR publishes the recovered metadata.
+    if (auto synchronizer = scopedCsr->getMetadataSynchronizer()) {
+        synchronizer->onOplogEntry(op.getTimestamp(), entry);
         return;
     }
 

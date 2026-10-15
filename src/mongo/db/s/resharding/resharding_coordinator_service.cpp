@@ -3,10 +3,12 @@
 
 #include "mongo/db/s/resharding/resharding_coordinator_service.h"
 
+#include "mongo/db/commands/feature_compatibility_version.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/s/resharding/resharding_coordinator.h"
 #include "mongo/db/s/resharding/resharding_coordinator_service_external_state.h"
 #include "mongo/db/s/resharding/resharding_server_parameters_gen.h"
+#include "mongo/db/s/resharding/resharding_util.h"
 #include "mongo/s/resharding/resharding_coordinator_service_conflicting_op_in_progress_info.h"
 #include "mongo/s/resharding/resharding_feature_flag_gen.h"
 
@@ -39,11 +41,15 @@ void ReshardingCoordinatorService::checkIfConflictsWithOtherInstances(
     for (const auto& instance : existingInstances) {
         auto typedInstance = checked_cast<const ReshardingCoordinator*>(instance);
         // Instances which have already completed do not conflict with other instances, unless
-        // their user resharding UUIDs are the same.
+        // their user resharding UUIDs are the same. An instance recovered from a kQuiesced document
+        // has also already completed, even though its freshly started chain of work has not
+        // fulfilled its completion promise yet.
         const bool isUserReshardingUUIDSame =
             typedInstance->getMetadata().getUserReshardingUUID() ==
             coordinatorDoc.getUserReshardingUUID();
-        if (!isUserReshardingUUIDSame && typedInstance->getCompletionFuture().isReady()) {
+        const bool hasAlreadyCompleted =
+            typedInstance->isRecoveryInQuiesce() || typedInstance->getCompletionFuture().isReady();
+        if (!isUserReshardingUUIDSame && hasAlreadyCompleted) {
             LOGV2_DEBUG(7760400,
                         1,
                         "Ignoring 'conflict' with completed instance of resharding",
@@ -87,6 +93,37 @@ void ReshardingCoordinatorService::checkIfConflictsWithOtherInstances(
                                 << coordinatorDoc.getReshardingKey().toString()
                                 << userReshardingIdMsg);
     }
+
+    // Refuse to create a new resharding coordinator while an FCV upgrade/downgrade is in progress.
+    // Otherwise a resharding operation could start after existing reshardings have been drained as
+    // part of the FCV transition and then complete across the FCV change, potentially leaving the
+    // metadata in an inconsistent state.
+    //
+    // TODO(SERVER-131381): Review/rework this logic to avoid relying on FCV internals via the
+    // isFcvTransitionInProgress() function.
+    uassert(ErrorCodes::CommandNotSupported,
+            "Resharding is not supported during FCV changes, please wait for the FCV change to "
+            "complete.",
+            !isFcvTransitionInProgress(opCtx));
+
+    // Double check that the feature flags are in a consistent state. We don't have to worry about
+    // transitional FCV because of the above assertion.
+    tassert(13237401,
+            "Resharding with authoritative shards requires shard refreshes to be disabled",
+            !resharding::isEnabledWithPinnedVersion(coordinatorDoc.getForwardableOpMetadata(),
+                                                    feature_flags::gAuthoritativeShardsDDL) ||
+                (resharding::isEnabledWithPinnedVersion(
+                     coordinatorDoc.getForwardableOpMetadata(),
+                     resharding::gFeatureFlagReshardingCloneNoRefresh) &&
+                 resharding::isEnabledWithPinnedVersion(
+                     coordinatorDoc.getForwardableOpMetadata(),
+                     resharding::gFeatureFlagReshardingInitNoRefresh) &&
+                 resharding::isEnabledWithPinnedVersion(
+                     coordinatorDoc.getForwardableOpMetadata(),
+                     resharding::gFeatureFlagReshardingNoRefreshApplyingAndBlockingWrites) &&
+                 resharding::isEnabledWithPinnedVersion(
+                     coordinatorDoc.getForwardableOpMetadata(),
+                     resharding::gFeatureFlagReshardingSkipCloningAndApplyingIfApplicable)));
 }
 
 std::shared_ptr<repl::PrimaryOnlyService::Instance> ReshardingCoordinatorService::constructInstance(
@@ -97,6 +134,15 @@ std::shared_ptr<repl::PrimaryOnlyService::Instance> ReshardingCoordinatorService
                                              IDLParserContext("ReshardingCoordinatorStateDoc")),
         std::make_shared<ReshardingCoordinatorExternalStateImpl>(),
         _serviceContext);
+}
+
+std::shared_ptr<ReshardingCoordinator> ReshardingCoordinator::getOrCreate(
+    OperationContext* opCtx,
+    repl::PrimaryOnlyService* service,
+    BSONObj initialState,
+    const FixedFCVRegion&,
+    bool checkOptions) {
+    return TypedInstance::getOrCreate(opCtx, service, std::move(initialState), checkOptions);
 }
 
 ExecutorFuture<void> ReshardingCoordinatorService::_rebuildService(

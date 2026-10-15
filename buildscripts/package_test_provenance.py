@@ -6,13 +6,16 @@ import contextlib
 import dataclasses
 import hashlib
 import json
+import logging
 import os
+import re
 import shutil
 import subprocess
 import tarfile
+import time
 import zipfile
 from pathlib import Path
-from typing import Any, BinaryIO, Iterable, Iterator
+from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
 import requests
 from google.protobuf.message import DecodeError
@@ -25,6 +28,7 @@ RELEASE_BINARY_NAMES = ("mongod", "mongos")
 CRYPT_RELEASE_BINARY_NAMES = ("mongo_crypt_v1.so",)
 DISALLOWED_EXECUTION_LOG_RUNNERS = {"remote", "remote cache hit"}
 SERVER_RELEASE_PROJECT_PREFIX = "mongo-release"
+RELEASE_BRANCH_PROJECT_PATTERN = re.compile(r"mongodb-mongo-v\d+\.\d+(?:-staging)?")
 
 RELEASE_LOCAL_SAFETY_FLAGS = (
     "--remote_executor= --noremote_accept_cached "
@@ -32,10 +36,25 @@ RELEASE_LOCAL_SAFETY_FLAGS = (
 )
 
 
+class ArtifactNotFoundError(RuntimeError):
+    """Raised when an expected artifact is missing from an Evergreen task.
+
+    Distinct from a plain RuntimeError so callers can retry only on a missing
+    artifact (e.g. due to Evergreen secondary replication lag) and fail fast on
+    other errors such as a duplicate artifact.
+    """
+
+
 def is_server_release_project(evg_project: str | None) -> bool:
     """Return whether this Evergreen project is a server release project."""
 
     return bool(evg_project) and evg_project.startswith(SERVER_RELEASE_PROJECT_PREFIX)
+
+
+def is_release_branch_project(evg_project: str | None) -> bool:
+    """Return whether this is a regular or staging release-branch project."""
+
+    return bool(evg_project) and RELEASE_BRANCH_PROJECT_PATTERN.fullmatch(evg_project) is not None
 
 
 def find_build_task(tasks: list[Any], task_display_name: str) -> Any:
@@ -62,7 +81,7 @@ def find_task_artifact_url(task: Any, artifact_name: str) -> str:
     matching_artifacts = [artifact for artifact in task.artifacts if artifact.name == artifact_name]
 
     if not matching_artifacts:
-        raise RuntimeError(
+        raise ArtifactNotFoundError(
             f"Could not find '{artifact_name}' artifact for task {task.task_id} "
             f"({task.display_name})"
         )
@@ -74,6 +93,54 @@ def find_task_artifact_url(task: Any, artifact_name: str) -> str:
         )
 
     return matching_artifacts[0].url
+
+
+# The Evergreen API serves artifact lists from a secondary node
+# (DEVPROD-32223), so artifacts attached by a recently-finished task can be
+# missing from the response due to replication lag. Retry the artifact URL
+# lookup with exponential backoff before giving up (BF-45409).
+NUM_ARTIFACT_URL_RETRIES = 8
+ARTIFACT_URL_RETRY_INITIAL_DELAY_SECS = 15
+ARTIFACT_URL_RETRY_MAX_DELAY_SECS = 120
+
+
+def find_task_artifact_url_with_retry(
+    task: Any, artifact_name: str, refetch_task: Callable[[], Any]
+) -> str:
+    """Find a unique artifact URL on a task, retrying against Evergreen secondary lag.
+
+    The Evergreen API may serve a stale artifact list for a recently-finished
+    task. ``refetch_task`` is called to obtain a fresh task (with a fresh
+    artifact list) before each retry; ``task`` is used for the first attempt.
+    """
+
+    for attempt in range(NUM_ARTIFACT_URL_RETRIES):
+        try:
+            return find_task_artifact_url(task, artifact_name)
+        except ArtifactNotFoundError:
+            if attempt + 1 >= NUM_ARTIFACT_URL_RETRIES:
+                raise
+            delay = min(
+                ARTIFACT_URL_RETRY_INITIAL_DELAY_SECS * (2**attempt),
+                ARTIFACT_URL_RETRY_MAX_DELAY_SECS,
+            )
+            logging.warning(
+                "Could not find '%s' artifact for task %s on attempt %d of %d. "
+                "This can happen when the Evergreen API's secondary node lags behind "
+                "on recently attached artifacts; retrying in %ds.",
+                artifact_name,
+                task.task_id,
+                attempt + 1,
+                NUM_ARTIFACT_URL_RETRIES,
+                delay,
+            )
+            time.sleep(delay)
+            task = refetch_task()
+
+    # Unreachable: the loop either returns or re-raises on the final attempt.
+    raise ArtifactNotFoundError(  # pragma: no cover
+        f"Could not find '{artifact_name}' artifact after {NUM_ARTIFACT_URL_RETRIES} attempts"
+    )
 
 
 def fetch_task_artifact_text(task: Any, artifact_name: str) -> str:

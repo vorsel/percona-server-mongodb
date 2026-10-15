@@ -3,12 +3,15 @@
 
 #include "mongo/db/pipeline/lite_parsed_lookup.h"
 
+#include "mongo/db/extension/host/extension_search_server_status.h"
+#include "mongo/db/extension/host/extension_vector_search_server_status.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
 #include "mongo/db/pipeline/document_source_documents.h"
 #include "mongo/db/pipeline/document_source_lookup.h"      // parseLookupFromAndResolveNamespace
 #include "mongo/db/pipeline/document_source_lookup_gen.h"  // DocumentSourceLookupSpec IDL
 #include "mongo/db/pipeline/document_source_queue.h"
 #include "mongo/db/pipeline/owned_lite_parsed_pipeline.h"
+#include "mongo/db/pipeline/search/search_helper.h"
 #include "mongo/db/pipeline/stage_params_to_document_source_registry.h"
 #include "mongo/db/query/allowed_contexts.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
@@ -29,6 +32,7 @@ REGISTER_LITE_PARSED_DOCUMENT_SOURCE(lookup,
                                      AllowedWithApiStrict::kConditionally);
 
 LiteParsedLookUp::LiteParsedLookUp(const BSONElement& spec,
+                                   const LiteParserOptions& options,
                                    NamespaceString foreignNss,
                                    boost::optional<OwnedLiteParsedPipeline> pipeline,
                                    std::vector<BSONObj> rawPipeline,
@@ -43,7 +47,8 @@ LiteParsedLookUp::LiteParsedLookUp(const BSONElement& spec,
                                    bool internalFromIsAView,
                                    bool noUserPipeline,
                                    bool allowGenericForeignDbLookup)
-    : LiteParsedDocumentSourceNestedPipelines(spec, std::move(foreignNss), std::move(pipeline)),
+    : LiteParsedDocumentSourceNestedPipelines(
+          spec, options, std::move(foreignNss), std::move(pipeline)),
       _rawPipeline(std::move(rawPipeline)),
       _as(std::move(as)),
       _letVariables(std::move(letVariables)),
@@ -141,6 +146,7 @@ std::unique_ptr<LiteParsedLookUp> LiteParsedLookUp::parse(const NamespaceString&
     const bool internalFromIsAView = lookupSpec.getInternalFromIsAView().value_or(false);
 
     return std::make_unique<LiteParsedLookUp>(spec,
+                                              options,
                                               std::move(fromNss),
                                               std::move(ownedPipeline),
                                               std::move(rawPipeline),
@@ -207,8 +213,17 @@ bool LiteParsedLookUp::hasExtensionSearchStage() const {
 
 std::unique_ptr<StageParams> LiteParsedLookUp::getStageParams() const {
     boost::optional<StageParamsPipeline> subParams;
+    auto subpipelineViewPolicy = FirstStageViewApplicationPolicy::kDefaultPrepend;
+    size_t subpipelineViewPrefixLen = 0;
     if (!_pipelines.empty()) {
         subParams = _pipelines[0]->getStageParams();
+        // handleView() may already have prepended the foreign view's definition here, so ask for
+        // the user's first stage rather than the front stage.
+        subpipelineViewPolicy = _pipelines[0]->getUserFirstStageViewApplicationPolicy();
+        // With no user `pipeline:` field the subpipeline *is* the materialized view definition, so
+        // every stage is a view stage; otherwise the view was prepended ahead of the user's stages.
+        subpipelineViewPrefixLen = _noUserPipeline ? _pipelines[0]->getStages().size()
+                                                   : _pipelines[0]->getNumPrependedViewStages();
     }
     return std::make_unique<LookUpStageParams>(*_foreignNss,
                                                _as,
@@ -223,10 +238,12 @@ std::unique_ptr<StageParams> LiteParsedLookUp::getStageParams() const {
                                                std::move(subParams),
                                                _internalFieldMatchPipelineIdx,
                                                _internalFromIsAView,
-                                               _noUserPipeline);
+                                               _noUserPipeline,
+                                               subpipelineViewPolicy,
+                                               subpipelineViewPrefixLen);
 }
 
-void LiteParsedLookUp::validate() const {
+void LiteParsedLookUp::validate(const OperationContext* opCtx) const {
     if (_hasForeignDB) {
         // Enforce the cross-db $lookup restriction. This mirrors the check on the legacy
         // createFromBson path via expCtx and ensures validation fires before the stage is
@@ -243,6 +260,27 @@ void LiteParsedLookUp::validate() const {
                 str::stream() << stage->getParseTimeName()
                               << " is not allowed to be used within a $lookup pipeline",
                 stage->isAllowedInLookupPipeline());
+    }
+
+    // The extension implementations of $search/$searchMeta/$vectorSearch are not supported inside a
+    // $lookup sub-pipeline while featureFlagExtensionsInsideHybridSearch is disabled.
+    // DocumentSourceExtensionOptimizable::create() raises that kickback when the stage is
+    // constructed, but unlike $unionWith, $lookup does not desugar its sub-pipeline during parsing:
+    // it waits until the first input document reaches LookUpStage::buildPipeline. That document may
+    // not arrive until a getMore, which has no retry handler to catch the kickback. Raise it here
+    // instead, during lite-parse, which every caller wraps in an IFRFlagRetry handler.
+    if (const auto& ifrContext = getIfrContext(); ifrContext &&
+        !ifrContext->getSavedFlagValue(feature_flags::gFeatureFlagExtensionsInsideHybridSearch)) {
+        search_helpers::throwIfrKickbackIfNecessary(
+            _pipelines[0]->hasExtensionVectorSearchStage(),
+            feature_flags::gFeatureFlagVectorSearchExtension,
+            vector_search_metrics::inLookupKickbackRetryCount,
+            "The $vectorSearch extension stage is not supported in a $lookup");
+        search_helpers::throwIfrKickbackIfNecessary(
+            _pipelines[0]->hasExtensionSearchStage(),
+            feature_flags::gFeatureFlagSearchExtension,
+            search_metrics::inLookupKickbackRetryCount,
+            "The $search/$searchMeta extension stage is not supported in a $lookup");
     }
 }
 

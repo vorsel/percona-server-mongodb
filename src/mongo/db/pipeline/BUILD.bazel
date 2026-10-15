@@ -358,6 +358,7 @@ mongo_cc_library(
         "//src/mongo/db/exec:sort_executor",
         "//src/mongo/db/index:index_access_method",
         "//src/mongo/db/query/compiler/logical_model/sort_pattern",
+        "//src/mongo/db/query/util:represent_as_util",
         "//src/mongo/db/sorter:sorter_base",
     ],
 )
@@ -373,6 +374,7 @@ mongo_cc_library(
         ":field_path",
         "//src/mongo/db:query_expressions",
         "//src/mongo/db/exec/document_value",
+        "//src/mongo/db/query/util:represent_as_util",
     ],
 )
 
@@ -602,6 +604,7 @@ mongo_cc_library(
         "//src/mongo/db/memory_tracking",
         "//src/mongo/db/pipeline/search:mongot_extension_name",
         "//src/mongo/db/pipeline/spilling",
+        "//src/mongo/db/query:await_data_state",
         "//src/mongo/db/query:bucket_predicate_generator",
         "//src/mongo/db/query:explain_policy",
         "//src/mongo/db/query:query_knobs",
@@ -1049,9 +1052,11 @@ mongo_cc_library(
     deps = [
         ":pipeline",
         "//src/mongo/db/exec/single_doc_lookup:collection_acquirer",
-        "//src/mongo/db/exec/single_doc_lookup:express_single_document_lookup_executor",
         "//src/mongo/db/exec/single_doc_lookup:local_lookup_eligibility",
+        "//src/mongo/db/exec/single_doc_lookup:sbe_single_document_lookup_executor",
         "//src/mongo/db/exec/single_doc_lookup:single_document_lookup_executor",
+        "//src/mongo/db/query:query_knobs",
+        "//src/mongo/db/query/query_knobs:query_knob_configuration",
     ],
 )
 
@@ -1305,10 +1310,9 @@ mongo_cc_unit_test(
         "//src/mongo/db/exec/document_value",
         "//src/mongo/db/exec/document_value:document_value_test_util",
         "//src/mongo/db/memory_tracking",
-        "//src/mongo/db/query/collation:collator_factory_mock",
-        "//src/mongo/db/query/collation:collator_interface_mock",
         "//src/mongo/db/query/query_knobs:query_knob_configuration_test_util",
         "//src/mongo/scripting:scripting_server",
+        "//src/mongo/transport:transport_layer_mock",
         "//src/mongo/unittest",
         "//src/mongo/unittest:server_parameter_guard",
     ],
@@ -1533,6 +1537,7 @@ mongo_cc_unit_test(
         "lite_parsed_rank_fusion_test.cpp",
         "lite_parsed_score_fusion_desugarer_test.cpp",
         "lite_parsed_score_fusion_test.cpp",
+        "match_processor_test.cpp",
         "serverless_aggregation_context_fixture.cpp",
         "sort_rules_test.cpp",
         "//src/mongo/db/pipeline:document_source_coll_stats_test.cpp",
@@ -1566,6 +1571,7 @@ mongo_cc_unit_test(
         "//src/mongo/db/exec/document_value",
         "//src/mongo/db/exec/document_value:document_value_test_util",
         "//src/mongo/db/exec/single_doc_lookup:express_single_document_lookup_executor",
+        "//src/mongo/db/exec/single_doc_lookup:sbe_single_document_lookup_executor",
         "//src/mongo/db/exec/single_doc_lookup:single_document_lookup_executor",
         "//src/mongo/db/extension/host:extension_loader",
         "//src/mongo/db/memory_tracking",
@@ -1576,6 +1582,7 @@ mongo_cc_unit_test(
         "//src/mongo/db/sharding_environment:shard_server_test_fixture",
         "//src/mongo/db/sharding_environment:sharding_mongos_test_fixture",
         "//src/mongo/s/query/exec:router_exec_stage",
+        "//src/mongo/transport:transport_layer_mock",
         "//src/mongo/unittest",
         "//src/mongo/unittest:server_parameter_guard",
         "//src/mongo/util:version_impl",
@@ -1594,6 +1601,7 @@ mongo_cc_unit_test(
         "granularity_rounder_preferred_numbers_test.cpp",
         "lite_parsed_desugarer_test.cpp",
         "lookup_set_cache_test.cpp",
+        "match_processor_test.cpp",
         "partition_key_comparator_test.cpp",
         "pipeline_factory_test.cpp",
         "pipeline_metadata_tree_test.cpp",
@@ -1699,29 +1707,6 @@ mongo_cc_unit_test(
         ":aggregation_context_fixture",
         ":pipeline",
         "//src/mongo/db/query:query_test_service_context",
-    ],
-)
-
-mongo_cc_unit_test(
-    name = "pipeline_d_test",
-    srcs = [
-        "pipeline_d_test.cpp",
-    ],
-    tags = [
-        # Requires access to /data/db/ for storage.
-        "code_coverage_quarantine",
-        "mongo_unittest_fifth_group",
-    ],
-    deps = [
-        ":expression_context_for_test",
-        ":pipeline",
-        "//src/mongo/db:expression_context_builder",
-        "//src/mongo/db:query_exec",
-        "//src/mongo/db/query/collation:collator_factory_mock",
-        "//src/mongo/db/query/collation:collator_interface_mock",
-        "//src/mongo/db/shard_role",
-        "//src/mongo/db/shard_role/shard_catalog:catalog_test_fixture",
-        "//src/mongo/unittest",
     ],
 )
 

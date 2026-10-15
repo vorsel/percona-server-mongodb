@@ -51,6 +51,7 @@
 #include "mongo/util/assert_util.h"
 
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <string_view>
 #include <vector>
@@ -1153,6 +1154,12 @@ void QueryPlannerAnalysis::analyzeGeo(const QueryPlannerParams& params,
             continue;
         }
 
+        // Partial indexes don't validate unmatched documents on insertion, so they cannot
+        // guarantee every stored value was already validated.
+        if (indexEntry.filterExpr) {
+            continue;
+        }
+
         S2IndexingParams params;
         index2dsphere::initialize2dsphereParams(indexEntry.infoObj, indexEntry.collator, &params);
 
@@ -1190,6 +1197,10 @@ BSONObj QueryPlannerAnalysis::getSortPattern(const BSONObj& indexKeyPattern) {
 // static
 bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
                                           std::unique_ptr<QuerySolutionNode>* solnRoot) {
+    // Upper bound the number of scan leaves is capped at, so it can't overflow and wrap past the
+    // cap.
+    static constexpr size_t kMaxValue = std::numeric_limits<size_t>::max();
+
     vector<QuerySolutionNode*> explodableNodes;
 
     std::unique_ptr<QuerySolutionNode>* toReplace = structureOKForExplode(solnRoot);
@@ -1251,7 +1262,16 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
             if (!isOilExplodable(oil, iet)) {
                 break;
             }
-            numScans *= oil.intervals.size();
+
+            // If multiplying would overflow size_t, use the max value so the cap below still
+            // catches it.
+            const size_t numIntervals = oil.intervals.size();
+            if (numIntervals != 0 && numScans > kMaxValue / numIntervals) {
+                numScans = kMaxValue;
+            } else {
+                numScans *= numIntervals;
+            }
+
             kpIt.next();
             ++boundsIdx;
         }
@@ -1312,8 +1332,13 @@ bool QueryPlannerAnalysis::explodeForSort(const CanonicalQuery& query,
             }
         }
 
-        // Do some bookkeeping to see how many ixscans we'll create total.
-        totalNumScans += numScans;
+        // Do some bookkeeping to see how many ixscans we'll create total. If addition would
+        // overflow size_t, use the max value so the cap below still catches it.
+        if (totalNumScans > kMaxValue - numScans) {
+            totalNumScans = kMaxValue;
+        } else {
+            totalNumScans += numScans;
+        }
 
         // And for this scan how many fields we expand.
         fieldsToExplode.push_back(boundsIdx);
@@ -1499,6 +1524,12 @@ std::unique_ptr<QuerySolutionNode> QueryPlannerAnalysis::analyzeSort(
 
     if (!solnRoot->fetched()) {
         const bool sortIsCovered = std::all_of(sortObj.begin(), sortObj.end(), [&](BSONElement e) {
+            // Meta expression sort components (e.g. {$meta: "randVal"}) cannot be covered by
+            // index keys for they require metadata generation which only happens after a fetch.
+            // The element value is an object ({$meta: ...}) rather than a numeric direction.
+            if (!e.isNumber()) {
+                return false;
+            }
             // Note that hasField() will return 'false' in the case that this field is a
             // string and there is a non-simple collation on the index. This will lead to
             // encoding of the field from the document on fetch, despite having read the

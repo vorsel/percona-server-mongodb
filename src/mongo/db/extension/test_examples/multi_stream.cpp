@@ -14,6 +14,7 @@
 
 namespace sdk = mongo::extension::sdk;
 using namespace mongo;
+using mongo::extension::PipelineRewriteRule;
 
 using StreamType = sdk::ExecAggStageResultsAndMetadataSource::StreamType;
 
@@ -25,7 +26,9 @@ constexpr std::string_view kMetaField = "meta"sv;
 constexpr std::string_view kNumMetaField = "numMeta"sv;
 constexpr std::string_view kNumDocsField = "numDocs"sv;
 constexpr std::string_view kDocPadField = "docPad"sv;
+constexpr std::string_view kBatchSizeField = "batchSize"sv;
 constexpr std::string_view kAddStreamTypeField = "addStreamTypeField"sv;
+constexpr std::string_view kReportObservedBoundsField = "reportObservedBounds"sv;
 constexpr std::string_view kAdvertiseSortKeyField = "advertiseSortKey"sv;
 constexpr std::string_view kSuppressScoreField = "suppressScore"sv;
 constexpr std::string_view kAdvertiseScoreDetailsField = "advertiseScoreDetails"sv;
@@ -51,6 +54,10 @@ constexpr std::string_view kStreamTypeField = "_streamType"sv;
 // assert this marker survives the fusion to confirm the DRM source was recognized as
 // scoreDetails-generating.
 constexpr std::string_view kScoreDetailsMarker = "extensionMultiStreamScoreDetails"sv;
+
+// Pipeline bounds error values.
+constexpr long long kNoRuleFiredSentinel = -1;
+constexpr long long kNonDiscreteBoundValue = -2;
 
 // True if 'field' is present at the top level or inside any per-shard override.
 bool fieldPresentInAnyShard(const BSONObj& args, std::string_view field) {
@@ -88,16 +95,25 @@ struct DocEmitConfig {
     // inflate the document stream past the Exchange's per-consumer buffer with fewer documents.
     int docPad = 0;
     bool addStreamTypeField = false;
-    // When set, each document result also carries $scoreDetails metadata (see kScoreDetailsMarker).
     bool scoreDetails = false;
+    int batchSize = 0;
+    bool reportObservedBounds = false;
+    // The distinct states that can be observed from the applyPipelineBounds rule:
+    //   boost::none            -> the rule never fired (kNoRuleFiredSentinel reported: -1)
+    //   kNonDiscreteBoundValue -> the rule fired but found a non-discrete (Unknown/NeedAll) bound
+    //   any other value        -> the rule fired and found this discrete bound
+    boost::optional<long long> observedMaxLimit;
 
     static DocEmitConfig parse(const BSONObj& args) {
-        return {
-            args[kNumDocsField].isNumber() ? args[kNumDocsField].safeNumberInt() : 0,
-            args[kDocPadField].isNumber() ? args[kDocPadField].safeNumberInt() : 0,
-            args[kAddStreamTypeField].booleanSafe(),
-            args[kAdvertiseScoreDetailsField].booleanSafe(),
-        };
+        DocEmitConfig config;
+        config.numDocs = args[kNumDocsField].isNumber() ? args[kNumDocsField].safeNumberInt() : 0;
+        config.docPad = args[kDocPadField].isNumber() ? args[kDocPadField].safeNumberInt() : 0;
+        config.addStreamTypeField = args[kAddStreamTypeField].booleanSafe();
+        config.scoreDetails = args[kAdvertiseScoreDetailsField].booleanSafe();
+        config.batchSize =
+            args[kBatchSizeField].isNumber() ? args[kBatchSizeField].safeNumberInt() : 0;
+        config.reportObservedBounds = args[kReportObservedBoundsField].booleanSafe();
+        return config;
     }
 };
 
@@ -165,7 +181,7 @@ public:
           _metaConfig(std::move(metaConfig)) {}
 
     extension::ExtensionGetNextResult getNext(
-        const sdk::QueryExecutionContextHandle& /*execCtx*/,
+        const sdk::QueryExecutionContextHandle& execCtx,
         ::MongoExtensionExecAggStage* /*execStage*/) override {
         if (!_metaConfig.skip && _metaConfig.isActive() && _metaEmitted < _metaConfig.numMeta) {
             ++_metaEmitted;
@@ -178,6 +194,9 @@ public:
         if (_nextDoc >= _docConfig.numDocs) {
             return extension::ExtensionGetNextResult::eof();
         }
+        if (_nextDoc == 0 && _docConfig.batchSize > 0) {
+            execCtx->setBatchSize(static_cast<uint64_t>(_docConfig.batchSize));
+        }
         int i = _nextDoc++;
         int score = _docConfig.numDocs - i;
         BSONObjBuilder builder;
@@ -189,6 +208,10 @@ public:
         }
         if (_docConfig.addStreamTypeField) {
             builder.append(kStreamTypeField, -1);
+        }
+        if (_docConfig.reportObservedBounds) {
+            builder.append("observedPipelineLimit",
+                           _docConfig.observedMaxLimit.value_or(kNoRuleFiredSentinel));
         }
         // $sortKey drives merge-sort across shards. $searchScore is score * 0.125.
         BSONObjBuilder metaBuilder;
@@ -244,6 +267,24 @@ public:
 
     std::unique_ptr<sdk::ExecAggStageBase> compile() const override {
         return std::make_unique<MultiStreamSourceExecStage>(_name, _docConfig, _metaConfig);
+    }
+
+    bool evaluatePipelineRewriteRulePrecondition(
+        std::string_view ruleName,
+        mongo::extension::ConstPipelineRewriteContextHandle) const override {
+        return ruleName == "applyPipelineBounds";
+    }
+
+    bool evaluatePipelineRewriteRuleTransform(
+        std::string_view ruleName, mongo::extension::PipelineRewriteContextHandle ctx) override {
+        if (ruleName == "applyPipelineBounds") {
+            // Always assign so a later re-run correctly overwrites a stale value.
+            auto bounds = ctx->getPipelineSuffixBounds();
+            _docConfig.observedMaxLimit = (bounds.maxBounds.type == kDocsNeededConstraintDiscrete)
+                ? static_cast<long long>(bounds.maxBounds.value)
+                : kNonDiscreteBoundValue;
+        }
+        return false;
     }
 
     boost::optional<extension::sdk::DistributedPlanLogic> getDistributedPlanLogic() const override {
@@ -483,6 +524,11 @@ public:
         _registerStage<ExtensionMultiStreamStageDescriptor>(portal);
         _registerStage<MultiStreamSourceStageDescriptor>(portal);
         _registerStage<ExpandToDrmStageDescriptor>(portal);
+
+        std::vector<PipelineRewriteRule> rules{
+            {"applyPipelineBounds", kPipelineRewriteRuleTagInPlace},
+        };
+        _registerStageRules<MultiStreamSourceStageDescriptor>(portal, rules);
     }
 };
 

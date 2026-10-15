@@ -148,11 +148,11 @@ void registerMigrationRecoveryJobs(OperationContext* opCtx, long long term) {
     // Register a recovery job for migrationutil::resumeMigrationCoordinationsOnStepUp(), which
     // recovers all standalone MigrationCoordinators as a single batch and calls
     // notifyRecoveryJobComplete once when the entire batch finishes.
-    RangeDeleterService::get(opCtx)->registerRecoveryJob(term);
+    RangeDeleterService::get(opCtx)->registerRecoveryJob(term, RecoveryJob::kLegacyMigration);
 
-    // Register a second recovery job on behalf of MoveRangeCoordinator recovery, resolved later
-    // from ShardingCoordinatorService::_onServiceInitialization().
-    RangeDeleterService::get(opCtx)->registerRecoveryJob(term);
+    // Register one recovery job for the MoveRangeCoordinator recovered from disk. If there is no
+    // such coordinator, ShardingCoordinatorService resolves this job during its rebuild.
+    RangeDeleterService::get(opCtx)->registerRecoveryJob(term, RecoveryJob::kMoveRangeCoordinator);
 }
 
 BSONObj getQueryFilterForRangeDeletionTask(const UUID& collectionUuid, const ChunkRange& range) {
@@ -372,14 +372,24 @@ void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx, long long ter
                 return true;
             }
 
+            const auto& nss = doc.getNss();
+
+            // Clear the collection metadata to avoid data loss if a failover interrupts the
+            // migration. Otherwise, secondaries could serve queries with a stale ShardVersion.
+            // This is required for legacy migrations, where the critical section is in memory and
+            // unreplicated. Thus, the new node stepping up must resolve the legacy migration before
+            // serving any CRUD operation.
+            {
+                auto scopedCsr = CollectionShardingRuntime::acquireExclusive(opCtx, nss);
+                scopedCsr->clearCollectionMetadata(opCtx);
+            }
+
             LOGV2_DEBUG(4798511,
                         3,
                         "Found unfinished migration on step-up",
                         "term"_attr = term,
                         "migrationCoordinatorDoc"_attr = redact(doc.toBSON()),
                         "unfinishedMigrationsCount"_attr = recoveryFutures.size() + 1);
-
-            const auto& nss = doc.getNss();
 
             recoveryFutures.emplace_back(
                 asyncRecoverMigrationUntilSuccessOrStepDown(opCtx, nss).thenRunOn(executor));
@@ -403,7 +413,8 @@ void resumeMigrationCoordinationsOnStepUp(OperationContext* opCtx, long long ter
         return whenAll(std::move(futures)).ignoreValue().thenRunOn(executor);
     }()
         .onCompletion([term](const auto&) {
-            RangeDeleterService::get(getGlobalServiceContext())->notifyRecoveryJobComplete(term);
+            RangeDeleterService::get(getGlobalServiceContext())
+                ->notifyRecoveryJobComplete(term, RecoveryJob::kLegacyMigration);
             LOGV2_DEBUG(11420100,
                         2,
                         "Finished all migration coordinator step-up recovery tasks",
@@ -577,14 +588,6 @@ void drainMigrationsPendingRecovery(OperationContext* opCtx) {
     while (store.count(opCtx)) {
         store.forEach(opCtx, BSONObj(), [opCtx](const MigrationCoordinatorDocument& doc) {
             try {
-                // Clear the in-memory filtering metadata so the refresh triggered below runs full
-                // recovery (_recoverMigrationCoordinations), which completes/forgets this
-                // migrationCoordinators document.
-                {
-                    auto scopedCsr =
-                        CollectionShardingRuntime::acquireExclusive(opCtx, doc.getNss());
-                    scopedCsr->clearCollectionMetadata(opCtx);
-                }
                 uassertStatusOK(FilteringMetadataCache::get(opCtx)->onShardVersionMismatch(
                     opCtx, doc.getNss(), boost::none));
             } catch (DBException& ex) {
@@ -624,13 +627,6 @@ SemiFuture<void> asyncRecoverMigrationUntilSuccessOrStepDown(OperationContext* o
             auto opCtx{uniqueOpCtx.get()};
 
             try {
-                // Clear the in-memory filtering metadata so the refresh below runs full recovery
-                // (_recoverMigrationCoordinations), which completes/forgets any pending
-                // migrationCoordinators document for this namespace.
-                {
-                    auto scopedCsr = CollectionShardingRuntime::acquireExclusive(opCtx, nss);
-                    scopedCsr->clearCollectionMetadata(opCtx);
-                }
                 refreshFilteringMetadataUntilSuccess(opCtx, nss);
             } catch (const DBException& ex) {
                 // This is expected in the event of a stepdown.

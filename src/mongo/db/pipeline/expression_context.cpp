@@ -9,6 +9,7 @@
 #include "mongo/db/feature_compatibility_version_documentation.h"
 #include "mongo/db/feature_flag.h"
 #include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/memory_tracking/query_memory_load_shedding.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/process_interface/stub_mongo_process_interface.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
@@ -30,7 +31,9 @@ namespace mongo {
 
 SimpleMemoryUsageTracker& ExpressionContext::getExpressionFallbackTracker() {
     if (!_expressionFallbackTracker) {
-        if (getOperationContext() && !_params.excludeOperationMemoryTracking &&
+        if (getOperationContext() &&
+            !_params.excludeExpressionFallbackFromOperationMemoryTracking &&
+            !_params.excludeOperationMemoryTracking &&
             feature_flags::gFeatureFlagQueryMemoryTracking.isEnabled() &&
             feature_flags::gFeatureFlagExpressionMemoryTracking.isEnabled()) {
             // Memory tracking is enabled and an OperationContext is available: wire the fallback to
@@ -64,9 +67,13 @@ ExpressionContext::ExpressionContext(ExpressionContextParams&& params)
 
     _params.timeZoneDatabase = mongo::getTimeZoneDatabase(_params.opCtx);
 
-    // Default IFRContext for code paths that don't go through run_aggregate or cluster_aggregate.
+    // The IFRContext is per-operation: it is installed on the opCtx in the command's
+    // InvocationBaseInternal ctor, so any ExpressionContext built while executing a command
+    // observes the operation's feature-flag values -- including any disabled on an IFR retry --
+    // through get(opCtx).
     if (!_params.ifrContext) {
-        _params.ifrContext = std::make_shared<IncrementalFeatureRolloutContext>();
+        _params.ifrContext = _params.opCtx ? IncrementalFeatureRolloutContext::get(_params.opCtx)
+                                           : std::make_shared<IncrementalFeatureRolloutContext>();
     }
 
     // Disallow disk use if in read-only mode.
@@ -126,6 +133,10 @@ void ExpressionContext::InterruptChecker::checkForInterruptVerySlow() {
     CurOp::get(_expressionContext->getOperationContext())->maybeLogSlowQuery();
 }
 
+void ExpressionContext::InterruptChecker::checkForQueryMemoryLoadShedding(OperationContext* opCtx) {
+    uassertStatusOK(queryMemoryCheckLoadShedding(opCtx));
+}
+
 std::unique_ptr<ExpressionContext::CollatorStash> ExpressionContext::temporarilyChangeCollator(
     std::unique_ptr<CollatorInterface> newCollator) {
     // This constructor of CollatorStash is private, so we can't use make_unique().
@@ -172,6 +183,18 @@ void ExpressionContext::stopExpressionCounters() {
             _expressionCounters->windowAccumulatorExprCountersMap);
     }
     _expressionCounters.reset();
+}
+
+void ExpressionContext::checkAndIncrementMemoryIntensiveExprCount(std::string_view exprName) {
+    ++_memoryIntensiveExprCount;
+    const auto limit =
+        static_cast<uint32_t>(internalQueryMaxMemoryIntensiveExpressions.loadRelaxed());
+    uassert(12876600,
+            str::stream() << "Pipeline contains too many memory-intensive expressions. " << exprName
+                          << " caused the count to reach " << _memoryIntensiveExprCount
+                          << ", which exceeds the limit of " << limit
+                          << " (internalQueryMaxMemoryIntensiveExpressions).",
+            _memoryIntensiveExprCount <= limit);
 }
 
 void ExpressionContext::initializeReferencedSystemVariables() {

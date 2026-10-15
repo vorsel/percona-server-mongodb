@@ -44,6 +44,7 @@ public:
     ExpressionContextBuilder& inRouter(bool);
     ExpressionContextBuilder& forPerShardCursor(bool);
     ExpressionContextBuilder& excludeOperationMemoryTracking(bool);
+    ExpressionContextBuilder& excludeExpressionFallbackFromOperationMemoryTracking(bool);
     ExpressionContextBuilder& allowDiskUse(bool);
     ExpressionContextBuilder& allowPartialResults(bool);
     ExpressionContextBuilder& bypassDocumentValidation(bool);
@@ -56,6 +57,7 @@ public:
     ExpressionContextBuilder& inUnionWith(bool);
     ExpressionContextBuilder& isParsingViewDefinition(bool);
     ExpressionContextBuilder& isParsingCollectionValidator(bool);
+    ExpressionContextBuilder& isReparsingRepresentativeQueryShape(bool);
     ExpressionContextBuilder& isIdHackQuery(bool);
     ExpressionContextBuilder& isFleQuery(bool);
     ExpressionContextBuilder& canBeRejected(bool);

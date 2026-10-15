@@ -9,6 +9,7 @@
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/field_ref.h"
 #include "mongo/db/matcher/path.h"
+#include "mongo/util/assert_util.h"
 #include "mongo/util/modules.h"
 
 #include <cstddef>
@@ -58,8 +59,16 @@ public:
 
 class BSONMatchableDocument : public MatchableDocument {
 public:
-    BSONMatchableDocument(const BSONObj& obj);
-    ~BSONMatchableDocument() override;
+    BSONMatchableDocument(BSONObj obj) : _obj(std::move(obj)) {}
+
+    ~BSONMatchableDocument() override = default;
+
+    void reset(BSONObj obj) {
+        tassert(13179700,
+                "Cannot reset BSONMatchableDocument while iterator is in use",
+                !_iteratorUsed);
+        _obj = std::move(obj);
+    }
 
     BSONObj toBSON() const override {
         return _obj;
@@ -84,7 +93,7 @@ public:
 private:
     BSONObj _obj;
     mutable BSONElementIterator _iterator;
-    mutable bool _iteratorUsed;
+    mutable bool _iteratorUsed = false;
 };
 
 /**

@@ -65,6 +65,7 @@ load(
     "use_glibcxx_debug",
     "use_lldbserver",
     "use_ocsp_stapling",
+    "use_rbe_sysroot",
     "use_wait_for_debugger",
     "use_wiredtiger",
     "visibility_support",
@@ -184,6 +185,17 @@ selects.config_setting_group(
         "@platforms//cpu:ppc64le",
         ":compiler_type_gcc",
         "//bazel/platforms:rhel9",
+        ":linkstatic_enabled",
+    ],
+)
+
+selects.config_setting_group(
+    name = "rhel10_ppc64le_gcc_linkstatic",
+    match_all = [
+        "@platforms//os:linux",
+        "@platforms//cpu:ppc64le",
+        ":compiler_type_gcc",
+        "//bazel/platforms:rhel10",
         ":linkstatic_enabled",
     ],
 )
@@ -829,6 +841,43 @@ config_setting(
     flag_values = {
         "//bazel/config:remote_test": "True",
     },
+)
+
+# ==========
+# use_rbe_sysroot
+# ==========
+
+use_rbe_sysroot(
+    name = "use_rbe_sysroot",
+    build_setting_default = False,
+)
+
+# The sysroot dump only has RBE container images for x86_64 and arm64.
+# On s390x and ppc64le we have no container to extract from, so the
+# config setting evaluates False even when the flag is True — the
+# toolchain template then falls back to the no-sysroot path.
+config_setting(
+    name = "_use_rbe_sysroot_x86_64",
+    constraint_values = ["@platforms//cpu:x86_64"],
+    flag_values = {
+        "//bazel/config:use_rbe_sysroot": "True",
+    },
+)
+
+config_setting(
+    name = "_use_rbe_sysroot_arm64",
+    constraint_values = ["@platforms//cpu:arm64"],
+    flag_values = {
+        "//bazel/config:use_rbe_sysroot": "True",
+    },
+)
+
+selects.config_setting_group(
+    name = "use_rbe_sysroot_enabled",
+    match_any = [
+        ":_use_rbe_sysroot_x86_64",
+        ":_use_rbe_sysroot_arm64",
+    ],
 )
 
 # --------------------------------------
@@ -3025,6 +3074,19 @@ config_setting(
     },
 )
 
+# Whether mongod/mongos may depend on a server-side JS engine. Server-side scripting is never
+# compiled into ppc64le binaries (the JS engine must be absent from released PPC builds regardless
+# of the server_js flag), so a build links scripting_server only when server_js is enabled AND the
+# target is not ppc64le. Keying this on the platform means any ppc64le build links scripting_none,
+# not just the Evergreen variants that remember to pass --server_js=False.
+selects.config_setting_group(
+    name = "server_js_engine_allowed",
+    match_all = [
+        ":server_js_enabled",
+        ":not_ppc",
+    ],
+)
+
 # --------------------------------------
 # xray
 # --------------------------------------
@@ -3287,7 +3349,7 @@ string_flag(
 
 bool_flag(
     name = "build_atlas",
-    build_setting_default = True,
+    build_setting_default = False,
 )
 
 config_setting(

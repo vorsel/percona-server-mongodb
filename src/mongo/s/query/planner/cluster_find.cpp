@@ -164,11 +164,10 @@ BSONObj makeFindCommandForShards(OperationContext* opCtx,
         findCommand.setLet(vars.toBSON(vps, *letParams));
     }
 
-    // ExpressionContext may contain previously looked up query settings. Propagate it to the
-    // shards.
-    if (!query_settings::isDefault(query.getExpCtx()->getQuerySettings())) {
-        findCommand.setQuerySettings(query.getExpCtx()->getQuerySettings());
-    }
+    // ExpressionContext may contain previously looked up query settings. Propagate them, and the
+    // 'maxTimeMS' resolved from them, to the shards.
+    query_settings::applyToShardRequest(
+        findCommand, query.getExpCtx()->getQuerySettings(), static_cast<bool>(query.getExplain()));
 
     // Pass the queryShapeHash to the shards. We must validate that all participating shards can
     // understand 'originalQueryShapeHash' and therefore check the feature flag. We use the last LTS
@@ -519,6 +518,13 @@ Status setUpOperationContextStateForGetMore(OperationContext* opCtx,
 
     // Restore rawData onto the opCtx.
     isRawDataOperation(opCtx) = cursor->getRawData();
+
+    // Restore the IFR context that this cursor's plan was built under. The feature-flag values
+    // stamped onto outbound shard requests come from this opCtx decoration (see
+    // ClientMetadataPropagationEgressHook::writeRequestMetadata), not from the pipeline's
+    // ExpressionContext. The GetMore should retain IFR flag values as dictated by the router's
+    // outbound request.
+    IncrementalFeatureRolloutContext::set(opCtx, cursor->cloneIfrContext());
 
     auto apiParamsFromClient = APIParameters::get(opCtx);
     uassert(

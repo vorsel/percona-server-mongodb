@@ -17,6 +17,7 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/database_name.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/feature_compatibility_version_parser.h"
 #include "mongo/db/generic_argument_util.h"
 #include "mongo/db/global_catalog/chunk_manager.h"
 #include "mongo/db/global_catalog/ddl/notify_sharding_event_gen.h"
@@ -34,6 +35,7 @@
 #include "mongo/db/namespace_string_util.h"
 #include "mongo/db/query/collation/collator_interface.h"
 #include "mongo/db/query/distinct_command_gen.h"
+#include "mongo/db/query/find_command.h"
 #include "mongo/db/query/write_ops/write_ops_gen.h"
 #include "mongo/db/query/write_ops/write_ops_parsers.h"
 #include "mongo/db/repl/change_stream_oplog_notification.h"
@@ -975,8 +977,14 @@ void cloneAuthoritativeCollectionMetadataToShards(
             str::stream() << "The collection " << nss.toStringForErrorMsg() << " is not tracked",
             cm.hasRoutingTable());
     std::set<ShardId> shardIds;
-    cm.getAllShardIds(&shardIds);
-
+    if (cm.isUnsplittable()) {
+        // We can just target the data shard, since the collection's single chunk can't be moved.
+        cm.getAllShardIds(&shardIds);
+    } else {
+        // For sharded collections, target all shards to cover current and historical chunk owners.
+        const auto allShardIds = Grid::get(opCtx)->shardRegistry()->getAllShardIds(opCtx);
+        shardIds.insert(allShardIds.begin(), allShardIds.end());
+    }
     // The DB primary must always know that a collection is tracked, even when it owns no chunks.
     shardIds.insert(primaryShardId);
 
@@ -1159,6 +1167,57 @@ void commitChunkOperationsMetadataToShardCatalog(
         **executor, token, std::move(request));
 
     sendAuthenticatedCommandToShards(opCtx, opts, shardIds);
+}
+
+multiversion::FeatureCompatibilityVersion getShardFCV(OperationContext* opCtx,
+                                                      const ShardId& shardId) {
+    const auto shard = uassertStatusOK(Grid::get(opCtx)->shardRegistry()->getShard(opCtx, shardId));
+
+    FindCommandRequest findCommand(NamespaceString::kServerConfigurationNamespace);
+    findCommand.setFilter(BSON("_id" << multiversion::kParameterName));
+    findCommand.setLimit(1);
+    findCommand.setReadConcern(repl::ReadConcernArgs(repl::ReadConcernLevel::kMajorityReadConcern));
+
+    const auto response = uassertStatusOK(
+        shard->runExhaustiveCursorCommand(opCtx,
+                                          ReadPreferenceSetting(ReadPreference::PrimaryOnly),
+                                          DatabaseName::kAdmin,
+                                          findCommand.toBSON(),
+                                          Milliseconds(-1)));
+
+    tassert(13154100,
+            fmt::format("Could not find the featureCompatibilityVersion document on shard {}",
+                        shardId.toString()),
+            !response.docs.empty());
+
+    return uassertStatusOK(FeatureCompatibilityVersionParser::parse(response.docs.front()));
+}
+
+void assertShardsAreNotInFCVTransitionsForMovePrimary(
+    OperationContext* opCtx,
+    const ShardId& recipientShardId,
+    AuthoritativeMetadataAccessLevelEnum donorAccessLevel) {
+
+    uassert(ErrorCodes::ConflictingOperationInProgress,
+            "Cannot start a movePrimary operation while donor shard is modifying its FCV to either "
+            "upgrade or downgrade",
+            donorAccessLevel != AuthoritativeMetadataAccessLevelEnum::kWritesAllowed);
+
+    const auto recipientFCV = getShardFCV(opCtx, recipientShardId);
+    bool ddlAuthoritative = feature_flags::gAuthoritativeShardsDDL.isEnabledOnVersion(recipientFCV);
+    bool crudAuthoritative =
+        feature_flags::gAuthoritativeShardsCRUD.isEnabledOnVersion(recipientFCV);
+    uassert(
+        ErrorCodes::ConflictingOperationInProgress,
+        fmt::format(
+            "Cannot start movePrimary while recipient shard {} is in an FCV transition (FCV: {}). "
+            "Wait for setFeatureCompatibilityVersion to complete on all shards.",
+            recipientShardId.toString(),
+            multiversion::toString(recipientFCV)),
+        (donorAccessLevel == AuthoritativeMetadataAccessLevelEnum::kNone && !ddlAuthoritative &&
+         !crudAuthoritative) ||
+            (donorAccessLevel == AuthoritativeMetadataAccessLevelEnum::kWritesAndReadsAllowed &&
+             ddlAuthoritative && crudAuthoritative));
 }
 
 AuthoritativeMetadataAccessLevelEnum getGrantedAuthoritativeMetadataAccessLevel(

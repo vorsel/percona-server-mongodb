@@ -133,8 +133,23 @@ void validate(const AggregateCommandRequest& aggregate,
                         hintElem.value() == BSON(query_request_helper::kNaturalSortField << 1)));
     }
 
+    if (aggregate.getResumeAfter() || aggregate.getStartAt()) {
+        uassert(12848200,
+                "$_resumeAfter is not supported for collectionless aggregations",
+                !nss.isCollectionlessAggregateNS());
+    }
+
     if (client) {
         assertInternalParamsAreSetByInternalClients(client, aggregate);
+
+        // '$_isHybridSearch' is set internally for a desugared $rankFusion/$scoreFusion pipeline by
+        // the router. It should be checked here against the request as it came off the wire, rather
+        // than in the generic command request validation checks as those are re-run by the router
+        // against potentially mutated requests, still under the user's own external client.
+        uassert(13212500,
+                str::stream() << "BSON field '" << AggregateCommandRequest::kIsHybridSearchFieldName
+                              << "' is an unknown field",
+                isInternalOrDirectClient(client) || !aggregate.getIsHybridSearch().has_value());
     }
 }
 

@@ -6,6 +6,7 @@
 #include "mongo/client/read_preference.h"
 #include "mongo/db/api_parameters.h"
 #include "mongo/db/auth/user_name.h"
+#include "mongo/db/feature_flag.h"
 #include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
 #include "mongo/db/query/query_shape/query_shape.h"
 #include "mongo/db/session/logical_session_id.h"
@@ -205,6 +206,17 @@ public:
     virtual bool getRawData() const = 0;
 
     /**
+     * Returns a fresh clone of the IFR context under which this cursor's **execution** plan was
+     * built. Installed onto each getMore's OperationContext so remote dispatch uses the same
+     * feature-flag values, including any flag disabled by an IFR kickback retry.
+     *
+     * A clone is returned rather than the cursor's own context so that callers cannot mutate the
+     * pinned state, and because the cursor's context carries a memoized egress serialization from
+     * the originating operation which a new OperationContext must not inherit.
+     */
+    virtual std::shared_ptr<IncrementalFeatureRolloutContext> cloneIfrContext() const = 0;
+
+    /**
      * Returns the creation date of the cursor.
      */
     virtual Date_t getCreatedDate() const = 0;
@@ -318,7 +330,7 @@ public:
      */
     virtual boost::optional<query_stats::DataBearingNodeMetrics> takeRemoteMetrics() = 0;
 
-    std::unique_ptr<OperationMemoryUsageTracker> releaseMemoryUsageTracker() {
+    std::shared_ptr<OperationMemoryUsageTracker> releaseMemoryUsageTracker() {
         return std::move(_memoryTracker);
     }
 
@@ -326,7 +338,7 @@ public:
         return _memoryTracker.get();
     }
 
-    void setMemoryUsageTracker(std::unique_ptr<OperationMemoryUsageTracker> memoryTracker) {
+    void setMemoryUsageTracker(std::shared_ptr<OperationMemoryUsageTracker> memoryTracker) {
         _memoryTracker = std::move(memoryTracker);
     }
 
@@ -345,7 +357,7 @@ private:
     // Unused maxTime budget for this cursor.
     Microseconds _leftoverMaxTimeMicros = Microseconds::max();
 
-    std::unique_ptr<OperationMemoryUsageTracker> _memoryTracker;
+    std::shared_ptr<OperationMemoryUsageTracker> _memoryTracker;
 };
 
 }  // namespace mongo

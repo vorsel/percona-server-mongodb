@@ -158,7 +158,7 @@ TEST(WasmtimeScope, GetNumberLongLong_ReturnsMillisForDateValue) {
 // The idle-bridge revival path hits resetRealm() on every request.
 TEST(WasmtimeBridge, DateNow_SurvivesRealmReset) {
     WasmtimeScriptEngine engine;
-    auto ctx = engine.createWasmEngineContext();
+    auto ctx = engine.getWasmEngineContext();
     wasm::MozJSWasmBridge::Options opts;
     opts.linearMemoryLimitMB = static_cast<uint32_t>(gWasmtimeStoreMemoryLimitMB.load());
     auto bridge = std::make_unique<wasm::MozJSWasmBridge>(ctx, opts);
@@ -340,4 +340,42 @@ TEST(WasmtimeScope, GetRegEx_SlashInPattern) {
     JSRegEx re = scope->getRegEx("__returnValue");
     ASSERT_EQ(std::string("hello\\/world"), re.pattern);
     ASSERT_EQ(std::string("gi"), re.flags);
+}
+
+// A constructed DBPointer must be immutable in the wasm scope as well: DBPointerInfo::construct
+// defines `ns` and `id` as JSPROP_READONLY. In sloppy mode assignments are silently dropped (the
+// values survive), and in strict mode they throw a TypeError. The function returns the observed
+// outcomes as an object so each can be asserted independently.
+TEST(WasmtimeScope, DBPointerPropertiesAreReadOnly) {
+    WasmtimeScriptEngine engine;
+    std::unique_ptr<Scope> scope(engine.createScopeForCurrentThread(boost::none));
+    ASSERT(scope);
+
+    ScriptingFunction fn = scope->createFunction(
+        "function() {"
+        "    var dbp = DBPointer('originalNs', ObjectId('507f1f77bcf86cd799439011'));"
+        "    var originalId = dbp.id.toString();"
+        "    dbp.ns = 'mutatedNs';"
+        "    dbp.id = ObjectId('000000000000000000000000');"
+        "    var nsUnchanged = (dbp.ns === 'originalNs');"
+        "    var idUnchanged = (dbp.id.toString() === originalId);"
+        "    var threwForNs = false;"
+        "    var threwForId = false;"
+        "    var dbp2 = DBPointer('originalNs', ObjectId('507f1f77bcf86cd799439011'));"
+        "    try { (function() { 'use strict'; dbp2.ns = 'mutatedNs'; })(); }"
+        "    catch (e) { threwForNs = (e instanceof TypeError); }"
+        "    try { (function() { 'use strict'; dbp2.id = ObjectId('000000000000000000000000'); "
+        "})(); }"
+        "    catch (e) { threwForId = (e instanceof TypeError); }"
+        "    return {nsUnchanged: nsUnchanged, idUnchanged: idUnchanged, threwForNs: threwForNs, "
+        "threwForId: threwForId};"
+        "}");
+    ASSERT(fn != 0);
+    ASSERT_EQ(0, scope->invoke(fn, nullptr, nullptr, 0));
+
+    BSONObj res = scope->getObject("__returnValue");
+    ASSERT_TRUE(res.getBoolField("nsUnchanged"));
+    ASSERT_TRUE(res.getBoolField("idUnchanged"));
+    ASSERT_TRUE(res.getBoolField("threwForNs"));
+    ASSERT_TRUE(res.getBoolField("threwForId"));
 }

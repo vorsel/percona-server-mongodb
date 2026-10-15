@@ -10,6 +10,7 @@
 #include "mongo/util/modules.h"
 
 #include <cstdint>
+#include <string_view>
 
 [[MONGO_MOD_PUBLIC]];
 
@@ -60,5 +61,17 @@ Status validateBSONColumn(const char* buf,
                           int maxLength,
                           BSONValidateModeEnum mode = BSONValidateModeEnum::kDefault,
                           ValidationVersion validationVersion = currentValidationVersion) noexcept;
+
+// Validates JS-produced BSON. Throws InvalidBSONFromJavaScript on failure, preserves
+// ExceededMemoryLimit.
+void uassertValidBSONFromJavaScript(const BSONObj& obj, std::string_view context);
+
+/**
+ * Validates the nesting depth of 'obj', returning ErrorCodes::Overflow if it exceeds the depth
+ * limit getMaxDepthForUserStorage() sets. That limit is lower than the one validateBSON() enforces,
+ * because a depth level buffer is needed to account for the nesting the server adds when it embeds
+ * 'obj' in an oplog entry or a command reply.
+ */
+Status validateBSONDepthForUserStorage(const BSONObj& obj);
 
 }  // namespace mongo

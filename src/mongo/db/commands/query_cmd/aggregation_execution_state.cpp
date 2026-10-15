@@ -144,9 +144,10 @@ public:
                         << "Failed to resolve view '" << involvedNs.toStringForErrorMsg());
                 }
 
-                // The mongos all-view resolution path doesn't correctly handle timeseries views.
-                // Since mongos view resolution and viewless timeseries are released in 9.0, we do
-                // not need to support this for timeseries views.
+                // The mongos all-view resolution path doesn't correctly handle timeseries views. We
+                // still need to handle timeseries views in 9.0 because of FCV downgrades. We
+                // perform a kickback here to retry the aggregation without hybrid search enabled to
+                // ensure we handle the view correctly.
                 const auto& ifrContext = getIfrContext();
                 const bool extensionsInsideHybridSearchEnabled = ifrContext &&
                     ifrContext->getSavedFlagValue(
@@ -227,9 +228,19 @@ public:
         // top-level binding branch in resolveInvolvedNamespacesOnLiteParsedPipeline is skipped — we
         // don't apply this view to itself, we only recurse into its subpipelines.
         for (auto& [_, entry] : resolvedNamespaces) {
-            if (auto* parsed = entry.getMutableParsedPipeline()) {
+            if (entry.getMutableParsedPipeline()) {
+                // Desugar the view's lite-parsed pipeline before resolving its subpipeline views.
+                // TODO SERVER-131677: combine desugaring and resolveInvolvedNamespaces into a
+                // single API so callers cannot resolve a non-desugared pipeline by mistake.
+                if (!entry.getLiteParserOptions()) {
+                    entry.setLiteParserOptions(std::make_shared<LiteParserOptions>(
+                        LiteParserOptions{.ifrContext = getIfrContext()}));
+                }
+                entry.desugarViewPipeline();
                 PipelineResolver::resolveInvolvedNamespacesOnLiteParsedPipeline(
-                    &parsed->pipeline(), entry.getResolvedNamespace(), resolvedNamespaces);
+                    &entry.getMutableParsedPipeline()->pipeline(),
+                    entry.getResolvedNamespace(),
+                    resolvedNamespaces);
             }
         }
 
@@ -514,6 +525,10 @@ public:
 
     const CollectionOrViewAcquisition& getMainCollectionOrView() const override {
         MONGO_UNREACHABLE;
+    }
+
+    bool isCollectionlessAggregation() const override {
+        return true;
     }
 
     query_shape::CollectionType getMainCollectionType() const override {
@@ -1047,6 +1062,9 @@ void AggCatalogState::validate() const {
             !(_aggExState.getRequest().getIsMapReduceCommand() && isTimeseriesQuery));
 
     if (_aggExState.getRequest().getResumeAfter() || _aggExState.getRequest().getStartAt()) {
+        uassert(12848201,
+                "$_resumeAfter is not supported for collectionless aggregations",
+                !isCollectionlessAggregation());
         const auto& collectionOrView = getMainCollectionOrView();
         uassert(ErrorCodes::InvalidPipelineOperator,
                 "$_resumeAfter is not supported on timeseries collections",

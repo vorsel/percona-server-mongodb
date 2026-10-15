@@ -22,6 +22,8 @@
 #include "mongo/db/logical_time.h"
 #include "mongo/db/matcher/extensions_callback_noop.h"
 #include "mongo/db/matcher/extensions_callback_real.h"
+#include "mongo/db/memory_tracking/operation_memory_usage_tracker.h"
+#include "mongo/db/memory_tracking/query_memory_load_shedding.h"
 #include "mongo/db/namespace_string.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/pipeline/aggregation_request_helper.h"
@@ -159,8 +161,21 @@ BSONObj prepareDistinctForPassthrough(
     const bool requestQueryStats,
     const boost::optional<query_shape::QueryShapeHash>& queryShapeHash) {
     const auto qsBson = qs.toBSON();
+    // Replace the client-supplied 'maxTimeMS' with the one resolved from the query settings, so
+    // that the shard's deadline reflects the override rather than the stale, client-supplied value.
+    // 'addField' replaces in place, preserving field order, so the forwarded command carries
+    // exactly one 'maxTimeMS'. This function is only reached on the non-explain path, hence
+    // 'isExplain' is false.
+    const auto cmdWithResolvedMaxTimeMS = [&] {
+        if (auto qsMaxTimeMS =
+                query_settings::resolveMaxTimeMSForShardForwarding(qs, false /* isExplain */)) {
+            return cmd.addField(
+                BSON(GenericArguments::kMaxTimeMSFieldName << *qsMaxTimeMS).firstElement());
+        }
+        return cmd;
+    }();
     if (requestQueryStats || !qsBson.isEmpty() || queryShapeHash) {
-        BSONObjBuilder bob(cmd);
+        BSONObjBuilder bob(cmdWithResolvedMaxTimeMS);
         // Append distinct command with the query settings and includeQueryStatsMetrics if needed.
         if (requestQueryStats) {
             bob.append(DistinctCommandRequest::kIncludeQueryStatsMetricsFieldName, true);
@@ -187,7 +202,7 @@ BSONObj prepareDistinctForPassthrough(
         return CommandHelpers::filterCommandRequestForPassthrough(bob.done());
     }
 
-    return CommandHelpers::filterCommandRequestForPassthrough(cmd);
+    return CommandHelpers::filterCommandRequestForPassthrough(cmdWithResolvedMaxTimeMS);
 }
 
 void runDistinctAsAgg(OperationContext* opCtx,
@@ -371,6 +386,7 @@ public:
 
         void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) override {
             CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+            markOperationQueryMemorySheddingEligible(opCtx);
             try {
                 executeDistinct(opCtx, boost::none /* verbosity */, reply);
             } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {

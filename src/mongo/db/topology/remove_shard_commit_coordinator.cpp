@@ -5,16 +5,22 @@
 
 #include "mongo/client/replica_set_monitor.h"
 #include "mongo/db/dbdirectclient.h"
+#include "mongo/db/global_catalog/ddl/sharding_coordinator_gen.h"
+#include "mongo/db/global_catalog/type_collection.h"
+#include "mongo/db/namespace_string_util.h"
 #include "mongo/db/query/write_ops/write_ops_gen.h"
 #include "mongo/db/query/write_ops/write_ops_parsers.h"
 #include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
 #include "mongo/db/shard_role/shard_catalog/collection_sharding_state.h"
+#include "mongo/db/shard_role/shard_catalog/commit_collection_metadata_locally.h"
+#include "mongo/db/shard_role/shard_catalog/commit_database_metadata_locally.h"
 #include "mongo/db/shard_role/shard_catalog/database_sharding_runtime.h"
 #include "mongo/db/shard_role/shard_catalog/database_sharding_state.h"
 #include "mongo/db/sharding_environment/grid.h"
 #include "mongo/db/sharding_environment/sharding_logging.h"
 #include "mongo/db/topology/remove_shard_exception.h"
 #include "mongo/db/topology/topology_change_helpers.h"
+#include "mongo/util/serialization_context.h"
 
 #define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
 
@@ -22,12 +28,14 @@ namespace mongo {
 
 namespace {
 
-void deleteAllDocumentsFromCollection(OperationContext* opCtx, const NamespaceString& nss) {
+void deleteAllDocumentsFromCollection(OperationContext* opCtx,
+                                      const NamespaceString& nss,
+                                      BSONObj filter = BSONObj()) {
     DBDirectClient client(opCtx);
     write_ops::DeleteCommandRequest deleteOp(nss);
     deleteOp.setDeletes({[&] {
         write_ops::DeleteOpEntry entry;
-        entry.setQ(BSONObj());
+        entry.setQ(std::move(filter));
         entry.setMulti(true);
         return entry;
     }()});
@@ -35,22 +43,27 @@ void deleteAllDocumentsFromCollection(OperationContext* opCtx, const NamespaceSt
     write_ops::checkWriteErrors(client.remove(std::move(deleteOp)));
 }
 
-void dropShardCatalogMetadata(OperationContext* opCtx) {
+void dropShardCatalogMetadata(OperationContext* opCtx,
+                              AuthoritativeMetadataAccessLevelEnum accessLevel) {
     LOGV2(9194400, "Dropping shard catalog metadata before shard removal");
 
+    const auto& sessionsNss = NamespaceString::kLogicalSessionsNamespace;
+    const auto sessionsNssSerialized =
+        NamespaceStringUtil::serialize(sessionsNss, SerializationContext::stateDefault());
+    const BSONObj allButSessionsNssFilter =
+        BSON(CollectionType::kNssFieldName << BSON("$ne" << sessionsNssSerialized));
+
     deleteAllDocumentsFromCollection(opCtx, NamespaceString::kConfigShardCatalogDatabasesNamespace);
-    deleteAllDocumentsFromCollection(opCtx,
-                                     NamespaceString::kConfigShardCatalogCollectionsNamespace);
+    // Excluding config.system.sessions collection entries from being removed from shard catalog
+    // since removing them, can cause config server to enter invalid state after transitioning
+    // to dedicated and back to embedded, marking it as kUnknown, while still the DB primary shard.
+    deleteAllDocumentsFromCollection(
+        opCtx, NamespaceString::kConfigShardCatalogCollectionsNamespace, allButSessionsNssFilter);
     deleteAllDocumentsFromCollection(opCtx, NamespaceString::kConfigShardCatalogChunksNamespace);
 
-    for (const auto& nss : CollectionShardingState::getCollectionNames(opCtx)) {
-        auto scopedCsr = CollectionShardingRuntime::acquireExclusive(opCtx, nss);
-        scopedCsr->clearCollectionMetadata(opCtx);
-    }
-
-    for (const auto& dbName : DatabaseShardingState::getDatabaseNames(opCtx)) {
-        auto scopedDsr = DatabaseShardingRuntime::acquireExclusive(opCtx, dbName);
-        scopedDsr->clearDbMetadata(opCtx);
+    if (accessLevel >= AuthoritativeMetadataAccessLevelEnum::kWritesAllowed) {
+        shard_catalog_commit::commitInvalidateAllDatabaseMetadata(opCtx);
+        shard_catalog_commit::commitInvalidateAllCollectionMetadata(opCtx);
     }
 }
 
@@ -225,7 +238,7 @@ void RemoveShardCommitCoordinator::_dropLocalCollections(OperationContext* opCtx
         // Once the config server is no longer a shard, its local shard catalog must not retain
         // authoritative ownership metadata. Clear both durable metadata and in-memory CSR/DSR state
         // so stale entries cannot be reused if the config server is later re-added as a shard.
-        dropShardCatalogMetadata(opCtx);
+        dropShardCatalogMetadata(opCtx, _doc.getAuthoritativeMetadataAccessLevel());
     }
 }
 

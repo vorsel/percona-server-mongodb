@@ -61,6 +61,17 @@ void planShardedSearch(const boost::intrusive_ptr<ExpressionContext>& pExpCtx,
  */
 bool hasReferenceToSearchMeta(const DocumentSource& ds);
 
+/**
+ * Opts the operation out of per-operation memory tracking, for $search queries that will expose a
+ * second, metadata cursor alongside the results cursor.
+ *
+ * This must be called before any subsequent stage in the pipeline is parsed, because some stages
+ * (e.g. $group) capture their memory tracker in the constructor and cannot be opted out
+ * retroactively.
+ */
+void excludeOperationMemoryTrackingForSecondaryMetadataCursor(
+    const boost::intrusive_ptr<ExpressionContext>& expCtx);
+
 // TODO: Move this into $_internalDocumentResultsAndMetadata once $search is removed.
 /**
  * Returns true if the current stage can move past a search source stage to the shard side
@@ -229,7 +240,21 @@ boost::optional<SearchQueryViewSpec> getViewFromExpCtx(
 
 boost::optional<SearchQueryViewSpec> getViewFromBSONObj(const BSONObj& spec);
 
-void validateViewNotSetByUser(boost::intrusive_ptr<ExpressionContext> expCtx, const BSONObj& spec);
+/**
+ * Asserts that a spec does not contain internal search routing fields (e.g. 'mergingPipeline')
+ * when the request comes from an external (non-internal) client. These fields are set exclusively
+ * by the router during sharded search planning and must never be accepted from user requests.
+ */
+void validateInternalSearchFieldsNotSetByUser(const OperationContext* opCtx, const BSONObj& spec);
+
+/**
+ * Rejects a user-supplied $vectorSearch spec that contains any of the security-trusted,
+ * mongod-owned fields ('vectorSearch', 'collectionUUID', 'viewName'). mongod derives these from
+ * trusted sources (the target collection name, its UUID, and the authorized view name) when
+ * building the command sent to mongot. Letting a client inject one of them would bypass view
+ * authorization or redirect the query to another collection. See SERVER-129618.
+ */
+void validateUserSpecDoesNotOverrideTrustedFields(const BSONObj& spec);
 
 /**
  * Validates that search stages on views are only allowed when the respective feature flag
