@@ -49,7 +49,9 @@ public:
             catalogResourceHandle,
         const std::shared_ptr<SearchIdLookupMetrics>& searchIdLookupMetrics,
         std::unique_ptr<SingleDocumentLookupExecutor> lookupExecutor,
-        Limits limits);
+        Limits limits,
+        BatchedEnrichmentStatsRecorder batchStatsRecorder =
+            BatchedEnrichmentStatsRecorder::makeSearchIdLookupRecorder());
 
     const SpecificStats* getSpecificStats() const override {
         return &_stats;
@@ -117,8 +119,8 @@ private:
     std::shared_ptr<SearchIdLookupMetrics> _searchIdLookupMetrics;
     DocumentSourceIdLookupStats _stats;
 
-    // Lookup strategy enrich() drives for every _id (never null): the Express fast path or the
-    // local-read executor, chosen by buildIdLookupExecutor().
+    // Lookup strategy enrich() drives for every _id (never null): SBE with local-read fallback,
+    // or local-read alone, chosen by buildIdLookupExecutor().
     std::unique_ptr<SingleDocumentLookupExecutor> _lookupExecutor;
 
     // The active per-batch resource scope, present only while a batch is being enriched.
@@ -126,9 +128,9 @@ private:
 };
 
 /**
- * Builds the executor InternalSearchIdLookUpStage drives for every _id. Returns the SBE point-read
- * executor when the flag is on and there is no view (a view is not a pure _id point lookup);
- * otherwise the local-read executor. The stage wires its explain stats sink through the executor
+ * Builds the executor InternalSearchIdLookUpStage drives for every _id. When the flag is on and
+ * there is no view, returns SBE with a local-read fallback (SBE may decline some _id types).
+ * Otherwise the local-read executor. The stage wires its explain stats sink through the executor
  * interface, so no separate handle is returned.
  */
 std::unique_ptr<SingleDocumentLookupExecutor> buildIdLookupExecutor(

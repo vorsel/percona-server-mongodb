@@ -12,8 +12,33 @@
 #include "mongo/db/query/multiple_collection_accessor.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/str.h"
+#include "mongo/util/timer.h"
 
 namespace mongo::exec::agg {
+namespace {
+
+/**
+ * RAII guard that forces a shard-filter stage onto any query executor planned against the given
+ * ExpressionContext while it is alive, then restores the previous setting. Because the
+ * id-lookup sub-pipeline shares its ExpressionContext with the outer pipeline, the flag must not
+ * outlive the attach (and planning) it is intended for.
+ */
+class ScopedForceShardFilter {
+public:
+    explicit ScopedForceShardFilter(const boost::intrusive_ptr<ExpressionContext>& expCtx)
+        : _expCtx(expCtx), _restore(expCtx->forceShardFilter()) {
+        _expCtx->setForceShardFilter(true);
+    }
+    ~ScopedForceShardFilter() {
+        _expCtx->setForceShardFilter(_restore);
+    }
+
+private:
+    boost::intrusive_ptr<ExpressionContext> _expCtx;
+    bool _restore;
+};
+
+}  // namespace
 
 SingleDocumentLookupExecutor::LookupResult InternalSearchIdLookUpLocalReadExecutor::performLookup(
     const boost::intrusive_ptr<ExpressionContext>& expCtx,
@@ -21,6 +46,7 @@ SingleDocumentLookupExecutor::LookupResult InternalSearchIdLookUpLocalReadExecut
     boost::optional<UUID> collectionUUID,
     const Document& documentKey,
     boost::optional<Timestamp> afterClusterTime) {
+    Timer timer;
     // Find the document by performing a local read.
     pipeline_factory::MakePipelineOptions pipelineOpts;
     pipelineOpts.attachCursorSource = false;
@@ -41,6 +67,9 @@ SingleDocumentLookupExecutor::LookupResult InternalSearchIdLookUpLocalReadExecut
     {
         _catalogResourceHandle->acquire(expCtx->getOperationContext());
         auto collection = _catalogResourceHandle->getCollection();
+        // This never-routed local _id lookup must drop orphans physically present on the shard but
+        // no longer owned (e.g. left behind by a chunk migration).
+        ScopedForceShardFilter forceShardFilter{expCtx};
         pipeline =
             expCtx->getMongoProcessInterface()->attachCursorSourceToPipelineForLocalReadWithCatalog(
                 std::move(pipeline),
@@ -69,8 +98,10 @@ SingleDocumentLookupExecutor::LookupResult InternalSearchIdLookUpLocalReadExecut
     }
 
     if (!result) {
+        _recorder.recordNotFound(timer.elapsed());
         return {LookupResult::HandledStatus::kDocumentNotFound, boost::none};
     }
+    _recorder.recordFound(timer.elapsed());
     return {LookupResult::HandledStatus::kDocumentFound, std::move(result)};
 }
 

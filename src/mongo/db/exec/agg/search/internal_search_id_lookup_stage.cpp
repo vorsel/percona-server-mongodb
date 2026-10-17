@@ -12,6 +12,7 @@
 #include "mongo/db/exec/single_doc_lookup/local_lookup_eligibility.h"
 #include "mongo/db/exec/single_doc_lookup/sbe_single_document_lookup_executor.h"
 #include "mongo/db/exec/single_doc_lookup/single_document_lookup_executor.h"
+#include "mongo/db/exec/single_doc_lookup/single_document_lookup_stats.h"
 #include "mongo/db/pipeline/expression_context.h"
 #include "mongo/db/query/query_execution_knobs_gen.h"
 #include "mongo/db/query/query_feature_flags_gen.h"
@@ -90,22 +91,31 @@ std::unique_ptr<SingleDocumentLookupExecutor> buildIdLookupExecutor(
     const bool optimizedLookupEnabled = ifrContext &&
         ifrContext->getSavedFlagValue(feature_flags::gFeatureFlagSearchOptimizedIdLookup);
 
-    // Optimized fast path (flag on, no view): the SBE point-read executor, reusing the stage's
-    // upfront acquisition and caching a parameterized '{_id}' plan across the batch window. The
-    // lookup always runs local (search index is on-shard), so AlwaysLocalEligibility; a sharded
-    // collection's orphans are dropped by the SHARDING_FILTER the executor adds above the scan.
+    // Optimized fast path (flag on, no view): SBE point-read, with the local-read executor as
+    // fallback when SBE returns kNotHandled (e.g. object _id that SlotBinder cannot encode).
+    // Search always runs local, so AlwaysLocalEligibility; a sharded collection's orphans are
+    // dropped by the SHARDING_FILTER SBE adds above the scan.
     if (optimizedLookupEnabled && !viewPipeline) {
-        return std::make_unique<SbeSingleDocumentLookupExecutor>(
+        auto sbe = std::make_unique<SbeSingleDocumentLookupExecutor>(
             std::make_unique<PreAcquiredCollectionAcquirer>(
                 catalogResourceHandle->getStasher(),
                 catalogResourceHandle->getCollectionForLookupExecutor()),
-            std::make_unique<AlwaysLocalEligibility>());
+            std::make_unique<AlwaysLocalEligibility>(),
+            exec::SingleDocumentLookupStatsRecorder::makeSearchIdLookupSbeRecorder());
+        auto aggregation = std::make_unique<InternalSearchIdLookUpLocalReadExecutor>(
+            catalogResourceHandle,
+            boost::none /* view */,
+            exec::SingleDocumentLookupStatsRecorder::makeSearchIdLookupAggregationRecorder());
+        return std::make_unique<PrimaryWithFallbackSingleDocumentLookupExecutor>(
+            std::move(sbe), std::move(aggregation));
     }
 
-    // Local-read path: `$match`-on-_id (optionally + view pipeline) against the stashed
+    // Aggregation-executor path: `$match`-on-_id (optionally + view pipeline) against the stashed
     // acquisition.
-    return std::make_unique<InternalSearchIdLookUpLocalReadExecutor>(catalogResourceHandle,
-                                                                     std::move(viewPipeline));
+    return std::make_unique<InternalSearchIdLookUpLocalReadExecutor>(
+        catalogResourceHandle,
+        std::move(viewPipeline),
+        exec::SingleDocumentLookupStatsRecorder::makeSearchIdLookupAggregationRecorder());
 }
 
 InternalSearchIdLookUpStage::InternalSearchIdLookUpStage(
@@ -116,8 +126,9 @@ InternalSearchIdLookUpStage::InternalSearchIdLookUpStage(
         catalogResourceHandle,
     const std::shared_ptr<SearchIdLookupMetrics>& searchIdLookupMetrics,
     std::unique_ptr<SingleDocumentLookupExecutor> lookupExecutor,
-    Limits limits)
-    : BatchedEnrichmentStage(stageName, expCtx, limits),
+    Limits limits,
+    BatchedEnrichmentStatsRecorder batchStatsRecorder)
+    : BatchedEnrichmentStage(stageName, expCtx, limits, std::move(batchStatsRecorder)),
       _stageName(stageName),
       _spec(std::move(spec)),
       _catalogResourceHandle(catalogResourceHandle),
@@ -226,8 +237,9 @@ boost::optional<Document> InternalSearchIdLookUpStage::enrich(Document event) {
             "Collection should exist when using $_internalSearchIdLookup",
             pExpCtx->getUUID().has_value());
 
-    // Resolve the _id. The executor always handles a bare _id lookup, so the result is found or
-    // not-found (a miss -- deleted doc or orphan -- is dropped below), never kNotHandled.
+    // Resolve the _id. The installed executor (SBE + local-read fallback, or local-read alone)
+    // always handles a bare _id lookup, so the result is found or not-found (a miss -- deleted
+    // doc or orphan -- is dropped below), never kNotHandled.
     using HandledStatus = SingleDocumentLookupExecutor::LookupResult::HandledStatus;
     auto lookupResult = _lookupExecutor->performLookup(pExpCtx,
                                                        pExpCtx->getNamespaceString(),

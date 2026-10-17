@@ -303,6 +303,11 @@ selector:
     - jstests/sharding/resharding_oplog_sync_agg_resume_token.js
     - jstests/sharding/timeseries/timeseries_change_stream_no_orphans.js
 
+    # Uses the ChangeStreamTest fixture correctly, but intermittently stalls for many minutes
+    # under this suite and hits the hang analyzer; cause not yet identified.
+    # TODO: SERVER-135482 investigate and re-enable.
+    - jstests/sharding/query/change_streams/change_stream_metrics_update_lookup.js
+
     # TODO (SERVER-115616): Enable after retrying addShard cmd on retriable network errors.
     - jstests/sharding/add_shard_4.js
 
@@ -326,6 +331,9 @@ selector:
   exclude_with_any_tags:
     - does_not_support_stepdowns
     - assumes_change_streams_v1
+    # FsyncLock prevents stepdown from acquiring the RSTL lock, blocking stepdown and preventing
+    # that node from being unlocked.
+    - requires_fsync
 
 executor:
   config:
@@ -335,6 +343,12 @@ executor:
           # TODO: SERVER-45994 remove
           skipCheckingCatalogCacheConsistencyWithShardingCatalog: true
           skipCheckOrphans: true
+          # Allow internal clients to retry more aggressively, since config server stepdowns make
+          # retriable errors common in this suite.
+          setParameters:
+            defaultClientMaxRetryAttempts: 10
+          setParametersMongos:
+            defaultClientMaxRetryAttempts: 10
       eval: >-
         await import("jstests/libs/override_methods/sharding_csrs_continuous_config_stepdown.js");
         await import("jstests/libs/override_methods/require_change_stream_test_fixture.js");

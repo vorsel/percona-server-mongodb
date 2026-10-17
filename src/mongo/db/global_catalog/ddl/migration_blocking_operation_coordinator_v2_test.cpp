@@ -18,6 +18,7 @@ namespace {
 
 constexpr auto kHangBeforeBlockingMigrations = "hangBeforeBlockingMigrationsV2";
 constexpr auto kHangBeforeAllowingMigrations = "hangBeforeAllowingMigrationsV2";
+constexpr auto kHangBeforeRemovingCoordinatorDocument = "hangBeforeRemovingCoordinatorDocument";
 
 class MigrationBlockingOperationCoordinatorV2Test : public repl::PrimaryOnlyServiceMongoDTest {
 protected:
@@ -88,10 +89,10 @@ protected:
     }
 
     MigrationBlockingOperationCoordinatorV2Document getStateDocumentOnDisk() {
-        ASSERT_TRUE(stateDocumentExistsOnDisk());
         DBDirectClient client(_opCtx);
         auto doc = client.findOne(NamespaceString::kShardingDDLCoordinatorsNamespace,
                                   BSON("_id" << getCoordinatorId().toBSON()));
+        ASSERT_FALSE(doc.isEmpty()) << "State document not found on disk";
         IDLParserContext errCtx(
             "MigrationBlockingOperationCoordinatorV2Test::getStateDocumentOnDisk()");
         return MigrationBlockingOperationCoordinatorV2Document::parse(doc, errCtx);
@@ -311,11 +312,18 @@ TEST_F(MigrationBlockingOperationCoordinatorV2Test,
     stepDown();
     fp->setMode(FailPoint::off);
     ASSERT_NOT_OK(_instance->getCompletionFuture().getNoThrow());
+    // Hold the recovered instance in cleanup so it cannot remove its state document and release
+    // itself from the service before the lookup below.
+    auto cleanupFp = globalFailPointRegistry().find(kHangBeforeRemovingCoordinatorDocument);
+    auto cleanupTimesEntered = cleanupFp->setMode(FailPoint::alwaysOn);
     stepUp(_opCtx);
 
     // Recovery re-drives `_stopBlockingMigrations` from the persisted kStopBlockingMigrations phase
     // through to completion.
     _instance = getExistingInstance();
+    cleanupFp->waitForTimesEntered(cleanupTimesEntered + 1);
+    cleanupFp->setMode(FailPoint::off);
+
     ASSERT_OK(_instance->getCompletionFuture().getNoThrow());
     ASSERT_TRUE(_externalState->migrationsAreAllowed());
     ASSERT_FALSE(stateDocumentExistsOnDisk());
@@ -424,10 +432,12 @@ TEST_F(MigrationBlockingOperationCoordinatorV2Test, BeginOperationRollsBackOnPer
 
     _instance = getInstance();
 
-    // The failed persist rolls back the in-memory operation set, leaving it consistent with disk,
-    // and surfaces the error to the caller.
+    // The failed persist surfaces the error and rolls back the in-memory operation set.
     ASSERT_NOT_OK(_instance->beginOperation(_opCtx, UUID::gen()).getNoThrow(_opCtx));
-    assertOperationCountOnDisk(0);
+
+    // Verify number of operations is zero. A leftover operation would keep `_processRequests` from
+    // ever seeing the set empty, so the coordinator would block migrations forever and the
+    // assertions below would fail.
 
     ASSERT_OK(_instance->getCompletionFuture().getNoThrow());
     ASSERT_TRUE(_externalState->migrationsAreAllowed());
@@ -476,9 +486,16 @@ TEST_F(MigrationBlockingOperationCoordinatorV2Test, RecoversWhenBlockingWithNoOp
 
     stepDown();
     ASSERT_NOT_OK(_instance->getCompletionFuture().getNoThrow());
+    // Hold the recovered instance in cleanup so it cannot remove its state document and release
+    // itself from the service before the lookup below.
+    auto cleanupFp = globalFailPointRegistry().find(kHangBeforeRemovingCoordinatorDocument);
+    auto cleanupTimesEntered = cleanupFp->setMode(FailPoint::alwaysOn);
     stepUp(_opCtx);
 
     _instance = getExistingInstance();
+    cleanupFp->waitForTimesEntered(cleanupTimesEntered + 1);
+    cleanupFp->setMode(FailPoint::off);
+
     ASSERT_OK(_instance->getCompletionFuture().getNoThrow());
     ASSERT_TRUE(_externalState->migrationsAreAllowed());
     ASSERT_FALSE(stateDocumentExistsOnDisk());

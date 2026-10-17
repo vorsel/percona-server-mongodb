@@ -240,6 +240,60 @@ export function assertChangeStreamEventEq(actualEvent, expectedEvent, eventModif
 }
 
 /**
+ * Asserts that 'actualChanges' and 'expectedChanges' contain the same change events, in any order.
+ *
+ * This is a multiset comparison: each actual event must match a distinct expected event (per
+ * assertChangeStreamEventEq semantics), so a duplicate actual event cannot stand in for a missing
+ * expected one. Use it where event order is not guaranteed, e.g. on sharded topologies where
+ * cross-shard event order may not match client issue order.
+ */
+export function assertChangeStreamEventsEqUnordered(actualChanges, expectedChanges, eventModifier) {
+    assert.eq(
+        actualChanges.length,
+        expectedChanges.length,
+        "Change event count mismatch (order ignored)",
+        {actualChanges, expectedChanges},
+    );
+
+    const remaining = [...expectedChanges];
+    for (const actual of actualChanges) {
+        const i = remaining.findIndex((expected) =>
+            isChangeStreamEventEq(actual, expected, eventModifier),
+        );
+        assert.neq(i, -1, "No expected event matched the observed event (order ignored)", {
+            actual,
+            remaining,
+        });
+        remaining.splice(i, 1);
+    }
+}
+
+/**
+ * Asserts that the observed change events equal the expected ones, with deployment awareness:
+ * ordered on replica sets and standalone, unordered on sharded clusters, where cross-shard event
+ * order may not match client issue order.
+ *
+ * The array-based counterpart of ChangeStreamTest.assertNextChangesEqualWithDeploymentAwareness,
+ * for tests that drain their cursor themselves (e.g. via plain cursor.next()) rather than through
+ * ChangeStreamTest's batchSize:1 batches.
+ */
+export function assertChangeStreamEventsEqWithDeploymentAwareness(
+    db,
+    actualChanges,
+    expectedChanges,
+    eventModifier,
+) {
+    assert.eq(actualChanges.length, expectedChanges.length, {actualChanges, expectedChanges});
+    if (FixtureHelpers.isMongos(db)) {
+        assertChangeStreamEventsEqUnordered(actualChanges, expectedChanges, eventModifier);
+    } else {
+        for (let i = 0; i < expectedChanges.length; i++) {
+            assertChangeStreamEventEq(actualChanges[i], expectedChanges[i], eventModifier);
+        }
+    }
+}
+
+/**
  * Asserts that there are no changes waiting on the change stream cursor.
  */
 export function assertNoChanges(cursor) {
@@ -364,6 +418,13 @@ export function ChangeStreamTest(_db, options) {
             if (events) {
                 for (let i = 0; i < events.length; i++) {
                     const eventToken = events[i]._id;
+                    if (
+                        !eventToken ||
+                        typeof eventToken !== "object" ||
+                        !eventToken.hasOwnProperty("_data")
+                    ) {
+                        continue;
+                    }
                     if (previousToken) {
                         assertNotRegressed(eventToken, previousToken, "event token at index " + i);
                     }
@@ -901,10 +962,12 @@ export function ChangeStreamTest(_db, options) {
 
     /**
      * Returns the document to be used for the value of a $changeStream stage, given a watchMode
-     * of type ChangeStreamWatchMode and optional resumeAfter value.
+     * of type ChangeStreamWatchMode and optional resumeAfter value. Any 'extraOptions' (e.g.
+     * {fullDocument: "updateLookup"}) are merged in; the watchMode-derived and resumeAfter fields
+     * take precedence over them.
      */
-    self.getChangeStreamStage = function (watchMode, resumeAfter) {
-        const changeStreamDoc = {};
+    self.getChangeStreamStage = function (watchMode, resumeAfter, extraOptions = {}) {
+        const changeStreamDoc = {...extraOptions};
         if (resumeAfter) {
             changeStreamDoc.resumeAfter = resumeAfter;
         }
@@ -917,11 +980,12 @@ export function ChangeStreamTest(_db, options) {
 
     /**
      * Create a change stream of the given watch mode (see ChangeStreamWatchMode) on the given
-     * collection. Will resume from a given point if resumeAfter is specified.
+     * collection. Will resume from a given point if resumeAfter is specified. Any 'options' are
+     * merged into the $changeStream stage (e.g. {fullDocument: "updateLookup"}).
      */
-    self.getChangeStream = function ({watchMode, coll, resumeAfter}) {
+    self.getChangeStream = function ({watchMode, coll, resumeAfter, options = {}}) {
         return self.startWatchingChanges({
-            pipeline: [{$changeStream: self.getChangeStreamStage(watchMode, resumeAfter)}],
+            pipeline: [{$changeStream: self.getChangeStreamStage(watchMode, resumeAfter, options)}],
             collection: watchMode == ChangeStreamWatchMode.kCollection ? coll : 1,
             // Use a batch size of 0 to prevent any notifications from being returned in the first
             // batch. These would be ignored by ChangeStreamTest.getOneChange().

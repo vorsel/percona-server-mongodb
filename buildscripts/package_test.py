@@ -27,8 +27,10 @@ from retry.api import retry_call
 from simple_report import Report, Result
 
 from buildscripts.package_test_provenance import (
+    ARCHIVE_DIST_TEST_PROVENANCE_BUILD_COMMAND_PATH,
     RELEASE_BINARY_NAMES,
     combine_execution_log_validation_summaries,
+    extract_file_from_tar_by_basename,
     fetch_release_binary_provenance_from_tasks,
     fetch_release_execution_log_from_tasks,
     fetch_task_artifact_to_file,
@@ -53,7 +55,6 @@ formatter = logging.Formatter("[%(asctime)s]%(levelname)s:%(message)s")
 handler.setFormatter(formatter)
 root.addHandler(handler)
 
-ARCHIVE_DIST_TEST_BUILD_COMMAND_PATH = ".bazel_build_invocation"
 ARCHIVE_DIST_TEST_EXECUTION_LOG_PATH = ".bazel_release_execution_log.binpb.zst"
 DEFAULT_RELEASE_BINARY_ARCHIVE_PATH = Path("mongo-binaries.tgz")
 
@@ -171,7 +172,7 @@ def create_release_binary_provenance_from_archive_dist_test(
         archive_task, "Artifacts", download_dir / "archive_dist_test_artifacts.tgz"
     )
     build_command_path = extract_file_from_tar_by_basename(
-        artifacts_path, ARCHIVE_DIST_TEST_BUILD_COMMAND_PATH, download_dir
+        artifacts_path, ARCHIVE_DIST_TEST_PROVENANCE_BUILD_COMMAND_PATH, download_dir
     )
     binary_archive_path = fetch_task_artifact_to_file(
         archive_task, "Binaries", download_dir / "archive_dist_test_binaries"
@@ -300,34 +301,6 @@ def fetch_release_execution_log_from_archive_artifacts(
     return extract_file_from_tar_by_basename(
         artifacts_path, ARCHIVE_DIST_TEST_EXECUTION_LOG_PATH, output_dir
     )
-
-
-def extract_file_from_tar_by_basename(
-    artifacts_path: Path, artifact_basename: str, output_dir: Path
-) -> Path:
-    """Extract a file from a tar archive by basename."""
-
-    output_path = output_dir / artifact_basename
-    with tarfile.open(artifacts_path, "r:*") as artifacts:
-        for member in artifacts.getmembers():
-            if not member.isfile():
-                continue
-            if Path(member.name).name != artifact_basename:
-                continue
-
-            extracted = artifacts.extractfile(member)
-            if extracted is None:
-                continue
-
-            try:
-                with output_path.open("wb") as output:
-                    while chunk := extracted.read(1024 * 1024):
-                        output.write(chunk)
-            finally:
-                extracted.close()
-            return output_path
-
-    raise RuntimeError(f"Could not find {artifact_basename} in {artifacts_path}")
 
 
 def should_validate_package_build_provenance() -> bool:
@@ -576,6 +549,23 @@ OS_DOCKER_LOOKUP = {
         ),
         "python3",
     ),
+    "ubuntu2604": (
+        "ubuntu:26.04",
+        "apt",
+        frozenset(
+            [
+                "python3",
+                "python-is-python3",
+                "wget",
+                "pkg-config",
+                "systemd",
+                "systemd-dev",
+                "procps",
+                "file",
+            ]
+        ),
+        "python3",
+    ),
     "windows": None,
     "windows_i686": None,
     "windows_x86_64": None,
@@ -693,6 +683,21 @@ def run_test(test: Test, client: DockerClient) -> Result:
     log_external_path = Path.joinpath(test_external_root, log_name)
     commands: list[str] = ["export PYTHONIOENCODING=UTF-8"]
 
+    # Custom builds (see etc/evergreen_yml_components/custom_builds/README.md) may link
+    # the produced packages against libraries installed on the host but not in the
+    # stock container image (e.g. a system OpenSSL 3, mounted into the container
+    # below). Register the library directories with the dynamic linker so the
+    # installed binaries resolve them no matter how they are launched (the test starts
+    # mongod via a systemctl emulator, which does not propagate this process's
+    # environment). A no-op unless the variant sets the custom_ld_library_path
+    # expansion.
+    custom_ld_library_path = os.environ.get("custom_ld_library_path")
+    if custom_ld_library_path:
+        ld_dirs = " ".join(f"'{d}'" for d in custom_ld_library_path.split(":"))
+        commands.append(
+            f"printf '%s\\n' {ld_dirs} > /etc/ld.so.conf.d/zz-mongo-custom-build.conf && ldconfig"
+        )
+
     if test.os_name.startswith("rhel"):
         # RHEL distros need EPEL for Compass dependencies
         commands += [
@@ -751,18 +756,25 @@ def run_test(test: Test, client: DockerClient) -> Result:
     container: Container | None = None
     try:
         image = get_image(test, client)
+        # Mount the custom build's library prefix (e.g. a system OpenSSL 3) into the
+        # container; the ld.so.conf.d command above makes the linker find it.
+        # A no-op unless the variant sets the mongo_openssl_root expansion.
+        volumes = [
+            f"{test_external_root}:{test_docker_root}",
+            "/etc/pki/entitlement/:/run/secrets/etc-pki-entitlement",
+            "/etc/rhsm:/run/secrets/rhsm",
+            "/etc/yum.repos.d/redhat.repo:/run/secrets/redhat.repo",
+            "/etc/yum.repos.d/redhat-rhsm.repo:/run/secrets/redhat-rhsm.repo",
+        ]
+        openssl_root = os.environ.get("mongo_openssl_root")
+        if openssl_root:
+            volumes.append(f"{openssl_root}:{openssl_root}:ro")
         container = client.containers.run(
             image,
             command=f'bash -c "{join_commands(commands)}"',
             auto_remove=True,
             detach=True,
-            volumes=[
-                f"{test_external_root}:{test_docker_root}",
-                "/etc/pki/entitlement/:/run/secrets/etc-pki-entitlement",
-                "/etc/rhsm:/run/secrets/rhsm",
-                "/etc/yum.repos.d/redhat.repo:/run/secrets/redhat.repo",
-                "/etc/yum.repos.d/redhat-rhsm.repo:/run/secrets/redhat-rhsm.repo",
-            ],
+            volumes=volumes,
         )
         for log in container.logs(stream=True):
             result["log_raw"] += log.decode("UTF-8")

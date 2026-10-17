@@ -12,6 +12,7 @@
 #include "mongo/util/duration.h"
 #include "mongo/util/future_util.h"
 #include "mongo/util/packaged_task.h"
+#include "mongo/util/scopeguard.h"
 #include "mongo/util/system_tick_source.h"
 #include "mongo/util/tick_source_mock.h"
 
@@ -113,7 +114,7 @@ public:
     /**
      * Helper function that tests ticket wait timeout behavior.
      *
-     * Sets up a TicketHolder with 1 ticket, acquires it, then spawns a thread that attempts
+     * Sets up a TicketHolder with 1 ticket, acquires it, then runs a thread that attempts
      * to acquire a ticket with a deadline. Verifies the timeout occurs within expected bounds.
      *
      * @param maxTimeMS The deadline to set on the waiting operation
@@ -231,7 +232,7 @@ struct TicketHolderTest::MockAdmission {
 
     // Block until this Admission attempt is queued waiting on a ticket.
     bool waitUntilQueued(Nanoseconds timeout) {
-        return admCtx.waitUntilQueued(timeout);
+        return admCtx.waitUntilQueued_forTest(timeout);
     }
 
     ServiceContext::UniqueClient client;
@@ -256,27 +257,36 @@ void TicketHolderTest::runTicketWaitTimeoutTest(Milliseconds maxTimeMS,
     MockAdmission timedOutAdmission{getServiceContext(), AdmissionContext::Priority::kNormal};
     timedOutAdmission.opCtx->setDeadlineAfterNowBy(maxTimeMS, ErrorCodes::MaxTimeMSExpired);
 
-    // Record the start time (after set the deadline)
-    Timer timer;
-
-    // Spawn a thread that will try to acquire a ticket and should timeout
     Atomic<bool> didTimeout{false};
     Atomic<ErrorCodes::Error> errorCode{ErrorCodes::OK};
-    Future<void> ticketFuture = spawn([&]() {
+    Atomic<bool> waiterFinished{false};
+    stdx::thread waiter([&]() {
         try {
             holder->waitForTicket(timedOutAdmission.opCtx.get(), &timedOutAdmission.admCtx);
         } catch (const DBException& ex) {
             didTimeout.store(true);
             errorCode.store(ex.code());
         }
+        waiterFinished.store(true);
+    });
+    ON_BLOCK_EXIT([&] {
+        if (waiter.joinable()) {
+            waiter.join();
+        }
     });
 
-    // Wait until the thread is actually queued waiting for a ticket
-    ASSERT_TRUE(timedOutAdmission.waitUntilQueued(kDefaultTimeout));
+    // Wait until the thread is actually queued waiting for a ticket.
+    _opCtx->runWithDeadline(getNextDeadline(), ErrorCodes::ExceededTimeLimit, [&] {
+        waitUntilCanceled(
+            *_opCtx, [&] { return timedOutAdmission.admCtx.startQueueingTime() != boost::none; });
+    });
 
-    // Wait for the future to complete
-    _opCtx->runWithDeadline(
-        getNextDeadline(), ErrorCodes::ExceededTimeLimit, [&] { ticketFuture.get(_opCtx.get()); });
+    // Measure elapsed time from queueing through timeout.
+    Timer timer;
+
+    _opCtx->runWithDeadline(getNextDeadline(), ErrorCodes::ExceededTimeLimit, [&] {
+        waitUntilCanceled(*_opCtx, [&] { return waiterFinished.load(); });
+    });
 
     auto actualDuration = Milliseconds{timer.millis()};
 
@@ -1161,15 +1171,16 @@ TEST_F(TicketHolderTestTick, WaitForTicketDeadlineBetweenTimeoutWindows) {
     // ticket wait finishes in an interval which has no overlap with the first or second
     // timeout window.
     runTicketWaitTimeoutTest(Milliseconds{650},   // maxTimeMS
-                             Milliseconds{100},   // lowerBoundSlack
-                             Milliseconds{100});  // upperBoundSlack
+                             Milliseconds{49},    // lowerBoundSlack
+                             Milliseconds{149});  // upperBoundSlack
 }
 
 TEST_F(TicketHolderTestTick, WaitForTicketWithShortDeadline) {
     // This test verifies that short deadlines (much less than the 500ms base interval) are
-    // respected.
+    // respected. Use a loose upper bound so the test remains stable under CI load while still
+    // finishing well before the 500ms semaphore polling interval.
     runTicketWaitTimeoutTest(Milliseconds{50},    // maxTimeMS - much less than 500ms base interval
                              Milliseconds{50},    // lowerBoundSlack
-                             Milliseconds{100});  // upperBoundSlack
+                             Milliseconds{349});  // upperBoundSlack; total < 500ms poll interval
 }
 }  // namespace

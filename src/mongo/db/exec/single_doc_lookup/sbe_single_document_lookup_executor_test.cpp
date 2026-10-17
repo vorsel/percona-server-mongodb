@@ -28,6 +28,7 @@
 #include "mongo/db/shard_role/shard_catalog/collection_catalog.h"
 #include "mongo/db/shard_role/shard_catalog/collection_options.h"
 #include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
+#include "mongo/db/shard_role/shard_catalog/index_catalog.h"
 #include "mongo/db/shard_role/shard_catalog/operation_sharding_state.h"
 #include "mongo/db/sharding_environment/shard_server_test_fixture.h"
 #include "mongo/db/storage/write_unit_of_work.h"
@@ -114,6 +115,28 @@ protected:
         opts.collation = fromjson("{locale: 'en', strength: 2}");
         opts.clusteredIndex = clustered_util::makeDefaultClusteredIdIndex();
         ASSERT_OK(storageInterface()->createCollection(operationContext(), kNss, opts));
+    }
+
+    // Mimics the secondary index a collection clustered by _id gets when it's also sharded with
+    // {_id: "hashed"}: a real "_id_hashed" index coexisting with the (indexless) cluster key. Must
+    // be called on an empty collection, before any documents are inserted.
+    void createHashedIdIndex() {
+        auto coll = acquireCollection(
+            operationContext(),
+            CollectionAcquisitionRequest::fromOpCtx(
+                operationContext(), kNss, AcquisitionPrerequisites::OperationType::kWrite),
+            MODE_X);
+        WriteUnitOfWork wuow(operationContext());
+        CollectionWriter writer{operationContext(), &coll};
+        ASSERT_OK(
+            writer.getWritableCollection(operationContext())
+                ->getIndexCatalog()
+                ->createIndexOnEmptyCollection(
+                    operationContext(),
+                    writer.getWritableCollection(operationContext()),
+                    BSON("v" << 2 << "key" << BSON("_id" << "hashed") << "name" << "_id_hashed"))
+                .getStatus());
+        wuow.commit();
     }
 
     void insertDocuments(std::vector<BSONObj> docs) {
@@ -209,14 +232,15 @@ protected:
 
 TEST_F(SbeSingleDocumentLookupExecutorTest, FindDocumentById) {
     createCollection();
-    insertDocuments({fromjson("{_id: 1, x: 'hello'}"), fromjson("{_id: 2, x: 'world'}")});
+    const BSONObj doc1 = fromjson("{_id: 1, x: 'hello'}");
+    insertDocuments({doc1, fromjson("{_id: 2, x: 'world'}")});
 
     auto strategy = makeStrategy();
     auto result = lookup(&strategy, fromjson("{_id: 1}"));
 
     ASSERT_EQ(result.status, LookupResult::HandledStatus::kDocumentFound);
     ASSERT_TRUE(result.document.has_value());
-    ASSERT_BSONOBJ_EQ(result.document->toBson(), fromjson("{_id: 1, x: 'hello'}"));
+    ASSERT_BSONOBJ_EQ(result.document->toBson(), doc1);
 }
 
 TEST_F(SbeSingleDocumentLookupExecutorTest, NotFoundForMissingDocument) {
@@ -237,6 +261,22 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, NotFoundForMissingCollection) {
     ASSERT_EQ(result.status, LookupResult::HandledStatus::kDocumentNotFound);
 }
 
+// On a sharded cluster, eligibility routing (not just collection acquisition) can throw
+// NamespaceNotFound when the *database* has been dropped, before the acquisition body ever runs.
+// That must also be mapped to kDocumentNotFound rather than propagating out of performLookup.
+TEST_F(SbeSingleDocumentLookupExecutorTest, EligibilityRunThrowsNamespaceNotFound) {
+    auto eligibility = std::make_unique<MockLocalLookupEligibility>(
+        [](const boost::intrusive_ptr<ExpressionContext>&,
+           const NamespaceString&,
+           const Document&) -> LocalLookupEligibility::Decision {
+            uasserted(ErrorCodes::NamespaceNotFound, "database not found");
+        });
+    SbeSingleDocumentLookupExecutor strategy(makeOnDemandAcquirer(), std::move(eligibility));
+    auto result = lookup(&strategy, fromjson("{_id: 1}"));
+
+    ASSERT_EQ(result.status, LookupResult::HandledStatus::kDocumentNotFound);
+}
+
 TEST_F(SbeSingleDocumentLookupExecutorTest, NotFoundForEmptyCollection) {
     createCollection();
 
@@ -248,32 +288,34 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, NotFoundForEmptyCollection) {
 
 TEST_F(SbeSingleDocumentLookupExecutorTest, CachedPlanReuse) {
     createCollection();
-    insertDocuments({fromjson("{_id: 1, val: 'a'}"),
-                     fromjson("{_id: 2, val: 'b'}"),
-                     fromjson("{_id: 3, val: 'c'}")});
+    const BSONObj doc1 = fromjson("{_id: 1, val: 'a'}");
+    const BSONObj doc2 = fromjson("{_id: 2, val: 'b'}");
+    const BSONObj doc3 = fromjson("{_id: 3, val: 'c'}");
+    insertDocuments({doc1, doc2, doc3});
 
     auto strategy = makeStrategy();
 
     auto r1 = lookup(&strategy, fromjson("{_id: 1}"));
     ASSERT_EQ(r1.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(r1.document->toBson(), fromjson("{_id: 1, val: 'a'}"));
+    ASSERT_BSONOBJ_EQ(r1.document->toBson(), doc1);
 
     auto r2 = lookup(&strategy, fromjson("{_id: 2}"));
     ASSERT_EQ(r2.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(r2.document->toBson(), fromjson("{_id: 2, val: 'b'}"));
+    ASSERT_BSONOBJ_EQ(r2.document->toBson(), doc2);
 
     auto r3 = lookup(&strategy, fromjson("{_id: 999}"));
     ASSERT_EQ(r3.status, LookupResult::HandledStatus::kDocumentNotFound);
 
     auto r4 = lookup(&strategy, fromjson("{_id: 3}"));
     ASSERT_EQ(r4.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(r4.document->toBson(), fromjson("{_id: 3, val: 'c'}"));
+    ASSERT_BSONOBJ_EQ(r4.document->toBson(), doc3);
 }
 
 // Stress test for cached-executor reuse: many lookups by different _ids against the same strategy
 // instance, with revisits, misses, and out-of-order keys. Asserts every lookup returns the correct
-// document AND that the SBE plan tree pointer is identical across every call (the planner ran once
-// and rebinding does the work on subsequent calls). This is the property the strategy exists for.
+// document AND that the plan is never rebuilt (the planner ran once and rebinding does the work on
+// subsequent calls), via the rebuild counter rather than plan-tree pointer identity. This is the
+// property the strategy exists for.
 TEST_F(SbeSingleDocumentLookupExecutorTest, RepeatedLookupsReuseExecutorAndReturnCorrectDocs) {
     createCollection();
     // A non-trivial collection size so a stale-bound bug or a fallback to COLLSCAN would be
@@ -291,8 +333,7 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, RepeatedLookupsReuseExecutorAndRetur
     auto r0 = lookup(&strategy, fromjson("{_id: 42}"));
     ASSERT_EQ(r0.status, LookupResult::HandledStatus::kDocumentFound);
     ASSERT_BSONOBJ_EQ(r0.document->toBson(), BSON("_id" << 42 << "val" << 420));
-    const auto* originalPlanRoot = strategy.getCachedPlanRoot_forTest();
-    ASSERT_TRUE(originalPlanRoot);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
 
     const std::vector<int> keys{
         1,
@@ -315,27 +356,27 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, RepeatedLookupsReuseExecutorAndRetur
         auto r = lookup(&strategy, BSON("_id" << k));
         ASSERT_EQ(r.status, LookupResult::HandledStatus::kDocumentFound) << "key=" << k;
         ASSERT_BSONOBJ_EQ(r.document->toBson(), BSON("_id" << k << "val" << k * 10));
-        // Executor identity: same plan root means PreparedExecutor::make ran exactly once and
+        // The rebuild counter staying at 1 means PreparedExecutor::make ran exactly once and
         // rebind handled the rest. If this fires the strategy is rebuilding the SBE tree per call,
         // defeating the caching.
-        ASSERT_EQ(strategy.getCachedPlanRoot_forTest(), originalPlanRoot) << "key=" << k;
+        ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U) << "key=" << k;
     }
 
     auto miss = lookup(&strategy, fromjson("{_id: 9999}"));
     ASSERT_EQ(miss.status, LookupResult::HandledStatus::kDocumentNotFound);
-    ASSERT_EQ(strategy.getCachedPlanRoot_forTest(), originalPlanRoot);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
 
     auto afterMiss = lookup(&strategy, fromjson("{_id: 17}"));
     ASSERT_EQ(afterMiss.status, LookupResult::HandledStatus::kDocumentFound);
     ASSERT_BSONOBJ_EQ(afterMiss.document->toBson(), BSON("_id" << 17 << "val" << 170));
-    ASSERT_EQ(strategy.getCachedPlanRoot_forTest(), originalPlanRoot);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
 
     for (int k = 1; k <= kNumDocs; ++k) {
         auto r = lookup(&strategy, BSON("_id" << k));
         ASSERT_EQ(r.status, LookupResult::HandledStatus::kDocumentFound) << "key=" << k;
         ASSERT_BSONOBJ_EQ(r.document->toBson(), BSON("_id" << k << "val" << k * 10));
     }
-    ASSERT_EQ(strategy.getCachedPlanRoot_forTest(), originalPlanRoot);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
 }
 
 // Same stress test against a clustered collection, where the planner produces a bounded scan rather
@@ -356,8 +397,7 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, RepeatedLookupsOnClusteredCollection
     auto r0 = lookup(&strategy, fromjson("{_id: 42}"));
     ASSERT_EQ(r0.status, LookupResult::HandledStatus::kDocumentFound);
     ASSERT_BSONOBJ_EQ(r0.document->toBson(), BSON("_id" << 42 << "payload" << 1042));
-    const auto* originalPlanRoot = strategy.getCachedPlanRoot_forTest();
-    ASSERT_TRUE(originalPlanRoot);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
 
     const std::vector<int> keys{
         1,
@@ -380,7 +420,7 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, RepeatedLookupsOnClusteredCollection
         auto r = lookup(&strategy, BSON("_id" << k));
         ASSERT_EQ(r.status, LookupResult::HandledStatus::kDocumentFound) << "key=" << k;
         ASSERT_BSONOBJ_EQ(r.document->toBson(), BSON("_id" << k << "payload" << k + 1000));
-        ASSERT_EQ(strategy.getCachedPlanRoot_forTest(), originalPlanRoot) << "key=" << k;
+        ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U) << "key=" << k;
     }
 }
 
@@ -428,21 +468,135 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, ClusteredCompoundIdLookupsReturnFull
     ASSERT_EQ(first.status, LookupResult::HandledStatus::kDocumentFound);
     ASSERT_BSONOBJ_EQ(first.document->toBson(), entries[0].fullDoc);
 
-    const auto* originalPlanRoot = strategy.getCachedPlanRoot_forTest();
-    ASSERT_TRUE(originalPlanRoot);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
 
     for (size_t i = 1; i < entries.size(); ++i) {
         auto r = lookup(&strategy, BSON("_id" << entries[i].id));
         ASSERT_EQ(r.status, LookupResult::HandledStatus::kDocumentFound)
             << "lookup #" << i << "; _id=" << entries[i].id.toString();
         ASSERT_BSONOBJ_EQ(r.document->toBson(), entries[i].fullDoc);
-        ASSERT_EQ(strategy.getCachedPlanRoot_forTest(), originalPlanRoot)
+        ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U)
             << "Plan must be reused across lookups, not rebuilt";
     }
 
     auto revisit = lookup(&strategy, BSON("_id" << entries[0].id));
     ASSERT_EQ(revisit.status, LookupResult::HandledStatus::kDocumentFound);
     ASSERT_BSONOBJ_EQ(revisit.document->toBson(), entries[0].fullDoc);
+}
+
+// Non-clustered analog of ClusteredCompoundIdLookupsReturnFullDocument: a regular collection with
+// a real _id_ index and a compound (object) _id. Exercises the kIxscanKeyPair rebind path
+// (SlotBinder::bind's validIdField gate) rather than kClusteredRecordIdPair.
+TEST_F(SbeSingleDocumentLookupExecutorTest, NonClusteredCompoundIdLookupsReturnFullDocument) {
+    createCollection();
+
+    struct Entry {
+        BSONObj id;
+        BSONObj fullDoc;
+    };
+    std::vector<Entry> entries;
+    for (int i = 0; i < 8; ++i) {
+        auto id = BSON("a" << i << "b" << (i % 3));
+        entries.push_back(
+            {id.getOwned(), BSON("_id" << id << "payload" << (i * 7 + 1)).getOwned()});
+    }
+
+    std::vector<BSONObj> docs;
+    docs.reserve(entries.size());
+    for (const auto& e : entries) {
+        docs.push_back(e.fullDoc);
+    }
+    insertDocuments(std::move(docs));
+
+    auto strategy = makeStrategy();
+
+    auto first = lookup(&strategy, BSON("_id" << entries[0].id));
+    ASSERT_EQ(first.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(first.document->toBson(), entries[0].fullDoc);
+
+    const auto* originalPlanRoot = strategy.getCachedPlanRoot_forTest();
+    ASSERT_TRUE(originalPlanRoot);
+    auto types = planStageTypes(originalPlanRoot);
+    ASSERT_TRUE(contains(types, "ixseek") || contains(types, "ixscan"))
+        << "Expected the _id ixscan fast path, got: " << joinStageTypes(types);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
+
+    for (size_t i = 1; i < entries.size(); ++i) {
+        auto r = lookup(&strategy, BSON("_id" << entries[i].id));
+        ASSERT_EQ(r.status, LookupResult::HandledStatus::kDocumentFound)
+            << "lookup #" << i << "; _id=" << entries[i].id.toString();
+        ASSERT_BSONOBJ_EQ(r.document->toBson(), entries[i].fullDoc);
+        ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U)
+            << "Plan must be reused across lookups, not rebuilt";
+    }
+
+    auto revisit = lookup(&strategy, BSON("_id" << entries[0].id));
+    ASSERT_EQ(revisit.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(revisit.document->toBson(), entries[0].fullDoc);
+
+    const BSONObj missingId = BSON("a" << 999 << "b" << 999);
+    auto miss = lookup(&strategy, BSON("_id" << missingId));
+    ASSERT_EQ(miss.status, LookupResult::HandledStatus::kDocumentNotFound);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
+}
+
+// A compound _id with an array-valued sub-field is storable (validIdField only rejects a top-level
+// array) and the whole-object KeyString encoding seeks the exact stored key, so different array
+// contents must not match.
+TEST_F(SbeSingleDocumentLookupExecutorTest, NonClusteredCompoundIdWithArraySubfieldIsHandled) {
+    createCollection();
+    const BSONObj docWithArray = BSON("a" << 1 << "tags" << BSON_ARRAY("x" << "y"));
+    const BSONObj idWithArray = BSON("_id" << docWithArray << "x" << "nested");
+    const BSONObj plainDoc = BSON("a" << 2);
+    const BSONObj plainId = BSON("_id" << plainDoc << "x" << "plain");
+    const BSONObj docWithMissingTag = BSON("a" << 1 << "tags" << BSON_ARRAY("x"));
+    const BSONObj withArrayKey = BSON("_id" << docWithArray);
+    const BSONObj plainKey = BSON("_id" << plainDoc);
+    const BSONObj missingTagKey = BSON("_id" << docWithMissingTag);
+    insertDocuments({idWithArray, plainId});
+
+    auto strategy = makeStrategy();
+
+    auto found = lookup(&strategy, withArrayKey);
+    ASSERT_EQ(found.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(found.document->toBson(), idWithArray);
+
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
+
+    auto plain = lookup(&strategy, plainKey);
+    ASSERT_EQ(plain.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(plain.document->toBson(), plainId);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
+
+    auto miss = lookup(&strategy, missingTagKey);
+    ASSERT_EQ(miss.status, LookupResult::HandledStatus::kDocumentNotFound);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
+}
+
+// The compound analog of NonSimpleCollationEngagesIxscanFastPath: collation comparison keys are
+// encoded recursively inside the object, so a compound _id whose string field differs only by
+// case still resolves through the collation-aware _id index.
+TEST_F(SbeSingleDocumentLookupExecutorTest, NonSimpleCollationCompoundIdEngagesIxscanFastPath) {
+    createCollectionWithCaseInsensitiveCollation();
+    const BSONObj doc = fromjson("{_id: {a: 'abc', b: 1}, x: 1}");
+    const BSONObj caseVariantKey = fromjson("{_id: {a: 'ABC', b: 1}}");
+    const BSONObj nonMatchingKey = fromjson("{_id: {a: 'xyz', b: 1}}");
+    insertDocuments({doc});
+
+    auto strategy = makeStrategy();
+    auto result = lookup(&strategy, caseVariantKey);
+
+    ASSERT_EQ(result.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(result.document->toBson(), doc);
+    ASSERT_TRUE(strategy.getCachedPlanRoot_forTest());
+    ASSERT_EQ(idIndexAccesses(), 1);
+    ASSERT_EQ(collectionScans(), 0);
+
+    auto miss = lookup(&strategy, nonMatchingKey);
+    ASSERT_EQ(miss.status, LookupResult::HandledStatus::kDocumentNotFound);
+    ASSERT_EQ(idIndexAccesses(), 2);
+    ASSERT_EQ(collectionScans(), 0);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
 }
 
 // --- Plan shape -------------------------------------------------------------------------------
@@ -452,14 +606,14 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, MultiFieldDocumentKeyHandledViaIxsca
     // handing the filter to the planner. The produced plan is a single-leaf _id IXSCAN with no
     // residual filter.
     createCollection();
-    insertDocuments(
-        {fromjson("{_id: 1, sk: 'a', data: 100}"), fromjson("{_id: 2, sk: 'b', data: 200}")});
+    const BSONObj doc1 = fromjson("{_id: 1, sk: 'a', data: 100}");
+    insertDocuments({doc1, fromjson("{_id: 2, sk: 'b', data: 200}")});
 
     auto strategy = makeStrategy();
     auto result = lookup(&strategy, fromjson("{_id: 1, sk: 'a'}"));
 
     ASSERT_EQ(result.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(result.document->toBson(), fromjson("{_id: 1, sk: 'a', data: 100}"));
+    ASSERT_BSONOBJ_EQ(result.document->toBson(), doc1);
 
     const auto* root = strategy.getCachedPlanRoot_forTest();
     ASSERT_TRUE(root);
@@ -472,16 +626,16 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, MultiFieldDocumentKeyHandledViaIxsca
 }
 
 // On a regular (non-clustered) collection an _id-equality lookup must produce a plan with an index
-// scan stage, never a bare record-store scan (the parallel-poc COLLSCAN regression).
+// scan stage, never a bare record-store scan.
 TEST_F(SbeSingleDocumentLookupExecutorTest, RegularCollectionUsesIndexScan) {
     createCollection();
-    insertDocuments(
-        {fromjson("{_id: 1, x: 'a'}"), fromjson("{_id: 2, x: 'b'}"), fromjson("{_id: 3, x: 'c'}")});
+    const BSONObj doc2 = fromjson("{_id: 2, x: 'b'}");
+    insertDocuments({fromjson("{_id: 1, x: 'a'}"), doc2, fromjson("{_id: 3, x: 'c'}")});
 
     auto strategy = makeStrategy();
     auto result = lookup(&strategy, fromjson("{_id: 2}"));
     ASSERT_EQ(result.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(result.document->toBson(), fromjson("{_id: 2, x: 'b'}"));
+    ASSERT_BSONOBJ_EQ(result.document->toBson(), doc2);
 
     const auto* root = strategy.getCachedPlanRoot_forTest();
     ASSERT_TRUE(root) << "Expected the SBE strategy to have built a cached plan";
@@ -532,6 +686,61 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, ClusteredCollectionUsesBoundedScan) 
     ASSERT_TRUE(specific) << "Expected ScanStats on the scan stage";
     ASSERT_LT(specific->numReads, 10u)
         << "Clustered _id lookup must be bounded; got numReads=" << specific->numReads;
+}
+
+// A collection clustered by _id and also sharded with {_id: "hashed"} carries a real secondary
+// "_id_hashed" index alongside its (indexless) cluster key. The query planner offers both a
+// bounded-collscan solution and an IXSCAN(_id_hashed) solution for an _id-equality lookup; SBE
+// must still resolve it via the clustered bounded scan, not the hashed index (SlotBinder::bind()'s
+// literal-KeyString rebind is only valid against the real ascending "_id_" index).
+TEST_F(SbeSingleDocumentLookupExecutorTest, ClusteredCollectionWithHashedIdIndexUsesBoundedScan) {
+    createClusteredCollection();
+    createHashedIdIndex();
+    insertDocuments({fromjson("{_id: 1, x: 1}"), fromjson("{_id: 2, x: 2}")});
+
+    auto strategy = makeStrategy();
+    auto result = lookup(&strategy, fromjson("{_id: 1}"));
+    ASSERT_EQ(result.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(result.document->toBson(), fromjson("{_id: 1, x: 1}"));
+
+    const auto* root = strategy.getCachedPlanRoot_forTest();
+    ASSERT_TRUE(root);
+
+    auto stats = root->getStats(/*includeDebugInfo=*/true);
+    std::function<const sbe::PlanStageStats*(const sbe::PlanStageStats*)> findScan;
+    findScan = [&](const sbe::PlanStageStats* s) -> const sbe::PlanStageStats* {
+        if (s->common.stageType == "scan"sv || s->common.stageType == "ixscan"sv) {
+            return s;
+        }
+        for (const auto& child : s->children) {
+            if (auto found = findScan(child.get())) {
+                return found;
+            }
+        }
+        return nullptr;
+    };
+    const auto* scanStats = findScan(stats.get());
+    ASSERT_TRUE(scanStats) << "Expected a scan stage in the plan";
+    ASSERT_EQ(scanStats->common.stageType, "scan"sv)
+        << "Expected the bounded clustered collscan, not an ixscan over the hashed _id index";
+}
+
+// A non-clustered collection sharded with {_id: "hashed"} carries both the real ascending "_id_"
+// index and a secondary "_id_hashed" index. QueryPlanner::plan() may offer an indexed solution for
+// either one; PreparedExecutor::make() takes solutions[0] unconditionally. SBE must resolve the
+// lookup via the real "_id_" index, not decline just because the hashed index happened to be
+// offered first; the document is still reachable through the ordinary ixscan path.
+TEST_F(SbeSingleDocumentLookupExecutorTest,
+       NonClusteredCollectionWithHashedIdIndexUsesRealIdIndex) {
+    createCollection();
+    createHashedIdIndex();
+    insertDocuments({fromjson("{_id: 1, x: 1}"), fromjson("{_id: 2, x: 2}")});
+
+    auto strategy = makeStrategy();
+    auto result = lookup(&strategy, fromjson("{_id: 1}"));
+    ASSERT_EQ(result.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(result.document->toBson(), fromjson("{_id: 1, x: 1}"));
+    ASSERT_EQ(idIndexAccesses(), 1);
 }
 
 // --- $indexStats recording ---------------------------------------------------------------------
@@ -615,17 +824,19 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, ClusteredScalarIdEngagesSlotBinder) 
     // Shape (2) scalar variant: clustered collection with integer _id. The bounded scan's min/max
     // RecordId slots are populated by a kClusteredRecordIdPair binder via keyForElem.
     createClusteredCollection();
-    insertDocuments({fromjson("{_id: 1, x: 1}"), fromjson("{_id: 2, x: 2}")});
+    const BSONObj doc1 = fromjson("{_id: 1, x: 1}");
+    const BSONObj doc2 = fromjson("{_id: 2, x: 2}");
+    insertDocuments({doc1, doc2});
 
     auto strategy = makeStrategy();
 
     auto r1 = lookup(&strategy, fromjson("{_id: 1}"));
     ASSERT_EQ(r1.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(r1.document->toBson(), fromjson("{_id: 1, x: 1}"));
+    ASSERT_BSONOBJ_EQ(r1.document->toBson(), doc1);
 
     auto r2 = lookup(&strategy, fromjson("{_id: 2}"));
     ASSERT_EQ(r2.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(r2.document->toBson(), fromjson("{_id: 2, x: 2}"));
+    ASSERT_BSONOBJ_EQ(r2.document->toBson(), doc2);
 }
 
 TEST_F(SbeSingleDocumentLookupExecutorTest, ClusteredCompoundIdEngagesSlotBinder) {
@@ -637,27 +848,28 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, ClusteredCompoundIdEngagesSlotBinder
                              << "applyOpsIndex" << 0);
     auto id2 = BSON("nsUUID" << uuidA.toBSON().firstElement() << "ts" << Timestamp(101, 1)
                              << "applyOpsIndex" << 0);
-    insertDocuments(
-        {BSON("_id" << id1 << "body" << "first"), BSON("_id" << id2 << "body" << "second")});
+    const BSONObj doc1 = BSON("_id" << id1 << "body" << "first");
+    const BSONObj doc2 = BSON("_id" << id2 << "body" << "second");
+    insertDocuments({doc1, doc2});
 
     auto strategy = makeStrategy();
 
     auto r1 = lookup(&strategy, BSON("_id" << id1));
     ASSERT_EQ(r1.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(r1.document->toBson(), BSON("_id" << id1 << "body" << "first"));
+    ASSERT_BSONOBJ_EQ(r1.document->toBson(), doc1);
 
     auto r2 = lookup(&strategy, BSON("_id" << id2));
     ASSERT_EQ(r2.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(r2.document->toBson(), BSON("_id" << id2 << "body" << "second"));
+    ASSERT_BSONOBJ_EQ(r2.document->toBson(), doc2);
 }
 
 // --- Collation ---------------------------------------------------------------------------------
 //
 // For the IXSCAN shape, the strategy adopts the collection's default collation onto the query (so
 // the planner selects the collation-aware _id index) and SlotBinder encodes collation comparison
-// keys, so it resolves the lookup via the _id index. The clustered shape still declines a
-// non-simple collation: its RecordId encoding can't apply collation keys, so it falls back rather
-// than compute wrong seek bounds.
+// keys, so it resolves the lookup via the _id index. The clustered shape applies the same
+// collation transform to its RecordId seek key (mirroring record_id_helpers::keyForDoc's
+// insert-time encoding), so it resolves the lookup directly too.
 
 // A non-simple default collation makes the _id index collation-aware. The fast path adopts that
 // collation (so the planner selects the _id index) and encodes collation comparison keys for the
@@ -665,41 +877,46 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, ClusteredCompoundIdEngagesSlotBinder
 // recorded as _id index usage in $indexStats.
 TEST_F(SbeSingleDocumentLookupExecutorTest, NonSimpleCollationEngagesIxscanFastPath) {
     createCollectionWithCaseInsensitiveCollation();
-    insertDocuments({fromjson("{_id: 'abc', x: 1}")});
+    const BSONObj doc = fromjson("{_id: 'abc', x: 1}");
+    insertDocuments({doc});
 
     auto strategy = makeStrategy();
     // Look up with a different case; the case-insensitive _id index must still resolve it.
     auto result = lookup(&strategy, fromjson("{_id: 'ABC'}"));
 
     ASSERT_EQ(result.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(result.document->toBson(), fromjson("{_id: 'abc', x: 1}"));
+    ASSERT_BSONOBJ_EQ(result.document->toBson(), doc);
     ASSERT_TRUE(strategy.getCachedPlanRoot_forTest());
     ASSERT_EQ(idIndexAccesses(), 1);
     ASSERT_EQ(collectionScans(), 0);
 }
 
-TEST_F(SbeSingleDocumentLookupExecutorTest, NonSimpleCollationDeclinesClusteredFastPath) {
+// The seek key must go through the same collation transform as insert-time RecordId encoding
+// (record_id_helpers::keyForDoc), not just avoid declining. Querying with a different case than
+// the stored value only succeeds if the fast path actually applies the collation.
+TEST_F(SbeSingleDocumentLookupExecutorTest, NonSimpleCollationEngagesClusteredFastPath) {
     createClusteredCollectionWithCaseInsensitiveCollation();
-    insertDocuments({fromjson("{_id: 'abc', x: 1}")});
+    const BSONObj doc = fromjson("{_id: 'abc', x: 1}");
+    insertDocuments({doc});
 
     auto strategy = makeStrategy();
-    auto result = lookup(&strategy, fromjson("{_id: 'abc'}"));
+    auto result = lookup(&strategy, fromjson("{_id: 'ABC'}"));
 
-    ASSERT_EQ(result.status, LookupResult::HandledStatus::kNotHandled);
-    ASSERT_FALSE(strategy.getCachedPlanRoot_forTest())
-        << "A declined plan shape must not be cached";
+    ASSERT_EQ(result.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(result.document->toBson(), doc);
 }
 
 // A simple (or absent) collation is unaffected: the fast path still engages for a string _id.
 TEST_F(SbeSingleDocumentLookupExecutorTest, SimpleCollationStillEngagesIxscanFastPath) {
     createCollection();
-    insertDocuments({fromjson("{_id: 'abc', x: 1}"), fromjson("{_id: 'ABC', x: 2}")});
+    const BSONObj doc = fromjson("{_id: 'abc', x: 1}");
+    insertDocuments({doc, fromjson("{_id: 'ABC', x: 2}")});
 
     auto strategy = makeStrategy();
     auto result = lookup(&strategy, fromjson("{_id: 'abc'}"));
 
     ASSERT_EQ(result.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(result.document->toBson(), fromjson("{_id: 'abc', x: 1}"));
+    ASSERT_BSONOBJ_EQ(result.document->toBson(), doc);
     ASSERT_TRUE(strategy.getCachedPlanRoot_forTest());
 }
 
@@ -707,7 +924,8 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, SimpleCollationStillEngagesIxscanFas
 
 TEST_F(SbeSingleDocumentLookupExecutorTest, ReleaseResourcesDropsAllCachedState) {
     createCollection();
-    insertDocuments({fromjson("{_id: 1, x: 'a'}"), fromjson("{_id: 2, x: 'b'}")});
+    const BSONObj doc2 = fromjson("{_id: 2, x: 'b'}");
+    insertDocuments({fromjson("{_id: 1, x: 'a'}"), doc2});
 
     auto strategy = makeStrategy();
     auto r1 = lookup(&strategy, fromjson("{_id: 1}"));
@@ -724,7 +942,7 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, ReleaseResourcesDropsAllCachedState)
     // against. The next lookup rebuilds from scratch.
     auto r2 = lookup(&strategy, fromjson("{_id: 2}"));
     ASSERT_EQ(r2.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(r2.document->toBson(), fromjson("{_id: 2, x: 'b'}"));
+    ASSERT_BSONOBJ_EQ(r2.document->toBson(), doc2);
     ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), rebuildCountBefore + 1);
     ASSERT_TRUE(strategy.holdsAttachedCatalogState_forTest());
 }
@@ -760,7 +978,8 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, ReleaseResourcesBeforeAnyLookupIsANo
 TEST_F(SbeSingleDocumentLookupExecutorTest,
        PreAcquiredAcquirerAlsoRebuildsPlanAfterReleaseResources) {
     createCollection();
-    insertDocuments({fromjson("{_id: 1, x: 'a'}"), fromjson("{_id: 2, x: 'b'}")});
+    const BSONObj doc2 = fromjson("{_id: 2, x: 'b'}");
+    insertDocuments({fromjson("{_id: 1, x: 'a'}"), doc2});
 
     auto acquisition =
         acquireCollection(operationContext(),
@@ -784,7 +1003,7 @@ TEST_F(SbeSingleDocumentLookupExecutorTest,
 
     auto r2 = lookup(&strategy, fromjson("{_id: 2}"));
     ASSERT_EQ(r2.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(r2.document->toBson(), fromjson("{_id: 2, x: 'b'}"));
+    ASSERT_BSONOBJ_EQ(r2.document->toBson(), doc2);
     ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), rebuildCountBefore + 1)
         << "releaseResources() must tear down the plan for every acquirer kind, not just OnDemand";
 }
@@ -793,7 +1012,8 @@ TEST_F(SbeSingleDocumentLookupExecutorTest,
 
 TEST_F(SbeSingleDocumentLookupExecutorTest, UuidMismatchMidBatchReportsNotFound) {
     createCollection();
-    insertDocuments({fromjson("{_id: 1, x: 'old'}")});
+    const BSONObj doc = fromjson("{_id: 1, x: 'old'}");
+    insertDocuments({doc});
     const UUID actualUuid = currentUuid();
     const UUID staleUuid = UUID::gen();
     ASSERT_NE(actualUuid, staleUuid);
@@ -814,14 +1034,14 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, UuidMismatchMidBatchReportsNotFound)
     // The strategy recovers on the next lookup against the collection's real, current UUID.
     auto r3 = lookup(&strategy, fromjson("{_id: 1}"), actualUuid);
     ASSERT_EQ(r3.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(r3.document->toBson(), fromjson("{_id: 1, x: 'old'}"));
+    ASSERT_BSONOBJ_EQ(r3.document->toBson(), doc);
 }
 
 // Dropping the collection right after releaseResources() used to trip the
 // ConsistentCollection::checkNoCollectionsInUse debug invariant, because releaseResources() only
 // saved the plan and dropped the executor's own _collectionAcquisition bookkeeping, while
-// sbe::ScanStageBase::_coll -- the actual CollectionAcquisition the scan stage holds, set once in
-// prepare() -- is a second, independent reference that saveState() never clears. Since
+// sbe::ScanStageBase::_coll (the CollectionAcquisition the scan stage holds, set once in
+// prepare()) is a second, independent reference that saveState() never clears. Since
 // releaseResources() now fully tears the plan down along with the acquisition, that stale
 // reference can no longer outlive the acquisition it was built against.
 TEST_F(SbeSingleDocumentLookupExecutorTest, ReleaseResourcesThenDropCollectionIsSafe) {
@@ -840,14 +1060,15 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, ReleaseResourcesThenDropCollectionIs
 }
 
 // Same root cause as above: any catalog-mutating operation on the same OperationContext after only
-// releaseResources() -- not just a drop, even an index-metadata rebuild taking a normal MODE_X
-// collection lock -- used to hit the still-live sbe::ScanStageBase::_coll reference in the cached
+// releaseResources(), not just a drop but even an index-metadata rebuild taking a normal MODE_X
+// collection lock, used to hit the still-live sbe::ScanStageBase::_coll reference in the cached
 // plan. Now that releaseResources() always tears the plan down, isExecutorInvalidated()'s
 // version-check branch is reachable: the next lookup detects the bumped
 // PlanCacheInvalidatorVersion and rebuilds.
 TEST_F(SbeSingleDocumentLookupExecutorTest, PlanCacheInvalidationMidBatchTriggersReplan) {
     createCollection();
-    insertDocuments({fromjson("{_id: 1, x: 'a'}"), fromjson("{_id: 2, x: 'b'}")});
+    const BSONObj doc2 = fromjson("{_id: 2, x: 'b'}");
+    insertDocuments({fromjson("{_id: 1, x: 'a'}"), doc2});
 
     auto strategy = makeStrategy();
     auto r1 = lookup(&strategy, fromjson("{_id: 1}"));
@@ -860,8 +1081,223 @@ TEST_F(SbeSingleDocumentLookupExecutorTest, PlanCacheInvalidationMidBatchTrigger
 
     auto r2 = lookup(&strategy, fromjson("{_id: 2}"));
     ASSERT_EQ(r2.status, LookupResult::HandledStatus::kDocumentFound);
-    ASSERT_BSONOBJ_EQ(r2.document->toBson(), fromjson("{_id: 2, x: 'b'}"));
+    ASSERT_BSONOBJ_EQ(r2.document->toBson(), doc2);
     ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), rebuildCountBefore + 1);
+}
+
+// A documentKey without _id declines before any acquisition or plan is built, and is recorded
+// as notHandled with no latency.
+TEST_F(SbeSingleDocumentLookupExecutorTest, LookupWithoutIdFieldIsNotHandled) {
+    OtelMetricsCapturer capturer;
+    if (!capturer.canReadMetrics()) {
+        return;
+    }
+
+    createCollection();
+    insertDocuments({fromjson("{_id: 1}")});
+    auto strategy = makeStrategyWithRealRecorder(std::make_unique<AlwaysLocalEligibility>());
+
+    const auto before = snapshotSbeCell(capturer);
+    auto result = lookup(&strategy, fromjson("{sk: 1}"));
+    const auto after = snapshotSbeCell(capturer);
+
+    ASSERT_EQ(result.status, LookupResult::HandledStatus::kNotHandled);
+    // Declined before building anything: no plan, no cached acquisition.
+    ASSERT_FALSE(strategy.getCachedPlanRoot_forTest());
+    ASSERT_FALSE(strategy.holdsAttachedCatalogState_forTest());
+    ASSERT_EQ(after.found, before.found);
+    ASSERT_EQ(after.notFound, before.notFound);
+    ASSERT_EQ(after.notHandled, before.notHandled + 1);
+    // A declined lookup carries no meaningful latency.
+    ASSERT_EQ(after.latencyCount, before.latencyCount);
+}
+
+// --- kNotHandled declines: unsupported _id value types -----------------------------------------
+//
+// These are the shapes behind tassert 13006201 ($_internalSearchIdLookup's never-kNotHandled
+// invariant, which is exactly why the decline must be safe): an _id value the SlotBinder cannot
+// encode as a single bound pair must decline cleanly (kNotHandled) so the fallback wrapper can take
+// over, never crash. The read-time canLookupId() gate refuses regex, array and undefined
+// (validIdField) and null (whose equality would plan inexact); the decline can also fire at
+// PreparedExecutor::make (plan shape), so these tests assert the outcome, not the sub-path.
+
+// A regex _id cannot be stored (validIdField rejects it) but mongot's index is not so constrained;
+// the lookup must decline rather than crash or seek wrong bounds.
+TEST_F(SbeSingleDocumentLookupExecutorTest, RegexIdIsNotHandled) {
+    createCollection();
+    const BSONObj doc = fromjson("{_id: 1, x: 'a'}");
+    insertDocuments({doc});
+
+    auto strategy = makeStrategy();
+    auto result = lookup(&strategy, BSON("_id" << BSONRegEx("needle", "")));
+    ASSERT_EQ(result.status, LookupResult::HandledStatus::kNotHandled);
+
+    // The strategy recovers on the next (supported) lookup in the same window.
+    auto recovery = lookup(&strategy, fromjson("{_id: 1}"));
+    ASSERT_EQ(recovery.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(recovery.document->toBson(), doc);
+}
+
+// An array _id is likewise unstorable but mongot-reachable, and likewise must decline.
+TEST_F(SbeSingleDocumentLookupExecutorTest, ArrayIdIsNotHandled) {
+    createCollection();
+    const BSONObj doc = fromjson("{_id: 1, x: 'a'}");
+    insertDocuments({doc});
+
+    auto strategy = makeStrategy();
+    auto result = lookup(&strategy, BSON("_id" << BSON_ARRAY(1 << 2 << 3)));
+    ASSERT_EQ(result.status, LookupResult::HandledStatus::kNotHandled);
+
+    auto recovery = lookup(&strategy, fromjson("{_id: 1}"));
+    ASSERT_EQ(recovery.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(recovery.document->toBson(), doc);
+}
+
+// An undefined _id declines at the read-time validIdField gate, before any filter construction
+// or plan work; comparison match expressions would also reject it (expression_leaf.cpp), and
+// Search's enrich() drops undefined ids earlier still, so this is the defensive outermost wall.
+TEST_F(SbeSingleDocumentLookupExecutorTest, UndefinedIdIsNotHandled) {
+    createCollection();
+    insertDocuments({fromjson("{_id: 1, x: 'a'}")});
+
+    auto strategy = makeStrategy();
+    auto result = lookup(&strategy, BSON("_id" << BSONUndefined));
+    ASSERT_EQ(result.status, LookupResult::HandledStatus::kNotHandled);
+
+    // The strategy recovers on the next (supported) lookup in the same window.
+    auto recovery = lookup(&strategy, fromjson("{_id: 1}"));
+    ASSERT_EQ(recovery.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(recovery.document->toBson(), fromjson("{_id: 1, x: 'a'}"));
+}
+
+// The mid-batch mixed sequence: a decline caused by the _id *value* (not the plan) resets the
+// cached state, so the next supported _id in the same window rebuilds from scratch and still
+// resolves correctly. This is the interleaving a real mixed batch produces (mongot returning a
+// supported and an unsupported _id in one batch).
+TEST_F(SbeSingleDocumentLookupExecutorTest, DeclinedIdMidSequenceResetsAndNextLookupRebuilds) {
+    createCollection();
+    const BSONObj doc2 = fromjson("{_id: 2, x: 'b'}");
+    insertDocuments({fromjson("{_id: 1, x: 'a'}"), doc2});
+
+    auto strategy = makeStrategy();
+    auto r1 = lookup(&strategy, fromjson("{_id: 1}"));
+    ASSERT_EQ(r1.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
+
+    // Both unsupported value types decline mid-sequence...
+    auto regexDecline = lookup(&strategy, BSON("_id" << BSONRegEx("needle", "")));
+    ASSERT_EQ(regexDecline.status, LookupResult::HandledStatus::kNotHandled);
+    auto arrayDecline = lookup(&strategy, BSON("_id" << BSON_ARRAY(1 << 2)));
+    ASSERT_EQ(arrayDecline.status, LookupResult::HandledStatus::kNotHandled);
+
+    // ...dropping the cached plan; the next supported _id rebuilds and is found through it.
+    auto r2 = lookup(&strategy, fromjson("{_id: 2}"));
+    ASSERT_EQ(r2.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(r2.document->toBson(), doc2);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 2U);
+}
+
+// A null _id declines: null equality also matches a missing _id, so a plan built for it is
+// inexact (a FETCH reading the match param slot, bound to null at prepare), and
+// SlotBinder::bind() rebinds only the seek bounds, so a cached plan would filter later lookups
+// by the stale null. The fallback resolves the null doc instead.
+TEST_F(SbeSingleDocumentLookupExecutorTest, NullIdIsNotHandled) {
+    createCollection();
+    insertDocuments({fromjson("{_id: null, x: 'null'}"), fromjson("{_id: 1, x: 'a'}")});
+
+    auto strategy = makeStrategy();
+    auto result = lookup(&strategy, fromjson("{_id: null}"));
+    ASSERT_EQ(result.status, LookupResult::HandledStatus::kNotHandled);
+
+    // The strategy recovers on the next (supported) lookup in the same window.
+    auto recovery = lookup(&strategy, fromjson("{_id: 1}"));
+    ASSERT_EQ(recovery.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(recovery.document->toBson(), fromjson("{_id: 1, x: 'a'}"));
+}
+
+// The reverse ordering: a plan is already cached from a preceding non-null lookup when a null
+// _id declines. Pins that the decline does not leave the cached plan poisoned for the *next*
+// non-null lookup in the same window: it re-finds its own document through a rebuilt plan, not a
+// stale one.
+TEST_F(SbeSingleDocumentLookupExecutorTest, NonNullThenNullThenNonNullIsNotPoisoned) {
+    createCollection();
+    const BSONObj doc1 = fromjson("{_id: 1, x: 'a'}");
+    const BSONObj doc2 = fromjson("{_id: 2, x: 'b'}");
+    insertDocuments({doc1, doc2, fromjson("{_id: null, x: 'null'}")});
+
+    auto strategy = makeStrategy();
+    auto r1 = lookup(&strategy, fromjson("{_id: 1}"));
+    ASSERT_EQ(r1.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(r1.document->toBson(), doc1);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
+
+    auto nullResult = lookup(&strategy, fromjson("{_id: null}"));
+    ASSERT_EQ(nullResult.status, LookupResult::HandledStatus::kNotHandled);
+
+    // The next non-null lookup rebuilds from scratch and resolves its own document, not a stale
+    // plan left over from either the doc1 lookup or the declined null.
+    auto r2 = lookup(&strategy, fromjson("{_id: 2}"));
+    ASSERT_EQ(r2.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(r2.document->toBson(), doc2);
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 2U);
+}
+
+// The exotic-but-storable _id types (binData, codeWScope) are mongot-reachable _id shapes that
+// isEligibleForComparisonAutoParameterization() still allows: pin that their seek encoding
+// actually resolves and that both share the one cached plan. (Null is also storable but
+// declined; see NullIdIsNotHandled.)
+TEST_F(SbeSingleDocumentLookupExecutorTest, ExoticButEncodableIdTypesAreHandled) {
+    createCollection();
+
+    BSONObjBuilder codeWScopeBob;
+    codeWScopeBob.appendCodeWScope("_id", "int(a) + b", BSON("b" << 1));
+    codeWScopeBob.append("x", "codewscope");
+
+    const std::vector<BSONObj> docs{
+        BSON("_id" << BSONBinData("\x01\x02", 2, BinDataGeneral) << "x" << "bin"),
+        codeWScopeBob.obj()};
+    insertDocuments(docs);
+
+    auto strategy = makeStrategy();
+    for (const auto& doc : docs) {
+        auto result = lookup(&strategy, BSON("_id" << doc["_id"]));
+        ASSERT_EQ(result.status, LookupResult::HandledStatus::kDocumentFound);
+        ASSERT_BSONOBJ_EQ(result.document->toBson(), doc);
+    }
+    // Both rebind the one cached plan: it was built exactly once for both (the rebuild count is
+    // the reliable reuse signal; a plan-root pointer can be fooled by heap address reuse).
+    ASSERT_EQ(strategy.getPlanRebuildCount_forTest(), 1U);
+}
+
+// minKey, maxKey, boolean and dbRef are storable _id shapes (validIdField accepts them) but
+// isEligibleForComparisonAutoParameterization() declines them: MinKey/MaxKey/null are reserved as
+// interval-evaluation-tree boundary markers elsewhere in auto-parameterization, and reusing that
+// same classification here (rather than a bespoke one) is the whole point of sharing this check.
+// Each must decline cleanly, like the other kNotHandled types, so the fallback resolves them.
+TEST_F(SbeSingleDocumentLookupExecutorTest, SentinelIdTypesAreNotHandled) {
+    createCollection();
+
+    BSONObjBuilder dbRefBob;
+    dbRefBob.appendDBRef("_id", "dbref.coll", OID::gen());
+    dbRefBob.append("x", "dbref");
+
+    const std::vector<BSONObj> docs{BSON("_id" << MINKEY << "x" << "minkey"),
+                                    BSON("_id" << MAXKEY << "x" << "maxkey"),
+                                    BSON("_id" << true << "x" << "bool"),
+                                    dbRefBob.obj()};
+    insertDocuments(docs);
+
+    auto strategy = makeStrategy();
+    for (const auto& doc : docs) {
+        auto result = lookup(&strategy, BSON("_id" << doc["_id"]));
+        ASSERT_EQ(result.status, LookupResult::HandledStatus::kNotHandled);
+    }
+
+    // The strategy recovers on the next (supported) lookup in the same window.
+    insertDocuments({fromjson("{_id: 1, x: 'a'}")});
+    auto recovery = lookup(&strategy, fromjson("{_id: 1}"));
+    ASSERT_EQ(recovery.status, LookupResult::HandledStatus::kDocumentFound);
+    ASSERT_BSONOBJ_EQ(recovery.document->toBson(), fromjson("{_id: 1, x: 'a'}"));
 }
 
 // --- Plan summary stats sink -------------------------------------------------------------------
@@ -876,7 +1312,7 @@ TEST_F(SbeSingleDocumentLookupExecutorTest,
     strategy.setPlanSummaryStatsSink(&sink);
 
     // The sink only folds in at teardown (releaseResources()/resetPlan()), not after every
-    // lookup, so it stays untouched mid-window.
+    // lookup, so it stays untouched mid-batch.
     lookup(&strategy, fromjson("{_id: 1}"));
     lookup(&strategy, fromjson("{_id: 2}"));
     ASSERT_EQ(sink.totalKeysExamined, 0U);

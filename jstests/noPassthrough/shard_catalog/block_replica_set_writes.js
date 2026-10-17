@@ -142,9 +142,32 @@ describe("Test blockReplicaSetWrites command on shard replica sets in a sharded 
             "replicaSetWritesBlockReason metric should be 0 (InsufficientDiskSpace)",
         );
         assert.eq(
+            replStatus.replicaSetWritesBlockAllowDeletions,
+            false,
+            "replicaSetWritesBlockAllowDeletions metric should be false when deletions are blocked",
+        );
+        assert.eq(
             replStatus.replicaSetWritesBlockCounters.InsufficientDiskSpace,
             1,
             "repl.replicaSetWritesBlockCounters counter for InsufficientDiskSpace should be 1",
+        );
+
+        // Update the active block's deletion policy. This must increment the enable counter.
+        enableReplicaSetWriteBlock(
+            this.shard0PrimaryAdminDB,
+            true /* allowDeletions */,
+            "InsufficientDiskSpace" /* reason */,
+        );
+        replStatus = assert.commandWorked(this.shard0PrimaryAdminDB.serverStatus()).repl;
+        assert.eq(
+            replStatus.replicaSetWritesBlock,
+            2,
+            "replicaSetWritesBlock metric should remain enabled after the policy update",
+        );
+        assert.eq(
+            replStatus.replicaSetWritesBlockCounters.InsufficientDiskSpace,
+            2,
+            "repl.replicaSetWritesBlockCounters counter should increment on allowDeletions change",
         );
 
         // Disable write blocking on shard0.
@@ -165,9 +188,29 @@ describe("Test blockReplicaSetWrites command on shard replica sets in a sharded 
             "replicaSetWritesBlockReason should be absent when replica set write block is disabled",
         );
         assert.eq(
+            replStatus.replicaSetWritesBlockAllowDeletions,
+            true,
+            "replicaSetWritesBlockAllowDeletions should be true when replica set write blocking is disabled",
+        );
+        assert.eq(
             replStatus.replicaSetWritesBlockCounters.InsufficientDiskSpace,
-            1,
+            2,
             "repl.replicaSetWritesBlockCounters counter for InsufficientDiskSpace should not change on disable",
+        );
+    });
+
+    it("Test replica set writes block allowDeletions metric reports allowed deletions", function () {
+        enableReplicaSetWriteBlock(
+            this.shard0PrimaryAdminDB,
+            true /* allowDeletions */,
+            "InsufficientDiskSpace" /* reason */,
+        );
+
+        const replStatus = assert.commandWorked(this.shard0PrimaryAdminDB.serverStatus()).repl;
+        assert.eq(
+            replStatus.replicaSetWritesBlockAllowDeletions,
+            true,
+            "replicaSetWritesBlockAllowDeletions metric should be true when deletions are allowed",
         );
     });
 
@@ -340,12 +383,7 @@ describe("Test blockReplicaSetWrites command on shard replica sets in a sharded 
         assert.commandFailedWithCode(testColl.remove({_id: 1}), ErrorCodes.ReplicaSetWritesBlocked);
         assert.eq(2, testColl.count(), "Both documents should remain while deletions are blocked");
 
-        // Disable write block and re-enable with allowDeletions: true — user deletes should succeed.
-        disableReplicaSetWriteBlock(
-            this.shard0PrimaryAdminDB,
-            "InsufficientDiskSpace" /* reason */,
-        );
-
+        // Update the active block with allowDeletions: true — user deletes should succeed.
         enableReplicaSetWriteBlock(
             this.shard0PrimaryAdminDB,
             true /* allowDeletions */,
@@ -421,12 +459,7 @@ describe("Test blockReplicaSetWrites command on shard replica sets in a sharded 
             "Expected orphan to still be present after range deletion was blocked",
         );
 
-        // Disable write block, then re-enable with allowDeletions set to true (i.e., all deletes allowed).
-        disableReplicaSetWriteBlock(
-            this.shard0PrimaryAdminDB,
-            "InsufficientDiskSpace" /* reason */,
-        );
-
+        // Update the active block with allowDeletions set to true (i.e., all deletes allowed).
         enableReplicaSetWriteBlock(
             this.shard0PrimaryAdminDB,
             true /* allowDeletions */,
@@ -470,13 +503,7 @@ describe("Test blockReplicaSetWrites command on shard replica sets in a sharded 
             ErrorCodes.ReplicaSetWritesBlocked,
         );
 
-        // Disable write blocking.
-        disableReplicaSetWriteBlock(
-            this.shard0PrimaryAdminDB,
-            "InsufficientDiskSpace" /* reason */,
-        );
-
-        // Check that with allowDeletions:true, compact is permitted.
+        // Update the active block with allowDeletions:true; compact is then permitted.
         enableReplicaSetWriteBlock(
             this.shard0PrimaryAdminDB,
             true /* allowDeletions */,
@@ -521,13 +548,7 @@ describe("Test blockReplicaSetWrites command on shard replica sets in a sharded 
         );
         assert.commandWorked(shard0AdminDB.runCommand({autoCompact: false}));
 
-        // Disable write blocking.
-        disableReplicaSetWriteBlock(
-            this.shard0PrimaryAdminDB,
-            "InsufficientDiskSpace" /* reason */,
-        );
-
-        // Check that with allowDeletions:true, auto-compact is permitted.
+        // Update the active block with allowDeletions:true; auto-compact is then permitted.
         enableReplicaSetWriteBlock(
             shard0AdminDB,
             true /* allowDeletions */,

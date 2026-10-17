@@ -217,7 +217,7 @@ MongoRunner.binVersionSubs = [
     new MongoRunner.VersionSub("latest", shellVersion()),
     new MongoRunner.VersionSub("last-continuous", fcvConstants.lastContinuous),
     new MongoRunner.VersionSub("last-lts", fcvConstants.lastLTS),
-    new MongoRunner.VersionSub("last-patch", shellVersion()),
+    new MongoRunner.VersionSub("last-patch", fcvConstants.latest),
 ];
 
 MongoRunner.getBinVersionFor = function (version) {
@@ -771,11 +771,6 @@ MongoRunner.mongodOptions = function (opts = {}) {
     _removeSetParameterIfBeforeVersion(opts, "defaultConfigCommandTimeoutMS", "7.3.0");
     _removeSetParameterIfBeforeVersion(opts, "enableAutoCompaction", "7.3.0");
     _removeSetParameterIfBeforeVersion(opts, "opentelemetryTraceDirectory", "8.3.0");
-    _removeSetParameterIfBeforeVersion(
-        opts,
-        "initialSyncWaitForSyncSourceLastStableRecoveryTsInitiatingSetThresholdSecs",
-        "9.0.0",
-    );
     _removeSetParameterIfBeforeVersion(opts, "reshardingDocumentVerification", "9.0.0");
 
     if (!opts.logFile && opts.useLogFiles) {
@@ -1344,6 +1339,14 @@ function appendSetParameterArgs(argArray) {
                 }
             }
         } else if (baseProgramName === "mongod") {
+            // TODO SERVER-136165: Remove or re-enable featureFlagListIndexesAlwaysIncludesSimpleCollation.
+            if (programMajorMinorVersion >= 900) {
+                argArray.push(
+                    "--setParameter",
+                    "featureFlagListIndexesAlwaysIncludesSimpleCollation=false",
+                );
+            }
+
             if (jsTestOptions().roleGraphInvalidationIsFatal) {
                 argArray.push(...["--setParameter", "roleGraphInvalidationIsFatal=true"]);
             }

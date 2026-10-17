@@ -448,8 +448,15 @@ __reconcile(WT_SESSION_IMPL *session, WT_REF *ref, WT_SALVAGE_COOKIE *salvage, u
           session->reconcile_timeline.total_reentry_hs_eviction_time;
 
 err:
-    if (ret != 0)
+    if (ret != 0) {
+        /*
+         * The reconcile-local block array is normally freed by cleanup when wrapping up the
+         * reconciliation, which this path skips. If cleanup has not run, free it here.
+         */
+        if (r->multi != NULL)
+            WT_TRET(__rec_cleanup(session, r));
         WT_RET_PANIC(session, ret, "reconciliation failed after building the disk image");
+    }
     return (ret);
 }
 
@@ -623,7 +630,7 @@ __rec_root_write(WT_SESSION_IMPL *session, WT_PAGE *page, uint32_t flags)
 
         WT_ERR(__wt_multi_to_ref(session, NULL, next, &mod->mod_multi[i], mod->mod_multi_entries,
           &pindex->index[i], NULL, false, false));
-        pindex->index[i]->home = next;
+        __wt_atomic_store_ptr_relaxed(&pindex->index[i]->home, next);
     }
 
     /*
@@ -1266,7 +1273,7 @@ __wti_rec_split_init(
         if (__wt_ref_is_root(ref))
             WT_RET(__wt_buf_set(session, &chunk->key, "", 1));
         else
-            __wt_ref_key(ref->home, ref, &chunk->key.data, &chunk->key.size);
+            __wt_ref_key_home(ref, &chunk->key.data, &chunk->key.size);
     } else
         chunk->recno = recno;
 
@@ -2772,7 +2779,7 @@ __wt_bulk_wrapup(WT_SESSION_IMPL *session, WT_CURSOR_BULK *cbulk)
     __rec_write_page_status(session, r);
 
     /* Mark the page's parent and the tree dirty. */
-    parent = r->ref->home;
+    parent = (WT_PAGE *)__wt_atomic_load_ptr_relaxed(&r->ref->home);
     WT_ERR(__wt_page_modify_init(session, parent));
     __wt_page_modify_set(session, parent);
 

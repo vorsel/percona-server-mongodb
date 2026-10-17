@@ -36,6 +36,7 @@
 #include "mongo/db/scoped_read_concern.h"
 #include "mongo/db/shard_role/lock_manager/lock_manager_defs.h"
 #include "mongo/db/shard_role/shard_catalog/catalog_raii.h"
+#include "mongo/db/shard_role/shard_catalog/collection_critical_section_document_gen.h"
 #include "mongo/db/shard_role/shard_catalog/collection_metadata.h"
 #include "mongo/db/shard_role/shard_catalog/collection_sharding_runtime.h"
 #include "mongo/db/shard_role/shard_catalog/database_sharding_runtime.h"
@@ -85,6 +86,7 @@ MONGO_FAIL_POINT_DEFINE(simulateCatalogTopLevelMetadataInconsistency);
 
 static constexpr std::string_view kInMemoryShardCatalogSourceScope = "inMemoryShardCatalog"sv;
 static constexpr std::string_view kDurableShardCatalogSourceScope = "durableShardCatalog"sv;
+static constexpr int kConsistentSnapshotMaxRetries = 10;
 
 /*
  * Parses a durable shard catalog document. On success returns the parsed object. If parsing fails
@@ -103,6 +105,20 @@ auto parseDurableCatalogObject(const ParseFn& parse,
         inconsistencies.emplace_back(makeInconsistency(ex.reason()));
         return boost::none;
     }
+}
+
+/*
+ * This helper function returns a ScopedReadConcern with level kSnapshotReadConcern only if the
+ * current readConcern doesn't have an atClusterTime, this way we keep a consistent snapshot if it
+ * was provided.
+ */
+boost::optional<ScopedReadConcern> setSnapshotReadConcernIfNeeded(OperationContext* opCtx) {
+    boost::optional<ScopedReadConcern> ret;
+    if (repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime().has_value()) {
+        return ret;
+    }
+    ret.emplace(opCtx, repl::ReadConcernArgs::kSnapshot);
+    return ret;
 }
 
 /*
@@ -133,17 +149,21 @@ MetadataInconsistencyItem makeInconsistentDurableShardCatalogMetadata(const Name
  * infrastructure will catch these cases. It is a uassert with ConflictingOperationInProgress if the
  * scenario is acceptable for this to happen.
  *
- * The two accepted scenarios are:
- * 1. The collection is `config.system.sessions` - this is acceptable since this collection is only
- * droppable via direct shard connection.
- * 2. This node is a config server - this can happen since transitionToDedicated drops collections
- * in the background.
+ * The three accepted scenarios are:
+ * 1. The current node is a secondary. Catalog stability is given by the DDL lock held by the
+ *    primary, if the primary dies then there's no stability guarantee.
+ * 2. The collection is `config.system.sessions` - this is acceptable since this collection is only
+ *    droppable via direct shard connection.
+ * 3. This node is a config server - this can happen since transitionToDedicated drops collections
+ *    in the background.
  */
-void throwCollectionDisappearedError(OperationContext* opCtx, const NamespaceString& nss) {
+void throwCollectionDisappearedError(OperationContext* opCtx,
+                                     const NamespaceString& nss,
+                                     RSNodeMode rsMode) {
     tassert(9690601,
             str::stream() << "Collection unexpectedly disappeared while holding database DDL lock: "
                           << nss.toStringForErrorMsg(),
-            nss == NamespaceString::kLogicalSessionsNamespace ||
+            rsMode != RSNodeMode::kPrimary || nss == NamespaceString::kLogicalSessionsNamespace ||
                 ShardingState::get(opCtx)->shardId() == ShardId::kConfigServerId);
 
     uasserted(ErrorCodes::ConflictingOperationInProgress,
@@ -156,12 +176,12 @@ void throwCollectionDisappearedError(OperationContext* opCtx, const NamespaceStr
  *
  * TODO SERVER-24266: get rid of the `getNumDocs` function and simply rely on `numRecords`.
  */
-long long getNumDocs(OperationContext* opCtx, const Collection* localColl) {
+long long getNumDocs(OperationContext* opCtx, const Collection* localColl, RSNodeMode rsMode) {
     // Since users are advised to delete empty misplaced collections, rely on isEmpty
     // that is safe because the implementation guards against SERVER-24266.
     AutoGetCollection ac(opCtx, localColl->ns(), MODE_IS);
     if (!ac) {
-        throwCollectionDisappearedError(opCtx, localColl->ns());
+        throwCollectionDisappearedError(opCtx, localColl->ns(), rsMode);
     }
     if (ac->isEmpty(opCtx)) {
         return 0;
@@ -189,9 +209,19 @@ void _checkBucketCollectionInconsistencies(
     const std::shared_ptr<const CollectionCatalog> localCatalogSnapshot,
     const CollectionPtr& localColl,
     const bool checkView,
+    RSNodeMode rsMode,
     std::vector<MetadataInconsistencyItem>& inconsistencies) {
 
     if (!nss.isTimeseriesBucketsCollection()) {
+        return;
+    }
+
+    // This check relies on both the DDL lock being held + reads "at latest" to see the
+    // timeseries view and system.buckets collection consistently and avoid false positives.
+    // The DDL lock alone is not sufficient: For example, on a secondary, we may hold the DDL lock,
+    // but only applied the creation of the system.buckets collection (a CreateCollectionUntracked
+    // may not yet be majority committed), so we could report a false positive here.
+    if (rsMode != RSNodeMode::kPrimary) {
         return;
     }
 
@@ -217,22 +247,20 @@ void _checkBucketCollectionInconsistencies(
 std::vector<ChunkType> getChunksFromGlobalCatalog(OperationContext* opCtx,
                                                   const CollectionType& coll,
                                                   const ShardId& shardId) {
-    auto chunksStatus = Grid::get(opCtx)->catalogClient()->getChunks(
-        opCtx,
-        BSON(ChunkType::collectionUUID()
-             << coll.getUuid() << "$or"
-             << BSON_ARRAY(BSON(ChunkType::shard(shardId.toString()))
-                           << BSON("history.shard" << shardId.toString()))),
-        BSON(ChunkType::min() << 1),
-        boost::none,
-        nullptr,
-        coll.getEpoch(),
-        coll.getTimestamp(),
-        repl::ReadConcernArgs::kSnapshot);
-
-    uassertStatusOK(chunksStatus.getStatus());
-
-    return chunksStatus.getValue();
+    return snapshotUnavailableRetry(opCtx, "getChunksFromGlobalCatalog", [&] {
+        return uassertStatusOK(Grid::get(opCtx)->catalogClient()->getChunks(
+            opCtx,
+            BSON(ChunkType::collectionUUID()
+                 << coll.getUuid() << "$or"
+                 << BSON_ARRAY(BSON(ChunkType::shard(shardId.toString()))
+                               << BSON("history.shard" << shardId.toString()))),
+            BSON(ChunkType::min() << 1),
+            boost::none,
+            nullptr,
+            coll.getEpoch(),
+            coll.getTimestamp(),
+            getReadConcernForConfigServer(opCtx, repl::ReadConcernArgs::kSnapshot)));
+    });
 }
 
 struct CatalogRelaxedAggregateChunkInfo {
@@ -366,27 +394,27 @@ boost::optional<CollectionType> readCollectionFromDurableShardCatalog(
 bool hasChunksFromDurableShardCatalog(OperationContext* opCtx,
                                       const UUID& uuid,
                                       const ShardId& shardId) {
-    ScopedReadConcern scopedReadConcern(
-        opCtx, repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern));
+    const auto scopedReadConcern = setSnapshotReadConcernIfNeeded(opCtx);
 
     DBDirectClient client(opCtx);
     FindCommandRequest chunkFindOp{NamespaceString::kConfigShardCatalogChunksNamespace};
     chunkFindOp.setFilter(
         BSON(ChunkType::collectionUUID() << uuid << ChunkType::shard(shardId.toString())));
     chunkFindOp.setSort(BSON(ChunkType::min() << 1));
-    auto chunkCursor = client.find(std::move(chunkFindOp));
+    auto chunkCursor = snapshotUnavailableRetry(
+        opCtx, "hasChunksFromDurableShardCatalog", [&] { return client.find(chunkFindOp); });
     return chunkCursor->more();
 }
 
 bool hasAnyChunksFromDurableShardCatalog(OperationContext* opCtx, const UUID& uuid) {
-    ScopedReadConcern scopedReadConcern(
-        opCtx, repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern));
+    const auto scopedReadConcern = setSnapshotReadConcernIfNeeded(opCtx);
 
     DBDirectClient client(opCtx);
     FindCommandRequest chunkFindOp{NamespaceString::kConfigShardCatalogChunksNamespace};
     chunkFindOp.setFilter(BSON(ChunkType::collectionUUID() << uuid));
     chunkFindOp.setSort(BSON(ChunkType::min() << 1));
-    auto chunkCursor = client.find(std::move(chunkFindOp));
+    auto chunkCursor = snapshotUnavailableRetry(
+        opCtx, "hasAnyChunksFromDurableShardCatalog", [&] { return client.find(chunkFindOp); });
     return chunkCursor->more();
 }
 
@@ -431,14 +459,14 @@ boost::optional<std::vector<ChunkType>> readChunksFromDurableShardCatalog(
     OperationContext* opCtx,
     const CollectionType& coll,
     std::vector<MetadataInconsistencyItem>& inconsistencies) {
-    ScopedReadConcern scopedReadConcern(
-        opCtx, repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern));
+    const auto scopedReadConcern = setSnapshotReadConcernIfNeeded(opCtx);
 
     DBDirectClient client(opCtx);
     FindCommandRequest chunkFindOp{NamespaceString::kConfigShardCatalogChunksNamespace};
     chunkFindOp.setFilter(BSON(ChunkType::collectionUUID() << coll.getUuid()));
     chunkFindOp.setSort(BSON(ChunkType::min() << 1));
-    auto chunkCursor = client.find(std::move(chunkFindOp));
+    auto chunkCursor = metadata_consistency_util::snapshotUnavailableRetry(
+        opCtx, "readChunksFromDurableShardCatalog", [&] { return client.find(chunkFindOp); });
 
     std::vector<ChunkType> chunks;
     while (chunkCursor->more()) {
@@ -689,17 +717,24 @@ boost::optional<BSONObj> validateChunksStrictEquality(
 void checkCollectionEntriesConsistent(ShardCatalogCollectionTypeBase shardCatalogCollection,
                                       const CollectionType& globalCatalogCollection,
                                       std::string_view sourceName,
-                                      bool asRSPrimaryNode,
+                                      RSNodeMode rsMode,
                                       std::vector<MetadataInconsistencyItem>& inconsistencies) {
-    if (!asRSPrimaryNode) {
-        // The allowMigrations flag is not persisted locally, only in memory, so `atClusterTime` is
-        // not enough to guarantee that secondaries see an updated value. Since this flag is not
-        // used with authoritative shards and CMC on secondaries only runs with the auth shards flag
-        // enabled, this mismatch can only happen on very rare occasions during setFCV, so just
-        // ignore it on secondaries.
+    if (rsMode != RSNodeMode::kPrimary) {
+        // The allowMigrations flag is not persisted locally, only in memory, so secondaries could
+        // see an outdated value. Since this flag is not used with authoritative shards and CMC on
+        // secondaries only runs with the auth shards flag enabled, this mismatch can only happen on
+        // very rare occasions during setFCV, so just ignore it on secondaries.
         shardCatalogCollection.setAllowMigrations(globalCatalogCollection.getAllowMigrations()
                                                       ? boost::none
                                                       : boost::make_optional(false));
+    }
+
+    if (rsMode == RSNodeMode::kDelayedSecondary) {
+        // The allowChunkOperations flag can change outside of the critical section, so delayed
+        // secondaries can't check it reliably.
+        shardCatalogCollection.setAllowChunkOperations(
+            globalCatalogCollection.getAllowChunkOperations() ? boost::none
+                                                              : boost::make_optional(false));
     }
 
     if (shardCatalogCollection.getComparableFields() !=
@@ -746,13 +781,10 @@ void validateShardCatalogEntries(ShardCatalogCollectionTypeBase shardCatalogColl
                                  const ShardId& shardId,
                                  std::string_view sourceName,
                                  bool useStrictChunkValidation,
-                                 bool asRSPrimaryNode,
+                                 RSNodeMode rsMode,
                                  std::vector<MetadataInconsistencyItem>& inconsistencies) {
-    checkCollectionEntriesConsistent(shardCatalogCollection,
-                                     globalCatalogCollection,
-                                     sourceName,
-                                     asRSPrimaryNode,
-                                     inconsistencies);
+    checkCollectionEntriesConsistent(
+        shardCatalogCollection, globalCatalogCollection, sourceName, rsMode, inconsistencies);
 
     if (auto mismatchDetail = validateAllShardChunksOwned(shardCatalogChunks, shardId)) {
         inconsistencies.emplace_back(makeInconsistency(
@@ -861,7 +893,7 @@ void validateInMemoryShardCatalogEntries(const CollectionMetadata& inMemoryShard
                                          const std::vector<ChunkType>& chunksInGlobalCatalog,
                                          const ShardId& shardId,
                                          bool useStrictChunkValidation,
-                                         bool asRSPrimaryNode,
+                                         RSNodeMode rsMode,
                                          std::vector<MetadataInconsistencyItem>& inconsistencies) {
     auto chunksInMemoryShardCatalog =
         getChunksFromInMemoryShardCatalog(inMemoryShardCatalogMetadata, shardId);
@@ -876,7 +908,7 @@ void validateInMemoryShardCatalogEntries(const CollectionMetadata& inMemoryShard
                                 shardId,
                                 kInMemoryShardCatalogSourceScope,
                                 useStrictChunkValidation,
-                                asRSPrimaryNode,
+                                rsMode,
                                 inconsistencies);
 }
 
@@ -923,8 +955,7 @@ void validateDurableShardCatalogEntries(const NamespaceString& nss,
                                         const std::vector<ChunkType>& chunksInGlobalCatalog,
                                         const CollectionType& collectionInDurableShardCatalog,
                                         const std::vector<ChunkType>& chunksInDurableShardCatalog,
-                                        bool useStrictChunkValidation,
-                                        bool asRSPrimaryNode,
+                                        RSNodeMode rsMode,
                                         std::vector<MetadataInconsistencyItem>& inconsistencies) {
 
     if (!checkShardHasChunksDurablyPersistedWhenItShould(nss,
@@ -935,14 +966,16 @@ void validateDurableShardCatalogEntries(const NamespaceString& nss,
         return;
     }
 
+    // At this point of this validation authoritativeShardsCRUD is always enabled, so we
+    // enable strict chunk validation.
     validateShardCatalogEntries(collectionInDurableShardCatalog.asShardCatalogType(),
                                 chunksInDurableShardCatalog,
                                 collectionInGlobalCatalog,
                                 chunksInGlobalCatalog,
                                 shardId,
                                 kDurableShardCatalogSourceScope,
-                                useStrictChunkValidation,
-                                asRSPrimaryNode,
+                                true /* useStrictChunkValidation */,
+                                rsMode,
                                 inconsistencies);
 }
 
@@ -1003,7 +1036,7 @@ void checkCollectionMetadataInShardCatalog(
     const NamespaceString& nss,
     const ShardId& shardId,
     bool isPrimary,
-    bool asRSPrimaryNode,
+    RSNodeMode rsMode,
     const CollectionPtr& localCollectionPtr,
     const boost::optional<CollectionType> collectionInGlobalCatalog,
     int64_t strictChunkChecksThreshold,
@@ -1035,6 +1068,15 @@ void checkCollectionMetadataInShardCatalog(
     // the CSR lock, release it, perform the remote reads, then re-acquire the lock and verify the
     // placement version hasn't changed.
     auto optimisticCheck = [&] {
+        if (rsMode == RSNodeMode::kDelayedSecondary) {
+            // The in-memory catalog metadata is not versioned, delayed secondaries can't in general
+            // rely on its contents, so don't bother retrieving a CollectionMetadata but still
+            // return true to make durable checks later.
+            // TODO (SERVER-130947): take and keep a consistent CollectionMetadata on delayed
+            // secondaries.
+            return true;
+        }
+
         const auto scopedCsr = CollectionShardingRuntime::acquireShared(opCtx, nss);
         if (scopedCsr->getCriticalSectionSignal(ShardingMigrationCriticalSection::kWrite)) {
             return false;
@@ -1052,8 +1094,8 @@ void checkCollectionMetadataInShardCatalog(
         return;
     }
 
-    if (!inMemoryShardCatalogMetadata && TestingProctor::instance().isEnabled() &&
-        authoritativeShardsCRUD.wasEnabled() &&
+    if (rsMode != RSNodeMode::kDelayedSecondary && !inMemoryShardCatalogMetadata &&
+        TestingProctor::instance().isEnabled() && authoritativeShardsCRUD.wasEnabled() &&
         opCtx->getClient()->getPrng().trueWithProbability(
             gProbabilityOfFilteringMetadataRecovery.loadRelaxed())) {
         // Trigger a filtering metadata recovery if no data is present in memory since otherwise
@@ -1162,7 +1204,7 @@ void checkCollectionMetadataInShardCatalog(
         return isPlacementVersionStable(**scopedCsr, collectionPlacementVersion);
     };
 
-    if (!asRSPrimaryNode) {
+    if (rsMode == RSNodeMode::kSecondary) {
         // Get the last applied timestamp and use it from now on to read from durable catalogs (both
         // the shard and the global catalog). Reacquire the CSR and check for stability. If the
         // check passes, we know that both the CSR snapshot and the timestamp are valid and
@@ -1230,8 +1272,7 @@ void checkCollectionMetadataInShardCatalog(
                                            chunksInGlobalCatalog,
                                            durableShardCatalogCollection,
                                            *durableChunks,
-                                           authoritativeShardsCRUD.wasEnabled(),
-                                           asRSPrimaryNode,
+                                           rsMode,
                                            authShardsInconsistencies);
     };
 
@@ -1261,7 +1302,7 @@ void checkCollectionMetadataInShardCatalog(
         checkCollectionEntriesConsistent(durableShardCatalogCollection.asShardCatalogType(),
                                          *collectionInGlobalCatalog,
                                          kDurableShardCatalogSourceScope,
-                                         asRSPrimaryNode,
+                                         rsMode,
                                          authShardsInconsistencies);
 
         if (globalRelaxedInfo.maxChunkVersion != shardRelaxedInfo.maxChunkVersion) {
@@ -1277,9 +1318,6 @@ void checkCollectionMetadataInShardCatalog(
         }
     };
 
-    // If metadata became unknown, the critical section was acquired, or the placement version
-    // changed, a migration may have occurred during the remote call. Skip the following checks to
-    // avoid false positives.
     if (!checkCatalogStability()) {
         return;
     }
@@ -1346,7 +1384,7 @@ void checkCollectionMetadataInShardCatalog(
                                             *chunksInGlobalCatalog,
                                             shardId,
                                             useStrictChunkValidation,
-                                            asRSPrimaryNode,
+                                            rsMode,
                                             inconsistencies);
     }
 
@@ -1379,17 +1417,13 @@ void _checkShardKeyIndexInconsistencies(OperationContext* opCtx,
                                         const BSONObj& shardKey,
                                         const CollectionPtr& localColl,
                                         std::vector<MetadataInconsistencyItem>& inconsistencies,
-                                        const bool checkRangeDeletionIndexes) {
-    const auto performChecks = [&](const CollectionPtr& localColl,
-                                   std::vector<MetadataInconsistencyItem>& inconsistencies) {
-        // We allow users to drop hashed shard key indexes, and therefore we don't require hashed
-        // shard keys to have a supporting index.
-        if (!ShardKeyPattern(shardKey).isHashedPattern()) {
-            inconsistencies.emplace_back(metadata_consistency_util::makeInconsistency(
-                MetadataInconsistencyTypeEnum::kMissingShardKeyIndex,
-                MissingShardKeyIndexDetails{localColl->ns(), shardId, shardKey}));
-        }
-    };
+                                        const bool checkRangeDeletionIndexes,
+                                        RSNodeMode rsMode) {
+    // Shards that do not own any chunks do not participate in the creation of new indexes, so they
+    // could potentially miss any indexes created after they no longer own chunks. Thus we first
+    // perform a check optimistically without taking collection lock, if missing indexes are found
+    // we check under the collection lock if this shard currently own any chunk and re-execute again
+    // the checks under the lock to ensure stability of the ShardVersion.
 
     // Check that the collection has an index that supports the shard key. The
     // checkMetadataConsistency function is executed under the database DDL lock, ensuring any
@@ -1400,6 +1434,61 @@ void _checkShardKeyIndexInconsistencies(OperationContext* opCtx,
     if (findShardKeyPrefixedIndex(opCtx, localColl, shardKey, false /*requireSingleKey*/)) {
         return;
     }
+
+    std::vector<MetadataInconsistencyItem> tmpInconsistencies;
+
+    // We allow users to drop hashed shard key indexes, and therefore we don't require hashed
+    // shard keys to have a supporting index.
+    if (!ShardKeyPattern(shardKey).isHashedPattern()) {
+        tmpInconsistencies.emplace_back(metadata_consistency_util::makeInconsistency(
+            MetadataInconsistencyTypeEnum::kMissingShardKeyIndex,
+            MissingShardKeyIndexDetails{localColl->ns(), shardId, shardKey}));
+    }
+
+    if (tmpInconsistencies.size()) {
+        // Pessimistic check under collection lock to serialize with chunk migration commit.
+        AutoGetCollection ac(opCtx, nss, MODE_IS);
+        if (!ac) {
+            throwCollectionDisappearedError(opCtx, nss, rsMode);
+        }
+
+        if (findShardKeyPrefixedIndex(opCtx, *ac, shardKey, false /*requireSingleKey*/)) {
+            return;
+        }
+
+        const auto scopedCsr =
+            CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
+        auto optCollDescr = scopedCsr->getCurrentMetadataIfKnown();
+        if (!optCollDescr) {
+            LOGV2_DEBUG(7531701,
+                        1,
+                        "Ignoring missing shard key index because collection metadata is unknown",
+                        logAttrs(nss),
+                        "inconsistencies"_attr = tmpInconsistencies);
+            tmpInconsistencies.clear();
+        } else if (!optCollDescr->hasRoutingTable()) {
+            LOGV2_DEBUG(9302300,
+                        1,
+                        "Ignoring missing shard key index because collection metadata is incorrect",
+                        logAttrs(nss),
+                        "inconsistencies"_attr = tmpInconsistencies);
+            tmpInconsistencies.clear();
+        } else if (!optCollDescr->currentShardHasAnyChunks()) {
+            LOGV2_DEBUG(7531703,
+                        1,
+                        "Ignoring missing shard key index because shard does not own any chunk for "
+                        "this collection",
+                        logAttrs(nss),
+                        "inconsistencies"_attr = tmpInconsistencies);
+            tmpInconsistencies.clear();
+        }
+    }
+
+    // At this point we didn't find a shard key index (even though we may not report it).
+
+    // Copy the possible kMissingShardKeyIndex into the resulting inconsistencies.
+    inconsistencies.insert(
+        inconsistencies.end(), tmpInconsistencies.begin(), tmpInconsistencies.end());
 
     // If the checkRangeDeletionIndexes flag is set, perform an additional check to detect
     // inconsistencies in cases where a collection has an outstanding range deletion without
@@ -1413,61 +1502,6 @@ void _checkShardKeyIndexInconsistencies(OperationContext* opCtx,
                 RangeDeletionMissingShardKeyIndexDetails{localColl->ns(), shardId, shardKey}));
         }
     }
-
-    std::vector<MetadataInconsistencyItem> tmpInconsistencies;
-
-    // Shards that do not own any chunks do not participate in the creation of new indexes, so they
-    // could potentially miss any indexes created after they no longer own chunks. Thus we first
-    // perform a check optimistically without taking collection lock, if missing indexes are found
-    // we check under the collection lock if this shard currently own any chunk and re-execute again
-    // the checks under the lock to ensure stability of the ShardVersion.
-    performChecks(localColl, tmpInconsistencies);
-
-    if (!tmpInconsistencies.size()) {
-        // No index inconsistencies found
-        return;
-    }
-
-    // Pessimistic check under collection lock to serialize with chunk migration commit.
-    AutoGetCollection ac(opCtx, nss, MODE_IS);
-    if (!ac) {
-        throwCollectionDisappearedError(opCtx, nss);
-    }
-
-    const auto scopedCsr =
-        CollectionShardingRuntime::assertCollectionLockedAndAcquireShared(opCtx, nss);
-    auto optCollDescr = scopedCsr->getCurrentMetadataIfKnown();
-    if (!optCollDescr) {
-        LOGV2_DEBUG(7531701,
-                    1,
-                    "Ignoring index inconsistencies because collection metadata is unknown",
-                    logAttrs(nss),
-                    "inconsistencies"_attr = tmpInconsistencies);
-        return;
-    }
-
-    if (!optCollDescr->hasRoutingTable()) {
-        LOGV2_DEBUG(9302300,
-                    1,
-                    "Ignoring index inconsistencies because collection metadata is incorrect",
-                    logAttrs(nss),
-                    logAttrs(nss),
-                    "inconsistencies"_attr = tmpInconsistencies);
-        return;
-    }
-
-    if (!optCollDescr->currentShardHasAnyChunks()) {
-        LOGV2_DEBUG(7531703,
-                    1,
-                    "Ignoring index inconsistencies because shard does not own any chunk for "
-                    "this collection",
-                    logAttrs(nss),
-                    "inconsistencies"_attr = tmpInconsistencies);
-        return;
-    }
-
-    tmpInconsistencies.clear();
-    performChecks(*ac, inconsistencies);
 }
 
 std::vector<MetadataInconsistencyItem> _checkInconsistenciesBetweenBothCatalogs(
@@ -1479,19 +1513,24 @@ std::vector<MetadataInconsistencyItem> _checkInconsistenciesBetweenBothCatalogs(
     const CollectionPtr& localColl,
     const bool checkRangeDeletionIndexes,
     int64_t strictChunkChecksThreshold,
-    const bool asRSPrimaryNode) {
+    RSNodeMode rsMode) {
     std::vector<MetadataInconsistencyItem> inconsistencies;
 
     const auto& catalogUUID = catalogColl.getUuid();
     const auto& localUUID = localColl->uuid();
     if (catalogUUID != localUUID) {
+        // In some circumstances there might be a local old incarnation of a collection outside the
+        // critical section. On delayed secondaries, return right away.
+        if (rsMode == RSNodeMode::kDelayedSecondary) {
+            return inconsistencies;
+        }
         const auto severity =
             boost::make_optional(nss == NamespaceString::kLogicalSessionsNamespace,
                                  MetadataInconsistencySeverityEnum::kLow);
         inconsistencies.emplace_back(makeInconsistency(
             MetadataInconsistencyTypeEnum::kCollectionUUIDMismatch,
             CollectionUUIDMismatchDetails{
-                nss, shardId, localUUID, catalogUUID, getNumDocs(opCtx, localColl.get())},
+                nss, shardId, localUUID, catalogUUID, getNumDocs(opCtx, localColl.get(), rsMode)},
             severity));
     }
 
@@ -1539,13 +1578,23 @@ std::vector<MetadataInconsistencyItem> _checkInconsistenciesBetweenBothCatalogs(
     if ((localTimeseriesOptions && catalogTimeseriesOptions &&
          !timeseries::optionsAreEqual(*localTimeseriesOptions, *catalogTimeseriesOptions)) ||
         catalogTimeseriesOptions.has_value() != localTimeseriesOptions.has_value()) {
-        inconsistencies.emplace_back(makeOptionsMismatchInconsistencyBetweenShardAndConfig(
-            nss,
-            shardId,
-            BSON(CollectionType::kTimeseriesFieldsFieldName
-                 << (localTimeseriesOptions ? localTimeseriesOptions->toBSON() : BSONObj())),
-            BSON(CollectionType::kTimeseriesFieldsFieldName
-                 << (catalogTimeseriesOptions ? catalogTimeseriesOptions->toBSON() : BSONObj()))));
+        // TODO(SERVER-132808): remove this exception
+        if (rsMode == RSNodeMode::kDelayedSecondary &&
+            (!catalogColl.getAllowChunkOperations() || !catalogColl.getAllowMigrations())) {
+            LOGV2(13280600,
+                  "Skipping timeseries options check for collection in delayed secondary because a "
+                  "DDL coordinator has frozen chunk operations",
+                  "nss"_attr = nss);
+        } else {
+            inconsistencies.emplace_back(makeOptionsMismatchInconsistencyBetweenShardAndConfig(
+                nss,
+                shardId,
+                BSON(CollectionType::kTimeseriesFieldsFieldName
+                     << (localTimeseriesOptions ? localTimeseriesOptions->toBSON() : BSONObj())),
+                BSON(CollectionType::kTimeseriesFieldsFieldName
+                     << (catalogTimeseriesOptions ? catalogTimeseriesOptions->toBSON()
+                                                  : BSONObj()))));
+        }
     }
 
     // Verify default collation is consistent between the shard and the config server.
@@ -1566,7 +1615,7 @@ std::vector<MetadataInconsistencyItem> _checkInconsistenciesBetweenBothCatalogs(
                                               nss,
                                               shardId,
                                               shardId == primaryShardId,
-                                              asRSPrimaryNode,
+                                              rsMode,
                                               localColl,
                                               catalogColl,
                                               strictChunkChecksThreshold,
@@ -1576,17 +1625,18 @@ std::vector<MetadataInconsistencyItem> _checkInconsistenciesBetweenBothCatalogs(
     // Check shardKey index inconsistencies.
     // Skip the check in case of unsplittable collections as we don't strictly require an index on
     // the shard key for unsplittable collections.
-    //
-    // TODO (SERVER-130807): Re-enable shard-key indexes check on secondaries
+    // These checks rely on acquiring the CSR for the collection, so exclude delayed secondaries.
+    // TODO (SERVER-130947): revisit if we can make those checks on delayed secondaries.
     const bool isSharded = !catalogColl.getUnsplittable();
-    if (asRSPrimaryNode && catalogUUID == localUUID && isSharded) {
+    if (rsMode != RSNodeMode::kDelayedSecondary && catalogUUID == localUUID && isSharded) {
         _checkShardKeyIndexInconsistencies(opCtx,
                                            nss,
                                            shardId,
                                            catalogColl.getKeyPattern().toBSON(),
                                            localColl,
                                            inconsistencies,
-                                           checkRangeDeletionIndexes);
+                                           checkRangeDeletionIndexes,
+                                           rsMode);
     }
 
     return inconsistencies;
@@ -1599,11 +1649,17 @@ std::vector<MetadataInconsistencyItem> _checkLocalInconsistencies(
     const ShardId& primaryShard,
     const std::shared_ptr<const CollectionCatalog> localCatalogSnapshot,
     const CollectionPtr& localColl,
-    const bool asRSPrimaryNode) {
+    RSNodeMode rsMode) {
     std::vector<MetadataInconsistencyItem> inconsistencies;
 
     if (currentShard != primaryShard) {
-        const auto numDocs = getNumDocs(opCtx, localColl.get());
+        if (rsMode == RSNodeMode::kDelayedSecondary) {
+            // movePrimary runs the clone phase outside the critical section, so there may be local
+            // untracked collections while we are not the primary shard. On delayed secondaries, we
+            // can't make these checks.
+            return inconsistencies;
+        }
+        const auto numDocs = getNumDocs(opCtx, localColl.get(), rsMode);
         // config.system.sessions is created on the first data shard by CreateCollectionCoordinator,
         // not on the config server (the database primary). Ignore the transient MisplacedCollection
         // while the collection is being created and still empty.
@@ -1621,23 +1677,63 @@ std::vector<MetadataInconsistencyItem> _checkLocalInconsistencies(
                                               nss,
                                               currentShard,
                                               currentShard == primaryShard,
-                                              asRSPrimaryNode,
+                                              rsMode,
                                               localColl,
                                               boost::none,
                                               false,
                                               inconsistencies);
     }
 
-    _checkBucketCollectionInconsistencies(
-        opCtx, nss, localCatalogSnapshot, localColl, currentShard == primaryShard, inconsistencies);
+    _checkBucketCollectionInconsistencies(opCtx,
+                                          nss,
+                                          localCatalogSnapshot,
+                                          localColl,
+                                          currentShard == primaryShard,
+                                          rsMode,
+                                          inconsistencies);
 
     return inconsistencies;
+}
+
+bool _shouldSkipOnDelayedSecondary(const NamespaceString& nss,
+                                   RSNodeMode rsMode,
+                                   const stdx::unordered_set<NamespaceString>& collectionsUnderCs) {
+    if (rsMode != RSNodeMode::kDelayedSecondary) {
+        return false;
+    }
+
+    if (collectionsUnderCs.contains(nss)) {
+        LOGV2(12922301,
+              "Skipping checkMetadataConsistency for collection in delayed secondary because the "
+              "critical section is taken",
+              "nss"_attr = nss);
+        return true;
+    }
+    // Resharding temporary collections don't follow any normal consistency invariants. They are
+    // normally hidden from CMC by the DDL lock taken by the resharding coordinator, but on delayed
+    // secondaries we don't have that protection, so just ignore them altogether.
+    if (nss.isTemporaryReshardingCollection()) {
+        LOGV2(12922302,
+              "Skipping checkMetadataConsistency for resharding temporary collection in delayed "
+              "secondary",
+              "nss"_attr = nss);
+        return true;
+    }
+
+    return false;
 }
 
 bool _collectionMustExistLocallyButDoesnt(OperationContext* opCtx,
                                           const NamespaceString& nss,
                                           const ShardId& currentShard,
-                                          const ShardId& primaryShard) {
+                                          const ShardId& primaryShard,
+                                          RSNodeMode rsMode) {
+    if (rsMode == RSNodeMode::kDelayedSecondary) {
+        // Delayed secondaries can't check the in-memory metadata reliably.
+        // TODO (SERVER-130947): revisit this.
+        return false;
+    }
+
     // The DBPrimary shard must always have the collection created locally regardless if it owns
     // chunks or not. The config database is excluded because config.system.sessions is created on
     // the first shard instead of the database primary.
@@ -1911,7 +2007,8 @@ std::vector<MetadataInconsistencyItem> checkDatabaseMetadataConsistencyInShardCa
     OperationContext* opCtx,
     const DatabaseName& dbName,
     const DatabaseVersion& dbVersionInGlobalCatalog,
-    const ShardId& primaryShard) {
+    const ShardId& primaryShard,
+    RSNodeMode rsMode) {
     std::vector<MetadataInconsistencyItem> inconsistencies;
 
     auto dbInShardCatalog = readDatabaseFromDurableShardCatalog(
@@ -1936,12 +2033,17 @@ std::vector<MetadataInconsistencyItem> checkDatabaseMetadataConsistencyInShardCa
                 dbName, primaryShard, dbVersionInGlobalCatalog, dbVersionInShardCatalog}));
     }
 
-    auto cacheInconsistencies = checkDatabaseMetadataConsistencyInShardCatalogCache(
-        opCtx, dbName, dbVersionInGlobalCatalog, dbVersionInShardCatalog, primaryShard);
+    // There is currently no way to retrieve a DSR from a given timestamp, so we skip this check on
+    // delayed secondaries.
+    // TODO (SERVER-130947): maybe you can.
+    if (rsMode != RSNodeMode::kDelayedSecondary) {
+        auto cacheInconsistencies = checkDatabaseMetadataConsistencyInShardCatalogCache(
+            opCtx, dbName, dbVersionInGlobalCatalog, dbVersionInShardCatalog, primaryShard);
 
-    inconsistencies.insert(inconsistencies.end(),
-                           std::make_move_iterator(cacheInconsistencies.begin()),
-                           std::make_move_iterator(cacheInconsistencies.end()));
+        inconsistencies.insert(inconsistencies.end(),
+                               std::make_move_iterator(cacheInconsistencies.begin()),
+                               std::make_move_iterator(cacheInconsistencies.end()));
+    }
 
     return inconsistencies;
 }
@@ -1955,12 +2057,13 @@ std::vector<CollectionType> getCollectionsListFromConfigServer(
             return Grid::get(opCtx)->catalogClient()->getCollections(
                 opCtx,
                 nss.dbName(),
-                repl::ReadConcernArgs::kMajority,
+                getReadConcernForConfigServer(opCtx),
                 BSON(CollectionType::kNssFieldName << 1) /*sort*/);
         }
         case MetadataConsistencyCommandLevelEnum::kCollectionLevel: {
             try {
-                auto collectionType = Grid::get(opCtx)->catalogClient()->getCollection(opCtx, nss);
+                auto collectionType = Grid::get(opCtx)->catalogClient()->getCollection(
+                    opCtx, nss, getReadConcernForConfigServer(opCtx));
                 return {std::move(collectionType)};
             } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
                 // If we don't find the nss, it means that the collection is not sharded.
@@ -1998,7 +2101,7 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeQueuedPlanExecutor(
 
     for (auto&& inconsistency : inconsistencies) {
         // Every inconsistency encountered need to be logged with the same format
-        // to allow log injestion systems to correctly detect them.
+        // to allow log ingestion systems to correctly detect them.
         logMetadataInconsistency(inconsistency);
         WorkingSetID id = ws->allocate();
         WorkingSetMember* member = ws->get(id);
@@ -2018,8 +2121,156 @@ std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> makeQueuedPlanExecutor(
                                        nss);
 }
 
+auto getCatalogAndCollections(OperationContext* opCtx,
+                              const NamespaceString& nss,
+                              MetadataConsistencyCommandLevelEnum commandLevel) {
+    std::vector<CollectionPtr> localCatalogCollections;
+    switch (commandLevel) {
+        case MetadataConsistencyCommandLevelEnum::kDatabaseLevel: {
+            auto collCatalogSnapshot = [&] {
+                // Lock db in mode IS while taking the collection catalog snapshot to ensure that we
+                // serialize with non-atomic collection and index creation performed by the
+                // MigrationDestinationManager. Without this lock we could potentially acquire a
+                // snapshot in which a collection have been already created by the
+                // MigrationDestinationManager but the relative shardkey index is still missing.
+                AutoGetDb autoDb(opCtx, nss.dbName(), MODE_IS);
+                return CollectionCatalog::get(opCtx);
+            }();
+
+            for (auto&& coll : collCatalogSnapshot->range(nss.dbName())) {
+                if (!coll) {
+                    continue;
+                }
+                // The collection catalog snapshot will be in scope until the end of the command
+                // execution, so we can safely use CollectionPtr_UNSAFE as the instance pointed
+                // by Collection* will stay in scope as a consequence.
+                localCatalogCollections.emplace_back(CollectionPtr::CollectionPtr_UNSAFE(coll));
+            }
+            std::sort(localCatalogCollections.begin(),
+                      localCatalogCollections.end(),
+                      [](const CollectionPtr& prev, const CollectionPtr& next) {
+                          return prev->ns() < next->ns();
+                      });
+
+            return std::make_pair(std::move(collCatalogSnapshot),
+                                  std::move(localCatalogCollections));
+        }
+        case MetadataConsistencyCommandLevelEnum::kCollectionLevel: {
+            auto collCatalogSnapshot = [&] {
+                // Lock collection in mode IS while taking the collection catalog snapshot to ensure
+                // that we serialize with non-atomic collection and index creation performed by the
+                // MigrationDestinationManager. Without this lock we could potentially acquire a
+                // snapshot in which a collection have been already created by the
+                // MigrationDestinationManager but the relative shardkey index is still missing.
+                AutoGetCollection coll(opCtx,
+                                       nss,
+                                       MODE_IS,
+                                       auto_get_collection::Options{}.viewMode(
+                                           auto_get_collection::ViewMode::kViewsPermitted));
+                return CollectionCatalog::get(opCtx);
+            }();
+
+            // The collection catalog snapshot will be in scope until the end of the command
+            // execution, so we can safely use CollectionPtr_UNSAFE as the instance pointed by
+            // Collection* will stay in scope as a consequence.
+            if (auto coll = collCatalogSnapshot->lookupCollectionByNamespace(opCtx, nss)) {
+                localCatalogCollections.emplace_back(CollectionPtr::CollectionPtr_UNSAFE(coll));
+            }
+
+            return std::make_pair(std::move(collCatalogSnapshot),
+                                  std::move(localCatalogCollections));
+        }
+        default:
+            tasserted(1011705,
+                      str::stream()
+                          << "Unexpected parameter during the internal execution of "
+                             "checkMetadataConsistency command. The shard server was "
+                             "expecting to receive a database or collection level parameter, but "
+                             "received "
+                          << idl::serialize(commandLevel) << " with namespace "
+                          << nss.toStringForErrorMsg());
+    }
+}
+
+auto getConsistentSnapshot(OperationContext* opCtx,
+                           const NamespaceString& nss,
+                           MetadataConsistencyCommandLevelEnum commandLevel) {
+    using CatalogAndCollections = decltype(getCatalogAndCollections(opCtx, nss, commandLevel));
+    CatalogAndCollections catalogAndCollections1;
+    CatalogAndCollections catalogAndCollections2;
+    Timestamp optime;
+    int retries = 0;
+
+    // Here we want to get a local catalog snapshot along with a timestamp at which the catalog was
+    // valid. The idea is simple:
+    //  1. Take the latest catalog snapshot.
+    //  2. Get the last applied timestamp.
+    //  3. Take the latest catalog again.
+    // If the catalog snapshots taken at 1 and 3 are equal, that means that none of the oplog
+    // entries that were applied between the two acquisitions changed the catalog, and in particular
+    // the one timestamp we took in the middle is consistent with the catalog snapshot.
+    do {
+        retries++;
+        if (retries >= kConsistentSnapshotMaxRetries) {
+            optime = Timestamp{};
+            break;
+        }
+
+        catalogAndCollections1 = getCatalogAndCollections(opCtx, nss, commandLevel);
+        optime = repl::ReplicationCoordinator::get(opCtx)->getMyLastAppliedTimestamp();
+        catalogAndCollections2 = getCatalogAndCollections(opCtx, nss, commandLevel);
+    } while (!optime.isNull() &&
+             std::get<0>(catalogAndCollections1) != std::get<0>(catalogAndCollections2));
+
+    if (optime.isNull()) {
+        static constexpr char msg[] =
+            "Couldn't get a consistent snapshot/timestamp pair for check metadata consistency on a "
+            "delayed secondary";
+        LOGV2_WARNING(
+            12922305, msg, "nss"_attr = nss, "commandLevel"_attr = idl::serialize(commandLevel));
+        uasserted(ErrorCodes::SnapshotUnavailable, msg);
+    }
+
+    return std::tuple_cat(std::move(catalogAndCollections2),
+                          std::tuple{boost::make_optional(optime)});
+}
+
+stdx::unordered_set<NamespaceString> getCollectionsUnderCriticalSection(
+    OperationContext* opCtx, const std::vector<CollectionPtr>& localCatalogCollections) {
+    DBDirectClient dbClient(opCtx);
+    FindCommandRequest request{NamespaceString::kCollectionCriticalSectionsNamespace};
+    request.setFilter(BSON(CollectionCriticalSectionDocument::kBlockReadsFieldName << true));
+    auto cursor = dbClient.find(std::move(request));
+    stdx::unordered_set<NamespaceString> namespacesUnderCS;
+
+    while (cursor->more()) {
+        const auto obj = cursor->next();
+        const auto nssName =
+            obj[CollectionCriticalSectionDocument::kNssFieldName].valueStringDataSafe();
+        if (nssName.empty()) {
+            continue;
+        }
+        auto nss = NamespaceStringUtil::deserialize(
+            boost::none, nssName, SerializationContext::stateDefault());
+        uassert(
+            ErrorCodes::SnapshotUnavailable,
+            fmt::format("The database critical section is taken: {}", nss.toStringForErrorMsg()),
+            !nss.isDbOnly());
+        namespacesUnderCS.emplace(std::move(nss));
+    }
+
+    return namespacesUnderCS;
+}
+
 }  // namespace
 
+void logSnapshotUnavailableRetry(std::string_view checkName, size_t attempt, const Status& status) {
+    LOGV2(13217503,
+          "Retrying metadata consistency check after SnapshotUnavailable error",
+          "check"_attr = checkName,
+          "attempt"_attr = attempt,
+          "error"_attr = redact(status));
+}
 
 MetadataConsistencyCommandLevelEnum getCommandLevel(const NamespaceString& nss) {
     if (nss.isAdminDB()) {
@@ -2137,7 +2388,8 @@ std::vector<MetadataInconsistencyItem> checkCollectionMetadataConsistency(
     const bool checkRangeDeletionIndexes,
     const bool optionalCheckIndexes,
     int64_t strictChunkChecksThreshold,
-    const bool asRSPrimaryNode) {
+    RSNodeMode rsMode,
+    const stdx::unordered_set<NamespaceString>& collectionsUnderCs) {
 
     std::vector<MetadataInconsistencyItem> inconsistencies;
     auto itLocalCollections = localCatalogCollections.begin();
@@ -2168,13 +2420,20 @@ std::vector<MetadataInconsistencyItem> checkCollectionMetadataConsistency(
             }
             // Case where we have found a collection in the sharding catalog that it is not in the
             // local catalog.
-            if (_collectionMustExistLocallyButDoesnt(opCtx, remoteNss, shardId, primaryShardId)) {
+            if (_collectionMustExistLocallyButDoesnt(
+                    opCtx, remoteNss, shardId, primaryShardId, rsMode)) {
                 inconsistencies.emplace_back(makeInconsistency(
                     MetadataInconsistencyTypeEnum::kMissingLocalCollection,
                     MissingLocalCollectionDetails{remoteNss, catalogColl.getUuid(), shardId}));
             }
             itCatalogCollections++;
         } else if (isCollectionOnBothCatalogs) {
+            if (_shouldSkipOnDelayedSecondary(remoteNss, rsMode, collectionsUnderCs)) {
+                itLocalCollections++;
+                itCatalogCollections++;
+                continue;
+            }
+
             // Case where we have found same collection in the catalog client than in the local
             // catalog.
             auto inconsistenciesBetweenBothCatalogs =
@@ -2186,7 +2445,7 @@ std::vector<MetadataInconsistencyItem> checkCollectionMetadataConsistency(
                                                          localColl,
                                                          checkRangeDeletionIndexes,
                                                          strictChunkChecksThreshold,
-                                                         asRSPrimaryNode);
+                                                         rsMode);
             inconsistencies.insert(
                 inconsistencies.end(),
                 std::make_move_iterator(inconsistenciesBetweenBothCatalogs.begin()),
@@ -2200,6 +2459,7 @@ std::vector<MetadataInconsistencyItem> checkCollectionMetadataConsistency(
                                                   localCatalogSnapshot,
                                                   localColl,
                                                   primaryShardId == shardId /* isPrimaryShard */,
+                                                  rsMode,
                                                   inconsistencies);
             if (optionalCheckIndexes && !catalogColl.getUnsplittable()) {
                 auto indexesInconsistencies = _checkShardedCollectionUniqueIndexConsistency(
@@ -2213,14 +2473,10 @@ std::vector<MetadataInconsistencyItem> checkCollectionMetadataConsistency(
             // Case where we have found a local collection that is not in the sharding catalog.
             const auto& nss = localNss;
 
-            if (!localNss.isShardLocalNamespace()) {
-                auto localInconsistencies = _checkLocalInconsistencies(opCtx,
-                                                                       nss,
-                                                                       shardId,
-                                                                       primaryShardId,
-                                                                       localCatalogSnapshot,
-                                                                       localColl,
-                                                                       asRSPrimaryNode);
+            if (!localNss.isShardLocalNamespace() &&
+                !_shouldSkipOnDelayedSecondary(localNss, rsMode, collectionsUnderCs)) {
+                auto localInconsistencies = _checkLocalInconsistencies(
+                    opCtx, nss, shardId, primaryShardId, localCatalogSnapshot, localColl, rsMode);
                 inconsistencies.insert(inconsistencies.end(),
                                        std::make_move_iterator(localInconsistencies.begin()),
                                        std::make_move_iterator(localInconsistencies.end()));
@@ -2237,14 +2493,10 @@ std::vector<MetadataInconsistencyItem> checkCollectionMetadataConsistency(
         const auto& localColl = *itLocalCollections;
         const auto& localNss = localColl->ns();
 
-        if (!localNss.isShardLocalNamespace()) {
-            auto localInconsistencies = _checkLocalInconsistencies(opCtx,
-                                                                   localNss,
-                                                                   shardId,
-                                                                   primaryShardId,
-                                                                   localCatalogSnapshot,
-                                                                   localColl,
-                                                                   asRSPrimaryNode);
+        if (!localNss.isShardLocalNamespace() &&
+            !_shouldSkipOnDelayedSecondary(localNss, rsMode, collectionsUnderCs)) {
+            auto localInconsistencies = _checkLocalInconsistencies(
+                opCtx, localNss, shardId, primaryShardId, localCatalogSnapshot, localColl, rsMode);
             inconsistencies.insert(inconsistencies.end(),
                                    std::make_move_iterator(localInconsistencies.begin()),
                                    std::make_move_iterator(localInconsistencies.end()));
@@ -2258,7 +2510,7 @@ std::vector<MetadataInconsistencyItem> checkCollectionMetadataConsistency(
         });
 
         if (_collectionMustExistLocallyButDoesnt(
-                opCtx, itCatalogCollections->getNss(), shardId, primaryShardId)) {
+                opCtx, itCatalogCollections->getNss(), shardId, primaryShardId, rsMode)) {
             inconsistencies.emplace_back(makeInconsistency(
                 MetadataInconsistencyTypeEnum::kMissingLocalCollection,
                 MissingLocalCollectionDetails{
@@ -2429,7 +2681,7 @@ std::vector<MetadataInconsistencyItem> checkCollectionMetadataConsistencyAcrossS
          *      1. Use the $listCatalog stage to gather the collection metadata from all shards
          *      owning chunks.
          *      2. Since $listCatalog only targets shards owning chunks, we may skip checking the
-         *      existance of the collection on the DBPrimary shard, where the collection must also
+         *      existence of the collection on the DBPrimary shard, where the collection must also
          *      exist. Therefore, in this step we are appending the catalog entry obtained from
          *      the DBPrimary shard to the list of documents returned by $listCatalog. To do so, we
          *      need to concatenate the following 4 stages: $group, $project, $unwind and
@@ -2631,9 +2883,11 @@ std::vector<MetadataInconsistencyItem> checkChunksConsistency(OperationContext* 
 
     DBDirectClient client{opCtx};
     // We need to read at snapshot readConcern, set it in the opCtx for DBDirectClient.
-    ScopedReadConcern scopedReadConcern(
-        opCtx, repl::ReadConcernArgs(repl::ReadConcernLevel::kSnapshotReadConcern));
-    const auto chunksCursor = _getCollectionChunksCursor(&client, collection);
+    const auto scopedReadConcern = setSnapshotReadConcernIfNeeded(opCtx);
+    const auto chunksCursor =
+        metadata_consistency_util::snapshotUnavailableRetry(opCtx, "checkChunksConsistency", [&] {
+            return _getCollectionChunksCursor(&client, collection);
+        });
 
     const auto& uuid = collection.getUuid();
     const auto& nss = collection.getNss();
@@ -2808,7 +3062,7 @@ std::vector<MetadataInconsistencyItem> checkCollectionShardingMetadataConsistenc
 }
 
 std::vector<MetadataInconsistencyItem> checkDatabaseMetadataConsistency(
-    OperationContext* opCtx, const DatabaseType& dbInGlobalCatalog) {
+    OperationContext* opCtx, const DatabaseType& dbInGlobalCatalog, RSNodeMode rsMode) {
     const auto dbName = dbInGlobalCatalog.getDbName();
     const auto dbVersionInGlobalCatalog = dbInGlobalCatalog.getVersion();
     const auto primaryShard = dbInGlobalCatalog.getPrimary();
@@ -2826,7 +3080,7 @@ std::vector<MetadataInconsistencyItem> checkDatabaseMetadataConsistency(
     // example, the shard catalog may not be in sync with the global catalog.
 
     if (checkDatabaseMetadataConsistencyInShardCatalog(
-            opCtx, dbName, dbVersionInGlobalCatalog, primaryShard)
+            opCtx, dbName, dbVersionInGlobalCatalog, primaryShard, rsMode)
             .empty()) {
         return {};
     }
@@ -2843,7 +3097,7 @@ std::vector<MetadataInconsistencyItem> checkDatabaseMetadataConsistency(
     }
 
     return checkDatabaseMetadataConsistencyInShardCatalog(
-        opCtx, dbName, dbVersionInGlobalCatalog, primaryShard);
+        opCtx, dbName, dbVersionInGlobalCatalog, primaryShard, rsMode);
 }
 
 namespace {
@@ -2942,14 +3196,14 @@ std::vector<MetadataInconsistencyItem> checkShardCatalogCollectionsConsistentWit
     return result.value_or(std::vector<MetadataInconsistencyItem>{});
 }
 
-std::vector<MetadataInconsistencyItem> runCheckMetadataConsistencyOnParticipant(
-    OperationContext* opCtx,
-    const NamespaceString& nss,
-    const ShardId& primaryShardId,
-    bool checkRangeDeletionIndexes,
-    bool checkIndexes,
-    int64_t strictChunkChecksThreshold,
-    bool asRSPrimaryNode) {
+std::pair<std::vector<MetadataInconsistencyItem>, boost::optional<Timestamp>>
+runCheckMetadataConsistencyOnParticipant(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         const ShardId& primaryShardId,
+                                         bool checkRangeDeletionIndexes,
+                                         bool checkIndexes,
+                                         int64_t strictChunkChecksThreshold,
+                                         RSNodeMode rsMode) {
     const auto shardId = ShardingState::get(opCtx)->shardId();
     const auto commandLevel = getCommandLevel(nss);
     ON_BLOCK_EXIT([&] {
@@ -2968,102 +3222,77 @@ std::vector<MetadataInconsistencyItem> runCheckMetadataConsistencyOnParticipant(
             commandLevel == MetadataConsistencyCommandLevelEnum::kCollectionLevel ||
                 commandLevel == MetadataConsistencyCommandLevelEnum::kDatabaseLevel);
 
-    // Get the list of collections from configsvr sorted by namespace
-    const auto configsvrCollections = getCollectionsListFromConfigServer(opCtx, nss, commandLevel);
-
     uassert(ErrorCodes::InvalidOptions,
-            "Range deletion missing shard key index inconsistency check is not supported "
-            "with the current FCV. Upgrade to the highest FCV for performing the check.",
+            "Range deletion missing shard key index inconsistency check is not supported with the "
+            "current FCV. Upgrade to the highest FCV for performing the check.",
             !checkRangeDeletionIndexes ||
                 feature_flags::gCheckRangeDeletionsWithMissingShardKeyIndex.isEnabled(
                     VersionContext::getDecoration(opCtx),
                     serverGlobalParams.featureCompatibility.acquireFCVSnapshot()));
 
-    const auto& [collCatalogSnapshot, localCatalogCollections] = [&] {
-        std::vector<CollectionPtr> localCatalogCollections;
-        switch (commandLevel) {
-            case MetadataConsistencyCommandLevelEnum::kDatabaseLevel: {
-                auto collCatalogSnapshot = [&] {
-                    // Lock db in mode IS while taking the collection catalog snapshot to ensure
-                    // that we serialize with non-atomic collection and index creation performed by
-                    // the MigrationDestinationManager. Without this lock we could potentially
-                    // acquire a snapshot in which a collection have been already created by the
-                    // MigrationDestinationManager but the relative shardkey index is still missing.
-                    AutoGetDb autoDb(opCtx, nss.dbName(), MODE_IS);
-                    return CollectionCatalog::get(opCtx);
-                }();
+    auto [collCatalogSnapshot, localCatalogCollections, snapshotTimestamp] = [&] {
+        if (rsMode != RSNodeMode::kDelayedSecondary) {
+            return std::tuple_cat(getCatalogAndCollections(opCtx, nss, commandLevel),
+                                  std::tuple<boost::optional<Timestamp>>{boost::none});
+        } else {
+            return getConsistentSnapshot(opCtx, nss, commandLevel);
+        }
+    }();
 
-                for (auto&& coll : collCatalogSnapshot->range(nss.dbName())) {
-                    if (!coll) {
-                        continue;
-                    }
-                    // The collection catalog snapshot will be in scope until the end of the command
-                    // execution, so we can safely use CollectionPtr_UNSAFE as the instance pointed
-                    // by Collection* will stay in scope as a consequence.
-                    localCatalogCollections.emplace_back(CollectionPtr::CollectionPtr_UNSAFE(coll));
-                }
-                std::sort(localCatalogCollections.begin(),
-                          localCatalogCollections.end(),
-                          [](const CollectionPtr& prev, const CollectionPtr& next) {
-                              return prev->ns() < next->ns();
-                          });
+    boost::optional<ScopedReadConcern> scopedReadConcern;
+    stdx::unordered_set<NamespaceString> collectionsUnderCs;
+    if (rsMode == RSNodeMode::kDelayedSecondary) {
+        invariant(snapshotTimestamp);
+        repl::ReadConcernArgs snapshotReadConcern{repl::ReadConcernLevel::kSnapshotReadConcern};
+        snapshotReadConcern.setArgsAtClusterTimeForSnapshot(*snapshotTimestamp);
+        scopedReadConcern.emplace(opCtx, std::move(snapshotReadConcern));
 
-                return std::make_pair(std::move(collCatalogSnapshot),
-                                      std::move(localCatalogCollections));
-            }
-            case MetadataConsistencyCommandLevelEnum::kCollectionLevel: {
-                auto collCatalogSnapshot = [&] {
-                    // Lock collection in mode IS while taking the collection catalog snapshot to
-                    // ensure that we serialize with non-atomic collection and index creation
-                    // performed by the MigrationDestinationManager. Without this lock we could
-                    // potentially acquire a snapshot in which a collection have been already
-                    // created by the MigrationDestinationManager but the relative shardkey index is
-                    // still missing.
-                    AutoGetCollection coll(opCtx,
-                                           nss,
-                                           MODE_IS,
-                                           auto_get_collection::Options{}.viewMode(
-                                               auto_get_collection::ViewMode::kViewsPermitted));
-                    return CollectionCatalog::get(opCtx);
-                }();
+        collectionsUnderCs = getCollectionsUnderCriticalSection(opCtx, localCatalogCollections);
 
-                // The collection catalog snapshot will be in scope until the end of the command
-                // execution, so we can safely use CollectionPtr_UNSAFE as the instance pointed by
-                // Collection* will stay in scope as a consequence.
-                if (auto coll = collCatalogSnapshot->lookupCollectionByNamespace(opCtx, nss)) {
-                    localCatalogCollections.emplace_back(CollectionPtr::CollectionPtr_UNSAFE(coll));
-                }
+        LOGV2(
+            12922300,
+            "Running _shardsvrCheckMetadataConsistencySecondaryParticipant on a delayed secondary",
+            "timestamp"_attr = repl::ReadConcernArgs::get(opCtx).getArgsAtClusterTime());
+    }
 
-                return std::make_pair(std::move(collCatalogSnapshot),
-                                      std::move(localCatalogCollections));
-            }
-            default:
-                tasserted(1011705,
-                          str::stream()
-                              << "Unexpected parameter during the internal execution of "
-                                 "checkMetadataConsistency command. The shard server was "
-                                 "expecting "
-                                 "to receive a database or collection level parameter, but "
-                                 "received "
-                              << idl::serialize(commandLevel) << " with namespace "
-                              << nss.toStringForErrorMsg());
+    // Get the list of collections from configsvr sorted by namespace
+    const auto configsvrCollections = getCollectionsListFromConfigServer(opCtx, nss, commandLevel);
+
+    const auto currentPrimaryShardId = [&] {
+        if (rsMode != RSNodeMode::kDelayedSecondary) {
+            return primaryShardId;
+        }
+        // On a delayed secondary, the primaryShardId as reported in the command arguments can be
+        // stale. In that case, trust the CSRS and get the primary shardID from it.
+        try {
+            return Grid::get(opCtx)
+                ->catalogClient()
+                ->getDatabase(opCtx, nss.dbName(), getReadConcernForConfigServer(opCtx))
+                .getPrimary()
+                .getShardId();
+        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>& e) {
+            // The collection didn't exist at the current snapshot, so return a snapshot error.
+            uasserted(ErrorCodes::SnapshotUnavailable,
+                      fmt::format("Database not found at the current optime: {}", e.toString()));
         }
     }();
 
     auto inconsistencies = checkCollectionMetadataConsistency(opCtx,
                                                               shardId,
-                                                              primaryShardId,
+                                                              currentPrimaryShardId,
                                                               configsvrCollections,
                                                               collCatalogSnapshot,
                                                               localCatalogCollections,
                                                               checkRangeDeletionIndexes,
                                                               checkIndexes,
                                                               strictChunkChecksThreshold,
-                                                              asRSPrimaryNode);
+                                                              rsMode,
+                                                              collectionsUnderCs);
 
     // If this is the primary shard of the db coordinate index check across shards
-    if (shardId == primaryShardId) {
-        if (asRSPrimaryNode) {
+    if (shardId == currentPrimaryShardId) {
+        // Inter-shard checks don't make sense on RS secondaries.
+        if (rsMode == RSNodeMode::kPrimary) {
             if (checkIndexes) {
                 auto indexInconsistencies =
                     metadata_consistency_util::checkIndexesConsistencyAcrossShards(
@@ -3085,10 +3314,10 @@ std::vector<MetadataInconsistencyItem> runCheckMetadataConsistencyOnParticipant(
                 serverGlobalParams.featureCompatibility.acquireFCVSnapshot()) &&
             !nss.isConfigDB()) {
             const auto dbInGlobalCatalog = Grid::get(opCtx)->catalogClient()->getDatabase(
-                opCtx, nss.dbName(), repl::ReadConcernArgs::kMajority);
+                opCtx, nss.dbName(), getReadConcernForConfigServer(opCtx));
 
             auto dbMetadataInconsistencies =
-                checkDatabaseMetadataConsistency(opCtx, dbInGlobalCatalog);
+                checkDatabaseMetadataConsistency(opCtx, dbInGlobalCatalog, rsMode);
             inconsistencies.insert(inconsistencies.end(),
                                    std::make_move_iterator(dbMetadataInconsistencies.begin()),
                                    std::make_move_iterator(dbMetadataInconsistencies.end()));
@@ -3098,7 +3327,7 @@ std::vector<MetadataInconsistencyItem> runCheckMetadataConsistencyOnParticipant(
     ShardingStatistics::get(opCtx).checkMetadataStatistics.incrementInconsistenciesFound(
         inconsistencies.size());
 
-    return inconsistencies;
+    return {std::move(inconsistencies), snapshotTimestamp};
 }
 
 }  // namespace metadata_consistency_util
