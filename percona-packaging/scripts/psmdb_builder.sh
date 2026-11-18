@@ -430,6 +430,10 @@ install_deps() {
       pip install --upgrade pip
 
     else
+      # bullseye is EOL: deb.debian.org still has the security index but the pool is gone (404)
+      if grep -q '^VERSION_CODENAME=bullseye$' /etc/os-release; then
+        sed -i 's|http://deb.debian.org/debian-security|http://archive.debian.org/debian-security|' /etc/apt/sources.list
+      fi
       apt-get -y update
       DEBIAN_FRONTEND=noninteractive apt-get -y install curl lsb-release wget apt-transport-https software-properties-common
       export DEBIAN=$(lsb_release -sc)
